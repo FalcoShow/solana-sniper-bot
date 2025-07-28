@@ -1,0 +1,5 @@
+solana
+requests
+aiohttp
+python-dotenv
+pyTelegramBotAPI
