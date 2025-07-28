@@ -1,1 +1,2 @@
-python core.py
+#!/bin/sh
+python3 core.py
