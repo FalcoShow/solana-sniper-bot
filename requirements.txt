@@ -1,5 +1,5 @@
 solana
 requests
+python-telegram-bot
 aiohttp
 python-dotenv
-pyTelegramBotAPI
