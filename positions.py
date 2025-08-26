@@ -14,11 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
+import csv
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 # Optional import of shared Redis client from your utils
 # (init_resources() in utils_pkg.core_utils sets this)
@@ -103,7 +103,10 @@ async def _file_read_positions() -> Dict[str, Dict[str, Any]]:
             return {}
         text = POSITIONS_JSON.read_text(encoding="utf-8") or "{}"
         try:
-            return json.loads(text)
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj
+            return {}
         except Exception:
             # Corrupted file — rotate & start fresh
             POSITIONS_JSON.rename(POSITIONS_JSON.with_suffix(".corrupt.json"))
@@ -118,7 +121,7 @@ async def _file_write_positions(obj: Dict[str, Dict[str, Any]]) -> None:
 async def _file_append_jsonl(path: Path, row: Dict[str, Any]) -> None:
     async with _FILE_LOCK:
         with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            f.write(json.dumps(row, ensure_ascii=False) + "\\n")
 
 async def _file_append_csv(row: Dict[str, Any]) -> None:
     # very light CSV writer (header if missing)
@@ -129,21 +132,10 @@ async def _file_append_csv(row: Dict[str, Any]) -> None:
     async with _FILE_LOCK:
         write_header = not TRADES_CSV.exists()
         with TRADES_CSV.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=HEAD)
             if write_header:
-                f.write(",".join(HEAD) + "\n")
-            vals = [
-                str(row.get("token_address","")),
-                str(row.get("symbol","") or "")),
-                str(row.get("buy_price","")),
-                str(row.get("sell_price","")),
-                str(row.get("amount","")),
-                str(row.get("profit_sol","")),
-                str(row.get("profit_pct","")),
-                str(row.get("buy_time","")),
-                str(row.get("sell_time","")),
-                str(row.get("reason","")),
-            ]
-            f.write(",".join(vals) + "\n")
+                writer.writeheader()
+            writer.writerow({k: row.get(k, "") for k in HEAD})
 
 
 # ---------- public API (async) ----------
@@ -154,7 +146,6 @@ async def load_positions() -> Dict[str, Dict[str, Any]]:
     Uses Redis (preferred). Falls back to JSON file.
     """
     if _redis_available():
-        # return all keys in index
         try:
             members = await _shared_redis.smembers(REDIS_INDEX_KEY)  # type: ignore
             res: Dict[str, Dict[str, Any]] = {}
@@ -162,7 +153,7 @@ async def load_positions() -> Dict[str, Dict[str, Any]]:
                 raw = await _shared_redis.get(f"{REDIS_POS_PREFIX}{token}")  # type: ignore
                 if raw:
                     try:
-                        res[token] = json.loads(raw)
+                        res[str(token)] = json.loads(raw)
                     except Exception:
                         pass
             return res
@@ -176,7 +167,6 @@ async def list_active_tokens() -> List[str]:
     if _redis_available():
         try:
             members = await _shared_redis.smembers(REDIS_INDEX_KEY)  # type: ignore
-            # normalize to str list
             return [str(m) for m in members]
         except Exception:
             pass
@@ -196,10 +186,8 @@ async def get_position(token_address: str) -> Optional[Dict[str, Any]]:
     return pos.get(token_address)
 
 
-async def save_position(token_address: str, data: Dict[str, Any]) -> None:
-    """
-    Insert or replace a position for token_address.
-    """
+async def _save_position_pair(token_address: str, data: Dict[str, Any]) -> None:
+    """Internal: save position by (token_address, data)."""
     data = dict(data)
     data.setdefault("token_address", token_address)
     data.setdefault("timestamp", _now_iso())
@@ -218,24 +206,37 @@ async def save_position(token_address: str, data: Dict[str, Any]) -> None:
     await _file_write_positions(obj)
 
 
+async def save_position(arg1: Any, data: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Flexible signature:
+      - save_position(position_dict)
+      - save_position(token_address: str, data_dict: dict)
+    """
+    if isinstance(arg1, dict) and data is None:
+        position = dict(arg1)
+        token = position.get("token_address") or position.get("token")
+        if not token:
+            raise ValueError("position dict must include 'token_address' (or 'token')")
+        await _save_position_pair(str(token), position)
+    else:
+        if not isinstance(arg1, str) or data is None:
+            raise TypeError("save_position expects (position_dict) or (token_address, data_dict)")
+        await _save_position_pair(arg1, data)
+
+
 async def update_position(token_address: str, patch: Dict[str, Any]) -> None:
-    """
-    Merge patch into existing position.
-    """
+    """Merge patch into existing position."""
     cur = await get_position(token_address) or {}
     cur.update(patch)
-    await save_position(token_address, cur)
+    await _save_position_pair(token_address, cur)
 
 
 async def remove_position(token_address: str) -> None:
-    """
-    Remove a position from the active store.
-    """
+    """Remove a position from the active store."""
     if _redis_available():
         try:
             await _shared_redis.delete(f"{REDIS_POS_PREFIX}{token_address}")  # type: ignore
             await _shared_redis.srem(REDIS_INDEX_KEY, token_address)  # type: ignore
-            # continue to file removal to keep parity
         except Exception:
             pass
 
@@ -277,9 +278,7 @@ async def ensure_position(
     source: Optional[str] = None,
     meta: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """
-    Create if missing; otherwise no-op (does not overwrite existing fields).
-    """
+    """Create if missing; otherwise no-op (does not overwrite existing fields)."""
     cur = await get_position(token_address)
     if cur:
         return
@@ -294,13 +293,11 @@ async def ensure_position(
         source=source,
         meta=meta or {},
     )
-    await save_position(token_address, pos.to_dict())
+    await _save_position_pair(token_address, pos.to_dict())
 
 
 async def iter_positions() -> List[Position]:
-    """
-    Return a list of Position dataclass objects for convenience.
-    """
+    """Return a list of Position dataclass objects for convenience."""
     obj = await load_positions()
     out: List[Position] = []
     for k, v in obj.items():
@@ -317,8 +314,8 @@ async def iter_positions() -> List[Position]:
 
 # ---------- sync shims (optional) ----------
 
-def save_position_sync(token_address: str, data: Dict[str, Any]) -> None:
-    asyncio.run(save_position(token_address, data))
+def save_position_sync(arg1: Any, data: Optional[Dict[str, Any]] = None) -> None:
+    asyncio.run(save_position(arg1, data))
 
 def load_positions_sync() -> Dict[str, Dict[str, Any]]:
     return asyncio.run(load_positions())
