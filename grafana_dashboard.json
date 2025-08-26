@@ -1,0 +1,178 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "Sol Sniper — Ops, PnL & Routing",
+    "tags": ["solana", "trading", "sniper"],
+    "timezone": "utc",
+    "refresh": "10s",
+    "time": { "from": "now-24h", "to": "now" },
+    "templating": {
+      "list": [
+        {
+          "name": "datasource",
+          "type": "datasource",
+          "hide": 0,
+          "label": "Prometheus",
+          "query": "prometheus",
+          "refresh": 1
+        },
+        {
+          "name": "dex",
+          "type": "query",
+          "datasource": "$datasource",
+          "label": "DEX",
+          "query": "label_values(bot_route_used_total, dex)",
+          "refresh": 1,
+          "includeAll": true,
+          "allValue": ".*",
+          "multi": true
+        }
+      ]
+    },
+    "panels": [
+      {
+        "type": "stat",
+        "title": "Equity HWM (USD)",
+        "gridPos": {"x":0,"y":0,"w":6,"h":4},
+        "targets": [{"datasource": "$datasource","expr":"bot_equity_hwm_usd"}],
+        "options": {"reduceOptions":{"calcs":["lastNotNull"]},"orientation":"horizontal"}
+      },
+      {
+        "type": "stat",
+        "title": "Realized PnL Today (USD)",
+        "gridPos": {"x":6,"y":0,"w":6,"h":4},
+        "targets": [{"datasource": "$datasource","expr":"bot_realized_pnl_today_usd"}],
+        "options": {"reduceOptions":{"calcs":["lastNotNull"]},"orientation":"horizontal"}
+      },
+      {
+        "type": "gauge",
+        "title": "Winrate-20",
+        "gridPos": {"x":12,"y":0,"w":6,"h":4},
+        "targets": [{"datasource": "$datasource","expr":"bot_winrate20"}],
+        "fieldConfig":{"defaults":{"min":0,"max":1,"unit":"percentunit","thresholds":{"mode":"percentage","steps":[{"color":"red","value":null},{"color":"yellow","value":0.45},{"color":"green","value":0.5}]}}}
+      },
+      {
+        "type": "gauge",
+        "title": "Rolling Drawdown",
+        "gridPos": {"x":18,"y":0,"w":6,"h":4},
+        "targets": [{"datasource": "$datasource","expr":"bot_rolling_drawdown"}],
+        "fieldConfig":{"defaults":{"min":0,"max":0.25,"unit":"percentunit","thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"yellow","value":0.08},{"color":"red","value":0.12}]}}}
+      },
+
+      {
+        "type": "stat",
+        "title": "Realized % of Equity (Today)",
+        "gridPos": {"x":0,"y":4,"w":6,"h":4},
+        "targets": [
+          {"datasource":"$datasource","expr":"bot_realized_pnl_today_usd / clamp_min(bot_equity_hwm_usd, 1)"}
+        ],
+        "fieldConfig":{"defaults":{"min":0,"max":0.03,"unit":"percentunit","thresholds":{"mode":"percentage","steps":[{"color":"red","value":null},{"color":"yellow","value":0.004},{"color":"green","value":0.006}]}}}
+      },
+      {
+        "type": "stat",
+        "title": "Budget Spent (Today, USD)",
+        "gridPos": {"x":6,"y":4,"w":6,"h":4},
+        "targets": [{"datasource":"$datasource","expr":"bot_spend_today_usd"}],
+        "options":{"reduceOptions":{"calcs":["lastNotNull"]}}
+      },
+      {
+        "type": "stat",
+        "title": "Infra Halt",
+        "gridPos": {"x":12,"y":4,"w":6,"h":4},
+        "targets": [{"datasource":"$datasource","expr":"bot_infra_halt"}],
+        "fieldConfig":{"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"OK"},"1":{"text":"HALT"}}}],"thresholds":{"mode":"absolute","steps":[{"color":"green","value":0},{"color":"red","value":0.5}]}}}
+      },
+      {
+        "type": "stat",
+        "title": "Watchdog Hit Rate (6h, all DEX)",
+        "gridPos": {"x":18,"y":4,"w":6,"h":4},
+        "targets": [
+          {"datasource":"$datasource","expr":"sum(increase(bot_route_watchdog_hits_total[6h])) / clamp_min(sum(increase(bot_route_used_total[6h])),1)"}
+        ],
+        "fieldConfig":{"defaults":{"min":0,"max":0.1,"unit":"percentunit","thresholds":{"mode":"percentage","steps":[{"color":"green","value":null},{"color":"yellow","value":0.02},{"color":"red","value":0.05}]}}}
+      },
+
+      {
+        "type": "timeseries",
+        "title": "Daily Spend vs. Realized",
+        "gridPos": {"x":0,"y":8,"w":12,"h":8},
+        "targets": [
+          {"datasource":"$datasource","expr":"bot_spend_today_usd","legendFormat":"Spend (USD)"},
+          {"datasource":"$datasource","expr":"bot_realized_pnl_today_usd","legendFormat":"Realized (USD)"}
+        ]
+      },
+      {
+        "type": "state-timeline",
+        "title": "Worker States",
+        "gridPos": {"x":12,"y":8,"w":12,"h":8},
+        "targets": [
+          {"datasource":"$datasource","expr":"bot_worker_state{worker=\"sniper\"}"},
+          {"datasource":"$datasource","expr":"bot_worker_state{worker=\"velocity\"}"},
+          {"datasource":"$datasource","expr":"bot_worker_state{worker=\"hotlist\"}"},
+          {"datasource":"$datasource","expr":"bot_worker_state{worker=\"whales\"}"},
+          {"datasource":"$datasource","expr":"bot_worker_state{worker=\"scalper\"}"}
+        ],
+        "options":{"legend":{"show":true}, "rowHeight":24, "mergeValues":true}
+      },
+
+      {
+        "type": "barchart",
+        "title": "Route usage vs watchdog hits (by DEX)",
+        "gridPos": {"x":0,"y":16,"w":12,"h":8},
+        "options": {"legend": {"displayMode": "table"}, "orientation":"horizontal"},
+        "targets": [
+          {"datasource":"$datasource","expr":"bot_route_used_total{dex=~\"$dex\"}","legendFormat":"used {{dex}}"},
+          {"datasource":"$datasource","expr":"bot_route_watchdog_hits_total{dex=~\"$dex\"}","legendFormat":"watchdog {{dex}}"}
+        ]
+      },
+      {
+        "type": "table",
+        "title": "Playbook — Lever values (current)",
+        "gridPos": {"x":12,"y":16,"w":12,"h":8},
+        "targets": [
+          {"datasource":"$datasource","expr":"bot_lever_value","instant": true}
+        ],
+        "transformations": [
+          {"id":"labelsToFields"}
+        ],
+        "options": { "showHeader": true }
+      },
+
+      {
+        "type": "table",
+        "title": "Playbook — Last change & changes total",
+        "gridPos": {"x":0,"y":24,"w":12,"h":8},
+        "targets": [
+          {"datasource":"$datasource","expr":"bot_lever_last_change","instant": true},
+          {"datasource":"$datasource","expr":"bot_lever_change_total","instant": true}
+        ],
+        "transformations": [
+          {"id":"labelsToFields"}
+        ],
+        "options": { "showHeader": true },
+        "fieldConfig": {
+          "defaults": { "unit": "dateTimeAsIso" },
+          "overrides": [
+            {
+              "matcher": { "id":"byRegexp","options":"Value" },
+              "properties": [{ "id":"unit","value":"none" }]
+            }
+          ]
+        }
+      },
+
+      {
+        "type": "timeseries",
+        "title": "Trades / Wins (cumulative)",
+        "gridPos": {"x":12,"y":24,"w":12,"h":8},
+        "targets": [
+          {"datasource":"$datasource","expr":"bot_trades_total","legendFormat":"Trades"},
+          {"datasource":"$datasource","expr":"bot_wins_total","legendFormat":"Wins"}
+        ]
+      }
+    ],
+    "schemaVersion": 38,
+    "version": 1
+  },
+  "overwrite": true
+}
