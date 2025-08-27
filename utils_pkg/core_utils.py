@@ -862,7 +862,78 @@ async def get_sol_balance(wallet_address: str) -> float:
     except Exception:
         return 0.0
 
+# 
 # ───────────────────────────────────────────────────────────────────────────────
+# Savings transfers (used by reinvestor.py)
+# ───────────────────────────────────────────────────────────────────────────────
+async def transfer_sol(to_pubkey: str, amount_sol: float) -> str:
+    """
+    Send native SOL from our wallet to `to_pubkey`. Returns the signature.
+    """
+    if not solana_client or not wallet:
+        raise RuntimeError("Resources not initialized (solana_client/wallet)")
+
+    if amount_sol <= 0:
+        raise ValueError("amount_sol must be > 0")
+
+    lamports = int(round(float(amount_sol) * 1_000_000_000))
+
+    if transfer is None or TransferParams is None:
+        raise RuntimeError("solana.system_program.transfer not available in this solana-py version")
+
+    from solana.transaction import Transaction  # local import for compatibility
+
+    tx = Transaction().add(
+        transfer(TransferParams(
+            from_pubkey=wallet.pubkey(),
+            to_pubkey=PublicKey.from_string(to_pubkey),
+            lamports=lamports,
+        ))
+    )
+    resp = await solana_client.send_transaction(tx, wallet, opts=TxOpts(skip_preflight=True))
+    await solana_client.confirm_transaction(resp.value, commitment=Confirmed)
+    return resp.value
+
+
+async def transfer_to_savings(amount_sol: float) -> Optional[str]:
+    """
+    Move `amount_sol` to the SAVINGS_WALLET (set in env). Returns signature or None.
+    """
+    dest = (os.getenv("SAVINGS_WALLET") or "").strip()
+    if not dest:
+        logger.warning("SAVINGS_WALLET not set; skipping transfer_to_savings")
+        return None
+    if amount_sol <= 0:
+        return None
+    try:
+        sig = await transfer_sol(dest, amount_sol)
+        try:
+            await send_telegram(f"💸 Sent {amount_sol:.4f} SOL to savings\nsig: {sig}")
+        except Exception:
+            pass
+        return sig
+    except Exception as e:
+        logger.warning(f"transfer_to_savings failed: {e}")
+        return None
+
+
+async def sweep_to_savings(min_reserve_sol: float = 0.05) -> Optional[str]:
+    """
+    Send all SOL above `min_reserve_sol` to SAVINGS_WALLET.
+    Keeps a small buffer in the hot wallet for fees.
+    """
+    try:
+        me = str(wallet.pubkey())
+        bal = await get_sol_balance(me)
+        amount = round(max(0.0, bal - float(min_reserve_sol)), 9)
+        if amount <= 0.0:
+            return None
+        return await transfer_to_savings(amount)
+    except Exception as e:
+        logger.warning(f"sweep_to_savings failed: {e}")
+        return None
+#
+───────────────────────────────────────────────────────────────────────────────
 # Convenience: token info for alerts (symbol via Dexscreener top pair)
 # ───────────────────────────────────────────────────────────────────────────────
 async def get_token_info(mint: str) -> Dict[str, Any]:
