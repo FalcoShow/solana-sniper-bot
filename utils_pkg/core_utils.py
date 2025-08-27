@@ -1,8 +1,8 @@
 # utils_pkg/core_utils.py
 # Core utilities: resources (redis/aiohttp/solana wallet), pricing, Jupiter swaps,
 # alerts (Telegram/Discord), Notion logging, entry-price cache, volatility helpers,
-# Jito tips, Postgres logging — plus day-trading helpers (indicators, risk sizing,
-# OHLC fetchers, orderflow snapshot) and an AI scoring gate wrapper.
+# Jito tips, Postgres logging, day-trading helpers, and an AI scoring gate wrapper.
+
 from __future__ import annotations
 
 import os
@@ -12,10 +12,8 @@ import time
 import base64
 import certifi
 import struct
-import math
 import logging
-import random
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Tuple, List, Dict, Any
 
 import aiohttp
@@ -24,19 +22,19 @@ import redis.asyncio as aioredis
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 from sqlalchemy import MetaData, Table, Column, BigInteger, String, Float, DateTime, text
-from sqlalchemy.engine.url import make_url
 
 # Solana
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TokenAccountOpts, TxOpts
 from solana.rpc.commitment import Confirmed
+from solana.transaction import Transaction
 
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey as PublicKey
 
-# Try both transaction styles for broad compatibility
+# Try both transaction styles for broad compatibility (Jupiter swap deserialization)
 try:
-    from solders.transaction import VersionedTransaction as SVTx  # Jupiter v0 tx path
+    from solders.transaction import VersionedTransaction as SVTx  # Jupiter v0 path
     _HAS_VERSIONED = True
 except Exception:
     _HAS_VERSIONED = False
@@ -53,28 +51,21 @@ except Exception:
     TransferParams = None
     transfer = None
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Config import (with safe fallbacks to envs)
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
+# Config import (with env fallbacks)
+# ==============================
 try:
     from config import (
-        # networking
         RPC_URL, REDIS_URL,
-        # alerts
         TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DISCORD_WEBHOOK,
-        # APIs
         BIRDEYE_API_KEY, BIRDEYE_API_URL, JUPITER_SWAP_API,
-        # Notion
         NOTION_TOKEN, NOTION_DATABASE_ID, ENABLE_NOTION_LOGGING,
-        # storage
         SQLITE_DB_PATH,
-        # optional Postgres
-        PG_ENABLED, PG_DSN,
-        # trading / swaps
+        PG_ENABLED,
         JUPITER_MAX_SLIPPAGE, SAVINGS_WALLET,
-        # fraud & scanners
         FRAUD_API_URL, FRAUD_API_KEY, SCANNER_MIN_FRAUD_SCORE,
     )
+    # PG_DSN is intentionally not imported from config; we use utils_pkg.db_dsn picker.
 except Exception:
     RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -89,18 +80,11 @@ except Exception:
     ENABLE_NOTION_LOGGING = os.getenv("ENABLE_NOTION_LOGGING", "false").lower() == "true"
     SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "./state.sqlite3")
     PG_ENABLED = os.getenv("PG_ENABLED", "false").strip().lower() in ("1","true","yes","y","on")
-    PG_DSN = os.getenv("PG_DSN", "")
     JUPITER_MAX_SLIPPAGE = float(os.getenv("JUPITER_MAX_SLIPPAGE", "0.005"))
     SAVINGS_WALLET = os.getenv("SAVINGS_WALLET", "")
     FRAUD_API_URL = os.getenv("FRAUD_API_URL", "")
     FRAUD_API_KEY = os.getenv("FRAUD_API_KEY", "")
-    SCANNER_MIN_FRAUD_SCORE = float(os.getenv("SCANNER_MIN_FRAUD_SCORE", "70"))  # 0..100
-
-# Day-trader add-ons (env flags & risk defaults)
-DAYTRADER_ENABLED = os.getenv("DAYTRADER_ENABLED", "false").strip().lower() in ("1","true","yes","y","on")
-MAX_RISK_PCT = float(os.getenv("DT_MAX_RISK_PCT", "0.02"))
-ATR_SL_MULT = float(os.getenv("DT_ATR_SL_MULT", "2.0"))
-ATR_TP_MULT = float(os.getenv("DT_ATR_TP_MULT", "3.0"))
+    SCANNER_MIN_FRAUD_SCORE = float(os.getenv("SCANNER_MIN_FRAUD_SCORE", "70"))
 
 # Logging
 logger = logging.getLogger("core_utils")
@@ -122,9 +106,9 @@ WSOL_MINT = "So11111111111111111111111111111111111111112"
 COINGECKO_SOL_API = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
 
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 # Optional Postgres
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 PG_METADATA = MetaData()
 _pg_engine: AsyncEngine | None = None
 
@@ -147,21 +131,18 @@ TRADES = Table(
 
 async def init_postgres() -> None:
     """Initialize optional Postgres engine and ensure tables (with TLS when needed)."""
-    from utils_pkg.db_dsn import pick_pg_dsn  # local import avoids cycles
     global _pg_engine
     if not PG_ENABLED or _pg_engine is not None:
         return
-
     try:
+        from utils_pkg.db_dsn import pick_pg_dsn  # local import avoids cycles
         dsn, connect_args = pick_pg_dsn()
     except Exception as e:
         logger.warning(f"Postgres init skipped: DSN picker error: {e}")
         return
-
     if not dsn:
         logger.warning("Postgres init skipped: no DSN found")
         return
-
     eng = create_async_engine(
         dsn,
         echo=False,
@@ -184,54 +165,13 @@ async def init_postgres() -> None:
         finally:
             _pg_engine = None
 
-    def _valid_dsn(s: str) -> bool:
-        if not s or not isinstance(s, str):
-            return False
-        try:
-            make_url(s.strip()); return True
-        except Exception:
-            return False
-
-    candidates: List[Tuple[str, str]] = []
-    exp = os.getenv("PG_DSN", "").strip()
-    internal = os.getenv("PG_DSN_INTERNAL", "").strip()
-    external = os.getenv("PG_DSN_EXTERNAL", "").strip()
-    if _valid_dsn(exp): candidates.append(("PG_DSN", exp))
-    if _valid_dsn(internal): candidates.append(("INTERNAL", internal))
-    if _valid_dsn(external): candidates.append(("EXTERNAL", external))
-
-    if not candidates:
-        logger.warning("Postgres init skipped: no valid DSN found")
-        return
-
-    last_err: Optional[Exception] = None
-    for label, dsn in candidates:
-        try:
-            eng = create_async_engine(dsn, echo=False, pool_pre_ping=True)
-            async with eng.begin() as conn:
-                await conn.execute(text("SELECT 1"))
-                await conn.run_sync(PG_METADATA.create_all)
-            _pg_engine = eng
-            logger.info(f"Postgres DSN selected: {label}")
-            logger.info("✅ Postgres ready")
-            return
-        except Exception as e:
-            last_err = e
-            logger.warning(f"Postgres {label} DSN failed: {e}")
-            try:
-                await eng.dispose()  # type: ignore[name-defined]
-            except Exception:
-                pass
-    _pg_engine = None
-    if last_err:
-        logger.warning(f"Postgres init failed: {last_err}")
 
 def get_pg_engine() -> AsyncEngine | None:
     return _pg_engine
 
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 # Initialization / Shutdown
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 async def init_sqlite() -> None:
     """Create local SQLite tables used for basic caching."""
     os.makedirs(os.path.dirname(SQLITE_DB_PATH) or ".", exist_ok=True)
@@ -244,6 +184,7 @@ async def init_sqlite() -> None:
             )
         """)
         await db.commit()
+
 
 def _parse_wallet_from_env() -> Keypair:
     """
@@ -265,6 +206,7 @@ def _parse_wallet_from_env() -> Keypair:
     except Exception as e:
         raise RuntimeError("WALLET_PRIVATE_KEY must be JSON array of 64 or 32 ints") from e
 
+
 async def init_resources() -> None:
     """Initialize Redis, Postgres (optional), aiohttp session, Solana client, and wallet."""
     global redis, session, solana_client, wallet
@@ -283,6 +225,7 @@ async def init_resources() -> None:
     wallet = _parse_wallet_from_env()
     await init_sqlite()
     logger.info("✅ init_resources: Redis/HTTP/Solana/SQLite ready")
+
 
 async def close_resources() -> None:
     """Gracefully close async resources."""
@@ -309,6 +252,7 @@ async def close_resources() -> None:
 
     logger.info("🛑 close_resources: all closed")
 
+
 # Accessors
 def get_redis(): return redis
 def get_session(): return session
@@ -317,9 +261,9 @@ def get_wallet_pubkey() -> str:
     try: return str(wallet.pubkey()) if wallet else ""
     except Exception: return ""
 
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 # Redis / SQLite helpers
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 async def cache_sniped_token(token: str, price: float) -> None:
     ts = int(time.time())
     if redis:
@@ -331,10 +275,12 @@ async def cache_sniped_token(token: str, price: float) -> None:
         )
         await db.commit()
 
+
 async def was_token_sniped(token: str) -> bool:
     if not redis: return False
     try: return (await redis.exists(f"sniped:{token}")) == 1
     except Exception: return False
+
 
 async def save_entry_price(redis_client: aioredis.Redis, token_address: str, entry_price: float) -> None:
     payload = {"price": entry_price, "timestamp": datetime.utcnow().isoformat()}
@@ -342,6 +288,7 @@ async def save_entry_price(redis_client: aioredis.Redis, token_address: str, ent
         await redis_client.set(f"entry_price:{token_address}", json.dumps(payload), ex=172800)  # 48h
     except Exception as e:
         logger.warning(f"save_entry_price failed for {token_address}: {e}")
+
 
 async def get_entry_price(redis_client: aioredis.Redis, token_address: str) -> Optional[float]:
     try:
@@ -351,14 +298,17 @@ async def get_entry_price(redis_client: aioredis.Redis, token_address: str) -> O
     except Exception:
         return None
 
+
 # Back-compat aliases
 async def get_entry_price_from_redis(token_address: str):
     if redis is None: raise RuntimeError("Redis not initialized. Call init_resources() first.")
     return await get_entry_price(redis, token_address)
 
+
 async def save_entry_price_to_redis(token_address: str, entry_price: float):
     if redis is None: raise RuntimeError("Redis not initialized. Call init_resources() first.")
     await save_entry_price(redis, token_address, entry_price)
+
 
 def dca_profit_exit(current: float, entry: float, target: float = 2.0) -> bool:
     try:
@@ -367,9 +317,9 @@ def dca_profit_exit(current: float, entry: float, target: float = 2.0) -> bool:
     except Exception:
         return False
 
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 # Jito tip accounts helper
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 _JITO_TIP_STATIC_LIST = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
     "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
@@ -381,9 +331,9 @@ _JITO_TIP_STATIC_LIST = [
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ]
 
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 # Alerts (Telegram / Discord)
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 async def send_telegram(message: str, sol_value: Optional[float] = None) -> None:
     if not session or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -398,6 +348,7 @@ async def send_telegram(message: str, sol_value: Optional[float] = None) -> None
                 logger.warning(f"Telegram [{resp.status}] {await resp.text()}")
     except Exception as e:
         logger.warning(f"send_telegram error: {e}")
+
 
 async def send_discord_alert(title: str, fields: List[Dict[str, Any]]) -> None:
     if not session or not DISCORD_WEBHOOK:
@@ -415,9 +366,9 @@ async def send_discord_alert(title: str, fields: List[Dict[str, Any]]) -> None:
     except Exception as e:
         logger.warning(f"send_discord_alert error: {e}")
 
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 # Prices / Volatility
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 async def get_sol_usd() -> float:
     if not session: return 0.0
     try:
@@ -429,13 +380,16 @@ async def get_sol_usd() -> float:
         pass
     return 0.0
 
+
 async def convert_sol_to_usd(sol_amount: float) -> float:
     px = await get_sol_usd()
     return round(sol_amount * px, 2) if px > 0 else 0.0
 
+
 async def convert_usd_to_sol(usd_amount: float) -> float:
     px = await get_sol_usd()
     return (usd_amount / px) if px > 0 else 0.0
+
 
 async def get_token_price(token_address: str) -> float:
     """Primary: Birdeye (USD) -> convert to SOL; fallback: Dexscreener. Returns SOL price or 0."""
@@ -468,6 +422,7 @@ async def get_token_price(token_address: str) -> float:
         pass
     return 0.0
 
+
 async def get_pair_snapshot_dexscreener(token_address: str) -> Dict[str, Any]:
     """Returns a best pair snapshot from Dexscreener: priceUsd, liquidity.usd, txns.m5.buy/sell, volume.h24, etc."""
     out: Dict[str, Any] = {}
@@ -486,7 +441,7 @@ async def get_pair_snapshot_dexscreener(token_address: str) -> Dict[str, Any]:
     except Exception:
         return out
 
-# Simple orderflow snapshot
+
 async def get_orderflow_snapshot(mint: str) -> Dict[str, Any]:
     snap = await get_pair_snapshot_dexscreener(mint)
     if not snap:
@@ -499,9 +454,9 @@ async def get_orderflow_snapshot(mint: str) -> Dict[str, Any]:
     skew = (buys + 1) / (sells + 1)
     return {"liq_usd": liq_usd, "price_usd": price_usd, "buys": buys, "sells": sells, "skew": skew}
 
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 # Indicators
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 def ema(xs: List[float], n: int) -> List[float]:
     if not xs: return []
     k = 2/(n+1)
@@ -509,6 +464,7 @@ def ema(xs: List[float], n: int) -> List[float]:
     for x in xs[1:]:
         out.append(out[-1] + k*(x - out[-1]))
     return out
+
 
 def rsi(closes: List[float], period: int = 14) -> List[float]:
     if len(closes) < period + 1: return [50.0]*len(closes)
@@ -526,6 +482,7 @@ def rsi(closes: List[float], period: int = 14) -> List[float]:
         out.append(100 - 100/(1+rs))
     return [50.0] + out
 
+
 def atr(ohlc: List[Dict[str, float]], period: int = 14) -> List[float]:
     if not ohlc: return []
     trs = []
@@ -536,9 +493,9 @@ def atr(ohlc: List[Dict[str, float]], period: int = 14) -> List[float]:
         trs.append(tr); prev_c = cl
     return ema(trs, period)
 
-# ───────────────────────────────────────────────────────────────────────────────
-# AI Fraud Score & Risk wrappers (what scanners/sniper expect)
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
+# AI Fraud Score & Risk wrappers
+# ==============================
 async def ai_fraud_score(token_address: str) -> float:
     """
     Legacy function name retained (0..1). Prefer fraud_score_ai() below for 0..100.
@@ -557,6 +514,7 @@ async def ai_fraud_score(token_address: str) -> float:
     except Exception:
         return 0.9
 
+
 async def fraud_score_ai(token_address: str) -> float:
     """
     Returns 0..100 for easier thresholds in scanners.
@@ -565,12 +523,14 @@ async def fraud_score_ai(token_address: str) -> float:
     s01 = await ai_fraud_score(token_address)
     return round(max(0.0, min(1.0, s01)) * 100, 2)
 
+
 async def check_rug_pull_risk(token_address: str) -> bool:
     """
     Boolean guard: pass if fraud score >= SCANNER_MIN_FRAUD_SCORE.
     """
     score = await fraud_score_ai(token_address)
     return score >= float(SCANNER_MIN_FRAUD_SCORE)
+
 
 async def is_whale_wallet(token_mint: str, usd_threshold: float = 50_000) -> bool:
     """
@@ -580,8 +540,6 @@ async def is_whale_wallet(token_mint: str, usd_threshold: float = 50_000) -> boo
     if not session or not BIRDEYE_API_KEY:
         return False
     headers = {"X-API-KEY": BIRDEYE_API_KEY}
-    # Birdeye holder endpoint varies by plan; keep tolerant:
-    # Try /defi/holders?address=... else /token/<mint>/holders (older docs)
     urls = [
         f"{BIRDEYE_API_URL.rstrip('/')}/defi/holders?address={token_mint}&page=1&limit=20",
         f"{BIRDEYE_API_URL.rstrip('/')}/token/{token_mint}/holders",
@@ -604,9 +562,9 @@ async def is_whale_wallet(token_mint: str, usd_threshold: float = 50_000) -> boo
             continue
     return False
 
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 # Notion logging (direct API, configurable columns)
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 def _notion_fields_map() -> Dict[str, str]:
     def env_first(keys, default):
         for k in keys:
@@ -634,6 +592,7 @@ def _notion_fields_map() -> Dict[str, str]:
     except Exception:
         pass
     return defaults
+
 
 async def log_to_notion(token: str, symbol: str, balance: float, entry: float, current: float, profit: float, reason: str) -> None:
     if not ENABLE_NOTION_LOGGING or not NOTION_TOKEN or not NOTION_DATABASE_ID or not session:
@@ -670,11 +629,11 @@ async def log_to_notion(token: str, symbol: str, balance: float, entry: float, c
     except Exception as e:
         logger.warning(f"log_to_notion failed: {e}")
 
-# Dual logging: Postgres (if enabled) + Notion (if enabled)
+
 async def pg_log_trade(*, token: str, symbol: str | None, side: str | None, amount: float | None,
                        entry: float | None, current: float | None, profit: float | None,
                        reason: str | None, signature: Any | None = None) -> None:
-    if not PG_ENABLED or _pg_engine is None:
+    if _pg_engine is None:
         return
     sig_txt = None
     try:
@@ -697,6 +656,7 @@ async def pg_log_trade(*, token: str, symbol: str | None, side: str | None, amou
     except Exception as e:
         logger.warning(f"pg_log_trade failed: {e}")
 
+
 async def log_trade_event(token: str, symbol: str, balance: float, entry: float, current: float, profit: float, reason: str,
                           *, side: str | None = None, signature: Any | None = None) -> None:
     await pg_log_trade(token=token, symbol=symbol, side=side, amount=balance,
@@ -707,9 +667,9 @@ async def log_trade_event(token: str, symbol: str, balance: float, entry: float,
     except Exception:
         pass
 
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 # Jupiter v6 swap helpers
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 async def get_jupiter_quote(
     input_mint: str,
     output_mint: str,
@@ -738,6 +698,7 @@ async def get_jupiter_quote(
     except Exception as e:
         logger.warning(f"get_jupiter_quote error: {e}")
     return None
+
 
 async def perform_jupiter_swap(quote_json: Dict[str, Any]) -> Tuple[bool, str]:
     """Sign and send the serialized tx returned by Jupiter /swap (v6)."""
@@ -806,6 +767,7 @@ async def perform_jupiter_swap(quote_json: Dict[str, Any]) -> Tuple[bool, str]:
         logger.warning(f"perform_jupiter_swap error: {e}")
     return (False, "")
 
+
 async def swap_token_jupiter(
     input_mint: str,
     output_mint: str,
@@ -825,9 +787,9 @@ async def swap_token_jupiter(
         logger.warning(f"swap_token_jupiter error: {e}")
         return (False, "")
 
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 # Wallet / Accounts
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 def _parse_token_account_data(data: bytes) -> Dict[str, Any]:
     if len(data) != 165:
         raise ValueError("Invalid SPL token account length")
@@ -836,6 +798,7 @@ def _parse_token_account_data(data: bytes) -> Dict[str, Any]:
         "owner": str(PublicKey(data[32:64])),
         "amount": struct.unpack("<Q", data[64:72])[0],
     }
+
 
 async def get_wallet_tokens(wallet_pubkey: str) -> List[Dict[str, Any]]:
     if not solana_client:
@@ -854,6 +817,7 @@ async def get_wallet_tokens(wallet_pubkey: str) -> List[Dict[str, Any]]:
         logger.warning(f"get_wallet_tokens error: {e}")
         return []
 
+
 async def get_sol_balance(wallet_address: str) -> float:
     if not solana_client: return 0.0
     try:
@@ -862,80 +826,40 @@ async def get_sol_balance(wallet_address: str) -> float:
     except Exception:
         return 0.0
 
-# 
-# ───────────────────────────────────────────────────────────────────────────────
-# Savings transfers (used by reinvestor.py)
-# ───────────────────────────────────────────────────────────────────────────────
-async def transfer_sol(to_pubkey: str, amount_sol: float) -> str:
-    """
-    Send native SOL from our wallet to `to_pubkey`. Returns the signature.
-    """
-    if not solana_client or not wallet:
-        raise RuntimeError("Resources not initialized (solana_client/wallet)")
-
-    if amount_sol <= 0:
-        raise ValueError("amount_sol must be > 0")
-
-    lamports = int(round(float(amount_sol) * 1_000_000_000))
-
-    if transfer is None or TransferParams is None:
-        raise RuntimeError("solana.system_program.transfer not available in this solana-py version")
-
-    from solana.transaction import Transaction  # local import for compatibility
-
-    tx = Transaction().add(
-        transfer(TransferParams(
-            from_pubkey=wallet.pubkey(),
-            to_pubkey=PublicKey.from_string(to_pubkey),
-            lamports=lamports,
-        ))
-    )
-    resp = await solana_client.send_transaction(tx, wallet, opts=TxOpts(skip_preflight=True))
-    await solana_client.confirm_transaction(resp.value, commitment=Confirmed)
-    return resp.value
-
-
+# ==============================
+# Savings transfer
+# ==============================
 async def transfer_to_savings(amount_sol: float) -> Optional[str]:
-    """
-    Move `amount_sol` to the SAVINGS_WALLET (set in env). Returns signature or None.
-    """
-    dest = (os.getenv("SAVINGS_WALLET") or "").strip()
+    """Send SOL to the SAVINGS_WALLET address. Returns signature or None on failure."""
+    if not solana_client or not wallet:
+        logger.warning("transfer_to_savings: resources not initialized")
+        return None
+    dest = (SAVINGS_WALLET or "").strip()
     if not dest:
-        logger.warning("SAVINGS_WALLET not set; skipping transfer_to_savings")
-        return None
-    if amount_sol <= 0:
+        logger.warning("transfer_to_savings: SAVINGS_WALLET not set")
         return None
     try:
-        sig = await transfer_sol(dest, amount_sol)
-        try:
-            await send_telegram(f"💸 Sent {amount_sol:.4f} SOL to savings\nsig: {sig}")
-        except Exception:
-            pass
-        return sig
-    except Exception as e:
-        logger.warning(f"transfer_to_savings failed: {e}")
+        to_pub = PublicKey.from_string(dest)
+    except Exception:
+        logger.warning("transfer_to_savings: invalid SAVINGS_WALLET pubkey")
         return None
-
-
-async def sweep_to_savings(min_reserve_sol: float = 0.05) -> Optional[str]:
-    """
-    Send all SOL above `min_reserve_sol` to SAVINGS_WALLET.
-    Keeps a small buffer in the hot wallet for fees.
-    """
+    lamports = int(amount_sol * 1_000_000_000)
+    if lamports <= 0:
+        return None
     try:
-        me = str(wallet.pubkey())
-        bal = await get_sol_balance(me)
-        amount = round(max(0.0, bal - float(min_reserve_sol)), 9)
-        if amount <= 0.0:
-            return None
-        return await transfer_to_savings(amount)
+        if transfer and TransferParams:
+            ix = transfer(TransferParams(from_pubkey=wallet.pubkey(), to_pubkey=to_pub, lamports=lamports))
+            tx = Transaction().add(ix)
+            sig = await solana_client.send_transaction(tx, wallet, opts=TxOpts(skip_preflight=True))
+            await solana_client.confirm_transaction(sig.value, commitment=Confirmed)
+            return sig.value
     except Exception as e:
-        logger.warning(f"sweep_to_savings failed: {e}")
-        return None
-#
-───────────────────────────────────────────────────────────────────────────────
-# Convenience: token info for alerts (symbol via Dexscreener top pair)
-# ───────────────────────────────────────────────────────────────────────────────
+        logger.warning(f"transfer_to_savings error: {e}")
+    return None
+
+# ==============================
+# Convenience: token info for alerts
+# ==============================
 async def get_token_info(mint: str) -> Dict[str, Any]:
     snap = await get_pair_snapshot_dexscreener(mint)
     if not snap:
@@ -945,11 +869,12 @@ async def get_token_info(mint: str) -> Dict[str, Any]:
     px = float(snap.get("priceUsd") or 0.0)
     return {"symbol": sym, "priceUsd": px, "liquidityUsd": liq}
 
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 # Misc
-# ───────────────────────────────────────────────────────────────────────────────
+# ==============================
 def log_sniper_event(msg: str) -> None:
     logger.info(f"[Sniper] {msg}")
+
 
 def is_wallet_drained(balance: float) -> bool:
     return balance <= 0.0001
