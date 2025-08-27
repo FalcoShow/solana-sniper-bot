@@ -1,223 +1,248 @@
+# Write an improved Pump.fun scanner with multiple fallbacks and tolerant signature.
+from textwrap import dedent
+from pathlib import Path
+
+code = dedent('''
 # scanner/pumpfun_scanner.py
+# Robust Pump.fun scanner with JSON API attempts + HTML fallback.
+# Signature tolerant: scan_pumpfun(redis=None, session=None) or scan_pumpfun(redis) or scan_pumpfun().
 from __future__ import annotations
 
-import os, re, json, logging, math, time
+import os, re, json, ssl, asyncio, logging
 from typing import Any, Dict, List, Optional
+import certifi
 
-from utils_pkg import core_utils as cu  # import the module, not symbols
+try:
+    import aiohttp
+except Exception:  # pragma: no cover
+    aiohttp = None  # type: ignore
 
-LOG = logging.getLogger("scanner.pumpfun")
+# Light coupling on core_utils only for session getter if available
+try:
+    from utils_pkg.core_utils import get_session  # type: ignore
+except Exception:  # pragma: no cover
+    def get_session():
+        return None
 
-# --- small utils --------------------------------------------------------------
-def _now_s() -> int:
-    return int(time.time())
+log = logging.getLogger("scanner.pumpfun")
 
-def _env(name: str, default: str = "") -> str:
-    v = os.getenv(name, "")
-    return v.strip() if isinstance(v, str) else default
+USER_AGENT = os.getenv("PUMPFUN_UA", "").strip() or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+COOKIE = os.getenv("PUMPFUN_COOKIE", "").strip()
+TIMEOUT = int(os.getenv("PUMPFUN_TIMEOUT_SEC", "10"))
+MAX_ITEMS = int(os.getenv("PUMPFUN_MAX_ITEMS", "50"))
 
-def _headers() -> Dict[str, str]:
-    ua = _env("PUMPFUN_UA") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
-    cookie = _env("PUMPFUN_COOKIE")
+JSON_ENDPOINTS = [
+    # Public FE API (often works; still CF-protected). We try both "trending" and "last".
+    "https://frontend-api.pump.fun/coins/trending?limit=60&offset=0",
+    "https://frontend-api.pump.fun/coins/last?limit=100&offset=0",
+]
+HTML_PAGES = [
+    "https://pump.fun/trending",
+    "https://pump.fun/",
+]
+
+def _headers(json_pref: bool = True) -> Dict[str, str]:
     h = {
-        "accept": "application/json, text/plain, */*",
+        "user-agent": USER_AGENT,
         "accept-language": "en-US,en;q=0.9",
-        "cache-control": "no-cache",
-        "pragma": "no-cache",
-        "origin": "https://pump.fun",
         "referer": "https://pump.fun/",
-        "user-agent": ua,
+        "origin": "https://pump.fun",
     }
-    if cookie:
-        h["cookie"] = cookie
+    if json_pref:
+        h["accept"] = "application/json, text/plain, */*"
     else:
-        LOG.warning("Pump.fun: no PUMPFUN_COOKIE set; you may get 403/404/530 from Cloudflare.")
+        h["accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    if COOKIE:
+        h["cookie"] = COOKIE
     return h
 
-def _first(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return items[0] if items else {}
-
-def _norm_candidate(src: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Try to normalize arbitrary pump.fun JSON blobs into our candidate shape.
-    We’re tolerant: look for typical keys and fall back safely.
-    """
-    mint = src.get("mint") or src.get("mintAddress") or src.get("tokenAddress") or src.get("address")
-    if not mint or not isinstance(mint, str):
+def _age_minutes(ts: Optional[str]) -> Optional[float]:
+    if not ts:
+        return None
+    try:
+        # Many Pump.fun APIs return ISO timestamps; parse lightly
+        from datetime import datetime, timezone
+        t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return max(0.0, (datetime.now(timezone.utc) - t).total_seconds() / 60.0)
+    except Exception:
         return None
 
-    symbol = src.get("symbol") or src.get("ticker") or (mint[:6])
-    liq_usd = 0.0
-    pool_age_min = None
-    impact_1k_bps = None
-
-    # common shapes we’ve seen
+def _map_coin(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Map a Pump.fun coin-like dict to our candidate schema.
+    We only require "mint" to consider it valid.
+    """
+    mint = obj.get("mint") or obj.get("mintAddress") or obj.get("mint_address")
+    if not mint:
+        return None
+    sym = obj.get("symbol") or obj.get("ticker") or (obj.get("name") or "")[:8]
+    liq = obj.get("liquidityUSD") or obj.get("liq_usd") or obj.get("usdLiquidity") or obj.get("liquidity_usd")
+    if liq is not None:
+        try:
+            liq = float(liq)
+        except Exception:
+            liq = None
+    age = _age_minutes(obj.get("launchedAt") or obj.get("createdAt") or obj.get("launch_at") or obj.get("created_at"))
+    imp = obj.get("impact_1k_bps") or obj.get("priceImpact1kBps")
     try:
-        liq_usd = float(
-            src.get("liq_usd")
-            or (src.get("liquidity") or {}).get("usd")
-            or (src.get("liquidityUsd"))
-            or 0.0
-        )
+        imp = float(imp) if imp is not None else None
     except Exception:
-        liq_usd = 0.0
-
-    # age in minutes if a timestamp exists
-    for ts_key in ("createdAt", "launchedAt", "listedAt", "created_at", "launchTs", "timestamp"):
-        ts = src.get(ts_key)
-        try:
-            if isinstance(ts, (int, float)) and ts > 1_000_000_000:
-                pool_age_min = max(0, int((_now_s() - int(ts)) / 60))
-                break
-        except Exception:
-            pass
-
-    # sometimes price impact is provided; otherwise we leave None
-    for k in ("impact_1k_bps", "priceImpact1kBps", "impact_bps"):
-        v = src.get(k)
-        try:
-            impact_1k_bps = float(v) if v is not None else impact_1k_bps
-        except Exception:
-            pass
-
+        imp = None
     return {
-        "mint": mint,
-        "symbol": str(symbol) if symbol is not None else mint[:6],
-        "liq_usd": float(liq_usd),
-        "pool_age_min": pool_age_min,
-        "impact_1k_bps": impact_1k_bps,
         "source": "pumpfun",
+        "mint": mint,
+        "symbol": sym or mint[:6],
+        "liq_usd": liq,
+        "pool_age_min": age,
+        "impact_1k_bps": imp,
     }
 
-def _dedupe_keep_latest(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for x in items:
-        m = x.get("mint")
-        if not m:
-            continue
-        # prefer newer/younger pools if we have an age
-        if m not in out:
-            out[m] = x
-        else:
-            a = out[m].get("pool_age_min")
-            b = x.get("pool_age_min")
-            if a is None and b is not None:
-                out[m] = x
-            elif a is not None and b is not None and b < a:
-                out[m] = x
-    return list(out.values())
+async def _ensure_session(session: Optional[aiohttp.ClientSession]) -> aiohttp.ClientSession:
+    if session and not session.closed:
+        return session
+    if aiohttp is None:
+        raise RuntimeError("aiohttp not available")
+    sslctx = ssl.create_default_context(cafile=certifi.where())
+    return aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=sslctx))
 
-# --- HTML fallback ------------------------------------------------------------
-_NEXT_DATA_RE = re.compile(
-    r'<script[^>]+id="__NEXT_DATA__"[^>]*>(?P<json>{.*?})</script>',
-    re.DOTALL | re.IGNORECASE,
-)
+async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Optional[Any]:
+    try:
+        async with session.get(url, headers=_headers(True), timeout=TIMEOUT) as r:
+            if r.status == 200:
+                return await r.json(content_type=None)
+            txt = await r.text()
+            log.warning("Pump.fun [%s] HTTP %s observed; first 120 chars: %s", url, r.status, txt[:120].replace("\\n"," "))
+            return None
+    except Exception as e:
+        log.warning("Pump.fun JSON fetch error (%s): %s", url, e)
+        return None
+
+async def _fetch_html(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    try:
+        async with session.get(url, headers=_headers(False), timeout=TIMEOUT) as r:
+            txt = await r.text()
+            if r.status != 200:
+                log.warning("Pump.fun HTML [%s] HTTP %s observed; first 120 chars: %s", url, r.status, txt[:120].replace("\\n"," "))
+            return txt
+    except Exception as e:
+        log.warning("Pump.fun HTML fetch error (%s): %s", url, e)
+        return None
 
 def _extract_next_data(html: str) -> Optional[Dict[str, Any]]:
-    m = _NEXT_DATA_RE.search(html or "")
-    if not m:
+    if not html:
         return None
-    try:
-        return json.loads(m.group("json"))
-    except Exception:
-        return None
-
-def _walk_for_mints(node: Any, found: List[Dict[str, Any]]) -> None:
-    if isinstance(node, dict):
-        # treat dicts that look like tokens
-        if any(k in node for k in ("mint", "mintAddress", "tokenAddress", "address")):
-            norm = _norm_candidate(node)
-            if norm:
-                found.append(norm)
-        for v in node.values():
-            _walk_for_mints(v, found)
-    elif isinstance(node, list):
-        for v in node:
-            _walk_for_mints(v, found)
-
-# --- main scanner -------------------------------------------------------------
-async def scan_pumpfun(redis, session=None) -> List[Dict[str, Any]]:
-    """
-    Return a list of candidate dicts from Pump.fun.
-    Signature: (redis, session=None)  ← works with sniper._maybe_call_scanner
-    Falls back gracefully if API is blocked by Cloudflare.
-    """
-    s = session or cu.session
-    if s is None or getattr(s, "closed", False):
-        LOG.warning("Pump.fun scanner: no HTTP session available")
-        return []
-
-    hdrs = _headers()
-    urls: List[str] = [
-        # Try a few candidates; at least one usually works depending on CF rules.
-        # These may change; the HTML fallback below keeps us alive.
-        "https://pump.fun/api/trending?sort=buys_5m&limit=50",
-        "https://pump.fun/api/trending?sort=volume_5m&limit=50",
-        "https://pump.fun/api/trending?sort=recent&limit=50",
-    ]
-
-    # 1) Try JSON endpoints first
-    for url in urls:
+    # Next.js usually exposes a script tag with id="__NEXT_DATA__"
+    m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, flags=re.S|re.I)
+    if m:
         try:
-            async with s.get(url, headers=hdrs, timeout=8) as r:
-                ct = r.headers.get("content-type", "")
-                txt = await r.text()
-                if r.status != 200:
-                    LOG.warning("Pump.fun [%s] HTTP %s observed; first 120 chars: %s",
-                                url.split("?")[0], r.status, txt[:120].replace("\n", " "))
-                    continue
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    # Some setups set window.__NEXT_DATA__ =
+    m2 = re.search(r'__NEXT_DATA__\\s*=\\s*({.*?})\\s*;</script>', html, flags=re.S)
+    if m2:
+        try:
+            return json.loads(m2.group(1))
+        except Exception:
+            pass
+    return None
 
-                if "application/json" in ct or txt.strip().startswith("{") or txt.strip().startswith("["):
-                    try:
-                        data = json.loads(txt)
-                    except Exception:
-                        LOG.warning("Pump.fun: JSON parse failed on %s", url)
-                        continue
-
-                    pairs = []
-                    # common shapes: {"data":[ {...}, {...} ]} or {"pairs":[...]} or just list
-                    if isinstance(data, dict):
-                        for key in ("data", "pairs", "items", "coins"):
-                            if isinstance(data.get(key), list):
-                                pairs = data[key]
-                                break
-                    elif isinstance(data, list):
-                        pairs = data
-
-                    out: List[Dict[str, Any]] = []
-                    for raw in pairs:
-                        norm = _norm_candidate(raw) if isinstance(raw, dict) else None
-                        if norm:
-                            out.append(norm)
-
-                    if out:
-                        LOG.info("scanner.pumpfun: %d candidates from JSON", len(out))
-                        return _dedupe_keep_latest(out)
-                else:
-                    LOG.warning("Pump.fun: %s returned non-JSON (ct=%s).", url, ct)
-        except Exception as e:
-            LOG.warning("Pump.fun request error on %s: %s", url, e)
-
-    # 2) Fallback: fetch HTML and parse __NEXT_DATA__
+def _walk_collect_mints(obj: Any, acc: List[Dict[str, Any]]) -> None:
     try:
-        async with s.get("https://pump.fun/", headers=hdrs, timeout=8) as r:
-            html = await r.text()
-            if r.status != 200:
-                LOG.warning("Pump.fun HTML fallback HTTP %s", r.status)
-                return []
-            blob = _extract_next_data(html)
-            if not blob:
-                LOG.warning("Pump.fun HTML fallback: __NEXT_DATA__ not found.")
-                return []
+        if isinstance(obj, dict):
+            if ("mint" in obj) or ("mintAddress" in obj) or ("mint_address" in obj):
+                mapped = _map_coin(obj)
+                if mapped:
+                    acc.append(mapped)
+            for v in obj.values():
+                _walk_collect_mints(v, acc)
+        elif isinstance(obj, list):
+            for v in obj:
+                _walk_collect_mints(v, acc)
+    except Exception:
+        pass
 
-            found: List[Dict[str, Any]] = []
-            _walk_for_mints(blob, found)
-            out = _dedupe_keep_latest(found)
-            if out:
-                LOG.info("scanner.pumpfun: %d candidates from HTML fallback", len(out))
-            else:
-                LOG.warning("Pump.fun HTML fallback produced 0 candidates.")
-            return out
-    except Exception as e:
-        LOG.warning("Pump.fun HTML fallback error: %s", e)
+async def _from_json_endpoints(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for url in JSON_ENDPOINTS:
+        data = await _fetch_json(session, url)
+        if not data:
+            continue
+        # Accept { "coins": [...] } OR list
+        coins = []
+        if isinstance(data, dict):
+            for key in ("coins", "data", "items", "result"):
+                if key in data and isinstance(data[key], list):
+                    coins = data[key]
+                    break
+        elif isinstance(data, list):
+            coins = data
+        # Map
+        for c in coins:
+            if not isinstance(c, dict):
+                continue
+            m = _map_coin(c)
+            if m:
+                out.append(m)
+        if out:
+            break  # first successful endpoint is enough
+    return out[:MAX_ITEMS]
+
+async def _from_html_fallback(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+    for url in HTML_PAGES:
+        html = await _fetch_html(session, url)
+        if not html:
+            continue
+        data = _extract_next_data(html)
+        if not data:
+            log.warning("Pump.fun HTML fallback: __NEXT_DATA__ not found.")
+            continue
+        acc: List[Dict[str, Any]] = []
+        _walk_collect_mints(data, acc)
+        if acc:
+            return acc[:MAX_ITEMS]
+    return []
+
+async def scan_pumpfun(*args) -> List[Dict[str, Any]]:
+    """
+    Returns a list of candidate dicts.
+    Tolerant signature:
+      - scan_pumpfun(redis, session)
+      - scan_pumpfun(redis)
+      - scan_pumpfun()
+    """
+    # args unpack
+    session_arg = None
+    if len(args) >= 2:
+        session_arg = args[1]
+
+    # Prefer shared session from core_utils if available
+    session = session_arg or get_session()
+    if aiohttp is None or session is None:
+        log.warning("Pump.fun scanner: no HTTP session available")
         return []
+
+    # Try JSON endpoints first
+    try:
+        items = await _from_json_endpoints(session)
+        if items:
+            log.info("Pump.fun: %d candidates from JSON API", len(items))
+            return items
+    except Exception as e:
+        log.warning("Pump.fun JSON stage error: %s", e)
+
+    # HTML fallback
+    try:
+        items = await _from_html_fallback(session)
+        if items:
+            log.info("Pump.fun: %d candidates from HTML fallback", len(items))
+            return items
+    except Exception as e:
+        log.warning("Pump.fun HTML stage error: %s", e)
+
+    return []
+''')
+
+out_path = Path('/mnt/data/pumpfun_scanner.py')
+out_path.write_text(code, encoding='utf-8')
+out_path, out_path.stat().st_size
