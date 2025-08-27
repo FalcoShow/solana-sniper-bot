@@ -1,70 +1,75 @@
-
 # scanner/pumpfun_scanner.py
+# Cloudflare sometimes blocks direct API calls. We fail soft (return [])
+# and optionally source from Dexscreener as a proxy for Pump.fun activity.
 from __future__ import annotations
-import logging
-from typing import Any, Dict, List, Optional
+import os, logging
+from typing import List, Dict, Any
 
-try:
-    from utils_pkg.core_utils import get_session
-except Exception:
-    get_session = lambda: None  # type: ignore
+logger = logging.getLogger("scanner.pumpfun")
 
-log = logging.getLogger("scanner.pumpfun")
+UA = os.getenv("SCANNER_UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SniperBot/1.0 (+https://github.com/FalcoShow/solana-sniper-bot)")
+ENABLE_FALLBACK = os.getenv("PUMPFUN_USE_DEXSCREENER_FALLBACK", "true").lower() == "true"
+LIMIT = int(os.getenv("PUMPFUN_LIMIT", "30"))
+MIN_LIQ_USD = float(os.getenv("PUMPFUN_MIN_LIQ_USD", "5000"))
 
-HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": "sniper/1.0 (+github.com)",
-}
-
-def _norm_coin(c: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+async def _fallback_from_dexscreener(session) -> List[Dict[str, Any]]:
+    url = "https://api.dexscreener.com/latest/dex/search"
+    params = {"q": "pump"}
+    headers = {"User-Agent": UA, "Accept": "application/json"}
     try:
-        mint = c.get("mint") or c.get("address") or c.get("tokenAddress")
-        if not mint:
-            return None
-        sym = c.get("symbol") or c.get("ticker") or mint[:6]
-        liq = float(c.get("liquidity_usd") or c.get("liquidityUsd") or c.get("usdLiquidity") or 0.0)
-        vol24 = float(c.get("volumeUsd24h") or c.get("volume_usd_24h") or 0.0)
-        age_min = c.get("ageMin") or c.get("pool_age_min")
-        return {
-            "mint": mint,
-            "symbol": sym,
-            "liq_usd": liq,
-            "volumeUsd24h": vol24,
-            "pool_age_min": age_min,
-            "source": "pump.fun",
-        }
-    except Exception:
-        return None
-
-async def scan_pumpfun(*_args, **_kwargs) -> List[Dict[str, Any]]:
-    session = get_session()
-    if session is None:
-        log.warning("No shared session; pump.fun scan skipped")
+        async with session.get(url, params=params, headers=headers, timeout=8) as r:
+            if r.status != 200:
+                txt = await r.text()
+                logger.warning("Pump.fun fallback via Dexscreener failed: %s", r.status)
+                return []
+            data = await r.json()
+            pairs = data.get("pairs") or []
+    except Exception as e:
+        logger.warning("Pump.fun fallback error: %s", e)
         return []
 
-    # Unofficial public endpoints change often; try a few known ones.
-    urls = [
-        "https://frontend-api.pump.fun/coins/latest?limit=50",
-        "https://frontend-api.pump.fun/coins/trending?limit=50",
-    ]
     out: List[Dict[str, Any]] = []
-    for url in urls:
+    for p in pairs:
         try:
-            async with session.get(url, headers=HEADERS, timeout=8) as resp:
-                if resp.status != 200:
-                    txt = await resp.text()
-                    log.warning("[Pump.fun] HTTP %s: %s", resp.status, (txt[:120] + "...") if txt else "")
-                    continue
-                data = await resp.json()
-                # Payloads vary; handle list or {items: []}
-                items = data if isinstance(data, list) else data.get("items") or data.get("coins") or []
-                for it in items:
-                    c = _norm_coin(it)
-                    if c:
-                        out.append(c)
-            if out:
-                break  # one good endpoint is enough
-        except Exception as e:
-            log.warning("pump.fun request error: %s", e)
+            if p.get("chainId") != "solana":
+                continue
+            liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
+            if liq < MIN_LIQ_USD:
+                continue
+            base = p.get("baseToken") or {}
+            mint = base.get("address") or ""
+            if not mint:
+                continue
+            symbol = base.get("symbol") or mint[:6]
+            price_usd = float(p.get("priceUsd") or 0.0)
+            out.append({
+                "mint": mint,
+                "symbol": symbol,
+                "liq_usd": liq,
+                "price_usd": price_usd,
+                "source": "pumpfun(dex-fallback)",
+            })
+        except Exception:
             continue
-    return out
+    out.sort(key=lambda x: x.get("liq_usd", 0), reverse=True)
+    return out[:LIMIT]
+
+async def scan_pumpfun(*args):
+    # Grab shared session
+    session = None
+    if len(args) >= 2:
+        session = args[1]
+    else:
+        from utils_pkg.core_utils import session as core_session
+        session = core_session
+
+    if session is None:
+        logger.warning("Pump.fun scanner: no HTTP session available")
+        return []
+
+    # (If you later have an official Pump.fun JSON endpoint, call it here.)
+    # For now we use Dexscreener fallback to avoid HTTP 530 Cloudflare blocks.
+    if ENABLE_FALLBACK:
+        logger.warning("Pump.fun HTTP 530 observed or API not configured; using Dexscreener fallback.")
+        return await _fallback_from_dexscreener(session)
+    return []
