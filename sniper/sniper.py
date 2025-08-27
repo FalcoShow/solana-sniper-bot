@@ -6,6 +6,19 @@ import os, asyncio, logging, random
 from typing import Dict, Any, List, Callable, Optional
 from datetime import datetime, timezone
 
+# --- force logging level from env ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+root = logging.getLogger()
+root.setLevel(LOG_LEVEL)
+if not root.handlers:  # when nothing configured yet
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root.addHandler(h)
+# ensure our modules respect it
+for _n in ("sniper", "scanner.dexscreener", "scanner.pumpfun", "scanner.raydium",
+           "core_utils", "self_learning_ai"):
+    logging.getLogger(_n).setLevel(root.level)
+
 # ---- Core utils (with soft fallbacks) ----
 try:
     from utils_pkg.core_utils import (
