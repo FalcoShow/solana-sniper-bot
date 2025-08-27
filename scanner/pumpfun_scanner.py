@@ -1,245 +1,70 @@
-# pumpfun_scanner.py
-import aiohttp
+
+# scanner/pumpfun_scanner.py
+from __future__ import annotations
 import logging
-import json
-import time
-from pathlib import Path
-from typing import AsyncGenerator, Dict, Optional, Set
+from typing import Any, Dict, List, Optional
 
-import redis.asyncio as aioredis
+try:
+    from utils_pkg.core_utils import get_session
+except Exception:
+    get_session = lambda: None  # type: ignore
 
-from config import (
-    PUMPFUN_API_URL,
-    SCANNER_MIN_LIQ_USD,
-    SCANNER_MIN_FDV_USD,
-    SCANNER_MIN_FRAUD_SCORE,
-    SCANNER_ALERTS_ENABLED,
-)
-from utils import (
-    check_rug_pull_risk,   # honeypot/rug risk boolean (or high-level check)
-    fraud_score_ai,        # returns numeric score 0..100
-    is_whale_wallet,       # returns True if whales present around mint
-    send_telegram,         # async telegram sender
-    track_profit_notion,   # we reuse to log “discovery” rows (profit=0 at discovery)
-)
+log = logging.getLogger("scanner.pumpfun")
 
-logger = logging.getLogger("scanner.pumpfun")
+HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "sniper/1.0 (+github.com)",
+}
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
-SNIPED_MINTS_FILE = DATA_DIR / "sniped_mints_pumpfun.json"
-REDIS_SET_KEY = "scanner:pumpfun:seen"
-
-
-# ---------- Local file cache helpers ----------
-def _load_file_cache() -> Set[str]:
+def _norm_coin(c: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
-        if SNIPED_MINTS_FILE.exists():
-            return set(json.loads(SNIPED_MINTS_FILE.read_text()))
-    except Exception as e:
-        logger.warning(f"[Pump.fun] file cache read failed: {e}")
-    return set()
-
-
-def _save_file_cache(cache: Set[str]) -> None:
-    try:
-        SNIPED_MINTS_FILE.write_text(json.dumps(sorted(cache)))
-    except Exception as e:
-        logger.warning(f"[Pump.fun] file cache write failed: {e}")
-
-
-# ---------- Small parsing helpers ----------
-def _read_float(src: dict, *keys: str, default: Optional[float] = None) -> Optional[float]:
-    for k in keys:
-        v = src.get(k)
-        if v is None:
-            continue
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            continue
-    return default
-
-
-def _pool_age_min_from(item: dict) -> float:
-    """
-    Pump.fun payloads often include 'createdAt' or a nested 'bondingCurve.startTime'.
-    Normalize to minutes since creation.
-    """
-    created = item.get("createdAt") or item.get("created_at")
-    if not created:
-        bc = item.get("bondingCurve") or {}
-        created = bc.get("startTime") or bc.get("createdAt")
-    try:
-        if created:
-            ts = float(created)
-            # handle ms vs s
-            if ts > 10_000_000_000:
-                ts = ts / 1000.0
-            return max(0.0, (time.time() - ts) / 60.0)
+        mint = c.get("mint") or c.get("address") or c.get("tokenAddress")
+        if not mint:
+            return None
+        sym = c.get("symbol") or c.get("ticker") or mint[:6]
+        liq = float(c.get("liquidity_usd") or c.get("liquidityUsd") or c.get("usdLiquidity") or 0.0)
+        vol24 = float(c.get("volumeUsd24h") or c.get("volume_usd_24h") or 0.0)
+        age_min = c.get("ageMin") or c.get("pool_age_min")
+        return {
+            "mint": mint,
+            "symbol": sym,
+            "liq_usd": liq,
+            "volumeUsd24h": vol24,
+            "pool_age_min": age_min,
+            "source": "pump.fun",
+        }
     except Exception:
-        pass
-    return 0.0
+        return None
 
+async def scan_pumpfun(*_args, **_kwargs) -> List[Dict[str, Any]]:
+    session = get_session()
+    if session is None:
+        log.warning("No shared session; pump.fun scan skipped")
+        return []
 
-# ---------- Main scanner (async generator) ----------
-async def scan_pumpfun(
-    redis: aioredis.Redis,
-) -> AsyncGenerator[Dict, None]:
-    """
-    Scan Pump.fun listings and yield vetted token dicts that downstream can buy.
-    Yields dict with fields: {"source","mint","symbol","price","liquidity_usd","fdv_usd","pool_age_min"}.
-    - Uses Redis + local file cache to skip duplicates
-    - Filters by liquidity, FDV, fraud/whale/honeypot checks
-    - Sends Telegram + Notion logs for visibility
-    """
-    local_cache = _load_file_cache()
-
-    # --- fetch Pump.fun feed ---
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(PUMPFUN_API_URL, timeout=15) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    logger.warning(f"[Pump.fun] HTTP {resp.status}: {text[:200]}")
-                    return
-                payload = await resp.json()
-    except Exception as e:
-        logger.error(f"[Pump.fun] fetch error: {e}")
-        return
-
-    tokens = (
-        payload.get("tokens") if isinstance(payload, dict)
-        else (payload if isinstance(payload, list) else [])
-    )
-    if not isinstance(tokens, list):
-        logger.warning("[Pump.fun] unexpected JSON format")
-        return
-
-    # --- iterate tokens ---
-    for item in tokens:
+    # Unofficial public endpoints change often; try a few known ones.
+    urls = [
+        "https://frontend-api.pump.fun/coins/latest?limit=50",
+        "https://frontend-api.pump.fun/coins/trending?limit=50",
+    ]
+    out: List[Dict[str, Any]] = []
+    for url in urls:
         try:
-            mint = item.get("mint") or item.get("address")
-            symbol = item.get("symbol") or item.get("name") or "UNKNOWN"
-
-            # Normalize price/liquidity/fdv regardless of field naming
-            price_usd = _read_float(item, "priceUsd", "price_usd", "usdPrice", "price")
-            fdv_usd   = _read_float(item, "fdv", "marketCap", "fdvUsd", default=0.0) or 0.0
-
-            liq_usd = 0.0
-            liq_obj = item.get("liquidity") or {}
-            if isinstance(liq_obj, dict):
-                liq_usd = _read_float(liq_obj, "usd", "USD", "usdValue", default=0.0) or 0.0
-            else:
-                liq_usd = _read_float(item, "liquidityUsd", "liquidity_usd", default=0.0) or 0.0
-
-            pool_age_min = _pool_age_min_from(item)
-
-            if not mint or not price_usd or price_usd <= 0:
-                continue
-
-            # --- dedupe (Redis + local file) ---
-            try:
-                if mint in local_cache:
+            async with session.get(url, headers=HEADERS, timeout=8) as resp:
+                if resp.status != 200:
+                    txt = await resp.text()
+                    log.warning("[Pump.fun] HTTP %s: %s", resp.status, (txt[:120] + "...") if txt else "")
                     continue
-                if await redis.sismember(REDIS_SET_KEY, mint):
-                    continue
-            except Exception as e:
-                logger.debug(f"[Pump.fun] redis check failed: {e}")
-
-            # --- Stage 0: Market filters ---
-            if liq_usd < SCANNER_MIN_LIQ_USD or fdv_usd < SCANNER_MIN_FDV_USD:
-                logger.debug(
-                    f"[Pump.fun] reject {symbol} low liq/fdv: "
-                    f"liq=${liq_usd:.0f}, fdv=${fdv_usd:,.0f}"
-                )
-                # mark seen to avoid retesting junk in tight loops
-                try:
-                    await redis.sadd(REDIS_SET_KEY, mint)
-                    await redis.expire(REDIS_SET_KEY, 3 * 24 * 3600)
-                except Exception:
-                    pass
-                local_cache.add(mint)
-                _save_file_cache(local_cache)
-                continue
-
-            # --- Risk checks ---
-            if not await check_rug_pull_risk(mint):
-                logger.info(f"[Pump.fun] {symbol} honeypot/rug check failed")
-                # mark seen
-                try:
-                    await redis.sadd(REDIS_SET_KEY, mint)
-                    await redis.expire(REDIS_SET_KEY, 3 * 24 * 3600)
-                except Exception:
-                    pass
-                local_cache.add(mint)
-                _save_file_cache(local_cache)
-                continue
-
-            score = await fraud_score_ai(mint)
-            if score < SCANNER_MIN_FRAUD_SCORE:
-                logger.info(f"[Pump.fun] {symbol} fraud score {score:.2f} < {SCANNER_MIN_FRAUD_SCORE}")
-                # mark seen
-                try:
-                    await redis.sadd(REDIS_SET_KEY, mint)
-                    await redis.expire(REDIS_SET_KEY, 3 * 24 * 3600)
-                except Exception:
-                    pass
-                local_cache.add(mint)
-                _save_file_cache(local_cache)
-                continue
-
-            if not await is_whale_wallet(mint):
-                logger.info(f"[Pump.fun] {symbol} whale filter failed")
-                # mark seen
-                try:
-                    await redis.sadd(REDIS_SET_KEY, mint)
-                    await redis.expire(REDIS_SET_KEY, 3 * 24 * 3600)
-                except Exception:
-                    pass
-                local_cache.add(mint)
-                _save_file_cache(local_cache)
-                continue
-
-            # --- Passed all filters ---
-            candidate = {
-                "source": "pumpfun",
-                "mint": mint,
-                "symbol": symbol,
-                "price": float(price_usd),       # keep key 'price' to match core/sniper expectations
-                "liquidity_usd": float(liq_usd),
-                "fdv_usd": float(fdv_usd),
-                "pool_age_min": float(pool_age_min),
-                "fraud_score": float(score),
-            }
-
-            if SCANNER_ALERTS_ENABLED:
-                url = f"https://pump.fun/{mint}"
-                msg = (
-                    "🟢 <b>Pump.fun candidate</b>\n"
-                    f"<b>{symbol}</b> ({mint})\n"
-                    f"Price ${price_usd:.6f} | FDV ${fdv_usd:,.0f} | Liq ${liq_usd:,.0f}\n"
-                    f"Fraud Score: {score:.1f}\n{url}"
-                )
-                await send_telegram(msg)
-                # Log discovery into Notion (profit=0 at discover time)
-                try:
-                    await track_profit_notion(mint, 0.0)
-                except Exception:
-                    pass
-
-            # Cache “seen”
-            try:
-                await redis.sadd(REDIS_SET_KEY, mint)
-                await redis.expire(REDIS_SET_KEY, 3 * 24 * 3600)
-            except Exception:
-                pass
-            local_cache.add(mint)
-            _save_file_cache(local_cache)
-
-            logger.info(f"✅ [Pump.fun] yield {symbol} at ${price_usd:.6f}")
-            yield candidate
-
+                data = await resp.json()
+                # Payloads vary; handle list or {items: []}
+                items = data if isinstance(data, list) else data.get("items") or data.get("coins") or []
+                for it in items:
+                    c = _norm_coin(it)
+                    if c:
+                        out.append(c)
+            if out:
+                break  # one good endpoint is enough
         except Exception as e:
-            logger.error(f"[Pump.fun] item error: {e}")
+            log.warning("pump.fun request error: %s", e)
             continue
+    return out

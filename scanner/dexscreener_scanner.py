@@ -1,112 +1,113 @@
-import aiohttp
-import logging
-import json
-from config import DEXSCREENER_API_URL
-from utils import (
-    check_rug_pull_risk,
-    fraud_score_ai,
-    is_whale_wallet,
-    send_telegram,
-    track_profit_notion,
-    redis_cache_token,
-)
 
-logger = logging.getLogger("scanner.dexscreener")
+# scanner/dexscreener_scanner.py
+from __future__ import annotations
+import asyncio, logging, os, time
+from typing import Any, Dict, List, Optional
 
-SNIPED_MINTS_FILE = "data/sniped_mints_dexscreener.json"
-REDIS_CACHE_KEY = "dexscreener:sniped"
+try:
+    # Prefer shared session for connection pooling
+    from utils_pkg.core_utils import get_session
+except Exception:
+    get_session = lambda: None  # type: ignore
 
-# Load local file cache
-async def load_local_cache():
+log = logging.getLogger("scanner.dexscreener")
+
+HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "sniper/1.0 (+github.com)",
+}
+
+# Normalize a single pair to our candidate shape
+def _norm_pair(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
-        with open(SNIPED_MINTS_FILE, "r") as f:
-            return set(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return set()
+        base = (p.get("baseToken") or {}) if isinstance(p.get("baseToken"), dict) else {}
+        mint = base.get("address") or p.get("baseTokenAddress") or p.get("baseMint")
+        if not mint:
+            return None
+        sym  = base.get("symbol") or p.get("baseTokenSymbol") or (mint[:6])
+        liq_usd = float(((p.get("liquidity") or {}).get("usd") if isinstance(p.get("liquidity"), dict) else p.get("liquidityUsd")) or 0.0)
+        price_usd = float(p.get("priceUsd") or 0.0)
+        vol24 = float(((p.get("volume") or {}).get("h24") if isinstance(p.get("volume"), dict) else p.get("volumeUsd24h")) or 0.0)
+        tx5 = p.get("txns", {}).get("m5", {}) if isinstance(p.get("txns"), dict) else {}
+        buys5 = int(tx5.get("buys", 0) or 0)
+        sells5 = int(tx5.get("sells", 0) or 0)
+        age_min = None
+        if p.get("pairCreatedAt"):
+            try:
+                age_min = max(1, int((time.time()*1000 - int(p["pairCreatedAt"])) / 60000))
+            except Exception:
+                age_min = None
+        impact = float(p.get("priceImpact1kBps") or p.get("impact1kBps") or 0.0)
+        return {
+            "mint": mint,
+            "symbol": sym,
+            "liq_usd": liq_usd,
+            "price_usd": price_usd,
+            "volumeUsd24h": vol24,
+            "buys5m": buys5,
+            "sells5m": sells5,
+            "pool_age_min": age_min,
+            "impact_1k_bps": impact,
+            "source": "dexscreener",
+        }
+    except Exception:
+        return None
 
-# Save new token to local cache
-async def save_to_file_cache(token_mint):
+async def _fetch_json(session, url: str) -> Optional[Dict[str, Any]]:
     try:
-        current = await load_local_cache()
-        current.add(token_mint)
-        with open(SNIPED_MINTS_FILE, "w") as f:
-            json.dump(list(current), f)
+        async with session.get(url, headers=HEADERS, timeout=8) as resp:
+            if resp.status != 200:
+                txt = await resp.text()
+                log.warning("Dexscreener API failed with status %s", resp.status)
+                return None
+            return await resp.json()
     except Exception as e:
-        logger.error(f"Failed to save {token_mint} to local cache: {e}")
+        log.warning("Dexscreener request error: %s", e)
+        return None
 
-# Async generator scanning Dexscreener tokens
-async def scan_dexscreener(redis):
-    logger.info("🔎 Starting Dexscreener scan...")
-    local_cache = await load_local_cache()
+async def scan_dexscreener(*_args, **_kwargs) -> List[Dict[str, Any]]:
+    """Try multiple public endpoints; return a merged list of candidates.
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(DEXSCREENER_API_URL) as resp:
-                if resp.status != 200:
-                    logger.warning(f"Dexscreener API failed with status {resp.status}")
-                    return
-                data = await resp.json()
-    except Exception as e:
-        logger.error(f"Failed to fetch Dexscreener data: {e}")
-        return
+    Signature accepts anything to stay compatible with older callers.
 
-    tokens = data.get("tokens", [])
-    for token in tokens:
-        try:
-            token_mint = token.get("address") or token.get("mint")
-            price = float(token.get("priceUsd", 0))
-            symbol = token.get("symbol", "Unknown")
+    """
+    session = get_session()
+    if session is None:
+        log.warning("No shared session; dexscreener scan skipped")
+        return []
 
-            if not token_mint or price == 0:
+    log.info("🟣 Starting Dexscreener scan...")
+
+    endpoints = [
+        # 1) Trending pairs on Solana
+        "https://api.dexscreener.com/latest/dex/trending?chain=solana",
+        # 2) Broad pairs listing (often heavy; keep as fallback)
+        "https://api.dexscreener.com/latest/dex/pairs/solana",
+    ]
+
+    found: Dict[str, Dict[str, Any]] = {}
+    for url in endpoints:
+        data = await _fetch_json(session, url)
+        if not data:
+            continue
+        pairs: List[Dict[str, Any]] = []
+        if "pairs" in data and isinstance(data["pairs"], list):
+            pairs = data["pairs"]
+        elif "trending" in data and isinstance(data["trending"], list):
+            pairs = data["trending"]
+        for p in pairs:
+            c = _norm_pair(p) or {}
+            mint = c.get("mint")
+            if not mint: 
                 continue
+            if mint not in found:
+                found[mint] = c
+            else:
+                # prefer higher liquidity
+                if float(c.get("liq_usd", 0) or 0) > float(found[mint].get("liq_usd", 0) or 0):
+                    found[mint] = c
 
-            # Skip if already sniped
-            if await redis_cache_token(redis, token_mint, REDIS_CACHE_KEY) or token_mint in local_cache:
-                continue
-
-            logger.info(f"🔍 Checking {symbol} ({token_mint})")
-
-            # === MARKET FILTER ===
-            market_cap = float(token.get("fdv", 0))
-            liquidity = float(token.get("liquidity", {}).get("usd", 0))
-            if market_cap < 10_000 or liquidity < 1_000:
-                logger.info(f"❌ Skipping {symbol} - low market cap or liquidity")
-                continue
-
-            # === RUG & FRAUD DETECTION ===
-            if not await check_rug_pull_risk(token_mint):
-                logger.info(f"❌ Honeypot detected: {symbol}")
-                continue
-
-            score = await fraud_score_ai(token_mint)
-            if score < 60:
-                logger.info(f"❌ Fraud score too low: {score}")
-                continue
-
-            # === WHALE FILTER ===
-            if not await is_whale_wallet(token_mint):
-                logger.info(f"🐋 Skipping {symbol} - no whales found")
-                continue
-
-            # === PASSED ALL FILTERS ===
-            logger.info(f"✅ {symbol} passed all filters, price: ${price:.4f}")
-
-            # Notify
-            dex_link = f"https://dexscreener.com/solana/{token_mint}"
-            msg = f"🟢 **Dexscreener Alert**\nSymbol: {symbol}\nPrice: ${price:.4f}\nFraud Score: {score}\n[View Token]({dex_link})"
-            await send_telegram(msg)
-            await track_profit_notion(token_mint, 0)  # No profit yet, just logging
-
-            # Cache
-            await redis.sadd(REDIS_CACHE_KEY, token_mint)
-            await save_to_file_cache(token_mint)
-
-            # Yield to sniper
-            yield {
-                "mint": token_mint,
-                "symbol": symbol,
-                "price": price
-            }
-
-        except Exception as token_error:
-            logger.error(f"Error processing token: {token_error}")
+    out = list(found.values())
+    # light filter: ensure required fields
+    out = [c for c in out if c.get("mint") and c.get("symbol")]
+    return out
