@@ -15,29 +15,52 @@ logging.basicConfig(level=getattr(logging, _LOG_LEVEL, logging.INFO),
 log = logging.getLogger("sniper")
 
 # ----------------------------- utils imports (with fallbacks) ----------
+# We support BOTH styles:
+#   (A) from utils_pkg.core_utils import session, redis
+#   (B) from utils_pkg.core_utils import get_session, get_redis
+_session_ref = None
+_redis_ref = None
+
+def get_session():
+    return _session_ref
+
+def get_redis():
+    return _redis_ref
+
 try:
+    # Try style (A): direct globals
     from utils_pkg.core_utils import (
         init_resources, close_resources,
-        get_session, get_redis,
+        session as _session_ref, redis as _redis_ref,
         get_sol_balance, get_token_price, swap_token_jupiter,
         save_entry_price, convert_sol_to_usd, send_telegram,
         log_to_notion, log_trade_event,
     )
-except Exception as e:
-    # Best-effort local stubs for dev
-    log.warning("core_utils import failed, using stubs: %s", e)
-    async def init_resources(): pass
-    async def close_resources(): pass
-    def get_session(): return None
-    def get_redis(): return None
-    async def get_sol_balance(_): return 0.0
-    async def get_token_price(_): return 0.0
-    async def swap_token_jupiter(**_): return (False, '')
-    async def save_entry_price(*_a, **_k): pass
-    async def convert_sol_to_usd(x: float): return 0.0
-    async def send_telegram(_): pass
-    async def log_to_notion(*_a, **_k): pass
-    async def log_trade_event(*_a, **_k): pass
+except Exception as e_a:
+    try:
+        # Try style (B): accessors
+        from utils_pkg.core_utils import (
+            init_resources, close_resources,
+            get_session as _get_session, get_redis as _get_redis,
+            get_sol_balance, get_token_price, swap_token_jupiter,
+            save_entry_price, convert_sol_to_usd, send_telegram,
+            log_to_notion, log_trade_event,
+        )
+        _session_ref = _get_session()
+        _redis_ref   = _get_redis()
+    except Exception as e_b:
+        # Best-effort local stubs for dev
+        log.warning("core_utils import failed, using stubs: %s | %s", e_a, e_b)
+        async def init_resources(): pass
+        async def close_resources(): pass
+        async def get_sol_balance(_): return 0.0
+        async def get_token_price(_): return 0.0
+        async def swap_token_jupiter(**_): return (False, '')
+        async def save_entry_price(*_a, **_k): pass
+        async def convert_sol_to_usd(x: float): return 0.0
+        async def send_telegram(_): pass
+        async def log_to_notion(*_a, **_k): pass
+        async def log_trade_event(*_a, **_k): pass
 
 # Risk / spend gating (soft import)
 try:
@@ -554,6 +577,15 @@ class Sniper:
 async def main():
     await init_resources()
     try:
+        # refresh session/redis refs if accessors are available
+        global _session_ref, _redis_ref
+        if _session_ref is None and _redis_ref is None:
+            try:
+                from utils_pkg.core_utils import get_session as _get_session, get_redis as _get_redis
+                _session_ref = _get_session()
+                _redis_ref   = _get_redis()
+            except Exception:
+                pass
         await Sniper().main_loop()
     finally:
         await close_resources()
