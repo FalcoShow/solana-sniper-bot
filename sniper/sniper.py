@@ -630,6 +630,13 @@ async def main():
         await Sniper().main_loop()
     finally:
         await close_resources()
+# after init_resources()
+try:
+    from utils_pkg.pumpfun_cf import refresh_loop as _pf_refresh
+    asyncio.create_task(_pf_refresh(get_redis()))
+    log.info("pumpfun cookie refresher started")
+except Exception as e:
+    log.info("pumpfun cookie refresher not started: %s", e)
 
 if __name__ == "__main__":
     asyncio.run(main())
