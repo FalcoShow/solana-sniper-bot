@@ -20,5 +20,6 @@ ujson==5.10.0
 requests==2.32.4
 urllib3==2.5.0
 SQLAlchemy==2.0
-asyncpg==0.29
-playwright==1.46
+asyncpg==0.29.0
+playwright==1.46.0
+greenlet==3.0.3
