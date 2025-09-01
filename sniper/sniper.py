@@ -1,35 +1,23 @@
-# sniper.py — v6+ hardened
-# - Production-safe: no writes to /mnt/data
-# - Parallel scanners with per-source timeouts + env toggles
-# - Scanner signature tolerant: (redis, session) OR (redis) OR ()
-# - Verbose loop logs: counts, prewarm, filters, buys, skip reasons
-
+# sniper/sniper.py — v6.1 (CF refresher-safe)
 from __future__ import annotations
 
 import os, asyncio, logging, random
-from typing import Dict, Any, List, Callable, Optional, Tuple
+from typing import Dict, Any, List, Callable, Optional
 from datetime import datetime, timezone
 
-# ----------------------------- logging ---------------------------------
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, _LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s:%(name)s: %(message)s"
-)
+logging.basicConfig(level=getattr(logging, _LOG_LEVEL, logging.INFO),
+                    format="%(asctime)s %(levelname)s:%(name)s: %(message)s")
 log = logging.getLogger("sniper")
 
-# ----------------------------- utils imports (with fallbacks) ----------
+# ----------------------------- core utils (tolerant) -----------------------------
 _session_ref = None
 _redis_ref = None
 
-def get_session():
-    return _session_ref
-
-def get_redis():
-    return _redis_ref
+def get_session(): return _session_ref
+def get_redis():   return _redis_ref
 
 try:
-    # Mode A: direct globals
     from utils_pkg.core_utils import (
         init_resources, close_resources,
         session as _session_ref, redis as _redis_ref,
@@ -39,7 +27,6 @@ try:
     )
 except Exception as e_a:
     try:
-        # Mode B: accessors
         from utils_pkg.core_utils import (
             init_resources, close_resources,
             get_session as _get_session, get_redis as _get_redis,
@@ -50,7 +37,7 @@ except Exception as e_a:
         _session_ref = _get_session()
         _redis_ref   = _get_redis()
     except Exception as e_b:
-        log.warning("core_utils import fallback; using stubs: %s | %s", e_a, e_b)
+        log.warning("core_utils import failed, using stubs: %s | %s", e_a, e_b)
         async def init_resources(): pass
         async def close_resources(): pass
         async def get_sol_balance(_): return 0.0
@@ -62,7 +49,15 @@ except Exception as e_a:
         async def log_to_notion(*_a, **_k): pass
         async def log_trade_event(*_a, **_k): pass
 
-# Risk / spend gating (soft import)
+# ----------------------------- CF cookie refresher ------------------------------
+# IMPORTANT: call with NO arguments.
+try:
+    from utils_pkg.pumpfun_cf import ensure_cookie_refresher, refresh_loop as cf_refresh_loop
+except Exception:
+    ensure_cookie_refresher = None
+    cf_refresh_loop = None
+
+# ----------------------------- risk/locks/ai/route (soft) ----------------------
 try:
     from risk_manager import current_limits, should_allow_new_entry, note_spend
 except Exception as e:
@@ -71,21 +66,18 @@ except Exception as e:
     async def should_allow_new_entry(_): return True
     async def note_spend(*_a, **_k): pass
 
-# Shadow mode (soft)
 try:
     from shadow_utils import shadow_take, shadow_log
 except Exception:
     def shadow_take(_): return False
     async def shadow_log(*_a, **_k): pass
 
-# Entry lock (soft)
 try:
     from entry_gate import try_acquire, release
 except Exception:
     async def try_acquire(_): return True
     async def release(_): pass
 
-# Jupiter helpers (soft)
 try:
     from jup_quote_cache import prewarm_quotes
 except Exception:
@@ -99,7 +91,6 @@ except Exception:
     async def posttrade_watchdog(_mint, _sol_to_spend, _slip_bps, pre_meta):
         return True, "ok", {"hops": pre_meta.get("hops", 1), "out_amount": pre_meta.get("out_amount", 0)}
 
-# Optional AI and honeypot (soft)
 try:
     from utils_pkg.ai_buy_scoring import Candidate, pass_gate
 except Exception:
@@ -116,7 +107,7 @@ try:
 except Exception:
     async def honeypot_check(_m): return (True, {})
 
-# ----------------------------- scanners (flat first, then package) -----
+# ----------------------------- scanners ----------------------------------------
 scan_dexscreener = scan_pumpfun = scan_raydium = None
 
 try:
@@ -145,25 +136,19 @@ if scan_dexscreener is None or scan_pumpfun is None or scan_raydium is None:
     except Exception as e:
         log.warning("scanner package import failed: %s", e)
 
-# ----------------------------- env/config -------------------------------
+# ----------------------------- env/config --------------------------------------
 SOL_MINT = "So11111111111111111111111111111111111111112"
 WALLET_PUBKEY = os.getenv("WALLET_PUBKEY") or os.getenv("WALLET_PUBLIC_KEY")
 
 PAUSE_TRADING = os.getenv("PAUSE_TRADING", "false").lower() == "true"
 DRY_RUN       = os.getenv("DRY_RUN", "false").lower() == "true"
 
-SCANNER_PERIOD_SEC   = int(os.getenv("SCANNER_PERIOD_SEC", "15"))
-SCAN_TIMEOUT_SEC     = int(os.getenv("SCAN_TIMEOUT_SEC", "12"))  # per-source timeout
-BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", "120"))
-MAX_CONCURRENT_BUYS  = int(os.getenv("MAX_CONCURRENT_BUYS", "2"))
-MIN_SOL_BALANCE      = float(os.getenv("MIN_SOL_BALANCE", "0.2"))
-JUPITER_SLIPPAGE     = float(os.getenv("JUPITER_MAX_SLIPPAGE", "0.005"))
-SLIPPAGE_BPS         = max(1, int(JUPITER_SLIPPAGE * 10000))
-
-# Per-source toggles (helpful while bringing Pump.fun online)
-SCAN_DEXSCREENER_ENABLED = os.getenv("SCAN_DEXSCREENER_ENABLED", "true").lower() == "true"
-SCAN_PUMPFUN_ENABLED     = os.getenv("SCAN_PUMPFUN_ENABLED", "true").lower() == "true"
-SCAN_RAYDIUM_ENABLED     = os.getenv("SCAN_RAYDIUM_ENABLED", "true").lower() == "true"
+SCANNER_PERIOD_SEC  = int(os.getenv("SCANNER_PERIOD_SEC", "15"))
+BUY_COOLDOWN_SEC    = int(os.getenv("BUY_COOLDOWN_SEC", "120"))
+MAX_CONCURRENT_BUYS = int(os.getenv("MAX_CONCURRENT_BUYS", "2"))
+MIN_SOL_BALANCE     = float(os.getenv("MIN_SOL_BALANCE", "0.2"))
+JUPITER_SLIPPAGE    = float(os.getenv("JUPITER_MAX_SLIPPAGE", "0.005"))
+SLIPPAGE_BPS        = max(1, int(JUPITER_SLIPPAGE * 10000))
 
 BLOCKLIST = set(x.strip() for x in os.getenv("BLOCKLIST_MINTS", "").split(",") if x.strip())
 ALLOWLIST = set(x.strip() for x in os.getenv("ALLOWLIST_MINTS", "").split(",") if x.strip())
@@ -173,7 +158,7 @@ HALT_KEYS = ("halt:manual", "halt:infra", "infra:halt", "halt:daily_loss")
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-# ----------------------------- helpers ---------------------------------
+# ----------------------------- helpers ----------------------------------------
 async def _is_halted() -> bool:
     if PAUSE_TRADING:
         return True
@@ -192,19 +177,17 @@ async def _is_halted() -> bool:
 
 async def _cooldown_key(key: str, ttl: int) -> bool:
     r = get_redis()
-    if not r:
-        return False
+    if not r: return False
     try:
         v = await r.get(key)
-        if v:
-            return True
+        if v: return True
         await r.set(key, "1", ex=ttl)
         return False
     except Exception as e:
         log.debug("cooldown set failed: %s", e)
         return False
 
-# Moonshot sleeve (simple daily cap using Redis)
+# ----------------------------- moonshot budget --------------------------------
 MOONSHOT_ENABLED           = os.getenv("MOONSHOT_ENABLED", "true").lower() == "true"
 MOONSHOT_DAILY_USD         = float(os.getenv("MOONSHOT_DAILY_USD", "100"))
 MOONSHOT_MAX_TRADE_USD     = float(os.getenv("MOONSHOT_MAX_TRADE_USD", "25"))
@@ -215,22 +198,16 @@ MOONSHOT_IMPACT_CUTOFF_BPS = float(os.getenv("MOONSHOT_IMPACT_CUTOFF_BPS", "150"
 def _is_moonshot_like(c: Dict[str, Any]) -> bool:
     try:
         age = c.get("pool_age_min") or c.get("poolAgeMin") or c.get("ageMin")
-        if age is not None and float(age) < MOONSHOT_AGE_CUTOFF_MIN:
-            return True
-    except Exception:
-        pass
+        if age is not None and float(age) < MOONSHOT_AGE_CUTOFF_MIN: return True
+    except Exception: pass
     try:
         liq = c.get("liq_usd") or c.get("liquidity_usd") or c.get("liquidityUSD")
-        if liq is not None and float(liq) < MOONSHOT_LIQ_CUTOFF_USD:
-            return True
-    except Exception:
-        pass
+        if liq is not None and float(liq) < MOONSHOT_LIQ_CUTOFF_USD: return True
+    except Exception: pass
     try:
         imp = c.get("impact_1k_bps") or c.get("priceImpact1kBps")
-        if imp is not None and float(imp) > MOONSHOT_IMPACT_CUTOFF_BPS:
-            return True
-    except Exception:
-        pass
+        if imp is not None and float(imp) > MOONSHOT_IMPACT_CUTOFF_BPS: return True
+    except Exception: pass
     return False
 
 def _today_tag() -> str:
@@ -239,26 +216,22 @@ def _today_tag() -> str:
 
 async def _moonshot_spent_today() -> float:
     r = get_redis()
-    if not r:
-        return 0.0
+    if not r: return 0.0
     try:
         v = await r.get(f"moonshot:spent:{_today_tag()}")
         return float(v) if v else 0.0
-    except Exception:
-        return 0.0
+    except Exception: return 0.0
 
 async def _moonshot_add_spent(usd: float) -> None:
     r = get_redis()
-    if not r:
-        return
+    if not r: return
     try:
         k = f"moonshot:spent:{_today_tag()}"
         await r.incrbyfloat(k, float(max(0.0, usd)))
-        await r.expire(k, 26 * 3600)
-    except Exception:
-        pass
+        await r.expire(k, 26*3600)
+    except Exception: pass
 
-async def _apply_moonshot_budget(c: Dict[str, Any], ticket_usd: float) -> Tuple[bool, float, str]:
+async def _apply_moonshot_budget(c: Dict[str, Any], ticket_usd: float):
     if not MOONSHOT_ENABLED or not _is_moonshot_like(c):
         return True, ticket_usd, ""
     note = "moonshot"
@@ -271,76 +244,54 @@ async def _apply_moonshot_budget(c: Dict[str, Any], ticket_usd: float) -> Tuple[
     await _moonshot_add_spent(ticket_usd)
     return True, ticket_usd, note
 
-# scanner compatibility helpers
+# ----------------------------- scanner plumbing -------------------------------
 async def _collect_scan(result) -> List[Dict[str, Any]]:
-    # async iterator
-    if hasattr(result, '__aiter__'):
+    if hasattr(result, "__aiter__"):
         out: List[Dict[str, Any]] = []
         async for item in result:
-            if isinstance(item, dict):
-                out.append(item)
+            if isinstance(item, dict): out.append(item)
         return out
-    # coroutine
     if asyncio.iscoroutine(result):
-        try:
-            return await _collect_scan(await result)
-        except Exception:
-            return []
-    # list
+        try: return await _collect_scan(await result)
+        except Exception: return []
     if isinstance(result, list):
         return [x for x in result if isinstance(x, dict)]
     return []
 
-async def _call_scanner(func: Optional[Callable], name: str) -> List[Dict[str, Any]]:
-    """Try calling with (redis, session) → (redis) → () and enforce timeout."""
+async def _maybe_call_scanner(func: Optional[Callable], name: str) -> List[Dict[str, Any]]:
     if func is None:
         log.debug("scanner.%s not available", name)
         return []
-    async def _attempt() -> List[Dict[str, Any]]:
-        for arity in (2, 1, 0):
-            try:
-                if arity == 2:
-                    items = await _collect_scan(func(get_redis(), get_session()))  # type: ignore[misc]
-                elif arity == 1:
-                    items = await _collect_scan(func(get_redis()))  # type: ignore[misc]
-                else:
-                    items = await _collect_scan(func())  # type: ignore[misc]
-                return items
-            except TypeError:
-                continue
-        log.warning("scanner.%s: no compatible signature", name)
-        return []
-    try:
-        items = await asyncio.wait_for(_attempt(), timeout=SCAN_TIMEOUT_SEC)
-        log.info("scanner.%s: %d candidates", name, len(items))
-        return items
-    except asyncio.TimeoutError:
-        log.warning("scanner.%s timed out after %ss", name, SCAN_TIMEOUT_SEC)
-        return []
-    except Exception as e:
-        log.warning("scanner.%s error: %s", name, e)
-        return []
+    for arity in (2, 1, 0):
+        try:
+            if arity == 2:
+                items = await _collect_scan(func(get_redis(), get_session()))  # type: ignore
+            elif arity == 1:
+                items = await _collect_scan(func(get_redis()))  # type: ignore
+            else:
+                items = await _collect_scan(func())  # type: ignore
+            log.info("scanner.%s: %d candidates", name, len(items))
+            return items
+        except TypeError:
+            continue
+        except Exception as e:
+            log.warning("scanner.%s error: %s", name, e)
+            return []
+    log.warning("scanner.%s: no compatible signature", name)
+    return []
 
 async def _scan_all_sources() -> List[Dict[str, Any]]:
-    tasks: List[Tuple[str, asyncio.Task]] = []
-    if SCAN_DEXSCREENER_ENABLED:
-        tasks.append(("dexscreener", asyncio.create_task(_call_scanner(scan_dexscreener, "dexscreener"))))
-    if SCAN_PUMPFUN_ENABLED:
-        tasks.append(("pumpfun",     asyncio.create_task(_call_scanner(scan_pumpfun, "pumpfun"))))
-    if SCAN_RAYDIUM_ENABLED:
-        tasks.append(("raydium",     asyncio.create_task(_call_scanner(scan_raydium, "raydium"))))
-
+    batches = await asyncio.gather(
+        _maybe_call_scanner(scan_dexscreener, "dexscreener"),
+        _maybe_call_scanner(scan_pumpfun, "pumpfun"),
+        _maybe_call_scanner(scan_raydium, "raydium"),
+        return_exceptions=False,
+    )
     merged: Dict[str, Dict[str, Any]] = {}
-    for name, t in tasks:
-        try:
-            batch = await t
-        except Exception as e:
-            log.warning("scanner.%s task error: %s", name, e)
-            batch = []
+    for batch in batches:
         for c in batch:
             mint = c.get("mint")
-            if not mint:
-                continue
+            if not mint: continue
             if mint not in merged:
                 merged[mint] = dict(c)
             else:
@@ -352,16 +303,15 @@ async def _scan_all_sources() -> List[Dict[str, Any]]:
                     for k, v in c.items():
                         if merged[mint].get(k) in (None, "", 0):
                             merged[mint][k] = v
-
     out = list(merged.values())
     random.shuffle(out)
     log.info("scan: merged %d unique candidates", len(out))
     return out
 
-# gates
+# ----------------------------- filters & buy path ------------------------------
 async def _basic_filters(c: Dict[str, Any]) -> bool:
     mint = c.get("mint")
-    if not mint:
+    if not mint: 
         log.debug("skip: no mint")
         return False
     if BLOCKLIST and mint in BLOCKLIST:
@@ -389,17 +339,10 @@ def _coalesce(src: Dict[str, Any], *keys, default=None):
             return src[k]
     return default
 
-# buy path
 async def _buy_token(mint: str, symbol: str, ticket_usd: float, entry_price_sol_per_token: float) -> bool:
-    if await _is_halted():
-        log.info("buy: halted -> skip %s", mint)
-        return False
-    if await _cooldown_key(f"buycd:{mint}", BUY_COOLDOWN_SEC):
-        log.debug("buy: cooldown -> skip %s", mint)
-        return False
-    if not await try_acquire(mint):
-        log.debug("buy: lock denied -> skip %s", mint)
-        return False
+    if await _is_halted(): return False
+    if await _cooldown_key(f"buycd:{mint}", BUY_COOLDOWN_SEC): return False
+    if not await try_acquire(mint): return False
 
     try:
         if shadow_take("SNIPER"):
@@ -415,26 +358,17 @@ async def _buy_token(mint: str, symbol: str, ticket_usd: float, entry_price_sol_
             return False
 
         usd_per_sol = await convert_sol_to_usd(1.0)
-        if not usd_per_sol or usd_per_sol <= 0:
-            log.debug("buy: usd_per_sol unavailable")
-            return False
+        if not usd_per_sol or usd_per_sol <= 0: return False
         sol_to_spend = ticket_usd / usd_per_sol
-        if sol_to_spend <= 0:
-            log.debug("buy: non-positive SOL spend")
-            return False
+        if sol_to_spend <= 0: return False
 
         ok_rg, why, pre_meta = await precheck_buy(mint, sol_to_spend, SLIPPAGE_BPS)
         if not ok_rg:
             msg = f"⛔ RouteGuard block {symbol} ({mint}) — {why} • hops={pre_meta.get('hops')} • impact_bps={pre_meta.get('impact_bps')}"
-            await send_telegram(msg); log.info(msg)
+            await send_telegram(msg); log.info(msg); 
             return False
 
-        ok, sig = await swap_token_jupiter(
-            input_mint=SOL_MINT,
-            output_mint=mint,
-            amount_float=sol_to_spend,
-            slippage=JUPITER_SLIPPAGE
-        )
+        ok, sig = await swap_token_jupiter(input_mint=SOL_MINT, output_mint=mint, amount_float=sol_to_spend, slippage=JUPITER_SLIPPAGE)
         if not ok:
             log.info("buy: swap failed %s %s", symbol, mint)
             return False
@@ -483,11 +417,10 @@ async def _buy_token(mint: str, symbol: str, ticket_usd: float, entry_price_sol_
             )
         return True
     finally:
-        try:
-            await release(mint)
-        except Exception:
-            pass
+        try: await release(mint)
+        except Exception: pass
 
+# ----------------------------- main loop ---------------------------------------
 class Sniper:
     def __init__(self):
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_BUYS)
@@ -499,9 +432,7 @@ class Sniper:
         usd_per_sol = await convert_sol_to_usd(1.0) or 0.0
         if usd_per_sol <= 0: return
         amount_sol = ticket_usd / usd_per_sol
-        top = sorted([c for c in cands if c.get("mint")],
-                     key=lambda x: float(x.get("liquidity_usd", 0) or 0),
-                     reverse=True)[:8]
+        top = sorted([c for c in cands if c.get("mint")], key=lambda x: float(x.get("liquidity_usd", 0) or 0), reverse=True)[:8]
         mints = [c["mint"] for c in top]
         try:
             await prewarm_quotes(mints, amount_sol, SLIPPAGE_BPS)
@@ -516,10 +447,7 @@ class Sniper:
             return
         if not await _basic_filters(c): return
 
-        mint = c.get("mint")
-        symbol = c.get("symbol") or (mint[:6] if mint else "???")
-
-        # optional AI buy-gate
+        mint = c.get("mint");  symbol = c.get("symbol") or (mint[:6] if mint else "???")
         try:
             pool_age_min = _coalesce(c, "pool_age_min", "poolAgeMin", "ageMin", default=None)
             liq_usd      = float(_coalesce(c, "liq_usd", "liquidity_usd", "liquidityUSD", default=0.0) or 0.0)
@@ -572,8 +500,7 @@ class Sniper:
             await _buy_token(mint, symbol, float(ticket), float(entry))
 
     async def main_loop(self):
-        await send_telegram("🎯 Sniper started (v6+ hardened: timeouts, toggles, prewarm, route_guard, watchdog).")
-        # Optional self-learning loop
+        await send_telegram("🎯 Sniper started (v6.1: CF refresher-safe).")
         try:
             from self_learning_ai_strategy import run_self_learning_loop
             asyncio.create_task(run_self_learning_loop(get_redis()))
@@ -581,10 +508,9 @@ class Sniper:
             log.debug("self_learning loop not started: %s", e)
 
         while not self.stop.is_set():
-            self.iter += 1
             try:
                 if await _is_halted():
-                    log.info("loop[%d]: halted, sleeping %ds", self.iter, SCANNER_PERIOD_SEC)
+                    log.info("loop: halted, sleeping %ds", SCANNER_PERIOD_SEC)
                     await asyncio.sleep(SCANNER_PERIOD_SEC)
                     continue
 
@@ -594,10 +520,10 @@ class Sniper:
                 except Exception:
                     sl_params = {"SLIPPAGE": JUPITER_SLIPPAGE}
 
-                log.info("loop[%d]: scanning...", self.iter)
+                log.info("loop: scanning...")
                 cands = await _scan_all_sources()
                 if not cands:
-                    log.info("loop[%d]: no candidates", self.iter)
+                    log.info("loop: no candidates")
                     await asyncio.sleep(SCANNER_PERIOD_SEC)
                     continue
 
@@ -608,34 +534,34 @@ class Sniper:
                 for c in cands:
                     await self._consider(c, sl_params)
 
-            except asyncio.CancelledError:
-                log.info("loop[%d]: cancelled", self.iter)
-                break
             except Exception as e:
-                log.error("loop[%d] error: %s", self.iter, e, exc_info=True)
+                log.error("loop error: %s", e, exc_info=True)
             await asyncio.sleep(SCANNER_PERIOD_SEC)
 
+# ----------------------------- entrypoint --------------------------------------
 async def main():
     await init_resources()
+    # Make sure CF cookie refresher is running — NO ARGUMENTS
+    try:
+        if ensure_cookie_refresher:
+            ensure_cookie_refresher()
+        elif cf_refresh_loop:
+            asyncio.create_task(cf_refresh_loop())
+        else:
+            log.info("pumpfun CF refresher not available")
+    except Exception as e:
+        log.warning("pumpfun cookie refresher not started: %s", e)
+
     try:
         # refresh session/redis refs if accessors are available
         global _session_ref, _redis_ref
-        if _session_ref is None or _redis_ref is None:
+        if _session_ref is None and _redis_ref is None:
             try:
                 from utils_pkg.core_utils import get_session as _get_session, get_redis as _get_redis
                 _session_ref = _get_session()
                 _redis_ref   = _get_redis()
             except Exception:
                 pass
-
-        # start Pump.fun cookie refresher *inside* the running loop
-        try:
-            from utils_pkg.pumpfun_cf import refresh_loop as _pf_refresh
-            asyncio.create_task(_pf_refresh(get_redis()))
-            log.info("pumpfun cookie refresher started")
-        except Exception as e:
-            log.info("pumpfun cookie refresher not started: %s", e)
-
         await Sniper().main_loop()
     finally:
         await close_resources()
