@@ -502,25 +502,33 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
         return None
 
 
-async def browser_fetch_scan_next_data() -> Optional[dict]:
+async def browser_fetch_scan_next_data(limit: int = 50) -> Optional[List[Dict[str, Any]]]:
     """
-    **DOM fallback**: open the apex Scan page and return its Next.js payload.
-    This avoids the API subdomain entirely and works when that host returns 1016/530.
+    Load the Pump.fun page in a real browser and pull the Next.js __NEXT_DATA__.
+    Works even when the API subdomain is blocked. Returns a list of raw coin dicts.
+    """
+    targets = [
+        os.getenv("PUMPFUN_CF_URL", "https://pump.fun/advanced/scan"),
+        "https://pump.fun/trending",
+    ]
 
-    Returns:
-        dict (Next.js data JSON) or None if not found/parsable.
-    """
+    def _extract_from_next_data(payload: Any) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+        page = payload.get("props", {}).get("pageProps", {})
+        for k in ("trending", "coins", "items", "projects", "data"):
+            v = page.get(k)
+            if isinstance(v, list) and v:
+                return v[:limit]
+        return []
+
     try:
         await _ensure_chromium_available()
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                ],
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-setuid-sandbox",
+                      "--disable-blink-features=AutomationControlled"],
             )
             try:
                 ctx = await browser.new_context(
@@ -533,31 +541,38 @@ async def browser_fetch_scan_next_data() -> Optional[dict]:
                 page = await ctx.new_page()
                 await page.add_init_script(STEALTH_JS)
 
-                # Visit apex Scan page and let CF run
-                await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
-                await page.goto(PUMP_CF_PAGE, wait_until="networkidle", timeout=60_000)
-
-                # 1) Classic Next.js script
-                try:
-                    el = await page.wait_for_selector("script#__NEXT_DATA__", timeout=8_000)
-                    txt = await el.text_content()
-                    if txt:
-                        return json.loads(txt)
-                except Exception:
-                    pass
-
-                # 2) App Router / streaming JSON blocks
-                scripts = await page.locator('script[type="application/json"]').all()
-                for s in scripts:
+                for url in targets:
                     try:
-                        t = await s.text_content()
-                        if not t:
-                            continue
-                        # heuristic: prefer blocks that look like page data
-                        if '"pageProps"' in t or '"trending"' in t or '"coins"' in t:
-                            return json.loads(t)
-                    except Exception:
-                        continue
+                        await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
+                        # Be lenient: don't wait for networkidle; it often never happens with CF
+                        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                        # Wait (best-effort) for the Next.js data to appear
+                        try:
+                            await page.wait_for_selector('script#__NEXT_DATA__', timeout=45_000)
+                        except Exception:
+                            await page.wait_for_timeout(1500)
+
+                        # Prefer reading window.__NEXT_DATA__ directly
+                        payload = await page.evaluate("window.__NEXT_DATA__ || null")
+                        if not payload:
+                            # Fallback: parse the HTML for the script tag
+                            html = await page.content()
+                            import re, json as _json
+                            m = re.search(r'id="__NEXT_DATA__"[^>]*>\s*({.*?})\s*</script>', html, re.S)
+                            if m:
+                                try:
+                                    payload = _json.loads(m.group(1))
+                                except Exception:
+                                    payload = None
+
+                        items = _extract_from_next_data(payload)
+                        if items:
+                            log.info("DOM-scrape: got %d items from %s", len(items), url)
+                            return items
+                        else:
+                            log.warning("DOM-scrape: no items found at %s", url)
+                    except Exception as e:
+                        log.warning("browser_fetch_scan_next_data: %s failed: %s", url, e)
 
                 return None
             finally:
@@ -565,7 +580,6 @@ async def browser_fetch_scan_next_data() -> Optional[dict]:
     except Exception as e:
         log.warning("browser_fetch_scan_next_data failed: %s", e)
         return None
-
 
 # ============================ Exports ================================
 
