@@ -707,6 +707,117 @@ async def browser_fetch_trending_via_next_data(limit: int = 50) -> Optional[List
     log.warning("next-data: no items found on apex JSON for /trending or /advanced/scan")
     return None
 
+# ---- DOM scrape of apex /trending (no API host needed) ----
+async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str, Any]]]:
+    """
+    Navigate to pump.fun/trending (and /advanced/scan as a fallback) and scrape token
+    mints from the DOM. This avoids the frontend-api host entirely.
+
+    Returns: list[{"mint": "...", "symbol": Optional[str]}] or [] if none, or None on hard error.
+    """
+    try:
+        await _ensure_chromium_available()
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-setuid-sandbox",
+                      "--disable-blink-features=AutomationControlled"],
+            )
+            try:
+                ctx = await browser.new_context(
+                    user_agent=UA,
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    viewport={"width": 1366, "height": 820},
+                    color_scheme="light",
+                )
+                page = await ctx.new_page()
+                await page.add_init_script(STEALTH_JS)
+
+                async def _scrape_one(path: str) -> List[Dict[str, Any]]:
+                    url = f"https://pump.fun{path}"
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                        # let client-side hydration run
+                        await page.wait_for_timeout(1500)
+                        # try to let lazy lists load
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=10_000)
+                        except Exception:
+                            pass
+                        # gentle scroll to trigger lazy content
+                        try:
+                            await page.evaluate(
+                                """async () => {
+                                    let total = 0;
+                                    for (let i = 0; i < 4; i++) {
+                                      window.scrollBy(0, 800);
+                                      await new Promise(r => setTimeout(r, 400));
+                                      total += 1;
+                                    }
+                                    window.scrollTo(0, 0);
+                                  }"""
+                            )
+                            await page.wait_for_timeout(500)
+                        except Exception:
+                            pass
+
+                        # Extract links that look like token pages. Try several patterns.
+                        data = await page.evaluate(
+                            """(limit) => {
+                                const out = [];
+                                const seen = new Set();
+                                const sel = [
+                                  'a[href*="/coin/"]',
+                                  'a[href^="/token/"]',
+                                  'a[href*="/token/"]',
+                                  'a[href*="/coins/"]'
+                                ];
+                                const reMint = /[1-9A-HJ-NP-Za-km-z]{32,64}/; // base58-ish
+                                const nodes = Array.from(document.querySelectorAll(sel.join(',')));
+                                for (const a of nodes) {
+                                  const href = a.getAttribute('href') || '';
+                                  const parts = href.split('/');
+                                  const last = parts[parts.length - 1] || '';
+                                  const candidate = reMint.test(last) ? last : null;
+                                  if (!candidate) continue;
+                                  if (seen.has(candidate)) continue;
+                                  seen.add(candidate);
+
+                                  // Attempt a nearby symbol text (best effort, optional)
+                                  let symbol = (a.textContent || '').trim();
+                                  if (!symbol || symbol.length > 40) {
+                                    const parent = a.closest('*');
+                                    if (parent) {
+                                      const t = parent.textContent || '';
+                                      symbol = t.split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
+                                    }
+                                  }
+                                  out.push({ mint: candidate, symbol: symbol || null });
+                                  if (out.length >= limit) break;
+                                }
+                                return out;
+                              }""",
+                            int(limit),
+                        )
+                        if isinstance(data, list):
+                            return data
+                        return []
+                    except Exception:
+                        return []
+
+                # Try /trending first, then /advanced/scan
+                items = await _scrape_one("/trending")
+                if not items:
+                    items = await _scrape_one("/advanced/scan")
+
+                return items or []
+            finally:
+                await browser.close()
+    except Exception as e:
+        log.warning("DOM scrape error: %s", e)
+        return None
+
 # ============================ Exports ================================
 
 __all__ = [
@@ -719,4 +830,5 @@ __all__ = [
     "browser_fetch_scan_next_data",
     "browser_fetch_next_json", 
     "browser_fetch_trending_via_next_data",  
+    "browser_scrape_trending_dom",
 ]
