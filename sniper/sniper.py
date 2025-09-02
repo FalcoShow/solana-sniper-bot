@@ -62,12 +62,17 @@ except Exception as e_a:
         async def log_trade_event(*_a, **_k): ...
 
 # ----------------------------- CF cookie refresher ------------------------------
-# IMPORTANT: call with NO arguments.
+# Import defensively and log details if it fails.
+ensure_cookie_refresher = None
+cf_refresh_loop = None
 try:
-    from utils_pkg.pumpfun_cf import ensure_cookie_refresher, refresh_loop as cf_refresh_loop
-except Exception:
-    ensure_cookie_refresher = None
-    cf_refresh_loop = None
+    import utils_pkg.pumpfun_cf as _pump_cf
+    ensure_cookie_refresher = getattr(_pump_cf, "ensure_cookie_refresher", None)
+    cf_refresh_loop = getattr(_pump_cf, "refresh_loop", None)
+    log.info("pumpfun_cf loaded: ensure=%s loop=%s",
+             bool(ensure_cookie_refresher), bool(cf_refresh_loop))
+except Exception as e:
+    log.warning("pumpfun_cf import failed: %s", e)
 
 # ----------------------------- risk/locks/ai/route (soft deps) -----------------
 try:
