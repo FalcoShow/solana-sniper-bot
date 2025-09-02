@@ -707,14 +707,50 @@ async def browser_fetch_trending_via_next_data(limit: int = 50) -> Optional[List
     log.warning("next-data: no items found on apex JSON for /trending or /advanced/scan")
     return None
 
-# ---- DOM scrape of apex /trending (no API host needed) ----
 async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str, Any]]]:
     """
-    Navigate to pump.fun/trending (and /advanced/scan as a fallback) and scrape token
-    mints from the DOM. This avoids the frontend-api host entirely.
-
-    Returns: list[{"mint": "...", "symbol": Optional[str]}] or [] if none, or None on hard error.
+    Load apex pages and pull mints without touching the API host.
+    Tries DOM selectors first; if none found, falls back to regex over raw HTML.
+    Returns [{'mint': <base58>}, ...]
     """
+    from playwright.async_api import async_playwright
+    from urllib.parse import urlparse
+
+    PAGES = ["/trending", "/advanced/scan", "/"]  # try a few apex routes
+
+    def _uniq(seq: List[str]) -> List[str]:
+        s, out = set(), []
+        for x in seq:
+            if x and x not in s:
+                s.add(x); out.append(x)
+        return out
+
+    # small helpers
+    def _parse_cookie_string(s: str) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for part in (s or "").split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                out[k.strip()] = v.strip()
+        return out
+
+    def _pair_to_cookies(cjar: Dict[str, str]) -> List[Dict[str, Any]]:
+        cookies = []
+        for name in ("cf_clearance", "__cf_bm"):
+            if name in cjar:
+                cookies.append({
+                    "name": name,
+                    "value": cjar[name],
+                    "domain": "pump.fun",
+                    "path": "/",
+                    "httpOnly": False,
+                    "secure": True,
+                    "sameSite": "Lax",
+                })
+        return cookies
+
+    BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,64}"
+
     try:
         await _ensure_chromium_available()
         async with async_playwright() as p:
@@ -728,94 +764,95 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
                     user_agent=UA,
                     locale="en-US",
                     timezone_id="America/New_York",
-                    viewport={"width": 1366, "height": 820},
+                    viewport={"width": 1366, "height": 768},
                     color_scheme="light",
                 )
+
+                # seed apex cookies into this context so CF doesn't bounce us
+                apex_cookie_str = os.getenv("PUMPFUN_COOKIE", "").strip()
+                if apex_cookie_str:
+                    jar = _parse_cookie_string(apex_cookie_str)
+                    seed = _pair_to_cookies(jar)
+                    if seed:
+                        await ctx.add_cookies(seed)
+
                 page = await ctx.new_page()
                 await page.add_init_script(STEALTH_JS)
 
-                async def _scrape_one(path: str) -> List[Dict[str, Any]]:
+                found: List[str] = []
+
+                for path in PAGES:
                     url = f"https://pump.fun{path}"
                     try:
+                        await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
                         await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                        # let client-side hydration run
-                        await page.wait_for_timeout(1500)
-                        # try to let lazy lists load
-                        try:
-                            await page.wait_for_load_state("networkidle", timeout=10_000)
-                        except Exception:
-                            pass
-                        # gentle scroll to trigger lazy content
-                        try:
-                            await page.evaluate(
-                                """async () => {
-                                    let total = 0;
-                                    for (let i = 0; i < 4; i++) {
-                                      window.scrollBy(0, 800);
-                                      await new Promise(r => setTimeout(r, 400));
-                                      total += 1;
-                                    }
-                                    window.scrollTo(0, 0);
-                                  }"""
-                            )
-                            await page.wait_for_timeout(500)
-                        except Exception:
-                            pass
-
-                        # Extract links that look like token pages. Try several patterns.
-                        data = await page.evaluate(
-                            """(limit) => {
-                                const out = [];
-                                const seen = new Set();
-                                const sel = [
-                                  'a[href*="/coin/"]',
-                                  'a[href^="/token/"]',
-                                  'a[href*="/token/"]',
-                                  'a[href*="/coins/"]'
-                                ];
-                                const reMint = /[1-9A-HJ-NP-Za-km-z]{32,64}/; // base58-ish
-                                const nodes = Array.from(document.querySelectorAll(sel.join(',')));
-                                for (const a of nodes) {
-                                  const href = a.getAttribute('href') || '';
-                                  const parts = href.split('/');
-                                  const last = parts[parts.length - 1] || '';
-                                  const candidate = reMint.test(last) ? last : null;
-                                  if (!candidate) continue;
-                                  if (seen.has(candidate)) continue;
-                                  seen.add(candidate);
-
-                                  // Attempt a nearby symbol text (best effort, optional)
-                                  let symbol = (a.textContent || '').trim();
-                                  if (!symbol || symbol.length > 40) {
-                                    const parent = a.closest('*');
-                                    if (parent) {
-                                      const t = parent.textContent || '';
-                                      symbol = t.split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
-                                    }
-                                  }
-                                  out.push({ mint: candidate, symbol: symbol || null });
-                                  if (out.length >= limit) break;
-                                }
-                                return out;
-                              }""",
-                            int(limit),
-                        )
-                        if isinstance(data, list):
-                            return data
-                        return []
                     except Exception:
-                        return []
+                        continue
 
-                # Try /trending first, then /advanced/scan
-                items = await _scrape_one("/trending")
-                if not items:
-                    items = await _scrape_one("/advanced/scan")
+                    # Give hydration a chance (but don’t depend on it)
+                    try:
+                        await page.wait_for_timeout(800)
+                        # Try to find anchors to coin pages or elements with data-mint
+                        anchors = await page.locator('a[href*="/coin/"], a[href*="/coins/"], [data-mint]').all()
+                        if anchors:
+                            # Try to scroll to reveal lazy items
+                            for _ in range(4):
+                                await page.mouse.wheel(0, 1200)
+                                await page.wait_for_timeout(250)
+                        # Collect mints from DOM
+                        mints: List[str] = []
+                        for el in anchors[: max(200, limit*3) ]:
+                            href = await el.get_attribute("href")
+                            dm = await el.get_attribute("data-mint")
+                            if dm:
+                                mints.append(dm)
+                            if href:
+                                # normalize relative
+                                if href.startswith("/"):
+                                    href = f"https://pump.fun{href}"
+                                # match /coin/<mint> or /coins/<mint> or ?mint=<mint>
+                                m = re.search(rf"/coins?/(?P<m>{BASE58})", href)
+                                if not m:
+                                    m = re.search(rf"[?&]mint=(?P<m>{BASE58})", href)
+                                if m:
+                                    mints.append(m.group("m"))
 
-                return items or []
+                        mints = _uniq([m for m in mints if m])
+                        if mints:
+                            log.info("DOM-scrape: %d mints via selectors on %s", len(mints), path)
+                            found.extend(mints)
+                            if len(_uniq(found)) >= limit:
+                                break
+
+                        # Fallback: regex over raw HTML (no JS required)
+                        html = await page.content()
+                        extra = []
+                        for pat in [
+                            rf'href="(?:https://pump\.fun)?/coin/({BASE58})"',
+                            rf'href="(?:https://pump\.fun)?/coins/({BASE58})"',
+                            rf'data-mint="({BASE58})"',
+                            rf'"mintAddress"\s*:\s*"({BASE58})"',
+                            rf'"mint"\s*:\s*"({BASE58})"',
+                        ]:
+                            extra += re.findall(pat, html)
+                        extra = _uniq(extra)
+                        if extra:
+                            log.info("DOM-scrape: +%d mints via HTML regex on %s", len(extra), path)
+                            found.extend(extra)
+                            if len(_uniq(found)) >= limit:
+                                break
+                    except Exception:
+                        continue
+
+                uniq = _uniq(found)[:limit]
+                await page.close()
+
+                log.info("DOM-scrape total: %d unique mints", len(uniq))
+                return [{"mint": m} for m in uniq]
             finally:
                 await browser.close()
     except Exception as e:
-        log.warning("DOM scrape error: %s", e)
+        log.warning("browser_scrape_trending_dom failed: %s", e)
         return None
 
 # ============================ Exports ================================
