@@ -36,19 +36,15 @@ UA = os.getenv(
     "(KHTML, like Gecko) Chrome/126 Safari/537.36",
 )
 
-# Page that reliably triggers CF for the apex site
 PUMP_CF_PAGE = os.getenv("PUMPFUN_CF_URL", "https://pump.fun/advanced/scan")
 
-# A URL that causes the API host to set/validate CF cookies
-API_CF_PAGE = os.getenv(
-    "PUMPFUN_API_CF_URL",
-    "https://frontend-api.pump.fun/coins/trending?offset=0&limit=1",
-)
+# Just used to warm the API host; the path doesn’t really matter
+API_WARM_PATH = "/coins/trending?offset=0&limit=1"
 
 REFRESH_SEC = int(os.getenv("PUMPFUN_CF_REFRESH_SEC", "900"))  # ~15 minutes
 HOSTS = ("pump.fun", "frontend-api.pump.fun")
 
-# If Render’s env var isn’t set, still prefer a writable path
+# Prefer a persistent path for browser binaries on Render
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
 
 # ---------- State ----------
@@ -56,15 +52,11 @@ _COOKIES: Dict[str, str] = {}  # host -> "cf_clearance=...; __cf_bm=..."
 _EXP: float = 0.0
 _TASK: Optional[asyncio.Task] = None
 
+
 # ---------- Helpers ----------
 async def _ensure_chromium_available() -> None:
-    """
-    Render sometimes misses browser binaries even if Playwright is present.
-    Try a one-time runtime install of Chromium.
-    """
+    """One-time install if Chromium isn’t present at runtime."""
     try:
-        # Quick probe: try to launch and immediately close – if it explodes,
-        # do a one-time install below.
         async with async_playwright() as p:
             b = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             await b.close()
@@ -74,7 +66,6 @@ async def _ensure_chromium_available() -> None:
 
     try:
         log.info("Playwright: chromium not found, attempting one-time install...")
-        # Avoid blocking the loop forever; keep it simple.
         proc = await asyncio.create_subprocess_exec(
             "python", "-m", "playwright", "install", "chromium",
             stdout=asyncio.subprocess.PIPE,
@@ -110,32 +101,39 @@ def _cookie_for_host(all_cookies: List[Dict[str, Any]], host: str) -> Optional[s
 
 async def _prime_context_and_cookies(ctx) -> Dict[str, str]:
     """
-    Navigate both hosts so CF sets cookies; return host->cookie string.
+    Navigate both hosts and perform a same-origin fetch on the API host
+    so CF sets cookies for that domain.
     """
     page = await ctx.new_page()
-    # 1) apex – this often primes the challenge
+
+    # 1) Apex site — normal page navigation solves CF
     try:
         await page.goto(PUMP_CF_PAGE, wait_until="networkidle", timeout=60_000)
     except Exception:
-        # Not fatal; CF might still be satisfied
         pass
 
-    # 2) API host – try to trip/solve CF here as well
+    # 2) API host — go to the origin then do same-origin fetch (credentials included)
     try:
-        await page.goto(API_CF_PAGE, wait_until="networkidle", timeout=60_000)
+        await page.goto("https://frontend-api.pump.fun/", wait_until="domcontentloaded", timeout=30_000)
+    except Exception:
+        # If the origin 404s, that’s fine; we only need the origin context
+        pass
+    try:
+        await page.evaluate(
+            f"""() => fetch('{API_WARM_PATH}', {{ credentials: 'include' }}).catch(() => {{}})"""
+        )
+        await page.wait_for_timeout(800)
     except Exception:
         pass
 
-    # tiny breath – sometimes cookies land just after network idle
-    await page.wait_for_timeout(300)
     all_cookies = await ctx.cookies()
+    await page.close()
 
     new_map: Dict[str, str] = {}
     for host in HOSTS:
         ck = _cookie_for_host(all_cookies, host)
         if ck:
             new_map[host] = ck
-    await page.close()
     return new_map
 
 
@@ -218,9 +216,7 @@ def _parse_cookie_string(s: str) -> Dict[str, str]:
 
 
 def apply_cookies_to_session(session) -> None:
-    """
-    Attach per-host cookies to an existing aiohttp.ClientSession.
-    """
+    """Attach per-host cookies to an existing aiohttp.ClientSession."""
     try:
         from aiohttp import client_reqrep
         for host in HOSTS:
@@ -239,6 +235,7 @@ def apply_cookies_to_session(session) -> None:
 async def browser_fetch_json(url: str) -> Optional[Any]:
     """
     JSON GET via Playwright after priming cookies in the *same* context.
+    For the API host, use a same-origin browser fetch to bypass CF/CORS quirks.
     """
     try:
         await _ensure_chromium_available()
@@ -249,10 +246,44 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
             )
             try:
                 ctx = await browser.new_context(user_agent=UA)
-                # Make sure this context has solved CF
+                # Make sure this context has solved CF for both hosts
                 await _prime_context_and_cookies(ctx)
 
-                # Fetch JSON using the same context/cookies
+                host = urlparse(url).hostname or ""
+                page = await ctx.new_page()
+
+                # If the call targets the API host, stay same-origin and fetch via the page.
+                if host.endswith("frontend-api.pump.fun"):
+                    try:
+                        await page.goto("https://frontend-api.pump.fun/", wait_until="domcontentloaded", timeout=30_000)
+                    except Exception:
+                        pass
+                    try:
+                        js = """
+                            async (u) => {
+                              try {
+                                const r = await fetch(u, { credentials: 'include' });
+                                if (!r.ok) return { ok:false, status:r.status };
+                                const ct = r.headers.get('content-type') || '';
+                                if (ct.includes('application/json')) return { ok:true, status:r.status, data: await r.json() };
+                                const t = await r.text();
+                                try { return { ok:true, status:r.status, data: JSON.parse(t) }; }
+                                catch { return { ok:false, status:r.status }; }
+                              } catch (e) { return { ok:false, status:0 }; }
+                            }
+                        """
+                        res = await page.evaluate(js, url)
+                        if res and res.get("ok"):
+                            return res.get("data")
+                        status = res.get("status", 0) if isinstance(res, dict) else 0
+                        if status == 530:
+                            flag_cookie_bad()
+                        log.warning("browser_fetch_json: %s -> HTTP %s (page.fetch)", url, status)
+                        return None
+                    finally:
+                        await page.close()
+
+                # Otherwise, fall back to the request context (still carries cookies)
                 headers = {
                     "User-Agent": UA,
                     "Accept": "application/json, text/plain, */*",
@@ -263,7 +294,6 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                 }
                 r = await ctx.request.get(url, headers=headers, timeout=30_000)
                 if r.ok:
-                    # Try JSON first; some endpoints return lists, some objects.
                     try:
                         return await r.json()
                     except Exception:
@@ -272,12 +302,11 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                             return json.loads(text)
                         except Exception:
                             return None
-                else:
-                    status = r.status
-                    if status == 530:
-                        flag_cookie_bad()
-                    log.warning("browser_fetch_json: %s -> HTTP %s", url, status)
-                    return None
+                status = r.status
+                if status == 530:
+                    flag_cookie_bad()
+                log.warning("browser_fetch_json: %s -> HTTP %s", url, status)
+                return None
             finally:
                 await browser.close()
     except Exception as e:
