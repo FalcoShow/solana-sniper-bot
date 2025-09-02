@@ -1,4 +1,4 @@
-# scanner/pumpfun_scanner.py — v6 (Apex-first: next-data → DOM → API)
+# scanner/pumpfun_scanner.py — v6.2 (Apex-first: next-data → DOM → HTML → API)
 from __future__ import annotations
 
 import os
@@ -24,7 +24,7 @@ try:
         flag_cookie_bad,                       # mark cookie stale (e.g., on 530/403)
         browser_fetch_json,                    # last-resort JSON via Playwright (API host)
         browser_fetch_trending_via_next_data,  # Next.js JSON from apex (/_next/data)
-        browser_scrape_trending_dom,           # NEW: pure DOM scrape from apex
+        browser_scrape_trending_dom,           # DOM scrape from apex pages (no API host)
     )
 except Exception:  # pragma: no cover
     def apply_cookies_to_session(_session):  # type: ignore
@@ -54,7 +54,7 @@ REQ_TIMEOUT_S = int(os.getenv("PUMPFUN_HTTP_TIMEOUT_S", "15"))
 SESSION_LIMIT = int(os.getenv("PUMPFUN_HTTP_CONN_LIMIT", "30"))
 
 # ---------------------------------------------------------------------------
-# Header builder (per-host cookies, reasonable browser-y headers)
+# Header builder
 # ---------------------------------------------------------------------------
 def _host_of(url: str) -> str:
     try:
@@ -103,14 +103,10 @@ def _map_coin(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             or obj.get("mint")
             or obj.get("baseMint")
             or obj.get("tokenMint")
-            or obj.get("mint_id")  # in case DOM scrape returns this key
+            or obj.get("mint_id")
         )
         if not mint:
-            # Also accept a plain {"mint": "..."} from DOM scrape
-            if "mint" in obj and isinstance(obj["mint"], str):
-                mint = obj["mint"]
-            else:
-                return None
+            return None
 
         symbol = obj.get("symbol") or obj.get("tokenSymbol") or obj.get("name") or mint[:6]
 
@@ -164,14 +160,14 @@ def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
             if k in payload and isinstance(payload[k], list):
                 src = payload[k]
                 break
-            if (
-                "data" in payload
-                and isinstance(payload["data"], dict)
-                and k in payload["data"]
-                and isinstance(payload["data"][k], list)
-            ):
-                src = payload["data"][k]
-                break
+            if "data" in payload and isinstance(payload["data"], dict):
+                dd = payload["data"]
+                for kk in ("trending", "coins", "items", "projects", "data"):
+                    if kk in dd and isinstance(dd[kk], list):
+                        src = dd[kk]
+                        break
+                if src:
+                    break
         src = src or []
     else:
         src = []
@@ -184,7 +180,7 @@ def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
     return items
 
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# HTTP helpers (JSON primary)
 # ---------------------------------------------------------------------------
 async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[Any], int, str]:
     try:
@@ -219,7 +215,48 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
         return (None, 0, "")
 
 # ---------------------------------------------------------------------------
-# HTML __NEXT_DATA__ fallback (raw GET, no Playwright)
+# HTML helpers: scrape coin links directly from apex HTML (no JS)
+# ---------------------------------------------------------------------------
+_BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,64}"
+
+def _uniq(seq: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+async def _html_scrape_links(session: aiohttp.ClientSession, path: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Fetch the raw HTML for an apex page and regex out coin links.
+    Works even if JS doesn't hydrate or Next.js JSON is absent.
+    """
+    url = f"https://pump.fun{path}"
+    try:
+        async with session.get(url, headers=_hdrs(url), timeout=aiohttp.ClientTimeout(total=REQ_TIMEOUT_S)) as r:
+            html = await r.text()
+    except Exception as e:
+        LOG.warning("Pump.fun HTML link scrape failed (%s): %s", path, e)
+        return []
+
+    # Look for /coin/<mint>, /coins/<mint>, /token/<mint>, or ?mint=<mint>
+    mints = []
+    for pattern in [
+        rf'href="(?:https://pump\.fun)?/coin/({_BASE58})"',
+        rf'href="(?:https://pump\.fun)?/coins/({_BASE58})"',
+        rf'href="(?:https://pump\.fun)?/token/({_BASE58})"',
+        rf'[?&]mint=({_BASE58})',
+        rf'data-mint="({_BASE58})"',
+    ]:
+        mints += re.findall(pattern, html)
+
+    mints = _uniq(mints)[:limit]
+    return [{"mint": m} for m in mints]
+
+# ---------------------------------------------------------------------------
+# HTML __NEXT_DATA__ fallback (legacy, may be absent)
 # ---------------------------------------------------------------------------
 async def _html_next_data(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     url = "https://pump.fun/trending"
@@ -234,9 +271,7 @@ async def _html_next_data(session: aiohttp.ClientSession) -> List[Dict[str, Any]
 
     m = re.search(r'id="__NEXT_DATA__"[^>]*>\s*({.*?})\s*</script>', html, re.S)
     if not m:
-        LOG.warning("Pump.fun HTML fallback: __NEXT_DATA__ not found.")
         return []
-
     try:
         data = json.loads(m.group(1))
     except Exception:
@@ -263,9 +298,10 @@ async def _html_next_data(session: aiohttp.ClientSession) -> List[Dict[str, Any]
 # Scanner core
 # ---------------------------------------------------------------------------
 async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+    # Ensure the session has apex cookies at least.
     apply_cookies_to_session(session)
 
-    # 0) Apex Next.js data (/_next/data) via Playwright
+    # 0) Apex Next.js data (/_next/data) via Playwright (cheap; may be absent)
     try:
         raw = await browser_fetch_trending_via_next_data(limit=50)
         if isinstance(raw, list) and raw:
@@ -276,6 +312,7 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
                     if m:
                         items.append(m)
             if items:
+                LOG.info("scanner.pumpfun: next-data apex → %s items", len(items))
                 return items
     except Exception as e:
         LOG.warning("Pump.fun next-data apex fetch error: %s", e)
@@ -291,6 +328,7 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
                     if m:
                         items.append(m)
             if items:
+                LOG.info("scanner.pumpfun: DOM apex → %s items", len(items))
                 return items
     except Exception as e:
         LOG.warning("Pump.fun apex DOM scrape error: %s", e)
@@ -301,13 +339,39 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     if OVERRIDE_URL:
         endpoints.append(OVERRIDE_URL)
 
+    # 2) Pure HTML (regex) from apex pages (no JS, no Playwright)
+    html_items: List[Dict[str, Any]] = []
+    for path in ("/trending", "/advanced/scan"):
+        try:
+            links = await _html_scrape_links(session, path, limit=50)
+            if links:
+                html_items.extend(links)
+        except Exception:
+            pass
+    if html_items:
+        # Dedup by mint
+        seen, uniq = set(), []
+        for d in html_items:
+            m = d.get("mint")
+            if isinstance(m, str) and m not in seen:
+                seen.add(m)
+                uniq.append(d)
+        items = []
+        for it in uniq:
+            m = _map_coin(it)
+            if m:
+                items.append(m)
+        if items:
+            LOG.info("scanner.pumpfun: HTML apex → %s items", len(items))
+            return items
+
+    # 3) Direct JSON endpoints (CF-aware) — will likely 530, but keep for completeness
     endpoints += [
         "https://frontend-api.pump.fun/coins/trending?offset=0&limit=50",
         "https://frontend-api.pump.fun/coins/new?offset=0&limit=50",
-        "https://pump.fun/api/trending",
+        "https://pump.fun/api/trending",  # legacy (often 404)
     ]
 
-    # 2) Direct JSON endpoints (CF-aware)
     for url in endpoints:
         payload, status, first = await _fetch_json(session, url)
         tried.append(f"{url} status={status}")
@@ -317,18 +381,21 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
             continue
         items = _extract_items_from_payload(payload)
         if items:
+            LOG.info("scanner.pumpfun: API JSON → %s items", len(items))
             return items
 
-    # 3) HTML __NEXT_DATA__ fallback (raw GET)
+    # 4) HTML __NEXT_DATA__ fallback (legacy)
     items = await _html_next_data(session)
     if items:
+        LOG.info("scanner.pumpfun: HTML __NEXT_DATA__ → %s items", len(items))
         return items
 
-    # 4) Last-resort: browser fetch on API trending (then normalize)
+    # 5) Last-resort: browser fetch on API trending (then normalize)
     fallback_url = "https://frontend-api.pump.fun/coins/trending?offset=0&limit=50"
     payload = await browser_fetch_json(fallback_url)
     items = _extract_items_from_payload(payload)
     if items:
+        LOG.info("scanner.pumpfun: Playwright API → %s items", len(items))
         return items
 
     LOG.warning("Pump.fun all endpoints failed: tried=%s", "; ".join(tried))
