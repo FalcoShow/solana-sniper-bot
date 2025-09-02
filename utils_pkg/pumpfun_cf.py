@@ -1,252 +1,245 @@
 # utils_pkg/pumpfun_cf.py
 """
-Periodic Cloudflare-cookie refresher for Pump.fun, using Playwright (Chromium).
+Cloudflare cookie manager for Pump.fun.
 
-Public API:
-- refresh_loop():        awaitable infinite loop; schedule with asyncio.create_task(...)
-- ensure_cookie_refresher(): start the loop once per process if an event loop is running
-- get_cookie_header():   returns current cookie string "cf_clearance=...; __cf_bm=..."
-- flag_cookie_bad():     force a refresh ASAP (e.g., after HTTP 530)
-- browser_fetch_json():  last-resort JSON fetch using Playwright context
+- Solves CF for BOTH hosts: pump.fun and frontend-api.pump.fun
+- Keeps per-host cookie strings (cf_clearance, __cf_bm)
+- Can apply cookies to an aiohttp session
+- Provides a last-resort JSON fetch via Playwright if HTTP client hits 530/HTML
 
-Env knobs:
-- PUMPFUN_UA                       : User-Agent override
-- PUMPFUN_CF_URL                   : page we open to satisfy CF (default: /advanced/scan)
-- PUMPFUN_CF_REFRESH_SEC           : refresh cadence seconds (default: 900)
-- PLAYWRIGHT_BROWSERS_PATH         : path where Playwright stores browser bundles
+Public:
+    ensure_cookie_refresher()
+    get_cookie_for(url_or_host) -> str
+    apply_cookies_to_session(session) -> None
+    flag_cookie_bad() -> None
+    browser_fetch_json(url) -> dict|list|None
 """
-
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
-import subprocess
 import time
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
-from playwright.async_api import async_playwright, Error as PWError
+from playwright.async_api import async_playwright
 
 log = logging.getLogger("pumpfun.cf")
 
-# -------------------- config --------------------
-
+# ---------- Config ----------
 UA = os.getenv(
     "PUMPFUN_UA",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126 Safari/537.36",
 )
 
-TARGET_URL = os.getenv("PUMPFUN_CF_URL", "https://pump.fun/advanced/scan")
-REFRESH_SEC = int(os.getenv("PUMPFUN_CF_REFRESH_SEC", "900"))  # default 15 min
-BROWSERS_PATH = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
+# Page that reliably triggers CF for the apex site
+PUMP_CF_PAGE = os.getenv(
+    "PUMPFUN_CF_URL",
+    "https://pump.fun/advanced/scan"
+)
 
-# Chromium args for container environments (Render, Docker, etc.)
-CHROME_ARGS: List[str] = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-]
+# A “page-like” URL that forces CF on the API host as well (JSON URL is fine;
+# if CF challenges, it serves an HTML page that runs the challenge JS).
+API_CF_PAGE = os.getenv(
+    "PUMPFUN_API_CF_URL",
+    "https://frontend-api.pump.fun/coins/trending?offset=0&limit=1"
+)
 
-# -------------------- state ---------------------
+REFRESH_SEC = int(os.getenv("PUMPFUN_CF_REFRESH_SEC", "900"))  # ~15 minutes
 
-_COOKIE: Optional[str] = None  # "cf_clearance=...; __cf_bm=..."
-_EXP: float = 0.0              # epoch seconds when cookie should be refreshed
+HOSTS = ("pump.fun", "frontend-api.pump.fun")
+
+# ---------- State ----------
+_COOKIES: Dict[str, str] = {}      # host -> "cf_clearance=...; __cf_bm=..."
+_EXP: float = 0.0                  # when to refresh
 _TASK: Optional[asyncio.Task] = None
-_install_lock = asyncio.Lock()
-_installed_once: bool = False  # process-level guard so we don't spam installs
 
-# -------------------- helpers -------------------
 
-def _cookie_from(playwright_cookies: list[Dict[str, Any]]) -> Optional[str]:
-    jar = {c.get("name"): c.get("value") for c in (playwright_cookies or [])}
+# ---------- Helpers ----------
+def _cookie_for_host(all_cookies: List[Dict[str, Any]], host: str) -> Optional[str]:
+    """Extract the cf cookies for a specific host (host-only cookies!)."""
+    want = {}
+    for c in all_cookies or []:
+        name = c.get("name")
+        domain = (c.get("domain") or "").lstrip(".")
+        if domain.endswith(host) and name in ("cf_clearance", "__cf_bm"):
+            val = c.get("value")
+            if val:
+                want[name] = val
+    if not want:
+        return None
     parts = []
-    for k in ("cf_clearance", "__cf_bm"):
-        v = jar.get(k)
-        if v:
-            parts.append(f"{k}={v}")
-    return "; ".join(parts) if parts else None
-
-
-async def _install_browsers_once() -> None:
-    """Install Chromium at runtime if it isn't available. Safe to call repeatedly."""
-    global _installed_once
-    if _installed_once:
-        return
-    async with _install_lock:
-        if _installed_once:
-            return
-        try:
-            log.warning("playwright: chromium not found, attempting one-time install...")
-            # Keep env so PLAYWRIGHT_BROWSERS_PATH is honored.
-            env = {**os.environ, "PLAYWRIGHT_BROWSERS_PATH": BROWSERS_PATH}
-            subprocess.run(
-                ["python", "-m", "playwright", "install", "chromium"],
-                check=False,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except Exception as e:
-            log.warning("playwright: install invocation failed: %s", e)
-        _installed_once = True
-
-
-async def _launch_browser(p):
-    """
-    Launch Chromium with container-friendly flags.
-    If the bundle is missing, attempt an on-the-fly install and retry once.
-    """
-    try:
-        return await p.chromium.launch(headless=True, args=CHROME_ARGS)
-    except PWError as e:
-        msg = str(e)
-        if "playwright install" in msg or "Executable doesn't exist" in msg or "was just installed" in msg:
-            await _install_browsers_once()
-            return await p.chromium.launch(headless=True, args=CHROME_ARGS)
-        raise
+    if "cf_clearance" in want:
+        parts.append(f"cf_clearance={want['cf_clearance']}")
+    if "__cf_bm" in want:
+        parts.append(f"__cf_bm={want['__cf_bm']}")
+    return "; ".join(parts)
 
 
 async def _refresh_once() -> None:
-    """
-    Open Pump.fun with Playwright to satisfy Cloudflare, collect cookies,
-    and prime the API host. Stores cookie into process env for scanners.
-    """
-    global _COOKIE, _EXP
-    browser = None
+    """Solve CF on both hosts and capture host-specific cookies."""
+    global _COOKIES, _EXP
     try:
         async with async_playwright() as p:
-            browser = await _launch_browser(p)
-            ctx = await browser.new_context(user_agent=UA)
-            page = await ctx.new_page()
-
-            # Hit the real page so CF sets/validates cookies
-            await page.goto(TARGET_URL, wait_until="networkidle", timeout=60_000)
-
-            # Touch the API host; if first call is blocked, the previous nav
-            # normally completes the challenge and cookies will work next call.
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
             try:
-                await page.goto(
-                    "https://frontend-api.pump.fun/health",
-                    wait_until="domcontentloaded",
-                    timeout=20_000,
-                )
-            except Exception:
-                # health endpoint sometimes 5xx/blocked — not fatal
-                pass
+                ctx = await browser.new_context(user_agent=UA)
+                page = await ctx.new_page()
 
-            ck = _cookie_from(await ctx.cookies())
+                # 1) Apex site
+                await page.goto(PUMP_CF_PAGE, wait_until="networkidle", timeout=60_000)
+
+                # 2) API host
+                try:
+                    await page.goto(API_CF_PAGE, wait_until="networkidle", timeout=60_000)
+                except Exception:
+                    # CF sometimes bounces; the apex step usually primes the challenge anyway.
+                    pass
+
+                all_cookies = await ctx.cookies()
+            finally:
+                await browser.close()
+
+        new_map: Dict[str, str] = {}
+        for host in HOSTS:
+            ck = _cookie_for_host(all_cookies, host)
+            if ck:
+                new_map[host] = ck
+
+        # store + env exports (optional for other components)
+        _COOKIES = new_map
+        os.environ["PUMPFUN_COOKIE"] = new_map.get("pump.fun", "")
+        os.environ["PUMPFUN_COOKIE_API"] = new_map.get("frontend-api.pump.fun", "")
+
+        if _COOKIES:
+            _EXP = time.time() + max(60.0, REFRESH_SEC * 0.9)
+            red_pump = "***" if "pump.fun" in _COOKIES else "-"
+            red_api = "***" if "frontend-api.pump.fun" in _COOKIES else "-"
+            log.info("CF refresh: got cookies (pump=%s, api=%s), next in ~%ds",
+                     red_pump, red_api, REFRESH_SEC)
+        else:
+            _EXP = time.time() + 120.0
+            log.warning("CF refresh: no cookies captured; will retry sooner.")
+
     except Exception as e:
-        # Back off a bit on errors
-        _COOKIE = None
         _EXP = time.time() + 120.0
         log.warning("CF refresh failed: %s", e)
-        return
-    finally:
-        try:
-            if browser:
-                await browser.close()
-        except Exception:
-            pass
-
-    if ck:
-        _COOKIE = ck
-        os.environ["PUMPFUN_COOKIE"] = ck  # scanners can read this directly
-        # refresh slightly before full interval to avoid edge expiry
-        _EXP = time.time() + max(60.0, float(REFRESH_SEC) * 0.9)
-        redacted = "cf_clearance=***" + ("" if "__cf_bm=" not in ck else "; __cf_bm=***")
-        log.info("CF refresh: got cookies (%s), next refresh in ~%ds", redacted, REFRESH_SEC)
-    else:
-        # No cookie means CF didn’t set it (rare), try again soon
-        _COOKIE = None
-        _EXP = time.time() + 120.0
-        log.warning("CF refresh: no cookies found; will retry sooner")
 
 
-# -------------------- public API ----------------
-
+# ---------- Public ----------
 async def refresh_loop() -> None:
-    """
-    Background refresher; await or schedule via `asyncio.create_task(refresh_loop())`.
-    """
-    # Do an immediate refresh on start
     await _refresh_once()
     while True:
-        # If someone marked cookie bad, _EXP will be <= now
-        wait_for = max(1.0, _EXP - time.time())
-        await asyncio.sleep(min(wait_for, 300.0))  # wake up at least every 5 minutes
+        sleep_s = max(1.0, _EXP - time.time())
+        await asyncio.sleep(min(sleep_s, 300.0))
         if time.time() >= _EXP:
             await _refresh_once()
 
 
 def ensure_cookie_refresher() -> None:
-    """
-    Idempotently start the refresher loop once per process.
-    Call this from INSIDE an already running asyncio loop.
-    """
     global _TASK
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         log.warning("ensure_cookie_refresher() called without a running event loop")
         return
-
     if _TASK and not _TASK.done():
         return
     _TASK = loop.create_task(refresh_loop())
     log.info("CF refresher started")
 
 
-# Backwards/alternate name in case other modules import a different symbol
-run_refresh_loop = refresh_loop
-
-
-def get_cookie_header() -> str:
-    """Return 'cf_clearance=...; __cf_bm=...' or env fallback if not yet refreshed."""
-    return _COOKIE or os.getenv("PUMPFUN_COOKIE", "")
+def get_cookie_for(url_or_host: str) -> str:
+    """Return the cookie string for a given URL or bare host."""
+    host = urlparse(url_or_host).hostname or url_or_host
+    return _COOKIES.get(host, "")
 
 
 def flag_cookie_bad() -> None:
-    """Force an early refresh (e.g., when the HTTP client sees a 530 page)."""
+    """Force a quicker refresh (e.g., on 530)."""
     global _EXP
     _EXP = 0.0
 
 
+def _parse_cookie_string(s: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for part in (s or "").split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def apply_cookies_to_session(session) -> None:
+    """
+    Attach per-host cookies to an existing aiohttp.ClientSession.
+    (The caller should pass the session already created.)
+    """
+    try:
+        from aiohttp import client_reqrep  # lazy import inside function
+        for host in HOSTS:
+            ck = _COOKIES.get(host)
+            if not ck:
+                continue
+            session.cookie_jar.update_cookies(
+                _parse_cookie_string(ck),
+                response_url=client_reqrep.URL(f"https://{host}/"),
+            )
+    except Exception as e:
+        log.warning("apply_cookies_to_session failed: %s", e)
+
+
 async def browser_fetch_json(url: str) -> Optional[Any]:
     """
-    Last-resort JSON fetch via Playwright’s request API inside a context
-    that already solved CF. Useful when aiohttp gets HTML/530.
+    Last-resort JSON GET via Playwright. Ensures CF is solved for the
+    target host in this context before the request.
     """
-    browser = None
+    host = urlparse(url).hostname or ""
     try:
         async with async_playwright() as p:
-            browser = await _launch_browser(p)
-            ctx = await browser.new_context(user_agent=UA)
-            page = await ctx.new_page()
-            # Prime cookies by visiting Pump.fun once
-            await page.goto(TARGET_URL, wait_until="networkidle", timeout=60_000)
-            # Fetch JSON using the same context/cookies
-            r = await ctx.request.get(url, timeout=30_000)
-            if r.ok:
-                return await r.json()
-            log.warning("browser_fetch_json: %s -> HTTP %s", url, r.status)
-            return None
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            try:
+                ctx = await browser.new_context(user_agent=UA)
+                page = await ctx.new_page()
+
+                # Always prime apex first – it often makes API host challenge easier
+                try:
+                    await page.goto(PUMP_CF_PAGE, wait_until="networkidle", timeout=60_000)
+                except Exception:
+                    pass
+
+                # If target is the API host, try to trip/solve CF there too
+                if host.endswith("frontend-api.pump.fun"):
+                    try:
+                        await page.goto(API_CF_PAGE, wait_until="networkidle", timeout=60_000)
+                    except Exception:
+                        pass
+
+                r = await ctx.request.get(url, timeout=30_000)
+                if r.ok:
+                    return await r.json()
+                log.warning("browser_fetch_json: %s -> HTTP %s", url, r.status)
+                return None
+            finally:
+                await browser.close()
     except Exception as e:
         log.warning("browser_fetch_json failed: %s", e)
         return None
-    finally:
-        try:
-            if browser:
-                await browser.close()
-        except Exception:
-            pass
 
 
 __all__ = [
-    "refresh_loop",
-    "run_refresh_loop",
     "ensure_cookie_refresher",
-    "get_cookie_header",
+    "get_cookie_for",
+    "apply_cookies_to_session",
     "flag_cookie_bad",
     "browser_fetch_json",
+    "refresh_loop",
 ]
