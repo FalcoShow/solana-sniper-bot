@@ -1,4 +1,4 @@
-# scanner/pumpfun_scanner.py — v3.2 (CF-aware + per-host cookies + robust fallbacks)
+# scanner/pumpfun_scanner.py — v4 (CF-aware, JSON+DOM fallbacks, per-host cookies)
 from __future__ import annotations
 
 import os
@@ -15,27 +15,30 @@ import certifi
 LOG = logging.getLogger("scanner.pumpfun")
 
 # ---------------------------------------------------------------------------
-# Cloudflare helpers (graceful fallbacks if the helper module isn't present)
+# Cloudflare / Playwright helpers
 # ---------------------------------------------------------------------------
 try:
     from utils_pkg.pumpfun_cf import (
-        apply_cookies_to_session,  # attach per-host cookies to aiohttp session
-        get_cookie_for,            # cookie string for a given URL/host
-        flag_cookie_bad,           # mark cookie stale (e.g., on 530)
-        browser_fetch_json,        # last-resort JSON via Playwright
+        apply_cookies_to_session,     # attach per-host cookies to aiohttp session
+        get_cookie_for,               # cookie string for a given URL/host
+        flag_cookie_bad,              # mark cookie stale (e.g., on 530/403)
+        browser_fetch_json,           # last-resort JSON via Playwright
+        browser_fetch_scan_next_data, # **NEW**: DOM fallback from apex Scan page
     )
 except Exception:  # pragma: no cover
     def apply_cookies_to_session(_session):  # type: ignore
         pass
 
     def get_cookie_for(_url_or_host: str) -> str:  # type: ignore
-        # fall back to the generic env var if present
         return os.getenv("PUMPFUN_COOKIE_API", "") or os.getenv("PUMPFUN_COOKIE", "")
 
     def flag_cookie_bad() -> None:  # type: ignore
         pass
 
     async def browser_fetch_json(_url: str):  # type: ignore
+        return None
+
+    async def browser_fetch_scan_next_data():  # type: ignore
         return None
 
 
@@ -55,15 +58,24 @@ SESSION_LIMIT = int(os.getenv("PUMPFUN_HTTP_CONN_LIMIT", "30"))
 
 
 # ---------------------------------------------------------------------------
-# Header builder (picks the correct cookie for the URL/host)
+# Header builder (per-host cookies, reasonable browser-y headers)
 # ---------------------------------------------------------------------------
+def _host_of(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
 def _hdrs(url: str) -> Dict[str, str]:
+    host = _host_of(url)
+    origin = "https://frontend-api.pump.fun" if host.endswith("frontend-api.pump.fun") else "https://pump.fun"
     h = {
         "User-Agent": UA,
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://pump.fun/trending",
-        "Origin": "https://pump.fun",
+        "Origin": origin,
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
@@ -79,7 +91,6 @@ def _hdrs(url: str) -> Dict[str, str]:
 def _now() -> float:
     return time.time()
 
-
 def _age_min(created_ts: Optional[float]) -> Optional[float]:
     try:
         if created_ts is None:
@@ -90,7 +101,6 @@ def _age_min(created_ts: Optional[float]) -> Optional[float]:
         return max(0.0, (_now() - float(created_ts)) / 60.0)
     except Exception:
         return None
-
 
 def _map_coin(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
@@ -147,7 +157,6 @@ def _map_coin(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-
 def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
     """
     Accept a server payload (list or dict) and return a list of mapped coin dicts.
@@ -158,6 +167,7 @@ def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
         src = payload
     elif isinstance(payload, dict):
         src: List[Dict[str, Any]] | None = None
+        # common shapes: { data: { trending: [...] } } or { coins: [...] } etc.
         for k in ("trending", "coins", "items", "projects", "data"):
             if k in payload and isinstance(payload[k], list):
                 src = payload[k]
@@ -201,7 +211,7 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
 
             # Cloudflare / blocked patterns
             if status in (403, 429, 530) or "text/html" in ctype or text.lstrip().startswith("<!DOCTYPE html"):
-                if status == 530:
+                if status in (403, 429, 530):
                     flag_cookie_bad()
                 try:
                     data = await browser_fetch_json(url)
@@ -225,47 +235,45 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
         return (None, 0, "")
 
 
-async def _html_next_data(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# DOM fallback (apex) using Playwright — resilient to API host outages
+# ---------------------------------------------------------------------------
+async def _apex_dom_fallback() -> List[Dict[str, Any]]:
     """
-    Light HTML fallback: fetch /trending, parse Next.js __NEXT_DATA__ and extract coins.
-    Works only if apex cookies are valid and the page structure is unchanged.
+    Load the apex Scan page in a browser and pull its Next.js payload.
+    This avoids the API subdomain entirely (works around 1016/530).
     """
-    url = "https://pump.fun/trending"
     try:
-        async with session.get(
-            url, headers=_hdrs(url), timeout=aiohttp.ClientTimeout(total=REQ_TIMEOUT_S)
-        ) as r:
-            html = await r.text()
+        data = await browser_fetch_scan_next_data()
+        if not data:
+            return []
+        # The returned object is the Next.js data blob; find lists inside it.
+        # Try the same keys we support in _extract_items_from_payload.
+        for root in (
+            data,
+            data.get("props", {}).get("pageProps", {}) if isinstance(data, dict) else {},
+            data.get("pageProps", {}) if isinstance(data, dict) else {},
+        ):
+            items = _extract_items_from_payload(root)
+            if items:
+                return items
+        # Some pages keep the list deeper; try a generic scan:
+        def _walk(d: Any) -> List[Dict[str, Any]]:
+            if isinstance(d, list):
+                return _extract_items_from_payload(d)
+            if isinstance(d, dict):
+                got = _extract_items_from_payload(d)
+                if got:
+                    return got
+                for v in d.values():
+                    got = _walk(v)
+                    if got:
+                        return got
+            return []
+        return _walk(data) or []
     except Exception as e:
-        LOG.warning("Pump.fun HTML fallback failed: %s", e)
+        LOG.warning("Pump.fun DOM fallback error: %s", e)
         return []
-
-    m = re.search(r'id="__NEXT_DATA__"[^>]*>\s*({.*?})\s*</script>', html, re.S)
-    if not m:
-        LOG.warning("Pump.fun HTML fallback: __NEXT_DATA__ not found.")
-        return []
-
-    try:
-        data = json.loads(m.group(1))
-    except Exception:
-        return []
-
-    page = data.get("props", {}).get("pageProps", {}) if isinstance(data, dict) else {}
-    arr: Optional[List[Dict[str, Any]]] = None
-    for k in ("trending", "coins", "projects", "items", "data"):
-        v = page.get(k)
-        if isinstance(v, list) and v:
-            arr = v
-            break
-
-    items: List[Dict[str, Any]] = []
-    if isinstance(arr, list):
-        for it in arr:
-            if isinstance(it, dict):
-                mobj = _map_coin(it)
-                if mobj:
-                    items.append(mobj)
-    return items
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +293,7 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     endpoints += [
         "https://frontend-api.pump.fun/coins/trending?offset=0&limit=50",
         "https://frontend-api.pump.fun/coins/new?offset=0&limit=50",
-        # Legacy (sometimes 404s)
+        # Legacy (often 404s)
         "https://pump.fun/api/trending",
     ]
 
@@ -302,8 +310,8 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
         if items:
             return items
 
-    # 2) HTML __NEXT_DATA__ fallback (apex site)
-    items = await _html_next_data(session)
+    # 2) **Apex DOM fallback** (Playwright): parse Next.js data from Scan page
+    items = await _apex_dom_fallback()
     if items:
         return items
 
@@ -357,6 +365,5 @@ async def scan_pumpfun(*args):
         except Exception as e:
             LOG.warning("Pump.fun scan error: %s", e)
             return []
-
 
 __all__ = ["scan_pumpfun"]

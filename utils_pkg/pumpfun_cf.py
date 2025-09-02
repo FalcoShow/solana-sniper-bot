@@ -2,11 +2,23 @@
 """
 Cloudflare cookie manager for Pump.fun.
 
-- Solves CF on BOTH hosts: pump.fun and frontend-api.pump.fun
-- Keeps per-host cookie strings (cf_clearance, __cf_bm)
-- Can apply cookies to an aiohttp session
-- Provides a last-resort JSON fetch via Playwright when HTTP client hits 530/HTML
+What this module provides:
+- CF cookie refresher for BOTH hosts: `pump.fun` and `frontend-api.pump.fun`
+- Per-host cookie strings kept in-memory (cf_clearance, __cf_bm)
+- Ability to apply cookies to an aiohttp session
+- Last-resort JSON fetch via Playwright when the plain HTTP client fails
+- **NEW:** DOM fallback that loads the apex Scan page and reads its Next.js
+  data payload (works even when the API subdomain is 1016/530)
+
+Env vars you can set:
+- PUMPFUN_UA                  -> user agent to use (desktop UA is best)
+- PUMPFUN_CF_URL              -> page used to prime CF on apex (default: /advanced/scan)
+- PUMPFUN_API_PRIME_PATH      -> small JSON path used to prime the API host
+- PUMPFUN_CF_REFRESH_SEC      -> refresh cadence (default 900)
+- PUMPFUN_COOKIE              -> optional seed: "cf_clearance=...; __cf_bm=..." for apex
+- PUMPFUN_COOKIE_API          -> optional seed for API host
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -21,27 +33,55 @@ from playwright.async_api import async_playwright, Response
 
 log = logging.getLogger("pumpfun.cf")
 
-# ---------------- Config ----------------
+# =============================== Config ===============================
+
 UA = os.getenv(
     "PUMPFUN_UA",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 )
 
+# Apex page we can always visit in a browser
 PUMP_CF_PAGE = os.getenv("PUMPFUN_CF_URL", "https://pump.fun/advanced/scan")
+
+# Small JSON on API host for priming (used only inside Playwright context)
 API_PRIME_PATH = os.getenv("PUMPFUN_API_PRIME_PATH", "/coins/trending?offset=0&limit=1")
+
+# Cookie refresh cadence
 REFRESH_SEC = int(os.getenv("PUMPFUN_CF_REFRESH_SEC", "900"))
+
+# The two hosts we care about
 HOSTS = ("pump.fun", "frontend-api.pump.fun")
 
-# Persist Chromium between deploys (Render-friendly)
+# Persist Playwright browser binaries in a writable location on Render
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
 
-# ---------------- State -----------------
-_COOKIES: Dict[str, str] = {}  # host -> cookie string
+# ========================= In-Memory State ===========================
+
+_COOKIES: Dict[str, str] = {}
 _EXP: float = 0.0
 _TASK: Optional[asyncio.Task] = None
 
-# ---------------- Stealth-lite ----------------
+
+def _seed_from_env() -> None:
+    """Seed cookie jar from env so we can work even if CF priming is blocked."""
+    seeded = []
+    apex = os.getenv("PUMPFUN_COOKIE", "").strip()
+    api = os.getenv("PUMPFUN_COOKIE_API", "").strip()
+    if apex:
+        _COOKIES["pump.fun"] = apex
+        seeded.append("pump")
+    if api:
+        _COOKIES["frontend-api.pump.fun"] = api
+        seeded.append("api")
+    if seeded:
+        log.info("CF seed: loaded cookies from env (%s)", ",".join(seeded))
+
+
+_seed_from_env()
+
+# =========================== Stealth Lite ============================
+
 STEALTH_JS = r"""
 // Hide webdriver
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -90,9 +130,11 @@ EXTRA_HEADERS_JSON = {
     "Referer": "https://pump.fun/trending",
 }
 
-# ---------------- Internals ----------------
+# =========================== Internals ==============================
+
+
 async def _ensure_chromium_available() -> None:
-    """Install chromium once if missing."""
+    """Install chromium once if missing (Render occasionally builds cold)."""
     try:
         async with async_playwright() as p:
             b = await p.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -103,8 +145,13 @@ async def _ensure_chromium_available() -> None:
     try:
         log.info("Playwright: chromium not found, attempting one-time install...")
         proc = await asyncio.create_subprocess_exec(
-            "python", "-m", "playwright", "install", "chromium",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            "python",
+            "-m",
+            "playwright",
+            "install",
+            "chromium",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
         try:
             await asyncio.wait_for(proc.communicate(), timeout=180)
@@ -114,7 +161,9 @@ async def _ensure_chromium_available() -> None:
     except Exception as e:
         log.warning("Playwright one-time install failed: %s", e)
 
+
 def _cookie_for_host(all_cookies: List[Dict[str, Any]], host: str) -> Optional[str]:
+    """Build 'cf_clearance=...; __cf_bm=...' for the given host, if present."""
     jar: Dict[str, str] = {}
     for c in all_cookies or []:
         name = c.get("name")
@@ -132,10 +181,11 @@ def _cookie_for_host(all_cookies: List[Dict[str, Any]], host: str) -> Optional[s
         parts.append(f"__cf_bm={jar['__cf_bm']}")
     return "; ".join(parts)
 
+
 async def _prime_api_host(page) -> None:
     """
     Stronger priming for the API host:
-      1) Navigate to root HTML of https://frontend-api.pump.fun/ (challenge runs)
+      1) Navigate to root HTML of https://frontend-api.pump.fun/ (CF challenge runs)
       2) Reload once
       3) Same-origin fetch to a small JSON path with credentials
     """
@@ -146,7 +196,7 @@ async def _prime_api_host(page) -> None:
     for root in roots:
         try:
             await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
-            resp: Optional[Response] = await page.goto(root, wait_until="domcontentloaded", timeout=60_000)
+            await page.goto(root, wait_until="domcontentloaded", timeout=60_000)
             await page.wait_for_timeout(1000)
             try:
                 await page.reload(wait_until="domcontentloaded", timeout=20_000)
@@ -158,7 +208,6 @@ async def _prime_api_host(page) -> None:
         except Exception:
             continue
 
-    # same-origin fetch to JSON path (forces cookies to be used/issued on the API host)
     try:
         await page.set_extra_http_headers(EXTRA_HEADERS_JSON)
         res = await page.evaluate(
@@ -171,17 +220,22 @@ async def _prime_api_host(page) -> None:
             API_PRIME_PATH,
         )
         await page.wait_for_timeout(600)
-        # If still hard-blocked, do a gentle location change to same path
         if not (res and res.get("ok")):
             try:
-                await page.goto(f"https://frontend-api.pump.fun{API_PRIME_PATH}", wait_until="networkidle", timeout=30_000)
+                await page.goto(
+                    f"https://frontend-api.pump.fun{API_PRIME_PATH}",
+                    wait_until="networkidle",
+                    timeout=30_000,
+                )
                 await page.wait_for_timeout(800)
             except Exception:
                 pass
     except Exception:
         pass
 
+
 async def _prime_context_and_collect(ctx) -> Dict[str, str]:
+    """Prime both sites in a new context and collect cookies for the two hosts."""
     page = await ctx.new_page()
     await page.add_init_script(STEALTH_JS)
 
@@ -193,7 +247,7 @@ async def _prime_context_and_collect(ctx) -> Dict[str, str]:
     except Exception:
         pass
 
-    # 2) API host (must be primed via navigation + same-origin fetch)
+    # 2) API host
     try:
         await _prime_api_host(page)
     except Exception:
@@ -209,16 +263,24 @@ async def _prime_context_and_collect(ctx) -> Dict[str, str]:
             out[host] = ck
     return out
 
-# ---------------- Refresher ----------------
+
+# ============================ Refresher ==============================
+
+
 async def _refresh_once() -> None:
+    """Run one refresh cycle and schedule the next."""
     global _COOKIES, _EXP
     try:
         await _ensure_chromium_available()
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-setuid-sandbox",
-                      "--disable-blink-features=AutomationControlled"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                ],
             )
             try:
                 ctx = await browser.new_context(
@@ -230,7 +292,7 @@ async def _refresh_once() -> None:
                 )
                 new_map = await _prime_context_and_collect(ctx)
 
-                # If API cookie still missing, retry once within same context
+                # If API cookie still missing, retry once in same context
                 if "frontend-api.pump.fun" not in new_map:
                     page = await ctx.new_page()
                     await page.add_init_script(STEALTH_JS)
@@ -239,7 +301,6 @@ async def _refresh_once() -> None:
                     except Exception:
                         pass
                     await page.close()
-                    # collect again
                     all_cookies = await ctx.cookies()
                     ck_api = _cookie_for_host(all_cookies, "frontend-api.pump.fun")
                     if ck_api:
@@ -248,6 +309,7 @@ async def _refresh_once() -> None:
                 await browser.close()
 
         _COOKIES = new_map
+        # also reflect in os.environ so other places can read them if desired
         os.environ["PUMPFUN_COOKIE"] = new_map.get("pump.fun", "")
         os.environ["PUMPFUN_COOKIE_API"] = new_map.get("frontend-api.pump.fun", "")
 
@@ -266,6 +328,7 @@ async def _refresh_once() -> None:
         _EXP = time.time() + 120.0
         log.warning("CF refresh failed: %s", e)
 
+
 async def refresh_loop() -> None:
     await _refresh_once()
     while True:
@@ -274,7 +337,9 @@ async def refresh_loop() -> None:
         if time.time() >= _EXP:
             await _refresh_once()
 
+
 def ensure_cookie_refresher() -> None:
+    """Start the background refresher (call once at app start)."""
     global _TASK
     try:
         loop = asyncio.get_running_loop()
@@ -286,14 +351,21 @@ def ensure_cookie_refresher() -> None:
     _TASK = loop.create_task(refresh_loop())
     log.info("CF refresher started")
 
-# ---------------- Public helpers ----------------
+
+# ========================= Public Helpers ============================
+
+
 def get_cookie_for(url_or_host: str) -> str:
+    """Return the cookie string for this host (or empty string if absent)."""
     host = urlparse(url_or_host).hostname or url_or_host
     return _COOKIES.get(host, "")
 
+
 def flag_cookie_bad() -> None:
+    """Signal that cookies are stale; refresher will run ASAP."""
     global _EXP
     _EXP = 0.0
+
 
 def _parse_cookie_string(s: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -302,6 +374,7 @@ def _parse_cookie_string(s: str) -> Dict[str, str]:
             k, v = part.split("=", 1)
             out[k.strip()] = v.strip()
     return out
+
 
 def apply_cookies_to_session(session) -> None:
     """Attach per-host cookies to an existing aiohttp.ClientSession."""
@@ -318,15 +391,27 @@ def apply_cookies_to_session(session) -> None:
     except Exception as e:
         log.warning("apply_cookies_to_session failed: %s", e)
 
-# ---------------- Last-resort JSON fetch ----------------
+
+# ================= Last-resort JSON & DOM fetchers ===================
+
+
 async def browser_fetch_json(url: str) -> Optional[Any]:
+    """
+    Try to fetch JSON with Playwright. Useful when the plain client gets 530/HTML.
+    If the host is the API subdomain, we first try to prime that host in the same
+    context, then attempt both page.goto and a same-origin fetch().
+    """
     try:
         await _ensure_chromium_available()
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-setuid-sandbox",
-                      "--disable-blink-features=AutomationControlled"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                ],
             )
             try:
                 ctx = await browser.new_context(
@@ -339,15 +424,17 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                 page = await ctx.new_page()
                 await page.add_init_script(STEALTH_JS)
 
-                host = urlparse(url).hostname or ""
+                host = (urlparse(url).hostname or "").lower()
                 if host.endswith("frontend-api.pump.fun"):
                     # Prime this context for the API host
                     await _prime_api_host(page)
 
-                    # Try navigation directly to the JSON URL first
+                    # Attempt navigation to the JSON URL (some CF configs allow it)
                     try:
                         await page.set_extra_http_headers(EXTRA_HEADERS_JSON)
-                        resp: Optional[Response] = await page.goto(url, wait_until="networkidle", timeout=45_000)
+                        resp: Optional[Response] = await page.goto(
+                            url, wait_until="networkidle", timeout=45_000
+                        )
                         if resp and resp.ok:
                             text = await resp.text()
                             try:
@@ -355,7 +442,9 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                             except Exception:
                                 pass
                         status = resp.status if resp else 0
-                        log.warning("browser_fetch_json: %s -> HTTP %s (page.goto)", url, status or 0)
+                        log.warning(
+                            "browser_fetch_json: %s -> HTTP %s (page.goto)", url, status or 0
+                        )
                         if status in (403, 429, 530):
                             flag_cookie_bad()
                     except Exception:
@@ -381,14 +470,16 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                         if res and res.get("ok"):
                             return res.get("data")
                         status = res.get("status", 0) if isinstance(res, dict) else 0
-                        log.warning("browser_fetch_json: %s -> HTTP %s (page.fetch)", url, status)
+                        log.warning(
+                            "browser_fetch_json: %s -> HTTP %s (page.fetch)", url, status
+                        )
                         if status in (403, 429, 530):
                             flag_cookie_bad()
                         return None
                     finally:
                         await page.close()
 
-                # Non-API host: use request client
+                # Non-API host: use request client directly
                 r = await ctx.request.get(url, headers=EXTRA_HEADERS_JSON, timeout=30_000)
                 if r.ok:
                     try:
@@ -410,6 +501,74 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
         log.warning("browser_fetch_json failed: %s", e)
         return None
 
+
+async def browser_fetch_scan_next_data() -> Optional[dict]:
+    """
+    **DOM fallback**: open the apex Scan page and return its Next.js payload.
+    This avoids the API subdomain entirely and works when that host returns 1016/530.
+
+    Returns:
+        dict (Next.js data JSON) or None if not found/parsable.
+    """
+    try:
+        await _ensure_chromium_available()
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            try:
+                ctx = await browser.new_context(
+                    user_agent=UA,
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    viewport={"width": 1366, "height": 768},
+                    color_scheme="light",
+                )
+                page = await ctx.new_page()
+                await page.add_init_script(STEALTH_JS)
+
+                # Visit apex Scan page and let CF run
+                await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
+                await page.goto(PUMP_CF_PAGE, wait_until="networkidle", timeout=60_000)
+
+                # 1) Classic Next.js script
+                try:
+                    el = await page.wait_for_selector("script#__NEXT_DATA__", timeout=8_000)
+                    txt = await el.text_content()
+                    if txt:
+                        return json.loads(txt)
+                except Exception:
+                    pass
+
+                # 2) App Router / streaming JSON blocks
+                scripts = await page.locator('script[type="application/json"]').all()
+                for s in scripts:
+                    try:
+                        t = await s.text_content()
+                        if not t:
+                            continue
+                        # heuristic: prefer blocks that look like page data
+                        if '"pageProps"' in t or '"trending"' in t or '"coins"' in t:
+                            return json.loads(t)
+                    except Exception:
+                        continue
+
+                return None
+            finally:
+                await browser.close()
+    except Exception as e:
+        log.warning("browser_fetch_scan_next_data failed: %s", e)
+        return None
+
+
+# ============================ Exports ================================
+
 __all__ = [
     "ensure_cookie_refresher",
     "refresh_loop",
@@ -417,4 +576,5 @@ __all__ = [
     "apply_cookies_to_session",
     "flag_cookie_bad",
     "browser_fetch_json",
+    "browser_fetch_scan_next_data",  # NEW
 ]
