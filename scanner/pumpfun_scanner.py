@@ -1,4 +1,4 @@
-# scanner/pumpfun_scanner.py — v6.2 (Apex-first: next-data → DOM → HTML → API)
+# scanner/pumpfun_scanner.py — v7 (Apex-first: next-data → DOM → HTML → API; proxy-aware)
 from __future__ import annotations
 
 import os
@@ -29,16 +29,22 @@ try:
 except Exception:  # pragma: no cover
     def apply_cookies_to_session(_session):  # type: ignore
         pass
+
     def get_cookie_for(_url_or_host: str) -> str:  # type: ignore
         return os.getenv("PUMPFUN_COOKIE_API", "") or os.getenv("PUMPFUN_COOKIE", "")
+
     def flag_cookie_bad() -> None:  # type: ignore
         pass
+
     async def browser_fetch_json(_url: str):  # type: ignore
         return None
+
     async def browser_fetch_trending_via_next_data(_limit: int = 50):  # type: ignore
         return None
+
     async def browser_scrape_trending_dom(_limit: int = 50):  # type: ignore
         return None
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -48,10 +54,12 @@ UA = os.getenv("PUMPFUN_UA") or (
     "(KHTML, like Gecko) Chrome/126 Safari/537.36"
 )
 
+# Optional override endpoint (for testing)
 OVERRIDE_URL = os.getenv("PUMPFUN_URL", "").strip()
 
 REQ_TIMEOUT_S = int(os.getenv("PUMPFUN_HTTP_TIMEOUT_S", "15"))
 SESSION_LIMIT = int(os.getenv("PUMPFUN_HTTP_CONN_LIMIT", "30"))
+
 
 # ---------------------------------------------------------------------------
 # Header builder
@@ -62,6 +70,7 @@ def _host_of(url: str) -> str:
         return (urlparse(url).hostname or "").lower()
     except Exception:
         return ""
+
 
 def _hdrs(url: str) -> Dict[str, str]:
     host = _host_of(url)
@@ -80,23 +89,30 @@ def _hdrs(url: str) -> Dict[str, str]:
         h["Cookie"] = ck
     return h
 
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 def _now() -> float:
     return time.time()
 
+
 def _age_min(created_ts: Optional[float]) -> Optional[float]:
     try:
         if created_ts is None:
             return None
+        # accept seconds or milliseconds
         if float(created_ts) > 10_000_000_000:
             created_ts = float(created_ts) / 1000.0
         return max(0.0, (_now() - float(created_ts)) / 60.0)
     except Exception:
         return None
 
+
 def _map_coin(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Normalize multiple Pump.fun response shapes into a common candidate dict.
+    """
     try:
         mint = (
             obj.get("mintAddress")
@@ -149,7 +165,11 @@ def _map_coin(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
+
 def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    """
+    Accept a server payload (list or dict) and return a list of mapped coin dicts.
+    """
     items: List[Dict[str, Any]] = []
 
     if isinstance(payload, list):
@@ -179,10 +199,15 @@ def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
                 items.append(m)
     return items
 
+
 # ---------------------------------------------------------------------------
 # HTTP helpers (JSON primary)
 # ---------------------------------------------------------------------------
 async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[Any], int, str]:
+    """
+    Primary fetch: try aiohttp. If HTML/403/429/530, mark cookies bad and
+    attempt a browser-based JSON fetch for the same URL.
+    """
     try:
         async with session.get(
             url, headers=_hdrs(url), timeout=aiohttp.ClientTimeout(total=REQ_TIMEOUT_S)
@@ -192,6 +217,7 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
             first = text[:120].replace("\n", " ")
             ctype = (r.headers.get("content-type") or "").lower()
 
+            # Cloudflare / blocked patterns
             if status in (403, 429, 530) or "text/html" in ctype or text.lstrip().startswith("<!DOCTYPE html"):
                 if status in (403, 429, 530):
                     flag_cookie_bad()
@@ -203,6 +229,7 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
                     pass
                 return (None, status, first)
 
+            # Normal JSON path
             try:
                 return (json.loads(text), status, first)
             except Exception:
@@ -210,14 +237,17 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
                     return (await r.json(content_type=None), status, first)
                 except Exception:
                     return (None, status, first)
+
     except Exception as e:
         LOG.warning("Pump.fun request failed: %s %s", url, e)
         return (None, 0, "")
+
 
 # ---------------------------------------------------------------------------
 # HTML helpers: scrape coin links directly from apex HTML (no JS)
 # ---------------------------------------------------------------------------
 _BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,64}"
+
 
 def _uniq(seq: List[str]) -> List[str]:
     seen = set()
@@ -227,6 +257,7 @@ def _uniq(seq: List[str]) -> List[str]:
             seen.add(x)
             out.append(x)
     return out
+
 
 async def _html_scrape_links(session: aiohttp.ClientSession, path: str, limit: int = 50) -> List[Dict[str, Any]]:
     """
@@ -242,7 +273,7 @@ async def _html_scrape_links(session: aiohttp.ClientSession, path: str, limit: i
         return []
 
     # Look for /coin/<mint>, /coins/<mint>, /token/<mint>, or ?mint=<mint>
-    mints = []
+    mints: List[str] = []
     for pattern in [
         rf'href="(?:https://pump\.fun)?/coin/({_BASE58})"',
         rf'href="(?:https://pump\.fun)?/coins/({_BASE58})"',
@@ -254,6 +285,7 @@ async def _html_scrape_links(session: aiohttp.ClientSession, path: str, limit: i
 
     mints = _uniq(mints)[:limit]
     return [{"mint": m} for m in mints]
+
 
 # ---------------------------------------------------------------------------
 # HTML __NEXT_DATA__ fallback (legacy, may be absent)
@@ -272,6 +304,7 @@ async def _html_next_data(session: aiohttp.ClientSession) -> List[Dict[str, Any]
     m = re.search(r'id="__NEXT_DATA__"[^>]*>\s*({.*?})\s*</script>', html, re.S)
     if not m:
         return []
+
     try:
         data = json.loads(m.group(1))
     except Exception:
@@ -294,11 +327,12 @@ async def _html_next_data(session: aiohttp.ClientSession) -> List[Dict[str, Any]
                     items.append(mobj)
     return items
 
+
 # ---------------------------------------------------------------------------
 # Scanner core
 # ---------------------------------------------------------------------------
 async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
-    # Ensure the session has apex cookies at least.
+    # Ensure the session has current cookies for both hosts.
     apply_cookies_to_session(session)
 
     # 0) Apex Next.js data (/_next/data) via Playwright (cheap; may be absent)
@@ -321,7 +355,7 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     try:
         dom = await browser_scrape_trending_dom(limit=50)
         if isinstance(dom, list) and dom:
-            items: List[Dict[str, Any]] = []
+            items = []
             for it in dom:
                 if isinstance(it, dict):
                     m = _map_coin(it)
@@ -365,7 +399,7 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
             LOG.info("scanner.pumpfun: HTML apex → %s items", len(items))
             return items
 
-    # 3) Direct JSON endpoints (CF-aware) — will likely 530, but keep for completeness
+    # 3) Direct JSON endpoints (CF-aware) — may 530, but keep for completeness
     endpoints += [
         "https://frontend-api.pump.fun/coins/trending?offset=0&limit=50",
         "https://frontend-api.pump.fun/coins/new?offset=0&limit=50",
@@ -401,6 +435,7 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     LOG.warning("Pump.fun all endpoints failed: tried=%s", "; ".join(tried))
     return []
 
+
 # ---------------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------------
@@ -428,10 +463,11 @@ async def scan_pumpfun(*args):
             LOG.warning("Pump.fun scan error (session): %s", e)
             return []
 
-sslctx = ssl.create_default_context(cafile=certifi.where())
-timeout = aiohttp.ClientTimeout(total=REQ_TIMEOUT_S + 5)
-conn = aiohttp.TCPConnector(ssl=sslctx, limit=SESSION_LIMIT)
-async with aiohttp.ClientSession(connector=conn, timeout=timeout, trust_env=True) as local:
+    # Create a local session if none was supplied (proxy/env aware via trust_env)
+    sslctx = ssl.create_default_context(cafile=certifi.where())
+    timeout = aiohttp.ClientTimeout(total=REQ_TIMEOUT_S + 5)
+    conn = aiohttp.TCPConnector(ssl=sslctx, limit=SESSION_LIMIT)
+    async with aiohttp.ClientSession(connector=conn, timeout=timeout, trust_env=True) as local:
         try:
             items = await _scan_inner(local)
             LOG.info("scanner.pumpfun: %s candidates", len(items))
@@ -439,5 +475,6 @@ async with aiohttp.ClientSession(connector=conn, timeout=timeout, trust_env=True
         except Exception as e:
             LOG.warning("Pump.fun scan error: %s", e)
             return []
+
 
 __all__ = ["scan_pumpfun"]
