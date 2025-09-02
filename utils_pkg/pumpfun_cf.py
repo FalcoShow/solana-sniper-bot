@@ -581,6 +581,132 @@ async def browser_fetch_scan_next_data(limit: int = 50) -> Optional[List[Dict[st
         log.warning("browser_fetch_scan_next_data failed: %s", e)
         return None
 
+# === NEXT.JS DATA HELPERS (apex-only, works when API host is blocked) ===
+
+async def _browser_get_build_id(page) -> Optional[str]:
+    """Return Next.js buildId from window.__NEXT_DATA__ on the current page."""
+    try:
+        bid = await page.evaluate("window.__NEXT_DATA__ && window.__NEXT_DATA__.buildId || null")
+        if bid and isinstance(bid, str):
+            return bid
+    except Exception:
+        pass
+    # Fallback: parse HTML for __NEXT_DATA__
+    try:
+        html = await page.content()
+        import re, json as _json
+        m = re.search(r'id="__NEXT_DATA__"[^>]*>\s*({.*?})\s*</script>', html, re.S)
+        if m:
+            j = _json.loads(m.group(1))
+            bid = j.get("buildId")
+            if bid and isinstance(bid, str):
+                return bid
+    except Exception:
+        pass
+    return None
+
+
+async def browser_fetch_next_json(page_path: str) -> Optional[dict]:
+    """
+    Fetch a Next.js page's JSON via /_next/data/<buildId>/<path>.json on apex host.
+    Example: page_path="/trending" -> /_next/data/<buildId>/trending.json
+    """
+    try:
+        await _ensure_chromium_available()
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-setuid-sandbox",
+                      "--disable-blink-features=AutomationControlled"],
+            )
+            try:
+                ctx = await browser.new_context(
+                    user_agent=UA,
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    viewport={"width": 1366, "height": 768},
+                    color_scheme="light",
+                )
+                page = await ctx.new_page()
+                await page.add_init_script(STEALTH_JS)
+
+                # 1) Load the page on apex (no API host involved)
+                base = "https://pump.fun"
+                path = page_path if page_path.startswith("/") else f"/{page_path}"
+                await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
+                await page.goto(base + path, wait_until="domcontentloaded", timeout=60_000)
+                try:
+                    await page.wait_for_selector('script#__NEXT_DATA__', timeout=30_000)
+                except Exception:
+                    await page.wait_for_timeout(1500)
+
+                # 2) Discover buildId, then fetch Next.js data JSON
+                build_id = await _browser_get_build_id(page)
+                if not build_id:
+                    log.warning("next-data: buildId not found for %s", path)
+                    return None
+
+                # Construct the JSON URL
+                # e.g. /_next/data/<buildId>/trending.json or /advanced/scan.json
+                tail = path.lstrip("/")
+                if not tail.endswith(".json"):
+                    if not tail.endswith("/"):
+                        tail = tail + ".json"
+                    else:
+                        tail = tail[:-1] + ".json"
+
+                data_url = f"{base}/_next/data/{build_id}/{tail}"
+                r = await ctx.request.get(data_url, headers=EXTRA_HEADERS_JSON, timeout=30_000)
+                if r.ok:
+                    try:
+                        return await r.json()
+                    except Exception:
+                        t = await r.text()
+                        import json as _json
+                        try:
+                            return _json.loads(t)
+                        except Exception:
+                            return None
+                log.warning("next-data: fetch %s -> HTTP %s", data_url, r.status)
+                return None
+            finally:
+                await browser.close()
+    except Exception as e:
+        log.warning("browser_fetch_next_json failed: %s", e)
+        return None
+
+
+async def browser_fetch_trending_via_next_data(limit: int = 50) -> Optional[List[Dict[str, Any]]]:
+    """
+    Get trending items via apex Next.js data JSON: first try /trending, then /advanced/scan.
+    Returns a list of raw item dicts (not yet normalized).
+    """
+    candidates = ["/trending", "/advanced/scan"]
+    for path in candidates:
+        data = await browser_fetch_next_json(path)
+        if not isinstance(data, dict):
+            continue
+
+        # Try common Next.js data shapes
+        page = data.get("pageProps", {}) if isinstance(data, dict) else {}
+        for k in ("trending", "coins", "projects", "items", "data"):
+            v = page.get(k)
+            if isinstance(v, list) and v:
+                out = v[:limit]
+                log.info("next-data: got %d items from %s", len(out), path)
+                return out
+
+        # Some apps nest under pageProps.data.<key>
+        if isinstance(page.get("data"), dict):
+            for k, v in page["data"].items():
+                if isinstance(v, list) and v:
+                    out = v[:limit]
+                    log.info("next-data: got %d items from %s (data.%s)", len(out), path, k)
+                    return out
+
+    log.warning("next-data: no items found on apex JSON for /trending or /advanced/scan")
+    return None
+
 # ============================ Exports ================================
 
 __all__ = [
@@ -590,5 +716,7 @@ __all__ = [
     "apply_cookies_to_session",
     "flag_cookie_bad",
     "browser_fetch_json",
-    "browser_fetch_scan_next_data",  # NEW
+    "browser_fetch_scan_next_data",
+    "browser_fetch_next_json", 
+    "browser_fetch_trending_via_next_data",  
 ]
