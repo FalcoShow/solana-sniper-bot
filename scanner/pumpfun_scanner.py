@@ -428,10 +428,10 @@ async def scan_pumpfun(*args):
             LOG.warning("Pump.fun scan error (session): %s", e)
             return []
 
-    sslctx = ssl.create_default_context(cafile=certifi.where())
-    timeout = aiohttp.ClientTimeout(total=REQ_TIMEOUT_S + 5)
-    conn = aiohttp.TCPConnector(ssl=sslctx, limit=SESSION_LIMIT)
-    async with aiohttp.ClientSession(connector=conn, timeout=timeout) as local:
+sslctx = ssl.create_default_context(cafile=certifi.where())
+timeout = aiohttp.ClientTimeout(total=REQ_TIMEOUT_S + 5)
+conn = aiohttp.TCPConnector(ssl=sslctx, limit=SESSION_LIMIT)
+async with aiohttp.ClientSession(connector=conn, timeout=timeout, trust_env=True) as local:
         try:
             items = await _scan_inner(local)
             LOG.info("scanner.pumpfun: %s candidates", len(items))

@@ -7,8 +7,8 @@ What this module provides:
 - Per-host cookie strings kept in-memory (cf_clearance, __cf_bm)
 - Ability to apply cookies to an aiohttp session
 - Last-resort JSON fetch via Playwright when the plain HTTP client fails
-- **NEW:** DOM fallback that loads the apex Scan page and reads its Next.js
-  data payload (works even when the API subdomain is 1016/530)
+- DOM fallback that loads the apex Scan page and reads its Next.js data payload
+- **NEW:** Full outbound proxy support for Playwright
 
 Env vars you can set:
 - PUMPFUN_UA                  -> user agent to use (desktop UA is best)
@@ -17,6 +17,9 @@ Env vars you can set:
 - PUMPFUN_CF_REFRESH_SEC      -> refresh cadence (default 900)
 - PUMPFUN_COOKIE              -> optional seed: "cf_clearance=...; __cf_bm=..." for apex
 - PUMPFUN_COOKIE_API          -> optional seed for API host
+- PLAYWRIGHT_PROXY            -> proxy URL (preferred), e.g. https://user:pass@host:port
+- PUMPFUN_PROXY               -> proxy URL (fallback)
+- HTTPS_PROXY / HTTP_PROXY    -> standard proxy envs (fallbacks)
 """
 
 from __future__ import annotations
@@ -61,6 +64,81 @@ os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwri
 _COOKIES: Dict[str, str] = {}
 _EXP: float = 0.0
 _TASK: Optional[asyncio.Task] = None
+
+# ============================== Proxy ================================
+
+_PROXY_LOGGED = False  # avoid logging the proxy more than once
+
+
+def _resolve_proxy_url() -> Optional[str]:
+    """
+    Resolve a proxy URL from env (priority order):
+      1) PLAYWRIGHT_PROXY
+      2) PUMPFUN_PROXY
+      3) HTTPS_PROXY
+      4) HTTP_PROXY
+    """
+    return (
+        os.getenv("PLAYWRIGHT_PROXY")
+        or os.getenv("PUMPFUN_PROXY")
+        or os.getenv("HTTPS_PROXY")
+        or os.getenv("HTTP_PROXY")
+    )
+
+
+def _playwright_proxy() -> Optional[dict]:
+    """
+    Build a Playwright proxy dict from env. Accepts credentials in the URL,
+    e.g. https://user:pass@host:port
+    """
+    raw = _resolve_proxy_url()
+    if not raw:
+        return None
+    u = urlparse(raw)
+    if not (u.scheme and u.hostname and u.port):
+        return None
+    proxy = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+    if u.username:
+        proxy["username"] = u.username
+    if u.password:
+        proxy["password"] = u.password
+    return proxy
+
+
+def _mask_proxy_for_log(url: str) -> str:
+    try:
+        u = urlparse(url or "")
+        if not u.scheme:
+            return url
+        hostport = f"{u.hostname or ''}:{u.port or ''}".rstrip(":")
+        return f"{u.scheme}://{hostport}"
+    except Exception:
+        return url or ""
+
+
+async def _launch_browser(p):
+    """
+    Centralized launcher so every Playwright usage consistently picks up the proxy
+    and launch args.
+    """
+    global _PROXY_LOGGED
+    proxy_cfg = _playwright_proxy()
+
+    if proxy_cfg and not _PROXY_LOGGED:
+        raw = _resolve_proxy_url()
+        log.info("Playwright proxy enabled: %s", _mask_proxy_for_log(raw or ""))
+        _PROXY_LOGGED = True
+
+    return await p.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-setuid-sandbox",
+            "--disable-blink-features=AutomationControlled",
+        ],
+        proxy=proxy_cfg,
+    )
 
 
 def _seed_from_env() -> None:
@@ -137,7 +215,7 @@ async def _ensure_chromium_available() -> None:
     """Install chromium once if missing (Render occasionally builds cold)."""
     try:
         async with async_playwright() as p:
-            b = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+            b = await _launch_browser(p)
             await b.close()
         return
     except Exception:
@@ -203,7 +281,6 @@ async def _prime_api_host(page) -> None:
             except Exception:
                 pass
             await page.wait_for_timeout(800)
-            # If HTML loaded, CF likely ran; proceed to same-origin fetch
             break
         except Exception:
             continue
@@ -273,15 +350,7 @@ async def _refresh_once() -> None:
     try:
         await _ensure_chromium_available()
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
+            browser = await _launch_browser(p)
             try:
                 ctx = await browser.new_context(
                     user_agent=UA,
@@ -357,7 +426,8 @@ def ensure_cookie_refresher() -> None:
 
 def get_cookie_for(url_or_host: str) -> str:
     """Return the cookie string for this host (or empty string if absent)."""
-    host = urlparse(url_or_host).hostname or url_or_host
+    from urllib.parse import urlparse as _urlparse
+    host = _urlparse(url_or_host).hostname or url_or_host
     return _COOKIES.get(host, "")
 
 
@@ -404,15 +474,7 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
     try:
         await _ensure_chromium_available()
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
+            browser = await _launch_browser(p)
             try:
                 ctx = await browser.new_context(
                     user_agent=UA,
@@ -525,11 +587,7 @@ async def browser_fetch_scan_next_data(limit: int = 50) -> Optional[List[Dict[st
     try:
         await _ensure_chromium_available()
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-setuid-sandbox",
-                      "--disable-blink-features=AutomationControlled"],
-            )
+            browser = await _launch_browser(p)
             try:
                 ctx = await browser.new_context(
                     user_agent=UA,
@@ -544,18 +602,14 @@ async def browser_fetch_scan_next_data(limit: int = 50) -> Optional[List[Dict[st
                 for url in targets:
                     try:
                         await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
-                        # Be lenient: don't wait for networkidle; it often never happens with CF
                         await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                        # Wait (best-effort) for the Next.js data to appear
                         try:
                             await page.wait_for_selector('script#__NEXT_DATA__', timeout=45_000)
                         except Exception:
                             await page.wait_for_timeout(1500)
 
-                        # Prefer reading window.__NEXT_DATA__ directly
                         payload = await page.evaluate("window.__NEXT_DATA__ || null")
                         if not payload:
-                            # Fallback: parse the HTML for the script tag
                             html = await page.content()
                             import re, json as _json
                             m = re.search(r'id="__NEXT_DATA__"[^>]*>\s*({.*?})\s*</script>', html, re.S)
@@ -581,6 +635,7 @@ async def browser_fetch_scan_next_data(limit: int = 50) -> Optional[List[Dict[st
         log.warning("browser_fetch_scan_next_data failed: %s", e)
         return None
 
+
 # === NEXT.JS DATA HELPERS (apex-only, works when API host is blocked) ===
 
 async def _browser_get_build_id(page) -> Optional[str]:
@@ -591,7 +646,6 @@ async def _browser_get_build_id(page) -> Optional[str]:
             return bid
     except Exception:
         pass
-    # Fallback: parse HTML for __NEXT_DATA__
     try:
         html = await page.content()
         import re, json as _json
@@ -614,11 +668,7 @@ async def browser_fetch_next_json(page_path: str) -> Optional[dict]:
     try:
         await _ensure_chromium_available()
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-setuid-sandbox",
-                      "--disable-blink-features=AutomationControlled"],
-            )
+            browser = await _launch_browser(p)
             try:
                 ctx = await browser.new_context(
                     user_agent=UA,
@@ -630,7 +680,6 @@ async def browser_fetch_next_json(page_path: str) -> Optional[dict]:
                 page = await ctx.new_page()
                 await page.add_init_script(STEALTH_JS)
 
-                # 1) Load the page on apex (no API host involved)
                 base = "https://pump.fun"
                 path = page_path if page_path.startswith("/") else f"/{page_path}"
                 await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
@@ -640,14 +689,11 @@ async def browser_fetch_next_json(page_path: str) -> Optional[dict]:
                 except Exception:
                     await page.wait_for_timeout(1500)
 
-                # 2) Discover buildId, then fetch Next.js data JSON
                 build_id = await _browser_get_build_id(page)
                 if not build_id:
                     log.warning("next-data: buildId not found for %s", path)
                     return None
 
-                # Construct the JSON URL
-                # e.g. /_next/data/<buildId>/trending.json or /advanced/scan.json
                 tail = path.lstrip("/")
                 if not tail.endswith(".json"):
                     if not tail.endswith("/"):
@@ -687,7 +733,6 @@ async def browser_fetch_trending_via_next_data(limit: int = 50) -> Optional[List
         if not isinstance(data, dict):
             continue
 
-        # Try common Next.js data shapes
         page = data.get("pageProps", {}) if isinstance(data, dict) else {}
         for k in ("trending", "coins", "projects", "items", "data"):
             v = page.get(k)
@@ -696,7 +741,6 @@ async def browser_fetch_trending_via_next_data(limit: int = 50) -> Optional[List
                 log.info("next-data: got %d items from %s", len(out), path)
                 return out
 
-        # Some apps nest under pageProps.data.<key>
         if isinstance(page.get("data"), dict):
             for k, v in page["data"].items():
                 if isinstance(v, list) and v:
@@ -707,14 +751,14 @@ async def browser_fetch_trending_via_next_data(limit: int = 50) -> Optional[List
     log.warning("next-data: no items found on apex JSON for /trending or /advanced/scan")
     return None
 
+
 async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str, Any]]]:
     """
     Load apex pages and pull mints without touching the API host.
     Tries DOM selectors first; if none found, falls back to regex over raw HTML.
     Returns [{'mint': <base58>}, ...]
     """
-    from playwright.async_api import async_playwright
-    from urllib.parse import urlparse
+    import re
 
     PAGES = ["/trending", "/advanced/scan", "/"]  # try a few apex routes
 
@@ -722,10 +766,10 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
         s, out = set(), []
         for x in seq:
             if x and x not in s:
-                s.add(x); out.append(x)
+                s.add(x)
+                out.append(x)
         return out
 
-    # small helpers
     def _parse_cookie_string(s: str) -> Dict[str, str]:
         out: Dict[str, str] = {}
         for part in (s or "").split(";"):
@@ -738,15 +782,17 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
         cookies = []
         for name in ("cf_clearance", "__cf_bm"):
             if name in cjar:
-                cookies.append({
-                    "name": name,
-                    "value": cjar[name],
-                    "domain": "pump.fun",
-                    "path": "/",
-                    "httpOnly": False,
-                    "secure": True,
-                    "sameSite": "Lax",
-                })
+                cookies.append(
+                    {
+                        "name": name,
+                        "value": cjar[name],
+                        "domain": "pump.fun",
+                        "path": "/",
+                        "httpOnly": False,
+                        "secure": True,
+                        "sameSite": "Lax",
+                    }
+                )
         return cookies
 
     BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,64}"
@@ -754,11 +800,7 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
     try:
         await _ensure_chromium_available()
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-setuid-sandbox",
-                      "--disable-blink-features=AutomationControlled"],
-            )
+            browser = await _launch_browser(p)
             try:
                 ctx = await browser.new_context(
                     user_agent=UA,
@@ -789,28 +831,23 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
                     except Exception:
                         continue
 
-                    # Give hydration a chance (but don’t depend on it)
                     try:
                         await page.wait_for_timeout(800)
-                        # Try to find anchors to coin pages or elements with data-mint
                         anchors = await page.locator('a[href*="/coin/"], a[href*="/coins/"], [data-mint]').all()
                         if anchors:
-                            # Try to scroll to reveal lazy items
                             for _ in range(4):
                                 await page.mouse.wheel(0, 1200)
                                 await page.wait_for_timeout(250)
-                        # Collect mints from DOM
+
                         mints: List[str] = []
-                        for el in anchors[: max(200, limit*3) ]:
+                        for el in anchors[: max(200, limit * 3)]:
                             href = await el.get_attribute("href")
                             dm = await el.get_attribute("data-mint")
                             if dm:
                                 mints.append(dm)
                             if href:
-                                # normalize relative
                                 if href.startswith("/"):
                                     href = f"https://pump.fun{href}"
-                                # match /coin/<mint> or /coins/<mint> or ?mint=<mint>
                                 m = re.search(rf"/coins?/(?P<m>{BASE58})", href)
                                 if not m:
                                     m = re.search(rf"[?&]mint=(?P<m>{BASE58})", href)
@@ -824,7 +861,6 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
                             if len(_uniq(found)) >= limit:
                                 break
 
-                        # Fallback: regex over raw HTML (no JS required)
                         html = await page.content()
                         extra = []
                         for pat in [
@@ -855,6 +891,7 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
         log.warning("browser_scrape_trending_dom failed: %s", e)
         return None
 
+
 # ============================ Exports ================================
 
 __all__ = [
@@ -865,7 +902,7 @@ __all__ = [
     "flag_cookie_bad",
     "browser_fetch_json",
     "browser_fetch_scan_next_data",
-    "browser_fetch_next_json", 
-    "browser_fetch_trending_via_next_data",  
+    "browser_fetch_next_json",
+    "browser_fetch_trending_via_next_data",
     "browser_scrape_trending_dom",
 ]
