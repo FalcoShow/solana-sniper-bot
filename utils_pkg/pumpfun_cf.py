@@ -229,23 +229,37 @@ def apply_cookies_to_session(session) -> None:
     except Exception as e:
         log.warning("apply_cookies_to_session failed: %s", e)
 
+# --- replace the whole browser_fetch_json in utils_pkg/pumpfun_cf.py ---
+
 async def browser_fetch_json(url: str) -> Optional[Any]:
     """
-    Last-resort JSON GET via Playwright. Ensures CF is solved for the
-    target host in this context before the request; retries once on 530.
+    Last-resort JSON GET via Playwright.
+
+    Flow:
+      1) Try Playwright's request API (fast path).
+      2) If CF returns 530 (or not ok), open a real page and:
+         - ensure CF is solved on apex and API root,
+         - try to sniff the network response for /coins/(trending|new),
+         - finally, run window.fetch(url) from the page (browser context).
     """
     host = urlparse(url).hostname or ""
+    path = urlparse(url).path or ""
+    is_trending = "/coins/trending" in url
+    is_new      = "/coins/new" in url
+
     try:
+        # 1) open context (auto-installs chromium once if missing)
         p, browser, ctx = await _open_context()
         try:
             page = await ctx.new_page()
 
-            # Always prime apex first – it often makes API host challenge easier
+            # Always prime CF on apex
             try:
                 await page.goto(PUMP_CF_PAGE, wait_until="networkidle", timeout=60_000)
             except Exception:
                 pass
 
+            # And on the API host
             if host.endswith(API_HOST):
                 try:
                     await page.goto(API_ROOT, wait_until="domcontentloaded", timeout=60_000)
@@ -253,16 +267,61 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                 except Exception:
                     pass
 
-            # Try fetch, retry once on 530 after another brief wait
-            for attempt in (1, 2):
-                r = await ctx.request.get(url, timeout=30_000)
-                if r.ok:
-                    return await r.json()
-                if r.status == 530 and attempt == 1:
-                    await page.wait_for_timeout(2000)
-                    continue
-                log.warning("browser_fetch_json: %s -> HTTP %s", url, r.status)
+            # 2) Fast path: context request
+            r = await ctx.request.get(url, timeout=30_000)
+            if r.ok:
+                return await r.json()
+            bad_status = r.status
+
+            # 3) Sniff path-specific network if we're asking for trending/new
+            # Navigate the visible page to a route that triggers those API calls naturally.
+            if is_trending or is_new:
+                try:
+                    # Trending tab exists for sure; it still fires the same API calls we want.
+                    await page.goto(f"https://{PUMP_HOST}/trending", wait_until="domcontentloaded", timeout=60_000)
+
+                    # If the site itself hits our API URL, catch it.
+                    async def _want(resp):
+                        ru = resp.url or ""
+                        return ru.startswith(f"https://{API_HOST}/coins/") and ("/trending" in ru or "/new" in ru)
+
+                    try:
+                        sniff = await page.wait_for_response(_want, timeout=20_000)
+                        if sniff and sniff.ok:
+                            try:
+                                return await sniff.json()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            # 4) Final fallback: run window.fetch from the page (browser environment)
+            try:
+                js = """
+                    async (u) => {
+                      try {
+                        const r = await fetch(u, { credentials: "include" });
+                        if (!r.ok) return { __status: r.status };
+                        return await r.json();
+                      } catch (e) {
+                        return { __error: String(e) };
+                      }
+                    }
+                """
+                data = await page.evaluate(js, url)
+                if isinstance(data, dict) and "__status" in data:
+                    log.warning("browser_fetch_json: %s -> HTTP %s (page.fetch)", url, data["__status"])
+                    return None
+                if isinstance(data, dict) and "__error" in data:
+                    log.warning("browser_fetch_json page.fetch error: %s", data["__error"])
+                    return None
+                return data
+            except Exception as e:
+                log.warning("browser_fetch_json page.fetch failed: %s", e)
                 return None
+
         finally:
             await browser.close()
             await p.stop()
