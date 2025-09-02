@@ -25,7 +25,7 @@ import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Response
 
 log = logging.getLogger("pumpfun.cf")
 
@@ -36,15 +36,16 @@ UA = os.getenv(
     "(KHTML, like Gecko) Chrome/126 Safari/537.36",
 )
 
+# A real Pump.fun page that triggers CF for the apex host
 PUMP_CF_PAGE = os.getenv("PUMPFUN_CF_URL", "https://pump.fun/advanced/scan")
 
-# Just used to warm the API host; the path doesn’t really matter
-API_WARM_PATH = "/coins/trending?offset=0&limit=1"
+# Path on the API host we can navigate to (a JSON endpoint works; CF will serve a challenge page)
+API_PRIME_PATH = os.getenv("PUMPFUN_API_PRIME_PATH", "/coins/trending?offset=0&limit=1")
 
 REFRESH_SEC = int(os.getenv("PUMPFUN_CF_REFRESH_SEC", "900"))  # ~15 minutes
 HOSTS = ("pump.fun", "frontend-api.pump.fun")
 
-# Prefer a persistent path for browser binaries on Render
+# Keep browser binaries between deploys (Render-friendly)
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
 
 # ---------- State ----------
@@ -53,9 +54,9 @@ _EXP: float = 0.0
 _TASK: Optional[asyncio.Task] = None
 
 
-# ---------- Helpers ----------
+# ---------- Utility ----------
 async def _ensure_chromium_available() -> None:
-    """One-time install if Chromium isn’t present at runtime."""
+    """Install Chromium once if not present."""
     try:
         async with async_playwright() as p:
             b = await p.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -99,33 +100,59 @@ def _cookie_for_host(all_cookies: List[Dict[str, Any]], host: str) -> Optional[s
     return "; ".join(parts)
 
 
+async def _prime_api_host_via_navigation(page) -> None:
+    """
+    Navigate directly to the API JSON URL. Cloudflare will serve a challenge page
+    under that host, execute, and then redirect back—setting host-scoped cookies.
+    """
+    targets = [
+        f"https://frontend-api.pump.fun{API_PRIME_PATH}",
+        "https://frontend-api.pump.fun/health",
+        "https://frontend-api.pump.fun/",  # last resort just to establish origin
+    ]
+    for url in targets:
+        try:
+            # 'networkidle' lets CF challenge finish; some pages never reach that,
+            # so we cap the timeout and continue.
+            resp: Optional[Response] = await page.goto(url, wait_until="networkidle", timeout=60_000)
+            await page.wait_for_timeout(600)  # give CF a moment to set cookies
+            # If we actually got JSON 2xx back, great—cookies should be set now.
+            if resp and resp.ok:
+                ct = (resp.headers.get("content-type") or "").lower()
+                if "json" in ct:
+                    break
+        except Exception:
+            continue
+
+    # As a final nudge, do a same-origin fetch to a tiny endpoint with credentials
+    try:
+        await page.evaluate(
+            f"""() => fetch('{API_PRIME_PATH}', {{ credentials: 'include' }}).catch(() => {{}})"""
+        )
+        await page.wait_for_timeout(600)
+    except Exception:
+        pass
+
+
 async def _prime_context_and_cookies(ctx) -> Dict[str, str]:
     """
-    Navigate both hosts and perform a same-origin fetch on the API host
-    so CF sets cookies for that domain.
+    Solve CF for apex and API hosts within the same browser context, then return cookies.
     """
     page = await ctx.new_page()
 
-    # 1) Apex site — normal page navigation solves CF
+    # 1) Apex host (pump.fun)
     try:
         await page.goto(PUMP_CF_PAGE, wait_until="networkidle", timeout=60_000)
     except Exception:
         pass
 
-    # 2) API host — go to the origin then do same-origin fetch (credentials included)
+    # 2) API host (frontend-api.pump.fun) — MUST use navigation on that host
     try:
-        await page.goto("https://frontend-api.pump.fun/", wait_until="domcontentloaded", timeout=30_000)
-    except Exception:
-        # If the origin 404s, that’s fine; we only need the origin context
-        pass
-    try:
-        await page.evaluate(
-            f"""() => fetch('{API_WARM_PATH}', {{ credentials: 'include' }}).catch(() => {{}})"""
-        )
-        await page.wait_for_timeout(800)
+        await _prime_api_host_via_navigation(page)
     except Exception:
         pass
 
+    # Collect cookies for both hosts
     all_cookies = await ctx.cookies()
     await page.close()
 
@@ -137,6 +164,7 @@ async def _prime_context_and_cookies(ctx) -> Dict[str, str]:
     return new_map
 
 
+# ---------- Refresher ----------
 async def _refresh_once() -> None:
     global _COOKIES, _EXP
     try:
@@ -172,7 +200,6 @@ async def _refresh_once() -> None:
         log.warning("CF refresh failed: %s", e)
 
 
-# ---------- Public: refresher ----------
 async def refresh_loop() -> None:
     await _refresh_once()
     while True:
@@ -195,7 +222,7 @@ def ensure_cookie_refresher() -> None:
     log.info("CF refresher started")
 
 
-# ---------- Public: helpers ----------
+# ---------- Helpers ----------
 def get_cookie_for(url_or_host: str) -> str:
     host = urlparse(url_or_host).hostname or url_or_host
     return _COOKIES.get(host, "")
@@ -231,11 +258,12 @@ def apply_cookies_to_session(session) -> None:
         log.warning("apply_cookies_to_session failed: %s", e)
 
 
-# ---------- Public: last-resort fetch ----------
+# ---------- Last-resort fetch ----------
 async def browser_fetch_json(url: str) -> Optional[Any]:
     """
-    JSON GET via Playwright after priming cookies in the *same* context.
-    For the API host, use a same-origin browser fetch to bypass CF/CORS quirks.
+    Use the same browser-context that already solved CF. For API host,
+    try a real navigation first (so the challenge page runs if needed),
+    then fall back to same-origin page.fetch.
     """
     try:
         await _ensure_chromium_available()
@@ -246,18 +274,30 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
             )
             try:
                 ctx = await browser.new_context(user_agent=UA)
-                # Make sure this context has solved CF for both hosts
+                # Ensure cookies exist in this context
                 await _prime_context_and_cookies(ctx)
 
                 host = urlparse(url).hostname or ""
                 page = await ctx.new_page()
 
-                # If the call targets the API host, stay same-origin and fetch via the page.
                 if host.endswith("frontend-api.pump.fun"):
+                    # 1) Try navigation directly to the JSON URL
                     try:
-                        await page.goto("https://frontend-api.pump.fun/", wait_until="domcontentloaded", timeout=30_000)
+                        resp: Optional[Response] = await page.goto(url, wait_until="networkidle", timeout=45_000)
+                        if resp and resp.ok:
+                            text = await resp.text()
+                            try:
+                                return json.loads(text)
+                            except Exception:
+                                pass
+                        status = (resp.status if resp else 0)
+                        if status in (403, 429, 530):
+                            flag_cookie_bad()
+                        log.warning("browser_fetch_json: %s -> HTTP %s (page.goto)", url, status or 0)
                     except Exception:
+                        # 2) Fallback to same-origin fetch via the page
                         pass
+
                     try:
                         js = """
                             async (u) => {
@@ -276,14 +316,14 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                         if res and res.get("ok"):
                             return res.get("data")
                         status = res.get("status", 0) if isinstance(res, dict) else 0
-                        if status == 530:
+                        if status in (403, 429, 530):
                             flag_cookie_bad()
                         log.warning("browser_fetch_json: %s -> HTTP %s (page.fetch)", url, status)
                         return None
                     finally:
                         await page.close()
 
-                # Otherwise, fall back to the request context (still carries cookies)
+                # Non-API hosts: simple request client
                 headers = {
                     "User-Agent": UA,
                     "Accept": "application/json, text/plain, */*",
@@ -303,7 +343,7 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                         except Exception:
                             return None
                 status = r.status
-                if status == 530:
+                if status in (403, 429, 530):
                     flag_cookie_bad()
                 log.warning("browser_fetch_json: %s -> HTTP %s", url, status)
                 return None
