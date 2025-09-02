@@ -297,9 +297,43 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                 except Exception:
                     pass
 
-            # 4) Final fallback: run window.fetch from the page (browser environment)
+            # 4) Final fallback: run fetch from the SAME ORIGIN as the target
             try:
-                js = """
+                # If the target is the API host, put the page on that origin first.
+                if host.endswith(API_HOST):
+                    try:
+                        # Any page on the API origin works; /health is simple and fast.
+                        await page.goto(API_ROOT, wait_until="domcontentloaded", timeout=60_000)
+                        await page.wait_for_timeout(500)  # tiny settle
+                    except Exception:
+                        pass
+
+                    # Build a same-origin path (avoid CORS by not using absolute URL)
+                    parsed = urlparse(url)
+                    rel = parsed.path + (("?" + parsed.query) if parsed.query else "")
+
+                    js_same_origin = """
+                        async (path) => {
+                          try {
+                            const r = await fetch(path, { credentials: "include" });
+                            if (!r.ok) return { __status: r.status };
+                            return await r.json();
+                          } catch (e) {
+                            return { __error: String(e) };
+                          }
+                        }
+                    """
+                    data = await page.evaluate(js_same_origin, rel)
+                    if isinstance(data, dict) and "__status" in data:
+                        log.warning("browser_fetch_json: %s -> HTTP %s (page.fetch same-origin)", url, data["__status"])
+                        return None
+                    if isinstance(data, dict) and "__error" in data:
+                        log.warning("browser_fetch_json page.fetch same-origin error: %s", data["__error"])
+                        return None
+                    return data
+
+                # Otherwise (not API host), do absolute fetch from current page (should be same-origin already)
+                js_abs = """
                     async (u) => {
                       try {
                         const r = await fetch(u, { credentials: "include" });
@@ -310,7 +344,7 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                       }
                     }
                 """
-                data = await page.evaluate(js, url)
+                data = await page.evaluate(js_abs, url)
                 if isinstance(data, dict) and "__status" in data:
                     log.warning("browser_fetch_json: %s -> HTTP %s (page.fetch)", url, data["__status"])
                     return None
@@ -318,16 +352,10 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                     log.warning("browser_fetch_json page.fetch error: %s", data["__error"])
                     return None
                 return data
+
             except Exception as e:
                 log.warning("browser_fetch_json page.fetch failed: %s", e)
                 return None
-
-        finally:
-            await browser.close()
-            await p.stop()
-    except Exception as e:
-        log.warning("browser_fetch_json failed: %s", e)
-        return None
 
 __all__ = [
     "ensure_cookie_refresher",
