@@ -2,7 +2,7 @@
 set -euxo pipefail
 
 # Where Playwright caches downloaded browsers
-export PLAYWRIGHT_BROWSERS_PATH="/opt/render/.cache/ms-playwright"
+export PLAYWRIGHT_BROWSERS_PATH="/opt/render/project/src/.cache/ms-playwright"
 
 # Use a venv that ships with your deploy
 PYV="/opt/render/project/src/.venv"
