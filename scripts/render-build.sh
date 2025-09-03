@@ -1,32 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Paths
-VENV="/opt/render/project/src/.venv"
-PWB="/opt/render/project/src/.cache/ms-playwright"
-export PLAYWRIGHT_BROWSERS_PATH="$PWB"
+# Disable proxies for build time
+for v in HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy; do
+  if [[ -n "${!v:-}" ]]; then export "ORIG_$v=${!v}"; fi
+  unset "$v" || true
+done
+export NO_PROXY="127.0.0.1,localhost,::1,.render.internal"
 
 echo ">>> creating venv + installing python deps..."
-python -m venv "$VENV"
-"$VENV/bin/python" -m pip install --upgrade pip setuptools wheel
-# respect any PIP_* envs you set in Render (e.g., PIP_ONLY_BINARY)
-"$VENV/bin/python" -m pip install --no-cache-dir -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate
 
-echo ">>> installing Playwright browsers (no proxies during install)..."
-# Clear env so Node/Playwright doesn't inherit HTTP(S)_PROXY
-env -i \
-  PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games" \
-  HOME="/opt/render" \
-  PLAYWRIGHT_BROWSERS_PATH="$PWB" \
-  NODE_OPTIONS="--dns-result-order=ipv4first" \
-  "$VENV/bin/python" -m playwright install chromium
+# Speed up/quiet pip a bit
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+python -m pip install --upgrade pip setuptools wheel
 
-echo ">>> versions:"
-"$VENV/bin/python" - <<'PY'
-import sys, pkgutil
-print("PYTHON:", sys.version)
-print("EXE   :", sys.executable)
-print("has_aiohttp:", "aiohttp" in {m.name for m in pkgutil.iter_modules()})
-import playwright
-print("playwright pkg ok")
-PY
+# If you use Poetry, keep your existing poetry install line; otherwise requirements.txt is fine:
+if [[ -f poetry.lock ]]; then
+  poetry config virtualenvs.create false
+  poetry install --no-interaction --no-ansi
+elif [[ -f requirements.txt ]]; then
+  pip install -r requirements.txt
+fi
+
+# Optional: cache PW browser at build; if it fails, ignore (runtime will self-install)
+python -m playwright install-deps || true
+python -m playwright install chromium || true
+
+echo ">>> build step finished"
