@@ -52,6 +52,7 @@ UA = os.getenv("PUMPFUN_UA") or (
 
 # Optional override *full URL* (for testing a single endpoint)
 OVERRIDE_URL = os.getenv("PUMPFUN_URL", "").strip()
+SKIP_NEXT = os.getenv("PUMPFUN_SKIP_NEXT", "0") == "1"
 
 REQ_TIMEOUT_S = int(os.getenv("PUMPFUN_HTTP_TIMEOUT_S", "15"))
 SESSION_LIMIT = int(os.getenv("PUMPFUN_HTTP_CONN_LIMIT", "30"))
@@ -383,6 +384,13 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
                 return items
     except Exception as e:
         LOG.warning("Pump.fun next-data apex fetch error: %s", e)
+	
+if not SKIP_NEXT:
+    try:
+        raw = await browser_fetch_trending_via_next_data(limit=50)
+        ...
+    except Exception as e:
+        LOG.warning("Pump.fun next-data apex fetch error: %s", e)
 
     # 1) Apex DOM scrape via Playwright (no API host)
     try:
@@ -454,6 +462,11 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
         if items:
             LOG.info("scanner.pumpfun: legacy API JSON → %s items", len(items))
             return items
+if not SKIP_NEXT:
+    items = await _html_next_data(session)
+    if items:
+        LOG.info("scanner.pumpfun: HTML __NEXT_DATA__ → %s items", len(items))
+        return items
 
     # 5) HTML __NEXT_DATA__ fallback (legacy)
     items = await _html_next_data(session)
