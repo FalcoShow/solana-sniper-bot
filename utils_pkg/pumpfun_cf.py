@@ -1,28 +1,14 @@
-# utils_pkg/pumpfun_cf.py
+# utils_pkg/pumpfun_cf.py — v1.1
 """
-Cloudflare cookie + Playwright helpers for Pump.fun.
+Cloudflare cookie manager for Pump.fun.
 
-What this module provides:
 - CF cookie refresher for BOTH hosts: `pump.fun` and `frontend-api.pump.fun`
 - Per-host cookie strings kept in-memory (cf_clearance, __cf_bm)
-- Ability to apply cookies to an aiohttp session
-- Last-resort JSON fetch via Playwright when the plain HTTP client fails
-- Apex-first helpers (Next.js JSON or direct __NEXT_DATA__ scrape) that avoid the API host
+- Apply cookies to aiohttp sessions
+- Last-resort JSON via Playwright; DOM and Next.js data helpers
 - Full outbound proxy support for Playwright
-
-Env you can set (all optional but helpful):
-- PUMPFUN_UA                  -> user agent to use (desktop UA is best)
-- PUMPFUN_CF_URL              -> apex page used to prime CF (default: /advanced/scan)
-- PUMPFUN_CF_PRIME_PATHS      -> comma list of apex paths to visit when priming (default: "/advanced/scan,/trending,/")
-- PUMPFUN_API_PRIME_PATH      -> small JSON path used to prime the API host (default: /coins/trending?offset=0&limit=1)
-- PUMPFUN_CF_REFRESH_SEC      -> refresh cadence in seconds (default 900)
-- PUMPFUN_COOKIE              -> optional seed: "cf_clearance=...; __cf_bm=..." for apex
-- PUMPFUN_COOKIE_API          -> optional seed for API host
-- PLAYWRIGHT_PROXY            -> proxy URL (preferred), e.g. http(s)://user:pass@host:port
-- PUMPFUN_PROXY               -> proxy URL (fallback)
-- HTTPS_PROXY / HTTP_PROXY    -> standard proxy envs (fallbacks)
+- NEW: keep existing API cookie if refresher fails; allow apex cookie for API host
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -38,54 +24,26 @@ from playwright.async_api import async_playwright, Response
 log = logging.getLogger("pumpfun.cf")
 
 # =============================== Config ===============================
-
 UA = os.getenv(
     "PUMPFUN_UA",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 )
-
-# Apex page we can always visit in a browser (used first during priming)
 PUMP_CF_PAGE = os.getenv("PUMPFUN_CF_URL", "https://pump.fun/advanced/scan")
-
-# Additional apex paths to cycle during priming (CSV, each must start with /)
-PRIME_PATHS = [
-    p.strip()
-    for p in os.getenv("PUMPFUN_CF_PRIME_PATHS", "/advanced/scan,/trending,/").split(",")
-    if p.strip()
-]
-
-# Small JSON on API host for priming (used only inside Playwright context)
 API_PRIME_PATH = os.getenv("PUMPFUN_API_PRIME_PATH", "/coins/trending?offset=0&limit=1")
-
-# Cookie refresh cadence
 REFRESH_SEC = int(os.getenv("PUMPFUN_CF_REFRESH_SEC", "900"))
-
-# The two hosts we care about
 HOSTS = ("pump.fun", "frontend-api.pump.fun")
-
-# Persist Playwright browser binaries in a writable location on Render
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
 
 # ========================= In-Memory State ===========================
-
 _COOKIES: Dict[str, str] = {}
 _EXP: float = 0.0
 _TASK: Optional[asyncio.Task] = None
 
 # ============================== Proxy ================================
-
-_PROXY_LOGGED = False  # avoid logging the proxy more than once
-
+_PROXY_LOGGED = False
 
 def _resolve_proxy_url() -> Optional[str]:
-    """
-    Resolve a proxy URL from env (priority order):
-      1) PLAYWRIGHT_PROXY
-      2) PUMPFUN_PROXY
-      3) HTTPS_PROXY
-      4) HTTP_PROXY
-    """
     return (
         os.getenv("PLAYWRIGHT_PROXY")
         or os.getenv("PUMPFUN_PROXY")
@@ -93,12 +51,7 @@ def _resolve_proxy_url() -> Optional[str]:
         or os.getenv("HTTP_PROXY")
     )
 
-
 def _playwright_proxy() -> Optional[dict]:
-    """
-    Build a Playwright proxy dict from env. Accepts credentials in the URL,
-    e.g. https://user:pass@host:port
-    """
     raw = _resolve_proxy_url()
     if not raw:
         return None
@@ -112,7 +65,6 @@ def _playwright_proxy() -> Optional[dict]:
         proxy["password"] = u.password
     return proxy
 
-
 def _mask_proxy_for_log(url: str) -> str:
     try:
         u = urlparse(url or "")
@@ -123,20 +75,13 @@ def _mask_proxy_for_log(url: str) -> str:
     except Exception:
         return url or ""
 
-
 async def _launch_browser(p):
-    """
-    Centralized launcher so every Playwright usage consistently picks up the proxy
-    and launch args.
-    """
     global _PROXY_LOGGED
     proxy_cfg = _playwright_proxy()
-
     if proxy_cfg and not _PROXY_LOGGED:
         raw = _resolve_proxy_url()
         log.info("Playwright proxy enabled: %s", _mask_proxy_for_log(raw or ""))
         _PROXY_LOGGED = True
-
     return await p.chromium.launch(
         headless=True,
         args=[
@@ -148,9 +93,7 @@ async def _launch_browser(p):
         proxy=proxy_cfg,
     )
 
-
 def _seed_from_env() -> None:
-    """Seed cookie jar from env so we can work even if CF priming is blocked."""
     seeded = []
     apex = os.getenv("PUMPFUN_COOKIE", "").strip()
     api = os.getenv("PUMPFUN_COOKIE_API", "").strip()
@@ -163,21 +106,14 @@ def _seed_from_env() -> None:
     if seeded:
         log.info("CF seed: loaded cookies from env (%s)", ",".join(seeded))
 
-
 _seed_from_env()
 
 # =========================== Stealth Lite ============================
-
 STEALTH_JS = r"""
-// Hide webdriver
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-// languages
 Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
-// plugins
 Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-// chrome object
 window.chrome = window.chrome || { runtime: {} };
-// permissions noise
 const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
 if (originalQuery) {
   window.navigator.permissions.query = (parameters) => (
@@ -201,7 +137,6 @@ EXTRA_HEADERS_HTML = {
     "Sec-Fetch-User": "?1",
     "Sec-Fetch-Dest": "document",
 }
-
 EXTRA_HEADERS_JSON = {
     "User-Agent": UA,
     "Accept": "application/json, text/plain, */*",
@@ -217,10 +152,7 @@ EXTRA_HEADERS_JSON = {
 }
 
 # =========================== Internals ==============================
-
-
 async def _ensure_chromium_available() -> None:
-    """Install chromium once if missing (Render occasionally builds cold)."""
     try:
         async with async_playwright() as p:
             b = await _launch_browser(p)
@@ -231,13 +163,8 @@ async def _ensure_chromium_available() -> None:
     try:
         log.info("Playwright: chromium not found, attempting one-time install...")
         proc = await asyncio.create_subprocess_exec(
-            "python",
-            "-m",
-            "playwright",
-            "install",
-            "chromium",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            "python", "-m", "playwright", "install", "chromium",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         try:
             await asyncio.wait_for(proc.communicate(), timeout=180)
@@ -247,14 +174,26 @@ async def _ensure_chromium_available() -> None:
     except Exception as e:
         log.warning("Playwright one-time install failed: %s", e)
 
-
 def _cookie_for_host(all_cookies: List[Dict[str, Any]], host: str) -> Optional[str]:
-    """Build 'cf_clearance=...; __cf_bm=...' for the given host, if present."""
+    """
+    Build 'cf_clearance=...; __cf_bm=...' for the given host.
+    Accept apex cookie for API host when CF sets it at parent domain.
+    """
+    want = (host or "").lower()
+    def _match(dom: str) -> bool:
+        d = (dom or "").lstrip(".").lower()
+        if d == want or d.endswith(want):
+            return True
+        # allow parent apex cookie for API subdomain
+        if want.endswith(".pump.fun") and d == "pump.fun":
+            return True
+        return False
+
     jar: Dict[str, str] = {}
     for c in all_cookies or []:
         name = c.get("name")
-        domain = (c.get("domain") or "").lstrip(".")
-        if domain.endswith(host) and name in ("cf_clearance", "__cf_bm"):
+        domain = c.get("domain") or ""
+        if name in ("cf_clearance", "__cf_bm") and _match(domain):
             val = c.get("value")
             if val:
                 jar[name] = val
@@ -267,32 +206,21 @@ def _cookie_for_host(all_cookies: List[Dict[str, Any]], host: str) -> Optional[s
         parts.append(f"__cf_bm={jar['__cf_bm']}")
     return "; ".join(parts)
 
-
 async def _prime_api_host(page) -> None:
-    """
-    Strong priming for the API host:
-      1) Navigate to https://frontend-api.pump.fun/ root/health
-      2) Reload once
-      3) Same-origin fetch to a tiny JSON path with credentials
-    """
-    roots = [
-        "https://frontend-api.pump.fun/",
-        "https://frontend-api.pump.fun/health",
-    ]
+    roots = ["https://frontend-api.pump.fun/", "https://frontend-api.pump.fun/health"]
     for root in roots:
         try:
             await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
             await page.goto(root, wait_until="domcontentloaded", timeout=60_000)
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(1200)
             try:
                 await page.reload(wait_until="domcontentloaded", timeout=20_000)
             except Exception:
                 pass
-            await page.wait_for_timeout(800)
+            await page.wait_for_timeout(1000)
             break
         except Exception:
             continue
-
     try:
         await page.set_extra_http_headers(EXTRA_HEADERS_JSON)
         res = await page.evaluate(
@@ -304,37 +232,26 @@ async def _prime_api_host(page) -> None:
             }""",
             API_PRIME_PATH,
         )
-        await page.wait_for_timeout(600)
+        await page.wait_for_timeout(800)
         if not (res and res.get("ok")):
             try:
-                await page.goto(
-                    f"https://frontend-api.pump.fun{API_PRIME_PATH}",
-                    wait_until="networkidle",
-                    timeout=30_000,
-                )
+                await page.goto(f"https://frontend-api.pump.fun{API_PRIME_PATH}",
+                                wait_until="networkidle", timeout=30_000)
                 await page.wait_for_timeout(800)
             except Exception:
                 pass
     except Exception:
         pass
 
-
 async def _prime_context_and_collect(ctx) -> Dict[str, str]:
-    """Prime both sites in a new context and collect cookies for the two hosts."""
     page = await ctx.new_page()
     await page.add_init_script(STEALTH_JS)
 
-    # 1) Apex site(s)
+    # 1) Apex
     try:
-        path_list = PRIME_PATHS or ["/advanced/scan", "/trending", "/"]
-        for pth in path_list:
-            url = f"https://pump.fun{pth}" if pth.startswith("/") else pth
-            try:
-                await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
-                await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-                await page.wait_for_timeout(500)
-            except Exception:
-                continue
+        await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
+        await page.goto(PUMP_CF_PAGE, wait_until="networkidle", timeout=60_000)
+        await page.wait_for_timeout(800)
     except Exception:
         pass
 
@@ -354,12 +271,11 @@ async def _prime_context_and_collect(ctx) -> Dict[str, str]:
             out[host] = ck
     return out
 
-
 # ============================ Refresher ==============================
-
 async def _refresh_once() -> None:
-    """Run one refresh cycle and schedule the next."""
+    """Refresh cookies; keep existing entries if the new context misses one."""
     global _COOKIES, _EXP
+    prev = dict(_COOKIES)
     try:
         await _ensure_chromium_available()
         async with async_playwright() as p:
@@ -374,7 +290,7 @@ async def _refresh_once() -> None:
                 )
                 new_map = await _prime_context_and_collect(ctx)
 
-                # If API cookie still missing, retry once in same context
+                # Retry API cookie once if missing
                 if "frontend-api.pump.fun" not in new_map:
                     page = await ctx.new_page()
                     await page.add_init_script(STEALTH_JS)
@@ -390,26 +306,31 @@ async def _refresh_once() -> None:
             finally:
                 await browser.close()
 
-        _COOKIES = new_map
-        # also reflect in os.environ so other places can read them if desired
-        os.environ["PUMPFUN_COOKIE"] = new_map.get("pump.fun", "")
-        os.environ["PUMPFUN_COOKIE_API"] = new_map.get("frontend-api.pump.fun", "")
+        # Merge: keep previous entries if not refreshed this round
+        merged = dict(prev)
+        merged.update(new_map)
+        _COOKIES = merged
 
-        if _COOKIES:
-            _EXP = time.time() + max(60.0, REFRESH_SEC * 0.9)
-            log.info(
-                "CF refresh: got cookies (pump=%s, api=%s), next in ~%ds",
-                "yes" if "pump.fun" in _COOKIES else "no",
-                "yes" if "frontend-api.pump.fun" in _COOKIES else "no",
-                REFRESH_SEC,
-            )
-        else:
-            _EXP = time.time() + 120.0
-            log.warning("CF refresh: no cookies captured; will retry sooner.")
+        # Reflect to env without clobbering a previously set cookie if missing
+        if "pump.fun" in new_map:
+            os.environ["PUMPFUN_COOKIE"] = new_map["pump.fun"]
+        elif prev.get("pump.fun"):
+            os.environ.setdefault("PUMPFUN_COOKIE", prev["pump.fun"])
+
+        if "frontend-api.pump.fun" in new_map:
+            os.environ["PUMPFUN_COOKIE_API"] = new_map["frontend-api.pump.fun"]
+        elif prev.get("frontend-api.pump.fun"):
+            os.environ.setdefault("PUMPFUN_COOKIE_API", prev["frontend-api.pump.fun"])
+
+        has_pump = "yes" if "pump.fun" in _COOKIES else "no"
+        has_api = "yes" if "frontend-api.pump.fun" in _COOKIES else "no"
+
+        _EXP = time.time() + max(60.0, REFRESH_SEC * 0.9)
+        log.info("CF refresh: got cookies (pump=%s, api=%s), next in ~%ds", has_pump, has_api, REFRESH_SEC)
+
     except Exception as e:
         _EXP = time.time() + 120.0
         log.warning("CF refresh failed: %s", e)
-
 
 async def refresh_loop() -> None:
     await _refresh_once()
@@ -419,9 +340,7 @@ async def refresh_loop() -> None:
         if time.time() >= _EXP:
             await _refresh_once()
 
-
 def ensure_cookie_refresher() -> None:
-    """Start the background refresher (call once at app start)."""
     global _TASK
     try:
         loop = asyncio.get_running_loop()
@@ -433,21 +352,15 @@ def ensure_cookie_refresher() -> None:
     _TASK = loop.create_task(refresh_loop())
     log.info("CF refresher started")
 
-
 # ========================= Public Helpers ============================
-
 def get_cookie_for(url_or_host: str) -> str:
-    """Return the cookie string for this host (or empty string if absent)."""
     from urllib.parse import urlparse as _urlparse
-    host = _urlparse(url_or_host).hostname or url_or_host
+    host = (_urlparse(url_or_host).hostname or url_or_host).lower()
     return _COOKIES.get(host, "")
 
-
 def flag_cookie_bad() -> None:
-    """Signal that cookies are stale; refresher will run ASAP."""
     global _EXP
     _EXP = 0.0
-
 
 def _parse_cookie_string(s: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -457,9 +370,7 @@ def _parse_cookie_string(s: str) -> Dict[str, str]:
             out[k.strip()] = v.strip()
     return out
 
-
 def apply_cookies_to_session(session) -> None:
-    """Attach per-host cookies to an existing aiohttp.ClientSession."""
     try:
         from aiohttp import client_reqrep
         for host in HOSTS:
@@ -473,15 +384,8 @@ def apply_cookies_to_session(session) -> None:
     except Exception as e:
         log.warning("apply_cookies_to_session failed: %s", e)
 
-
-# ========== Last-resort JSON and Apex-first Next.js helpers ==========
-
+# ================= Last-resort JSON & DOM fetchers ===================
 async def browser_fetch_json(url: str) -> Optional[Any]:
-    """
-    Try to fetch JSON with Playwright. Useful when the plain client gets 530/HTML.
-    If the host is the API subdomain, we first try to prime that host in the same
-    context, then attempt both page.goto and a same-origin fetch().
-    """
     try:
         await _ensure_chromium_available()
         async with async_playwright() as p:
@@ -499,15 +403,10 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
 
                 host = (urlparse(url).hostname or "").lower()
                 if host.endswith("frontend-api.pump.fun"):
-                    # Prime this context for the API host
                     await _prime_api_host(page)
-
-                    # Attempt navigation to the JSON URL (some CF configs allow it)
                     try:
                         await page.set_extra_http_headers(EXTRA_HEADERS_JSON)
-                        resp: Optional[Response] = await page.goto(
-                            url, wait_until="networkidle", timeout=45_000
-                        )
+                        resp: Optional[Response] = await page.goto(url, wait_until="networkidle", timeout=45_000)
                         if resp and resp.ok:
                             text = await resp.text()
                             try:
@@ -515,13 +414,11 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                             except Exception:
                                 pass
                         status = resp.status if resp else 0
-                        log.warning("browser_fetch_json: %s -> HTTP %s (page.goto)", url, status or 0)
                         if status in (403, 429, 530):
                             flag_cookie_bad()
+                        log.warning("browser_fetch_json: %s -> HTTP %s (page.goto)", url, status or 0)
                     except Exception:
                         pass
-
-                    # Fallback: same-origin fetch from inside the page
                     try:
                         await page.set_extra_http_headers(EXTRA_HEADERS_JSON)
                         res = await page.evaluate(
@@ -541,14 +438,13 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                         if res and res.get("ok"):
                             return res.get("data")
                         status = res.get("status", 0) if isinstance(res, dict) else 0
-                        log.warning("browser_fetch_json: %s -> HTTP %s (page.fetch)", url, status)
                         if status in (403, 429, 530):
                             flag_cookie_bad()
+                        log.warning("browser_fetch_json: %s -> HTTP %s (page.fetch)", url, status)
                         return None
                     finally:
                         await page.close()
 
-                # Non-API host: use request client directly
                 r = await ctx.request.get(url, headers=EXTRA_HEADERS_JSON, timeout=30_000)
                 if r.ok:
                     try:
@@ -570,11 +466,65 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
         log.warning("browser_fetch_json failed: %s", e)
         return None
 
-
-# ---- Next.js helpers (combined: buildId JSON + direct __NEXT_DATA__) ----
+async def browser_fetch_scan_next_data(limit: int = 50) -> Optional[List[Dict[str, Any]]]:
+    targets = [
+        os.getenv("PUMPFUN_CF_URL", "https://pump.fun/advanced/scan"),
+        "https://pump.fun/trending",
+    ]
+    def _extract_from_next_data(payload: Any) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+        page = payload.get("props", {}).get("pageProps", {})
+        for k in ("trending", "coins", "items", "projects", "data"):
+            v = page.get(k)
+            if isinstance(v, list) and v:
+                return v[:limit]
+        return []
+    try:
+        await _ensure_chromium_available()
+        async with async_playwright() as p:
+            browser = await _launch_browser(p)
+            try:
+                ctx = await browser.new_context(
+                    user_agent=UA, locale="en-US", timezone_id="America/New_York",
+                    viewport={"width": 1366, "height": 768}, color_scheme="light",
+                )
+                page = await ctx.new_page()
+                await page.add_init_script(STEALTH_JS)
+                for url in targets:
+                    try:
+                        await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
+                        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                        try:
+                            await page.wait_for_selector('script#__NEXT_DATA__', timeout=45_000)
+                        except Exception:
+                            await page.wait_for_timeout(1500)
+                        payload = await page.evaluate("window.__NEXT_DATA__ || null")
+                        if not payload:
+                            html = await page.content()
+                            import re, json as _json
+                            m = re.search(r'id="__NEXT_DATA__"[^>]*>\s*({.*?})\s*</script>', html, re.S)
+                            if m:
+                                try:
+                                    payload = _json.loads(m.group(1))
+                                except Exception:
+                                    payload = None
+                        items = _extract_from_next_data(payload)
+                        if items:
+                            log.info("DOM-scrape: got %d items from %s", len(items), url)
+                            return items
+                        else:
+                            log.warning("DOM-scrape: no items found at %s", url)
+                    except Exception as e:
+                        log.warning("browser_fetch_scan_next_data: %s failed: %s", url, e)
+                return None
+            finally:
+                await browser.close()
+    except Exception as e:
+        log.warning("browser_fetch_scan_next_data failed: %s", e)
+        return None
 
 async def _browser_get_build_id(page) -> Optional[str]:
-    """Return Next.js buildId from window.__NEXT_DATA__ on the current page."""
     try:
         bid = await page.evaluate("window.__NEXT_DATA__ && window.__NEXT_DATA__.buildId || null")
         if bid and isinstance(bid, str):
@@ -594,132 +544,85 @@ async def _browser_get_build_id(page) -> Optional[str]:
         pass
     return None
 
-
-def _extract_items_from_next_payload(payload: Any, limit: int) -> List[Dict[str, Any]]:
-    if not isinstance(payload, dict):
-        return []
-    page = payload.get("props", {}).get("pageProps", {})
-    # common keys
-    for k in ("trending", "coins", "projects", "items", "data"):
-        v = page.get(k)
-        if isinstance(v, list) and v:
-            return v[:limit]
-    # nested under pageProps.data.foo
-    data = page.get("data")
-    if isinstance(data, dict):
-        for v in data.values():
-            if isinstance(v, list) and v:
-                return v[:limit]
-    return []
-
-
-async def browser_fetch_trending_via_next_data(limit: int = 50) -> Optional[List[Dict[str, Any]]]:
-    """
-    Try apex Next.js data in TWO ways, per path:
-      1) Use buildId to fetch /_next/data/<buildId>/<path>.json
-      2) If that fails, read window.__NEXT_DATA__ directly from the page
-    Paths tried: /trending, /advanced/scan, /
-    """
-    candidates = ["/trending", "/advanced/scan", "/"]
-
+async def browser_fetch_next_json(page_path: str) -> Optional[dict]:
     try:
         await _ensure_chromium_available()
         async with async_playwright() as p:
             browser = await _launch_browser(p)
             try:
                 ctx = await browser.new_context(
-                    user_agent=UA,
-                    locale="en-US",
-                    timezone_id="America/New_York",
-                    viewport={"width": 1366, "height": 768},
-                    color_scheme="light",
+                    user_agent=UA, locale="en-US", timezone_id="America/New_York",
+                    viewport={"width": 1366, "height": 768}, color_scheme="light",
                 )
                 page = await ctx.new_page()
                 await page.add_init_script(STEALTH_JS)
 
                 base = "https://pump.fun"
+                path = page_path if page_path.startswith("/") else f"/{page_path}"
+                await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
+                await page.goto(base + path, wait_until="domcontentloaded", timeout=60_000)
+                try:
+                    await page.wait_for_selector('script#__NEXT_DATA__', timeout=30_000)
+                except Exception:
+                    await page.wait_for_timeout(1500)
 
-                for path in candidates:
-                    # 1) Navigate to the page and try to get buildId
-                    try:
-                        await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
-                        await page.goto(base + path, wait_until="domcontentloaded", timeout=60_000)
-                        try:
-                            await page.wait_for_selector('script#__NEXT_DATA__', timeout=30_000)
-                        except Exception:
-                            await page.wait_for_timeout(1200)
-                    except Exception as e:
-                        log.warning("next-data: failed to visit %s: %s", path, e)
-                        continue
+                build_id = await _browser_get_build_id(page)
+                if not build_id:
+                    log.warning("next-data: buildId not found for %s", path)
+                    return None
 
-                    build_id = await _browser_get_build_id(page)
-                    if build_id:
-                        tail = path.lstrip("/")
-                        if not tail.endswith(".json"):
-                            if not tail.endswith("/"):
-                                tail = tail + ".json"
-                            else:
-                                tail = tail[:-1] + ".json"
-                        data_url = f"{base}/_next/data/{build_id}/{tail}"
-                        r = await ctx.request.get(data_url, headers=EXTRA_HEADERS_JSON, timeout=30_000)
-                        if r.ok:
-                            try:
-                                j = await r.json()
-                            except Exception:
-                                t = await r.text()
-                                import json as _json
-                                try:
-                                    j = _json.loads(t)
-                                except Exception:
-                                    j = None
-                            if isinstance(j, dict):
-                                items = _extract_items_from_next_payload(j, limit)
-                                if items:
-                                    log.info("next-data: got %d items via buildId from %s", len(items), path)
-                                    return items
-                        else:
-                            log.warning("next-data: fetch %s -> HTTP %s", data_url, r.status)
+                tail = path.lstrip("/")
+                if not tail.endswith(".json"):
+                    if not tail.endswith("/"):
+                        tail = tail + ".json"
                     else:
-                        log.warning("next-data: buildId not found for %s", path)
+                        tail = tail[:-1] + ".json"
 
-                    # 2) Directly read __NEXT_DATA__ from the page
+                data_url = f"{base}/_next/data/{build_id}/{tail}"
+                r = await ctx.request.get(data_url, headers=EXTRA_HEADERS_JSON, timeout=30_000)
+                if r.ok:
                     try:
-                        payload = await page.evaluate("window.__NEXT_DATA__ || null")
-                        if not payload:
-                            html = await page.content()
-                            import re, json as _json
-                            m = re.search(r'id="__NEXT_DATA__"[^>]*>\s*({.*?})\s*</script>', html, re.S)
-                            if m:
-                                try:
-                                    payload = _json.loads(m.group(1))
-                                except Exception:
-                                    payload = None
-                        items = _extract_items_from_next_payload(payload, limit)
-                        if items:
-                            log.info("next-data: got %d items from __NEXT_DATA__ on %s", len(items), path)
-                            return items
-                        else:
-                            log.warning("next-data: no items found on %s via __NEXT_DATA__", path)
-                    except Exception as e:
-                        log.warning("next-data: __NEXT_DATA__ extract failed for %s: %s", path, e)
-
+                        return await r.json()
+                    except Exception:
+                        t = await r.text()
+                        import json as _json
+                        try:
+                            return _json.loads(t)
+                        except Exception:
+                            return None
+                log.warning("next-data: fetch %s -> HTTP %s", data_url, r.status)
                 return None
             finally:
                 await browser.close()
     except Exception as e:
-        log.warning("browser_fetch_trending_via_next_data failed: %s", e)
+        log.warning("browser_fetch_next_json failed: %s", e)
         return None
 
-async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str, Any]]]:
-    """
-    Load apex pages and pull mints without touching the API host.
-    Tries DOM selectors first; if none found, falls back to regex over raw HTML.
-    Returns [{'mint': <base58>}, ...]
-    """
-    import re
+async def browser_fetch_trending_via_next_data(limit: int = 50) -> Optional[List[Dict[str, Any]]]:
+    candidates = ["/trending", "/advanced/scan"]
+    for path in candidates:
+        data = await browser_fetch_next_json(path)
+        if not isinstance(data, dict):
+            continue
+        page = data.get("pageProps", {}) if isinstance(data, dict) else {}
+        for k in ("trending", "coins", "projects", "items", "data"):
+            v = page.get(k)
+            if isinstance(v, list) and v:
+                out = v[:limit]
+                log.info("next-data: got %d items from %s", len(out), path)
+                return out
+        if isinstance(page.get("data"), dict):
+            for k, v in page["data"].items():
+                if isinstance(v, list) and v:
+                    out = v[:limit]
+                    log.info("next-data: got %d items from %s (data.%s)", len(out), path, k)
+                    return out
+    log.warning("next-data: no items found on apex JSON for /trending or /advanced/scan")
+    return None
 
-    # Try /board first (pump.fun often 308-redirects there), then the others
-    PAGES = ["/board", "/trending", "/advanced/scan", "/"]
+async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str, Any]]]:
+    import re
+    PAGES = ["/trending", "/advanced/scan", "/"]
 
     def _uniq(seq: List[str]) -> List[str]:
         s, out = set(), []
@@ -754,14 +657,10 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
             browser = await _launch_browser(p)
             try:
                 ctx = await browser.new_context(
-                    user_agent=UA,
-                    locale="en-US",
-                    timezone_id="America/New_York",
-                    viewport={"width": 1366, "height": 768},
-                    color_scheme="light",
+                    user_agent=UA, locale="en-US", timezone_id="America/New_York",
+                    viewport={"width": 1366, "height": 768}, color_scheme="light",
                 )
 
-                # seed apex cookie into the context (helps avoid CF hiccups)
                 apex_cookie_str = os.getenv("PUMPFUN_COOKIE", "").strip()
                 if apex_cookie_str:
                     jar = _parse_cookie_string(apex_cookie_str)
@@ -773,7 +672,6 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
                 await page.add_init_script(STEALTH_JS)
 
                 found: List[str] = []
-
                 for path in PAGES:
                     url = f"https://pump.fun{path}"
                     try:
@@ -782,17 +680,16 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
                     except Exception:
                         continue
 
-                    # give the page a moment, then do deeper scrolling to load more rows
                     try:
-                        await page.wait_for_timeout(1000)
+                        await page.wait_for_timeout(800)
                         anchors = await page.locator('a[href*="/coin/"], a[href*="/coins/"], [data-mint]').all()
                         if anchors:
-                            for _ in range(12):  # was 4 — scroll much deeper
-                                await page.mouse.wheel(0, 1400)
-                                await page.wait_for_timeout(300)
+                            for _ in range(4):
+                                await page.mouse.wheel(0, 1200)
+                                await page.wait_for_timeout(250)
 
                         mints: List[str] = []
-                        for el in anchors[: max(400, limit * 6)]:
+                        for el in anchors[: max(200, limit * 3)]:
                             href = await el.get_attribute("href")
                             dm = await el.get_attribute("data-mint")
                             if dm:
@@ -842,9 +739,7 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
         log.warning("browser_scrape_trending_dom failed: %s", e)
         return None
 
-
 # ============================ Exports ================================
-
 __all__ = [
     "ensure_cookie_refresher",
     "refresh_loop",
@@ -852,6 +747,8 @@ __all__ = [
     "apply_cookies_to_session",
     "flag_cookie_bad",
     "browser_fetch_json",
-    "browser_fetch_trending_via_next_data",  # <-- combined buildId + __NEXT_DATA__
+    "browser_fetch_scan_next_data",
+    "browser_fetch_next_json",
+    "browser_fetch_trending_via_next_data",
     "browser_scrape_trending_dom",
 ]
