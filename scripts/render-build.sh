@@ -1,54 +1,32 @@
 #!/usr/bin/env bash
-set -euxo pipefail
+set -euo pipefail
 
-PWB="/opt/render/project/src/.cache/ms-playwright"
+# Paths
 VENV="/opt/render/project/src/.venv"
-PROXY="http://sprufb1u6o:vIg23nhNmScp1q%7EJ9l@gate.decodo.com:10004"
-
+PWB="/opt/render/project/src/.cache/ms-playwright"
 export PLAYWRIGHT_BROWSERS_PATH="$PWB"
 
-# 1) venv
+echo ">>> creating venv + installing python deps..."
 python -m venv "$VENV"
+"$VENV/bin/python" -m pip install --upgrade pip setuptools wheel
+# respect any PIP_* envs you set in Render (e.g., PIP_ONLY_BINARY)
+"$VENV/bin/python" -m pip install --no-cache-dir -r requirements.txt
 
-# 2) pip WITHOUT any proxies
-env -i PATH="$PATH" HOME="$HOME" \
-  "$VENV/bin/python" -m pip install --upgrade pip setuptools wheel
+echo ">>> installing Playwright browsers (no proxies during install)..."
+# Clear env so Node/Playwright doesn't inherit HTTP(S)_PROXY
+env -i \
+  PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games" \
+  HOME="/opt/render" \
+  PLAYWRIGHT_BROWSERS_PATH="$PWB" \
+  NODE_OPTIONS="--dns-result-order=ipv4first" \
+  "$VENV/bin/python" -m playwright install chromium
 
-env -i PATH="$PATH" HOME="$HOME" \
-  "$VENV/bin/python" -m pip install --no-cache-dir -r requirements.txt
-
-# 3) Playwright: try direct first, fall back to proxy only if needed
-install_playwright () {
-  local mode="$1"
-  if [[ "$mode" == "proxy" ]]; then
-    echo ">>> Playwright install via Decodo proxy..."
-    env -i PATH="$PATH" HOME="$HOME" \
-      PLAYWRIGHT_BROWSERS_PATH="$PWB" NODE_OPTIONS="--dns-result-order=ipv4first" \
-      HTTP_PROXY="$PROXY"  http_proxy="$PROXY" \
-      HTTPS_PROXY="$PROXY" https_proxy="$PROXY" \
-      ALL_PROXY="$PROXY"  all_proxy="$PROXY" \
-      "$VENV/bin/python" -m playwright install chromium
-  else
-    echo ">>> Playwright install direct (no proxy)..."
-    env -i PATH="$PATH" HOME="$HOME" \
-      PLAYWRIGHT_BROWSERS_PATH="$PWB" NODE_OPTIONS="--dns-result-order=ipv4first" \
-      "$VENV/bin/python" -m playwright install chromium
-  fi
-}
-
-if ! install_playwright direct; then
-  echo "Direct download failed — falling back to proxy."
-  install_playwright proxy
-fi
-
-# 4) sanity (don’t fail the build if version lookup changes)
+echo ">>> versions:"
 "$VENV/bin/python" - <<'PY'
-import os, sys
-try:
-    import importlib.metadata as ilm
-    ver = ilm.version("playwright")
-except Exception as e:
-    ver = f"unknown ({e})"
-print("OK Playwright:", ver)
-print("BROWSERS_PATH:", os.environ.get("PLAYWRIGHT_BROWSERS_PATH"))
+import sys, pkgutil
+print("PYTHON:", sys.version)
+print("EXE   :", sys.executable)
+print("has_aiohttp:", "aiohttp" in {m.name for m in pkgutil.iter_modules()})
+import playwright
+print("playwright pkg ok")
 PY
