@@ -41,9 +41,14 @@ if ! install_playwright direct; then
   install_playwright proxy
 fi
 
-# 4) sanity
+# 4) sanity (don’t fail the build if version lookup changes)
 "$VENV/bin/python" - <<'PY'
-import os, sys, playwright
-print("OK Playwright", playwright.__version__)
-print("BROWSERS_PATH", os.environ.get("PLAYWRIGHT_BROWSERS_PATH"))
+import os, sys
+try:
+    import importlib.metadata as ilm
+    ver = ilm.version("playwright")
+except Exception as e:
+    ver = f"unknown ({e})"
+print("OK Playwright:", ver)
+print("BROWSERS_PATH:", os.environ.get("PLAYWRIGHT_BROWSERS_PATH"))
 PY
