@@ -57,22 +57,11 @@ REQ_TIMEOUT_S = int(os.getenv("PUMPFUN_HTTP_TIMEOUT_S", "15"))
 SESSION_LIMIT = int(os.getenv("PUMPFUN_HTTP_CONN_LIMIT", "30"))
 
 def _api_bases() -> List[str]:
-    """
-    Order of API bases to try. Env override first; then primary only.
-    (No hardcoded mirror — we removed it due to DNS issues in your environment.)
-    """
-    bases: List[str] = []
     env_base = os.getenv("PUMPFUN_API_BASE", "").strip().rstrip("/")
     if env_base:
-        bases.append(env_base)
-    bases.append("https://frontend-api.pump.fun")
-    # de-dup while preserving order
-    seen, out = set(), []
-    for b in bases:
-        if b and b not in seen:
-            seen.add(b)
-            out.append(b)
-    return out
+        return [env_base]
+    # default to primary only
+    return ["https://frontend-api.pump.fun"]
 
 # ---------------------------------------------------------------------------
 # Header builder
