@@ -1,36 +1,44 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 
-# Where Playwright caches downloaded browsers
-export PLAYWRIGHT_BROWSERS_PATH="/opt/render/project/src/.cache/ms-playwright"
+PWB="/opt/render/project/src/.cache/ms-playwright"
+VENV="/opt/render/project/src/.venv"
+PROXY="http://sprufb1u6o:vIg23nhNmScp1q%7EJ9l@gate.decodo.com:10004"
 
-# Use a venv that ships with your deploy
-PYV="/opt/render/project/src/.venv"
-python -m venv "$PYV"
-"$PYV/bin/python" -m pip install --upgrade pip setuptools wheel
-"$PYV/bin/python" -m pip install --no-cache-dir -r requirements.txt
+export PLAYWRIGHT_BROWSERS_PATH="$PWB"
 
-# Your proxy (already URL-encoded ~ as %7E)
-PROXY="${PLAYWRIGHT_PROXY:-http://sprufb1u6o:vIg23nhNmScp1q%7EJ9l@gate.decodo.com:10004}"
+# venv + deps
+python -m venv "$VENV"
+"$VENV/bin/python" -m pip install --upgrade pip setuptools wheel
+"$VENV/bin/python" -m pip install --no-cache-dir -r requirements.txt
 
-# Two mirrors; try Azure edge first, then CDN
-URL1="https://playwright.azureedge.net/builds/chromium/1187/chromium-linux.zip"
-URL2="https://cdn.playwright.dev/builds/chromium/1187/chromium-linux.zip"
-mkdir -p "$PLAYWRIGHT_BROWSERS_PATH/chromium-1187"
+install_playwright () {
+  local mode="$1"
+  if [[ "$mode" == "proxy" ]]; then
+    echo ">>> Playwright install via Decodo proxy..."
+    env -i PATH="$PATH" HOME="$HOME" \
+      PLAYWRIGHT_BROWSERS_PATH="$PWB" NODE_OPTIONS="--dns-result-order=ipv4first" \
+      HTTP_PROXY="$PROXY"  http_proxy="$PROXY" \
+      HTTPS_PROXY="$PROXY" https_proxy="$PROXY" \
+      ALL_PROXY="$PROXY"  all_proxy="$PROXY" \
+      "$VENV/bin/python" -m playwright install chromium
+  else
+    echo ">>> Playwright install direct (no proxy)..."
+    env -i PATH="$PATH" HOME="$HOME" \
+      PLAYWRIGHT_BROWSERS_PATH="$PWB" NODE_OPTIONS="--dns-result-order=ipv4first" \
+      "$VENV/bin/python" -m playwright install chromium
+  fi
+}
 
-# Download Chromium via your proxy
-curl -fsSL4 --connect-timeout 20 --max-time 900 --retry 5 --retry-connrefused --retry-delay 2 \
-  -x "$PROXY" -o /tmp/chromium.zip "$URL1" \
-|| curl -fsSL4 --connect-timeout 20 --max-time 900 --retry 5 --retry-connrefused --retry-delay 2 \
-  -x "$PROXY" -o /tmp/chromium.zip "$URL2"
+# Try direct first to save proxy quota; fall back to proxy only if needed
+if ! install_playwright direct; then
+  echo "Direct download failed — falling back to proxy."
+  install_playwright proxy
+fi
 
-# Unpack exactly where Playwright expects
-"$PYV/bin/python" - <<'PY'
-import os, zipfile
-dest = os.path.join(os.environ['PLAYWRIGHT_BROWSERS_PATH'], 'chromium-1187')
-zipfile.ZipFile('/tmp/chromium.zip').extractall(dest)
-print('Unpacked to', dest)
+# sanity
+"$VENV/bin/python" - <<'PY'
+import os, sys, playwright
+print("OK Playwright", playwright.__version__)
+print("BROWSERS_PATH", os.environ.get("PLAYWRIGHT_BROWSERS_PATH"))
 PY
-
-# Let Playwright register the already-downloaded browser (no download)
-"$PYV/bin/python" -m playwright install chromium || true
