@@ -1,4 +1,6 @@
-# scanner/pumpfun_scanner.py — v7 (Apex-first: next-data → DOM → HTML → API; proxy-aware)
+# scanner/pumpfun_scanner.py — v8
+# Apex-first (next-data → DOM → HTML) with API mirror + fallback and proxy/cookie awareness.
+
 from __future__ import annotations
 
 import os
@@ -14,9 +16,9 @@ import certifi
 
 LOG = logging.getLogger("scanner.pumpfun")
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Cloudflare / Playwright helpers
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 try:
     from utils_pkg.pumpfun_cf import (
         apply_cookies_to_session,              # attach per-host cookies to aiohttp session
@@ -46,24 +48,44 @@ except Exception:  # pragma: no cover
         return None
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Config
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 UA = os.getenv("PUMPFUN_UA") or (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126 Safari/537.36"
 )
 
-# Optional override endpoint (for testing)
+# Optional override *full URL* (for testing a single endpoint)
 OVERRIDE_URL = os.getenv("PUMPFUN_URL", "").strip()
 
 REQ_TIMEOUT_S = int(os.getenv("PUMPFUN_HTTP_TIMEOUT_S", "15"))
 SESSION_LIMIT = int(os.getenv("PUMPFUN_HTTP_CONN_LIMIT", "30"))
 
+# Preferred API bases: env override → mirror → primary
+# You can set PUMPFUN_API_BASE="https://frontend-api.pump-mirror.fun"
+def _api_bases() -> List[str]:
+    bases: List[str] = []
+    env_base = os.getenv("PUMPFUN_API_BASE", "").strip().rstrip("/")
+    if env_base:
+        bases.append(env_base)
+    # known good order: mirror first, then primary
+    bases += [
+        "https://frontend-api.pump-mirror.fun",
+        "https://frontend-api.pump.fun",
+    ]
+    # de-dup while keeping order
+    seen, out = set(), []
+    for b in bases:
+        if b and b not in seen:
+            seen.add(b)
+            out.append(b)
+    return out
 
-# ---------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
 # Header builder
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def _host_of(url: str) -> str:
     try:
         from urllib.parse import urlparse
@@ -74,7 +96,12 @@ def _host_of(url: str) -> str:
 
 def _hdrs(url: str) -> Dict[str, str]:
     host = _host_of(url)
-    origin = "https://frontend-api.pump.fun" if host.endswith("frontend-api.pump.fun") else "https://pump.fun"
+    # For primary API we keep the historical origin; for mirror we use apex.
+    if host.endswith("frontend-api.pump.fun"):
+        origin = "https://frontend-api.pump.fun"
+    else:
+        origin = "https://pump.fun"
+
     h = {
         "User-Agent": UA,
         "Accept": "application/json, text/plain, */*",
@@ -90,9 +117,9 @@ def _hdrs(url: str) -> Dict[str, str]:
     return h
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Utilities
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def _now() -> float:
     return time.time()
 
@@ -200,12 +227,12 @@ def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
     return items
 
 
-# ---------------------------------------------------------------------------
-# HTTP helpers (JSON primary)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# HTTP helpers
+# -----------------------------------------------------------------------------
 async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[Any], int, str]:
     """
-    Primary fetch: try aiohttp. If HTML/403/429/530, mark cookies bad and
+    Single GET: try aiohttp. If HTML/403/429/530, mark cookies bad and
     attempt a browser-based JSON fetch for the same URL.
     """
     try:
@@ -243,9 +270,53 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
         return (None, 0, "")
 
 
-# ---------------------------------------------------------------------------
+def _join_url(base: str, path: str) -> str:
+    base = base.rstrip("/")
+    path = path.lstrip("/")
+    return f"{base}/{path}"
+
+
+async def _fetch_api_json_with_fallback(
+    session: aiohttp.ClientSession,
+    path: str,
+    tried_out: Optional[List[str]] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Try each API base until one returns JSON with items.
+    path example: "/coins/trending?offset=0&limit=50"
+    """
+    # Allow a one-off full URL override (debug/testing)
+    if OVERRIDE_URL.lower().startswith("http"):
+        payload, status, first = await _fetch_json(session, OVERRIDE_URL)
+        if payload:
+            items = _extract_items_from_payload(payload)
+            if items:
+                LOG.info("scanner.pumpfun: API JSON (override) → %s items", len(items))
+                return items
+        if tried_out is not None:
+            tried_out.append(f"{OVERRIDE_URL} status={status}")
+        # fall through to bases
+
+    for base in _api_bases():
+        url = _join_url(base, path)
+        payload, status, first = await _fetch_json(session, url)
+        if tried_out is not None:
+            tried_out.append(f"{url} status={status}")
+        if not payload:
+            if status in (404, 403, 429, 530):
+                LOG.warning("Pump.fun: [%s] HTTP %s; first 120: %s", url, status, first)
+            continue
+        items = _extract_items_from_payload(payload)
+        if items:
+            LOG.info("scanner.pumpfun: API JSON → %s items (base=%s)", len(items), base)
+            return items
+
+    return None
+
+
+# -----------------------------------------------------------------------------
 # HTML helpers: scrape coin links directly from apex HTML (no JS)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 _BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,64}"
 
 
@@ -287,9 +358,9 @@ async def _html_scrape_links(session: aiohttp.ClientSession, path: str, limit: i
     return [{"mint": m} for m in mints]
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # HTML __NEXT_DATA__ fallback (legacy, may be absent)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 async def _html_next_data(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     url = "https://pump.fun/trending"
     try:
@@ -328,9 +399,9 @@ async def _html_next_data(session: aiohttp.ClientSession) -> List[Dict[str, Any]
     return items
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Scanner core
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     # Ensure the session has current cookies for both hosts.
     apply_cookies_to_session(session)
@@ -399,23 +470,27 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
             LOG.info("scanner.pumpfun: HTML apex → %s items", len(items))
             return items
 
-    # 3) Direct JSON endpoints (CF-aware) — may 530, but keep for completeness
-    endpoints += [
-        "https://frontend-api.pump.fun/coins/trending?offset=0&limit=50",
-        "https://frontend-api.pump.fun/coins/new?offset=0&limit=50",
-        "https://pump.fun/api/trending",  # legacy (often 404)
-    ]
+    # 3) API JSON using mirror/primary fallback
+    items = await _fetch_api_json_with_fallback(
+        session, "/coins/trending?offset=0&limit=50", tried_out=tried
+    )
+    if items:
+        return items
 
-    for url in endpoints:
-        payload, status, first = await _fetch_json(session, url)
-        tried.append(f"{url} status={status}")
-        if not payload:
-            if status in (404, 403, 429, 530):
-                LOG.warning("Pump.fun: [%s] HTTP %s; first 120: %s", url, status, first)
-            continue
+    items = await _fetch_api_json_with_fallback(
+        session, "/coins/new?offset=0&limit=50", tried_out=tried
+    )
+    if items:
+        return items
+
+    # legacy endpoint (often 404) — still try once
+    legacy = "https://pump.fun/api/trending"
+    payload, status, first = await _fetch_json(session, legacy)
+    tried.append(f"{legacy} status={status}")
+    if payload:
         items = _extract_items_from_payload(payload)
         if items:
-            LOG.info("scanner.pumpfun: API JSON → %s items", len(items))
+            LOG.info("scanner.pumpfun: legacy API JSON → %s items", len(items))
             return items
 
     # 4) HTML __NEXT_DATA__ fallback (legacy)
@@ -424,8 +499,12 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
         LOG.info("scanner.pumpfun: HTML __NEXT_DATA__ → %s items", len(items))
         return items
 
-    # 5) Last-resort: browser fetch on API trending (then normalize)
-    fallback_url = "https://frontend-api.pump.fun/coins/trending?offset=0&limit=50"
+    # 5) Last resort: Playwright fetch to *first* available base
+    try:
+        first_base = _api_bases()[0]
+    except Exception:
+        first_base = "https://frontend-api.pump.fun"
+    fallback_url = _join_url(first_base, "/coins/trending?offset=0&limit=50")
     payload = await browser_fetch_json(fallback_url)
     items = _extract_items_from_payload(payload)
     if items:
@@ -436,9 +515,9 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     return []
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Public entrypoint
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 async def scan_pumpfun(*args):
     """
     Flexible entrypoint:
