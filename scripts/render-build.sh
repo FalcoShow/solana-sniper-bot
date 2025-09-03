@@ -7,11 +7,17 @@ PROXY="http://sprufb1u6o:vIg23nhNmScp1q%7EJ9l@gate.decodo.com:10004"
 
 export PLAYWRIGHT_BROWSERS_PATH="$PWB"
 
-# venv + deps
+# 1) venv
 python -m venv "$VENV"
-"$VENV/bin/python" -m pip install --upgrade pip setuptools wheel
-"$VENV/bin/python" -m pip install --no-cache-dir -r requirements.txt
 
+# 2) pip WITHOUT any proxies
+env -i PATH="$PATH" HOME="$HOME" \
+  "$VENV/bin/python" -m pip install --upgrade pip setuptools wheel
+
+env -i PATH="$PATH" HOME="$HOME" \
+  "$VENV/bin/python" -m pip install --no-cache-dir -r requirements.txt
+
+# 3) Playwright: try direct first, fall back to proxy only if needed
 install_playwright () {
   local mode="$1"
   if [[ "$mode" == "proxy" ]]; then
@@ -30,13 +36,12 @@ install_playwright () {
   fi
 }
 
-# Try direct first to save proxy quota; fall back to proxy only if needed
 if ! install_playwright direct; then
   echo "Direct download failed — falling back to proxy."
   install_playwright proxy
 fi
 
-# sanity
+# 4) sanity
 "$VENV/bin/python" - <<'PY'
 import os, sys, playwright
 print("OK Playwright", playwright.__version__)
