@@ -799,7 +799,11 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
     """
     import re
 
-    PAGES = ["/trending", "/advanced/scan", "/"]  # try a few apex routes
+pages_env = os.getenv("PUMPFUN_DOM_PAGES")  # e.g. "/board,/trending,/advanced/scan,/"
+if pages_env:
+    PAGES = [p.strip() for p in pages_env.split(",") if p.strip()]
+else:
+    PAGES = ["/board", "/trending", "/advanced/scan", "/"]
 
     def _uniq(seq: List[str]) -> List[str]:
         s, out = set(), []
