@@ -710,7 +710,6 @@ async def browser_fetch_trending_via_next_data(limit: int = 50) -> Optional[List
         log.warning("browser_fetch_trending_via_next_data failed: %s", e)
         return None
 
-
 async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str, Any]]]:
     """
     Load apex pages and pull mints without touching the API host.
@@ -719,7 +718,8 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
     """
     import re
 
-    PAGES = ["/trending", "/advanced/scan", "/"]  # try a few apex routes
+    # Try /board first (pump.fun often 308-redirects there), then the others
+    PAGES = ["/board", "/trending", "/advanced/scan", "/"]
 
     def _uniq(seq: List[str]) -> List[str]:
         s, out = set(), []
@@ -742,15 +742,7 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
         for name in ("cf_clearance", "__cf_bm"):
             if name in cjar:
                 cookies.append(
-                    {
-                        "name": name,
-                        "value": cjar[name],
-                        "domain": "pump.fun",
-                        "path": "/",
-                        "httpOnly": False,
-                        "secure": True,
-                        "sameSite": "Lax",
-                    }
+                    {"name": name, "value": cjar[name], "domain": "pump.fun", "path": "/", "httpOnly": False, "secure": True, "sameSite": "Lax"}
                 )
         return cookies
 
@@ -769,7 +761,7 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
                     color_scheme="light",
                 )
 
-                # seed apex cookies into this context so CF doesn't bounce us
+                # seed apex cookie into the context (helps avoid CF hiccups)
                 apex_cookie_str = os.getenv("PUMPFUN_COOKIE", "").strip()
                 if apex_cookie_str:
                     jar = _parse_cookie_string(apex_cookie_str)
@@ -790,16 +782,17 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
                     except Exception:
                         continue
 
+                    # give the page a moment, then do deeper scrolling to load more rows
                     try:
-                        await page.wait_for_timeout(800)
+                        await page.wait_for_timeout(1000)
                         anchors = await page.locator('a[href*="/coin/"], a[href*="/coins/"], [data-mint]').all()
                         if anchors:
-                            for _ in range(4):
-                                await page.mouse.wheel(0, 1200)
-                                await page.wait_for_timeout(250)
+                            for _ in range(12):  # was 4 — scroll much deeper
+                                await page.mouse.wheel(0, 1400)
+                                await page.wait_for_timeout(300)
 
                         mints: List[str] = []
-                        for el in anchors[: max(200, limit * 3)]:
+                        for el in anchors[: max(400, limit * 6)]:
                             href = await el.get_attribute("href")
                             dm = await el.get_attribute("data-mint")
                             if dm:
@@ -841,7 +834,6 @@ async def browser_scrape_trending_dom(limit: int = 50) -> Optional[List[Dict[str
 
                 uniq = _uniq(found)[:limit]
                 await page.close()
-
                 log.info("DOM-scrape total: %d unique mints", len(uniq))
                 return [{"mint": m} for m in uniq]
             finally:
