@@ -92,10 +92,12 @@ def _host_of(url: str) -> str:
     except Exception:
         return ""
 
-
 def _hdrs(url: str) -> Dict[str, str]:
     host = _host_of(url)
-    origin = "https://frontend-api.pump.fun" if host.endswith("frontend-api.pump.fun") else "https://pump.fun"
+    # OLD:
+    # origin = "https://frontend-api.pump.fun" if host.endswith("frontend-api.pump.fun") else "https://pump.fun"
+    # NEW (always look like requests were initiated from pump.fun):
+    origin = "https://pump.fun"
     h = {
         "User-Agent": UA,
         "Accept": "application/json, text/plain, */*",
