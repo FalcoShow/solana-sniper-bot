@@ -1,4 +1,4 @@
-# sniper/sniper.py — v6.2 (CF refresher-safe, resilient scanners)
+# sniper/sniper.py — v6.3 (Axiom integrated, CF refresher-safe)
 from __future__ import annotations
 
 import os
@@ -62,7 +62,6 @@ except Exception as e_a:
         async def log_trade_event(*_a, **_k): ...
 
 # ----------------------------- CF cookie refresher ------------------------------
-# Import defensively and log details if it fails.
 ensure_cookie_refresher = None
 cf_refresh_loop = None
 try:
@@ -131,8 +130,9 @@ except Exception:
     async def honeypot_check(_m): return (True, {})
 
 # ----------------------------- scanners (flat or package) ----------------------
-scan_dexscreener = scan_pumpfun = scan_raydium = None
+scan_dexscreener = scan_pumpfun = scan_raydium = scan_axiom = None
 
+# Flat-layout imports
 try:
     from dexscreener_scanner import scan_dexscreener  # type: ignore
 except Exception as e:
@@ -148,7 +148,13 @@ try:
 except Exception as e:
     log.debug("raydium_scanner flat import failed: %s", e)
 
-if scan_dexscreener is None or scan_pumpfun is None or scan_raydium is None:
+try:
+    from axiom_scanner import scan_axiom  # type: ignore
+except Exception as e:
+    log.debug("axiom_scanner flat import failed: %s", e)
+
+# Package-layout imports
+if scan_dexscreener is None or scan_pumpfun is None or scan_raydium is None or scan_axiom is None:
     try:
         if scan_dexscreener is None:
             from scanner.dexscreener_scanner import scan_dexscreener  # type: ignore
@@ -156,6 +162,8 @@ if scan_dexscreener is None or scan_pumpfun is None or scan_raydium is None:
             from scanner.pumpfun_scanner import scan_pumpfun  # type: ignore
         if scan_raydium is None:
             from scanner.raydium_scanner import scan_raydium  # type: ignore
+        if scan_axiom is None:
+            from scanner.axiom_scanner import scan_axiom  # type: ignore
     except Exception as e:
         log.warning("scanner package import failed: %s", e)
 
@@ -312,7 +320,6 @@ async def _maybe_call_scanner(func: Optional[Callable], name: str) -> List[Dict[
             log.info("scanner.%s: %d candidates", name, len(items))
             return items
         except TypeError:
-            # Try next arity
             continue
         except Exception as e:
             log.warning("scanner.%s error: %s", name, e)
@@ -325,6 +332,7 @@ async def _scan_all_sources() -> List[Dict[str, Any]]:
         _maybe_call_scanner(scan_dexscreener, "dexscreener"),
         _maybe_call_scanner(scan_pumpfun, "pumpfun"),
         _maybe_call_scanner(scan_raydium, "raydium"),
+        _maybe_call_scanner(scan_axiom, "axiom"),   # <-- Axiom integrated here
         return_exceptions=False,
     )
     merged: Dict[str, Dict[str, Any]] = {}
@@ -577,7 +585,7 @@ class Sniper:
             await _buy_token(mint, symbol, float(ticket), float(entry))
 
     async def main_loop(self):
-        await send_telegram("🎯 Sniper started (v6.2: CF refresher-safe).")
+        await send_telegram("🎯 Sniper started (v6.3: Axiom integrated).")
         try:
             from self_learning_ai_strategy import run_self_learning_loop
             asyncio.create_task(run_self_learning_loop(get_redis()))
