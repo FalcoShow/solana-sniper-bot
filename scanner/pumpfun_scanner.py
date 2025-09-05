@@ -1,4 +1,4 @@
-# scanner/pumpfun_scanner.py — v10
+# scanner/pumpfun_scanner.py — v11
 # Apex-first (next-data → DOM → HTML) with API mirror + fallback and proxy/cookie awareness.
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ try:
     from utils_pkg.pumpfun_cf import (
         apply_cookies_to_session,              # attach per-host cookies to aiohttp session
         get_cookie_for,                        # cookie string for a given URL/host
-        flag_cookie_bad,                       # mark cookie stale (e.g., on 530/403)
+        flag_cookie_bad,                       # mark cookie stale (e.g., on 530/403/407)
         browser_fetch_json,                    # last-resort JSON via Playwright (API host)
         browser_fetch_trending_via_next_data,  # Next.js JSON from apex (/_next/data)
         browser_scrape_trending_dom,           # DOM scrape from apex pages (no API host)
@@ -40,10 +40,10 @@ except Exception:  # pragma: no cover
     async def browser_fetch_json(_url: str):  # type: ignore
         return None
 
-    async def browser_fetch_trending_via_next_data():  # type: ignore
+    async def browser_fetch_trending_via_next_data(*, limit: int = 50):  # type: ignore
         return None
 
-    async def browser_scrape_trending_dom():  # type: ignore
+    async def browser_scrape_trending_dom(*, limit: int = 50):  # type: ignore
         return None
 
 
@@ -58,14 +58,19 @@ UA = os.getenv("PUMPFUN_UA") or (
 # Optional override *full URL* (for testing a single endpoint)
 OVERRIDE_URL = os.getenv("PUMPFUN_URL", "").strip()
 
-# Optional: skip Next.js/DOM steps entirely (quiet buildId noise)
+# Optional: skip Next.js/DOM steps entirely (quiet buildId/log noise)
 SKIP_NEXT = (os.getenv("PUMPFUN_SKIP_NEXT", "").strip().lower() in ("1", "true", "yes", "y"))
 
 REQ_TIMEOUT_S = int(os.getenv("PUMPFUN_HTTP_TIMEOUT_S", "15"))
 SESSION_LIMIT = int(os.getenv("PUMPFUN_HTTP_CONN_LIMIT", "30"))
 
-# **New**: cap API batch size (fallback path only)
+# Cap batch sizes (API & DOM/Next)
 API_LIMIT = int(os.getenv("PUMPFUN_API_LIMIT", "20"))
+DOM_LIMIT = int(os.getenv("PUMPFUN_DOM_LIMIT", str(API_LIMIT)))
+
+# HTML regex scrape paths (no JS)
+_HTML_PATHS_ENV = os.getenv("PUMPFUN_HTML_PATHS", "/trending,/advanced/scan")
+HTML_PATHS = [p.strip() for p in _HTML_PATHS_ENV.split(",") if p.strip()] or ["/trending", "/advanced/scan"]
 
 # Preferred API bases: env override → mirror → primary
 def _api_bases() -> List[str]:
@@ -88,13 +93,6 @@ def _api_bases() -> List[str]:
 # ---------------------------------------------------------------------
 # Header builder
 # ---------------------------------------------------------------------
-def _host_of(url: str) -> str:
-    try:
-        from urllib.parse import urlparse
-        return (urlparse(url).hostname or "").lower()
-    except Exception:
-        return ""
-
 def _hdrs(url: str) -> Dict[str, str]:
     # Always look like requests were initiated from pump.fun (helps with CF)
     h = {
@@ -215,6 +213,8 @@ def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------
 # HTTP helpers (JSON primary)
 # ---------------------------------------------------------------------
+_BAD_CF_CODES = {403, 407, 429, 530}
+
 async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[Any], int, str]:
     try:
         async with session.get(
@@ -226,8 +226,8 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
             ctype = (r.headers.get("content-type") or "").lower()
 
             # If CF/HTML shows up, try browser path once, else bubble status
-            if status in (403, 429, 530) or "text/html" in ctype or text.lstrip().startswith("<!DOCTYPE html"):
-                if status in (403, 429, 530):
+            if status in _BAD_CF_CODES or "text/html" in ctype or text.lstrip().startswith("<!DOCTYPE html"):
+                if status in _BAD_CF_CODES:
                     flag_cookie_bad()
                 try:
                     data = await browser_fetch_json(url)
@@ -276,7 +276,7 @@ async def _fetch_api_json_with_fallback(
         if tried_out is not None:
             tried_out.append(f"{url} status={status}")
         if not payload:
-            if status in (404, 403, 429, 530):
+            if status in (404, *tuple(_BAD_CF_CODES)):
                 LOG.warning("Pump.fun: [%s] HTTP %s; first 120: %s", url, status, first)
             continue
         items = _extract_items_from_payload(payload)
@@ -294,7 +294,7 @@ _BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,64}"
 
 def _uniq(seq: List[str]) -> List[str]:
     seen = set()
-    out = []
+    out: List[str] = []
     for x in seq:
         if x not in seen:
             seen.add(x)
@@ -374,7 +374,7 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     # 0) Apex Next.js data (/_next/data) via Playwright (cheap; may be absent)
     if not SKIP_NEXT:
         try:
-            raw = await browser_fetch_trending_via_next_data()  # no limit arg
+            raw = await browser_fetch_trending_via_next_data(limit=DOM_LIMIT)
             if isinstance(raw, list) and raw:
                 items: List[Dict[str, Any]] = []
                 for it in raw:
@@ -393,7 +393,7 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     # 1) Apex DOM scrape via Playwright (no API host)
     if not SKIP_NEXT:
         try:
-            dom = await browser_scrape_trending_dom()  # no limit arg
+            dom = await browser_scrape_trending_dom(limit=DOM_LIMIT)
             if isinstance(dom, list) and dom:
                 items: List[Dict[str, Any]] = []
                 for it in dom:
@@ -413,9 +413,9 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
 
     # 2) Pure HTML (regex) from apex pages (no JS, no Playwright)
     html_items: List[Dict[str, Any]] = []
-    for path in ("/trending", "/advanced/scan"):
+    for path in HTML_PATHS:
         try:
-            links = await _html_scrape_links(session, path, limit=50)
+            links = await _html_scrape_links(session, path, limit=DOM_LIMIT)
             if links:
                 html_items.extend(links)
         except Exception:
@@ -465,7 +465,7 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
             LOG.info("scanner.pumpfun: HTML __NEXT_DATA__ → %s items", len(items))
             return items
 
-    # 5) Last resort: Playwright fetch to *first* available base
+    # 5) Last resort: Playwright fetch to *first* available base (capped by API_LIMIT)
     try:
         first_base = _api_bases()[0]
     except Exception:
