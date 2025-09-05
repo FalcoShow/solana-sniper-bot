@@ -7,6 +7,8 @@ import logging
 import random
 from typing import Dict, Any, List, Callable, Optional
 from datetime import datetime, timezone
+AXIOM_ENABLE = os.getenv("AXIOM_ENABLE", "false").lower() == "true"
+from scanner.axiom_scanner import scan_axiom
 
 # ----------------------------- logging -----------------------------------------
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()

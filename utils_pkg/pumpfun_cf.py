@@ -513,63 +513,75 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
         async with async_playwright() as p:
             browser = await _launch_browser(p, kind)
             try:
-                ctx = await browser.new_context(
-                    user_agent=UA,
-                    locale="en-US",
-                    timezone_id="America/New_York",
-                    viewport={"width": 1366, "height": 768},
-                    color_scheme="light",
-                )
-                page = await ctx.new_page()
-                await page.add_init_script(STEALTH_JS)
+                
+ctx = await browser.new_context(
+    user_agent=UA,
+    locale="en-US",
+    timezone_id="America/New_York",
+    viewport={"width": 1366, "height": 768},
+    color_scheme="light",
+)
 
-                if kind == "api":
-                    # Prime this context for the API host
-                    await _prime_api_host(page)
+page = await ctx.new_page()
+await page.add_init_script(STEALTH_JS)
 
-                    # Attempt navigation to the JSON URL (some CF configs allow it)
-                    try:
-                        await page.set_extra_http_headers(EXTRA_HEADERS_JSON)
-                        resp: Optional[Response] = await page.goto(url, wait_until="networkidle", timeout=50_000)
-                        if resp and resp.ok:
-                            text = await resp.text()
-                            try:
-                                return json.loads(text)
-                            except Exception:
-                                pass
-                        status = resp.status if resp else 0
-                        if status in (403, 407, 429, 530):
-                            flag_cookie_bad()
-                        log.warning("browser_fetch_json: %s -> HTTP %s (page.goto)", url, status or 0)
-                    except Exception:
-                        pass
+host = (urlparse(url).hostname or "").lower()
 
-                    # Fallback: same-origin fetch from inside the page
-                    try:
-                        await page.set_extra_http_headers(EXTRA_HEADERS_JSON)
-                        res = await page.evaluate(
-                            """async (u) => {
-                                try {
-                                  const r = await fetch(u, { credentials: 'include' });
-                                  if (!r.ok) return { ok:false, status:r.status };
-                                  const ct = r.headers.get('content-type') || '';
-                                  if (ct.includes('application/json')) return { ok:true, status:r.status, data: await r.json() };
-                                  const t = await r.text();
-                                  try { return { ok:true, status:r.status, data: JSON.parse(t) }; }
-                                  catch { return { ok:false, status:r.status }; }
-                                } catch (e) { return { ok:false, status:0 }; }
-                            }""",
-                            url,
-                        )
-                        if res and res.get("ok"):
-                            return res.get("data")
-                        status = res.get("status", 0) if isinstance(res, dict) else 0
-                        if status in (403, 407, 429, 530):
-                            flag_cookie_bad()
-                        log.warning("browser_fetch_json: %s -> HTTP %s (page.fetch)", url, status)
-                        return None
-                    finally:
-                        await page.close()
+# If hitting the API host, make sure we go through a proxied request context:
+if host.endswith("frontend-api.pump.fun"):
+    # try page-side fetch first (goes through browser proxy)
+    try:
+        await page.set_extra_http_headers(EXTRA_HEADERS_JSON)
+        res = await page.evaluate(
+            """async (u) => {
+                try {
+                  const r = await fetch(u, { credentials: 'include' });
+                  if (!r.ok) return { ok:false, status:r.status };
+                  const ct = r.headers.get('content-type') || '';
+                  if (ct.includes('application/json')) return { ok:true, status:r.status, data: await r.json() };
+                  const t = await r.text();
+                  try { return { ok:true, status:r.status, data: JSON.parse(t) }; }
+                  catch { return { ok:false, status:r.status }; }
+                } catch (e) { return { ok:false, status:0 }; }
+            }""",
+            url,
+        )
+        if res and res.get("ok"):
+            return res["data"]
+        if isinstance(res, dict) and res.get("status") in (403, 407, 429, 530):
+            flag_cookie_bad()
+    except Exception:
+        pass
+
+    # fallback: a dedicated request context **with** proxy creds
+    try:
+        from urllib.parse import urlparse as _up
+        raw = os.getenv("PLAYWRIGHT_PROXY", "")
+        proxy_cfg = None
+        if raw:
+            u = _up(raw)
+            if u.scheme and u.hostname and u.port:
+                proxy_cfg = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+                if u.username: proxy_cfg["username"] = u.username
+                if u.password: proxy_cfg["password"] = u.password
+
+        req = await p.request.new_context(  # <— NOTE: p is async_playwright() instance above
+            proxy=proxy_cfg,
+            extra_http_headers=EXTRA_HEADERS_JSON,
+        )
+        r = await req.get(url, timeout=30_000)
+        if r.ok:
+            try:
+                return await r.json()
+            except Exception:
+                return json.loads(await r.text())
+        if r.status in (403, 407, 429, 530):
+            flag_cookie_bad()
+        log.warning("browser_fetch_json: %s -> HTTP %s (reqctx)", url, r.status)
+        return None
+    finally:
+        await page.close()
+        await browser.close()
 
                 # Non-API host: use request client directly
                 r = await ctx.request.get(url, headers=EXTRA_HEADERS_JSON, timeout=35_000)
@@ -616,60 +628,56 @@ async def _browser_get_build_id(page) -> Optional[str]:
         pass
     return None
 
-async def browser_fetch_next_json(page_path: str) -> Optional[dict]:
-    """Fetch apex Next.js data JSON via /_next/data/<buildId>/<path>.json (apex, no proxy by default)."""
-    try:
-        await _ensure_chromium_available()
-        async with async_playwright() as p:
-            browser = await _launch_browser(p, "apex")
-            try:
-                ctx = await browser.new_context(
-                    user_agent=UA,
-                    locale="en-US",
-                    timezone_id="America/New_York",
-                    viewport={"width": 1366, "height": 768},
-                    color_scheme="light",
-                )
-                page = await ctx.new_page()
-                await page.add_init_script(STEALTH_JS)
+def _dom_pages() -> list[str]:
+    raw = os.getenv("PUMPFUN_DOM_PAGES", "/board,/trending,/advanced/scan,/")
+    return [p.strip() for p in raw.split(",") if p.strip()]
 
-                base = "https://pump.fun"
-                path = page_path if page_path.startswith("/") else f"/{page_path}"
-                await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
-                await page.goto(base + path, wait_until="domcontentloaded", timeout=90_000)
+async def browser_fetch_next_json(page_path: str | None = None) -> Optional[dict]:
+    pages = _dom_pages() if page_path is None else [page_path]
+    base = "https://pump.fun"
+
+    await _ensure_chromium_available()
+    async with async_playwright() as p:
+        browser = await _launch_browser_apex(p)  # <-- launch WITHOUT proxy
+        try:
+            ctx = await browser.new_context(
+                user_agent=UA, locale="en-US", timezone_id="America/New_York",
+                viewport={"width": 1366, "height": 768}, color_scheme="light",
+            )
+            page = await ctx.new_page()
+            await page.add_init_script(STEALTH_JS)
+
+            for path in pages:
                 try:
-                    await page.wait_for_selector('script#__NEXT_DATA__', timeout=35_000)
-                except Exception:
-                    await page.wait_for_timeout(1200)
-
-                build_id = await _browser_get_build_id(page)
-                if not build_id:
-                    log.warning("next-data: buildId not found for %s", path)
-                    return None
-
-                tail = path.lstrip("/")
-                if not tail.endswith(".json"):
-                    if not tail.endswith("/"):
-                        tail = tail + ".json"
-                    else:
-                        tail = tail[:-1] + ".json"
-
-                data_url = f"{base}/_next/data/{build_id}/{tail}"
-                r = await ctx.request.get(data_url, headers=EXTRA_HEADERS_JSON, timeout=35_000)
-                if r.ok:
+                    await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
+                    await page.goto(base + (path if path.startswith("/") else f"/{path}"),
+                                    wait_until="domcontentloaded", timeout=60_000)
                     try:
-                        return await r.json()
+                        await page.wait_for_selector('script#__NEXT_DATA__', timeout=20_000)
                     except Exception:
-                        t = await r.text()
-                        import json as _json
+                        await page.wait_for_timeout(1200)
+
+                    build_id = await _browser_get_build_id(page)
+                    if not build_id:
+                        continue
+
+                    tail = path.lstrip("/")
+                    if not tail.endswith(".json"):
+                        tail = (tail.rstrip("/") + ".json") if tail else "index.json"
+
+                    data_url = f"{base}/_next/data/{build_id}/{tail}"
+                    r = await ctx.request.get(data_url, headers=EXTRA_HEADERS_JSON, timeout=30_000)
+                    if r.ok:
                         try:
-                            return _json.loads(t)
+                            return await r.json()
                         except Exception:
-                            return None
-                log.warning("next-data: fetch %s -> HTTP %s", data_url, r.status)
-                return None
-            finally:
-                await browser.close()
+                            return json.loads(await r.text())
+                except Exception as e:
+                    log.warning("next-data: %s failed: %s", path, e)
+            log.warning("next-data: no items found on apex JSON for %s", pages)
+            return None
+        finally:
+            await browser.close()
     except Exception as e:
         log.warning("browser_fetch_next_json failed: %s", e)
         return None
