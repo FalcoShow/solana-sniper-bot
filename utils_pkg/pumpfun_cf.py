@@ -517,12 +517,28 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                     viewport={"width": 1366, "height": 768},
                     color_scheme="light",
                 )
-
                 page = await ctx.new_page()
                 await page.add_init_script(STEALTH_JS)
 
                 if host.endswith("frontend-api.pump.fun"):
-                    # Prefer page-side fetch (goes through browser proxy)
+                    # 1) Try page.goto first (most reliable for proxy auth)
+                    try:
+                        await page.set_extra_http_headers(EXTRA_HEADERS_JSON)
+                        resp = await page.goto(url, wait_until="networkidle", timeout=40_000)
+                        if resp and resp.ok:
+                            try:
+                                return await resp.json()
+                            except Exception:
+                                return json.loads(await resp.text())
+                        if resp:
+                            status = resp.status
+                            if status in (403, 407, 429, 530):
+                                flag_cookie_bad()
+                            log.warning("browser_fetch_json: %s -> HTTP %s (page.goto)", url, status)
+                    except Exception:
+                        pass
+
+                    # 2) Try page-side fetch (still through browser proxy)
                     try:
                         await page.set_extra_http_headers(EXTRA_HEADERS_JSON)
                         res = await page.evaluate(
@@ -532,12 +548,8 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                                   const ct = r.headers.get('content-type') || '';
                                   const text = await r.text();
                                   if (!r.ok) return { ok:false, status:r.status, text };
-                                  if (ct.includes('application/json')) {
-                                    try { return { ok:true, status:r.status, data: JSON.parse(text) }; }
-                                    catch { return { ok:false, status:r.status, text }; }
-                                  }
                                   try { return { ok:true, status:r.status, data: JSON.parse(text) }; }
-                                  catch { return { ok:false, status:r.status, text }; }
+                                  catch { return { ok:false, status:r.status, text } }
                                 } catch (e) { return { ok:false, status:0, text:'' }; }
                             }""",
                             url,
@@ -546,10 +558,12 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                             return res["data"]
                         if isinstance(res, dict) and res.get("status") in (403, 407, 429, 530):
                             flag_cookie_bad()
+                        if isinstance(res, dict) and "status" in res:
+                            log.warning("browser_fetch_json: %s -> HTTP %s (page.fetch)", url, res["status"])
                     except Exception:
                         pass
 
-                    # Fallback: dedicated request context with explicit proxy creds
+                    # 3) Fallback: dedicated request context with explicit proxy creds
                     try:
                         proxy_cfg = _build_proxy_dict(_resolve_proxy_url()) if USE_PROXY_FOR_API else None
                         req = await p.request.new_context(
@@ -567,7 +581,9 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                         log.warning("browser_fetch_json: %s -> HTTP %s (reqctx)", url, r.status)
                         return None
                     finally:
+                        # close ctx after we're done to release sockets
                         await ctx.close()
+
                 else:
                     # Non-API host: use request client directly
                     r = await ctx.request.get(url, headers=EXTRA_HEADERS_JSON, timeout=35_000)
