@@ -1,6 +1,7 @@
-# integrations/axiom_web.py — v1.0
-# Axiom web connector: discovery, trackers, portfolio, rewards, (optional) UI trading).
-# Proxy-aware, cookie-aware, persistent user profile, optional Phantom bootstrap.
+# integrations/axiom_web.py — v1.1
+# Axiom web connector: discover, trackers, portfolio, rewards, (optional) UI trading.
+# Proxy-aware (AXIOM_PROXY / PLAYWRIGHT_PROXY), cookie-aware (AXIOM_COOKIE or AXIOM_TOKEN_*),
+# persistent user profile, optional Phantom bootstrap, and network-throttled scraping.
 
 from __future__ import annotations
 
@@ -22,24 +23,25 @@ LOG = logging.getLogger("axiom.web")
 AXIOM_BASE = os.getenv("AXIOM_BASE", "https://axiom.trade").rstrip("/")
 AXIOM_DISCOVER_PATH = os.getenv("AXIOM_DISCOVER_PATH", "/discover")
 AXIOM_USER_DATA_DIR = os.getenv("AXIOM_USER_DATA_DIR", "/opt/render/.cache/axiom-user")
-AXIOM_TIMEOUT_MS = int(os.getenv("AXIOM_TIMEOUT_MS", "60000"))
+AXIOM_TIMEOUT_MS = int(os.getenv("AXIOM_TIMEOUT_MS", "90000"))  # default 90s for heavy pages
+AXIOM_NAV_WAIT = os.getenv("AXIOM_NAV_WAIT", "networkidle")     # "networkidle" or "domcontentloaded"
+AXIOM_HEADLESS = os.getenv("AXIOM_HEADLESS", "true").lower() != "false"
 
-# One string cookie OR two token cookies; both are optional if your profile already has them
+# Cookies (either a full cookie string or the two token cookies)
 AXIOM_COOKIE = os.getenv("AXIOM_COOKIE", "").strip()
 AXIOM_TOKEN_ACCESS = os.getenv("AXIOM_TOKEN_ACCESS", "").strip()
 AXIOM_TOKEN_REFRESH = os.getenv("AXIOM_TOKEN_REFRESH", "").strip()
 
 # Optional wallet automation (only used if configured)
 AXIOM_WALLET = os.getenv("AXIOM_WALLET", "").lower()  # "phantom" to enable
-PHANTOM_EXT_PATH = os.getenv("PHANTOM_EXT_PATH", "")   # folder path to unpacked Phantom extension
-PHANTOM_SEED = os.getenv("PHANTOM_SEED", "")           # burner only!
+PHANTOM_EXT_PATH = os.getenv("PHANTOM_EXT_PATH", "")
+PHANTOM_SEED = os.getenv("PHANTOM_SEED", "")
 PHANTOM_PASSWORD = os.getenv("PHANTOM_PASSWORD", "ChangeMe123!")
 
-# Discover sections to scrape and per-section cap
-AXIOM_SECTIONS = [s.strip() for s in os.getenv(
-    "AXIOM_SECTIONS",
-    "Trending,Surge,DEX Screener,Pump Live"
-).split(",") if s.strip()]
+# Discover sections & per-section cap
+AXIOM_SECTIONS = [
+    s.strip() for s in os.getenv("AXIOM_SECTIONS", "Trending,Surge,DEX Screener,Pump Live").split(",") if s.strip()
+]
 AXIOM_MAX_PER_SECTION = int(os.getenv("AXIOM_MAX_PER_SECTION", "25"))
 
 UA = os.getenv(
@@ -48,16 +50,26 @@ UA = os.getenv(
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 )
 
-# Keep Playwright’s own proxy isolated. Do NOT set HTTP(S)_PROXY for Python unless you know you need it.
+# ============================== Proxy ================================
+
 def _resolve_proxy_url() -> Optional[str]:
-    return os.getenv("PLAYWRIGHT_PROXY") or None
+    """
+    Prefer a dedicated Axiom proxy, otherwise fall back to PLAYWRIGHT_PROXY.
+    Do not inherit HTTP(S)_PROXY to avoid impacting aiohttp/requests.
+    """
+    raw = os.getenv("AXIOM_PROXY") or os.getenv("PLAYWRIGHT_PROXY") or ""
+    raw = raw.strip()
+    if not raw:
+        return None
+    # allow bare "host:port"
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    return raw
 
 def _playwright_proxy() -> Optional[dict]:
     raw = _resolve_proxy_url()
     if not raw:
         return None
-    if "://" not in raw:
-        raw = f"http://{raw}"
     u = urlparse(raw)
     if not (u.scheme and u.hostname and u.port):
         return None
@@ -78,6 +90,8 @@ def _mask_proxy_for_log(url: Optional[str]) -> str:
         return f"{u.scheme}://{u.hostname}:{u.port}".rstrip(":")
     except Exception:
         return url or ""
+
+# ============================= Headers/JS ============================
 
 EXTRA_HTML = {
     "User-Agent": UA,
@@ -173,13 +187,13 @@ async def _seed_axiom_cookies(ctx) -> bool:
         LOG.info("Axiom: token cookies injected (%d)", len(cookies))
         return True
 
-    LOG.warning("Axiom: no cookies provided (AXIOM_COOKIE or AXIOM_TOKEN_*). Relying on saved profile.")
+    LOG.info("Axiom: no AXIOM_COOKIE / AXIOM_TOKEN_* in env — relying on persisted profile.")
     return False
 
 # ============================== Client ================================
 
 class AxiomWeb:
-    def __init__(self, headless: bool = True):
+    def __init__(self, headless: bool = AXIOM_HEADLESS):
         self.headless = headless
         self._pw = None
         self.ctx = None
@@ -194,6 +208,26 @@ class AxiomWeb:
         await self.close()
 
     # ---------- launch / teardown ----------
+
+    async def _install_throttle(self):
+        """
+        Abort heavy / non-essential resources to speed up slow networks.
+        Keep XHR/fetch/doc/script/css; drop images/fonts/media/trackers/analytics.
+        """
+        async def handler(route):
+            req = route.request
+            rt = req.resource_type
+            url = req.url.lower()
+            if rt in {"image", "media", "font"} or any(
+                bad in url for bad in (
+                    "googletagmanager", "google-analytics", "g.doubleclick",
+                    "hotjar", "segment.io", "fullstory", "intercom", "klarna",
+                )
+            ):
+                await route.abort()
+            else:
+                await route.continue_()
+        await self.ctx.route("**/*", handler)
 
     async def launch(self):
         if self.ctx:
@@ -230,6 +264,8 @@ class AxiomWeb:
                 *ext_args,
             ],
         )
+        await self._install_throttle()
+
         self.page = await self.ctx.new_page()
         await self.page.add_init_script(STEALTH_JS)
 
@@ -241,10 +277,10 @@ class AxiomWeb:
 
         # Prime the session: frontdoor + reload to refresh access using refresh cookie
         try:
-            await self.goto("/")
+            await self.goto("/", wait=AXIOM_NAV_WAIT)
             await self.page.wait_for_timeout(600)
             try:
-                await self.page.reload(wait_until="domcontentloaded", timeout=15000)
+                await self.page.reload(wait_until=AXIOM_NAV_WAIT, timeout=min(15000, AXIOM_TIMEOUT_MS))
             except Exception:
                 pass
             await self.page.wait_for_timeout(400)
@@ -279,12 +315,12 @@ class AxiomWeb:
 
     # ---------- navigation & helpers ----------
 
-    async def goto(self, path_or_url: str, wait: str = "domcontentloaded"):
+    async def goto(self, path_or_url: str, wait: str = AXIOM_NAV_WAIT):
         url = path_or_url if path_or_url.startswith("http") else f"{AXIOM_BASE}{path_or_url if path_or_url.startswith('/') else '/' + path_or_url}"
         await self.page.set_extra_http_headers(EXTRA_HTML)
         return await self.page.goto(url, wait_until=wait, timeout=AXIOM_TIMEOUT_MS)
 
-    async def _scroll(self, steps: int = 10, px: int = 1400, delay_ms: int = 200):
+    async def _scroll(self, steps: int = 12, px: int = 1400, delay_ms: int = 180):
         for _ in range(max(1, steps)):
             await self.page.mouse.wheel(0, px)
             await self.page.wait_for_timeout(delay_ms)
@@ -341,54 +377,64 @@ class AxiomWeb:
           - Surge
           - DEX Screener
           - Pump Live
-        Returns: { section_name: [ {mint, symbol?, source:'axiom'}, ... ] }
+        Returns: { section_name: [ {mint, source:'axiom'}, ... ] }
         """
-        await self.goto(AXIOM_DISCOVER_PATH)
+        try:
+            await self.goto(AXIOM_DISCOVER_PATH, wait=AXIOM_NAV_WAIT)
+        except PwTimeout:
+            LOG.warning("Axiom discover: initial nav timeout (%sms)", AXIOM_TIMEOUT_MS)
+        except Exception as e:
+            LOG.warning("Axiom discover nav error: %s", e)
         await self.page.wait_for_timeout(1200)
+
+        # Try two scroll passes (content is lazy-loaded)
         await self._scroll(steps=12)
+        await self.page.wait_for_timeout(600)
+        await self._scroll(steps=8)
 
         sections: Dict[str, List[Dict[str, Any]]] = {name: [] for name in AXIOM_SECTIONS}
         html = await self.page.content()
 
-        # Prefer DOM-based scrape within each section container
         for title in sections.keys():
             try:
-                # Try ARIA heading → nearest container
+                # Prefer ARIA heading; fallback to text
                 heading = self.page.get_by_role("heading", name=title).first
                 if await heading.count() == 0:
                     heading = self.page.get_by_text(title, exact=False).first
-                    if await heading.count() == 0:
-                        # fallback to HTML slice
-                        chunk = self._slice_near_heading(html, title)
-                        mints = self._find_mints(chunk)
-                        sections[title] = [{"mint": m, "source": "axiom"} for m in mints[:limit_per_section]]
-                        continue
 
-                container = heading.locator("xpath=ancestor::*[self::section or self::div][1]")
-                nodes = await container.locator("a[href*='/asset/'], a[href*='/token/'], a[href*='/coins/'], [data-mint], [data-testid*='card']").all()
-                found: List[str] = []
-                for el in nodes:
-                    try:
-                        href = await el.get_attribute("href")
-                        dm = await el.get_attribute("data-mint")
-                        text = (await el.inner_text()).strip()
-                        base = href or dm or text
-                        if not base:
+                if await heading.count() > 0:
+                    container = heading.locator("xpath=ancestor::*[self::section or self::div][1]")
+                    nodes = await container.locator(
+                        "a[href*='/asset/'], a[href*='/token/'], a[href*='/coins/'], [data-mint], [data-testid*='card']"
+                    ).all()
+                    found: List[str] = []
+                    for el in nodes:
+                        try:
+                            href = await el.get_attribute("href")
+                            dm = await el.get_attribute("data-mint")
+                            text = (await el.inner_text()).strip()
+                            blob = " ".join([href or "", dm or "", text or ""])
+                            m = re.search(BASE58, blob)
+                            if m:
+                                found.append(m.group(0))
+                        except Exception:
                             continue
-                        # extract mint by regex anywhere in base fields
-                        m = re.search(BASE58, (href or "") + " " + (dm or "") + " " + (text or ""))
-                        if m:
-                            found.append(m.group(0))
-                    except Exception:
-                        continue
-                # uniq + cap
-                seen, uniq = set(), []
-                for m in found:
-                    if m and m not in seen:
-                        seen.add(m); uniq.append(m)
-                sections[title] = [{"mint": m, "source": "axiom"} for m in uniq[:limit_per_section]]
+                    # uniq + cap
+                    seen, uniq = set(), []
+                    for m in found:
+                        if m and m not in seen:
+                            seen.add(m)
+                            uniq.append(m)
+                    sections[title] = [{"mint": m, "source": "axiom"} for m in uniq[:limit_per_section]]
+                    continue
+
+                # If no visible heading, slice raw HTML near the title
+                chunk = self._slice_near_heading(html, title)
+                mints = self._find_mints(chunk)
+                sections[title] = [{"mint": m, "source": "axiom"} for m in mints[:limit_per_section]]
+
             except Exception:
-                # last fallback: HTML slice
+                # Last resort: HTML slice
                 chunk = self._slice_near_heading(html, title)
                 mints = self._find_mints(chunk)
                 sections[title] = [{"mint": m, "source": "axiom"} for m in mints[:limit_per_section]]
@@ -399,8 +445,7 @@ class AxiomWeb:
                 text = json.dumps(blob, ensure_ascii=False)
                 mints = self._find_mints(text)
                 if mints:
-                    uniq = []
-                    seen = set()
+                    uniq, seen = [], set()
                     for m in mints:
                         if m not in seen:
                             seen.add(m); uniq.append(m)
@@ -419,7 +464,7 @@ class AxiomWeb:
         out: List[Dict[str, Any]] = []
         for path in ("/trackers", "/discover?tab=trackers"):
             try:
-                await self.goto(path)
+                await self.goto(path, wait=AXIOM_NAV_WAIT)
                 await self.page.wait_for_timeout(1200)
                 await self._scroll(steps=10)
                 html = await self.page.content()
@@ -444,7 +489,7 @@ class AxiomWeb:
         Snapshot of balances/positions from portfolio page if logged in.
         """
         try:
-            await self.goto("/portfolio")
+            await self.goto("/portfolio", wait=AXIOM_NAV_WAIT)
             await self.page.wait_for_timeout(1200)
             await self._scroll(steps=8)
             html = await self.page.content()
@@ -481,7 +526,7 @@ class AxiomWeb:
         Pull rewards/points summary (best-effort).
         """
         try:
-            await self.goto("/rewards")
+            await self.goto("/rewards", wait=AXIOM_NAV_WAIT)
             await self.page.wait_for_timeout(800)
             html = await self.page.content()
         except Exception as e:
@@ -510,14 +555,13 @@ class AxiomWeb:
 
     async def place_market_order(self, mint: str, side: str, size: float) -> bool:
         """
-        Drives the UI to attempt a market order. Will require a connected wallet
-        unless Axiom can do server-side swaps for your account (unlikely).
-        This function is *experimental* and should be kept disabled in prod.
+        Drives the UI to attempt a market order. Requires a connected wallet.
+        Experimental — keep disabled in prod unless Phantom bootstrap is working.
         """
         side = side.lower().strip()
         assert side in ("buy", "sell")
         try:
-            await self.goto(AXIOM_DISCOVER_PATH)
+            await self.goto(AXIOM_DISCOVER_PATH, wait=AXIOM_NAV_WAIT)
             await self.page.wait_for_timeout(600)
 
             # Try common search boxes
@@ -532,7 +576,7 @@ class AxiomWeb:
             await self.page.wait_for_timeout(600)
 
             # Click first row that mentions the mint
-            self.page.get_by_text(re.compile(mint[:8], re.I)).first.click(timeout=AXIOM_TIMEOUT_MS)
+            await self.page.get_by_text(re.compile(mint[:8], re.I)).first.click(timeout=AXIOM_TIMEOUT_MS)
 
             # Open trade/swap
             for name in ("Trade", "Instant Trade", "Swap"):
@@ -585,8 +629,7 @@ class AxiomWeb:
     async def _phantom_bootstrap(self):
         """
         Minimal Phantom onboarding: opens the extension UI, imports seed, sets password.
-        Runs once per user-data-dir. Assumes PHANTOM_EXT_PATH is valid and headful mode.
-        Highly version-dependent; best-effort.
+        Runs once per user-data-dir. Highly version-dependent; best-effort.
         """
         if not PHANTOM_SEED:
             return
@@ -603,7 +646,7 @@ class AxiomWeb:
 
         try:
             await ext.wait_for_timeout(1200)
-            # Import flow (these labels vary by version)
+            # Import flow (labels vary by version)
             for lab in ("Import", "I already have a wallet", "Use secret recovery phrase"):
                 try:
                     await ext.get_by_role("button", name=re.compile(lab, re.I)).click(timeout=1000)
@@ -637,11 +680,10 @@ class AxiomWeb:
         except Exception as e:
             LOG.warning("Phantom bootstrap flow error: %s", e)
 
-
 # ------------------------- Convenience runner -------------------------
 
 async def axiom_discover_once(limit: int = 200) -> List[Dict[str, Any]]:
-    async with AxiomWeb(headless=True) as ax:
+    async with AxiomWeb(headless=AXIOM_HEADLESS) as ax:
         sections = await ax.discover_sections(limit_per_section=limit)
         # flatten and uniq by mint
         out: List[Dict[str, Any]] = []
@@ -654,7 +696,6 @@ async def axiom_discover_once(limit: int = 200) -> List[Dict[str, Any]]:
                 seen.add(m)
                 uniq.append(d)
         return uniq
-
 
 # ------------------------------ CLI test ------------------------------
 
