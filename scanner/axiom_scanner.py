@@ -1,95 +1,102 @@
-# scanner/axiom_scanner.py — v1.1
+# scanner/axiom_scanner.py — v1.1 (persistent client + retry)
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
-from integrations.axiom_web import axiom_discover_once
+from integrations.axiom_web import AxiomWeb
 
 LOG = logging.getLogger("scanner.axiom")
 
 # ---------- Env knobs ----------
-AXIOM_SCAN_ENABLED: int = int(os.getenv("AXIOM_SCAN_ENABLED", "1"))   # set 0 to disable
-AXIOM_SCAN_LIMIT: int = int(os.getenv("AXIOM_SCAN_LIMIT", "80"))      # post-dedup cap
-AXIOM_SCAN_TIMEOUT_SEC: int = int(os.getenv("AXIOM_SCAN_TIMEOUT_SEC", "90"))
-AXIOM_SCAN_RETRIES: int = max(1, int(os.getenv("AXIOM_SCAN_RETRIES", "2")))
-AXIOM_SCAN_BACKOFF_MS: int = max(0, int(os.getenv("AXIOM_SCAN_BACKOFF_MS", "1200")))
+AXIOM_SCAN_ENABLED = int(os.getenv("AXIOM_SCAN_ENABLED", "1"))
+AXIOM_SCAN_LIMIT = int(os.getenv("AXIOM_SCAN_LIMIT", "80"))
+AXIOM_SCAN_TIMEOUT_SEC = int(os.getenv("AXIOM_SCAN_TIMEOUT_SEC", "90"))
+AXIOM_SECTIONS_ENV = os.getenv("AXIOM_SECTIONS", "Trending,Surge,DEX Screener,Pump Live")
 
-# Base58 (Solana) – keep the same bounds used elsewhere in the project
 _BASE58 = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,64}$")
 
 def _valid_mint(x: str) -> bool:
-    return isinstance(x, str) and bool(_BASE58.match(x))
+    return isinstance(x, str) and _BASE58.match(x) is not None
 
 def _dedup(items: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     seen = set()
     out: List[Dict[str, Any]] = []
-    for d in items or []:
+    for d in items:
         m = (d or {}).get("mint")
         if not _valid_mint(m):
             continue
         if m in seen:
             continue
         seen.add(m)
-        # normalize keys for downstream
-        d = dict(d)
+        d = dict(d or {})
         d.setdefault("source", "axiom")
         d.setdefault("scanner", "axiom")
         out.append(d)
-        if len(out) >= max(1, limit):
+        if len(out) >= limit:
             break
     return out
 
-async def _scan_once(want: int, timeout_sec: int) -> List[Dict[str, Any]]:
-    """
-    Single attempt at pulling from Axiom Discover, with its own timeout.
-    We ask for more than we need (2x) and then dedup+cap locally.
-    """
-    raw: List[Dict[str, Any]] = await asyncio.wait_for(
-        axiom_discover_once(limit=max(1, want * 2)),
-        timeout=timeout_sec,
-    )
-    return _dedup(raw, want)
+# ---------- persistent client ----------
+_AX: Optional[AxiomWeb] = None
+_ax_lock = asyncio.Lock()
+
+async def _get_ax() -> AxiomWeb:
+    global _AX
+    async with _ax_lock:
+        if _AX is None:
+            _AX = AxiomWeb(headless=True)
+            await _AX.launch()
+        return _AX
+
+async def _recycle_ax() -> None:
+    global _AX
+    async with _ax_lock:
+        try:
+            if _AX:
+                await _AX.close()
+        finally:
+            _AX = None
+
+async def _fetch_once(want: int) -> List[Dict[str, Any]]:
+    ax = await _get_ax()
+    sections = await ax.discover_sections(limit_per_section=want)
+    # flatten
+    flat: List[Dict[str, Any]] = []
+    for lst in sections.values():
+        flat.extend(lst)
+    return flat
 
 async def scan_axiom() -> List[Dict[str, Any]]:
-    """
-    Pull candidates from Axiom Discover (Trending / Surge / DEX Screener / Pump Live).
-    Returns: [{ mint, source:'axiom', scanner:'axiom', ... }, ...]
-    """
     if not AXIOM_SCAN_ENABLED:
         LOG.info("scanner.axiom: disabled via AXIOM_SCAN_ENABLED=0")
         return []
 
-    want = max(1, AXIOM_SCAN_LIMIT)
-    timeout_sec = max(15, AXIOM_SCAN_TIMEOUT_SEC)  # guardrail
+    want = max(AXIOM_SCAN_LIMIT, 1) * 2  # ask for extra, then dedup/trim
+    attempts = 2
+    last_err = None
 
-    last_err: Exception | None = None
-    for attempt in range(1, AXIOM_SCAN_RETRIES + 1):
+    for i in range(1, attempts + 1):
         try:
-            items = await _scan_once(want, timeout_sec)
-            LOG.info("scanner.axiom: %d candidates (cap=%d) [attempt %d/%d]",
-                     len(items), want, attempt, AXIOM_SCAN_RETRIES)
+            raw = await asyncio.wait_for(_fetch_once(want), timeout=AXIOM_SCAN_TIMEOUT_SEC)
+            items = _dedup(raw or [], limit=AXIOM_SCAN_LIMIT)
+            LOG.info("scanner.axiom: %d candidates (raw=%d, cap=%d) [attempt %d/%d]",
+                     len(items), len(raw or []), AXIOM_SCAN_LIMIT, i, attempts)
             return items
         except asyncio.TimeoutError as e:
             last_err = e
             LOG.warning("scanner.axiom: attempt %d/%d timed out after %ss",
-                        attempt, AXIOM_SCAN_RETRIES, timeout_sec)
+                        i, attempts, AXIOM_SCAN_TIMEOUT_SEC)
+            await _recycle_ax()  # drop and recreate browser next round
         except Exception as e:
             last_err = e
-            LOG.warning("scanner.axiom: attempt %d/%d error: %s",
-                        attempt, AXIOM_SCAN_RETRIES, e)
+            LOG.warning("scanner.axiom: attempt %d/%d failed: %s", i, attempts, e)
+            await _recycle_ax()
 
-        # backoff before retrying (except after final attempt)
-        if attempt < AXIOM_SCAN_RETRIES and AXIOM_SCAN_BACKOFF_MS > 0:
-            await asyncio.sleep(AXIOM_SCAN_BACKOFF_MS / 1000.0)
-
-    # All attempts failed
-    if last_err:
-        LOG.warning("scanner.axiom: giving up after %d attempts: %s",
-                    AXIOM_SCAN_RETRIES, last_err)
+    LOG.warning("scanner.axiom: giving up after %d attempts: %s", attempts, last_err or "")
     return []
 
 __all__ = ["scan_axiom"]

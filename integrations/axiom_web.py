@@ -371,77 +371,14 @@ class AxiomWeb:
     # ======================== Public: Discover ========================
 
     async def discover_sections(self, limit_per_section: int = AXIOM_MAX_PER_SECTION) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Scrape Discover buckets:
-          - Trending
-          - Surge
-          - DEX Screener
-          - Pump Live
-        Returns: { section_name: [ {mint, source:'axiom'}, ... ] }
-        """
-        try:
-            await self.goto(AXIOM_DISCOVER_PATH, wait=AXIOM_NAV_WAIT)
-        except PwTimeout:
-            LOG.warning("Axiom discover: initial nav timeout (%sms)", AXIOM_TIMEOUT_MS)
-        except Exception as e:
-            LOG.warning("Axiom discover nav error: %s", e)
-        await self.page.wait_for_timeout(1200)
-
-        # Try two scroll passes (content is lazy-loaded)
-        await self._scroll(steps=12)
+        await self.goto(AXIOM_DISCOVER_PATH)
         await self.page.wait_for_timeout(600)
-        await self._scroll(steps=8)
 
+        # QUICK PATH: Hydration-first (usually present on Next.js apps)
+        blobs = await self._pull_embedded_json()
         sections: Dict[str, List[Dict[str, Any]]] = {name: [] for name in AXIOM_SECTIONS}
-        html = await self.page.content()
-
-        for title in sections.keys():
-            try:
-                # Prefer ARIA heading; fallback to text
-                heading = self.page.get_by_role("heading", name=title).first
-                if await heading.count() == 0:
-                    heading = self.page.get_by_text(title, exact=False).first
-
-                if await heading.count() > 0:
-                    container = heading.locator("xpath=ancestor::*[self::section or self::div][1]")
-                    nodes = await container.locator(
-                        "a[href*='/asset/'], a[href*='/token/'], a[href*='/coins/'], [data-mint], [data-testid*='card']"
-                    ).all()
-                    found: List[str] = []
-                    for el in nodes:
-                        try:
-                            href = await el.get_attribute("href")
-                            dm = await el.get_attribute("data-mint")
-                            text = (await el.inner_text()).strip()
-                            blob = " ".join([href or "", dm or "", text or ""])
-                            m = re.search(BASE58, blob)
-                            if m:
-                                found.append(m.group(0))
-                        except Exception:
-                            continue
-                    # uniq + cap
-                    seen, uniq = set(), []
-                    for m in found:
-                        if m and m not in seen:
-                            seen.add(m)
-                            uniq.append(m)
-                    sections[title] = [{"mint": m, "source": "axiom"} for m in uniq[:limit_per_section]]
-                    continue
-
-                # If no visible heading, slice raw HTML near the title
-                chunk = self._slice_near_heading(html, title)
-                mints = self._find_mints(chunk)
-                sections[title] = [{"mint": m, "source": "axiom"} for m in mints[:limit_per_section]]
-
-            except Exception:
-                # Last resort: HTML slice
-                chunk = self._slice_near_heading(html, title)
-                mints = self._find_mints(chunk)
-                sections[title] = [{"mint": m, "source": "axiom"} for m in mints[:limit_per_section]]
-
-        # If absolutely empty, try hydration blobs
-        if all(len(v) == 0 for v in sections.values()):
-            for blob in await self._pull_embedded_json():
+        if blobs:
+            for blob in blobs:
                 text = json.dumps(blob, ensure_ascii=False)
                 mints = self._find_mints(text)
                 if mints:
@@ -449,11 +386,54 @@ class AxiomWeb:
                     for m in mints:
                         if m not in seen:
                             seen.add(m); uniq.append(m)
-                    sections[AXIOM_SECTIONS[0]] = [{"mint": m, "source": "axiom"} for m in uniq[:limit_per_section]]
+                    # Put into the first section for speed; DOM step will refine if needed.
+                    first = AXIOM_SECTIONS[0] if AXIOM_SECTIONS else "Trending"
+                    sections[first] = [{"mint": m, "source": "axiom"} for m in uniq[:limit_per_section]]
                     break
+
+        # If hydration found nothing, do a light DOM sweep
+        if all(len(v) == 0 for v in sections.values()):
+            await self._scroll(steps=8)
+            html = await self.page.content()
+            for title in sections.keys():
+                try:
+                    heading = self.page.get_by_role("heading", name=title).first
+                    if await heading.count() == 0:
+                        heading = self.page.get_by_text(title, exact=False).first
+                        if await heading.count() == 0:
+                            chunk = self._slice_near_heading(html, title)
+                            mints = self._find_mints(chunk)
+                            sections[title] = [{"mint": m, "source": "axiom"} for m in mints[:limit_per_section]]
+                            continue
+
+                    container = heading.locator("xpath=ancestor::*[self::section or self::div][1]")
+                    nodes = await container.locator("a[href*='/asset/'], a[href*='/token/'], a[href*='/coins/'], [data-mint]").all()
+                    found: List[str] = []
+                    for el in nodes:
+                        try:
+                            blob = " ".join(filter(None, [
+                                await el.get_attribute("href"),
+                                await el.get_attribute("data-mint"),
+                                (await el.inner_text()) or "",
+                            ]))
+                            m = re.search(BASE58, blob)
+                            if m:
+                                found.append(m.group(0))
+                        except Exception:
+                            continue
+                    uniq, seen = [], set()
+                    for m in found:
+                        if m and m not in seen:
+                            seen.add(m); uniq.append(m)
+                    sections[title] = [{"mint": m, "source": "axiom"} for m in uniq[:limit_per_section]]
+                except Exception:
+                    chunk = self._slice_near_heading(html, title)
+                    mints = self._find_mints(chunk)
+                    sections[title] = [{"mint": m, "source": "axiom"} for m in mints[:limit_per_section]]
 
         LOG.info("Axiom discover sections: %s", {k: len(v) for k, v in sections.items()})
         return sections
+
 
     # ======================== Public: Trackers ========================
 
