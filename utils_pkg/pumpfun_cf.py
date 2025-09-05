@@ -47,14 +47,16 @@ REFRESH_SEC = int(os.getenv("PUMPFUN_CF_REFRESH_SEC", "900"))
 # The two hosts we care about
 HOSTS = ("pump.fun", "frontend-api.pump.fun")
 
-
 def _env_true(x: Optional[str]) -> bool:
-    return str(x or "").strip().lower() not in ("", "0", "false", "no", "off")
-
+    s = str(x or "").strip().lower()
+    return s in ("1", "true", "yes", "on")
 
 # Per-host proxy toggles (defaults: apex=no proxy, API=proxy)
 USE_PROXY_FOR_APEX = _env_true(os.getenv("PUMPFUN_APEX_VIA_PROXY", "0"))
 USE_PROXY_FOR_API = _env_true(os.getenv("PUMPFUN_API_VIA_PROXY", "1"))
+log.info("CF config: apex_via_proxy=%s api_via_proxy=%s proxy=%s",
+         USE_PROXY_FOR_APEX, USE_PROXY_FOR_API,
+         (_mask_proxy_for_log(_resolve_proxy_url() or "") or "none"))
 
 # DOM pages to try on apex (comma separated)
 DOM_PAGES = [
@@ -679,6 +681,10 @@ async def browser_fetch_next_json(page_path: Optional[str] = None) -> Optional[d
     pages = _dom_pages() if page_path is None else [page_path]
     base = "https://pump.fun"
 
+if not _COOKIES.get("pump.fun"):
+    log.debug("pumpfun: apex cookie not ready yet; skipping browser fetch")
+    return None
+
     try:
         await _ensure_chromium_available()
         async with async_playwright() as p:
@@ -770,6 +776,10 @@ async def browser_scrape_trending_dom(*, limit: int = 50, pages: Optional[List[s
 
     PAGES = pages or ["/board", "/trending", "/advanced/scan", "/"]
 
+if not _COOKIES.get("pump.fun"):
+    log.debug("pumpfun: apex cookie not ready yet; skipping browser fetch")
+    return None
+
     def _uniq(seq: List[str]) -> List[str]:
         s, out = set(), []
         for x in seq:
@@ -833,7 +843,7 @@ async def browser_scrape_trending_dom(*, limit: int = 50, pages: Optional[List[s
                     url = f"https://pump.fun{path}"
                     try:
                         await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
-                        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                        await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
                     except Exception:
                         continue
 
