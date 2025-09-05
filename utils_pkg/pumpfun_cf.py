@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, quote
 
 from playwright.async_api import async_playwright, Response
+from urllib.parse import urlparse, quote, unquote
 
 log = logging.getLogger("pumpfun.cf")
 
@@ -67,31 +68,35 @@ def _playwright_proxy() -> Optional[dict]:
     """
     Build a Playwright proxy dict.
 
-    Supports:
-      1) Full URL: http(s)://user:pass@host:port
-      2) Colon form: host:port:user:pass  (we normalize to full URL)
+    Accepted formats:
+      A) Full URL:  http://user:pass@host:port
+      B) Colon form: host:port:user:pass   (we normalize + split)
+    Playwright works best when creds are passed as separate fields.
     """
     raw = os.getenv("PLAYWRIGHT_PROXY") or _resolve_proxy_url()
     if not raw:
         return None
 
-    # colon form -> normalize to URL with embedded credentials
+    # Colon form → split into parts
     if "://" not in raw and raw.count(":") >= 3:
         host, port, user, pwd = raw.split(":", 3)
-        # URL-encode just in case (e.g., @ or : in password)
-        user_q = quote(user, safe="~._-")
-        pwd_q = quote(pwd, safe="~._-")
-        return {"server": f"http://{user_q}:{pwd_q}@{host}:{port}"}
+        return {
+            "server": f"http://{host}:{port}",
+            "username": unquote(user),
+            "password": unquote(pwd),
+        }
 
-    # already a URL; if it has separate parts, just pass through as server
+    # URL form → extract creds and pass separately
     u = urlparse(raw)
     if u.scheme and u.hostname and u.port:
-        if u.username or u.password:
-            return {"server": raw}
-        return {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+        proxy = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+        if u.username:
+            proxy["username"] = unquote(u.username)
+        if u.password:
+            proxy["password"] = unquote(u.password)
+        return proxy
 
     return None
-
 
 def _mask_proxy_for_log(url: str) -> str:
     try:
@@ -560,7 +565,6 @@ async def _browser_get_build_id(page) -> Optional[str]:
         pass
     return None
 
-
 async def browser_fetch_next_json(page_path: str) -> Optional[dict]:
     try:
         await _ensure_chromium_available()
@@ -581,7 +585,7 @@ async def browser_fetch_next_json(page_path: str) -> Optional[dict]:
                 path = page_path if page_path.startswith("/") else f"/{page_path}"
 
                 await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
-                await page.goto(base + path, wait_until="domcontentloaded", timeout=60_000)
+                await page.goto(base + path, wait_until="domcontentloaded", timeout=90_000)
                 try:
                     await page.wait_for_selector('script#__NEXT_DATA__', timeout=30_000)
                 except Exception:
