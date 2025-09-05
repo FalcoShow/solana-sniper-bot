@@ -517,6 +517,23 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                     viewport={"width": 1366, "height": 768},
                     color_scheme="light",
                 )
+def _cookie_pairs(s: str, domain: str):
+    jar = _parse_cookie_string(s)
+    out = []
+    for name in ("cf_clearance", "__cf_bm"):
+        if name in jar:
+            out.append({
+                "name": name, "value": jar[name],
+                "domain": domain, "path": "/", "httpOnly": False, "secure": True, "sameSite": "Lax"
+            })
+    return out
+
+host = (urlparse(url).hostname or "").lower()
+if host.endswith("frontend-api.pump.fun"):
+    seed = os.getenv("PUMPFUN_COOKIE_API") or os.getenv("PUMPFUN_COOKIE") or ""
+    if seed:
+        await ctx.add_cookies(_cookie_pairs(seed, "frontend-api.pump.fun"))
+# -----------------------------------------------
                 page = await ctx.new_page()
                 await page.add_init_script(STEALTH_JS)
 
