@@ -777,7 +777,13 @@ async def browser_scrape_trending_dom(*, limit: int = 50, pages: Optional[List[s
                     url = f"https://pump.fun{path if path.startswith('/') else '/' + path}"
                     try:
                         await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
-                        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                        await page.goto(url, wait_until="networkidle", timeout=60_000)
+try:
+    await page.wait_for_selector('a[href*="/coin/"], a[href*="/coins/"], [data-mint]', timeout=10_000)
+except Exception:
+    # If nothing appeared, still give the page a moment (Next.js hydration / CF)
+    await page.wait_for_timeout(1500)
+
                     except Exception:
                         continue
 
@@ -788,8 +794,8 @@ async def browser_scrape_trending_dom(*, limit: int = 50, pages: Optional[List[s
                         if anchors:
                             # Small scroll helps load lazy anchors
                             for _ in range(4):
-                                await page.mouse.wheel(0, 1200)
-                                await page.wait_for_timeout(200)
+    await page.mouse.wheel(0, 1200)
+    await page.wait_for_timeout(250)
 
                         mints: List[str] = []
                         for el in anchors[: max(200, limit * 3)]:
