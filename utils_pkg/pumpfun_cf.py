@@ -666,7 +666,11 @@ async def browser_fetch_trending_via_next_data(*, limit: int = 50) -> Optional[L
 
 async def browser_scrape_trending_dom(*, limit: int = 50, pages: Optional[List[str]] = None) -> Optional[List[Dict[str, Any]]]:
     import re
+    WAIT_MS = int(os.getenv("PUMPFUN_DOM_WAIT_MS", "2000"))
+    SCROLLS = int(os.getenv("PUMPFUN_DOM_SCROLLS", "4"))
     PAGES = pages or ["/board", "/trending", "/advanced/scan", "/"]
+
+    BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,44}"
 
     def _uniq(seq: List[str]) -> List[str]:
         s, out = set(), []
@@ -687,7 +691,7 @@ async def browser_scrape_trending_dom(*, limit: int = 50, pages: Optional[List[s
                 )
 
                 # seed apex cookie if provided
-                apex_cookie_str = (get_cookie_for("pump.fun") or os.getenv("PUMPFUN_COOKIE") or "").strip()
+                apex_cookie_str = (os.getenv("PUMPFUN_COOKIE") or "").strip()
                 if apex_cookie_str:
                     jar = _parse_cookie_string(apex_cookie_str)
                     cookies = []
@@ -703,7 +707,59 @@ async def browser_scrape_trending_dom(*, limit: int = 50, pages: Optional[List[s
                 await page.add_init_script(STEALTH_JS)
 
                 found: List[str] = []
-                BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,44}"
+
+                async def grab_from_current_page(path_label: str) -> List[str]:
+                    # Always give the page a moment to hydrate and force some scrolls
+                    await page.wait_for_timeout(WAIT_MS)
+                    for _ in range(max(1, SCROLLS)):
+                        try:
+                            await page.mouse.wheel(0, 1200)
+                        except Exception:
+                            pass
+                        await page.wait_for_timeout(250)
+
+                    # Try selectors first (fast)
+                    try:
+                        anchors = await page.locator('a[href*="/coin/"], a[href*="/coins/"], [data-mint]').all()
+                    except Exception:
+                        anchors = []
+
+                    mints: List[str] = []
+                    for el in anchors[: max(200, limit * 3)]:
+                        try:
+                            dm = await el.get_attribute("data-mint")
+                            if dm:
+                                mints.append(dm)
+                            href = await el.get_attribute("href")
+                            if href:
+                                if href.startswith("/"):
+                                    href = f"https://pump.fun{href}"
+                                m = re.search(rf"/coins?/(?P<m>{BASE58})", href)
+                                if not m:
+                                    m = re.search(rf"[?&]mint=(?P<m>{BASE58})", href)
+                                if m:
+                                    mints.append(m.group("m"))
+                        except Exception:
+                            continue
+
+                    # Also regex on full HTML (SSR / inline JSON / hydration artifacts)
+                    try:
+                        html = await page.content()
+                        for pat in [
+                            rf'href="(?:https://pump\.fun)?/coin/({BASE58})"',
+                            rf'href="(?:https://pump\.fun)?/coins/({BASE58})"',
+                            rf'data-mint="({BASE58})"',
+                            rf'"mintAddress"\s*:\s*"({BASE58})"',
+                            rf'"mint"\s*:\s*"({BASE58})"',
+                        ]:
+                            mints += re.findall(pat, html)
+                    except Exception:
+                        pass
+
+                    mints = _uniq(mints)
+                    if mints:
+                        log.info("DOM-scrape: +%d mints via selectors/regex on %s", len(mints), path_label)
+                    return mints
 
                 for path in PAGES:
                     url = f"https://pump.fun{path}"
@@ -713,57 +769,26 @@ async def browser_scrape_trending_dom(*, limit: int = 50, pages: Optional[List[s
                     except Exception:
                         continue
 
-                    try:
-                        # scroll a bit to let lazy content populate
-                        anchors = await page.locator('a[href*="/coin/"], a[href*="/coins/"], [data-mint]').all()
-                        for _ in range(4):
-                            await page.mouse.wheel(0, 1200)
-                            await page.wait_for_timeout(250)
+                    # First pass
+                    mints = await grab_from_current_page(path)
+                    found.extend(mints)
+                    if len(_uniq(found)) >= limit:
+                        break
 
-                        mints: List[str] = []
-                        for el in anchors[: max(200, limit * 3)]:
-                            href = await el.get_attribute("href")
-                            dm = await el.get_attribute("data-mint")
-                            if dm:
-                                mints.append(dm)
-                            if href:
-                                if href.startswith("/"):
-                                    href = f"https://pump.fun{href}"
-                                m = re.search(rf"/coins?/(?P<m>{BASE58})", href)
-                                if not m:
-                                    m = re.search(rf"[?&]mint=(?P<m>{BASE58})", href)
-                                if m:
-                                    mints.append(m.group("m"))
-
-                        mints = _uniq([m for m in mints if m])
-                        if mints:
-                            log.info("DOM-scrape: %d mints via selectors on %s", len(mints), path)
-                            found.extend(mints)
-                            if len(_uniq(found)) >= limit:
-                                break
-
-                        html = await page.content()
-                        extra = []
-                        for pat in [
-                            rf'href="(?:https://pump\.fun)?/coin/({BASE58})"',
-                            rf'href="(?:https://pump\.fun)?/coins/({BASE58})"',
-                            rf'data-mint="({BASE58})"',
-                            rf'"mintAddress"\s*:\s*"({BASE58})"',
-                            rf'"mint"\s*:\s*"({BASE58})"',
-                        ]:
-                            extra += re.findall(pat, html)
-                        extra = _uniq(extra)
-                        if extra:
-                            log.info("DOM-scrape: +%d mints via HTML regex on %s", len(extra), path)
-                            found.extend(extra)
-                            if len(_uniq(found)) >= limit:
-                                break
-                    except Exception:
-                        continue
+                    # If the first pass missed, try a light reload once
+                    if not mints:
+                        try:
+                            await page.reload(wait_until="domcontentloaded", timeout=25_000)
+                        except Exception:
+                            pass
+                        mints = await grab_from_current_page(path + " (reload)")
+                        found.extend(mints)
+                        if len(_uniq(found)) >= limit:
+                            break
 
                 uniq = _uniq(found)[:limit]
                 if not uniq:
-                    log.debug("DOM-scrape: no items found on %s", ",".join(PAGES))
+                    log.debug("DOM-scrape: no items on %s", ",".join(PAGES))
                 else:
                     log.info("DOM-scrape total: %d unique mints", len(uniq))
                 return [{"mint": m} for m in uniq]
