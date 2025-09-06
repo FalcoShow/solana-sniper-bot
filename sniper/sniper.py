@@ -843,22 +843,22 @@ class Sniper:
 async def main():
     await init_resources()
 
-from execution.pnl_watcher import watch_positions_loop
-asyncio.create_task(watch_positions_loop())
-
     # Ensure DB schema exists
     try:
         await ensure_schema()
     except Exception as e:
         log.warning("ensure_schema failed: %s", e)
 
-    # Refresh session/redis via accessors if needed
+    # Refresh session/redis refs via accessors if needed
     try:
         global _session_ref, _redis_ref
         if _session_ref is None or _redis_ref is None:
-            from utils_pkg.core_utils import get_session as _get_session, get_redis as _get_redis  # type: ignore
-            _session_ref = _get_session()
-            _redis_ref = _get_redis()
+            try:
+                from utils_pkg.core_utils import get_session as _get_session, get_redis as _get_redis
+                _session_ref = _get_session()
+                _redis_ref = _get_redis()
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -873,18 +873,18 @@ asyncio.create_task(watch_positions_loop())
     except Exception as e:
         log.warning("pumpfun cookie refresher not started: %s", e)
 
-    # Optional: start PnL watcher if you added it
+    # Start the PnL watcher (non-blocking)
     try:
-        from execution.pnl_watcher import watch_positions_loop  # your watcher with sell_fn, decide_exit/apply_exit
+        from execution.pnl_watcher import watch_positions_loop
         asyncio.create_task(watch_positions_loop())
     except Exception as e:
         log.debug("pnl watcher not started: %s", e)
 
-    # Run main sniper loop
     try:
         await Sniper().main_loop()
     finally:
         await close_resources()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
