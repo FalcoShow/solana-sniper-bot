@@ -1,4 +1,4 @@
-# sniper/sniper.py — v7.1
+# sniper/sniper.py — v7.2
 # Max-PnL preset · rank+select · priority fees · exits wiring · DB logs · CF refresher
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ except Exception as e:
         ...
 
 try:
-    # these are from your rewritten db/logger.py
+    # from your rewritten db/logger.py
     from db.logger import (
         log_scan_batch,      # (when, total, kept, reason_top)
         log_scan_row,        # (row: dict)
@@ -170,7 +170,7 @@ try:
     from execution.params import get_ticket_size_usd  # type: ignore
 except Exception:
     def get_ticket_size_usd(equity_usd: float) -> float:
-        pct = float(os.getenv("TICKET_PCT_EQUITY", "0.04"))  # a bit more aggressive
+        pct = float(os.getenv("TICKET_PCT_EQUITY", "0.04"))  # slightly aggressive
         cap = float(os.getenv("TICKET_USD_CAP", "300"))
         base = equity_usd * pct
         return float(min(cap, max(10.0, base)))
@@ -180,7 +180,7 @@ try:
 except Exception:
     def compute_priority_tip(sol_to_spend: float) -> Tuple[int, Optional[int]]:
         if sol_to_spend >= 1.0:
-            return (10_000, 50_000)    # 0.01 micro-lamports/cu, 0.00005 SOL tip
+            return (10_000, 50_000)    # cu price (µ-lamports), jito tip (lamports)
         if sol_to_spend >= 0.25:
             return (6_000, 25_000)
         return (3_000, 10_000)
@@ -527,36 +527,14 @@ async def _buy_token(
     if not await try_acquire(mint):
         return False
 
-# ---- persist for PnL watcher ----
-try:
-    from execution.exits import PositionState   # reuse the same class
-    from positions import save_position
-    pos = PositionState(
-        mint=mint,
-        entry_px=float(entry_price_sol_per_token),  # SOL/token
-        size_usd=float(ticket_usd),
-        symbol=symbol,
-    )
-    # positions.save_position can take (mint, dict) or dict — we’ll pass dict
-    await save_position(mint, {
-        "token_address": mint,
-        "symbol": symbol,
-        "buy_price": float(pos.entry_px),        # SOL/token
-        "amount_invested": float(pos.size_usd),  # USD at risk (your convention)
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "peak_px": float(pos.entry_px),
-        "tp1_done": False,
-    })
-    log.info("position persisted for watcher: %s", mint)
-except Exception as e:
-    log.debug("save_position for watcher failed: %s", e)
-
     try:
+        # -------------------------------- DRY RUN ---------------------------------
         if DRY_RUN:
             await send_telegram(f"🧪 DRY-RUN — would buy {symbol} ({mint}) for ${ticket_usd:,.2f}")
             log.info("dry-run: would-buy %s %s @ $%.2f", symbol, mint, ticket_usd)
             return False
 
+        # --------------------------- size & priority fees -------------------------
         usd_per_sol = await convert_sol_to_usd(1.0)
         if not usd_per_sol or usd_per_sol <= 0:
             return False
@@ -566,6 +544,7 @@ except Exception as e:
 
         cu_price, jito_tip = compute_priority_tip(sol_to_spend)
 
+        # ------------------------------- route guard ------------------------------
         ok_rg, why, pre_meta = await precheck_buy(mint, sol_to_spend, SLIPPAGE_BPS)
         if not ok_rg:
             msg = (f"⛔ RouteGuard block {symbol} ({mint}) — {why} • "
@@ -574,7 +553,7 @@ except Exception as e:
             log.info(msg)
             return False
 
-        # Include priority fees if supported by your swap wrapper
+        # ------------------------------ the actual swap ---------------------------
         swap_kwargs = dict(
             input_mint=SOL_MINT,
             output_mint=mint,
@@ -595,29 +574,31 @@ except Exception as e:
             await log_trade_event({"type": "buy_fail", "mint": mint, "symbol": symbol, "why": "swap_failed"})
             return False
 
-        # ----------------- Construct PositionState on entry (required) -----------------
+        # ------------------ persist position for watcher/storage ------------------
         try:
-            from execution.exits import PositionState  # dataclass we standardized
-            from positions import save_position
-            pos = PositionState(
-                mint=mint,
-                entry_px=float(entry_price_sol_per_token),  # SOL/token
-                size_usd=float(ticket_usd),
+            from positions import ensure_position
+            stop_pct = float(os.getenv("HARD_STOP_PCT", "-28"))
+            trailing_px = entry_price_sol_per_token * (1.0 + (stop_pct / 100.0))
+            await ensure_position(
+                token_address=mint,
+                buy_price=float(entry_price_sol_per_token),   # SOL/token
+                amount_invested=float(sol_to_spend),          # SOL spent
+                symbol=symbol,
+                trailing_stop=float(trailing_px),
+                entry_tx=sig,
+                source="sniper",
+                meta={"preset": PRESET},
             )
-            # optional label for UI/logs
-            setattr(pos, "symbol", symbol)
-            await save_position(mint, pos)  # our positions.py accepts dataclass/dict
         except Exception as e:
-            log.debug("save PositionState failed: %s", e)
-        # ------------------------------------------------------------------------------
+            log.debug("ensure_position failed: %s", e)
 
-        # Persist entry price for other subsystems
+        # ------------------ share entry price with other subsystems ---------------
         try:
             await save_entry_price(get_redis(), mint, entry_price_sol_per_token)
         except Exception as e:
             log.debug("save_entry_price failed: %s", e)
 
-        # Inform exit supervisor (TP/TSL params are read by watcher)
+        # ------------------ inform exit supervisor (optional) ---------------------
         try:
             trailing_pct = float(os.getenv("STOP_LOSS_PERCENT", "20"))
             take1_pct    = float(os.getenv("TAKE_PROFIT1_PCT", "30"))
@@ -635,6 +616,7 @@ except Exception as e:
         except Exception as e:
             log.debug("register_entry failed: %s", e)
 
+        # ----------------------------- accounting + logs --------------------------
         await note_spend(None, float(ticket_usd))
 
         usd_est = await convert_sol_to_usd(sol_to_spend) or 0.0
@@ -659,6 +641,7 @@ except Exception as e:
             "jito_tip": jito_tip,
         })
 
+        # ------------------------------ post-trade guard --------------------------
         ok_wd, msg2, now_meta = await posttrade_watchdog(mint, sol_to_spend, SLIPPAGE_BPS, pre_meta)
         if not ok_wd:
             await send_telegram(
@@ -667,6 +650,7 @@ except Exception as e:
                 f"hops(pre/now)={pre_meta.get('hops')}/{now_meta.get('hops',0)}"
             )
         return True
+
     finally:
         try:
             await release(mint)
@@ -820,7 +804,7 @@ class Sniper:
 
                 await log_scan_batch(_now_utc().isoformat(), len(cands), len(top), f"preset={PRESET}")
 
-                # Prewarm quotes using current ticket sizing
+                # Prewarm quotes with current ticket sizing
                 try:
                     ticket = get_ticket_size_usd(equity_usd)
                     await self._prewarm(top, float(ticket))
