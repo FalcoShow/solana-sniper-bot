@@ -687,7 +687,7 @@ async def browser_scrape_trending_dom(*, limit: int = 50, pages: Optional[List[s
                 )
 
                 # seed apex cookie if provided
-                apex_cookie_str = (os.getenv("PUMPFUN_COOKIE") or "").strip()
+                apex_cookie_str = (get_cookie_for("pump.fun") or os.getenv("PUMPFUN_COOKIE") or "").strip()
                 if apex_cookie_str:
                     jar = _parse_cookie_string(apex_cookie_str)
                     cookies = []
