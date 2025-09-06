@@ -838,6 +838,28 @@ class Sniper:
 # ==============================================================================
 # Entrypoint
 # ==============================================================================
+# --- Back-compat scanner shim (prevents NameError and reuses your existing loop) ---
+import inspect
+import logging
+
+async def start_scanners():
+    await scan_loop()
+    """
+    Tries common entrypoints used by older layouts. If none are present,
+    it logs a warning and returns (service keeps running).
+    """
+    log = logging.getLogger("sniper")
+    for name in ("start_scanners_impl", "scan_loop", "run_loop", "loop"):
+        fn = globals().get(name)
+        if fn and callable(fn):
+            log.info("start_scanners: delegating to %s()", name)
+            ret = fn()
+            # if it's a coroutine, await it; if it's sync, just call it
+            if inspect.isawaitable(ret):
+                return await ret
+            return
+    log.warning("start_scanners: no scanner entrypoint found; continuing without scanners.")
+
 async def main():
     await init_resources()
     start_exit_supervisor()
