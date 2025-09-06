@@ -918,6 +918,46 @@ async def start_scanners():
     while True:
         await asyncio.sleep(3600)
 
+# --- minimal scan loop (keeps service + exits alive) ---
+import os, asyncio, logging
+log = logging.getLogger("sniper")
+
+async def idle_forever():
+    # simple heartbeat so the container looks healthy
+    beat = int(os.getenv("SCAN_HEARTBEAT_SEC", "10"))
+    while True:
+        log.info("scanner: idle heartbeat")
+        await asyncio.sleep(beat)
+
+async def scan_loop():
+    """
+    Minimal runner:
+      - start exits supervisor
+      - try to start PnL watcher (if present)
+      - then idle (or replace this with your real scanner later)
+    """
+    loop = asyncio.get_running_loop()
+
+    # Start exits
+    try:
+        from execution.exits_wiring import start_exit_supervisor
+        start_exit_supervisor(loop)
+        log.info("scanner: exit supervisor started")
+    except Exception as e:
+        log.exception(f"scanner: failed to start exit supervisor: {e}")
+
+    # Optional PnL watcher
+    try:
+        from execution.pnl_watcher import start_pnl_watcher
+        asyncio.create_task(start_pnl_watcher())
+        log.info("scanner: pnl_watcher task started")
+    except Exception:
+        # ok if not present
+        pass
+
+    # If you later have a real scanner, call it here instead of idle:
+    await idle_forever()
+
 async def main():
     await init_resources()
     start_exit_supervisor()
