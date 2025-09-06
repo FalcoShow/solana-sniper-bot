@@ -838,27 +838,85 @@ class Sniper:
 # ==============================================================================
 # Entrypoint
 # ==============================================================================
-# --- Back-compat scanner shim (prevents NameError and reuses your existing loop) ---
-import inspect
-import logging
+# --- scanner entry shim (robust) ---
+import os, asyncio, inspect, importlib, logging
+log = logging.getLogger("sniper")
+
+async def _maybe_await(x):
+    if inspect.iscoroutine(x):
+        return await x
+    return x
+
+def _resolve_callable(path: str):
+    """
+    Resolve 'module.sub:func' or 'func' (from current module) to a callable.
+    """
+    if not path:
+        return None
+    if ":" in path:
+        mod_name, fn_name = path.split(":", 1)
+        mod = importlib.import_module(mod_name)
+        return getattr(mod, fn_name, None)
+    # try current module
+    return globals().get(path)
 
 async def start_scanners():
-    await scan_loop()
     """
-    Tries common entrypoints used by older layouts. If none are present,
-    it logs a warning and returns (service keeps running).
+    Back-compat delegator that finds your scanner loop and runs it.
+    Priority:
+      1) SCANNERS_ENTRY / START_SCANNERS_TARGET env (e.g. "mypkg.runner:scan_forever")
+      2) Common function names in this module
+      3) Common function names in 'scanners' or 'sniper.scanners'
+      4) Idle keepalive so the container stays up (logs error once)
     """
-    log = logging.getLogger("sniper")
-    for name in ("start_scanners_impl", "scan_loop", "run_loop", "loop"):
+    # 1) explicit env override
+    env_target = os.getenv("SCANNERS_ENTRY") or os.getenv("START_SCANNERS_TARGET")
+    if env_target:
+        try:
+            fn = _resolve_callable(env_target)
+            if callable(fn):
+                log.info(f"start_scanners: env target -> {env_target}")
+                return await _maybe_await(fn())
+            else:
+                log.error(f"start_scanners: env target not callable: {env_target}")
+        except Exception as e:
+            log.exception(f"start_scanners: failed to import env target {env_target}: {e}")
+
+    # 2) try common names in this module
+    candidates_here = (
+        "scan_loop", "scan_forever", "scanner_loop", "scanners_loop",
+        "run_scanners", "run_loop", "loop", "start_scan"
+    )
+    for name in candidates_here:
         fn = globals().get(name)
-        if fn and callable(fn):
-            log.info("start_scanners: delegating to %s()", name)
-            ret = fn()
-            # if it's a coroutine, await it; if it's sync, just call it
-            if inspect.isawaitable(ret):
-                return await ret
-            return
-    log.warning("start_scanners: no scanner entrypoint found; continuing without scanners.")
+        if callable(fn):
+            log.info(f"start_scanners: delegating to local {name}()")
+            return await _maybe_await(fn())
+
+    # 3) try common names in typical modules
+    for mod_name, fn_name in (
+        ("scanners", "scan_loop"),
+        ("scanners", "scan_forever"),
+        ("sniper.scanners", "scan_loop"),
+        ("sniper.scanners", "scan_forever"),
+    ):
+        try:
+            mod = importlib.import_module(mod_name)
+            fn = getattr(mod, fn_name, None)
+            if callable(fn):
+                log.info(f"start_scanners: delegating to {mod_name}.{fn_name}()")
+                return await _maybe_await(fn())
+        except Exception:
+            pass
+
+    # 4) fallback: don't crash the service; keep alive and complain once
+    log.error(
+        "start_scanners: no scan loop found. "
+        "Set SCANNERS_ENTRY='module.path:func' in env or define scan_loop(). "
+        "Idling to keep the container alive."
+    )
+    while True:
+        await asyncio.sleep(3600)
 
 async def main():
     await init_resources()
