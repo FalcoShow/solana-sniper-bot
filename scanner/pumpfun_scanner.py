@@ -290,7 +290,7 @@ async def _fetch_api_json_with_fallback(
 # ---------------------------------------------------------------------
 # HTML helpers: scrape coin links directly from apex HTML (no JS)
 # ---------------------------------------------------------------------
-_BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,64}"
+_BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,44}"
 
 def _uniq(seq: List[str]) -> List[str]:
     seen = set()

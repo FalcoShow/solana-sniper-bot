@@ -703,7 +703,7 @@ async def browser_scrape_trending_dom(*, limit: int = 50, pages: Optional[List[s
                 await page.add_init_script(STEALTH_JS)
 
                 found: List[str] = []
-                BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,64}"
+                BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,44}"
 
                 for path in PAGES:
                     url = f"https://pump.fun{path}"
