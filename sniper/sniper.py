@@ -7,6 +7,7 @@ import os
 import asyncio
 import logging
 import random
+from execution.exits import start_exit_supervisor
 from typing import Dict, Any, List, Callable, Optional, Tuple
 from datetime import datetime, timezone
 
@@ -839,8 +840,10 @@ class Sniper:
 # ==============================================================================
 async def main():
     await init_resources()
+    start_exit_supervisor()
+    await start_scanners()
 
-    # Ensure DB schema exists
+# Ensure DB schema exists
     try:
         await ensure_schema()
     except Exception as e:
