@@ -51,39 +51,36 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots(
 );
 """
 
-MIGRATIONS = """
--- scan_rows: token_address -> mint (old builds)
+MIGRATIONS_SAFE = """
+-- Ensure columns exist
+ALTER TABLE scan_rows ADD COLUMN IF NOT EXISTS mint TEXT;
+ALTER TABLE trades    ADD COLUMN IF NOT EXISTS mint TEXT;
+
+-- Backfill from token_address if that legacy column exists
 DO $$ BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name='scan_rows' AND column_name='token_address'
-    ) AND NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name='scan_rows' AND column_name='mint'
     ) THEN
-        EXECUTE 'ALTER TABLE scan_rows RENAME COLUMN token_address TO mint';
+        EXECUTE 'UPDATE scan_rows SET mint = COALESCE(mint, token_address) WHERE mint IS NULL';
     END IF;
 END $$;
 
--- trades: token_address -> mint (old builds)
 DO $$ BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name='trades' AND column_name='token_address'
-    ) AND NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name='trades' AND column_name='mint'
     ) THEN
-        EXECUTE 'ALTER TABLE trades RENAME COLUMN token_address TO mint';
+        EXECUTE 'UPDATE trades SET mint = COALESCE(mint, token_address) WHERE mint IS NULL';
     END IF;
 END $$;
 """
 
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_scan_rows_mint ON scan_rows(mint);
-CREATE INDEX IF NOT EXISTS idx_trades_mint ON trades(mint);
-CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts);
-CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON pnl_snapshots(ts);
+CREATE INDEX IF NOT EXISTS idx_trades_mint    ON trades(mint);
+CREATE INDEX IF NOT EXISTS idx_trades_ts      ON trades(ts);
+CREATE INDEX IF NOT EXISTS idx_snapshots_ts   ON pnl_snapshots(ts);
 """
 
 async def ensure_schema():
@@ -95,10 +92,8 @@ async def ensure_schema():
     if not url:
         raise RuntimeError("DATABASE_URL not set")
 
-    conn = await asyncpg.connect(url)
-    try:
-        for sql in (DDL, MIGRATIONS, INDEXES):
-            await conn.execute(sql)
-        log.info("db.schema ensured (DDL + migrations + indexes).")
-    finally:
-        await conn.close()
+    async with asyncpg.create_pool(url, min_size=1, max_size=3) as pool:
+        async with pool.acquire() as conn:
+            for sql in (DDL, MIGRATIONS_SAFE, INDEXES):
+                await conn.execute(sql)
+            log.info("db.schema ensured (DDL + safe migrations + indexes).")

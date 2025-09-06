@@ -520,6 +520,7 @@ async def _buy_token(
     ticket_usd: float,
     entry_price_sol_per_token: float,
 ) -> bool:
+    # Guards
     if await _is_halted():
         return False
     if await _cooldown_key(f"buycd:{mint}", BUY_COOLDOWN_SEC):
@@ -528,13 +529,39 @@ async def _buy_token(
         return False
 
     try:
-        # -------------------------------- DRY RUN ---------------------------------
+        # Best-effort: persist initial position for the watcher (does NOT gate the buy)
+        try:
+            from execution.exits import PositionState   # reuse the same class
+            from positions import save_position
+            pos = PositionState(
+                mint=mint,
+                entry_px=float(entry_price_sol_per_token),  # SOL/token
+                size_usd=float(ticket_usd),
+                symbol=symbol,
+            )
+            await save_position(mint, {
+                "token_address": mint,
+                "symbol": symbol,
+                "buy_price": float(pos.entry_px),        # SOL/token
+                "amount_invested": float(pos.size_usd),  # USD at risk (your convention)
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "peak_px": float(pos.entry_px),
+                "tp1_done": False,
+            })
+            log.info("position persisted for watcher: %s", mint)
+        except Exception as e:
+            log.debug("save_position for watcher failed: %s", e)
+
+        # DRY-RUN?
         if DRY_RUN:
-            await send_telegram(f"🧪 DRY-RUN — would buy {symbol} ({mint}) for ${ticket_usd:,.2f}")
+            try:
+                await send_telegram(f"🧪 DRY-RUN — would buy {symbol} ({mint}) for ${ticket_usd:,.2f}")
+            except Exception:
+                pass
             log.info("dry-run: would-buy %s %s @ $%.2f", symbol, mint, ticket_usd)
             return False
 
-        # --------------------------- size & priority fees -------------------------
+        # Sizing in SOL
         usd_per_sol = await convert_sol_to_usd(1.0)
         if not usd_per_sol or usd_per_sol <= 0:
             return False
@@ -542,9 +569,8 @@ async def _buy_token(
         if sol_to_spend <= 0:
             return False
 
+        # Fees + route guard
         cu_price, jito_tip = compute_priority_tip(sol_to_spend)
-
-        # ------------------------------- route guard ------------------------------
         ok_rg, why, pre_meta = await precheck_buy(mint, sol_to_spend, SLIPPAGE_BPS)
         if not ok_rg:
             msg = (f"⛔ RouteGuard block {symbol} ({mint}) — {why} • "
@@ -553,7 +579,7 @@ async def _buy_token(
             log.info(msg)
             return False
 
-        # ------------------------------ the actual swap ---------------------------
+        # Swap (include priority fees when supported)
         swap_kwargs = dict(
             input_mint=SOL_MINT,
             output_mint=mint,
@@ -574,31 +600,12 @@ async def _buy_token(
             await log_trade_event({"type": "buy_fail", "mint": mint, "symbol": symbol, "why": "swap_failed"})
             return False
 
-        # ------------------ persist position for watcher/storage ------------------
-        try:
-            from positions import ensure_position
-            stop_pct = float(os.getenv("HARD_STOP_PCT", "-28"))
-            trailing_px = entry_price_sol_per_token * (1.0 + (stop_pct / 100.0))
-            await ensure_position(
-                token_address=mint,
-                buy_price=float(entry_price_sol_per_token),   # SOL/token
-                amount_invested=float(sol_to_spend),          # SOL spent
-                symbol=symbol,
-                trailing_stop=float(trailing_px),
-                entry_tx=sig,
-                source="sniper",
-                meta={"preset": PRESET},
-            )
-        except Exception as e:
-            log.debug("ensure_position failed: %s", e)
-
-        # ------------------ share entry price with other subsystems ---------------
+        # Persist entry meta (optional) + register with exit supervisor
         try:
             await save_entry_price(get_redis(), mint, entry_price_sol_per_token)
         except Exception as e:
             log.debug("save_entry_price failed: %s", e)
 
-        # ------------------ inform exit supervisor (optional) ---------------------
         try:
             trailing_pct = float(os.getenv("STOP_LOSS_PERCENT", "20"))
             take1_pct    = float(os.getenv("TAKE_PROFIT1_PCT", "30"))
@@ -616,7 +623,6 @@ async def _buy_token(
         except Exception as e:
             log.debug("register_entry failed: %s", e)
 
-        # ----------------------------- accounting + logs --------------------------
         await note_spend(None, float(ticket_usd))
 
         usd_est = await convert_sol_to_usd(sol_to_spend) or 0.0
@@ -626,7 +632,10 @@ async def _buy_token(
             f"Entry (SOL/token): {entry_price_sol_per_token:.10f}\n"
             f"Mint: {mint}\nTx: {sig}"
         )
-        await send_telegram(msg)
+        try:
+            await send_telegram(msg)
+        except Exception:
+            pass
         log.info("buy: success %s %s sig=%s", symbol, mint, sig)
 
         await log_trade_event({
@@ -641,14 +650,18 @@ async def _buy_token(
             "jito_tip": jito_tip,
         })
 
-        # ------------------------------ post-trade guard --------------------------
-        ok_wd, msg2, now_meta = await posttrade_watchdog(mint, sol_to_spend, SLIPPAGE_BPS, pre_meta)
-        if not ok_wd:
-            await send_telegram(
-                f"⚠️ Route watchdog: {symbol} ({mint}) {msg2} • "
-                f"pre_out={pre_meta.get('out_amount'):.0f} now_out={now_meta.get('out_amount',0):.0f} "
-                f"hops(pre/now)={pre_meta.get('hops')}/{now_meta.get('hops',0)}"
-            )
+        # Post-trade watchdog
+        try:
+            ok_wd, msg2, now_meta = await posttrade_watchdog(mint, sol_to_spend, SLIPPAGE_BPS, pre_meta)
+            if not ok_wd:
+                await send_telegram(
+                    f"⚠️ Route watchdog: {symbol} ({mint}) {msg2} • "
+                    f"pre_out={pre_meta.get('out_amount'):.0f} now_out={now_meta.get('out_amount',0):.0f} "
+                    f"hops(pre/now)={pre_meta.get('hops')}/{now_meta.get('hops',0)}"
+                )
+        except Exception as e:
+            log.debug("posttrade_watchdog failed: %s", e)
+
         return True
 
     finally:
