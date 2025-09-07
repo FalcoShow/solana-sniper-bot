@@ -914,6 +914,11 @@ async def start_scanners():
 # ==============================================================================
 # Entrypoint
 # ==============================================================================
+# --- explicit entry for Render (env SCANNERS_ENTRY points here) ---
+async def run_sniper():
+    # start the full scanner/buyer loop (resources already inited by main())
+    return await Sniper().main_loop()
+
 async def main():
     # Init infra
     await init_resources()
