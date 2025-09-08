@@ -453,32 +453,40 @@ async def _maybe_call_scanner(func: Optional[Callable], name: str) -> List[Dict[
     log.warning("scanner.%s: no compatible signature", name)
     return []
 
+# --- replace your whole _scan_all_sources() with this ---
 async def _scan_all_sources() -> List[Dict[str, Any]]:
-    tasks = [
-    _maybe_call_scanner(scan_dexscreener, "dexscreener"),
-    _maybe_call_scanner(scan_pumpfun, "pumpfun"),
-    _maybe_call_scanner(scan_raydium, "raydium"),
-]
-if AXIOM_SCAN_ENABLED:
-    tasks.append(_maybe_call_scanner(scan_axiom, "axiom"))
-batches = await asyncio.gather(*tasks, return_exceptions=False)
+    batches = await asyncio.gather(
+        _maybe_call_scanner(scan_dexscreener, "dexscreener"),
+        _maybe_call_scanner(scan_pumpfun, "pumpfun"),
+        _maybe_call_scanner(scan_raydium, "raydium"),
+        _maybe_call_scanner(scan_axiom, "axiom"),
+        return_exceptions=False,
+    )
+
     merged: Dict[str, Dict[str, Any]] = {}
+
     for batch in batches:
         for c in batch:
+            if not isinstance(c, dict):
+                continue
             mint = c.get("mint")
             if not mint:
                 continue
+
             if mint not in merged:
                 merged[mint] = dict(c)
+                continue
+
+            # Prefer the item with higher 24h volume, otherwise fill blanks
+            v0 = float(merged[mint].get("volumeUsd24h", 0.0) or 0.0)
+            v1 = float(c.get("volumeUsd24h", 0.0) or 0.0)
+            if v1 > v0:
+                merged[mint] = {**merged[mint], **c}
             else:
-                v0 = float(merged[mint].get("volumeUsd24h", 0.0) or 0.0)
-                v1 = float(c.get("volumeUsd24h", 0.0) or 0.0)
-                if v1 > v0:
-                    merged[mint] = {**merged[mint], **c}
-                else:
-                    for k, v in c.items():
-                        if merged[mint].get(k) in (None, "", 0):
-                            merged[mint][k] = v
+                for k, v in c.items():
+                    if merged[mint].get(k) in (None, "", 0):
+                        merged[mint][k] = v
+
     out = list(merged.values())
     log.info("scan: merged %d unique candidates", len(out))
     return out
