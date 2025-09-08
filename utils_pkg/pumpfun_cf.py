@@ -1,4 +1,4 @@
-# utils_pkg/pumpfun_cf.py — v2.2 (syntax fix + sturdier DOM waits)
+# utils_pkg/pumpfun_cf.py — v3.0
 """
 Cloudflare cookie manager for Pump.fun.
 
@@ -9,6 +9,7 @@ Cloudflare cookie manager for Pump.fun.
 - Full outbound proxy support (URL or colon form)
 - Per-host proxy selection: apex(no proxy by default) vs API(proxy by default)
 - Separate browsers for apex and API so one cannot stall the other
+- Playwright request filtering (images/video/fonts/trackers) to save bandwidth
 - Compatible with Render (no root needed, cached Chromium)
 """
 
@@ -19,10 +20,10 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlparse, unquote
 
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Route, Request
 
 log = logging.getLogger("pumpfun.cf")
 
@@ -37,7 +38,7 @@ UA = os.getenv(
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 )
 
-# Page we hit to get CF cookies on apex (you set PUMPFUN_CF_URL=https://pump.fun/trending)
+# Page we hit to get CF cookies on apex
 PUMP_CF_PAGE = os.getenv("PUMPFUN_CF_URL", "https://pump.fun/advanced/scan")
 API_PRIME_PATH = os.getenv("PUMPFUN_API_PRIME_PATH", "/coins/trending?offset=0&limit=1")
 REFRESH_SEC = int(os.getenv("PUMPFUN_CF_REFRESH_SEC", "900"))
@@ -45,14 +46,18 @@ REFRESH_SEC = int(os.getenv("PUMPFUN_CF_REFRESH_SEC", "900"))
 HOSTS = ("pump.fun", "frontend-api.pump.fun")
 
 USE_PROXY_FOR_APEX = _env_true(os.getenv("PUMPFUN_APEX_VIA_PROXY", "0"))
-USE_PROXY_FOR_API = _env_true(os.getenv("PUMPFUN_API_VIA_PROXY", "1"))
+USE_PROXY_FOR_API  = _env_true(os.getenv("PUMPFUN_API_VIA_PROXY", "1"))
 
 # DOM pages list (allow empty env to fallback to defaults)
-_dom_env = os.getenv("PUMPFUN_DOM_PAGES", "/board,/trending,/advanced/scan,/")
+_dom_env  = os.getenv("PUMPFUN_DOM_PAGES", "/board,/trending,/advanced/scan,/")
 DOM_PAGES = [p.strip() for p in _dom_env.split(",") if p.strip()] or ["/trending", "/advanced/scan", "/"]
 
-# Persist Playwright browser binaries somewhere writable on Render
+# Playwright cache dir (Render-friendly)
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/project/src/.cache/ms-playwright")
+
+# Bandwidth guard toggles
+PUMP_CF_BLOCK_ASSETS = _env_true(os.getenv("PUMP_CF_BLOCK_ASSETS", "true"))
+PUMP_CF_BLOCK_STYLES = _env_true(os.getenv("PUMP_CF_BLOCK_STYLES", "false"))
 
 # ========================= In-Memory State ===========================
 
@@ -143,7 +148,7 @@ def _seed_from_env() -> None:
     """Seed cookie jar from env so we can start even if CF priming is blocked."""
     seeded = []
     apex = (os.getenv("PUMPFUN_COOKIE") or "").strip()
-    api = (os.getenv("PUMPFUN_COOKIE_API") or "").strip()
+    api  = (os.getenv("PUMPFUN_COOKIE_API") or "").strip()
     if apex:
         _COOKIES["pump.fun"] = apex
         seeded.append("pump")
@@ -200,6 +205,34 @@ EXTRA_HEADERS_JSON = {
     "Referer": "https://pump.fun/trending",
 }
 
+# =========================== Bandwidth Guard =========================
+
+_BLOCK_TYPES: Set[str] = {"image", "media", "font"}
+if PUMP_CF_BLOCK_STYLES:
+    _BLOCK_TYPES.add("stylesheet")
+
+_TRACKERS = (
+    "googletagmanager", "google-analytics", "doubleclick",
+    "facebook", "hotjar", "mixpanel", "segment.io", "clarity.ms",
+    "sentry.io", "fullstory", "intercom", "criteo", "taboola",
+    "tiktok", "youtube.com", "ytimg.com",
+)
+
+async def _bw_guard(route: Route, request: Request):
+    """Abort heavy assets/trackers to save bandwidth."""
+    try:
+        if not PUMP_CF_BLOCK_ASSETS:
+            return await route.continue_()
+        rtype = (request.resource_type or "").lower()
+        url   = (request.url or "").lower()
+        if rtype in _BLOCK_TYPES:
+            return await route.abort()
+        if any(t in url for t in _TRACKERS):
+            return await route.abort()
+        return await route.continue_()
+    except Exception:
+        return await route.continue_()
+
 # =========================== Internals ==============================
 
 async def _ensure_chromium_available() -> None:
@@ -239,7 +272,7 @@ def _cookie_for_host(all_cookies: List[Dict[str, Any]], host: str) -> Optional[s
 
     jar: Dict[str, str] = {}
     for c in all_cookies or []:
-        name = c.get("name")
+        name   = c.get("name")
         domain = c.get("domain") or ""
         if name in ("cf_clearance", "__cf_bm") and _match(domain):
             val = c.get("value")
@@ -286,7 +319,6 @@ async def _prime_api_host(page) -> None:
         await page.wait_for_timeout(800)
         if not (res and res.get("ok")):
             try:
-                # Just hit the same path again to warm cookies; ignore result
                 await page.goto("https://frontend-api.pump.fun" + API_PRIME_PATH, wait_until="networkidle", timeout=30_000)
             except Exception:
                 pass
@@ -305,12 +337,14 @@ async def _prime_apex_and_collect() -> Dict[str, str]:
                 viewport={"width": 1366, "height": 768},
                 color_scheme="light",
             )
+            # Bandwidth guard
+            await ctx.route("**/*", _bw_guard)
+
             page = await ctx.new_page()
             await page.add_init_script(STEALTH_JS)
             try:
                 await page.set_extra_http_headers(EXTRA_HEADERS_HTML)
                 await page.goto(PUMP_CF_PAGE, wait_until="domcontentloaded", timeout=90_000)
-                # wait for any visible coin anchors
                 try:
                     await page.wait_for_selector('a[href*="/coin/"], a[href*="/coins/"], [data-mint]', timeout=10_000)
                 except Exception:
@@ -338,6 +372,9 @@ async def _prime_api_and_collect() -> Dict[str, str]:
                 viewport={"width": 1366, "height": 768},
                 color_scheme="light",
             )
+            # Bandwidth guard
+            await ctx.route("**/*", _bw_guard)
+
             page = await ctx.new_page()
             await page.add_init_script(STEALTH_JS)
             try:
@@ -366,7 +403,7 @@ async def _refresh_once() -> None:
         await _ensure_chromium_available()
 
         apex_task = asyncio.create_task(_prime_apex_and_collect())
-        api_task = asyncio.create_task(_prime_api_and_collect())
+        api_task  = asyncio.create_task(_prime_api_and_collect())
         new_apex, new_api = await asyncio.gather(apex_task, api_task, return_exceptions=True)
 
         new_map: Dict[str, str] = {}
@@ -390,7 +427,7 @@ async def _refresh_once() -> None:
             os.environ.setdefault("PUMPFUN_COOKIE_API", prev["frontend-api.pump.fun"])
 
         has_pump = "yes" if "pump.fun" in _COOKIES else "no"
-        has_api = "yes" if "frontend-api.pump.fun" in _COOKIES else "no"
+        has_api  = "yes" if "frontend-api.pump.fun" in _COOKIES else "no"
 
         _EXP = time.time() + max(60.0, REFRESH_SEC * 0.9)
         log.info("CF refresh: got cookies (pump=%s, api=%s), next in ~%ds", has_pump, has_api, REFRESH_SEC)
@@ -483,6 +520,8 @@ async def browser_fetch_json(url: str) -> Optional[Any]:
                     viewport={"width": 1366, "height": 768},
                     color_scheme="light",
                 )
+                # Bandwidth guard
+                await ctx.route("**/*", _bw_guard)
 
                 # Seed API cookies when available
                 if kind == "api":
@@ -585,8 +624,8 @@ async def _browser_get_build_id(page) -> Optional[str]:
         pass
     try:
         html = await page.content()
-        import re, json as _json
-        m = re.search(r'id="__NEXT_DATA__"[^>]*>\s*({.*?})\s*</script>', html, re.S)
+        import re as _re, json as _json
+        m = _re.search(r'id="__NEXT_DATA__"[^>]*>\s*({.*?})\s*</script>', html, _re.S)
         if m:
             j = _json.loads(m.group(1))
             bid = j.get("buildId")
@@ -609,6 +648,9 @@ async def browser_fetch_next_json(page_path: Optional[str] = None) -> Optional[d
                     user_agent=UA, locale="en-US", timezone_id="America/New_York",
                     viewport={"width": 1366, "height": 768}, color_scheme="light",
                 )
+                # Bandwidth guard
+                await ctx.route("**/*", _bw_guard)
+
                 page = await ctx.new_page()
                 await page.add_init_script(STEALTH_JS)
 
@@ -631,8 +673,11 @@ async def browser_fetch_next_json(page_path: Optional[str] = None) -> Optional[d
                         if not tail.endswith(".json"):
                             tail = (tail.rstrip("/") + ".json") if tail else "index.json"
 
-                        data_url = f"{base}/_next/data/{build_id}/{tail}"
-                        r = await ctx.request.get(data_url, headers=EXTRA_HEADERS_JSON, timeout=30_000)
+                        r = await ctx.request.get(
+                            f"{base}/_next/data/{build_id}/{tail}",
+                            headers=EXTRA_HEADERS_JSON,
+                            timeout=30_000,
+                        )
                         if r.ok:
                             try:
                                 return await r.json()
@@ -647,28 +692,11 @@ async def browser_fetch_next_json(page_path: Optional[str] = None) -> Optional[d
         log.debug("browser_fetch_next_json failed: %s", e)
     return None
 
-async def browser_fetch_trending_via_next_data(*, limit: int = 50) -> Optional[List[Dict[str, Any]]]:
-    for path in ("/trending", "/advanced/scan"):
-        data = await browser_fetch_next_json(path)
-        if not isinstance(data, dict):
-            continue
-        page = data.get("pageProps", {}) if isinstance(data, dict) else {}
-        for k in ("trending", "coins", "projects", "items", "data"):
-            v = page.get(k)
-            if isinstance(v, list) and v:
-                return v[:limit]
-        if isinstance(page.get("data"), dict):
-            for _, v in page["data"].items():
-                if isinstance(v, list) and v:
-                    return v[:limit]
-    log.debug("next-data: no items found on apex JSON for /trending or /advanced/scan")
-    return None
-
 async def browser_scrape_trending_dom(*, limit: int = 50, pages: Optional[List[str]] = None) -> Optional[List[Dict[str, Any]]]:
     import re
     WAIT_MS = int(os.getenv("PUMPFUN_DOM_WAIT_MS", "2000"))
     SCROLLS = int(os.getenv("PUMPFUN_DOM_SCROLLS", "4"))
-    PAGES = pages or ["/board", "/trending", "/advanced/scan", "/"]
+    PAGES   = pages or ["/board", "/trending", "/advanced/scan", "/"]
 
     BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,44}"
 
@@ -689,6 +717,8 @@ async def browser_scrape_trending_dom(*, limit: int = 50, pages: Optional[List[s
                     user_agent=UA, locale="en-US", timezone_id="America/New_York",
                     viewport={"width": 1366, "height": 768}, color_scheme="light",
                 )
+                # Bandwidth guard
+                await ctx.route("**/*", _bw_guard)
 
                 # seed apex cookie if provided
                 apex_cookie_str = (os.getenv("PUMPFUN_COOKIE") or "").strip()

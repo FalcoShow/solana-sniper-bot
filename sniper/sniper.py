@@ -269,6 +269,7 @@ WALLET_PUBKEY = os.getenv("WALLET_PUBKEY") or os.getenv("WALLET_PUBLIC_KEY")
 
 PAUSE_TRADING = os.getenv("PAUSE_TRADING", "false").lower() == "true"
 DRY_RUN       = os.getenv("DRY_RUN", "false").lower() == "true"
+AXIOM_SCAN_ENABLED = os.getenv("AXIOM_SCAN_ENABLED", "true").lower() == "true"
 
 SCANNER_PERIOD_SEC   = int(os.getenv("SCANNER_PERIOD_SEC", "15"))
 BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", "120"))
@@ -277,6 +278,8 @@ MIN_SOL_BALANCE      = float(os.getenv("MIN_SOL_BALANCE", "0.2"))
 JUPITER_SLIPPAGE     = float(os.getenv("JUPITER_MAX_SLIPPAGE", "0.005"))
 SLIPPAGE_BPS         = max(1, int(JUPITER_SLIPPAGE * 10000))
 PREWARM_TOP_N        = int(os.getenv("PREWARM_TOP_N", "8"))
+TELEGRAM_NOTIFY_ROUTE_BLOCKS = os.getenv("TELEGRAM_NOTIFY_ROUTE_BLOCKS", "false").lower() == "true"
+NOROUTE_COOLDOWN_SEC  = int(os.getenv("NOROUTE_COOLDOWN_SEC", "600"))  # 10 minutes default
 
 PRESET = os.getenv("STRATEGY_PRESET", "max-pnl").lower()
 if PRESET not in ("max-pnl", "balanced", "conservative"):
@@ -323,6 +326,23 @@ async def _cooldown_key(key: str, ttl: int) -> bool:
         log.debug("cooldown set failed: %s", e)
         return False
 
+async def _get_flag(key: str) -> bool:
+    r = get_redis()
+    if not r:
+        return False
+    try:
+        return bool(await r.get(key))
+    except Exception:
+        return False
+
+async def _set_flag(key: str, ttl: int):
+    r = get_redis()
+    if not r:
+        return
+    try:
+        await r.set(key, "1", ex=ttl)
+    except Exception:
+        pass
 # ==============================================================================
 # Moonshot budget (optional)
 # ==============================================================================
@@ -434,13 +454,14 @@ async def _maybe_call_scanner(func: Optional[Callable], name: str) -> List[Dict[
     return []
 
 async def _scan_all_sources() -> List[Dict[str, Any]]:
-    batches = await asyncio.gather(
-        _maybe_call_scanner(scan_dexscreener, "dexscreener"),
-        _maybe_call_scanner(scan_pumpfun, "pumpfun"),
-        _maybe_call_scanner(scan_raydium, "raydium"),
-        _maybe_call_scanner(scan_axiom, "axiom"),
-        return_exceptions=False,
-    )
+    tasks = [
+    _maybe_call_scanner(scan_dexscreener, "dexscreener"),
+    _maybe_call_scanner(scan_pumpfun, "pumpfun"),
+    _maybe_call_scanner(scan_raydium, "raydium"),
+]
+if AXIOM_SCAN_ENABLED:
+    tasks.append(_maybe_call_scanner(scan_axiom, "axiom"))
+batches = await asyncio.gather(*tasks, return_exceptions=False)
     merged: Dict[str, Dict[str, Any]] = {}
     for batch in batches:
         for c in batch:
@@ -614,12 +635,20 @@ async def _buy_token(
         # Fees + route guard
         cu_price, jito_tip = compute_priority_tip(sol_to_spend)
         ok_rg, why, pre_meta = await precheck_buy(mint, sol_to_spend, SLIPPAGE_BPS)
-        if not ok_rg:
+        # Back-off this mint so we don't hammer Jupiter or spam logs
+            try:
+                await _set_flag(f"noroute:{mint}", NOROUTE_COOLDOWN_SEC)
+            except Exception:
+                pass
             msg = (f"⛔ RouteGuard block {symbol} ({mint}) — {why} • "
                    f"hops={pre_meta.get('hops')} • impact_bps={pre_meta.get('impact_bps')}")
-            await send_telegram(msg)
+            if TELEGRAM_NOTIFY_ROUTE_BLOCKS:
+                try:
+                    await send_telegram(msg)
+                except Exception:
+                    pass
             log.info(msg)
-            return False
+             return False
 
         # Swap (include priority fees when supported)
         swap_kwargs = dict(
@@ -757,6 +786,9 @@ class Sniper:
         # AI pre-gate (if available)
         try:
             pool_age_min = _coalesce(c, "pool_age_min", "poolAgeMin", "ageMin", default=None)
+            try:
+            # Harden None → numeric defaults to avoid AI gate type errors
+            pool_age_min = float(_coalesce(c, "pool_age_min", "poolAgeMin", "ageMin", default=9999) or 9999)
             liq_usd      = float(_coalesce(c, "liq_usd", "liquidity_usd", "liquidityUSD", default=0.0) or 0.0)
             impact1k_bps = float(_coalesce(c, "impact_1k_bps", "priceImpact1kBps", default=0.0) or 0.0)
             vol5m_pct    = float(_coalesce(c, "vol5m_pct", default=0.0) or 0.0)
@@ -802,7 +834,23 @@ class Sniper:
                 log.info("skip %s: %s", mint, mnote)
             return
 
-        entry = await get_token_price(mint)  # SOL/token
+        # Route back-off: if we recently saw no route, skip for a while
+        if await _get_flag(f"noroute:{mint}"):
+            log.debug("consider: noroute cooldown active for %s", mint)
+            return
+
+        entry = await get_token_price(mint)
+        if not entry or entry <= 0:
+            # Fallback: try a micro-quote to derive SOL/token (best effort)
+            try:
+                test_sol = 0.02  # tiny probe
+                ok_rg, _why, pre = await precheck_buy(mint, test_sol, SLIPPAGE_BPS)
+                if ok_rg:
+                    out_amt = float(pre.get("out_amount") or 0.0)
+                    if out_amt > 0:
+                        entry = float(test_sol) / out_amt  # ≈ SOL per token
+            except Exception as e:
+                log.debug("entry price fallback failed %s: %s", mint, e)
         if not entry or entry <= 0:
             log.debug("consider: no entry price for %s", mint)
             return
