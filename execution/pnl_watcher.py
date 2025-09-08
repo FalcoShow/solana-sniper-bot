@@ -1,11 +1,13 @@
-# execution/pnl_watcher.py — v7 (Redis-persisted last-blip baseline)
+# execution/pnl_watcher.py — v8 (glitch-guarded equity + light price cache)
 from __future__ import annotations
 
 import os
 import asyncio
 import logging
 import json
-from typing import Dict, Any, Optional
+import math
+import time
+from typing import Dict, Any, Optional, Tuple
 from datetime import datetime, timezone
 
 # ---- prices, wallet, redis, telegram
@@ -25,7 +27,20 @@ except Exception:
     async def send_telegram(_msg: str): pass
 
 # ---- exits logic
-from execution.exits import PositionState, decide_exit, apply_exit
+try:
+    from execution.exits import PositionState, decide_exit, apply_exit
+except Exception:
+    # Minimal safe stubs so watcher can still heartbeat
+    class PositionState:  # type: ignore
+        def __init__(self, mint: str, entry_px: float, size_usd: float):
+            self.mint, self.entry_px, self.size_usd = mint, float(entry_px), float(size_usd)
+            self.peak_px, self.tp1_done, self.symbol = self.entry_px, False, None
+    def decide_exit(_pos, _last_px):  # type: ignore
+        class R: action = "HOLD"
+        return R()
+    async def apply_exit(pos, last_px, sell_fn):  # type: ignore
+        class Res: ok=True; reason="hold"; signature=""; action="HOLD"
+        return Res()
 
 # ---- sell function (USD -> swap)
 try:
@@ -63,7 +78,14 @@ log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 SCAN_SEC = int(os.getenv("PNL_SCAN_SEC", "5"))
 PNL_HEARTBEAT_N = int(os.getenv("PNL_HEARTBEAT_N", "6"))  # ~30s if SCAN_SEC=5
-PNL_REDIS_ONLY = os.getenv("PNL_REDIS_ONLY", "true").lower() == "true"
+
+# Guards / smoothing
+PNL_PRICE_CACHE_TTL_SEC   = int(os.getenv("PNL_PRICE_CACHE_TTL_SEC", "20"))
+PNL_ZERO_CONFIRM_STREAK   = int(os.getenv("PNL_ZERO_CONFIRM_STREAK", "3"))
+PNL_WALLET_MIN_VALID_USD  = float(os.getenv("PNL_WALLET_MIN_VALID_USD", "5"))
+
+# Redis-only watcher (same behavior as your v7)
+PNL_REDIS_ONLY = os.getenv("PNL_REDIS_ONLY", "true").strip().lower() in ("1","true","yes","on")
 
 # Telegram heartbeat controls
 PNL_TELEGRAM_HEARTBEAT      = os.getenv("PNL_TELEGRAM_HEARTBEAT", "false").lower() == "true"
@@ -80,7 +102,7 @@ EPS_USD = 1e-6
 WALLET_PUBKEY = os.getenv("WALLET_PUBKEY") or os.getenv("WALLET_PUBLIC_KEY")
 EQUITY_USD_FALLBACK = float(os.getenv("EQUITY_USD_FALLBACK", "2000"))
 
-# ---------- Redis helpers (no file fallback) ----------
+# ---------- Redis helpers ----------
 
 def _redis_ok() -> bool:
     return _redis is not None
@@ -249,6 +271,65 @@ async def _save_blip_state() -> None:
     except Exception:
         pass
 
+# ---------- light price cache (avoid 0 on transient hiccups) ----------
+
+_PRICE_CACHE: Dict[str, Tuple[float, float]] = {}  # mint -> (price, ts)
+
+def _now() -> float:
+    return time.time()
+
+def _is_num(x: Any) -> bool:
+    try:
+        fx = float(x)
+        return math.isfinite(fx)
+    except Exception:
+        return False
+
+async def _get_price_safe(mint: str) -> Optional[float]:
+    """Fetch price with small cache/TTL; ignore zeros/None by falling back to cache."""
+    px = None
+    try:
+        px = await get_token_price(mint)
+    except Exception:
+        px = None
+
+    if _is_num(px) and px and px > 0:
+        _PRICE_CACHE[mint] = (float(px), _now())
+        return float(px)
+
+    # fallback to cache if fresh
+    cached = _PRICE_CACHE.get(mint)
+    if cached and (_now() - cached[1]) <= PNL_PRICE_CACHE_TTL_SEC:
+        return float(cached[0])
+    return None
+
+# ---------- wallet smoothing (guard against 0/None spikes) ----------
+
+_last_good_wallet_usd: float = 0.0
+_wallet_zero_streak: int = 0
+
+async def _wallet_usd_smoothed() -> float:
+    global _last_good_wallet_usd, _wallet_zero_streak
+    try:
+        usd_per_sol = await convert_sol_to_usd(1.0) or 0.0
+        sol_bal = await get_sol_balance(WALLET_PUBKEY) if WALLET_PUBKEY else 0.0
+        candidate = float(usd_per_sol) * float(sol_bal)
+    except Exception:
+        candidate = 0.0
+
+    if not _is_num(candidate) or candidate < PNL_WALLET_MIN_VALID_USD:
+        # treat as glitch if we recently had a valid positive wallet
+        if _last_good_wallet_usd > 0 and _wallet_zero_streak < PNL_ZERO_CONFIRM_STREAK:
+            _wallet_zero_streak += 1
+            return _last_good_wallet_usd
+        _wallet_zero_streak = min(_wallet_zero_streak + 1, PNL_ZERO_CONFIRM_STREAK)
+        _last_good_wallet_usd = 0.0 if _wallet_zero_streak >= PNL_ZERO_CONFIRM_STREAK else _last_good_wallet_usd
+        return _last_good_wallet_usd
+    else:
+        _wallet_zero_streak = 0
+        _last_good_wallet_usd = float(candidate)
+        return _last_good_wallet_usd
+
 # ---------- heartbeat helpers ----------
 
 async def _should_blip(equity_usd: float, unrealized_pnl_usd: float) -> bool:
@@ -338,16 +419,15 @@ async def _emit_heartbeat(now_iso: str, equity_usd: float, open_cost_usd: float,
 # ---------- main watcher loop ----------
 
 async def watch_positions_loop():
-    if not _redis_ok():
+    if PNL_REDIS_ONLY and not _redis_ok():
         log.warning("PnL watcher: Redis not available; cannot run Redis-only watcher.")
         return
 
     log.info(
-        "PnL watcher (Redis-only) started — scan=%ss, heartbeat=%dx, telegram=%s, only_on_change=%s, "
-        "ΔUSD=%.2f, Δ%%=%.2f, ΔuPnLUSD=%.2f, force_every_n=%d, blip_ttl_hrs=%d",
-        SCAN_SEC, PNL_HEARTBEAT_N, PNL_TELEGRAM_HEARTBEAT, PNL_TELEGRAM_ONLY_ON_CHANGE,
-        PNL_TELEGRAM_DELTA_USD, PNL_TELEGRAM_DELTA_PCT, PNL_TELEGRAM_DELTA_UPNL_USD,
-        PNL_TELEGRAM_FORCE_EVERY_N, PNL_BLIP_STATE_TTL_HOURS
+        "PnL watcher started — scan=%ss, heartbeat=%dx, price_cache_ttl=%ss, zero_confirm=%dx, "
+        "wallet_min_valid_usd=%.2f, telegram=%s/%s",
+        SCAN_SEC, PNL_HEARTBEAT_N, PNL_PRICE_CACHE_TTL_SEC, PNL_ZERO_CONFIRM_STREAK,
+        PNL_WALLET_MIN_VALID_USD, PNL_TELEGRAM_HEARTBEAT, ("on_change" if PNL_TELEGRAM_ONLY_ON_CHANGE else "every")
     )
 
     # load baseline so restarts keep the delta reference
@@ -356,7 +436,7 @@ async def watch_positions_loop():
     tick = 0
     while True:
         try:
-            store = await _load_positions_redis()
+            store = await _load_positions_redis() if _redis_ok() else {}
             open_count = len(store or {})
             # position pass (also gather MV/pnl for heartbeat)
             open_cost_usd = 0.0
@@ -370,8 +450,9 @@ async def watch_positions_loop():
                         if pos.entry_px <= 0 or pos.size_usd <= EPS_USD:
                             continue
 
-                        last_px = await get_token_price(mint)   # SOL/token
+                        last_px = await _get_price_safe(mint)   # SOL/token
                         if not last_px or last_px <= 0:
+                            # no price this tick → skip PnL contrib, keep position as-is
                             continue
 
                         # accumulate PnL/MV for heartbeat
@@ -381,7 +462,7 @@ async def watch_positions_loop():
                         unrealized_pnl_usd += (mv - float(pos.size_usd))
 
                         decision = decide_exit(pos, last_px)
-                        if decision.action == "HOLD":
+                        if getattr(decision, "action", "HOLD") == "HOLD":
                             continue
 
                         before_usd = float(pos.size_usd)
@@ -416,14 +497,15 @@ async def watch_positions_loop():
             # heartbeat
             tick += 1
             if tick % PNL_HEARTBEAT_N == 0:
-                try:
-                    usd_per_sol = await convert_sol_to_usd(1.0) or 0.0
-                    sol_bal = await get_sol_balance(WALLET_PUBKEY) if WALLET_PUBKEY else 0.0
-                    wallet_usd = (usd_per_sol or 0.0) * (sol_bal or 0.0)
-                except Exception:
-                    wallet_usd = 0.0
+                wallet_usd = await _wallet_usd_smoothed()
 
+                # Equity smoothing: if everything vanished but we recently had a value,
+                # keep the last good wallet estimate (handled in _wallet_usd_smoothed).
                 equity_usd = float(wallet_usd or 0.0) + float(open_mv_usd or 0.0)
+                if equity_usd <= 0 and EQUITY_USD_FALLBACK > 0 and _last_good_wallet_usd <= 0:
+                    # absolute fallback for fresh cold start without wallet key
+                    equity_usd = EQUITY_USD_FALLBACK
+
                 now_iso = datetime.now(timezone.utc).isoformat()
 
                 await _emit_heartbeat(
@@ -440,3 +522,9 @@ async def watch_positions_loop():
             log.warning("pnl_watcher loop error: %s", e)
 
         await asyncio.sleep(SCAN_SEC)
+
+# Convenience wrapper used by some entrypoints
+async def start_pnl_watcher():
+    await watch_positions_loop()
+
+__all__ = ["watch_positions_loop", "start_pnl_watcher"]

@@ -1,4 +1,4 @@
-# scanner/pumpfun_scanner.py — v11
+# scanner/pumpfun_scanner.py — v12
 # Apex-first (next-data → DOM → HTML) with API mirror + fallback and proxy/cookie awareness.
 from __future__ import annotations
 
@@ -113,28 +113,50 @@ def _hdrs(url: str) -> Dict[str, str]:
 # ---------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------
+BASE58_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
+
 def _now() -> float:
     return time.time()
+
+def _nz(x, d=0.0) -> float:
+    try:
+        fx = float(x)
+        if fx != fx:  # NaN guard
+            return float(d)
+        return fx
+    except Exception:
+        return float(d)
 
 def _age_min(created_ts: Optional[float]) -> Optional[float]:
     try:
         if created_ts is None:
             return None
-        if float(created_ts) > 10_000_000_000:
+        if float(created_ts) > 10_000_000_000:  # ms → s
             created_ts = float(created_ts) / 1000.0
         return max(0.0, (_now() - float(created_ts)) / 60.0)
     except Exception:
         return None
 
+def _norm_mint(val: Any) -> str:
+    if not isinstance(val, str):
+        return ""
+    val = val.strip().replace(" ", "")
+    m = BASE58_RE.search(val)
+    return m.group(0) if m else ""
+
+
+# Shapes → common fields
 def _map_coin(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
-        mint = (
+        raw_mint = (
             obj.get("mintAddress")
             or obj.get("mint")
             or obj.get("baseMint")
             or obj.get("tokenMint")
             or obj.get("mint_id")
+            or obj.get("id")
         )
+        mint = _norm_mint(raw_mint)
         if not mint:
             return None
 
@@ -143,22 +165,22 @@ def _map_coin(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         liq_usd = None
         for k in ("liquidity", "liquidityUsd", "liqUsd", "lpUsd", "liquidity_usd"):
             v = obj.get(k)
-            if v is not None:
-                try:
+            try:
+                if v is not None:
                     liq_usd = float(v)
                     break
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         impact_bps = None
         for k in ("priceImpact1kBps", "impact1kBps", "impact_bps", "impact_1k_bps"):
             v = obj.get(k)
-            if v is not None:
-                try:
+            try:
+                if v is not None:
                     impact_bps = float(v)
                     break
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         created = (
             obj.get("createdAt")
@@ -168,14 +190,27 @@ def _map_coin(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         )
         pool_age_min = _age_min(float(created)) if created is not None else None
 
-        return {
+        # Provide numeric defaults where downstream scorers expect floats
+        liq_usd_f = _nz(liq_usd, 0.0)
+        impact_bps_f = _nz(impact_bps, 0.0)
+
+        out = {
             "source": "pumpfun",
             "mint": mint,
             "symbol": symbol,
-            "liq_usd": liq_usd,
+            "liq_usd": liq_usd_f,
             "pool_age_min": pool_age_min,
-            "impact_1k_bps": impact_bps,
+            "impact_1k_bps": impact_bps_f,
         }
+
+        # Common merge helpers other scanners use
+        if "volumeUsd24h" in obj and obj["volumeUsd24h"] is not None:
+            try:
+                out["volumeUsd24h"] = float(obj["volumeUsd24h"])
+            except Exception:
+                pass
+
+        return out
     except Exception:
         return None
 
@@ -186,17 +221,19 @@ def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
         src = payload
     elif isinstance(payload, dict):
         src: List[Dict[str, Any]] | None = None
+        # direct list containers
         for k in ("trending", "coins", "items", "projects", "data"):
-            if k in payload and isinstance(payload[k], list):
-                src = payload[k]
+            v = payload.get(k)
+            if isinstance(v, list):
+                src = v
                 break
-            if "data" in payload and isinstance(payload["data"], dict):
-                dd = payload["data"]
-                for kk in ("trending", "coins", "items", "projects", "data"):
-                    if kk in dd and isinstance(dd[kk], list):
-                        src = dd[kk]
-                        break
-                if src:
+        # nested `data` object with list inside
+        if src is None and isinstance(payload.get("data"), dict):
+            dd = payload["data"]
+            for kk in ("trending", "coins", "items", "projects", "data"):
+                v = dd.get(kk)
+                if isinstance(v, list):
+                    src = v
                     break
         src = src or []
     else:
@@ -225,7 +262,7 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
             first = text[:120].replace("\n", " ")
             ctype = (r.headers.get("content-type") or "").lower()
 
-            # If CF/HTML shows up, try browser path once, else bubble status
+            # CF/HTML gate
             if status in _BAD_CF_CODES or "text/html" in ctype or text.lstrip().startswith("<!DOCTYPE html"):
                 if status in _BAD_CF_CODES:
                     flag_cookie_bad()
@@ -262,13 +299,13 @@ async def _fetch_api_json_with_fallback(
     # Override URL (debug single endpoint)
     if OVERRIDE_URL.lower().startswith("http"):
         payload, status, first = await _fetch_json(session, OVERRIDE_URL)
+        if tried_out is not None:
+            tried_out.append(f"{OVERRIDE_URL} status={status}")
         if payload:
             items = _extract_items_from_payload(payload)
             if items:
                 LOG.info("scanner.pumpfun: API JSON (override) → %s items", len(items))
                 return items
-        if tried_out is not None:
-            tried_out.append(f"{OVERRIDE_URL} status={status}")
 
     for base in _api_bases():
         url = _join_url(base, path)

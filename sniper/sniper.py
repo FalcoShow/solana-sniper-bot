@@ -1,10 +1,13 @@
-# sniper/sniper.py — v8.1
+# sniper/sniper.py — v9.0
 # Max-PnL preset · rank+select · priority fees · exits wiring · DB logs · CF refresher
 from __future__ import annotations
 
 import os
+import re
 import asyncio
 import logging
+import inspect
+import importlib
 from typing import Dict, Any, List, Callable, Optional, Tuple
 from datetime import datetime, timezone
 
@@ -110,7 +113,7 @@ try:
     from risk_manager import current_limits, should_allow_new_entry, note_spend
 except Exception as e:
     log.warning("risk_manager import fallback: %s", e)
-    async def current_limits(_):  # defaults
+    async def current_limits(_):
         pct = float(os.getenv("TICKET_PCT_EQUITY", "0.03"))
         cap = float(os.getenv("TICKET_USD_CAP", "250"))
         return {"ticket_usd_pct": pct, "ticket_cap_usd": cap, "ticket_usd": 50.0}
@@ -177,7 +180,6 @@ except Exception:
 try:
     from execution.exits import start_exit_supervisor as _exits_start, register_entry
     async def start_exit_supervisor(_redis):
-        # Support both signatures
         try:
             return await _exits_start(_redis)  # type: ignore
         except TypeError:
@@ -257,7 +259,7 @@ JUPITER_SLIPPAGE     = float(os.getenv("JUPITER_MAX_SLIPPAGE", "0.005"))
 SLIPPAGE_BPS         = max(1, int(JUPITER_SLIPPAGE * 10000))
 PREWARM_TOP_N        = int(os.getenv("PREWARM_TOP_N", "8"))
 
-# New envs you added
+# New envs
 TELEGRAM_NOTIFY_ROUTE_BLOCKS = _env_true(os.getenv("TELEGRAM_NOTIFY_ROUTE_BLOCKS", "true"))
 NOROUTE_COOLDOWN_SEC = int(os.getenv("NOROUTE_COOLDOWN_SEC", "600"))
 MIN_POOL_AGE_MIN     = int(os.getenv("MIN_POOL_AGE_MIN", "0"))
@@ -274,6 +276,27 @@ HALT_KEYS = ("halt:manual", "halt:infra", "infra:halt", "halt:daily_loss")
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+# ==============================================================================
+# Helpers: mint normalization + numeric safety
+# ==============================================================================
+BASE58_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
+
+def normalize_mint(m) -> str:
+    if not isinstance(m, str):
+        return ""
+    m = m.strip().replace(" ", "")
+    hit = BASE58_RE.search(m)
+    return hit.group(0) if hit else ""
+
+def _nz(x, d=0.0) -> float:
+    try:
+        fx = float(x)
+        if fx != fx:  # NaN guard
+            return float(d)
+        return fx
+    except Exception:
+        return float(d)
 
 # ==============================================================================
 # Halt & cooldown
@@ -429,14 +452,15 @@ async def _scan_all_sources() -> List[Dict[str, Any]]:
     merged: Dict[str, Dict[str, Any]] = {}
     for batch in batches:
         for c in batch:
-            mint = c.get("mint")
+            mint = normalize_mint(c.get("mint"))
             if not mint:
                 continue
+            c["mint"] = mint
             if mint not in merged:
                 merged[mint] = dict(c)
             else:
-                v0 = float(merged[mint].get("volumeUsd24h", 0.0) or 0.0)
-                v1 = float(c.get("volumeUsd24h", 0.0) or 0.0)
+                v0 = _nz(merged[mint].get("volumeUsd24h"), 0.0)
+                v1 = _nz(c.get("volumeUsd24h"), 0.0)
                 if v1 > v0:
                     merged[mint] = {**merged[mint], **c}
                 else:
@@ -455,9 +479,9 @@ def _rank_key(c: Dict[str, Any]) -> float:
         base = float(alpha_score_fn(c))
     except Exception:
         base = 0.0
-    age = float(c.get("pool_age_min") or c.get("ageMin") or 9999)
-    liq = float(c.get("liq_usd") or c.get("liquidity_usd") or c.get("liquidityUSD") or 0)
-    impact = float(c.get("impact_1k_bps") or c.get("priceImpact1kBps") or 0)
+    age = _nz(c.get("pool_age_min") or c.get("ageMin"), 9999)
+    liq = _nz(c.get("liq_usd") or c.get("liquidity_usd") or c.get("liquidityUSD"), 0)
+    impact = _nz(c.get("impact_1k_bps") or c.get("priceImpact1kBps"), 0)
 
     if PRESET == "max-pnl":
         base += max(0, 60 - age) * 0.7
@@ -489,10 +513,13 @@ def _coalesce(src: Dict[str, Any], *keys, default=None):
     return default
 
 async def _basic_filters(c: Dict[str, Any]) -> bool:
-    mint = c.get("mint")
+    mint = normalize_mint(c.get("mint"))
+    if mint != c.get("mint"):
+        c["mint"] = mint
     if not mint:
-        log.debug("skip: no mint")
+        log.debug("skip: bad mint string")
         return False
+
     if BLOCKLIST and mint in BLOCKLIST:
         log.debug("skip: %s in blocklist", mint)
         return False
@@ -500,16 +527,16 @@ async def _basic_filters(c: Dict[str, Any]) -> bool:
         log.debug("skip: %s not in allowlist", mint)
         return False
 
-    # Minimums you added
+    # Minimums
     try:
-        age = float(_coalesce(c, "pool_age_min", "poolAgeMin", "ageMin", default=9999) or 9999)
+        age = _nz(_coalesce(c, "pool_age_min", "poolAgeMin", "ageMin"), 9999)
         if age < MIN_POOL_AGE_MIN:
             log.debug("skip: age %.2f < MIN_POOL_AGE_MIN=%s", age, MIN_POOL_AGE_MIN)
             return False
     except Exception:
         pass
     try:
-        liq = float(_coalesce(c, "liq_usd", "liquidity_usd", "liquidityUSD", default=0.0) or 0.0)
+        liq = _nz(_coalesce(c, "liq_usd", "liquidity_usd", "liquidityUSD"), 0.0)
         if liq < MIN_LIQ_USD:
             log.debug("skip: liq %.0f < MIN_LIQ_USD=%s", liq, MIN_LIQ_USD)
             return False
@@ -600,7 +627,7 @@ async def _buy_token(
             await log_trade_event({"type": "buy_fail", "mint": mint, "symbol": symbol, "why": "swap_failed"})
             return False
 
-        # Persist entry meta (optional) + register with exit supervisor
+        # Persist entry meta + register with exit supervisor
         try:
             await save_entry_price(get_redis(), mint, entry_price_sol_per_token)
         except Exception as e:
@@ -656,7 +683,7 @@ async def _buy_token(
             if not ok_wd and TELEGRAM_NOTIFY_ROUTE_BLOCKS:
                 await send_telegram(
                     f"⚠️ Route watchdog: {symbol} ({mint}) {msg2} • "
-                    f"pre_out={pre_meta.get('out_amount'):.0f} now_out={now_meta.get('out_amount',0):.0f} "
+                    f"pre_out={_nz(pre_meta.get('out_amount'),0):.0f} now_out={_nz(now_meta.get('out_amount'),0):.0f} "
                     f"hops(pre/now)={pre_meta.get('hops')}/{now_meta.get('hops',0)}"
                 )
         except Exception as e:
@@ -685,9 +712,11 @@ class Sniper:
         if usd_per_sol <= 0:
             return
         amount_sol = ticket_usd / usd_per_sol
+        def _liq(x):
+            return _nz(x.get("liquidity_usd") or x.get("liq_usd") or x.get("liquidityUSD"), 0)
         top = sorted(
             [c for c in cands if c.get("mint")],
-            key=lambda x: float(x.get("liquidity_usd", 0) or 0),
+            key=_liq,
             reverse=True,
         )[:PREWARM_TOP_N]
         mints = [c["mint"] for c in top]
@@ -712,11 +741,11 @@ class Sniper:
         # AI pre-gate (if available)
         try:
             pool_age_min = _coalesce(c, "pool_age_min", "poolAgeMin", "ageMin", default=None)
-            liq_usd      = float(_coalesce(c, "liq_usd", "liquidity_usd", "liquidityUSD", default=0.0) or 0.0)
-            impact1k_bps = float(_coalesce(c, "impact_1k_bps", "priceImpact1kBps", default=0.0) or 0.0)
-            vol5m_pct    = float(_coalesce(c, "vol5m_pct", default=0.0) or 0.0)
-            top10_pct    = float(_coalesce(c, "top10_pct", default=0.0) or 0.0)
-            whale_hits1h = float(_coalesce(c, "whale_touches_1h", default=0.0) or 0.0)
+            liq_usd      = _nz(_coalesce(c, "liq_usd", "liquidity_usd", "liquidityUSD"), 0.0)
+            impact1k_bps = _nz(_coalesce(c, "impact_1k_bps", "priceImpact1kBps"), 0.0)
+            vol5m_pct    = _nz(_coalesce(c, "vol5m_pct"), 0.0)
+            top10_pct    = _nz(_coalesce(c, "top10_pct"), 0.0)
+            whale_hits1h = _nz(_coalesce(c, "whale_touches_1h"), 0.0)
             if Candidate:
                 ok_ai, score_ai, why_ai = pass_gate(
                     Candidate(
@@ -757,8 +786,8 @@ class Sniper:
                 log.info("skip %s: %s", mint, mnote)
             return
 
-        entry = await get_token_price(mint)
-        if not entry or entry <= 0:
+        entry = _nz(await get_token_price(mint), 0.0)
+        if entry <= 0:
             log.debug("consider: no entry price for %s", mint)
             return
 
@@ -841,8 +870,6 @@ class Sniper:
 # ==============================================================================
 # Entrypoint (clean, no stray indentation)
 # ==============================================================================
-import inspect, importlib
-
 async def _maybe_await(x):
     return await x if inspect.iscoroutine(x) else x
 
