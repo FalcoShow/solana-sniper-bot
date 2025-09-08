@@ -968,37 +968,124 @@ async def start_scanners():
         await asyncio.sleep(beat)
 
 # ==============================================================================
-# Entrypoint
+# Entrypoint (clean, no stray indentation)
 # ==============================================================================
-# --- explicit entry for Render (env SCANNERS_ENTRY points here) ---
+import inspect, importlib
+
+async def _maybe_await(x):
+    return await x if inspect.iscoroutine(x) else x
+
+def _resolve_callable(path: str):
+    """Resolve 'module.sub:func' or 'func' (from current module) to a callable."""
+    if not path:
+        return None
+    if ":" in path:
+        mod_name, fn_name = path.split(":", 1)
+        mod = importlib.import_module(mod_name)
+        return getattr(mod, fn_name, None)
+    return globals().get(path)
+
+async def start_scanners():
+    """
+    Delegates to your scanner loop.
+    Priority:
+      1) SCANNERS_ENTRY / START_SCANNERS_TARGET -> 'module.path:func'
+      2) Common function names in this module or 'scanners' modules
+      3) Idle keepalive
+    """
+    # 1) explicit env override
+    env_target = os.getenv("SCANNERS_ENTRY") or os.getenv("START_SCANNERS_TARGET")
+    if env_target:
+        try:
+            fn = _resolve_callable(env_target)
+            if callable(fn):
+                log.info(f"start_scanners: env target -> {env_target}")
+                return await _maybe_await(fn())
+            else:
+                log.error(f"start_scanners: env target not callable: {env_target}")
+        except Exception as e:
+            log.exception(f"start_scanners: failed to import env target {env_target}: {e}")
+
+    # 2) common names here
+    for name in ("run_sniper", "scan_loop", "scan_forever", "scanner_loop", "run_scanners"):
+        fn = globals().get(name)
+        if callable(fn):
+            log.info(f"start_scanners: delegating to local {name}()")
+            return await _maybe_await(fn())
+
+    # 3) try typical external modules
+    for mod_name, fn_name in (
+        ("scanners", "scan_loop"),
+        ("scanners", "scan_forever"),
+        ("sniper.scanners", "scan_loop"),
+        ("sniper.scanners", "scan_forever"),
+    ):
+        try:
+            mod = importlib.import_module(mod_name)
+            fn = getattr(mod, fn_name, None)
+            if callable(fn):
+                log.info(f"start_scanners: delegating to {mod_name}.{fn_name}()")
+                return await _maybe_await(fn())
+        except Exception:
+            pass
+
+    log.error(
+        "start_scanners: no scan loop found. "
+        "Set SCANNERS_ENTRY='module.path:func' or provide run_sniper()/scan_loop(). "
+        "Idling to keep the container alive."
+    )
+    while True:
+        log.info("scanner: idle heartbeat")
+        await asyncio.sleep(int(os.getenv("SCAN_HEARTBEAT_SEC", "10")))
+
+async def scan_loop():
+    """
+    Minimal runner (only used if you choose to): starts exits + optional pnl watcher, then idles.
+    """
+    try:
+        asyncio.create_task(start_exit_supervisor(get_redis()))
+        log.info("scanner: exit supervisor started")
+    except Exception as e:
+        log.debug("scanner: failed to start exit supervisor: %s", e)
+
+    try:
+        from execution.pnl_watcher import start_pnl_watcher
+        asyncio.create_task(start_pnl_watcher())
+        log.info("scanner: pnl_watcher task started")
+    except Exception:
+        pass
+
+    while True:
+        log.info("scanner: idle heartbeat")
+        await asyncio.sleep(int(os.getenv("SCAN_HEARTBEAT_SEC", "10")))
+
 async def run_sniper():
-    # start the full scanner/buyer loop (resources already inited by main())
-    return await Sniper().main_loop()
+    """Default scanner entry: kicks off exits + pnl watcher, then runs Sniper().main_loop()."""
+    try:
+        asyncio.create_task(start_exit_supervisor(get_redis()))
+        log.info("exits supervisor started")
+    except Exception as e:
+        log.debug("exit supervisor not started: %s", e)
+
+    try:
+        from execution.pnl_watcher import watch_positions_loop
+        asyncio.create_task(watch_positions_loop())
+    except Exception as e:
+        log.debug("pnl watcher not started: %s", e)
+
+    await Sniper().main_loop()
 
 async def main():
-    # Init infra
+    # Base resources
     await init_resources()
 
-    # Ensure DB schema exists once
+    # Ensure DB schema
     try:
         await ensure_schema()
     except Exception as e:
         log.warning("ensure_schema failed: %s", e)
 
-    # Refresh session/redis refs via accessors if needed
-    try:
-        global _session_ref, _redis_ref
-        if _session_ref is None or _redis_ref is None:
-            try:
-                from utils_pkg.core_utils import get_session as _get_session, get_redis as _get_redis
-                _session_ref = _get_session()
-                _redis_ref = _get_redis()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # Start Pump.fun CF cookie refresher
+    # Start the Pump.fun CF cookie refresher
     try:
         if ensure_cookie_refresher:
             ensure_cookie_refresher()
@@ -1009,55 +1096,22 @@ async def main():
     except Exception as e:
         log.warning("pumpfun cookie refresher not started: %s", e)
 
-    # Start exits supervisor (once, global)
+    # Refresh session/redis refs via accessors if needed
     try:
-        loop = asyncio.get_running_loop()
-        start_exit_supervisor(loop)
-        log.info("exits supervisor started")
-    except Exception as e:
-        log.exception(f"failed to start exit supervisor: {e}")
-
-    # Optional: start PnL watcher
-    try:
-        from execution.pnl_watcher import start_pnl_watcher
-        asyncio.create_task(start_pnl_watcher())
-        log.info("pnl_watcher task started")
+        global _session_ref, _redis_ref
+        if _session_ref is None or _redis_ref is None:
+            from utils_pkg.core_utils import get_session as _get_session, get_redis as _get_redis
+            _session_ref = _get_session()
+            _redis_ref = _get_redis()
     except Exception:
         pass
 
-    # --- DEMO: register a fake entry on boot (optional) -----------------------
-    if os.getenv("DEMO_REGISTER_ON_BOOT") == "1":
-        try:
-            async def demo_price_fn(_mint: str) -> float | None:
-                # keep units consistent with entry_price below (SOL/token here)
-                return float(os.getenv("DEMO_ENTRY_PRICE_SOL", "0.01"))
-
-            async def demo_sell_fn(_mint: str, usd_to_sell: float, reason: str):
-                log.info("[DEMO SELL] usd=%.2f reason=%s", usd_to_sell, reason)
-                return True, "demo_sig", {}
-
-            register_entry(
-                signature="demo_entry",
-                mint=os.getenv("DEMO_MINT", "DemoMint1111111111111111111111111111111"),
-                qty=None,
-                entry_price=float(os.getenv("DEMO_ENTRY_PRICE_SOL", "0.01")),  # SOL/token
-                symbol="DEMO",
-                usd_spent=float(os.getenv("DEMO_USD", "50")),
-                sell_fn=demo_sell_fn,
-                price_fn=demo_price_fn,
-            )
-            log.info("DEMO: entry registered")
-        except Exception as e:
-            log.warning("DEMO register failed: %s", e)
-    # -------------------------------------------------------------------------
-
-    # If SCANNERS_ENTRY is set, use the shim; else run our Sniper loop
+    # Run whichever scanner entry you’ve configured
     if os.getenv("SCANNERS_ENTRY") or os.getenv("START_SCANNERS_TARGET"):
         await start_scanners()
     else:
-        await Sniper().main_loop()
+        await run_sniper()
 
-    # Cleanup
     await close_resources()
 
 if __name__ == "__main__":
