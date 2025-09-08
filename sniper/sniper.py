@@ -970,7 +970,8 @@ async def start_scanners():
 # ==============================================================================
 # Entrypoint (clean, no stray indentation)
 # ==============================================================================
-import inspect, importlib
+import inspect, importlib, os, asyncio
+log = logging.getLogger("sniper")
 
 async def _maybe_await(x):
     return await x if inspect.iscoroutine(x) else x
@@ -993,7 +994,6 @@ async def start_scanners():
       2) Common function names in this module or 'scanners' modules
       3) Idle keepalive
     """
-    # 1) explicit env override
     env_target = os.getenv("SCANNERS_ENTRY") or os.getenv("START_SCANNERS_TARGET")
     if env_target:
         try:
@@ -1006,14 +1006,12 @@ async def start_scanners():
         except Exception as e:
             log.exception(f"start_scanners: failed to import env target {env_target}: {e}")
 
-    # 2) common names here
     for name in ("run_sniper", "scan_loop", "scan_forever", "scanner_loop", "run_scanners"):
         fn = globals().get(name)
         if callable(fn):
             log.info(f"start_scanners: delegating to local {name}()")
             return await _maybe_await(fn())
 
-    # 3) try typical external modules
     for mod_name, fn_name in (
         ("scanners", "scan_loop"),
         ("scanners", "scan_forever"),
@@ -1039,9 +1037,7 @@ async def start_scanners():
         await asyncio.sleep(int(os.getenv("SCAN_HEARTBEAT_SEC", "10")))
 
 async def scan_loop():
-    """
-    Minimal runner (only used if you choose to): starts exits + optional pnl watcher, then idles.
-    """
+    """Minimal runner: start exits + optional PnL watcher, then idle."""
     try:
         asyncio.create_task(start_exit_supervisor(get_redis()))
         log.info("scanner: exit supervisor started")
@@ -1060,7 +1056,7 @@ async def scan_loop():
         await asyncio.sleep(int(os.getenv("SCAN_HEARTBEAT_SEC", "10")))
 
 async def run_sniper():
-    """Default scanner entry: kicks off exits + pnl watcher, then runs Sniper().main_loop()."""
+    """Default scanner entry: exits + watcher + main loop."""
     try:
         asyncio.create_task(start_exit_supervisor(get_redis()))
         log.info("exits supervisor started")
@@ -1076,16 +1072,13 @@ async def run_sniper():
     await Sniper().main_loop()
 
 async def main():
-    # Base resources
     await init_resources()
 
-    # Ensure DB schema
     try:
         await ensure_schema()
     except Exception as e:
         log.warning("ensure_schema failed: %s", e)
 
-    # Start the Pump.fun CF cookie refresher
     try:
         if ensure_cookie_refresher:
             ensure_cookie_refresher()
@@ -1096,17 +1089,15 @@ async def main():
     except Exception as e:
         log.warning("pumpfun cookie refresher not started: %s", e)
 
-    # Refresh session/redis refs via accessors if needed
+    # refresh session/redis refs via accessors if needed
     try:
         global _session_ref, _redis_ref
         if _session_ref is None or _redis_ref is None:
-            from utils_pkg.core_utils import get_session as _get_session, get_redis as _get_redis
-            _session_ref = _get_session()
-            _redis_ref = _get_redis()
+            from utils_pkg.core_utils import get_session as _gs, get_redis as _gr
+            _session_ref, _redis_ref = _gs(), _gr()
     except Exception:
         pass
 
-    # Run whichever scanner entry you’ve configured
     if os.getenv("SCANNERS_ENTRY") or os.getenv("START_SCANNERS_TARGET"):
         await start_scanners()
     else:
