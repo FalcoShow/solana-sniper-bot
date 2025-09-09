@@ -179,13 +179,19 @@ except Exception:
 
 try:
     from execution.exits import start_exit_supervisor as _exits_start, register_entry
+    import asyncio
+
     async def start_exit_supervisor(_redis):
+        loop = asyncio.get_running_loop()
         try:
+            # newer one-arg form
             return await _exits_start(_redis)  # type: ignore
-        except TypeError:
-            return _exits_start()  # type: ignore
+        except Exception:
+            # older two-arg form
+            return await _exits_start(loop, _redis)  # type: ignore
+
 except Exception as e:
-    log.warning("execution.exits import fallback: %s", e)
+    LOG.warning("execution.exits import fallback: %s", e)
     async def start_exit_supervisor(_redis): ...
     async def register_entry(**_): ...
 

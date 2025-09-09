@@ -246,7 +246,6 @@ def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
                 items.append(m)
     return items
 
-
 # ---------------------------------------------------------------------
 # HTTP helpers (JSON primary)
 # ---------------------------------------------------------------------
@@ -254,13 +253,14 @@ _BAD_CF_CODES = {403, 407, 429, 530}
 
 async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[Any], int, str]:
     try:
-        async with session.get(
-            url, headers=_hdrs(url), timeout=aiohttp.ClientTimeout(total=REQ_TIMEOUT_S)
-        ) as r:
+            async with session.get(url, proxy=PROXY_URL, timeout=HTTP_TIMEOUT) as r:
+
             status = r.status
             text = await r.text()
             first = text[:120].replace("\n", " ")
             ctype = (r.headers.get("content-type") or "").lower()
+	    PROXY_URL = os.getenv("https_proxy") or os.getenv("http_proxy") or os.getenv("all_proxy")
+	    HTTP_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("HTTP_TIMEOUT", "12")))
 
             # CF/HTML gate
             if status in _BAD_CF_CODES or "text/html" in ctype or text.lstrip().startswith("<!DOCTYPE html"):
@@ -548,7 +548,7 @@ async def scan_pumpfun(*args):
     sslctx = ssl.create_default_context(cafile=certifi.where())
     timeout = aiohttp.ClientTimeout(total=REQ_TIMEOUT_S + 5)
     conn = aiohttp.TCPConnector(ssl=sslctx, limit=SESSION_LIMIT)
-    async with aiohttp.ClientSession(connector=conn, timeout=timeout, trust_env=True) as local:
+    async with aiohttp.ClientSession(headers=HEADERS, trust_env=True, timeout=HTTP_TIMEOUT) as session:
         try:
             items = await _scan_inner(local)
             LOG.info("scanner.pumpfun: %s candidates", len(items))
