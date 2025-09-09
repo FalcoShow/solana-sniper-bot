@@ -628,8 +628,10 @@ class Sniper:
         if usd_per_sol <= 0:
             return
         amount_sol = ticket_usd / usd_per_sol
+
         def _liq(x):
             return _nz(x.get("liquidity_usd") or x.get("liq_usd") or x.get("liquidityUSD"), 0)
+
         top = sorted([c for c in cands if c.get("mint")], key=_liq, reverse=True)[:PREWARM_TOP_N]
         mints = [c["mint"] for c in top]
         try:
@@ -638,84 +640,76 @@ class Sniper:
         except Exception as e:
             log.debug("prewarm failed: %s", e)
 
-    # --- NEW: consolidated consider path (AI Gate + RouteGuard inside) --------
+    # --- Consider (AI Gate + RouteGuard) --------------------------------------
     async def _consider(self, c: Dict[str, Any], equity_usd: float):
+        # Global halts / basic gate
         if await _is_halted():
+            return
+        if not await should_allow_new_entry(None):
+            log.debug("consider: budget denies new entry")
             return
         if not await _basic_filters(c):
             return
 
         mint = c.get("mint")
-        symbol = c.get("symbol") or (mint[:6] if mint else "???")
-# Cooldown pre-check to avoid noisy "buy?: ..." logs
-if await _cooldown_key(f"buycd:{mint}", BUY_COOLDOWN_SEC):
-    log.debug("consider: cooldown active %s", mint)
-    return
+        symbol = c.get("symbol") or (mint[:6] if mint else "SOLANA")
 
-# ---- AI Gate (entry price + impact sanity) ----
-ok_gate, gate = await evaluate_candidate(mint)
-if not ok_gate:
-    log.debug("consider: ai-gate reject %s: %s", mint, gate.get("reasons"))
-    return
+        # Avoid noisy duplicate "buy?" logs if on cooldown
+        if await _cooldown_key(f"buycd:{mint}", BUY_COOLDOWN_SEC):
+            log.debug("consider: cooldown active %s", mint)
+            return
 
-# Prefer AI gate's entry price if provided; fallback to your price fetch
-entry = float(gate.get("entry_solin") or 0.0)
-if entry <= 0:
-    entry = _nz(await get_token_price(mint), 0.0)
-if entry <= 0:
-    log.debug("consider: no entry price for %s", mint)
-    return
-
-# ---- RouteGuard (SELL route sanity before BUY) ----
-rg = await check_routes(mint)
-if rg["action"] != "allow":
-    why = rg.get("reason")
-    log.info(
-        "RouteGuard block %s (%s) — %s — no_routes=%s • hops=%s • impact_bps=%s",
-        symbol, mint, why, rg.get("no_routes"), rg.get("hops"), rg.get("impact_bps"),
-    )
-    if TELEGRAM_NOTIFY_ROUTE_BLOCKS:
+        # ---- AI Gate (authoritative entry + price impact sanity) ----
         try:
-            await send_telegram(
-                f"⛔ RouteGuard block {symbol} ({mint}) — {why} • "
-                f"no_routes={rg.get('no_routes')} • hops={rg.get('hops')} • "
-                f"impact_bps={rg.get('impact_bps')}"
-            )
-        except Exception:
-            pass
-    if (why or "").lower().find("no_route") >= 0 and NOROUTE_COOLDOWN_SEC > 0:
-        await _cooldown_key(f"noroutecd:{mint}", NOROUTE_COOLDOWN_SEC)
-    return
-
-        # Optional: simple buy-AI gate if present
-        try:
-            if Candidate:
-                pool_age_min = _coalesce(c, "pool_age_min", "poolAgeMin", "ageMin", default=None)
-                liq_usd      = _nz(_coalesce(c, "liq_usd", "liquidity_usd", "liquidityUSD"), 0.0)
-                impact1k_bps = _nz(_coalesce(c, "impact_1k_bps", "priceImpact1kBps"), 0.0)
-                vol5m_pct    = _nz(_coalesce(c, "vol5m_pct"), 0.0)
-                top10_pct    = _nz(_coalesce(c, "top10_pct"), 0.0)
-                whale_hits1h = _nz(_coalesce(c, "whale_touches_1h"), 0.0)
-                ok_ai, score_ai, why_ai = pass_gate(
-                    Candidate(
-                        mint=mint, symbol=symbol, pool_age_min=pool_age_min,
-                        liq_usd=liq_usd, impact_1k_bps=impact1k_bps,
-                        vol5m_pct=vol5m_pct, top10_pct=top10_pct,
-                        honeypot_flag=False, whale_touches_1h=whale_hits1h,
-                    )
-                )
-                if not ok_ai:
-                    log.debug("consider: ai-softgate reject %s score=%.2f why=%s", mint, score_ai, why_ai)
-                    return
+            ok_gate, gate = await evaluate_candidate(mint)
         except Exception as e:
-            log.debug("ai-softgate error %s: %s", mint, e)
+            log.debug("ai-gate error %s: %s", mint, e)
+            return
+        if not ok_gate:
+            reasons = (gate or {}).get("reasons") or []
+            log.debug("ai-gate reject %s: %s", mint, reasons)
+            if _env_true(os.getenv("TELEGRAM_NOTIFY_AIGATE_BLOCKS", "0")):
+                try:
+                    await send_telegram(f"🤖 AI-Gate block {symbol} ({mint}) — {', '.join(map(str, reasons))}")
+                except Exception:
+                    pass
+            return
 
-async with self.sem:
-    log.info("buy?: %s (%s) ticket=$%.2f entry=%.10f SOL/token", symbol, mint, ticket, entry)
-    ok = await _buy_token(mint, symbol, float(ticket), float(entry))
-    ...
+        entry = _nz((gate or {}).get("entry_solin"), 0.0)  # SOL per token
+        if entry <= 0:
+            # Fallback to your quote getter if gate didn't supply an entry
+            entry = _nz(await get_token_price(mint), 0.0)
+        if entry <= 0:
+            log.debug("consider: no entry price for %s", mint)
+            return
 
-        # Balance guard
+        # ---- RouteGuard (quick SELL-route sanity before BUY) ----
+        try:
+            rg = await check_routes(mint)
+        except Exception as e:
+            log.debug("RouteGuard error %s: %s", mint, e)
+            return
+
+        if rg.get("action") != "allow":
+            why = rg.get("reason", "blocked")
+            log.info(
+                "RouteGuard block %s (%s) — %s — no_routes=%s • hops=%s • impact_bps=%s",
+                symbol, mint, why, rg.get("no_routes"), rg.get("hops"), rg.get("impact_bps"),
+            )
+            if TELEGRAM_NOTIFY_ROUTE_BLOCKS:
+                try:
+                    await send_telegram(
+                        f"⛔ RouteGuard block {symbol} ({mint}) — {why} • "
+                        f"hops={rg.get('hops')} • impact_bps={rg.get('impact_bps')}"
+                    )
+                except Exception:
+                    pass
+            if "no_route" in str(why).lower() and NOROUTE_COOLDOWN_SEC > 0:
+                await _cooldown_key(f"noroutecd:{mint}", NOROUTE_COOLDOWN_SEC)
+            await log_trade_event({"type": "buy_block", "mint": mint, "symbol": symbol, "why": str(why)})
+            return
+
+        # ---- Balance guard ----
         if WALLET_PUBKEY:
             try:
                 bal = await get_sol_balance(WALLET_PUBKEY)
@@ -726,102 +720,92 @@ async with self.sem:
                 log.debug("balance check error: %s", e)
                 return
 
-        # Ticket sizing
+        # ---- Ticket sizing (limits + moonshot) ----
+        ticket = float(get_ticket_size_usd(float(equity_usd)))
         try:
-            from execution.params import get_ticket_size_usd  # type: ignore
-            ticket = float(get_ticket_size_usd(float(equity_usd)))
+            lims = await current_limits(None)
+            if isinstance(lims, dict) and "ticket_usd" in lims:
+                ticket = min(ticket, float(lims["ticket_usd"]))
         except Exception:
-            pct = float(os.getenv("TICKET_PCT_EQUITY", "0.04"))
-            cap = float(os.getenv("TICKET_USD_CAP", "300"))
-            base = equity_usd * pct
-            ticket = float(min(cap, max(10.0, base)))
+            pass
 
-        # Apply moonshot budget (if tiny low-liq/new pools)
         ok_mshot, ticket, mnote = await _apply_moonshot_budget(c, ticket)
         if not ok_mshot or ticket <= 0:
             if mnote:
                 log.info("skip %s: %s", mint, mnote)
             return
 
-        # --- AI Gate (authoritative entry + price impact sanity) --------------
-        ok_gate, gate = await evaluate_candidate(mint)
-        if not ok_gate:
-            reasons = gate.get("reasons") if isinstance(gate, dict) else gate
-            log.debug("ai-gate reject %s: %s", mint, reasons)
-            return
-
-        entry_solin = float(gate.get("entry_solin") or 0.0)  # SOL per token
-        impact_bps  = gate.get("impact_bps")
-        if entry_solin <= 0:
-            log.debug("consider: ai-gate provided no entry for %s", mint)
-            return
-
-        # --- RouteGuard (Jupiter routes pre-trade) ----------------------------
-        rg = await check_routes(mint)
-        if rg.get("action") != "allow":
-            txt = (f"RouteGuard block {symbol} ({mint}) — {rg.get('reason')} — "
-                   f"no_routes={rg.get('no_routes')} • hops={rg.get('hops')} • impact_bps={rg.get('impact_bps')}")
-            log.info(txt)
-            if TELEGRAM_NOTIFY_ROUTE_BLOCKS:
-                try:
-                    await send_telegram(f"⛔ {txt}")
-                except Exception:
-                    pass
-            if str(rg.get("reason","")).lower().startswith("no_route") and NOROUTE_COOLDOWN_SEC > 0:
-                await _cooldown_key(f"noroutecd:{mint}", NOROUTE_COOLDOWN_SEC)
-            await log_trade_event({"type": "buy_block", "mint": mint, "symbol": symbol, "why": str(rg.get("reason"))})
-            return
-
-        # DRY-RUN preview + log
-        ticket_usd = float(ticket)
-        log.info("buy?: %s (%s) ticket=$%.2f entry=%.10f SOL/token", symbol, mint, ticket_usd, entry_solin)
+        # ---- DRY-RUN preview ----
+        log.info("buy?: %s (%s) ticket=$%.2f entry=%.10f SOL/token", symbol, mint, ticket, entry)
         try:
-            await log_scan_row({"mint": mint, "symbol": symbol, "action": "buy_try", "ticket_usd": ticket_usd})
+            await log_scan_row({"mint": mint, "symbol": symbol, "action": "buy_try", "ticket_usd": ticket})
         except Exception:
             pass
 
         if DRY_RUN:
             try:
-                await send_telegram(f"🧪 DRY-RUN — would buy {symbol} ({mint}) for ${ticket_usd:,.2f} at {entry_solin:.10f} SOL/token")
+                await send_telegram(f"🧪 DRY-RUN — would buy {symbol} ({mint}) for ${ticket:,.2f} at {entry:.10f} SOL/token")
             except Exception:
                 pass
             return
 
+        # ---- Concurrency + BUY ----
         if self.sem.locked():
             log.debug("consider: semaphore locked")
             return
 
         async with self.sem:
-            ok = await _buy_token(mint, symbol, ticket_usd, entry_solin)
+            ok = await _buy_token(mint, symbol, float(ticket), float(entry))
             if ok:
                 try:
-                    await log_scan_row({"mint": mint, "symbol": symbol, "action": "buy_ok", "ticket_usd": ticket_usd})
+                    await log_scan_row({"mint": mint, "symbol": symbol, "action": "buy_ok", "ticket_usd": ticket})
                 except Exception:
                     pass
 
-    # --- Telegram heartbeats --------------------------------------------------
+    # --- Telegram heartbeats (throttled) --------------------------------------
     async def _send_heartbeat(self, equity_usd: float):
-        if not HEARTBEATS_ENABLED:
+        # Configure via env: set HEARTBEAT_EVERY_SEC>0 to enable
+        every_sec = int(os.getenv("HEARTBEAT_EVERY_SEC", "0"))
+        only_on_change = _env_true(os.getenv("HEARTBEAT_ONLY_ON_CHANGE", "0"))
+        if every_sec <= 0:
             return
+
         r = get_redis()
-        delta_txt = ""
+        now_ts = int(_now_utc().timestamp())
         try:
-            last = 0.0
+            last_ts = 0
+            last_equity = None
             if r:
-                v = await r.get("hb:last_equity")
-                last = float(v) if v else 0.0
-                await r.set("hb:last_equity", f"{equity_usd:.2f}", ex=24*3600)
-            if last > 0:
-                delta = equity_usd - last
-                pct = (delta / last) * 100.0
+                vts = await r.get("hb:last_ts")
+                last_ts = int(vts) if vts else 0
+                veq = await r.get("hb:last_equity")
+                last_equity = float(veq) if veq else None
+
+            # Throttle by time
+            if last_ts and (now_ts - last_ts) < every_sec:
+                return
+
+            # Optionally skip if equity hasn't changed (rounded to dollars)
+            if only_on_change and last_equity is not None and round(last_equity, 0) == round(equity_usd, 0):
+                return
+
+            delta_txt = ""
+            if last_equity is not None and last_equity > 0:
+                delta = equity_usd - last_equity
+                pct = (delta / last_equity) * 100.0
                 delta_txt = f" (Δ {delta:+,.0f}, {pct:+.2f}%)"
-        except Exception:
-            pass
-        msg = f"📈 Heartbeat | equity ${equity_usd:,.0f}{delta_txt} | open MV $0 | uPnL +0 | open 0"
-        try:
-            await send_telegram(msg)
-        except Exception:
-            pass
+
+            msg = f"📈 Heartbeat | equity ${equity_usd:,.0f}{delta_txt} | open MV $0 | uPnL +0 | open 0"
+            try:
+                await send_telegram(msg)
+            except Exception:
+                pass
+
+            if r:
+                await r.set("hb:last_ts", str(now_ts), ex=24 * 3600)
+                await r.set("hb:last_equity", f"{equity_usd:.2f}", ex=24 * 3600)
+        except Exception as e:
+            log.debug("heartbeat error: %s", e)
 
     async def main_loop(self):
         try:
@@ -852,7 +836,7 @@ async with self.sem:
                     equity_usd = float(os.getenv("EQUITY_USD_FALLBACK", "2000"))
                 await log_pnl_snapshot(_now_utc().isoformat(), equity_usd, 0.0)
 
-                # Heartbeat to TG
+                # Heartbeat to TG (throttled)
                 await self._send_heartbeat(equity_usd)
 
                 log.info("loop: scanning...")
@@ -868,9 +852,8 @@ async with self.sem:
 
                 await log_scan_batch(_now_utc().isoformat(), len(cands), len(top), f"preset={PRESET}")
 
-                # Prewarm quotes with current ticket sizing
+                # Prewarm quotes with current ticket sizing (simple sizing mirror)
                 try:
-                    # Reuse the same sizing logic as in _consider (simple version)
                     pct = float(os.getenv("TICKET_PCT_EQUITY", "0.04"))
                     cap = float(os.getenv("TICKET_USD_CAP", "300"))
                     base = equity_usd * pct
