@@ -177,24 +177,33 @@ except Exception:
             return (6_000, 25_000)
         return (3_000, 10_000)
 
+import asyncio, inspect, logging
+LOG = logging.getLogger(__name__)
+
 try:
-    from execution.exits import start_exit_supervisor as _exits_start, register_entry
-    import asyncio
+    from execution.exits import start_exit_supervisor as _exits_start, register_entry  # noqa
 
     async def start_exit_supervisor(_redis):
-        loop = asyncio.get_running_loop()
         try:
-            # newer one-arg form
-            return await _exits_start(_redis)  # type: ignore
-        except Exception:
-            # older two-arg form
-            return await _exits_start(loop, _redis)  # type: ignore
-
+            sig = inspect.signature(_exits_start)
+            params = list(sig.parameters.values())
+            if len(params) == 0:
+                return await _exits_start()
+            elif len(params) == 1:
+                name = params[0].name
+                if name in ("loop", "event_loop"):
+                    return await _exits_start(asyncio.get_running_loop())
+                else:
+                    return await _exits_start(_redis)
+            else:
+                return await _exits_start(asyncio.get_running_loop(), _redis)
+        except Exception as e:
+            LOG.warning("exits wiring shim failed: %s", e)
+            return
 except Exception as e:
     LOG.warning("execution.exits import fallback: %s", e)
     async def start_exit_supervisor(_redis): ...
     async def register_entry(**_): ...
-
 # ==============================================================================
 # AI filters / fraud / honeypot (safe)
 # ==============================================================================

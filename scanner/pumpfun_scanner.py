@@ -521,6 +521,8 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------
+# scanner/pumpfun_scanner.py  (public entry at the bottom)
+
 async def scan_pumpfun(*args):
     """
     Flexible entrypoint:
@@ -545,17 +547,23 @@ async def scan_pumpfun(*args):
             LOG.warning("Pump.fun scan error (session): %s", e)
             return []
 
+    # Build our own session that honors proxies/certs/timeouts
     sslctx = ssl.create_default_context(cafile=certifi.where())
     timeout = aiohttp.ClientTimeout(total=REQ_TIMEOUT_S + 5)
     conn = aiohttp.TCPConnector(ssl=sslctx, limit=SESSION_LIMIT)
-    async with aiohttp.ClientSession(headers=HEADERS, trust_env=True, timeout=HTTP_TIMEOUT) as session:
+
+    async with aiohttp.ClientSession(
+        headers=HEADERS,
+        connector=conn,
+        trust_env=True,         # pick up HTTP(S)_PROXY/ALL_PROXY from env
+        timeout=timeout,
+    ) as session:
         try:
-            items = await _scan_inner(local)
+            items = await _scan_inner(session)
             LOG.info("scanner.pumpfun: %s candidates", len(items))
             return items
         except Exception as e:
             LOG.warning("Pump.fun scan error: %s", e)
             return []
-
 
 __all__ = ["scan_pumpfun"]
