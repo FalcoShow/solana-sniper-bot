@@ -521,6 +521,21 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------
+# --- Public entrypoint -------------------------------------------------------
+from typing import Optional
+import aiohttp, ssl, certifi
+import logging
+
+LOG = logging.getLogger(__name__)
+
+# these constants should already exist above; keep them or adjust if your file uses different names
+REQ_TIMEOUT_S = 15
+SESSION_LIMIT = 100
+HEADERS = {"User-Agent": "pumpfun-scanner/1.0"}
+
+# internal worker (should already exist in your file)
+# async def _scan_inner(session: aiohttp.ClientSession) -> list[dict]: ...
+
 async def scan_pumpfun(*args):
     """
     Flexible entrypoint:
