@@ -91,6 +91,10 @@ except Exception:
     FRAUD_API_URL = os.getenv("FRAUD_API_URL", "")
     FRAUD_API_KEY = os.getenv("FRAUD_API_KEY", "")
     SCANNER_MIN_FRAUD_SCORE = float(os.getenv("SCANNER_MIN_FRAUD_SCORE", "70"))
+    HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "").strip()
+    HELIUS_URL         = (os.getenv("HELIUS_URL", "").strip()
+                      or (f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""))
+    RPC_FALLBACK_URL   = os.getenv("RPC_FALLBACK_URL", "").strip()  # e.g. https://api.mainnet-beta.solana.com
 
 # Logging
 logger = logging.getLogger("core_utils")
@@ -266,6 +270,24 @@ async def was_token_sniped(token: str) -> bool:
         return (await redis.exists(f"sniped:{token}")) == 1
     except Exception:
         return False
+
+async def rpc_post(payload: dict):
+    url = HELIUS_URL or RPC_FALLBACK_URL
+    headers = {}
+    # If you use the base URL without the ?api-key, send header instead
+    if HELIUS_API_KEY and "api-key=" not in (url or ""):
+        headers["x-api-key"] = HELIUS_API_KEY
+
+    try:
+        r = await _http.post(url, json=payload, headers=headers or None)
+        if r.status_code == 401 and RPC_FALLBACK_URL and RPC_FALLBACK_URL != url:
+            # retry on fallback
+            return await _http.post(RPC_FALLBACK_URL, json=payload)
+        return r
+    except Exception:
+        if RPC_FALLBACK_URL and RPC_FALLBACK_URL != url:
+            return await _http.post(RPC_FALLBACK_URL, json=payload)
+        raise
 
 async def save_entry_price(redis_client: aioredis.Redis, token_address: str, entry_price: float) -> None:
     payload = {"price": entry_price, "timestamp": datetime.utcnow().isoformat()}

@@ -27,6 +27,7 @@ def _env_true(x: Optional[str], *, default=False) -> bool:
 
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
+    logging.getLogger("db.schema").setLevel(logging.WARNING)
     level=getattr(logging, _LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
 )
@@ -509,7 +510,20 @@ async def _buy_token(
     ticket_usd: float,
     entry_price_sol_per_token: float,
 ) -> bool:
-    # DRY-RUN path & guards are handled by caller (semaphore included)
+# --- inside _buy_token(), at the start of the function ---
+if await _is_halted():
+    log.debug("buy: early-exit (halted)")
+    return False
+
+if await _cooldown_key(f"buycd:{mint}", BUY_COOLDOWN_SEC):
+    log.debug("buy: early-exit (cooldown) %s", mint)
+    return False
+
+if not await try_acquire(mint):
+    log.debug("buy: early-exit (entry gate busy) %s", mint)
+    return False
+    
+# DRY-RUN path & guards are handled by caller (semaphore included)
     try:
         # Sizing in SOL
         usd_per_sol = await convert_sol_to_usd(1.0)
@@ -630,6 +644,45 @@ class Sniper:
 
         mint = c.get("mint")
         symbol = c.get("symbol") or (mint[:6] if mint else "???")
+# Cooldown pre-check to avoid noisy "buy?: ..." logs
+if await _cooldown_key(f"buycd:{mint}", BUY_COOLDOWN_SEC):
+    log.debug("consider: cooldown active %s", mint)
+    return
+
+# ---- AI Gate (entry price + impact sanity) ----
+ok_gate, gate = await evaluate_candidate(mint)
+if not ok_gate:
+    log.debug("consider: ai-gate reject %s: %s", mint, gate.get("reasons"))
+    return
+
+# Prefer AI gate's entry price if provided; fallback to your price fetch
+entry = float(gate.get("entry_solin") or 0.0)
+if entry <= 0:
+    entry = _nz(await get_token_price(mint), 0.0)
+if entry <= 0:
+    log.debug("consider: no entry price for %s", mint)
+    return
+
+# ---- RouteGuard (SELL route sanity before BUY) ----
+rg = await check_routes(mint)
+if rg["action"] != "allow":
+    why = rg.get("reason")
+    log.info(
+        "RouteGuard block %s (%s) — %s — no_routes=%s • hops=%s • impact_bps=%s",
+        symbol, mint, why, rg.get("no_routes"), rg.get("hops"), rg.get("impact_bps"),
+    )
+    if TELEGRAM_NOTIFY_ROUTE_BLOCKS:
+        try:
+            await send_telegram(
+                f"⛔ RouteGuard block {symbol} ({mint}) — {why} • "
+                f"no_routes={rg.get('no_routes')} • hops={rg.get('hops')} • "
+                f"impact_bps={rg.get('impact_bps')}"
+            )
+        except Exception:
+            pass
+    if (why or "").lower().find("no_route") >= 0 and NOROUTE_COOLDOWN_SEC > 0:
+        await _cooldown_key(f"noroutecd:{mint}", NOROUTE_COOLDOWN_SEC)
+    return
 
         # Optional: simple buy-AI gate if present
         try:
@@ -653,6 +706,11 @@ class Sniper:
                     return
         except Exception as e:
             log.debug("ai-softgate error %s: %s", mint, e)
+
+async with self.sem:
+    log.info("buy?: %s (%s) ticket=$%.2f entry=%.10f SOL/token", symbol, mint, ticket, entry)
+    ok = await _buy_token(mint, symbol, float(ticket), float(entry))
+    ...
 
         # Balance guard
         if WALLET_PUBKEY:
