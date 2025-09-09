@@ -177,26 +177,35 @@ except Exception:
             return (6_000, 25_000)
         return (3_000, 10_000)
 
+# --- exits wiring shim -------------------------------------------------------
 import asyncio, inspect, logging
 LOG = logging.getLogger(__name__)
 
 try:
-    from execution.exits import start_exit_supervisor as _exits_start, register_entry  # noqa
+    from execution.exits import start_exit_supervisor as _exits_start, register_entry  # type: ignore
 
     async def start_exit_supervisor(_redis):
         try:
+            # Figure out the callable signature *and* whether it is async
             sig = inspect.signature(_exits_start)
             params = list(sig.parameters.values())
+
+            # Build positional args based on arity
             if len(params) == 0:
-                return await _exits_start()
+                call = _exits_start()
             elif len(params) == 1:
-                name = params[0].name
-                if name in ("loop", "event_loop"):
-                    return await _exits_start(asyncio.get_running_loop())
+                p0 = params[0].name
+                if p0 in ("loop", "event_loop"):
+                    call = _exits_start(asyncio.get_running_loop())
                 else:
-                    return await _exits_start(_redis)
+                    call = _exits_start(_redis)
             else:
-                return await _exits_start(asyncio.get_running_loop(), _redis)
+                call = _exits_start(asyncio.get_running_loop(), _redis)
+
+            # If the result is awaitable, await it; otherwise just return
+            if inspect.isawaitable(call):
+                return await call
+            return call
         except Exception as e:
             LOG.warning("exits wiring shim failed: %s", e)
             return
