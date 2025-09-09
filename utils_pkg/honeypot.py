@@ -106,7 +106,7 @@ atexit.register(_atexit_close)
 
 # ---------- Helpers ----------
 def _headers_birdeye() -> Dict[str, str]:
-    h = {"accept": "application/json"}
+    h = {"accept": "application/json", "x-chain": "solana"}
     if BIRDEYE_API_KEY:
         h["X-API-KEY"] = BIRDEYE_API_KEY
     return h

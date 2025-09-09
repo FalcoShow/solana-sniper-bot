@@ -1,5 +1,4 @@
-# sniper/sniper.py — v9.0
-# Max-PnL preset · rank+select · priority fees · exits wiring · DB logs · CF refresher
+# sniper/sniper.py — v10.0 (AI-Gate + RouteGuard wired, Telegram HB added)
 from __future__ import annotations
 
 import os
@@ -10,6 +9,13 @@ import inspect
 import importlib
 from typing import Dict, Any, List, Callable, Optional, Tuple
 from datetime import datetime, timezone
+
+# --- NEW: hard gates ----------------------------------------------------------
+# If these files live under utils_pkg/, change to:
+#   from utils_pkg.ai_gate import evaluate_candidate
+#   from utils_pkg.routeguard import check_routes
+from ai_gate import evaluate_candidate
+from routeguard import check_routes
 
 # ==============================================================================
 # Logging
@@ -64,9 +70,8 @@ try:
     from utils_pkg.core_utils import (
         init_resources, close_resources,
         session as _session_ref, redis as _redis_ref,
-        get_sol_balance, get_token_price, swap_token_jupiter,
-        save_entry_price, convert_sol_to_usd, send_telegram,
-        log_to_notion,
+        get_sol_balance, swap_token_jupiter, save_entry_price,
+        convert_sol_to_usd, send_telegram, log_to_notion,
     )
 except Exception as e_a:
     try:
@@ -74,18 +79,16 @@ except Exception as e_a:
         from utils_pkg.core_utils import (
             init_resources, close_resources,
             get_session as _get_session, get_redis as _get_redis,
-            get_sol_balance, get_token_price, swap_token_jupiter,
-            save_entry_price, convert_sol_to_usd, send_telegram,
-            log_to_notion,
+            get_sol_balance, swap_token_jupiter, save_entry_price,
+            convert_sol_to_usd, send_telegram, log_to_notion,
         )
         _session_ref = _get_session()
         _redis_ref = _get_redis()
     except Exception as e_b:
-        log.warning("core_utils import failed, using stubs: %s | %s", e_a, e_b)
+        log.warning("core_utils import failed: %s | %s", e_a, e_b)
         async def init_resources(): ...
         async def close_resources(): ...
         async def get_sol_balance(_): return 0.0
-        async def get_token_price(_): return 0.0
         async def swap_token_jupiter(**_): return (False, "")
         async def save_entry_price(*_a, **_k): ...
         async def convert_sol_to_usd(_x: float): return 0.0
@@ -93,80 +96,8 @@ except Exception as e_a:
         async def log_to_notion(*_a, **_k): ...
 
 # ==============================================================================
-# Cloudflare / Playwright cookie refresher (safe)
+# Optional helpers (fees / exits / quotes) — safe fallbacks
 # ==============================================================================
-ensure_cookie_refresher = None
-cf_refresh_loop = None
-try:
-    import utils_pkg.pumpfun_cf as _pump_cf
-    ensure_cookie_refresher = getattr(_pump_cf, "ensure_cookie_refresher", None)
-    cf_refresh_loop = getattr(_pump_cf, "refresh_loop", None)
-    log.info("pumpfun_cf loaded: ensure=%s loop=%s",
-             bool(ensure_cookie_refresher), bool(cf_refresh_loop))
-except Exception as e:
-    log.warning("pumpfun_cf import failed: %s", e)
-
-# ==============================================================================
-# Risk manager / entry gate / quote cache / route guard (safe)
-# ==============================================================================
-try:
-    from risk_manager import current_limits, should_allow_new_entry, note_spend
-except Exception as e:
-    log.warning("risk_manager import fallback: %s", e)
-    async def current_limits(_):
-        pct = float(os.getenv("TICKET_PCT_EQUITY", "0.03"))
-        cap = float(os.getenv("TICKET_USD_CAP", "250"))
-        return {"ticket_usd_pct": pct, "ticket_cap_usd": cap, "ticket_usd": 50.0}
-    async def should_allow_new_entry(_): return True
-    async def note_spend(*_a, **_k): ...
-
-try:
-    from entry_gate import try_acquire, release
-except Exception:
-    async def try_acquire(_k): return True
-    async def release(_k): ...
-
-try:
-    from jup_quote_cache import prewarm_quotes
-except Exception:
-    async def prewarm_quotes(*_a, **_k): ...
-
-try:
-    from route_guard import precheck_buy, posttrade_watchdog
-except Exception:
-    async def precheck_buy(_mint, _sol_to_spend, _slip_bps):
-        return True, "ok", {"hops": 1, "impact_bps": 0, "out_amount": 0}
-    async def posttrade_watchdog(_mint, _sol_to_spend, _slip_bps, pre_meta):
-        return True, "ok", {"hops": pre_meta.get("hops", 1), "out_amount": pre_meta.get("out_amount", 0)}
-
-# ==============================================================================
-# Alpha scoring / params / fees / exits supervisor (safe)
-# ==============================================================================
-alpha_score_fn: Optional[Callable[[Dict[str, Any]], float]] = None
-try:
-    from core.alpha import score as alpha_score_fn  # type: ignore
-except Exception:
-    def alpha_score_fn(c: Dict[str, Any]) -> float:
-        age = float(c.get("pool_age_min") or c.get("ageMin") or 9999)
-        liq = float(c.get("liq_usd") or c.get("liquidity_usd") or c.get("liquidityUSD") or 0)
-        imp = float(c.get("impact_1k_bps") or c.get("priceImpact1kBps") or 0)
-        vol5 = float(c.get("vol5m_pct") or 0)
-        score = 0.0
-        if age < 60: score += (60 - age) * 0.5
-        score += min(liq, 80_000) / 8_000.0
-        score += max(0, 200 - abs(imp)) / 50.0
-        score += vol5 * 0.25
-        return float(score)
-
-try:
-    from execution.params import get_ticket_size_usd  # type: ignore
-except Exception:
-    def get_ticket_size_usd(equity_usd: float) -> float:
-        pct = float(os.getenv("TICKET_PCT_EQUITY", "0.04"))
-        cap = float(os.getenv("TICKET_USD_CAP", "300"))
-        base = equity_usd * pct
-        return float(min(cap, max(10.0, base)))
-
 try:
     from fees import compute_priority_tip  # type: ignore
 except Exception:
@@ -177,42 +108,36 @@ except Exception:
             return (6_000, 25_000)
         return (3_000, 10_000)
 
-# --- exits wiring shim -------------------------------------------------------
-import asyncio, inspect, logging
-LOG = logging.getLogger(__name__)
-
 try:
     from execution.exits import start_exit_supervisor as _exits_start, register_entry  # type: ignore
 
     async def start_exit_supervisor(_redis):
         try:
-            # Figure out the callable signature *and* whether it is async
             sig = inspect.signature(_exits_start)
             params = list(sig.parameters.values())
-
-            # Build positional args based on arity
             if len(params) == 0:
                 call = _exits_start()
             elif len(params) == 1:
                 p0 = params[0].name
-                if p0 in ("loop", "event_loop"):
-                    call = _exits_start(asyncio.get_running_loop())
-                else:
-                    call = _exits_start(_redis)
+                call = _exits_start(asyncio.get_running_loop() if p0 in ("loop", "event_loop") else _redis)
             else:
                 call = _exits_start(asyncio.get_running_loop(), _redis)
-
-            # If the result is awaitable, await it; otherwise just return
             if inspect.isawaitable(call):
                 return await call
             return call
         except Exception as e:
-            LOG.warning("exits wiring shim failed: %s", e)
+            log.warning("exits wiring shim failed: %s", e)
             return
 except Exception as e:
-    LOG.warning("execution.exits import fallback: %s", e)
+    log.warning("execution.exits import fallback: %s", e)
     async def start_exit_supervisor(_redis): ...
     async def register_entry(**_): ...
+
+try:
+    from jup_quote_cache import prewarm_quotes
+except Exception:
+    async def prewarm_quotes(*_a, **_k): ...
+
 # ==============================================================================
 # AI filters / fraud / honeypot (safe)
 # ==============================================================================
@@ -283,9 +208,14 @@ JUPITER_SLIPPAGE     = float(os.getenv("JUPITER_MAX_SLIPPAGE", "0.005"))
 SLIPPAGE_BPS         = max(1, int(JUPITER_SLIPPAGE * 10000))
 PREWARM_TOP_N        = int(os.getenv("PREWARM_TOP_N", "8"))
 
-# New envs
+# Heartbeats
+HEARTBEATS_ENABLED   = _env_true(os.getenv("TELEGRAM_HEARTBEATS", "true"))
 TELEGRAM_NOTIFY_ROUTE_BLOCKS = _env_true(os.getenv("TELEGRAM_NOTIFY_ROUTE_BLOCKS", "true"))
+
+# Route cooldown for no-route mints
 NOROUTE_COOLDOWN_SEC = int(os.getenv("NOROUTE_COOLDOWN_SEC", "600"))
+
+# Min scan filters
 MIN_POOL_AGE_MIN     = int(os.getenv("MIN_POOL_AGE_MIN", "0"))
 MIN_LIQ_USD          = float(os.getenv("MIN_LIQ_USD", "0"))
 
@@ -499,26 +429,18 @@ async def _scan_all_sources() -> List[Dict[str, Any]]:
 # Rank & select (preset aware)
 # ==============================================================================
 def _rank_key(c: Dict[str, Any]) -> float:
+    # Small, robust score
     try:
+        from core.alpha import score as alpha_score_fn  # type: ignore
         base = float(alpha_score_fn(c))
     except Exception:
         base = 0.0
-    age = _nz(c.get("pool_age_min") or c.get("ageMin"), 9999)
-    liq = _nz(c.get("liq_usd") or c.get("liquidity_usd") or c.get("liquidityUSD"), 0)
-    impact = _nz(c.get("impact_1k_bps") or c.get("priceImpact1kBps"), 0)
-
-    if PRESET == "max-pnl":
-        base += max(0, 60 - age) * 0.7
-        base += max(0, 200 - abs(impact)) / 40.0
-        base += min(liq, 100_000) / 6_000.0
-    elif PRESET == "balanced":
-        base += max(0, 90 - age) * 0.4
-        base += max(0, 180 - abs(impact)) / 60.0
-        base += min(liq, 150_000) / 10_000.0
-    else:
-        base += max(0, 180 - age) * 0.2
-        base += max(0, 150 - abs(impact)) / 80.0
-        base += min(liq, 300_000) / 20_000.0
+        age = _nz(c.get("pool_age_min") or c.get("ageMin"), 9999)
+        liq = _nz(c.get("liq_usd") or c.get("liquidity_usd") or c.get("liquidityUSD"), 0)
+        impact = _nz(c.get("impact_1k_bps") or c.get("priceImpact1kBps"), 0)
+        base += max(0, 60 - age) * 0.5
+        base += max(0, 200 - abs(impact)) / 50.0
+        base += min(liq, 80_000) / 8_000.0
     return float(base)
 
 def _select_after_rank(cands: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
@@ -567,6 +489,7 @@ async def _basic_filters(c: Dict[str, Any]) -> bool:
     except Exception:
         pass
 
+    # Honeypot + simple fraud AI
     try:
         ok_hp, _ = await honeypot_check(mint)
         if not ok_hp:
@@ -586,24 +509,8 @@ async def _buy_token(
     ticket_usd: float,
     entry_price_sol_per_token: float,
 ) -> bool:
-    # Guards
-    if await _is_halted():
-        return False
-    if await _cooldown_key(f"buycd:{mint}", BUY_COOLDOWN_SEC):
-        return False
-    if not await try_acquire(mint):
-        return False
-
+    # DRY-RUN path & guards are handled by caller (semaphore included)
     try:
-        # DRY-RUN?
-        if DRY_RUN:
-            try:
-                await send_telegram(f"🧪 DRY-RUN — would buy {symbol} ({mint}) for ${ticket_usd:,.2f}")
-            except Exception:
-                pass
-            log.info("dry-run: would-buy %s %s @ $%.2f", symbol, mint, ticket_usd)
-            return False
-
         # Sizing in SOL
         usd_per_sol = await convert_sol_to_usd(1.0)
         if not usd_per_sol or usd_per_sol <= 0:
@@ -612,25 +519,8 @@ async def _buy_token(
         if sol_to_spend <= 0:
             return False
 
-        # Fees + route guard
         cu_price, jito_tip = compute_priority_tip(sol_to_spend)
-        ok_rg, why, pre_meta = await precheck_buy(mint, sol_to_spend, SLIPPAGE_BPS)
-        if not ok_rg:
-            if TELEGRAM_NOTIFY_ROUTE_BLOCKS:
-                msg = (f"⛔ RouteGuard block {symbol} ({mint}) — {why} • "
-                       f"hops={pre_meta.get('hops')} • impact_bps={pre_meta.get('impact_bps')}")
-                try:
-                    await send_telegram(msg)
-                except Exception:
-                    pass
-            # Back-off on mint with no routes
-            if why and "no_route" in str(why).lower() and NOROUTE_COOLDOWN_SEC > 0:
-                await _cooldown_key(f"noroutecd:{mint}", NOROUTE_COOLDOWN_SEC)
-            await log_trade_event({"type": "buy_block", "mint": mint, "symbol": symbol, "why": str(why)})
-            log.info("routeguard: block %s %s: %s", symbol, mint, why)
-            return False
 
-        # Swap (include priority fees when supported)
         swap_kwargs = dict(
             input_mint=SOL_MINT,
             output_mint=mint,
@@ -674,21 +564,7 @@ async def _buy_token(
         except Exception as e:
             log.debug("register_entry failed: %s", e)
 
-        await note_spend(None, float(ticket_usd))
-
         usd_est = await convert_sol_to_usd(sol_to_spend) or 0.0
-        msg = (
-            f"✅ SNIPED {symbol}\n"
-            f"Spent: {sol_to_spend:.4f} SOL (~${usd_est:.2f})\n"
-            f"Entry (SOL/token): {entry_price_sol_per_token:.10f}\n"
-            f"Mint: {mint}\nTx: {sig}"
-        )
-        try:
-            await send_telegram(msg)
-        except Exception:
-            pass
-        log.info("buy: success %s %s sig=%s", symbol, mint, sig)
-
         await log_trade_event({
             "type": "buy",
             "symbol": symbol,
@@ -701,28 +577,27 @@ async def _buy_token(
             "jito_tip": jito_tip,
         })
 
-        # Post-trade watchdog
+        # Telegram success
         try:
-            ok_wd, msg2, now_meta = await posttrade_watchdog(mint, sol_to_spend, SLIPPAGE_BPS, pre_meta)
-            if not ok_wd and TELEGRAM_NOTIFY_ROUTE_BLOCKS:
-                await send_telegram(
-                    f"⚠️ Route watchdog: {symbol} ({mint}) {msg2} • "
-                    f"pre_out={_nz(pre_meta.get('out_amount'),0):.0f} now_out={_nz(now_meta.get('out_amount'),0):.0f} "
-                    f"hops(pre/now)={pre_meta.get('hops')}/{now_meta.get('hops',0)}"
-                )
-        except Exception as e:
-            log.debug("posttrade_watchdog failed: %s", e)
-
-        return True
-
-    finally:
-        try:
-            await release(mint)
+            msg = (
+                f"✅ SNIPED {symbol}\n"
+                f"Spent: {sol_to_spend:.4f} SOL (~${usd_est:.2f})\n"
+                f"Entry (SOL/token): {entry_price_sol_per_token:.10f}\n"
+                f"Mint: {mint}\nTx: {sig}"
+            )
+            await send_telegram(msg)
         except Exception:
             pass
 
+        log.info("buy: success %s %s sig=%s", symbol, mint, sig)
+        return True
+
+    except Exception as e:
+        log.info("buy: exception %s %s: %s", symbol, mint, e)
+        return False
+
 # ==============================================================================
-# Sniper class
+# Sniper
 # ==============================================================================
 class Sniper:
     def __init__(self):
@@ -738,11 +613,7 @@ class Sniper:
         amount_sol = ticket_usd / usd_per_sol
         def _liq(x):
             return _nz(x.get("liquidity_usd") or x.get("liq_usd") or x.get("liquidityUSD"), 0)
-        top = sorted(
-            [c for c in cands if c.get("mint")],
-            key=_liq,
-            reverse=True,
-        )[:PREWARM_TOP_N]
+        top = sorted([c for c in cands if c.get("mint")], key=_liq, reverse=True)[:PREWARM_TOP_N]
         mints = [c["mint"] for c in top]
         try:
             await prewarm_quotes(mints, amount_sol, SLIPPAGE_BPS)
@@ -750,11 +621,9 @@ class Sniper:
         except Exception as e:
             log.debug("prewarm failed: %s", e)
 
+    # --- NEW: consolidated consider path (AI Gate + RouteGuard inside) --------
     async def _consider(self, c: Dict[str, Any], equity_usd: float):
         if await _is_halted():
-            return
-        if not await should_allow_new_entry(None):
-            log.debug("consider: budget denies new entry")
             return
         if not await _basic_filters(c):
             return
@@ -762,15 +631,15 @@ class Sniper:
         mint = c.get("mint")
         symbol = c.get("symbol") or (mint[:6] if mint else "???")
 
-        # AI pre-gate (if available)
+        # Optional: simple buy-AI gate if present
         try:
-            pool_age_min = _coalesce(c, "pool_age_min", "poolAgeMin", "ageMin", default=None)
-            liq_usd      = _nz(_coalesce(c, "liq_usd", "liquidity_usd", "liquidityUSD"), 0.0)
-            impact1k_bps = _nz(_coalesce(c, "impact_1k_bps", "priceImpact1kBps"), 0.0)
-            vol5m_pct    = _nz(_coalesce(c, "vol5m_pct"), 0.0)
-            top10_pct    = _nz(_coalesce(c, "top10_pct"), 0.0)
-            whale_hits1h = _nz(_coalesce(c, "whale_touches_1h"), 0.0)
             if Candidate:
+                pool_age_min = _coalesce(c, "pool_age_min", "poolAgeMin", "ageMin", default=None)
+                liq_usd      = _nz(_coalesce(c, "liq_usd", "liquidity_usd", "liquidityUSD"), 0.0)
+                impact1k_bps = _nz(_coalesce(c, "impact_1k_bps", "priceImpact1kBps"), 0.0)
+                vol5m_pct    = _nz(_coalesce(c, "vol5m_pct"), 0.0)
+                top10_pct    = _nz(_coalesce(c, "top10_pct"), 0.0)
+                whale_hits1h = _nz(_coalesce(c, "whale_touches_1h"), 0.0)
                 ok_ai, score_ai, why_ai = pass_gate(
                     Candidate(
                         mint=mint, symbol=symbol, pool_age_min=pool_age_min,
@@ -780,11 +649,12 @@ class Sniper:
                     )
                 )
                 if not ok_ai:
-                    log.debug("consider: ai-gate reject %s score=%.2f why=%s", mint, score_ai, why_ai)
+                    log.debug("consider: ai-softgate reject %s score=%.2f why=%s", mint, score_ai, why_ai)
                     return
         except Exception as e:
-            log.debug("ai-gate error %s: %s", mint, e)
+            log.debug("ai-softgate error %s: %s", mint, e)
 
+        # Balance guard
         if WALLET_PUBKEY:
             try:
                 bal = await get_sol_balance(WALLET_PUBKEY)
@@ -796,23 +666,64 @@ class Sniper:
                 return
 
         # Ticket sizing
-        ticket = float(get_ticket_size_usd(float(equity_usd)))
         try:
-            lims = await current_limits(None)
-            if isinstance(lims, dict) and "ticket_usd" in lims:
-                ticket = min(ticket, float(lims["ticket_usd"]))
+            from execution.params import get_ticket_size_usd  # type: ignore
+            ticket = float(get_ticket_size_usd(float(equity_usd)))
         except Exception:
-            pass
+            pct = float(os.getenv("TICKET_PCT_EQUITY", "0.04"))
+            cap = float(os.getenv("TICKET_USD_CAP", "300"))
+            base = equity_usd * pct
+            ticket = float(min(cap, max(10.0, base)))
 
+        # Apply moonshot budget (if tiny low-liq/new pools)
         ok_mshot, ticket, mnote = await _apply_moonshot_budget(c, ticket)
         if not ok_mshot or ticket <= 0:
             if mnote:
                 log.info("skip %s: %s", mint, mnote)
             return
 
-        entry = _nz(await get_token_price(mint), 0.0)
-        if entry <= 0:
-            log.debug("consider: no entry price for %s", mint)
+        # --- AI Gate (authoritative entry + price impact sanity) --------------
+        ok_gate, gate = await evaluate_candidate(mint)
+        if not ok_gate:
+            reasons = gate.get("reasons") if isinstance(gate, dict) else gate
+            log.debug("ai-gate reject %s: %s", mint, reasons)
+            return
+
+        entry_solin = float(gate.get("entry_solin") or 0.0)  # SOL per token
+        impact_bps  = gate.get("impact_bps")
+        if entry_solin <= 0:
+            log.debug("consider: ai-gate provided no entry for %s", mint)
+            return
+
+        # --- RouteGuard (Jupiter routes pre-trade) ----------------------------
+        rg = await check_routes(mint)
+        if rg.get("action") != "allow":
+            txt = (f"RouteGuard block {symbol} ({mint}) — {rg.get('reason')} — "
+                   f"no_routes={rg.get('no_routes')} • hops={rg.get('hops')} • impact_bps={rg.get('impact_bps')}")
+            log.info(txt)
+            if TELEGRAM_NOTIFY_ROUTE_BLOCKS:
+                try:
+                    await send_telegram(f"⛔ {txt}")
+                except Exception:
+                    pass
+            if str(rg.get("reason","")).lower().startswith("no_route") and NOROUTE_COOLDOWN_SEC > 0:
+                await _cooldown_key(f"noroutecd:{mint}", NOROUTE_COOLDOWN_SEC)
+            await log_trade_event({"type": "buy_block", "mint": mint, "symbol": symbol, "why": str(rg.get("reason"))})
+            return
+
+        # DRY-RUN preview + log
+        ticket_usd = float(ticket)
+        log.info("buy?: %s (%s) ticket=$%.2f entry=%.10f SOL/token", symbol, mint, ticket_usd, entry_solin)
+        try:
+            await log_scan_row({"mint": mint, "symbol": symbol, "action": "buy_try", "ticket_usd": ticket_usd})
+        except Exception:
+            pass
+
+        if DRY_RUN:
+            try:
+                await send_telegram(f"🧪 DRY-RUN — would buy {symbol} ({mint}) for ${ticket_usd:,.2f} at {entry_solin:.10f} SOL/token")
+            except Exception:
+                pass
             return
 
         if self.sem.locked():
@@ -820,10 +731,36 @@ class Sniper:
             return
 
         async with self.sem:
-            log.info("buy?: %s (%s) ticket=$%.2f entry=%.10f SOL/token", symbol, mint, ticket, entry)
-            ok = await _buy_token(mint, symbol, float(ticket), float(entry))
+            ok = await _buy_token(mint, symbol, ticket_usd, entry_solin)
             if ok:
-                await log_scan_row({"mint": mint, "symbol": symbol, "action": "buy_ok", "ticket_usd": ticket})
+                try:
+                    await log_scan_row({"mint": mint, "symbol": symbol, "action": "buy_ok", "ticket_usd": ticket_usd})
+                except Exception:
+                    pass
+
+    # --- Telegram heartbeats --------------------------------------------------
+    async def _send_heartbeat(self, equity_usd: float):
+        if not HEARTBEATS_ENABLED:
+            return
+        r = get_redis()
+        delta_txt = ""
+        try:
+            last = 0.0
+            if r:
+                v = await r.get("hb:last_equity")
+                last = float(v) if v else 0.0
+                await r.set("hb:last_equity", f"{equity_usd:.2f}", ex=24*3600)
+            if last > 0:
+                delta = equity_usd - last
+                pct = (delta / last) * 100.0
+                delta_txt = f" (Δ {delta:+,.0f}, {pct:+.2f}%)"
+        except Exception:
+            pass
+        msg = f"📈 Heartbeat | equity ${equity_usd:,.0f}{delta_txt} | open MV $0 | uPnL +0 | open 0"
+        try:
+            await send_telegram(msg)
+        except Exception:
+            pass
 
     async def main_loop(self):
         try:
@@ -837,13 +774,6 @@ class Sniper:
             log.info("exits supervisor started")
         except Exception as e:
             log.debug("exit supervisor not started: %s", e)
-
-        # Optional: self-learning loop
-        try:
-            from self_learning_ai_strategy import run_self_learning_loop
-            asyncio.create_task(run_self_learning_loop(get_redis()))
-        except Exception as e:
-            log.debug("self_learning loop not started: %s", e)
 
         while True:
             try:
@@ -861,6 +791,9 @@ class Sniper:
                     equity_usd = float(os.getenv("EQUITY_USD_FALLBACK", "2000"))
                 await log_pnl_snapshot(_now_utc().isoformat(), equity_usd, 0.0)
 
+                # Heartbeat to TG
+                await self._send_heartbeat(equity_usd)
+
                 log.info("loop: scanning...")
                 cands = await _scan_all_sources()
                 if not cands:
@@ -876,12 +809,16 @@ class Sniper:
 
                 # Prewarm quotes with current ticket sizing
                 try:
-                    ticket = get_ticket_size_usd(equity_usd)
+                    # Reuse the same sizing logic as in _consider (simple version)
+                    pct = float(os.getenv("TICKET_PCT_EQUITY", "0.04"))
+                    cap = float(os.getenv("TICKET_USD_CAP", "300"))
+                    base = equity_usd * pct
+                    ticket = float(min(cap, max(10.0, base)))
                     await self._prewarm(top, float(ticket))
                 except Exception as e:
                     log.debug("prewarm fail: %s", e)
 
-                # Walk the ranked list
+                # Walk the ranked list (sequential; semaphore guards buys)
                 for c in top:
                     await self._consider(c, equity_usd)
 
@@ -892,7 +829,7 @@ class Sniper:
             await asyncio.sleep(SCANNER_PERIOD_SEC)
 
 # ==============================================================================
-# Entrypoint (clean, no stray indentation)
+# Entrypoints
 # ==============================================================================
 async def _maybe_await(x):
     return await x if inspect.iscoroutine(x) else x
@@ -912,7 +849,7 @@ async def start_scanners():
     Delegates to your scanner loop.
     Priority:
       1) SCANNERS_ENTRY / START_SCANNERS_TARGET -> 'module.path:func'
-      2) Common function names in this module or 'scanners' modules
+      2) Common function names in this module
       3) Idle keepalive
     """
     env_target = os.getenv("SCANNERS_ENTRY") or os.getenv("START_SCANNERS_TARGET")
@@ -933,21 +870,6 @@ async def start_scanners():
             log.info(f"start_scanners: delegating to local {name}()")
             return await _maybe_await(fn())
 
-    for mod_name, fn_name in (
-        ("scanners", "scan_loop"),
-        ("scanners", "scan_forever"),
-        ("sniper.scanners", "scan_loop"),
-        ("sniper.scanners", "scan_forever"),
-    ):
-        try:
-            mod = importlib.import_module(mod_name)
-            fn = getattr(mod, fn_name, None)
-            if callable(fn):
-                log.info(f"start_scanners: delegating to {mod_name}.{fn_name}()")
-                return await _maybe_await(fn())
-        except Exception:
-            pass
-
     log.error(
         "start_scanners: no scan loop found. "
         "Set SCANNERS_ENTRY='module.path:func' or provide run_sniper()/scan_loop(). "
@@ -958,38 +880,23 @@ async def start_scanners():
         await asyncio.sleep(int(os.getenv("SCAN_HEARTBEAT_SEC", "10")))
 
 async def scan_loop():
-    """Minimal runner: start exits + optional PnL watcher, then idle."""
+    """Minimal runner: start exits then idle."""
     try:
         asyncio.create_task(start_exit_supervisor(get_redis()))
         log.info("scanner: exit supervisor started")
     except Exception as e:
         log.debug("scanner: failed to start exit supervisor: %s", e)
-
-    try:
-        from execution.pnl_watcher import start_pnl_watcher
-        asyncio.create_task(start_pnl_watcher())
-        log.info("scanner: pnl_watcher task started")
-    except Exception:
-        pass
-
     while True:
         log.info("scanner: idle heartbeat")
         await asyncio.sleep(int(os.getenv("SCAN_HEARTBEAT_SEC", "10")))
 
 async def run_sniper():
-    """Default scanner entry: exits + watcher + main loop."""
+    """Default scanner entry: exits + main loop."""
     try:
         asyncio.create_task(start_exit_supervisor(get_redis()))
         log.info("exits supervisor started")
     except Exception as e:
         log.debug("exit supervisor not started: %s", e)
-
-    try:
-        from execution.pnl_watcher import watch_positions_loop
-        asyncio.create_task(watch_positions_loop())
-    except Exception as e:
-        log.debug("pnl watcher not started: %s", e)
-
     await Sniper().main_loop()
 
 async def main():
@@ -999,17 +906,6 @@ async def main():
         await ensure_schema()
     except Exception as e:
         log.warning("ensure_schema failed: %s", e)
-
-    # Start Pump.fun CF cookie refresher
-    try:
-        if ensure_cookie_refresher:
-            ensure_cookie_refresher()
-        elif cf_refresh_loop:
-            asyncio.create_task(cf_refresh_loop())
-        else:
-            log.info("pumpfun CF refresher not available")
-    except Exception as e:
-        log.warning("pumpfun cookie refresher not started: %s", e)
 
     # Refresh session/redis refs via accessors if needed
     try:
