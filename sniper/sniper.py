@@ -1,4 +1,6 @@
 # sniper/sniper.py — v10.0 (AI-Gate + RouteGuard wired, Telegram HB added)
+# sniper/sniper.py  (TOP OF FILE — replace imports + logging block)
+
 from __future__ import annotations
 
 import os
@@ -10,29 +12,30 @@ import importlib
 from typing import Dict, Any, List, Callable, Optional, Tuple
 from datetime import datetime, timezone
 
-# --- NEW: hard gates ----------------------------------------------------------
-# If these files live under utils_pkg/, change to:
-#   from utils_pkg.ai_gate import evaluate_candidate
-#   from utils_pkg.routeguard import check_routes
 from ai_gate import evaluate_candidate
 from routeguard import check_routes
 
 # ==============================================================================
 # Logging
 # ==============================================================================
+
 def _env_true(x: Optional[str], *, default=False) -> bool:
     if x is None:
         return bool(default)
     return str(x).strip().lower() in ("1", "true", "yes", "on")
 
-_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+_LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").upper()
+
 logging.basicConfig(
-    logging.getLogger("db.schema").setLevel(logging.WARNING)
     level=getattr(logging, _LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
 )
-log = logging.getLogger("sniper")
 
+# Quiet noisy libs early
+for _name in ("httpx", "httpcore", "asyncio", "db.schema"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
+
+log = logging.getLogger("sniper")
 # ==============================================================================
 # DB schema + DB logger (safe wrappers)
 # ==============================================================================
