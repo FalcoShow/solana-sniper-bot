@@ -308,6 +308,24 @@ def _req_kwargs(proxy: Optional[str]) -> Dict[str, Any]:
         kw["proxy"] = proxy
     return kw
 
+async def _fetch_text(session: aiohttp.ClientSession, url: str) -> tuple[str, int, dict]:
+    """
+    Fetch a URL as plain text. Returns (text, status, headers).
+    Never raises; on failure returns ("", 0, {}).
+    """
+    try:
+        async with session.get(url) as r:
+            text = await r.text(errors="ignore")
+            status = r.status
+            headers = dict(r.headers)
+            first = text[:120]
+            if status >= 400:
+                LOG.warning("Pump.fun: [%s] HTTP %s; first 120: %s", url, status, first)
+            return text, status, headers
+    except Exception as e:
+        LOG.warning("Pump.fun request failed: %s %s", url, e)
+        return "", 0, {}
+
 async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[Any], int, str]:
     """
     Fetch a URL and try to parse JSON.
@@ -435,11 +453,9 @@ async def _html_next_fallback(session: aiohttp.ClientSession) -> List[Dict[str, 
     for url in paths:
         try:
             # If your _fetch_text returns only a string, adapt accordingly:
-            #   html = await _fetch_text(session, url) or ""
-            html, status, headers = await _fetch_text(session, url)  # preferred if available
+            html, status, headers = await _fetch_text(session, url)
         except TypeError:
             # Fallback if _fetch_text(session, url) returns just str
-            html = await _fetch_text(session, url) or ""
             status, headers = 0, {}
 
         ctype = (headers.get("content-type") or "").lower() if isinstance(headers, dict) else ""
