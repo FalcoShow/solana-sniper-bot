@@ -1,8 +1,8 @@
 # sniper/sniper.py — v10.0 (AI-Gate + RouteGuard wired, Telegram HB added)
-# sniper/sniper.py  (TOP OF FILE — replace imports + logging block)
 
 from __future__ import annotations
 
+# --- stdlib imports ---------------------------------------------------------
 import os
 import re
 import asyncio
@@ -12,30 +12,51 @@ import importlib
 from typing import Dict, Any, List, Callable, Optional, Tuple
 from datetime import datetime, timezone
 
-from ai_gate import evaluate_candidate
-from routeguard import check_routes
-
-# ==============================================================================
-# Logging
-# ==============================================================================
-
-def _env_true(x: Optional[str], *, default=False) -> bool:
+# --- logging must be initialized before any try/except that uses it ----------
+def _env_true(x: Optional[str], *, default: bool = False) -> bool:
     if x is None:
         return bool(default)
     return str(x).strip().lower() in ("1", "true", "yes", "on")
 
 _LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").upper()
-
 logging.basicConfig(
     level=getattr(logging, _LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
 )
-
-# Quiet noisy libs early
-for _name in ("httpx", "httpcore", "asyncio", "db.schema"):
-    logging.getLogger(_name).setLevel(logging.WARNING)
-
 log = logging.getLogger("sniper")
+for _noisy in ("httpx", "httpcore", "asyncio", "db.schema"):
+    try:
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+    except Exception:
+        pass
+
+# --- local deps that don't require logger yet --------------------------------
+from ai_gate import evaluate_candidate  # noqa: E402
+from routeguard import check_routes     # noqa: E402# ==============================================================================
+# Risk manager / entry gate / quote cache / route guard (safe)
+# ==============================================================================
+try:
+    from risk_manager import current_limits, should_allow_new_entry, note_spend
+except Exception as e:
+    log.warning("risk_manager import failed: %s", e)
+    async def current_limits(_):
+        pct = float(os.getenv("TICKET_PCT_EQUITY", "0.03"))
+        cap = float(os.getenv("TICKET_USD_CAP", "250"))
+        # provide a default ticket value so downstream code doesn’t explode
+        return {"ticket_usd_pct": pct, "ticket_cap_usd": cap, "ticket_usd": 50.0}
+
+    async def should_allow_new_entry(_):
+        # permissive fallback so the loop can run even without risk_manager
+        return True
+
+    async def note_spend(*_a, **_k):
+        return None
+
+# Safety net in case something rebinds/omits it later
+if 'should_allow_new_entry' not in globals() or not callable(should_allow_new_entry):
+    async def should_allow_new_entry(_):
+        return True
+
 # ==============================================================================
 # DB schema + DB logger (safe wrappers)
 # ==============================================================================

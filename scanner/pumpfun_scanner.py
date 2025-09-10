@@ -251,29 +251,46 @@ def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------
 _BAD_CF_CODES = {403, 407, 429, 530}
 
-async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[Any], int, str]:
-    try:
-            async with session.get(url, proxy=PROXY_URL, timeout=HTTP_TIMEOUT) as r:
+# Config (module-level so they're not redefined inside the function)
+PROXY_URL = os.getenv("https_proxy") or os.getenv("http_proxy") or os.getenv("all_proxy")
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "12"))
+OVERRIDE_URL = os.getenv("PUMPFUN_OVERRIDE_URL", "")
 
+async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[Any], int, str]:
+    """
+    Fetch a URL and try to parse JSON.
+    Returns: (payload_or_none, status_code, first_120_chars_for_debug)
+    Falls back to browser_fetch_json() if CF/HTML is detected.
+    """
+    try:
+        req_kwargs = {"timeout": aiohttp.ClientTimeout(total=HTTP_TIMEOUT)}
+        if PROXY_URL:
+            req_kwargs["proxy"] = PROXY_URL
+
+        async with session.get(url, **req_kwargs) as r:
             status = r.status
             text = await r.text()
             first = text[:120].replace("\n", " ")
             ctype = (r.headers.get("content-type") or "").lower()
-	    PROXY_URL = os.getenv("https_proxy") or os.getenv("http_proxy") or os.getenv("all_proxy")
-	    HTTP_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("HTTP_TIMEOUT", "12")))
 
-            # CF/HTML gate
+            # CF/HTML gate detection
             if status in _BAD_CF_CODES or "text/html" in ctype or text.lstrip().startswith("<!DOCTYPE html"):
-                if status in _BAD_CF_CODES:
-                    flag_cookie_bad()
+                try:
+                    if status in _BAD_CF_CODES:
+                        # Let the CF cookie manager know this attempt failed
+                        flag_cookie_bad()
+                except Exception:
+                    pass
+                # Playwright fallback to defeat CF
                 try:
                     data = await browser_fetch_json(url)
                     if data is not None:
                         return (data, 200, first)
-                except Exception:
-                    pass
+                except Exception as e:
+                    LOG.debug("browser_fetch_json fallback failed: %s", e)
                 return (None, status, first)
 
+            # Try hard to parse JSON
             try:
                 return (json.loads(text), status, first)
             except Exception:
@@ -296,8 +313,12 @@ async def _fetch_api_json_with_fallback(
     path: str,
     tried_out: Optional[List[str]] = None,
 ) -> Optional[List[Dict[str, Any]]]:
-    # Override URL (debug single endpoint)
-    if OVERRIDE_URL.lower().startswith("http"):
+    """
+    Try current API bases; if CF/HTML encountered, _fetch_json will fallback.
+    Returns a list of items extracted by _extract_items_from_payload(), or None.
+    """
+    # Debug: override a single test URL if provided
+    if OVERRIDE_URL and OVERRIDE_URL.lower().startswith("http"):
         payload, status, first = await _fetch_json(session, OVERRIDE_URL)
         if tried_out is not None:
             tried_out.append(f"{OVERRIDE_URL} status={status}")
@@ -307,101 +328,24 @@ async def _fetch_api_json_with_fallback(
                 LOG.info("scanner.pumpfun: API JSON (override) → %s items", len(items))
                 return items
 
+    # Try each configured base
     for base in _api_bases():
         url = _join_url(base, path)
         payload, status, first = await _fetch_json(session, url)
         if tried_out is not None:
             tried_out.append(f"{url} status={status}")
+
         if not payload:
-            if status in (404, *tuple(_BAD_CF_CODES)):
+            if status in (404, *_BAD_CF_CODES):
                 LOG.warning("Pump.fun: [%s] HTTP %s; first 120: %s", url, status, first)
             continue
+
         items = _extract_items_from_payload(payload)
         if items:
             LOG.info("scanner.pumpfun: API JSON → %s items (base=%s)", len(items), base)
             return items
 
     return None
-
-
-# ---------------------------------------------------------------------
-# HTML helpers: scrape coin links directly from apex HTML (no JS)
-# ---------------------------------------------------------------------
-_BASE58 = r"[1-9A-HJ-NP-Za-km-z]{32,44}"
-
-def _uniq(seq: List[str]) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for x in seq:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-async def _html_scrape_links(session: aiohttp.ClientSession, path: str, limit: int = 50) -> List[Dict[str, Any]]:
-    url = f"https://pump.fun{path}"
-    try:
-        async with session.get(url, headers=_hdrs(url), timeout=aiohttp.ClientTimeout(total=REQ_TIMEOUT_S)) as r:
-            html = await r.text()
-    except Exception as e:
-        LOG.warning("Pump.fun HTML link scrape failed (%s): %s", path, e)
-        return []
-
-    mints: List[str] = []
-    for pattern in [
-        rf'href="(?:https://pump\.fun)?/coin/({_BASE58})"',
-        rf'href="(?:https://pump\.fun)?/coins/({_BASE58})"',
-        rf'href="(?:https://pump\.fun)?/token/({_BASE58})"',
-        rf'[?&]mint=({_BASE58})',
-        rf'data-mint="({_BASE58})"',
-    ]:
-        mints += re.findall(pattern, html)
-
-    mints = _uniq(mints)[:limit]
-    return [{"mint": m} for m in mints]
-
-
-# ---------------------------------------------------------------------
-# HTML __NEXT_DATA__ fallback (legacy, may be absent)
-# ---------------------------------------------------------------------
-async def _html_next_data(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
-    url = "https://pump.fun/trending"
-    try:
-        async with session.get(
-            url, headers=_hdrs(url), timeout=aiohttp.ClientTimeout(total=REQ_TIMEOUT_S)
-        ) as r:
-            html = await r.text()
-    except Exception as e:
-        LOG.warning("Pump.fun HTML fallback failed: %s", e)
-        return []
-
-    m = re.search(r'id="__NEXT_DATA__"[^>]*>\s*({.*?})\s*</script>', html, re.S)
-    if not m:
-        return []
-
-    try:
-        data = json.loads(m.group(1))
-    except Exception:
-        return []
-
-    page = data.get("props", {}).get("pageProps", {}) if isinstance(data, dict) else {}
-    arr: Optional[List[Dict[str, Any]]] = None
-    for k in ("trending", "coins", "projects", "items", "data"):
-        v = page.get(k)
-        if isinstance(v, list) and v:
-            arr = v
-            break
-
-    items: List[Dict[str, Any]] = []
-    if isinstance(arr, list):
-        for it in arr:
-            if isinstance(it, dict):
-                mobj = _map_coin(it)
-                if mobj:
-                    items.append(mobj)
-    return items
-
-
 # ---------------------------------------------------------------------
 # Scanner core
 # ---------------------------------------------------------------------
