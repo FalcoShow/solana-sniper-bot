@@ -416,6 +416,8 @@ async def _fetch_api_json_with_fallback(
 # ---------------------------------------------------------------------
 # Scanner core
 # ---------------------------------------------------------------------
+from typing import List, Dict, Any  # make sure this import exists at top
+
 async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     apply_cookies_to_session(session)
 
@@ -457,8 +459,6 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     else:
         LOG.debug("PUMPFUN_SKIP_NEXT=1 → skipping DOM scrape step")
 
-    tried: List[str] = []
-
     # 2) Pure HTML (regex) from apex pages (no JS, no Playwright)
     html_items: List[Dict[str, Any]] = []
     for path in HTML_PATHS:
@@ -484,9 +484,13 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
             LOG.info("scanner.pumpfun: HTML apex → %s items", len(items))
             return items
 
-async def _collect_pumpfun_items(session: aiohttp.ClientSession) -> Optional[List[Dict[str, Any]]]:
+    # 3) JSON/API + internal fallbacks (guaranteed list)
+    items = await _collect_pumpfun_items(session) or []
+    return items
+
+async def _collect_pumpfun_items(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     """
-    Try multiple Pump.fun sources in order, returning a list of items or None.
+    Try multiple Pump.fun sources in order, returning a *list* of items.
     Order:
       1) JSON API (trending)
       2) JSON API (new)
@@ -522,7 +526,7 @@ async def _collect_pumpfun_items(session: aiohttp.ClientSession) -> Optional[Lis
 
     # 4) HTML __NEXT_DATA__ fallback (legacy)
     if not SKIP_NEXT:
-        items = await _html_next_fallback(session)         # <— this is now inside an async def
+        items = await _html_next_fallback(session)  # returns list or None
         if items:
             LOG.info("scanner.pumpfun: HTML __NEXT_DATA__ → %s items", len(items))
             return items
@@ -538,7 +542,7 @@ async def _collect_pumpfun_items(session: aiohttp.ClientSession) -> Optional[Lis
     payload = None
     try:
         maybe = browser_fetch_json(fallback_url)
-        payload = await maybe if asyncio.iscoroutine(maybe) else maybe  # robust: works if sync or async
+        payload = await maybe if asyncio.iscoroutine(maybe) else maybe  # robust to sync/async
     except Exception as e:
         LOG.debug("browser_fetch_json final fallback failed: %s", e)
 
@@ -550,11 +554,12 @@ async def _collect_pumpfun_items(session: aiohttp.ClientSession) -> Optional[Lis
 
     if tried:
         LOG.warning("scanner.pumpfun: no items after tries: %s", " | ".join(tried))
-    return None
+
+    # IMPORTANT: never return None — callers do len(items)
+    return []
 # ---------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------
-# --- Public entrypoint -------------------------------------------------------
 from typing import Optional
 import aiohttp, ssl, certifi
 import logging
@@ -586,7 +591,7 @@ async def scan_pumpfun(*args):
 
     if sess is not None:
         try:
-            items = await _scan_inner(sess)
+            items = await _scan_inner(sess) or []
             LOG.info("scanner.pumpfun: %s candidates", len(items))
             return items
         except Exception as e:
@@ -605,7 +610,7 @@ async def scan_pumpfun(*args):
         timeout=timeout,
     ) as session:
         try:
-            items = await _scan_inner(session)
+            items = await _scan_inner(session) or []
             LOG.info("scanner.pumpfun: %s candidates", len(items))
             return items
         except Exception as e:
