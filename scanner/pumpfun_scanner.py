@@ -273,18 +273,16 @@ from typing import Optional, Any, Dict, List, Tuple
 import json
 import aiohttp
 import os
+import asyncio
 
-_BAD_CF_CODES = {403, 407, 429, 530}          # typical CF/anti-bot statuses
-_PROXY_BREAK_CODES = {522, 523, 524, 525, 526, 530}  # “tunnel/handshake” failures
+_BAD_CF_CODES = {403, 407, 429, 530}                 # typical CF/anti-bot statuses
+_PROXY_BREAK_CODES = {522, 523, 524, 525, 526, 530}  # tunnel/handshake failures
 
 # Per-scanner proxy control:
-# - If PUMPFUN_PROXY_URL is empty/None/"none", we DO NOT use a proxy for Pump.fun
-# - A global proxy in https_proxy/http_proxy/all_proxy will NOT be used unless you
-#   explicitly set PUMPFUN_PROXY_URL to that value.
 PUMPFUN_PROXY_URL = (os.getenv("PUMPFUN_PROXY_URL") or "").strip()
 HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT", "12"))
 OVERRIDE_URL = os.getenv("PUMPFUN_OVERRIDE_URL", "").strip()
-RETRY_DIRECT_IF_PROXY_FAILS = (os.getenv("PUMPFUN_RETRY_DIRECT", "1").strip() not in ("0", "false", "no"))
+RETRY_DIRECT_IF_PROXY_FAILS = (os.getenv("PUMPFUN_RETRY_DIRECT", "1").strip().lower() not in {"0", "false", "no"})
 
 def _pumpfun_proxy_url() -> Optional[str]:
     v = PUMPFUN_PROXY_URL.lower()
@@ -306,7 +304,8 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
       1) Try with Pump.fun-specific proxy (if provided).
       2) If we used a proxy and got a tunnel/CF break (522/530/etc) or a proxy exception,
          retry once with NO proxy (direct).
-      3) If response looks like HTML/CF, fall back to Playwright `browser_fetch_json`.
+      3) If response looks like HTML/CF, fall back to Playwright `browser_fetch_json`
+         (works whether that helper is sync or async).
     """
     proxy_first = _pumpfun_proxy_url()
     attempts: List[Optional[str]] = [proxy_first]
@@ -332,7 +331,8 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
                     except Exception:
                         pass
                     try:
-                        data = await browser_fetch_json(url)
+                        maybe = browser_fetch_json(url)
+                        data = await maybe if asyncio.iscoroutine(maybe) else maybe
                         if data is not None:
                             return (data, 200, first)
                     except Exception as e:
@@ -357,7 +357,6 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
                 aiohttp.ClientConnectorError,
                 aiohttp.ServerTimeoutError,
                 asyncio.TimeoutError) as e:
-            # Proxy/connect issues: if we used a proxy and are allowed to retry direct, loop
             LOG.warning("Pump.fun request failed%s: %s %s",
                         f" via proxy {proxy}" if proxy else "",
                         url, e)
@@ -485,19 +484,33 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
             LOG.info("scanner.pumpfun: HTML apex → %s items", len(items))
             return items
 
-    # 3) API JSON using mirror/primary fallback (capped by API_LIMIT)
-    api_path_tr = f"/coins/trending?offset=0&limit={API_LIMIT}"
-    api_path_new = f"/coins/new?offset=0&limit={API_LIMIT}"
+async def _collect_pumpfun_items(session: aiohttp.ClientSession) -> Optional[List[Dict[str, Any]]]:
+    """
+    Try multiple Pump.fun sources in order, returning a list of items or None.
+    Order:
+      1) JSON API (trending)
+      2) JSON API (new)
+      3) legacy endpoint
+      4) HTML __NEXT_DATA__ scrape (when CF blocks JSON)
+      5) Playwright JSON fetch to first base
+    """
+    tried: List[str] = []
 
-    items = await _fetch_api_json_with_fallback(session, api_path_tr, tried_out=tried)
+    # 1) API: trending
+    items = await _fetch_api_json_with_fallback(
+        session, f"coins/trending?offset=0&limit={API_LIMIT}", tried_out=tried
+    )
     if items:
         return items
 
-    items = await _fetch_api_json_with_fallback(session, api_path_new, tried_out=tried)
+    # 2) API: new
+    items = await _fetch_api_json_with_fallback(
+        session, f"coins/new?offset=0&limit={API_LIMIT}", tried_out=tried
+    )
     if items:
         return items
 
-    # legacy endpoint (often 404) — still try once
+    # 3) legacy endpoint (often 404) — still try once
     legacy = "https://pump.fun/api/trending"
     payload, status, first = await _fetch_json(session, legacy)
     tried.append(f"{legacy} status={status}")
@@ -509,27 +522,35 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
 
     # 4) HTML __NEXT_DATA__ fallback (legacy)
     if not SKIP_NEXT:
-        items = await _html_next_data(session)
+        items = await _html_next_fallback(session)         # <— this is now inside an async def
         if items:
             LOG.info("scanner.pumpfun: HTML __NEXT_DATA__ → %s items", len(items))
             return items
 
-    # 5) Last resort: Playwright fetch to *first* available base (capped by API_LIMIT)
+    # 5) last resort: Playwright fetch to *first* available base (capped by API_LIMIT)
     try:
         first_base = _api_bases()[0]
     except Exception:
         first_base = "https://frontend-api.pump.fun"
-    fallback_url = _join_url(first_base, f"/coins/trending?offset=0&limit={API_LIMIT}")
-    payload = await browser_fetch_json(fallback_url)
-    items = _extract_items_from_payload(payload)
-    if items:
-        LOG.info("scanner.pumpfun: Playwright API → %s items", len(items))
-        return items
 
-    LOG.warning("Pump.fun all endpoints failed: tried=%s", "; ".join(tried))
-    return []
+    fallback_url = _join_url(first_base, f"coins/trending?offset=0&limit={API_LIMIT}")
 
+    payload = None
+    try:
+        maybe = browser_fetch_json(fallback_url)
+        payload = await maybe if asyncio.iscoroutine(maybe) else maybe  # robust: works if sync or async
+    except Exception as e:
+        LOG.debug("browser_fetch_json final fallback failed: %s", e)
 
+    if payload:
+        items = _extract_items_from_payload(payload)
+        if items:
+            LOG.info("scanner.pumpfun: Playwright API → %s items", len(items))
+            return items
+
+    if tried:
+        LOG.warning("scanner.pumpfun: no items after tries: %s", " | ".join(tried))
+    return None
 # ---------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------
