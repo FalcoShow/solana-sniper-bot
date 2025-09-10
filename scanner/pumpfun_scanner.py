@@ -15,6 +15,25 @@ import certifi
 
 LOG = logging.getLogger("scanner.pumpfun")
 
+# --- compat shim for legacy code paths that call _html_next_data ----------
+import re, json
+
+# Grab __NEXT_DATA__ JSON from server-rendered Pump.fun pages (when CF blocks JSON API)
+_NEXT_RE = re.compile(
+    r'__NEXT_DATA__"\s*type="application/json"\s*>\s*({.*?})\s*</script>',
+    re.DOTALL | re.IGNORECASE
+)
+
+def _html_next_data(html: str):
+    """Return parsed __NEXT_DATA__ JSON dict or None if not present."""
+    try:
+        m = _NEXT_RE.search(html or "")
+        if not m:
+            return None
+        return json.loads(m.group(1))
+    except Exception:
+        return None
+
 # ---------------------------------------------------------------------
 # Cloudflare / Playwright helpers
 # ---------------------------------------------------------------------
@@ -249,59 +268,108 @@ def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------
 # HTTP helpers (JSON primary)
 # ---------------------------------------------------------------------
-_BAD_CF_CODES = {403, 407, 429, 530}
+from typing import Optional, Any, Dict, List, Tuple
+import json
+import aiohttp
+import os
 
-# Config (module-level so they're not redefined inside the function)
-PROXY_URL = os.getenv("https_proxy") or os.getenv("http_proxy") or os.getenv("all_proxy")
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "12"))
-OVERRIDE_URL = os.getenv("PUMPFUN_OVERRIDE_URL", "")
+_BAD_CF_CODES = {403, 407, 429, 530}          # typical CF/anti-bot statuses
+_PROXY_BREAK_CODES = {522, 523, 524, 525, 526, 530}  # “tunnel/handshake” failures
+
+# Per-scanner proxy control:
+# - If PUMPFUN_PROXY_URL is empty/None/"none", we DO NOT use a proxy for Pump.fun
+# - A global proxy in https_proxy/http_proxy/all_proxy will NOT be used unless you
+#   explicitly set PUMPFUN_PROXY_URL to that value.
+PUMPFUN_PROXY_URL = (os.getenv("PUMPFUN_PROXY_URL") or "").strip()
+HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT", "12"))
+OVERRIDE_URL = os.getenv("PUMPFUN_OVERRIDE_URL", "").strip()
+RETRY_DIRECT_IF_PROXY_FAILS = (os.getenv("PUMPFUN_RETRY_DIRECT", "1").strip() not in ("0", "false", "no"))
+
+def _pumpfun_proxy_url() -> Optional[str]:
+    v = PUMPFUN_PROXY_URL.lower()
+    if not v or v in ("none", "off", "0", "disable"):
+        return None
+    return PUMPFUN_PROXY_URL
+
+def _req_kwargs(proxy: Optional[str]) -> Dict[str, Any]:
+    kw: Dict[str, Any] = {"timeout": aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SEC)}
+    if proxy:
+        kw["proxy"] = proxy
+    return kw
 
 async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[Any], int, str]:
     """
     Fetch a URL and try to parse JSON.
     Returns: (payload_or_none, status_code, first_120_chars_for_debug)
-    Falls back to browser_fetch_json() if CF/HTML is detected.
+    Strategy:
+      1) Try with Pump.fun-specific proxy (if provided).
+      2) If we used a proxy and got a tunnel/CF break (522/530/etc) or a proxy exception,
+         retry once with NO proxy (direct).
+      3) If response looks like HTML/CF, fall back to Playwright `browser_fetch_json`.
     """
-    try:
-        req_kwargs = {"timeout": aiohttp.ClientTimeout(total=HTTP_TIMEOUT)}
-        if PROXY_URL:
-            req_kwargs["proxy"] = PROXY_URL
+    proxy_first = _pumpfun_proxy_url()
+    attempts: List[Optional[str]] = [proxy_first]
+    if proxy_first and RETRY_DIRECT_IF_PROXY_FAILS:
+        attempts.append(None)  # retry direct if proxy path fails
 
-        async with session.get(url, **req_kwargs) as r:
-            status = r.status
-            text = await r.text()
-            first = text[:120].replace("\n", " ")
-            ctype = (r.headers.get("content-type") or "").lower()
+    last_status = 0
+    last_first = ""
 
-            # CF/HTML gate detection
-            if status in _BAD_CF_CODES or "text/html" in ctype or text.lstrip().startswith("<!DOCTYPE html"):
-                try:
-                    if status in _BAD_CF_CODES:
-                        # Let the CF cookie manager know this attempt failed
-                        flag_cookie_bad()
-                except Exception:
-                    pass
-                # Playwright fallback to defeat CF
-                try:
-                    data = await browser_fetch_json(url)
-                    if data is not None:
-                        return (data, 200, first)
-                except Exception as e:
-                    LOG.debug("browser_fetch_json fallback failed: %s", e)
-                return (None, status, first)
+    for attempt_idx, proxy in enumerate(attempts, start=1):
+        try:
+            async with session.get(url, **_req_kwargs(proxy)) as r:
+                status = r.status
+                text = await r.text()
+                first = text[:120].replace("\n", " ")
+                ctype = (r.headers.get("content-type") or "").lower()
 
-            # Try hard to parse JSON
-            try:
-                return (json.loads(text), status, first)
-            except Exception:
-                try:
-                    return (await r.json(content_type=None), status, first)
-                except Exception:
+                # If CF/HTML page, try Playwright JSON fetch
+                if status in _BAD_CF_CODES or "text/html" in ctype or text.lstrip().startswith("<!DOCTYPE html"):
+                    try:
+                        if status in _BAD_CF_CODES:
+                            flag_cookie_bad()
+                    except Exception:
+                        pass
+                    try:
+                        data = await browser_fetch_json(url)
+                        if data is not None:
+                            return (data, 200, first)
+                    except Exception as e:
+                        LOG.debug("browser_fetch_json fallback failed: %s", e)
+                    # If we used a proxy and got a proxy-type break, we’ll loop to try direct
+                    if proxy and status in _PROXY_BREAK_CODES and RETRY_DIRECT_IF_PROXY_FAILS and attempt_idx == 1:
+                        last_status, last_first = status, first
+                        continue
                     return (None, status, first)
 
-    except Exception as e:
-        LOG.warning("Pump.fun request failed: %s %s", url, e)
-        return (None, 0, "")
+                # Normal JSON parse
+                try:
+                    return (json.loads(text), status, first)
+                except Exception:
+                    try:
+                        return (await r.json(content_type=None), status, first)
+                    except Exception:
+                        return (None, status, first)
+
+        except (aiohttp.ClientProxyConnectionError,
+                aiohttp.ClientHttpProxyError,
+                aiohttp.ClientConnectorError,
+                aiohttp.ServerTimeoutError,
+                asyncio.TimeoutError) as e:
+            # Proxy/connect issues: if we used a proxy and are allowed to retry direct, loop
+            LOG.warning("Pump.fun request failed%s: %s %s",
+                        f" via proxy {proxy}" if proxy else "",
+                        url, e)
+            last_status, last_first = 0, ""
+            if proxy and RETRY_DIRECT_IF_PROXY_FAILS and attempt_idx == 1:
+                continue
+            return (None, 0, "")
+        except Exception as e:
+            LOG.warning("Pump.fun request failed: %s %s", url, e)
+            return (None, 0, "")
+
+    # Exhausted attempts
+    return (None, last_status, last_first)
 
 def _join_url(base: str, path: str) -> str:
     base = base.rstrip("/")
@@ -314,10 +382,10 @@ async def _fetch_api_json_with_fallback(
     tried_out: Optional[List[str]] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """
-    Try current API bases; if CF/HTML encountered, _fetch_json will fallback.
+    Try current API bases; _fetch_json handles CF and proxy fallback.
     Returns a list of items extracted by _extract_items_from_payload(), or None.
     """
-    # Debug: override a single test URL if provided
+    # Debug override
     if OVERRIDE_URL and OVERRIDE_URL.lower().startswith("http"):
         payload, status, first = await _fetch_json(session, OVERRIDE_URL)
         if tried_out is not None:
@@ -328,15 +396,14 @@ async def _fetch_api_json_with_fallback(
                 LOG.info("scanner.pumpfun: API JSON (override) → %s items", len(items))
                 return items
 
-    # Try each configured base
+    # Normal path: try each base
     for base in _api_bases():
         url = _join_url(base, path)
         payload, status, first = await _fetch_json(session, url)
         if tried_out is not None:
             tried_out.append(f"{url} status={status}")
-
         if not payload:
-            if status in (404, *_BAD_CF_CODES):
+            if status in (404, *_BAD_CF_CODES, *_PROXY_BREAK_CODES):
                 LOG.warning("Pump.fun: [%s] HTTP %s; first 120: %s", url, status, first)
             continue
 
