@@ -65,7 +65,16 @@ except Exception:  # pragma: no cover
 
     async def browser_scrape_trending_dom(*, limit: int = 50):  # type: ignore
         return None
-
+try:
+    LOG.info(
+        "pumpfun flags: SKIP_NEXT=%s SKIP_HTML_NEXT=%s PROXY_SET=%s RETRY_DIRECT=%s",
+        SKIP_NEXT,
+        SKIP_HTML_NEXT,
+        bool(_pumpfun_proxy_url()),
+        RETRY_DIRECT_IF_PROXY_FAILS,
+    )
+except Exception:
+    pass
 
 # ---------------------------------------------------------------------
 # Config
@@ -91,6 +100,9 @@ DOM_LIMIT = int(os.getenv("PUMPFUN_DOM_LIMIT", str(API_LIMIT)))
 # HTML regex scrape paths (no JS)
 _HTML_PATHS_ENV = os.getenv("PUMPFUN_HTML_PATHS", "/trending,/advanced/scan")
 HTML_PATHS = [p.strip() for p in _HTML_PATHS_ENV.split(",") if p.strip()] or ["/trending", "/advanced/scan"]
+
+# near your other env flags
+SKIP_HTML_NEXT = (os.getenv("PUMPFUN_SKIP_HTMLNEXT", "0").strip().lower() in ("1","true","yes"))
 
 # Preferred API bases: env override → mirror → primary
 def _api_bases() -> List[str]:
@@ -411,29 +423,70 @@ async def _fetch_api_json_with_fallback(
         if items:
             LOG.info("scanner.pumpfun: API JSON → %s items (base=%s)", len(items), base)
             return items
+
 async def _html_next_fallback(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     """
-    Fetch pump.fun homepage HTML, parse __NEXT_DATA__, then map to items.
-    Returns [] on any problem.
+    Fetch pump.fun apex pages over plain HTTP, parse __NEXT_DATA__, and map to items.
+    Returns [] if no usable data.
     """
-    try:
-        html = await _fetch_text(session, "https://pump.fun/") or ""
-        if not html:
-            return []
+    paths = ("https://pump.fun/", "https://pump.fun/trending")
+    out: List[Dict[str, Any]] = []
 
-        # Parse the embedded JSON from the __NEXT_DATA__ script tag (sync)
-        next_data = _html_next_data(html)
-        if next_data is None:
-            return []
+    for url in paths:
+        try:
+            # If your _fetch_text returns only a string, adapt accordingly:
+            #   html = await _fetch_text(session, url) or ""
+            html, status, headers = await _fetch_text(session, url)  # preferred if available
+        except TypeError:
+            # Fallback if _fetch_text(session, url) returns just str
+            html = await _fetch_text(session, url) or ""
+            status, headers = 0, {}
 
-        # Reuse your existing mapper that knows how to turn payloads into items
-        items = _extract_items_from_payload(next_data) or []
-        return items
-    except Exception as e:
-        LOG.debug("html_next_fallback error: %s", e)
-        return []
+        ctype = (headers.get("content-type") or "").lower() if isinstance(headers, dict) else ""
+        first = (html or "")[:140].replace("\n", " ")
+        LOG.debug("pumpfun HTML fallback: GET %s → status=%s ctype=%s first140=%r", url, status, ctype, first)
 
-    return None
+        if not html or status in _BAD_CF_CODES or "cloudflare" in (html.lower() if html else ""):
+            LOG.warning("pumpfun HTML fallback: CF/blocked page at %s (status=%s)", url, status)
+            continue
+
+        payload = _html_next_data(html)
+        if not payload:
+            LOG.warning("pumpfun HTML fallback: __NEXT_DATA__ not found at %s", url)
+            continue
+
+        # Extract coins list from the payload — adapt to your actual shape if needed
+        try:
+            # This is a common Next.js shape; adjust if your _extract_items_from_payload already handles it.
+            items = _extract_items_from_payload(payload) or []
+        except Exception as e:
+            LOG.warning("pumpfun HTML fallback: payload extraction failed at %s: %s", url, e)
+            items = []
+
+        # Map to your normalized coin dicts
+        mapped: List[Dict[str, Any]] = []
+        for it in items:
+            if isinstance(it, dict):
+                m = _map_coin(it)
+                if m:
+                    mapped.append(m)
+
+        if mapped:
+            out.extend(mapped)
+            # No need to try the second path if the first succeeded; comment next line to merge both.
+            break
+
+    # De-dup by mint, keep first
+    if out:
+        seen, uniq = set(), []
+        for d in out:
+            mint = d.get("mint")
+            if isinstance(mint, str) and mint not in seen:
+                seen.add(mint)
+                uniq.append(d)
+        out = uniq
+
+    return out
 # ---------------------------------------------------------------------
 # Scanner core
 # ---------------------------------------------------------------------
@@ -508,6 +561,19 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     # 3) JSON/API + internal fallbacks (guaranteed list)
     items = await _collect_pumpfun_items(session) or []
     return items
+
+# 4) HTML __NEXT_DATA__ fallback (pure HTTP; should run even if Playwright is skipped)
+if not SKIP_HTML_NEXT:
+    LOG.debug("scanner.pumpfun: trying HTML __NEXT_DATA__ fallback")
+    try:
+        items = await _html_next_fallback(session)  # returns list (possibly empty)
+        if items:
+            LOG.info("scanner.pumpfun: HTML __NEXT_DATA__ → %s items", len(items))
+            return items
+        else:
+            LOG.warning("scanner.pumpfun: HTML __NEXT_DATA__ fallback yielded 0 items (CF or layout change).")
+    except Exception as e:
+        LOG.warning("scanner.pumpfun: HTML __NEXT_DATA__ fallback error: %s", e)
 
 async def _collect_pumpfun_items(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     """
