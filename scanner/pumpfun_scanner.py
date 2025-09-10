@@ -411,6 +411,27 @@ async def _fetch_api_json_with_fallback(
         if items:
             LOG.info("scanner.pumpfun: API JSON → %s items (base=%s)", len(items), base)
             return items
+async def _html_next_fallback(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+    """
+    Fetch pump.fun homepage HTML, parse __NEXT_DATA__, then map to items.
+    Returns [] on any problem.
+    """
+    try:
+        html = await _fetch_text(session, "https://pump.fun/") or ""
+        if not html:
+            return []
+
+        # Parse the embedded JSON from the __NEXT_DATA__ script tag (sync)
+        next_data = _html_next_data(html)
+        if next_data is None:
+            return []
+
+        # Reuse your existing mapper that knows how to turn payloads into items
+        items = _extract_items_from_payload(next_data) or []
+        return items
+    except Exception as e:
+        LOG.debug("html_next_fallback error: %s", e)
+        return []
 
     return None
 # ---------------------------------------------------------------------
