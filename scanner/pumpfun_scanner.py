@@ -562,19 +562,6 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     items = await _collect_pumpfun_items(session) or []
     return items
 
-# 4) HTML __NEXT_DATA__ fallback (pure HTTP; should run even if Playwright is skipped)
-if not SKIP_HTML_NEXT:
-    LOG.debug("scanner.pumpfun: trying HTML __NEXT_DATA__ fallback")
-    try:
-        items = await _html_next_fallback(session)  # returns list (possibly empty)
-        if items:
-            LOG.info("scanner.pumpfun: HTML __NEXT_DATA__ → %s items", len(items))
-            return items
-        else:
-            LOG.warning("scanner.pumpfun: HTML __NEXT_DATA__ fallback yielded 0 items (CF or layout change).")
-    except Exception as e:
-        LOG.warning("scanner.pumpfun: HTML __NEXT_DATA__ fallback error: %s", e)
-
 async def _collect_pumpfun_items(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     """
     Try multiple Pump.fun sources in order, returning a *list* of items.
