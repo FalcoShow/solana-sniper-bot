@@ -21,8 +21,8 @@ import re, json
 
 # Grab __NEXT_DATA__ JSON from server-rendered Pump.fun pages (when CF blocks JSON API)
 _NEXT_RE = re.compile(
-    r'__NEXT_DATA__"\s*type="application/json"\s*>\s*({.*?})\s*</script>',
-    re.DOTALL | re.IGNORECASE
+    r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>\s*({.*?})\s*</script>',
+    re.DOTALL | re.IGNORECASE,
 )
 
 def _html_next_data(html: str):
@@ -83,6 +83,22 @@ UA = os.getenv("PUMPFUN_UA") or (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126 Safari/537.36"
 )
+# Pump.fun HTML routes to try for __NEXT_DATA__ fallback
+FALLBACK_HTML_URLS = [
+    "https://pump.fun/",
+    "https://pump.fun/?tab=trending",
+    "https://pump.fun/?chain=sol&tab=trending",
+]
+
+# near your imports / config
+def _pump_cookie_header() -> Optional[str]:
+    # put your real env var names here; keep trying until one exists
+    return (
+        os.getenv("CF_PUMP_COOKIE")          # e.g. "cf_clearance=...; __cf_bm=...; ..."
+        or os.getenv("PUMPFUN_COOKIE")
+        or os.getenv("PUMP_COOKIE")
+        or None
+    )
 
 # Optional override *full URL* (for testing a single endpoint)
 OVERRIDE_URL = os.getenv("PUMPFUN_URL", "").strip()
@@ -120,8 +136,6 @@ def _api_bases() -> List[str]:
             seen.add(b)
             out.append(b)
     return out
-
-
 # ---------------------------------------------------------------------
 # Header builder
 # ---------------------------------------------------------------------
@@ -140,8 +154,6 @@ def _hdrs(url: str) -> Dict[str, str]:
     if ck:
         h["Cookie"] = ck
     return h
-
-
 # ---------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------
@@ -308,95 +320,99 @@ def _req_kwargs(proxy: Optional[str]) -> Dict[str, Any]:
         kw["proxy"] = proxy
     return kw
 
-async def _fetch_text(session: aiohttp.ClientSession, url: str) -> tuple[str, int, dict]:
-    """
-    Fetch a URL as plain text. Returns (text, status, headers).
-    Never raises; on failure returns ("", 0, {}).
-    """
+async def _fetch_text(session: aiohttp.ClientSession, url: str) -> Tuple[str, int, Dict[str, str]]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://pump.fun/",
+        "Origin": "https://pump.fun",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    ck = _pump_cookie_header()
+    if ck:
+        headers["cookie"] = ck
+
     try:
-        async with session.get(url) as r:
-            text = await r.text(errors="ignore")
-            status = r.status
-            headers = dict(r.headers)
-            first = text[:120]
-            if status >= 400:
-                LOG.warning("Pump.fun: [%s] HTTP %s; first 120: %s", url, status, first)
-            return text, status, headers
-    except Exception as e:
-        LOG.warning("Pump.fun request failed: %s %s", url, e)
+        async with session.get(url, headers=headers, ssl=ssl.create_default_context(cafile=certifi.where()), timeout=15) as r:
+            text = await r.text()
+            return text, r.status, dict(r.headers)
+    except Exception:
         return "", 0, {}
 
 async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[Any], int, str]:
     """
-    Fetch a URL and try to parse JSON.
-    Returns: (payload_or_none, status_code, first_120_chars_for_debug)
-    Strategy:
-      1) Try with Pump.fun-specific proxy (if provided).
-      2) If we used a proxy and got a tunnel/CF break (522/530/etc) or a proxy exception,
-         retry once with NO proxy (direct).
-      3) If response looks like HTML/CF, fall back to Playwright `browser_fetch_json`
-         (works whether that helper is sync or async).
+    GET `url` expecting JSON. Returns (data_or_None, http_status, first_120_chars_of_text).
+    Robust to bad content-types and falls back to manual json.loads(text).
     """
-    proxy_first = _pumpfun_proxy_url()
-    attempts: List[Optional[str]] = [proxy_first]
-    if proxy_first and RETRY_DIRECT_IF_PROXY_FAILS:
-        attempts.append(None)  # retry direct if proxy path fails
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://pump.fun/",
+        "Origin": "https://pump.fun",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
-    last_status = 0
-    last_first = ""
+    # Add cookies if your module provides a helper.
+    try:
+        ck = _pump_cookie_header()  # may not exist in some forks
+        if ck:
+            headers["cookie"] = ck
+    except NameError:
+        pass
 
-    for attempt_idx, proxy in enumerate(attempts, start=1):
-        try:
-            async with session.get(url, **_req_kwargs(proxy)) as r:
-                status = r.status
+    status = 0
+    first = ""
+    text = ""
+
+    try:
+        async with session.get(
+            url,
+            headers=headers,
+            ssl=ssl.create_default_context(cafile=certifi.where()),
+            timeout=15,
+        ) as r:
+            status = r.status
+
+            # Grab text once so we can both log and fallback-parse
+            try:
                 text = await r.text()
-                first = text[:120].replace("\n", " ")
-                ctype = (r.headers.get("content-type") or "").lower()
+                first = text[:120]
+            except Exception:
+                text = ""
+                first = ""
 
-                # If CF/HTML page, try Playwright JSON fetch
-                if status in _BAD_CF_CODES or "text/html" in ctype or text.lstrip().startswith("<!DOCTYPE html"):
-                    try:
-                        if status in _BAD_CF_CODES:
-                            flag_cookie_bad()
-                    except Exception:
-                        pass
-                    try:
-                        maybe = browser_fetch_json(url)
-                        data = await maybe if asyncio.iscoroutine(maybe) else maybe
-                        if data is not None:
-                            return (data, 200, first)
-                    except Exception as e:
-                        LOG.debug("browser_fetch_json fallback failed: %s", e)
-                    # If we used a proxy and got a proxy-type break, we’ll loop to try direct
-                    if proxy and status in _PROXY_BREAK_CODES and RETRY_DIRECT_IF_PROXY_FAILS and attempt_idx == 1:
-                        last_status, last_first = status, first
-                        continue
-                    return (None, status, first)
+            data: Optional[Any] = None
 
-                # Normal JSON parse
+            if status == 200:
+                # Try native JSON
                 try:
-                    return (json.loads(text), status, first)
+                    data = await r.json(content_type=None)
                 except Exception:
+                    # Fallback: manual parse of the body we already read
                     try:
-                        return (await r.json(content_type=None), status, first)
+                        if text:
+                            data = json.loads(text)
                     except Exception:
-                        return (None, status, first)
+                        data = None
 
-        except (aiohttp.ClientProxyConnectionError,
-                aiohttp.ClientHttpProxyError,
-                aiohttp.ClientConnectorError,
-                aiohttp.ServerTimeoutError,
-                asyncio.TimeoutError) as e:
-            LOG.warning("Pump.fun request failed%s: %s %s",
-                        f" via proxy {proxy}" if proxy else "",
-                        url, e)
-            last_status, last_first = 0, ""
-            if proxy and RETRY_DIRECT_IF_PROXY_FAILS and attempt_idx == 1:
-                continue
-            return (None, 0, "")
-        except Exception as e:
-            LOG.warning("Pump.fun request failed: %s %s", url, e)
-            return (None, 0, "")
+            return data, status, first
+
+    except (
+        aiohttp.ClientProxyConnectionError,
+        aiohttp.ClientHttpProxyError,
+        aiohttp.ClientConnectorError,
+        aiohttp.ServerTimeoutError,
+        asyncio.TimeoutError,
+    ) as e:
+        LOG.warning("Pump.fun request failed %s: %s", type(e).__name__, url)
+        return None, status, first
+    except Exception as e:
+        LOG.warning("Pump.fun request unexpected error at %s: %s", url, e)
+        return None, status, first
 
     # Exhausted attempts
     return (None, last_status, last_first)
@@ -444,65 +460,173 @@ async def _fetch_api_json_with_fallback(
 
 async def _html_next_fallback(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     """
-    Fetch pump.fun apex pages over plain HTTP, parse __NEXT_DATA__, and map to items.
-    Returns [] if no usable data.
+    Try plain-HTTP fallback against Pump.fun app pages, parse __NEXT_DATA__, and
+    return a list of normalized coin dicts. Safe to call even if Playwright is
+    disabled. Returns [] on failure.
     """
-    paths = ("https://pump.fun/", "https://pump.fun/trending")
+    # Use global override if defined, otherwise sensible defaults (avoid /trending path)
+    urls: List[str] = list(globals().get("FALLBACK_HTML_URLS", [
+        "https://pump.fun/",
+        "https://pump.fun/?tab=trending",
+        "https://pump.fun/?chain=sol&tab=trending",
+    ]))
+
+    # CF/blocked-like status codes; allow global override
+    cf_codes = set(globals().get("_BAD_CF_CODES", {403, 429, 503, 530}))
+
+    # Optional helpers if the module already defines them
+    map_coin = globals().get("_map_coin")
+    external_extract = globals().get("_extract_items_from_payload")
+
+    def _heuristic_extract_from_next(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Very forgiving extractor for Next.js JSON shapes."""
+        # If the project provides a stronger extractor, use it.
+        if callable(external_extract):
+            try:
+                got = external_extract(payload)
+                if isinstance(got, list):
+                    return [x for x in got if isinstance(x, dict)]
+            except Exception:
+                pass
+
+        # Common Next.js locations
+        props = payload.get("props") or {}
+        page_props = props.get("pageProps") or {}
+        # Older Next versions sometimes use initialProps
+        initial = (payload.get("initialProps") or {}).get("pageProps") or {}
+
+        candidates: List[Any] = []
+        for root in (page_props, initial):
+            if isinstance(root, dict):
+                # Typical keys we’ve seen in Pump.fun-like apps
+                for k in ("coins", "trending", "trendingCoins", "data", "items", "list", "feed"):
+                    v = root.get(k)
+                    if isinstance(v, list):
+                        candidates.append(v)
+                # Flatten any nested lists of dicts if present
+                for v in root.values():
+                    if isinstance(v, list):
+                        candidates.append(v)
+
+        # Heuristic: choose the first list that looks like coins (dicts with mint-ish keys)
+        def looks_coin(d: Any) -> bool:
+            if not isinstance(d, dict):
+                return False
+            keys = set(d.keys())
+            return bool(keys & {"mint", "mintAddress", "address", "publicKey", "symbol", "name"})
+
+        for lst in candidates:
+            if isinstance(lst, list):
+                dicts = [x for x in lst if isinstance(x, dict)]
+                if dicts and (looks_coin(dicts[0]) or any(looks_coin(x) for x in dicts[:5])):
+                    return dicts
+
+        # Last resort: scan tree for any list of coin-like dicts
+        def walk(obj: Any) -> Optional[List[Dict[str, Any]]]:
+            if isinstance(obj, list):
+                dicts = [x for x in obj if isinstance(x, dict)]
+                if dicts and any(looks_coin(x) for x in dicts[:5]):
+                    return dicts
+                for x in obj:
+                    got = walk(x)
+                    if got:
+                        return got
+            elif isinstance(obj, dict):
+                for v in obj.values():
+                    got = walk(v)
+                    if got:
+                        return got
+            return None
+
+        found = walk(payload)
+        return found or []
+
     out: List[Dict[str, Any]] = []
 
-    for url in paths:
+    for url in urls:
+        html = ""
+        status = 0
+        headers: Dict[str, str] = {}
+
+        # Fetch page; handle both triad and string returns for _fetch_text
         try:
-            # If your _fetch_text returns only a string, adapt accordingly:
-            html, status, headers = await _fetch_text(session, url)
-        except TypeError:
-            # Fallback if _fetch_text(session, url) returns just str
-            status, headers = 0, {}
+            fetched = await _fetch_text(session, url)
+            if isinstance(fetched, tuple) and len(fetched) >= 1:
+                # Expect (text, status, headers), but be lenient
+                html = fetched[0] or ""
+                status = int(fetched[1]) if len(fetched) > 1 and fetched[1] is not None else status
+                headers = fetched[2] if len(fetched) > 2 and isinstance(fetched[2], dict) else headers
+            else:
+                # Plain string
+                html = fetched or ""
+        except Exception as e:
+            LOG.warning("pumpfun HTML fallback: fetch failed at %s: %s", url, e)
+            continue
 
         ctype = (headers.get("content-type") or "").lower() if isinstance(headers, dict) else ""
         first = (html or "")[:140].replace("\n", " ")
         LOG.debug("pumpfun HTML fallback: GET %s → status=%s ctype=%s first140=%r", url, status, ctype, first)
 
-        if not html or status in _BAD_CF_CODES or "cloudflare" in (html.lower() if html else ""):
+        low = (html or "").lower()
+        blocked = (
+            status in cf_codes
+            or "cloudflare" in low
+            or "cf-chl-" in low
+            or "just a moment" in low  # common CF interstitial title
+        )
+        if not html or blocked:
             LOG.warning("pumpfun HTML fallback: CF/blocked page at %s (status=%s)", url, status)
             continue
 
         payload = _html_next_data(html)
         if not payload:
-            LOG.warning("pumpfun HTML fallback: __NEXT_DATA__ not found at %s", url)
+            LOG.warning("pumpfun HTML fallback: __NEXT_DATA__ not found at %s (status=%s)", url, status)
             continue
 
-        # Extract coins list from the payload — adapt to your actual shape if needed
         try:
-            # This is a common Next.js shape; adjust if your _extract_items_from_payload already handles it.
-            items = _extract_items_from_payload(payload) or []
+            items = _heuristic_extract_from_next(payload)
         except Exception as e:
             LOG.warning("pumpfun HTML fallback: payload extraction failed at %s: %s", url, e)
             items = []
 
-        # Map to your normalized coin dicts
+        # Normalize/map each raw item
         mapped: List[Dict[str, Any]] = []
         for it in items:
-            if isinstance(it, dict):
-                m = _map_coin(it)
-                if m:
-                    mapped.append(m)
+            if not isinstance(it, dict):
+                continue
+            if callable(map_coin):
+                try:
+                    m = map_coin(it)
+                except Exception:
+                    m = None
+            else:
+                # Minimal identity mapping if no mapper exists
+                m = dict(it)
+                # Ensure a 'mint' field if possible
+                mint = m.get("mint") or m.get("mintAddress") or m.get("address") or m.get("publicKey")
+                if mint:
+                    m["mint"] = mint
+            if m and isinstance(m, dict):
+                mapped.append(m)
 
         if mapped:
             out.extend(mapped)
-            # No need to try the second path if the first succeeded; comment next line to merge both.
-            break
+            LOG.info("scanner.pumpfun: HTML __NEXT_DATA__ → %s items from %s", len(mapped), url)
+            break  # first success is enough; remove this to merge across URLs
 
-    # De-dup by mint, keep first
+    # De-dup by 'mint' (or 'address' fallback), keep first occurrence
     if out:
-        seen, uniq = set(), []
+        seen: set = set()
+        uniq: List[Dict[str, Any]] = []
         for d in out:
-            mint = d.get("mint")
+            mint = d.get("mint") or d.get("address")
             if isinstance(mint, str) and mint not in seen:
                 seen.add(mint)
                 uniq.append(d)
         out = uniq
 
     return out
+
 # ---------------------------------------------------------------------
 # Scanner core
 # ---------------------------------------------------------------------
