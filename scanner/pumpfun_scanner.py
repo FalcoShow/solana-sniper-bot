@@ -10,6 +10,7 @@ import time
 import logging
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple
+from utils_pkg.pump_client import pump_get
 
 import aiohttp
 import certifi
@@ -103,8 +104,13 @@ def _pump_cookie_header() -> Optional[str]:
 # Optional override *full URL* (for testing a single endpoint)
 OVERRIDE_URL = os.getenv("PUMPFUN_URL", "").strip()
 
+# old: await session.get("https://pump.fun/api/trpc/board.latest?...")
+data = await pump_get("/api/trpc/board.latest?batch=1&input=%7B%7D")
+
 # Optional: skip Next.js/DOM steps entirely (quiet buildId/log noise)
 SKIP_NEXT = (os.getenv("PUMPFUN_SKIP_NEXT", "").strip().lower() in ("1", "true", "yes", "y"))
+
+PUMPFUN_HTTP_PROXY = os.getenv("PUMPFUN_HTTP_PROXY")  # e.g. http://user:pass@host:port
 
 REQ_TIMEOUT_S = int(os.getenv("PUMPFUN_HTTP_TIMEOUT_S", "15"))
 SESSION_LIMIT = int(os.getenv("PUMPFUN_HTTP_CONN_LIMIT", "30"))
@@ -320,21 +326,27 @@ def _req_kwargs(proxy: Optional[str]) -> Dict[str, Any]:
         kw["proxy"] = proxy
     return kw
 
-async def _fetch_text(session: aiohttp.ClientSession, url: str) -> Tuple[str, int, Dict[str, str]]:
+async def _fetch_text(session: aiohttp.ClientSession, url: str) -> Tuple[str, int, Dict[str,str]]:
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Referer": "https://pump.fun/",
         "Origin": "https://pump.fun",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    ck = _pump_cookie_header()
+    ck = _pump_cookie_header() if ' _pump_cookie_header' in globals() else None
     if ck:
         headers["cookie"] = ck
 
     try:
-        async with session.get(url, headers=headers, ssl=ssl.create_default_context(cafile=certifi.where()), timeout=15) as r:
+        async with session.get(
+            url,
+            headers=headers,
+            ssl=ssl.create_default_context(cafile=certifi.where()),
+            timeout=15,
+            proxy=PUMPFUN_HTTP_PROXY if PUMPFUN_HTTP_PROXY else None,
+        ) as r:
             text = await r.text()
             return text, r.status, dict(r.headers)
     except Exception:

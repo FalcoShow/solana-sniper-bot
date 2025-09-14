@@ -29,6 +29,13 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict
+
+def load_positions() -> Dict[str, Any]:
+    return {}
+
+def save_positions(data: Dict[str, Any]) -> None:
+    pass
 
 # --- execution data model (no circular import from exits) ---
 try:

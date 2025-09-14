@@ -7,8 +7,11 @@ import logging
 import signal
 import sys
 from typing import Awaitable, Callable
+import asyncio, aiohttp
+from utils_pkg.proxy_client import make_session, http_get
 
 from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(), override=False)
 
 # Centralized config
 import config as C
@@ -22,6 +25,11 @@ from utils_pkg.core_utils import (
     send_telegram,
 )
 from utils_pkg.alert_manager import AlertManager
+
+from utils_pkg.proxy_client import install_global_aiohttp_proxy
+
+# install global defaults so every aiohttp request uses the proxy
+install_global_aiohttp_proxy()
 
 # Scanners (async generators or async funcs returning candidates)
 from scanner.dexscreener_scanner import scan_dexscreener
@@ -55,6 +63,13 @@ _JITO_TIP_STATIC_LIST = [
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ]
+
+async def ensure_proxy_ok():
+    async with make_session() as s:
+        status, body = await http_get(s, "https://api.ipify.org?format=json")
+        if status != 200:
+            raise RuntimeError(f"Proxy unhealthy: {status} {body}")
+        print("Proxy OK:", body)
 
 def _env_bool(name: str, default: bool=False) -> bool:
     v = _os.getenv(name)
@@ -171,6 +186,7 @@ async def _graceful_cancel(tasks: list[asyncio.Task]):
 
 
 async def main():
+await ensure_proxy_ok()
     # 1) env + config summary
     # Ensure Jito tip accounts env is populated when left blank
     await ensure_jito_tip_accounts_env()

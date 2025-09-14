@@ -23,3 +23,11 @@ venv/
 venv311/
 venv*/
 tools/ 
+
+# secrets / local
+id.json
+keypair.json
+.pf_cookies.json
+pf-profile/
+etc/secrets/
+
