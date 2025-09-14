@@ -7,7 +7,7 @@ import traceback
 from typing import Any, Dict
 
 from utils_pkg.pumpportal_client import PumpPortalClient
-from utils_pkg.pump_trader import maybe_buy  # contains DRY_RUN + autosizing usage
+from utils_pkg.pump_trader import maybe_buy  # expects mint=..., symbol=..., ui=...
 
 # --------- lightweight, overridable filters ----------
 MIN_INITIAL_BUY_SOL = float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"))  # optional floor
@@ -18,26 +18,42 @@ SYMBOL_BLACKLIST   = {
     if s.strip()
 }
 
+def _as_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+def _extract_mint(msg: Dict[str, Any]) -> str:
+    return (
+        msg.get("mint")
+        or msg.get("mintAddress")
+        or msg.get("mint_address")
+        or ""
+    ).strip()
+
+def _extract_symbol(msg: Dict[str, Any]) -> str:
+    return (msg.get("symbol") or msg.get("ticker") or "").strip()
+
+def _extract_name(msg: Dict[str, Any]) -> str:
+    return (msg.get("name") or "").strip()
+
 def _passes_filters(msg: Dict[str, Any]) -> bool:
     # Only act on brand-new token creations seen by PumpPortal
-    if msg.get("txType") != "create":
+    if (msg.get("txType") or msg.get("type")) != "create":
         return False
 
-    # Initial buy (PumpPortal sends a float SOL in many payloads)
-    try:
-        init_buy = float(msg.get("initialBuy", 0))
-        if init_buy < MIN_INITIAL_BUY_SOL:
-            return False
-    except Exception:
-        # if field missing/malformed, allow through (or return False to be stricter)
-        pass
+    init_buy = _as_float(msg.get("initialBuy"), 0.0)
+    if init_buy < MIN_INITIAL_BUY_SOL:
+        return False
 
-    # Basic symbol/name hygiene
-    sym = (msg.get("symbol") or "").upper()
+    sym = _extract_symbol(msg).upper()
     if any(bad in sym for bad in SYMBOL_BLACKLIST):
         return False
 
-    name = msg.get("name") or ""
+    name = _extract_name(msg)
     if len(name) > MAX_NAME_LEN:
         return False
 
@@ -53,8 +69,10 @@ class Strategy:
         self._cooldown = float(os.getenv("SCANNER_PERIOD_SEC", "15"))
 
     async def on_new_token(self, m: Dict[str, Any]) -> None:
-        mint = m.get("mint")
-        if not mint or mint in self._seen_mints:
+        mint = _extract_mint(m)
+        if not mint:
+            return
+        if mint in self._seen_mints:
             return
         self._seen_mints.add(mint)
 
@@ -62,7 +80,8 @@ class Strategy:
             return
 
         try:
-            await maybe_buy(m)  # this handles DRY_RUN, sizing, slippage, etc.
+            # ✅ match pump_trader.maybe_buy signature
+            await maybe_buy(mint=mint, symbol=_extract_symbol(m), ui=m)
         except Exception:
             print("[strategy] maybe_buy exception:", flush=True)
             traceback.print_exc()
@@ -71,7 +90,7 @@ class Strategy:
         await asyncio.sleep(self._cooldown)
 
     async def on_trade(self, m: Dict[str, Any]) -> None:
-        # Hook for future: observe whales/liquidity, feed sell AI, etc.
+        # Hook: observe whales/liquidity, feed sell AI, etc.
         return
 
 
