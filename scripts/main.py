@@ -5,6 +5,9 @@ import os
 from solders.pubkey import Pubkey
 from utils_pkg.solana_wallet import load_keypair, sign_and_send_b64_tx
 from utils_pkg.pump_trader import build_buy_tx_via_portal
+import asyncio
+from utils_pkg.pumpportal_client import PumpPortalClient
+from utils_pkg.pump_trader import maybe_buy
 
 # --- simple heuristics you can tweak ---
 MIN_INITIAL_BUY_SOL = 0.15       # ignore tiny prank mints
@@ -23,6 +26,15 @@ def _kp():
         kp_cache["kp"] = kp
         kp_cache["pub"] = str(kp.public_key)
     return kp_cache["kp"], kp_cache["pub"]
+
+async def run_pumpportal():
+    client = PumpPortalClient()  # uses PF_PP_KEY / PF_PP_ACCOUNT / PF_PP_MINTS
+    print("Connecting to:", client.masked_uri())
+    async for ev in client.events():
+        msg = ev["raw"]
+        if ev["kind"] == "new_token":
+            # send to your existing filters / trader
+            await maybe_buy(msg)
 
 async def maybe_buy(msg: dict):
     mint = msg.get("mint")
