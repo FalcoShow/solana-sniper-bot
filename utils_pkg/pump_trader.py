@@ -1,235 +1,195 @@
 # utils_pkg/pump_trader.py
-# ----------------------------------------------------------------------
-# PumpPortal trading helpers: build buy tx, sign & send via your wallet.
-#
-# Reads dynamic sizing from PF_TRADE_SOL (set by scripts/entrypoint.py).
-# Honors PF_SLIPPAGE_BPS, PF_PRIORITY_SOL, DRY_RUN.
-#
-# ENV used (all optional unless noted):
-#   PF_PP_KEY                (required for PumpPortal)
-#   PF_PP_URL                default https://pumpportal.fun/api/trade
-#   PF_PP_ACCOUNT            optional hint/account tag for PP
-#   PF_SLIPPAGE_BPS          default 1000  (10%)
-#   PF_PRIORITY_SOL          default 0.0005 SOL
-#   PF_TRADE_SOL             set/updated by autosizer
-#   DRY_RUN                  "1"/"true" to simulate
-#   SOL_RPC_URL              (required) RPC endpoint for submit
-#
-# Dependencies:
-#   - utils_pkg.solana_wallet.load_keypair()
-# ----------------------------------------------------------------------
 
 from __future__ import annotations
-
-import os
-import json
-import logging
-from typing import Optional, Dict, Any
-from base64 import b64decode
+import os, json, base64, time, typing as t
 
 import requests
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.transaction import VersionedTransaction
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
-from solana.transaction import Transaction
 
-from utils_pkg.solana_wallet import load_keypair
+PP_API_KEY = os.getenv("PF_PP_KEY", "")
+RPC_URL    = os.getenv("SOL_RPC_URL", "https://api.mainnet-beta.solana.com")
 
-LOG = logging.getLogger("pump_trader")
+DEFAULT_SLIPPAGE_BPS = int(float(os.getenv("PF_SLIPPAGE_BPS", "1000")))  # 10.00%
+DEFAULT_PRIORITY_SOL = float(os.getenv("PF_PRIORITY_SOL", "0.0005"))     # 0.0005 SOL
 
+# --- PumpPortal (simple & fast on fresh mints) --------------------------------
 
-# ----------------------------- env helpers -----------------------------
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(str(os.getenv(name, default)).strip())
-    except Exception:
-        return float(default)
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(str(os.getenv(name, default)).strip())
-    except Exception:
-        return int(default)
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
-
-
-def _current_trade_sol() -> float:
-    """
-    Always read PF_TRADE_SOL at order time so autosizer updates apply.
-    """
-    try:
-        return float(os.getenv("PF_TRADE_SOL", "0.01"))
-    except Exception:
-        return 0.01
-
-
-def _rpc_url() -> str:
-    url = os.getenv("SOL_RPC_URL")
-    if not url:
-        raise RuntimeError("SOL_RPC_URL is required (Helius or other mainnet RPC).")
-    return url
-
-
-# --------------------------- portal builders ---------------------------
-
-def _pp_url() -> str:
-    return os.getenv("PF_PP_URL", "https://pumpportal.fun/api/trade")
-
-
-def _pp_headers() -> Dict[str, str]:
-    headers = {"content-type": "application/json"}
-    api_key = os.getenv("PF_PP_KEY")
-    if api_key:
-        headers["x-api-key"] = api_key  # some setups require header
-    return headers
-
-
-def _build_trade_payload(
-    *,
-    action: str,
+def build_buy_tx_via_portal(
     mint: str,
     payer_pubkey: str,
+    *,
     amount_sol: float,
-    slippage_bps: int,
-    priority_sol: float,
-) -> Dict[str, Any]:
+    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    priority_sol: float = DEFAULT_PRIORITY_SOL,
+) -> str:
     """
-    Build the PumpPortal trade payload (buy path). Some PP deployments accept
-    apiKey in both header and body; we include both to be safe.
+    Returns a base64 unsigned transaction that buys `amount_sol` of `mint`.
     """
-    payload: Dict[str, Any] = {
-        "action": action,                 # "buy" | "sell"
-        "mint": mint,
+    url = "https://pumpportal.fun/api/trade"
+    headers = {"content-type": "application/json", "x-api-key": PP_API_KEY}
+    body = {
+        "apiKey": PP_API_KEY,         # some setups read header, some read body; we set both
         "publicKey": payer_pubkey,
-        "amount": float(amount_sol),      # SOL to spend (for buy)
-        "slippage": int(slippage_bps),    # in bps
-        "priorityFee": float(priority_sol),
+        "action": "buy",
+        "mint": mint,
+        "amount": amount_sol,         # SOL in
+        "slippage": slippage_bps,     # bps
+        "priorityFee": priority_sol,  # SOL
         "pool": "pump",
     }
-    api_key = os.getenv("PF_PP_KEY")
-    if api_key:
-        payload["apiKey"] = api_key
-    # Optional tagging/analytics
-    pp_acct = os.getenv("PF_PP_ACCOUNT")
-    if pp_acct:
-        payload["account"] = pp_acct
-    return payload
-
-
-def _request_trade_tx(payload: Dict[str, Any]) -> str:
-    """
-    POST to PumpPortal, return base64-encoded transaction string.
-    """
-    url = _pp_url()
-    headers = _pp_headers()
-    try:
-        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=25)
-    except Exception as e:
-        raise RuntimeError(f"PumpPortal request error: {e}") from e
-
-    if not r.ok:
-        # include server message for debugging
-        snippet = r.text[:800]
-        raise RuntimeError(f"PumpPortal error {r.status_code}: {snippet}")
-
-    try:
-        js = r.json()
-    except Exception as e:
-        raise RuntimeError(f"PumpPortal bad JSON: {r.text[:800]}") from e
-
-    tx_b64 = js.get("transaction") or js.get("tx") or js.get("data", {}).get("transaction")
+    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=25)
+    r.raise_for_status()
+    js = r.json()
+    tx_b64 = js.get("transaction") or js.get("tx")
     if not tx_b64:
-        raise RuntimeError(f"PumpPortal response missing tx: {js}")
+        raise RuntimeError(f"PumpPortal buy: missing transaction in {js}")
     return tx_b64
 
 
-# ---------------------------- tx submission ----------------------------
-
-async def _sign_and_send_b64_tx(tx_b64: str) -> str:
+def build_sell_tx_via_portal(
+    mint: str,
+    payer_pubkey: str,
+    *,
+    token_amount: float | None = None,
+    sol_amount: float | None = None,
+    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    priority_sol: float = DEFAULT_PRIORITY_SOL,
+) -> str:
     """
-    Sign the PP-built transaction with your wallet and submit to SOL_RPC_URL.
-    Returns the transaction signature (base58).
+    Returns a base64 unsigned transaction that sells either a `token_amount` (tokens)
+    or for a target `sol_amount` (SOL out). Provide one of them.
     """
-    kp = load_keypair()
-    try:
-        tx = Transaction.deserialize(b64decode(tx_b64))
-    except Exception as e:
-        raise RuntimeError(f"Failed to decode/deserialize tx from portal: {e}") from e
+    if (token_amount is None) == (sol_amount is None):
+        raise ValueError("Provide exactly one of token_amount or sol_amount")
 
-    # Sign and serialize
-    tx.sign(kp)
-    raw = tx.serialize()  # bytes
+    url = "https://pumpportal.fun/api/trade"
+    headers = {"content-type": "application/json", "x-api-key": PP_API_KEY}
+    body = {
+        "apiKey": PP_API_KEY,
+        "publicKey": payer_pubkey,
+        "action": "sell",
+        "mint": mint,
+        "slippage": slippage_bps,
+        "priorityFee": priority_sol,
+        "pool": "pump",
+    }
+    if token_amount is not None:
+        body["tokenAmount"] = token_amount   # many builders accept this for sells
+    else:
+        body["amount"] = sol_amount          # or target SOL out
 
-    rpc = _rpc_url()
-    async with AsyncClient(rpc, timeout=30) as client:
-        try:
-            resp = await client.send_raw_transaction(
-                raw,
-                opts=TxOpts(skip_preflight=True, max_retries=3),
-            )
-        except Exception as e:
-            raise RuntimeError(f"send_raw_transaction failed: {e}") from e
+    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=25)
+    r.raise_for_status()
+    js = r.json()
+    tx_b64 = js.get("transaction") or js.get("tx")
+    if not tx_b64:
+        raise RuntimeError(f"PumpPortal sell: missing transaction in {js}")
+    return tx_b64
 
-        # solana-py returns RPCResponse with .value or dict-like
+
+# --- Jupiter v6 (best execution after real DEX liq forms) ---------------------
+
+JUP_BASE = "https://quote-api.jup.ag"
+
+def jup_quote(
+    in_mint: str,
+    out_mint: str,
+    *,
+    in_amount_atoms: int,
+    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    max_accounts: int = 64,
+) -> dict:
+    """
+    Get a quote response dict from Jupiter v6.
+    """
+    url = f"{JUP_BASE}/v6/quote"
+    params = {
+        "inputMint": in_mint,
+        "outputMint": out_mint,
+        "amount": in_amount_atoms,
+        "slippageBps": slippage_bps,
+        "swapMode": "ExactIn",
+        "maxAccounts": max_accounts,
+        "onlyDirectRoutes": "false",
+        "asLegacyTransaction": "false",
+        "preferDirectRoutes": "true",
+        "platformFeeBps": 0,
+    }
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
+def jup_swap_tx(
+    quote_response: dict,
+    user_pubkey: str,
+    *,
+    wrap_and_unwrap_sol: bool = True,
+) -> str:
+    """
+    Create Jupiter swap transaction (base64 unsigned) from a quoteResponse.
+    """
+    url = f"{JUP_BASE}/v6/swap"
+    body = {
+        "userPublicKey": user_pubkey,
+        "wrapAndUnwrapSol": wrap_and_unwrap_sol,
+        "useSharedAccounts": True,
+        "quoteResponse": quote_response,
+        "asLegacyTransaction": False,
+        # You can add "dynamicComputeUnitLimit" / "dynamicSlippage" if desired.
+    }
+    r = requests.post(url, json=body, timeout=25)
+    r.raise_for_status()
+    js = r.json()
+    tx_b64 = js.get("swapTransaction")
+    if not tx_b64:
+        raise RuntimeError(f"Jupiter swap: missing swapTransaction in {js}")
+    return tx_b64
+
+
+# --- Sign + send (solders only) ----------------------------------------------
+
+def _sign_b64_with_keypair(tx_b64: str, kp: Keypair) -> bytes:
+    """
+    Decode an unsigned base64 VersionedTransaction, sign with `kp`, return raw bytes.
+    """
+    tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
+    # Recreate a new VersionedTransaction with the same message and our signer.
+    signed = VersionedTransaction(tx.message, [kp])
+    return bytes(signed)
+
+
+async def sign_and_send_b64_tx(
+    tx_b64: str,
+    kp: Keypair,
+    *,
+    rpc_url: str = RPC_URL,
+    skip_preflight: bool = True,
+    max_retries: int = 3,
+) -> str:
+    """
+    Signs base64 v0 tx and sends it. Returns the signature (str).
+    """
+    raw = _sign_b64_with_keypair(tx_b64, kp)
+
+    async with AsyncClient(rpc_url) as c:
+        resp = await c.send_raw_transaction(
+            raw,
+            opts=TxOpts(skip_preflight=skip_preflight, max_retries=max_retries),
+        )
+        # solana-py returns RPCResponse; try to pull the value / signature gracefully
         sig = None
-        if isinstance(resp, dict):
-            sig = resp.get("result") or resp.get("value")
-        else:
-            sig = getattr(resp, "value", None) or getattr(resp, "result", None)
-
+        try:
+            sig = resp.value  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                sig = resp["result"]
+            except Exception:
+                pass
         if not sig:
-            raise RuntimeError(f"Unexpected RPC response: {resp}")
-
-        # (Optional) you can confirm here if your flow needs it:
-        # await client.confirm_transaction(sig, commitment="confirmed")
-
-    return str(sig)
-
-
-# ------------------------------- public API ----------------------------
-
-async def buy_via_portal(mint: str) -> Optional[str]:
-    """
-    Buy token (mint) via PumpPortal using auto-sized PF_TRADE_SOL.
-    Returns the tx signature, or None in DRY_RUN.
-    """
-    kp = load_keypair()
-    payer = str(kp.pubkey())
-
-    amount_sol = _current_trade_sol()
-    slippage_bps = _env_int("PF_SLIPPAGE_BPS", 1000)
-    priority_sol = _env_float("PF_PRIORITY_SOL", 0.0005)
-
-    if _env_bool("DRY_RUN", False):
-        print(f"[DRYRUN] would buy {mint} for {amount_sol} SOL "
-              f"(slippage {slippage_bps} bps, priority {priority_sol} SOL)")
-        return None
-
-    payload = _build_trade_payload(
-        action="buy",
-        mint=mint,
-        payer_pubkey=payer,
-        amount_sol=amount_sol,
-        slippage_bps=slippage_bps,
-        priority_sol=priority_sol,
-    )
-
-    tx_b64 = _request_trade_tx(payload)
-    sig = await _sign_and_send_b64_tx(tx_b64)
-    print(f"[BUY] {mint}  amount={amount_sol} SOL  slippage={slippage_bps}bps  "
-          f"priority={priority_sol} SOL  -> sig={sig}")
-    return sig
-
-
-# ---------------------------- (optional) sell --------------------------
-# If/when you want to route sells via PumpPortal as well, add a function like
-# `sell_via_portal(...)` mirroring the buy path above, but set action="sell"
-# and adjust payload fields per your PP deployment (amount in tokens or pct).
-# Your current repo’s AI/exit logic may already be using Jupiter/routeguard.
+            raise RuntimeError(f"send_raw_transaction failed: {resp}")
+        return str(sig)
