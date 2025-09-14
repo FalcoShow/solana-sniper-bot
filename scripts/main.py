@@ -81,7 +81,7 @@ class Strategy:
 
         try:
             # ✅ match pump_trader.maybe_buy signature
-            await maybe_buy(mint=mint, symbol=_extract_symbol(m), ui=m)
+            await maybe_buy(mint=mint, ui=m)
         except Exception:
             print("[strategy] maybe_buy exception:", flush=True)
             traceback.print_exc()
