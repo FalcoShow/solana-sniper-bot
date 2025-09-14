@@ -1,136 +1,126 @@
 # scripts/main.py
-from __future__ import annotations
-
-import os
-import asyncio
-from typing import Any, Dict
-
+import os, asyncio, datetime as dt
 from utils_pkg.pumpportal_client import PumpPortalClient
-from utils_pkg.solana_wallet import load_keypair
-from utils_pkg.pump_trader import maybe_buy  # <-- your async trader hook
+from utils_pkg.solana_wallet import load_keypair, get_balance_sol
+from utils_pkg.pump_trader import maybe_buy  # your buy hook
 
-# ----------------------------
-# Config (overridable via ENV)
-# ----------------------------
-DRY_RUN = int(os.getenv("DRY_RUN", "1"))
+# === Runtime guardrails (from ENV) ===
+DAILY_MAX_DD_PCT = float(os.getenv("PF_DAILY_MAX_DRAWDOWN_PCT", "999"))   # e.g. 8
+DAILY_MAX_LOSSES = int(os.getenv("PF_DAILY_MAX_LOSSES", "999"))           # e.g. 4
+MAX_CONCURRENT   = int(os.getenv("PF_MAX_CONCURRENT", "4"))               # e.g. 2
+COOLDOWN_SEC     = float(os.getenv("PF_COOLDOWN_SEC", "0"))               # e.g. 15
 
-# Buy routing / fees
-SLIPPAGE_BPS = int(os.getenv("PF_SLIPPAGE_BPS", "1000"))       # 10% default
-PRIORITY_SOL = float(os.getenv("PF_PRIORITY_SOL", "0.0005"))
+# You can keep your other filter/env knobs in here as needed
 
-# Basic quality guards
-MIN_INITIAL_BUY_SOL = float(os.getenv("MIN_INITIAL_BUY_SOL", "0.15"))
-MAX_NAME_LEN = int(os.getenv("MAX_NAME_LEN", "40"))
-SYMBOL_BLACKLIST = {
-    s.strip().upper()
-    for s in os.getenv("SYMBOL_BLACKLIST", "RUG,SCAM").split(",")
-    if s.strip()
-}
+class Guard:
+    """Tracks daily drawdown, loss count, and enforces concurrency/cooldown."""
+    def __init__(self, pubkey_str: str):
+        self.pubkey_str = pubkey_str
+        self.day = dt.date.today()
+        self.start_bal_sol: float | None = None
+        self.sema = asyncio.Semaphore(MAX_CONCURRENT)
+        self.losses_today = 0
+        self.paused_reason: str | None = None
+        self.cooldown_sec = COOLDOWN_SEC
+        self._cooling = asyncio.Lock()  # used only to sequence cooldown sleeps
 
-# Behavior
-ENTRY_COOLDOWN_SEC = float(os.getenv("ENTRY_COOLDOWN_SEC", "3.0"))
+    async def _maybe_roll_day(self):
+        today = dt.date.today()
+        if today != self.day:
+            self.day = today
+            self.start_bal_sol = None
+            self.losses_today = 0
+            self.paused_reason = None
+            print(f"[guard] New day -> counters reset.")
 
+    async def refresh_start_balance(self):
+        if self.start_bal_sol is None:
+            bal = await get_balance_sol(self.pubkey_str)
+            self.start_bal_sol = max(bal, 1e-9)
+            print(f"[guard] start_of_day_balance={self.start_bal_sol:.6f} SOL")
 
-def current_trade_sol() -> float:
-    """Read PF_TRADE_SOL at use-time so autosizer updates apply instantly."""
-    try:
-        return float(os.getenv("PF_TRADE_SOL", "0.01"))
-    except Exception:
-        return 0.01
+    async def should_trade(self) -> bool:
+        if self.paused_reason:
+            print(f"[guard] trading paused: {self.paused_reason}")
+            return False
 
+        await self._maybe_roll_day()
+        await self.refresh_start_balance()
 
-def passes_filters(msg: Dict[str, Any]) -> bool:
-    """Very light filters; expand/replace with your full filter stack as desired."""
-    if not isinstance(msg, dict):
-        return False
+        # drawdown check
+        try:
+            cur = await get_balance_sol(self.pubkey_str)
+        except Exception as e:
+            print(f"[guard] balance fetch failed: {e} (allowing trade)")
+            return True
 
-    # only react to new token creates
-    if msg.get("txType") != "create":
-        return False
+        dd_pct = 0.0
+        if self.start_bal_sol and self.start_bal_sol > 0:
+            dd_pct = max(0.0, (self.start_bal_sol - cur) / self.start_bal_sol * 100.0)
 
-    # initial buy gate (PumpPortal sends this as a float in SOL)
-    try:
-        init_buy = float(msg.get("initialBuy", 0.0))
-    except Exception:
-        init_buy = 0.0
-    if init_buy < MIN_INITIAL_BUY_SOL:
-        return False
+        if dd_pct >= DAILY_MAX_DD_PCT:
+            self.paused_reason = f"daily drawdown {dd_pct:.2f}% ≥ {DAILY_MAX_DD_PCT}%"
+            print(f"[guard] {self.paused_reason}")
+            return False
 
-    # symbol blacklist
-    sym = (msg.get("symbol") or "").upper()
-    if any(bad in sym for bad in SYMBOL_BLACKLIST):
-        return False
+        if self.losses_today >= DAILY_MAX_LOSSES:
+            self.paused_reason = f"daily losses {self.losses_today} ≥ {DAILY_MAX_LOSSES}"
+            print(f"[guard] {self.paused_reason}")
+            return False
 
-    # keep names short-ish to avoid obvious spam
-    name = msg.get("name") or ""
-    if len(name) > MAX_NAME_LEN:
-        return False
+        return True
 
-    # optionally: require pool == "pump"
-    pool = (msg.get("pool") or "").lower()
-    if pool and pool != "pump":
-        return False
+    async def after_trade(self):
+        # Global cooldown between fresh entries
+        if self.cooldown_sec > 0:
+            async with self._cooling:
+                await asyncio.sleep(self.cooldown_sec)
 
-    return True
-
+    # Optional helper you can call when a hard stop triggers to count a loss
+    def register_loss(self):
+        self.losses_today += 1
+        print(f"[guard] loss counted -> losses_today={self.losses_today}")
 
 class Strategy:
-    """Minimal strategy that buys once per mint if it passes filters."""
-    def __init__(self):
-        self._seen_mints: set[str] = set()
-        self._kp = load_keypair()  # solders.Keypair
-        self._pub = str(self._kp.pubkey())
+    def __init__(self, guard: Guard):
+        self.guard = guard
+        self._seen = set()
 
-    async def on_new_token(self, msg: Dict[str, Any]) -> None:
+    async def on_new_token(self, msg: dict):
         mint = msg.get("mint")
-        symbol = msg.get("symbol")
-        if not mint or mint in self._seen_mints:
+        if not mint or mint in self._seen:
             return
-        self._seen_mints.add(mint)
+        self._seen.add(mint)
 
-        if not passes_filters(msg):
+        if not await self.guard.should_trade():
             return
 
-        size_sol = current_trade_sol()
-
-        if DRY_RUN:
-            print(f"[DRYRUN] would buy {symbol} ({mint}) for {size_sol} SOL")
-        else:
+        # concurrency guard
+        async with self.guard.sema:
             try:
-                # route = "portal" (entries via PumpPortal)
-                await maybe_buy(
-                    keypair=self._kp,
-                    mint=mint,
-                    amount_sol=size_sol,
-                    venue="portal",
-                    slippage_bps=SLIPPAGE_BPS,
-                    priority_sol=PRIORITY_SOL,
-                )
-            except Exception as e:
-                print(f"[BUY ERR] {symbol} ({mint}) -> {e}")
+                await maybe_buy(msg)       # your existing buy logic (respects PF_TRADE_SOL autosize)
+            finally:
+                await self.guard.after_trade()
 
-        # small spacing so we don't spam builders
-        await asyncio.sleep(ENTRY_COOLDOWN_SEC)
-
-    async def on_trade(self, msg: Dict[str, Any]) -> None:
-        # Optional: track live trades per mint, liquidity growth, whale prints, etc.
-        # You can wire PnL/AI logic here or in a separate process.
+    async def on_trade(self, msg: dict):
+        # (optional) You can use trades to detect rug/stop and call guard.register_loss()
         pass
 
-
-async def main() -> None:
+async def main():
+    kp = load_keypair()
+    pubkey_str = str(kp.pubkey())
+    guard = Guard(pubkey_str)
     client = PumpPortalClient()  # uses PF_PP_KEY / PF_PP_ACCOUNT / PF_PP_MINTS
-    strat = Strategy()
 
     print("Connecting to:", client.masked_uri())
+    strat = Strategy(guard)
+
     async for ev in client.events():
         k, m = ev["kind"], ev["raw"]
         if k == "new_token":
             await strat.on_new_token(m)
         elif k == "trade":
             await strat.on_trade(m)
-        # ignore info/warning/unknown to keep logs clean
-
 
 if __name__ == "__main__":
     asyncio.run(main())
