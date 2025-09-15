@@ -3,6 +3,7 @@ import os, math, json, time, asyncio, requests, base58
 from typing import Tuple, Optional, Dict, Any
 
 from utils_pkg.solana_wallet import load_keypair, sign_and_send_b64_tx
+import base58
 
 # ----------------- Config helpers -----------------
 def _envf(name: str, default: float) -> float:
@@ -26,16 +27,16 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 # ----------------- Mint validation -----------------
 def _assert_mint(m: str) -> None:
-    """
-    Ensure the provided Base58 pubkey decodes to exactly 32 bytes.
-    Raises ValueError with a clear message if invalid.
-    """
     try:
         if len(base58.b58decode(m)) != 32:
             raise ValueError("mint must decode to 32 bytes")
     except Exception as e:
         raise ValueError(f"Invalid mint '{m}': {e}")
 
+def _jup_as_legacy() -> bool:
+    # default ON so we only get legacy txs (matches your wallet patch)
+    v = os.getenv("JUP_AS_LEGACY", "1")
+    return str(v).lower() in ("1", "true", "yes", "y")
 # ----------------- Exit tuning (override in env for aggressiveness) -----------------
 EXIT_TP1_PCT         = _envf("EXIT_TP1_PCT", 40.0)      # +40% → take partial
 EXIT_TP1_SELL_PCT    = _envf("EXIT_TP1_SELL_PCT", 0.40) # sell 40% at TP1
@@ -93,14 +94,6 @@ def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
     return total, decimals
 
 # ----------------- Jupiter quote/swap -----------------
-def _jup_as_legacy() -> bool:
-    """
-    Toggle whether Jupiter should return legacy (non-v0) transactions.
-    Default True for compatibility; set JUP_AS_LEGACY=0 to get v0 tx.
-    """
-    v = os.getenv("JUP_AS_LEGACY", "1")
-    return str(v).lower() in ("1", "true", "yes", "y")
-
 def _jup_quote(input_mint: str, output_mint: str, amount_iu: int) -> dict:
     _assert_mint(input_mint); _assert_mint(output_mint)
 
@@ -109,10 +102,10 @@ def _jup_quote(input_mint: str, output_mint: str, amount_iu: int) -> dict:
         "inputMint": input_mint,
         "outputMint": output_mint,
         "amount": str(amount_iu),
-        "slippageBps": _slippage_bps(),          # int is fine
+        "slippageBps": _slippage_bps(),
         "swapMode": "ExactIn",
-        "onlyDirectRoutes": "false",              # <-- string
-        "asLegacyTransaction": "true" if _jup_as_legacy() else "false",  # <-- string
+        "onlyDirectRoutes": "false",                                  # <- string
+        "asLegacyTransaction": "true" if _jup_as_legacy() else "false",  # <- string
     }
     r = requests.get(url, params=q, timeout=20)
     if not r.ok:

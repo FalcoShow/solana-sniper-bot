@@ -10,7 +10,7 @@ from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction as VTx, Transaction as LTx  # v0 + legacy
 from base64 import b64decode
 from solana.rpc.api import Client as RpcClient
-from solana.transaction import VersionedTransaction as PVersionedTx, Transaction as PLegacyTx
+from solders.transaction import Transaction as LTx, VersionedTransaction as VTx  # VTx only for type check
 
 RPC_URL = os.getenv("SOL_RPC_URL") or "https://api.mainnet-beta.solana.com"
 
@@ -45,33 +45,33 @@ async def get_balance_sol(pub: str | Pubkey) -> float:
         # solana 0.36 returns a dataclass with .value
         return r.value / 1e9
 
+def _is_legacy_tx_bytes(raw: bytes) -> bool:
+    # In Solana wire format, legacy tx encodes signature count (MSB == 0).
+    # Versioned v0 has MSB == 1 and embeds version in lower 7 bits.
+    return (raw[0] & 0x80) == 0
+
 async def sign_and_send_b64_tx(tx_b64: str, kp, *, skip_preflight: bool = True) -> str:
     """
-    Decode the base64 Jupiter tx, sign it (v0 or legacy), and send via RPC.
-    Works with solana==0.36.x and solders==0.26.x.
+    Decode the base64 Jupiter tx, sign it (legacy only), and send.
+    We enforce legacy by setting JUP_AS_LEGACY=1 in env & quote.
     """
     raw = b64decode(tx_b64)
     client = RpcClient(os.getenv("SOL_RPC_URL"))
 
-    # Try v0 first; if it doesn't parse, fall back to legacy
-    wire = None
-    try:
-        vtx = PVersionedTx.deserialize(raw)   # v0 tx
-        vtx.sign([kp])                        # accepts solders.Keypair
-        wire = bytes(vtx.serialize())
-    except Exception:
-        ltx = PLegacyTx.deserialize(raw)      # legacy tx
-        ltx.sign(kp)
-        wire = bytes(ltx.serialize())
+    if not _is_legacy_tx_bytes(raw):
+        # We explicitly ask Jupiter for legacy; if this trips, quote params drifted.
+        raise RuntimeError(
+            "Got a versioned (v0) transaction from Jupiter. "
+            "Ensure _jup_quote sends asLegacyTransaction='true' and JUP_AS_LEGACY=1."
+        )
+
+    # Legacy path (supported by solders 0.26.x)
+    signed = LTx.from_bytes(raw).sign([kp])          # returns a new signed tx
+    wire   = bytes(signed.to_bytes())                # serialize
 
     resp = client.send_raw_transaction(
         wire,
-        opts={
-            "skip_preflight": skip_preflight,
-            "preflight_commitment": "confirmed",
-            "max_retries": 3,
-        },
+        opts={"skip_preflight": skip_preflight, "preflight_commitment": "confirmed", "max_retries": 3},
     )
-    # solana-py returns a dict with "result"
-    sig = resp["result"] if isinstance(resp, dict) else str(resp)
-    return sig
+    # solana-py Client returns a dict
+    return resp["result"] if isinstance(resp, dict) else str(resp)
