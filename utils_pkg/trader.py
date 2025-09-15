@@ -17,10 +17,6 @@ def _envi(name: str, default: int) -> int:
     except Exception:
         return default
 
-def _jup_as_legacy() -> bool:
-    v = os.getenv("JUP_AS_LEGACY", "1")  # default ON for compatibility
-    return str(v).lower() in ("1", "true", "yes", "y")
-
 IS_DRYRUN = os.getenv("DRY_RUN", "0") == "1"
 RPC_URL   = os.getenv("SOL_RPC_URL")
 
@@ -97,21 +93,29 @@ def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
     return total, decimals
 
 # ----------------- Jupiter quote/swap -----------------
+def _jup_as_legacy() -> bool:
+    """
+    Toggle whether Jupiter should return legacy (non-v0) transactions.
+    Default True for compatibility; set JUP_AS_LEGACY=0 to get v0 tx.
+    """
+    v = os.getenv("JUP_AS_LEGACY", "1")
+    return str(v).lower() in ("1", "true", "yes", "y")
+
 def _jup_quote(input_mint: str, output_mint: str, amount_iu: int) -> dict:
     # Guardrail: make bad mints fail fast with a clear error
     _assert_mint(input_mint)
     _assert_mint(output_mint)
 
     url = "https://quote-api.jup.ag/v6/quote"
-   q = {
-    "inputMint": input_mint,
-    "outputMint": output_mint,
-    "amount": str(amount_iu),
-    "slippageBps": _slippage_bps(),
-    "swapMode": "ExactIn",
-    "onlyDirectRoutes": "false",
-    "asLegacyTransaction": _jup_as_legacy(),  # <-- changed (bool, default True)
-}
+    q = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount_iu),
+        "slippageBps": _slippage_bps(),
+        "swapMode": "ExactIn",
+        "onlyDirectRoutes": False,
+        "asLegacyTransaction": _jup_as_legacy(),
+    }
     r = requests.get(url, params=q, timeout=20)
     r.raise_for_status()
     return r.json()
