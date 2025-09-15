@@ -117,23 +117,28 @@ def _jup_swap(user_pubkey: str, quote: dict, priority_lamports: Optional[int]) -
     body = {
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": True,
-        "dynamicComputeUnitLimit": True,
+        "dynamicComputeUnitLimit": True,  # optional but helpful
         "quoteResponse": quote,
-        "asLegacyTransaction": True,
-        "asLegacyTransaction": "true",
-        "onlyDirectRoutes": "false",
-
+        "asLegacyTransaction": True,      # <-- boolean, not string; only once
     }
     if priority_lamports is not None:
+        # you can also send the advanced structure shown in docs; this simple int is fine
         body["prioritizationFeeLamports"] = priority_lamports
+
     r = requests.post(url, json=body, timeout=20)
-    r.raise_for_status()
+    if not r.ok:
+        # bubble up server’s message so we’re not debugging blind
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise RuntimeError(f"Jupiter /swap error {r.status_code}: {detail}")
+
     js = r.json()
     tx_b64 = js.get("swapTransaction")
     if not tx_b64:
         raise RuntimeError(f"Jupiter swap returned no transaction: {js}")
     return tx_b64
-
 # ----------------- Telegram (optional) -----------------
 def _tg_send(text: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
