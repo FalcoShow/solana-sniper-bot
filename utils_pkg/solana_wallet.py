@@ -8,6 +8,9 @@ from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction as VTx, Transaction as LTx  # v0 + legacy
+from base64 import b64decode
+from solana.rpc.api import Client as RpcClient
+from solana.transaction import VersionedTransaction as PVersionedTx, Transaction as PLegacyTx
 
 RPC_URL = os.getenv("SOL_RPC_URL") or "https://api.mainnet-beta.solana.com"
 
@@ -42,26 +45,33 @@ async def get_balance_sol(pub: str | Pubkey) -> float:
         # solana 0.36 returns a dataclass with .value
         return r.value / 1e9
 
-async def sign_and_send_b64_tx(b64_tx: str, kp: Keypair, *, skip_preflight: bool = True) -> str:
+async def sign_and_send_b64_tx(tx_b64: str, kp, *, skip_preflight: bool = True) -> str:
     """
-    Accepts a base64-encoded (legacy or v0) transaction, signs with solders.Keypair, broadcasts, confirms.
+    Decode the base64 Jupiter tx, sign it (v0 or legacy), and send via RPC.
+    Works with solana==0.36.x and solders==0.26.x.
     """
-    raw = base64.b64decode(b64_tx)
+    raw = b64decode(tx_b64)
+    client = RpcClient(os.getenv("SOL_RPC_URL"))
 
-    # Try v0 first, then legacy
+    # Try v0 first; if it doesn't parse, fall back to legacy
+    wire = None
     try:
-        vtx = VTx.from_bytes(raw).sign([kp])
-        tx_bytes = bytes(vtx)
+        vtx = PVersionedTx.deserialize(raw)   # v0 tx
+        vtx.sign([kp])                        # accepts solders.Keypair
+        wire = bytes(vtx.serialize())
     except Exception:
-        ltx = LTx.from_bytes(raw).sign([kp])
-        tx_bytes = bytes(ltx)
+        ltx = PLegacyTx.deserialize(raw)      # legacy tx
+        ltx.sign(kp)
+        wire = bytes(ltx.serialize())
 
-    async with await get_client() as c:
-        resp = await c.send_raw_transaction(
-            tx_bytes, opts=TxOpts(skip_preflight=skip_preflight, max_retries=3)
-        )
-        sig = resp.value if hasattr(resp, "value") else (resp.get("result") or resp.get("value"))
-        if not isinstance(sig, str):
-            raise RuntimeError(f"Unexpected send response: {resp}")
-        await c.confirm_transaction(sig, commitment="confirmed")
-        return sig
+    resp = client.send_raw_transaction(
+        wire,
+        opts={
+            "skip_preflight": skip_preflight,
+            "preflight_commitment": "confirmed",
+            "max_retries": 3,
+        },
+    )
+    # solana-py returns a dict with "result"
+    sig = resp["result"] if isinstance(resp, dict) else str(resp)
+    return sig
