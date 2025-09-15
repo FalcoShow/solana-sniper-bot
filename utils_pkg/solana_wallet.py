@@ -11,7 +11,7 @@ from solana.rpc.types import TxOpts
 
 from solders.pubkey import Pubkey
 from solders.keypair import Keypair
-from solders.transaction import Transaction as LTx   # legacy transaction
+from solders.transaction import Transaction as LTx      # legacy transaction
 from solders.message import Message
 from solders.signature import Signature
 
@@ -30,7 +30,6 @@ def _load_keypair_from_env_or_file() -> Keypair:
       - WALLET_PRIVKEY_B58  : base58-encoded 64-byte secret key (ed25519)
       - WALLET_KEYPAIR_PATH : Solana CLI JSON array path (default ~/.config/solana/id.json)
     """
-    # ENV: base58-encoded secret key (64 bytes)
     b58 = (os.getenv("WALLET_PRIVKEY_B58") or "").strip()
     if b58:
         sk = b58decode(b58)
@@ -40,7 +39,6 @@ def _load_keypair_from_env_or_file() -> Keypair:
             )
         return Keypair.from_bytes(sk)
 
-    # FILE: Solana CLI style JSON array (64 bytes)
     path = (os.getenv("WALLET_KEYPAIR_PATH") or os.path.expanduser("~/.config/solana/id.json")).strip()
     with open(path, "r", encoding="utf-8") as f:
         arr = json.load(f)
@@ -66,10 +64,8 @@ async def get_client() -> AsyncClient:
 async def get_balance_sol(pub: Union[str, Pubkey]) -> float:
     """Return SOL balance for a pubkey (in SOL, not lamports)."""
     pk = pub if isinstance(pub, Pubkey) else Pubkey.from_string(str(pub))
-    # Create/close the client within the call to avoid lingering sockets
     async with AsyncClient(RPC_URL, timeout=30) as c:
         resp = await c.get_balance(pk)
-        # solana-py 0.36.x returns a dataclass with .value in lamports
         return resp.value / 1e9
 
 
@@ -88,24 +84,26 @@ async def sign_and_send_b64_tx(tx_b64: str, kp: Keypair, *, skip_preflight: bool
     """
     Decode the base64 Jupiter tx, sign it (LEGACY only), and submit via RPC.
 
-    IMPORTANT:
-      - We force Jupiter to return legacy transactions by setting
-        asLegacyTransaction='true' in the quote request and JUP_AS_LEGACY=1
-        in the environment. If a versioned (v0) tx is received, we raise.
+    We force legacy via asLegacyTransaction='true' on the quote **and** swap,
+    and via JUP_AS_LEGACY=1 in the environment. If a versioned (v0) tx is
+    received, we fail fast with a clear error.
     """
     raw = b64decode(tx_b64)
 
+    # Fail fast if this is not legacy
     if not _is_legacy_tx_bytes(raw):
         raise RuntimeError(
             "Received a versioned (v0) transaction but legacy is expected. "
-            "Ensure _jup_quote sends asLegacyTransaction='true' and JUP_AS_LEGACY=1."
+            "Ensure BOTH: _jup_quote(asLegacyTransaction='true') and "
+            "_jup_swap(asLegacyTransaction=True)."
         )
 
-    # Deserialize legacy tx, sign the message bytes with our keypair, rebuild tx
-    tx_legacy: LTx = LTx.from_bytes(raw)
-    msg: Message = tx_legacy.message
+    # Deserialize legacy tx, sign the message, rebuild tx with our signature
+    tx_legacy: LTx = LTx.from_bytes(raw)           # unsigned legacy tx from Jupiter
+    msg: Message = tx_legacy.message               # compiled message
     sig: Signature = kp.sign_message(msg.serialize())
-    signed: LTx = LTx([sig], msg)
+
+    signed: LTx = LTx([sig], msg)                  # reconstruct signed tx
     wire: bytes = bytes(signed.to_bytes())
 
     client = RpcClient(RPC_URL)
@@ -118,7 +116,7 @@ async def sign_and_send_b64_tx(tx_b64: str, kp: Keypair, *, skip_preflight: bool
         ),
     )
 
-    # solana-py Client returns an RPCResponse dict; grab the signature
+    # solana-py Client returns an RPCResponse dict
     if isinstance(resp, dict) and "result" in resp:
         return resp["result"]
     return str(resp)

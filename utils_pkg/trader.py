@@ -119,6 +119,7 @@ def _jup_swap(user_pubkey: str, quote: dict, priority_lamports: Optional[int]) -
         "wrapAndUnwrapSol": True,
         "dynamicComputeUnitLimit": True,
         "quoteResponse": quote,
+        "asLegacyTransaction": True,   # <-- add this line
     }
     if priority_lamports is not None:
         body["prioritizationFeeLamports"] = priority_lamports
