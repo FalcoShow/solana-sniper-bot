@@ -84,13 +84,12 @@ async def sign_and_send_b64_tx(tx_b64: str, kp: Keypair, *, skip_preflight: bool
     """
     Decode the base64 Jupiter tx, sign it (LEGACY only), and submit via RPC.
 
-    We force legacy via asLegacyTransaction='true' on the quote **and** swap,
-    and via JUP_AS_LEGACY=1 in the environment. If a versioned (v0) tx is
-    received, we fail fast with a clear error.
+    We force legacy via asLegacyTransaction='true' on quote & swap,
+    and via JUP_AS_LEGACY=1. If a versioned (v0) tx is received, we fail fast.
     """
     raw = b64decode(tx_b64)
 
-    # Fail fast if this is not legacy
+    # reject v0 transactions immediately (we expect legacy)
     if not _is_legacy_tx_bytes(raw):
         raise RuntimeError(
             "Received a versioned (v0) transaction but legacy is expected. "
@@ -98,25 +97,17 @@ async def sign_and_send_b64_tx(tx_b64: str, kp: Keypair, *, skip_preflight: bool
             "_jup_swap(asLegacyTransaction=True)."
         )
 
-    # Deserialize legacy tx, sign the message, rebuild tx with our signature
-    tx_legacy: LTx = LTx.from_bytes(raw)           # unsigned legacy tx from Jupiter
-    msg: Message = tx_legacy.message               # compiled message
-    sig: Signature = kp.sign_message(msg.serialize())
+    # parse legacy tx, sign the compiled message bytes, rebuild tx
+    tx_legacy: LTx = LTx.from_bytes(raw)
+    msg: Message = tx_legacy.message
+    sig: Signature = kp.sign_message(msg.to_bytes())   # <-- solders 0.26 uses to_bytes()
 
-    signed: LTx = LTx([sig], msg)                  # reconstruct signed tx
+    signed: LTx = LTx([sig], msg)
     wire: bytes = bytes(signed.to_bytes())
 
     client = RpcClient(RPC_URL)
     resp = client.send_raw_transaction(
         wire,
-        opts=TxOpts(
-            skip_preflight=skip_preflight,
-            preflight_commitment="confirmed",
-            max_retries=3,
-        ),
+        opts=TxOpts(skip_preflight=skip_preflight, preflight_commitment="confirmed", max_retries=3),
     )
-
-    # solana-py Client returns an RPCResponse dict
-    if isinstance(resp, dict) and "result" in resp:
-        return resp["result"]
-    return str(resp)
+    return resp["result"] if isinstance(resp, dict) else str(resp)
