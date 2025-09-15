@@ -1,23 +1,42 @@
 # utils_pkg/trader.py
-import os, math, json, time, asyncio, requests
+import os, math, json, time, asyncio, requests, base58
 from typing import Tuple, Optional, Dict, Any
 
 from utils_pkg.solana_wallet import load_keypair, sign_and_send_b64_tx
 
 # ----------------- Config helpers -----------------
 def _envf(name: str, default: float) -> float:
-    try: return float(os.getenv(name, str(default)))
-    except Exception: return default
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
 
 def _envi(name: str, default: int) -> int:
-    try: return int(os.getenv(name, str(default)))
-    except Exception: return default
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
 
 IS_DRYRUN = os.getenv("DRY_RUN", "0") == "1"
 RPC_URL   = os.getenv("SOL_RPC_URL")
-SOL_MINT  = "So11111111111111111111111111111111111111112"
 
-# Exit tuning (defaults are conservative; override in Render if you want)
+# Canonical mints
+SOL_MINT  = "So11111111111111111111111111111111111111112"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+# ----------------- Mint validation -----------------
+def _assert_mint(m: str) -> None:
+    """
+    Ensure the provided Base58 pubkey decodes to exactly 32 bytes.
+    Raises ValueError with a clear message if invalid.
+    """
+    try:
+        if len(base58.b58decode(m)) != 32:
+            raise ValueError("mint must decode to 32 bytes")
+    except Exception as e:
+        raise ValueError(f"Invalid mint '{m}': {e}")
+
+# ----------------- Exit tuning (override in env for aggressiveness) -----------------
 EXIT_TP1_PCT         = _envf("EXIT_TP1_PCT", 40.0)      # +40% → take partial
 EXIT_TP1_SELL_PCT    = _envf("EXIT_TP1_SELL_PCT", 0.40) # sell 40% at TP1
 EXIT_TP2_PCT         = _envf("EXIT_TP2_PCT", 100.0)     # +100% → take more
@@ -26,7 +45,7 @@ EXIT_TSL_ARM_PCT     = _envf("EXIT_TSL_ARM_PCT", 60.0)  # arm trailing stop when
 EXIT_TSL_TRAIL_PCT   = _envf("EXIT_TSL_TRAIL_PCT", 20.0)# trail gap 20% off the peak
 EXIT_HARD_STOP_PCT   = _envf("HARD_STOP_PCT", -32.0)    # kill if drawdown from entry <= -32%
 
-# Sell path settings
+# ----------------- Sell path settings -----------------
 def _slippage_bps() -> int:
     # JUPITER_MAX_SLIPPAGE stored as fraction (e.g. 0.0125 = 1.25%)
     s = _envf("JUPITER_MAX_SLIPPAGE", 0.0125)
@@ -34,7 +53,8 @@ def _slippage_bps() -> int:
 
 def _priority_lamports() -> Optional[int]:
     p = os.getenv("PF_PRIORITY_SOL")
-    if not p: return None
+    if not p:
+        return None
     try:
         return int(float(p) * 1_000_000_000)
     except Exception:
@@ -42,9 +62,11 @@ def _priority_lamports() -> Optional[int]:
 
 # ----------------- RPC helpers -----------------
 def _rpc(method: str, params: list) -> Any:
+    if not RPC_URL:
+        raise RuntimeError("SOL_RPC_URL is not set")
     r = requests.post(
         RPC_URL,
-        json={"jsonrpc":"2.0","id":1,"method":method,"params":params},
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
         timeout=20,
     )
     r.raise_for_status()
@@ -53,12 +75,12 @@ def _rpc(method: str, params: list) -> Any:
         raise RuntimeError(js["error"])
     return js["result"]
 
-def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int,int]:
+def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
     """
     Return (amount_in_base_units, decimals) across all token accounts for `mint`.
     """
     res = _rpc("getTokenAccountsByOwner", [
-        owner, {"mint": mint}, {"encoding":"jsonParsed"}
+        owner, {"mint": mint}, {"encoding": "jsonParsed"}
     ])
     total = 0
     decimals = 0
@@ -72,12 +94,17 @@ def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int,int]:
 
 # ----------------- Jupiter quote/swap -----------------
 def _jup_quote(input_mint: str, output_mint: str, amount_iu: int) -> dict:
+    # Guardrail: make bad mints fail fast with a clear error
+    _assert_mint(input_mint)
+    _assert_mint(output_mint)
+
     url = "https://quote-api.jup.ag/v6/quote"
     q = {
         "inputMint": input_mint,
         "outputMint": output_mint,
         "amount": str(amount_iu),
         "slippageBps": _slippage_bps(),
+        "swapMode": "ExactIn",
         "onlyDirectRoutes": "false",
         "asLegacyTransaction": "false",
     }
@@ -107,7 +134,7 @@ def _jup_swap(user_pubkey: str, quote: dict, priority_lamports: Optional[int]) -
 def _tg_send(text: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat  = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat: 
+    if not token or not chat:
         return
     try:
         requests.post(
@@ -193,8 +220,8 @@ class PositionsExitEngine:
             "decimals": dec,
             "tp1_done": False,
             "tp2_done": False,
-            "peak_sol": price_sol,  # track peak for TSL
-            "entry_sol": price_sol, # None if quote failed, we’ll handle it
+            "peak_sol": price_sol,   # track peak for TSL
+            "entry_sol": price_sol,  # None if quote failed, we’ll handle it
             "last_ts": time.time(),
         }
         print(f"[pos] learned entry for {mint}: size_iu={amt_iu} entry≈{price_sol} SOL", flush=True)
