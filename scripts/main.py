@@ -7,12 +7,14 @@ import traceback
 from typing import Any, Dict
 
 from utils_pkg.pumpportal_client import PumpPortalClient
-from utils_pkg.pump_trader import maybe_buy  # expects mint=..., symbol=..., ui=...
+from utils_pkg.pump_trader import maybe_buy            # expects: maybe_buy(mint=..., ui=...)
+from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN
 
-# --------- lightweight, overridable filters ----------
+
+# ---------- lightweight, overridable filters ----------
 MIN_INITIAL_BUY_SOL = float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"))  # optional floor
-MAX_NAME_LEN       = int(os.getenv("ENTRY_MAX_NAME_LEN", "40"))
-SYMBOL_BLACKLIST   = {
+MAX_NAME_LEN        = int(os.getenv("ENTRY_MAX_NAME_LEN", "40"))
+SYMBOL_BLACKLIST    = {
     s.strip().upper()
     for s in os.getenv("ENTRY_SYMBOL_BLACKLIST", "RUG,SCAM").split(",")
     if s.strip()
@@ -20,9 +22,7 @@ SYMBOL_BLACKLIST   = {
 
 def _as_float(v: Any, default: float = 0.0) -> float:
     try:
-        if v is None:
-            return default
-        return float(v)
+        return float(v) if v is not None else default
     except Exception:
         return default
 
@@ -45,7 +45,7 @@ def _passes_filters(msg: Dict[str, Any]) -> bool:
     if (msg.get("txType") or msg.get("type")) != "create":
         return False
 
-    init_buy = _as_float(msg.get("initialBuy"), 0.0)
+    init_buy = _as_float(msg.get("initialBuy"), 0.0)  # PumpPortal sends a float
     if init_buy < MIN_INITIAL_BUY_SOL:
         return False
 
@@ -58,39 +58,62 @@ def _passes_filters(msg: Dict[str, Any]) -> bool:
         return False
 
     return True
-# -----------------------------------------------------
+# ------------------------------------------------------
+
+
+async def _post_buy_exit_test(mint: str) -> None:
+    """
+    Optional smoke-test: if POSTBUY_MODE=immediate_sell_test, wait 5s then
+    sell 100% via Jupiter. Otherwise no-op.
+    """
+    mode = os.getenv("POSTBUY_MODE", "").strip().lower()
+    if mode == "immediate_sell_test":
+        await asyncio.sleep(5)
+        try:
+            await sell_on_jupiter(mint, pct_of_wallet=1.0)
+            print(f"[post-buy test] sold 100% via Jupiter for {mint}", flush=True)
+        except Exception as e:
+            print(f"[post-buy test] sell failed for {mint}: {e}", flush=True)
 
 
 class Strategy:
     """Streams PumpPortal events and triggers buys for tokens that pass filters."""
     def __init__(self) -> None:
         self._seen_mints: set[str] = set()
-        # Use your SCANNER_PERIOD_SEC as a tiny cooldown after a hit
-        self._cooldown = float(os.getenv("SCANNER_PERIOD_SEC", "15"))
+        self._cooldown = float(os.getenv("SCANNER_PERIOD_SEC", "15"))  # micro-cooldown
+        self._max_conc = int(os.getenv("PF_MAX_CONCURRENT", "2"))
+        self._sema = asyncio.Semaphore(max(1, self._max_conc))
 
     async def on_new_token(self, m: Dict[str, Any]) -> None:
         mint = _extract_mint(m)
-        if not mint:
-            return
-        if mint in self._seen_mints:
+        if not mint or mint in self._seen_mints:
             return
         self._seen_mints.add(mint)
 
         if not _passes_filters(m):
             return
 
-        try:
-            # ✅ match pump_trader.maybe_buy signature
-            await maybe_buy(mint=mint, ui=m)
-        except Exception:
-            print("[strategy] maybe_buy exception:", flush=True)
-            traceback.print_exc()
+        async with self._sema:
+            try:
+                # ✅ buy path (maybe real, maybe DRYRUN) — pump_trader decides size/slippage/prio
+                await maybe_buy(mint=mint, ui=m)
 
-        # light cooldown to avoid spamming back-to-back tokens
+                # 🔔 after a *real* fill:
+                # either run the immediate-sell test OR register the position into the exit engine.
+                if not IS_DRYRUN:
+                    if os.getenv("POSTBUY_MODE", "").strip().lower() == "immediate_sell_test":
+                        asyncio.create_task(_post_buy_exit_test(mint))
+                    else:
+                        asyncio.create_task(exit_engine.on_buy_filled(mint))
+            except Exception:
+                print("[strategy] maybe_buy exception:", flush=True)
+                traceback.print_exc()
+
+        # avoid spamming back-to-back tokens
         await asyncio.sleep(self._cooldown)
 
     async def on_trade(self, m: Dict[str, Any]) -> None:
-        # Hook: observe whales/liquidity, feed sell AI, etc.
+        # optional analytics/hooks for your own dashboards
         return
 
 
@@ -104,11 +127,13 @@ async def stream_loop() -> None:
         if k == "new_token":
             await strat.on_new_token(raw)
         elif k == "trade":
+            # feed live ticks into exit engine for TP/TP2/TSL/SL
+            await exit_engine.on_trade_tick(raw)
             await strat.on_trade(raw)
 
 
 async def main() -> None:
-    """Never returns: reconnects on socket end/crash."""
+    """Never returns: reconnects on socket end/crash with backoff."""
     backoff = 3
     while True:
         try:
@@ -122,3 +147,7 @@ async def main() -> None:
             traceback.print_exc()
             backoff = min(backoff * 2, 30)
         await asyncio.sleep(backoff)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
