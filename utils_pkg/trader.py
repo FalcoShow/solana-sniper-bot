@@ -102,22 +102,21 @@ def _jup_as_legacy() -> bool:
     return str(v).lower() in ("1", "true", "yes", "y")
 
 def _jup_quote(input_mint: str, output_mint: str, amount_iu: int) -> dict:
-    # Guardrail: make bad mints fail fast with a clear error
-    _assert_mint(input_mint)
-    _assert_mint(output_mint)
+    _assert_mint(input_mint); _assert_mint(output_mint)
 
     url = "https://quote-api.jup.ag/v6/quote"
     q = {
         "inputMint": input_mint,
         "outputMint": output_mint,
         "amount": str(amount_iu),
-        "slippageBps": _slippage_bps(),
+        "slippageBps": _slippage_bps(),          # int is fine
         "swapMode": "ExactIn",
-        "onlyDirectRoutes": False,
-        "asLegacyTransaction": _jup_as_legacy(),
+        "onlyDirectRoutes": "false",              # <-- string
+        "asLegacyTransaction": "true" if _jup_as_legacy() else "false",  # <-- string
     }
     r = requests.get(url, params=q, timeout=20)
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"Jupiter quote {r.status_code}: {r.text[:400]}")
     return r.json()
 
 def _jup_swap(user_pubkey: str, quote: dict, priority_lamports: Optional[int]) -> str:
