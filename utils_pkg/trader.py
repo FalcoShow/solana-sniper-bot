@@ -32,13 +32,23 @@ def _envi(name: str, default: int) -> int:
     except Exception:
         return default
 
-def _envb(name: str, default: bool = False) -> bool:
-    v = os.getenv(name, "1" if default else "0")
+def _is_true(v: str | None, default: bool = False) -> bool:
+    if v is None:
+        return default
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-IS_DRYRUN     = _envb("DRY_RUN", False)
-RPC_URL       = os.getenv("SOL_RPC_URL")
-TX_RPC_URL    = os.getenv("SOL_RPC_TX_URL") or RPC_URL  # can point to Helius for tx lookups
+IS_DRYRUN   = _is_true(os.getenv("DRY_RUN"), False)
+RPC_URL     = os.getenv("SOL_RPC_URL")
+TX_RPC_URL  = os.getenv("SOL_RPC_TX_URL") or RPC_URL
+OWNER_FROM_ENV = (os.getenv("PF_PP_ACCOUNT") or "").strip()
+
+PF_DEBUG_TX = _is_true(os.getenv("PF_DEBUG_TX"), False)
+
+# Learner tuning (can be overridden in env)
+LEARN_MAX_ATTEMPTS   = _envi("PF_POS_LEARN_MAX_ATTEMPTS", 10)
+LEARN_BASE_DELAY_SEC = _envf("PF_POS_LEARN_BASE_DELAY_SEC", 6.0)
+LEARN_BACKOFF        = _envf("PF_POS_LEARN_BACKOFF", 1.5)
+LEARN_LOG_EVERY      = _envi("PF_POS_LEARN_LOG_EVERY", 3)
 
 # Canonical mints
 SOL_MINT  = "So11111111111111111111111111111111111111112"
@@ -58,30 +68,20 @@ def _assert_mint(m: str) -> None:
         raise ValueError(f"Invalid mint '{m}': {e}")
 
 def _jup_as_legacy() -> bool:
-    """
-    Default to legacy Jupiter transactions so our signer path (legacy-only)
-    works consistently. Set JUP_AS_LEGACY=0 if you later add v0 support.
-    """
     v = os.getenv("JUP_AS_LEGACY", "1")
     return str(v).lower() in {"1", "true", "yes", "y"}
 
 # =============================================================================
-# Exit / risk tuning (override with env to adjust aggressiveness)
+# Exit / risk tuning (override with env)
 # =============================================================================
 
-EXIT_TP1_PCT         = _envf("EXIT_TP1_PCT", 40.0)       # +40% → take partial
-EXIT_TP1_SELL_PCT    = _envf("EXIT_TP1_SELL_PCT", 0.40)  # sell 40% at TP1
-EXIT_TP2_PCT         = _envf("EXIT_TP2_PCT", 100.0)      # +100% → take more
-EXIT_TP2_SELL_PCT    = _envf("EXIT_TP2_SELL_PCT", 0.30)  # sell 30% at TP2
-EXIT_TSL_ARM_PCT     = _envf("EXIT_TSL_ARM_PCT", 60.0)   # arm trailing stop when +60%
-EXIT_TSL_TRAIL_PCT   = _envf("EXIT_TSL_TRAIL_PCT", 20.0) # trail gap 20% off the peak
-EXIT_HARD_STOP_PCT   = _envf("HARD_STOP_PCT", -32.0)     # kill if drawdown <= -32%
-
-# Learner tuning
-POS_LEARN_MAX_ATTEMPTS   = _envi("PF_POS_LEARN_MAX_ATTEMPTS", 10)
-POS_LEARN_BASE_DELAY_SEC = _envf("PF_POS_LEARN_BASE_DELAY_SEC", 6.0)
-POS_LEARN_BACKOFF        = _envf("PF_POS_LEARN_BACKOFF", 1.5)
-POS_LEARN_LOG_EVERY      = _envi("PF_POS_LEARN_LOG_EVERY", 3)
+EXIT_TP1_PCT         = _envf("EXIT_TP1_PCT", 40.0)       # +40% → partial
+EXIT_TP1_SELL_PCT    = _envf("EXIT_TP1_SELL_PCT", 0.40)  # sell 40%
+EXIT_TP2_PCT         = _envf("EXIT_TP2_PCT", 100.0)      # +100% → more
+EXIT_TP2_SELL_PCT    = _envf("EXIT_TP2_SELL_PCT", 0.30)  # sell 30%
+EXIT_TSL_ARM_PCT     = _envf("EXIT_TSL_ARM_PCT", 60.0)   # arm TSL at +60%
+EXIT_TSL_TRAIL_PCT   = _envf("EXIT_TSL_TRAIL_PCT", 20.0) # trail 20% off peak
+EXIT_HARD_STOP_PCT   = _envf("HARD_STOP_PCT", -32.0)     # hard stop
 
 # =============================================================================
 # Sell path helpers
@@ -105,10 +105,9 @@ def _priority_lamports() -> Optional[int]:
 # RPC helpers
 # =============================================================================
 
-def _rpc(method: str, params: list, *, use_tx_endpoint: bool = False) -> Any:
-    url = TX_RPC_URL if use_tx_endpoint else RPC_URL
+def _rpc_json(url: str, method: str, params: list) -> Any:
     if not url:
-        raise RuntimeError("SOL_RPC_URL (and optionally SOL_RPC_TX_URL) must be set")
+        raise RuntimeError("RPC URL not set")
     r = requests.post(
         url,
         json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
@@ -120,11 +119,29 @@ def _rpc(method: str, params: list, *, use_tx_endpoint: bool = False) -> Any:
         raise RuntimeError(js["error"])
     return js["result"]
 
+def _rpc(method: str, params: list) -> Any:
+    return _rpc_json(RPC_URL, method, params)
+
+def _txrpc(method: str, params: list) -> Any:
+    return _rpc_json(TX_RPC_URL, method, params)
+
+def _get_transaction(sig: str) -> Optional[dict]:
+    """
+    Fetch a transaction with meta (for postTokenBalances). Use TX_RPC_URL if set.
+    """
+    try:
+        # We want meta + token balance owners; request parsed with maxSupportedTransactionVersion=0
+        res = _txrpc("getTransaction", [
+            sig,
+            {"maxSupportedTransactionVersion": 0, "commitment": "confirmed"}
+        ])
+        return res
+    except Exception as e:
+        if PF_DEBUG_TX:
+            print(f"[txlearn] getTransaction failed for {sig}: {e}", flush=True)
+        return None
+
 def _sum_token_balance_iu_via_program_scan(owner: str, mint: str) -> Tuple[int, int]:
-    """
-    Fallback: enumerate token accounts by programId (Token + Token-2022),
-    then filter by mint client-side. Works when the RPC rejects {"mint": ...}.
-    """
     total = 0
     decimals: Optional[int] = None
     for prog in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
@@ -142,10 +159,6 @@ def _sum_token_balance_iu_via_program_scan(owner: str, mint: str) -> Tuple[int, 
     return total, (decimals or 0)
 
 def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
-    """
-    Try the fast path with {"mint": mint}. If empty or RPC says "could not find mint",
-    fall back to scanning by programId across both token programs.
-    """
     try:
         res = _rpc("getTokenAccountsByOwner", [
             owner, {"mint": mint}, {"encoding": "jsonParsed"}
@@ -167,16 +180,12 @@ def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
         msg = str(e)
         if "could not find mint" in msg or "Invalid param" in msg:
             return _sum_token_balance_iu_via_program_scan(owner, mint)
-        # As a last resort try the scan; if still zero, bubble up
         total, dec = _sum_token_balance_iu_via_program_scan(owner, mint)
         if total > 0:
             return total, dec
         raise
 
 async def _wait_tx_confirmed(sig: str, *, max_secs: float = 30.0) -> bool:
-    """
-    Poll getSignatureStatuses until confirmed/finalized or timeout.
-    """
     t0 = time.time()
     while time.time() - t0 < max_secs:
         res = _rpc("getSignatureStatuses", [[sig], {"searchTransactionHistory": True}])
@@ -190,41 +199,6 @@ async def _wait_tx_confirmed(sig: str, *, max_secs: float = 30.0) -> bool:
         await asyncio.sleep(0.8)
     return False
 
-def _try_learn_from_tx(owner: str, mint: str, tx_sig: Optional[str]) -> Optional[Tuple[int, int]]:
-    """
-    If we have the buy transaction signature, extract the owner's minted balance directly
-    from postTokenBalances. This works even before the RPC indexes token accounts.
-    """
-    if not tx_sig:
-        return None
-    try:
-        res = _rpc(
-            "getTransaction",
-            [tx_sig, {"encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}],
-            use_tx_endpoint=True,
-        )
-        if not res:
-            return None
-        post = (res.get("meta") or {}).get("postTokenBalances") or []
-        for bal in post:
-            if bal.get("mint") != mint:
-                continue
-            if (bal.get("owner") or "").strip() != owner:
-                continue
-            ui = bal.get("uiTokenAmount") or {}
-            amount_str = str(ui.get("amount") or "0")
-            dec = int(ui.get("decimals") or 0)
-            try:
-                amt_iu = int(amount_str)
-            except Exception:
-                amt_iu = 0
-            if amt_iu > 0:
-                return amt_iu, dec
-        return None
-    except Exception:
-        # If provider doesn't support/getTransaction, just return None.
-        return None
-
 # =============================================================================
 # Jupiter quote / swap (LEGACY tx)
 # =============================================================================
@@ -233,8 +207,6 @@ def _jup_quote(input_mint: str, output_mint: str, amount_iu: int) -> dict:
     _assert_mint(input_mint); _assert_mint(output_mint)
 
     url = "https://quote-api.jup.ag/v6/quote"
-    # Some Jupiter edge deployments are picky about types on these two flags,
-    # so we send them as strings here (works reliably in practice).
     q = {
         "inputMint": input_mint,
         "outputMint": output_mint,
@@ -256,7 +228,6 @@ def _jup_swap(user_pubkey: str, quote: dict, priority_lamports: Optional[int]) -
         "wrapAndUnwrapSol": True,
         "dynamicComputeUnitLimit": True,
         "quoteResponse": quote,
-        # swap endpoint accepts real booleans
         "asLegacyTransaction": True if _jup_as_legacy() else False,
     }
     if priority_lamports is not None:
@@ -295,6 +266,51 @@ def _tg_send(text: str) -> None:
         pass
 
 # =============================================================================
+# TX-based position learn
+# =============================================================================
+
+def _learn_from_tx_sig(owner_pubkey: str, mint: str, tx_sig: str) -> Tuple[int, int]:
+    """
+    Try to learn filled token amount immediately from the transaction meta.
+    Returns (amount_iu, decimals); (0,0) on failure.
+    """
+    tx = _get_transaction(tx_sig)
+    if not tx:
+        return 0, 0
+    meta = tx.get("meta") or {}
+    ptb = meta.get("postTokenBalances") or []
+    if PF_DEBUG_TX:
+        print(f"[txlearn] postTokenBalances count={len(ptb)}", flush=True)
+
+    total = 0
+    decimals: Optional[int] = None
+    for b in ptb:
+        try:
+            if b.get("mint") != mint:
+                continue
+            # Some RPCs include owner directly; otherwise resolve via accountIndex -> accountKeys
+            owner = b.get("owner")
+            if not owner:
+                acc_idx = b.get("accountIndex")
+                if acc_idx is not None:
+                    keys = (tx.get("transaction") or {}).get("message", {}).get("accountKeys") or []
+                    if isinstance(keys, list) and 0 <= acc_idx < len(keys):
+                        owner = keys[acc_idx].get("pubkey") if isinstance(keys[acc_idx], dict) else keys[acc_idx]
+            if owner != owner_pubkey:
+                continue
+            ui = b.get("uiTokenAmount") or {}
+            amt = int(ui.get("amount", "0"))
+            total += amt
+            if decimals is None:
+                decimals = int(ui.get("decimals", 0))
+        except Exception:
+            continue
+
+    if total > 0:
+        return total, (decimals or 0)
+    return 0, 0
+
+# =============================================================================
 # Public: SELL
 # =============================================================================
 
@@ -305,7 +321,7 @@ async def sell_on_jupiter(mint: str, *, pct_of_wallet: float = 1.0) -> Optional[
     Respects DRY_RUN=1.
     """
     kp = load_keypair()
-    owner = get_pubkey_str(kp)
+    owner = OWNER_FROM_ENV or get_pubkey_str(kp)
 
     try:
         bal_iu, _decimals = _sum_token_balance_iu(owner, mint)
@@ -346,67 +362,57 @@ def _extract_mint(msg: Dict[str, Any]) -> str:
 
 class PositionsExitEngine:
     def __init__(self) -> None:
-        self.owner = get_pubkey_str(load_keypair())
+        # Use PF_PP_ACCOUNT when provided to match PumpPortal payer
+        self.owner = OWNER_FROM_ENV or get_pubkey_str(load_keypair())
         self.pos: Dict[str, Dict[str, Any]] = {}  # mint -> state
 
-    async def on_buy_filled(self, mint: str, *, tx_sig: Optional[str] = None) -> None:
+    async def on_buy_filled(self, mint: str, *, tx_sig: str | None = None, poll_sec: float = LEARN_BASE_DELAY_SEC) -> None:
         """
-        After a buy, try to learn size/decimals:
-
-        1) If we have the transaction signature, read postTokenBalances from that tx.
-        2) If not found, poll the wallet via getTokenAccountsByOwner (with fallbacks).
-
-        Tuned via:
-          PF_POS_LEARN_MAX_ATTEMPTS
-          PF_POS_LEARN_BASE_DELAY_SEC
-          PF_POS_LEARN_BACKOFF
-          PF_POS_LEARN_LOG_EVERY
+        After a buy, prefer to learn size from the transaction meta (instant).
+        If that fails, poll wallet balances with backoff.
         """
-        attempts = max(1, POS_LEARN_MAX_ATTEMPTS)
-        delay = max(2.0, float(POS_LEARN_BASE_DELAY_SEC))
-        backoff = max(1.1, float(POS_LEARN_BACKOFF))
-        log_every = max(1, POS_LEARN_LOG_EVERY)
-
         amt_iu, dec = 0, 0
-        last_err: Optional[Exception] = None
 
-        # First, a one-shot attempt to learn from the tx itself.
+        # ---------- Path 1: learn from transaction signature ----------
         if tx_sig:
-            learned = _try_learn_from_tx(self.owner, mint, tx_sig)
-            if learned:
-                amt_iu, dec = learned
-                # fall through to set up position below
-            else:
-                # continue to wallet polling if tx path didn't yield
-                pass
-
-        i = 0
-        while amt_iu <= 0 and i < attempts:
-            i += 1
+            if PF_DEBUG_TX:
+                print(f"[txlearn] attempting from tx {tx_sig} for {mint}", flush=True)
             try:
-                amt_iu, dec = _sum_token_balance_iu(self.owner, mint)
+                amt_iu, dec = _learn_from_tx_sig(self.owner, mint, tx_sig)
                 if amt_iu > 0:
-                    break
+                    if PF_DEBUG_TX:
+                        print(f"[txlearn] success amount={amt_iu} dec={dec}", flush=True)
             except Exception as e:
-                last_err = e
+                if PF_DEBUG_TX:
+                    print(f"[txlearn] failed: {e}", flush=True)
 
-            if i % log_every == 0:
-                print(
-                    f"[pos] retry learn {mint} attempt {i}/{attempts}..."
-                    f" last_bal={amt_iu}{' err='+str(last_err) if last_err else ''}",
-                    flush=True,
-                )
-            await asyncio.sleep(delay)
-            delay = min(delay * backoff, 30.0)
-
+        # ---------- Path 2: fallback to polling if still zero ----------
         if amt_iu <= 0:
-            if last_err:
-                print(f"[pos] giving up learn {mint}: {last_err}", flush=True)
-            else:
-                print(f"[pos] giving up learn {mint}: still zero after retries", flush=True)
-            return
+            attempts = max(1, int(LEARN_MAX_ATTEMPTS))
+            delay = max(1.0, float(poll_sec))
 
-        # estimate entry price via a tiny quote (1% of size, clamped)
+            last_err = None
+            for i in range(1, attempts + 1):
+                await asyncio.sleep(delay)
+                try:
+                    amt_iu, dec = _sum_token_balance_iu(self.owner, mint)
+                    if amt_iu > 0:
+                        break
+                except Exception as e:
+                    last_err = e
+
+                delay = min(delay * max(1.01, LEARN_BACKOFF), 30.0)
+                if i == 1 or (i % max(1, LEARN_LOG_EVERY) == 0):
+                    print(f"[pos] retry learn {mint} attempt {i}/{attempts}... last_bal={amt_iu}", flush=True)
+
+            if amt_iu <= 0:
+                if last_err:
+                    print(f"[pos] giving up learn {mint}: {last_err}", flush=True)
+                else:
+                    print(f"[pos] giving up learn {mint}: still zero after retries", flush=True)
+                return
+
+        # ---------- Estimate entry price via small quote ----------
         sample = max(1, min(amt_iu // 100, amt_iu))
         try:
             q = _jup_quote(mint, SOL_MINT, sample)
@@ -446,12 +452,10 @@ class PositionsExitEngine:
         except Exception:
             return  # skip if quote fails briefly
 
-        # If we never got entry price (quote failed earlier), set it now
         if not st.get("entry_sol"):
             st["entry_sol"] = px_sol
             st["peak_sol"]  = px_sol
 
-        # update peak (for TSL)
         st["peak_sol"] = max(st.get("peak_sol") or px_sol, px_sol)
         st["last_ts"]  = time.time()
 
@@ -462,7 +466,7 @@ class PositionsExitEngine:
         pnl_pct = (px_sol / entry - 1.0) * 100.0
         drawdown_from_peak_pct = (px_sol / (st["peak_sol"] or px_sol) - 1.0) * 100.0
 
-        # ----- Hard stop -----
+        # Hard stop
         if pnl_pct <= EXIT_HARD_STOP_PCT:
             print(f"[exit] HARD STOP {mint} pnl={pnl_pct:.1f}%")
             _tg_send(f"⛔ HARD STOP {mint} pnl={pnl_pct:.1f}%")
@@ -470,7 +474,7 @@ class PositionsExitEngine:
             st["size_iu"] = 0
             return
 
-        # ----- TP1 -----
+        # TP1
         if (not st["tp1_done"]) and (pnl_pct >= EXIT_TP1_PCT):
             print(f"[exit] TP1 {mint} pnl={pnl_pct:.1f}% sell={EXIT_TP1_SELL_PCT:.0%}")
             _tg_send(f"🎯 TP1 {mint} pnl={pnl_pct:.1f}% sell={EXIT_TP1_SELL_PCT:.0%}")
@@ -478,7 +482,7 @@ class PositionsExitEngine:
             st["tp1_done"] = True
             return
 
-        # ----- TP2 -----
+        # TP2
         if (not st["tp2_done"]) and (pnl_pct >= EXIT_TP2_PCT):
             print(f"[exit] TP2 {mint} pnl={pnl_pct:.1f}% sell={EXIT_TP2_SELL_PCT:.0%}")
             _tg_send(f"🎯 TP2 {mint} pnl={pnl_pct:.1f}% sell={EXIT_TP2_SELL_PCT:.0%}")
@@ -486,12 +490,12 @@ class PositionsExitEngine:
             st["tp2_done"] = True
             return
 
-        # ----- Trailing stop (armed after EXIT_TSL_ARM_PCT) -----
+        # Trailing stop (armed)
         if pnl_pct >= EXIT_TSL_ARM_PCT:
             if drawdown_from_peak_pct <= -EXIT_TSL_TRAIL_PCT:
                 print(f"[exit] TSL {mint} drop_from_peak={drawdown_from_peak_pct:.1f}% -> exit")
                 _tg_send(f"🪢 TSL {mint} drop={drawdown_from_peak_pct:.1f}% -> exit")
-                await sell_on_jupiter(mint, pct_of_wallet=1.0)  # close remainder
+                await sell_on_jupiter(mint, pct_of_wallet=1.0)
                 st["size_iu"] = 0
                 return
 
