@@ -12,7 +12,6 @@ from solana.rpc.types import TxOpts
 
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.transaction import Transaction as LTx   # legacy transaction
 from solders.signature import Signature
 
 
@@ -70,8 +69,8 @@ async def get_balance_sol(pub: Union[str, Pubkey]) -> float:
 # -----------------------------------------------------------------------------
 def _is_legacy_tx_bytes(raw: bytes) -> bool:
     """
-    Legacy wire format encodes signature count with MSB=0 in the first shortvec byte.
-    Versioned (v0) sets MSB=1 for the versioned prefix.
+    Legacy wire format begins with the shortvec-encoded signature count.
+    Versioned (v0) sets MSB=1 in the very first byte to indicate a versioned prefix.
     """
     return (raw[0] & 0x80) == 0
 
@@ -91,6 +90,20 @@ def _read_shortvec(data: bytes, offset: int = 0) -> tuple[int, int]:
     return value, i
 
 
+def _encode_shortvec(n: int) -> bytes:
+    """Encode an integer to Solana shortvec bytes."""
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            b |= 0x80
+        out.append(b)
+        if not n:
+            break
+    return bytes(out)
+
+
 async def sign_and_send_b64_tx(tx_b64: str, kp: Keypair, *, skip_preflight: bool = True) -> str:
     """
     Decode the base64 Jupiter tx, sign it (LEGACY ONLY), and submit via RPC.
@@ -100,7 +113,7 @@ async def sign_and_send_b64_tx(tx_b64: str, kp: Keypair, *, skip_preflight: bool
     """
     raw = b64decode(tx_b64)
 
-    # Guard: we expect legacy
+    # Guard: we expect legacy bytes
     if not _is_legacy_tx_bytes(raw):
         raise RuntimeError(
             "Received a versioned (v0) transaction but legacy is expected. "
@@ -108,25 +121,18 @@ async def sign_and_send_b64_tx(tx_b64: str, kp: Keypair, *, skip_preflight: bool
             "_jup_swap(asLegacyTransaction=True)."
         )
 
-    # Parse the unsigned legacy transaction from Jupiter
-    tx_legacy: LTx = LTx.from_bytes(raw)
+    # Parse the existing signature section (usually 0) and extract message bytes
+    sig_count, pos = _read_shortvec(raw, 0)
+    pos += 64 * sig_count  # skip any present signatures (Jupiter usually sends 0)
+    msg_bytes = raw[pos:]
 
-    # Get canonical message bytes to sign (solders 0.26 compatible)
-    # Prefer Transaction.message_data() if present; otherwise compute from wire.
-    try:
-        msg_bytes: bytes = tx_legacy.message_data()  # available in solders 0.26
-    except Exception:
-        # Fallback: extract message bytes from wire format.
-        # legacy wire = [sig_count shortvec][sig_count * 64-byte sigs][message bytes...]
-        sig_count, pos = _read_shortvec(raw, 0)
-        pos += 64 * sig_count
-        msg_bytes = raw[pos:]
-
-    # Sign and rebuild the legacy transaction with our signature
+    # Sign the canonical message bytes
     sig: Signature = kp.sign_message(msg_bytes)
-    signed: LTx = LTx([sig], tx_legacy.message)
-    wire: bytes = bytes(signed.to_bytes())
 
+    # Rebuild a proper legacy wire: [shortvec(1)][signature][message_bytes]
+    wire = _encode_shortvec(1) + bytes(sig) + msg_bytes
+
+    # Send
     client = RpcClient(RPC_URL)
     resp = client.send_raw_transaction(
         wire,
