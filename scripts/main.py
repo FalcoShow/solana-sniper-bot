@@ -6,7 +6,7 @@ import traceback
 from typing import Any, Dict
 
 from utils_pkg.pumpportal_client import PumpPortalClient
-from utils_pkg.pump_trader import maybe_buy            # expects: maybe_buy(mint=..., ui=...)
+from utils_pkg.pump_trader import maybe_buy            # returns signature or None
 from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN
 
 EXIT_ENGINE_ENABLED = str(os.getenv("EXIT_ENGINE_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -41,11 +41,10 @@ def _extract_name(msg: Dict[str, Any]) -> str:
     return (msg.get("name") or "").strip()
 
 def _passes_filters(msg: Dict[str, Any]) -> bool:
-    # Only act on brand-new token creations seen by PumpPortal
     if (msg.get("txType") or msg.get("type")) != "create":
         return False
 
-    init_buy = _as_float(msg.get("initialBuy"), 0.0)  # PumpPortal sends a float
+    init_buy = _as_float(msg.get("initialBuy"), 0.0)
     if init_buy < MIN_INITIAL_BUY_SOL:
         return False
 
@@ -61,10 +60,6 @@ def _passes_filters(msg: Dict[str, Any]) -> bool:
 # ------------------------------------------------------
 
 async def _post_buy_exit_test(mint: str) -> None:
-    """
-    Optional smoke-test: if POSTBUY_MODE=immediate_sell_test, wait 5s then
-    sell 100% via Jupiter. Otherwise no-op.
-    """
     mode = os.getenv("POSTBUY_MODE", "").strip().lower()
     if mode == "immediate_sell_test":
         await asyncio.sleep(5)
@@ -75,10 +70,9 @@ async def _post_buy_exit_test(mint: str) -> None:
             print(f"[post-buy test] sell failed for {mint}: {e}", flush=True)
 
 class Strategy:
-    """Streams PumpPortal events and triggers buys for tokens that pass filters."""
     def __init__(self) -> None:
         self._seen_mints: set[str] = set()
-        self._cooldown = float(os.getenv("SCANNER_PERIOD_SEC", "15"))  # micro-cooldown
+        self._cooldown = float(os.getenv("SCANNER_PERIOD_SEC", "15"))
         self._max_conc = int(os.getenv("PF_MAX_CONCURRENT", "2"))
         self._sema = asyncio.Semaphore(max(1, self._max_conc))
 
@@ -93,29 +87,27 @@ class Strategy:
 
         async with self._sema:
             try:
-                # ✅ buy path (maybe real, maybe DRYRUN) — pump_trader decides size/slippage/prio
-                await maybe_buy(mint=mint, ui=m)
+                # ✅ buy path → capture signature
+                sig = await maybe_buy(mint=mint, ui=m)
 
-                # 🔔 after a *real* fill:
-                # either run the immediate-sell test OR register the position into the exit engine.
+                # after a *real* fill:
                 if not IS_DRYRUN and EXIT_ENGINE_ENABLED:
                     if os.getenv("POSTBUY_MODE", "").strip().lower() == "immediate_sell_test":
                         asyncio.create_task(_post_buy_exit_test(mint))
                     else:
-                        asyncio.create_task(exit_engine.on_buy_filled(mint))
+                        # pass the tx signature so we learn from the transaction itself
+                        asyncio.create_task(exit_engine.on_buy_filled(mint, tx_sig=sig))
             except Exception:
                 print("[strategy] maybe_buy exception:", flush=True)
                 traceback.print_exc()
 
-        # avoid spamming back-to-back tokens
         await asyncio.sleep(self._cooldown)
 
     async def on_trade(self, m: Dict[str, Any]) -> None:
-        # optional analytics/hooks for your own dashboards
         return
 
 async def stream_loop() -> None:
-    client = PumpPortalClient()  # uses PF_PP_KEY / PF_PP_ACCOUNT / PF_PP_MINTS
+    client = PumpPortalClient()
     strat = Strategy()
 
     print("[main] Connecting:", client.masked_uri(), flush=True)
@@ -124,18 +116,16 @@ async def stream_loop() -> None:
         if k == "new_token":
             await strat.on_new_token(raw)
         elif k == "trade" and EXIT_ENGINE_ENABLED:
-            # feed live ticks into exit engine for TP/TP2/TSL/SL
             await exit_engine.on_trade_tick(raw)
             await strat.on_trade(raw)
 
 async def main() -> None:
-    """Never returns: reconnects on socket end/crash with backoff."""
     backoff = 3
     while True:
         try:
             await stream_loop()
             print("[main] stream ended (remote closed). Reconnecting...", flush=True)
-            backoff = 3  # reset after a clean end
+            backoff = 3
         except asyncio.CancelledError:
             raise
         except Exception:

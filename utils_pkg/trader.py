@@ -112,10 +112,6 @@ def _rpc(method: str, params: list) -> Any:
     return js["result"]
 
 def _sum_token_balance_iu_via_program_scan(owner: str, mint: str) -> Tuple[int, int]:
-    """
-    Fallback: enumerate token accounts by programId (Token + Token-2022),
-    then filter by mint client-side. Works when the RPC rejects {"mint": ...}.
-    """
     total = 0
     decimals: Optional[int] = None
     for prog in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
@@ -133,10 +129,6 @@ def _sum_token_balance_iu_via_program_scan(owner: str, mint: str) -> Tuple[int, 
     return total, (decimals or 0)
 
 def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
-    """
-    Try the fast path with {"mint": mint}. If empty or RPC says "could not find mint",
-    fall back to scanning by programId across both token programs.
-    """
     try:
         res = _rpc("getTokenAccountsByOwner", [
             owner, {"mint": mint}, {"encoding": "jsonParsed"}
@@ -176,6 +168,80 @@ async def _wait_tx_confirmed(sig: str, *, max_secs: float = 30.0) -> bool:
                 return True
         await asyncio.sleep(0.8)
     return False
+
+# ---- Learn from buy transaction (fast path) ----------------------------------
+
+def _parse_tx_token_delta_for_owner(tx: dict, owner: str, mint: str) -> Tuple[int, int]:
+    """
+    Return (delta_amount_iu, decimals) for `owner` & `mint` from a parsed getTransaction.
+    If delta can't be computed, fall back to post balance (useful on first buy).
+    """
+    meta = (tx or {}).get("meta") or {}
+    pre  = meta.get("preTokenBalances") or []
+    post = meta.get("postTokenBalances") or []
+
+    # Map pre by (accountIndex) for quick lookups
+    pre_by_idx: Dict[int, Tuple[int, int]] = {}
+    for b in pre:
+        if (b.get("owner") == owner) and (b.get("mint") == mint):
+            ui = b.get("uiTokenAmount") or {}
+            amt = int(ui.get("amount", "0"))
+            dec = int(ui.get("decimals", 0))
+            pre_by_idx[int(b.get("accountIndex", -1))] = (amt, dec)
+
+    total_delta = 0
+    decimals = 0
+    any_match = False
+    post_sum = 0
+
+    for b in post:
+        if (b.get("owner") == owner) and (b.get("mint") == mint):
+            any_match = True
+            ui = b.get("uiTokenAmount") or {}
+            post_amt = int(ui.get("amount", "0"))
+            decimals = int(ui.get("decimals", 0)) or decimals
+            post_sum += post_amt
+
+            idx = int(b.get("accountIndex", -1))
+            if idx in pre_by_idx:
+                pre_amt, _ = pre_by_idx[idx]
+                total_delta += max(0, post_amt - pre_amt)
+            else:
+                total_delta += post_amt  # assume new ATA
+
+    if any_match:
+        if total_delta > 0:
+            return total_delta, decimals
+        return post_sum, decimals  # fallback
+
+    return 0, 0
+
+async def _learn_from_tx_sig(owner: str, mint: str, sig: str, *, max_wait: float = 45.0) -> Tuple[int, int]:
+    """
+    Poll getTransaction(jsonParsed) for the buy signature and compute how much
+    of `mint` landed in `owner`'s wallet. Returns (amount_iu, decimals).
+    """
+    t0 = time.time()
+    while time.time() - t0 < max_wait:
+        try:
+            tx = _rpc("getTransaction", [
+                sig,
+                {
+                    "encoding": "jsonParsed",
+                    "commitment": "confirmed",
+                    "maxSupportedTransactionVersion": 0
+                }
+            ])
+        except Exception:
+            tx = None
+
+        if tx:
+            amt_iu, dec = _parse_tx_token_delta_for_owner(tx, owner, mint)
+            if amt_iu > 0:
+                return amt_iu, dec
+        await asyncio.sleep(1.2)
+
+    return 0, 0
 
 # =============================================================================
 # Jupiter quote / swap (LEGACY tx)
@@ -248,11 +314,6 @@ def _tg_send(text: str) -> None:
 # =============================================================================
 
 async def sell_on_jupiter(mint: str, *, pct_of_wallet: float = 1.0) -> Optional[str]:
-    """
-    Sell `pct_of_wallet` of the SPL token `mint` into SOL via Jupiter.
-    Returns the signature if broadcasted, or None if nothing to sell.
-    Respects DRY_RUN=1.
-    """
     kp = load_keypair()
     owner = get_pubkey_str(kp)
 
@@ -298,41 +359,46 @@ class PositionsExitEngine:
         self.owner = get_pubkey_str(load_keypair())
         self.pos: Dict[str, Dict[str, Any]] = {}  # mint -> state
 
-    async def on_buy_filled(self, mint: str, *, poll_sec: float = POS_LEARN_BASE_DELAY_SEC) -> None:
+    async def on_buy_filled(self, mint: str, *, tx_sig: Optional[str] = None,
+                            poll_sec: float = POS_LEARN_BASE_DELAY_SEC) -> None:
         """
-        After a buy, poll the wallet for a while to learn the filled size.
-        Newly-created pump mints sometimes aren't immediately readable on RPC,
-        so we retry with controlled backoff and quiet logging.
+        Learn position size. Prefer parsing the buy transaction (tx_sig) for the
+        exact credited amount; fall back to RPC wallet scans if needed.
         """
-        max_attempts = max(1, int(POS_LEARN_MAX_ATTEMPTS))
-        delay = max(1.0, float(poll_sec))
-
+        # 1) Fast path: learn from the transaction itself
         amt_iu, dec = 0, 0
-        last_err: Optional[Exception] = None
-        for i in range(1, max_attempts + 1):
-            await asyncio.sleep(delay)
-            try:
-                amt_iu, dec = _sum_token_balance_iu(self.owner, mint)
-                if amt_iu > 0:
-                    break
-                last_err = None
-            except Exception as e:
-                last_err = e
+        if tx_sig:
+            amt_iu, dec = await _learn_from_tx_sig(self.owner, mint, tx_sig, max_wait=45.0)
 
-            # backoff and throttle logs
-            delay = min(delay * float(POS_LEARN_BACKOFF), 30.0)
-            if i in (1, 2, 3) or (POS_LEARN_LOG_EVERY and i % POS_LEARN_LOG_EVERY == 0):
-                if last_err:
-                    print(f"[pos] retry learn {mint} attempt {i}/{max_attempts}... last_bal={amt_iu} err={last_err}", flush=True)
-                else:
-                    print(f"[pos] retry learn {mint} attempt {i}/{max_attempts}... last_bal={amt_iu}", flush=True)
-
+        # 2) If tx parsing didn’t yield, fall back to scanning the wallet with backoff
         if amt_iu <= 0:
-            if last_err:
-                print(f"[pos] giving up learn {mint}: {last_err}", flush=True)
-            else:
-                print(f"[pos] giving up learn {mint}: still zero after retries", flush=True)
-            return
+            max_attempts = max(1, int(POS_LEARN_MAX_ATTEMPTS))
+            delay = max(1.0, float(poll_sec))
+            last_err: Optional[Exception] = None
+
+            for i in range(1, max_attempts + 1):
+                await asyncio.sleep(delay)
+                try:
+                    amt_iu, dec = _sum_token_balance_iu(self.owner, mint)
+                    if amt_iu > 0:
+                        break
+                    last_err = None
+                except Exception as e:
+                    last_err = e
+
+                delay = min(delay * float(POS_LEARN_BACKOFF), 30.0)
+                if i in (1, 2, 3) or (POS_LEARN_LOG_EVERY and i % POS_LEARN_LOG_EVERY == 0):
+                    if last_err:
+                        print(f"[pos] retry learn {mint} attempt {i}/{max_attempts}... last_bal={amt_iu} err={last_err}", flush=True)
+                    else:
+                        print(f"[pos] retry learn {mint} attempt {i}/{max_attempts}... last_bal={amt_iu}", flush=True)
+
+            if amt_iu <= 0:
+                if last_err:
+                    print(f"[pos] giving up learn {mint}: {last_err}", flush=True)
+                else:
+                    print(f"[pos] giving up learn {mint}: still zero after retries", flush=True)
+                return
 
         # estimate entry price via a tiny quote (1% of size, clamped)
         sample = max(1, min(amt_iu // 100, amt_iu))
@@ -355,7 +421,6 @@ class PositionsExitEngine:
         print(f"[pos] learned entry for {mint}: size_iu={amt_iu} entry≈{price_sol} SOL", flush=True)
 
     async def on_trade_tick(self, msg: Dict[str, Any]) -> None:
-        """Call on every PumpPortal trade tick."""
         mint = _extract_mint(msg)
         if not mint or mint not in self.pos:
             return
@@ -371,14 +436,12 @@ class PositionsExitEngine:
             out_lamports = float(q.get("outAmount", 0))
             px_sol = (out_lamports / sample) / 1_000_000_000.0
         except Exception:
-            return  # skip if quote fails briefly
+            return
 
-        # If we never got entry price (quote failed earlier), set it now
         if not st.get("entry_sol"):
             st["entry_sol"] = px_sol
             st["peak_sol"]  = px_sol
 
-        # update peak (for TSL)
         st["peak_sol"] = max(st.get("peak_sol") or px_sol, px_sol)
         st["last_ts"]  = time.time()
 
@@ -389,28 +452,24 @@ class PositionsExitEngine:
         pnl_pct = (px_sol / entry - 1.0) * 100.0
         drawdown_from_peak_pct = (px_sol / (st["peak_sol"] or px_sol) - 1.0) * 100.0
 
-        # ----- Hard stop -----
         if pnl_pct <= EXIT_HARD_STOP_PCT:
             print(f"[exit] HARD STOP {mint} pnl={pnl_pct:.1f}%")
             await sell_on_jupiter(mint, pct_of_wallet=1.0)
             st["size_iu"] = 0
             return
 
-        # ----- TP1 -----
         if (not st["tp1_done"]) and (pnl_pct >= EXIT_TP1_PCT):
             print(f"[exit] TP1 {mint} pnl={pnl_pct:.1f}% sell={EXIT_TP1_SELL_PCT:.0%}")
             await sell_on_jupiter(mint, pct_of_wallet=EXIT_TP1_SELL_PCT)
             st["tp1_done"] = True
             return
 
-        # ----- TP2 -----
         if (not st["tp2_done"]) and (pnl_pct >= EXIT_TP2_PCT):
             print(f"[exit] TP2 {mint} pnl={pnl_pct:.1f}% sell={EXIT_TP2_SELL_PCT:.0%}")
             await sell_on_jupiter(mint, pct_of_wallet=EXIT_TP2_SELL_PCT)
             st["tp2_done"] = True
             return
 
-        # ----- Trailing stop (armed after EXIT_TSL_ARM_PCT) -----
         if pnl_pct >= EXIT_TSL_ARM_PCT:
             if drawdown_from_peak_pct <= -EXIT_TSL_TRAIL_PCT:
                 print(f"[exit] TSL {mint} drop_from_peak={drawdown_from_peak_pct:.1f}% -> exit")

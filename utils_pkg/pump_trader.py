@@ -115,11 +115,10 @@ def _call_local(body: Dict[str, Any]) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Public: BUY helper
 # ──────────────────────────────────────────────────────────────────────────────
-async def maybe_buy(mint: str, **kwargs) -> None:
+async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
     """
-    Execute a buy via PumpPortal Lightning. Only trades tokens whose `pool` is allowed
-    by PF_POOLS (default: only 'pump'). We treat odd non-JSON Lightning replies as
-    transient and quietly skip the attempt to avoid log spam.
+    Execute a buy via PumpPortal Lightning and return the transaction signature
+    (or None on skip/error). Only trades tokens whose `pool` is allowed by PF_POOLS.
     """
     ui = kwargs.get("ui") or {}
     symbol = (kwargs.get("symbol") or ui.get("symbol") or "").strip()
@@ -127,14 +126,14 @@ async def maybe_buy(mint: str, **kwargs) -> None:
 
     if pool not in PF_POOLS:
         print(f"[skip] unsupported pool '{pool}' for {mint}; allowed={sorted(PF_POOLS)}; skipping.")
-        return
+        return None
 
     label   = f"{symbol} ({mint})" if symbol else mint
     amt_sol = current_trade_sol()
 
     if DRY_RUN:
         print(f"[DRYRUN] would buy {label} on {pool} for {amt_sol} SOL")
-        return
+        return None
 
     kp = load_keypair()
     payer_pub = get_pubkey_str(kp)
@@ -153,60 +152,56 @@ async def maybe_buy(mint: str, **kwargs) -> None:
     try:
         resp = _call_lightning(body)
     except TemporaryPumpPortal as te:
-        # Known transient; just back off for this token.
         print(f"[BUY TEMP] lightning quirk for {mint}: {te}")
-        return
+        return None
     except Exception as e:
-        # Hard failure from Lightning. Optionally try local, otherwise bail.
         if USE_LOCAL_FALLBK:
             try:
                 resp = _call_local(body)
             except TemporaryPumpPortal as te2:
                 print(f"[BUY TEMP] local quirk for {mint}: {te2}")
-                return
+                return None
             except Exception as e2:
                 print(f"[BUY ERR] local builder failed for {mint}: {e2}")
-                return
+                return None
         else:
             print(f"[BUY ERR] lightning call failed for {mint}: {e}")
-            return
+            return None
 
-    # 2) Handle a successful JSON result
-    await _handle_trade_response(label, resp, kp, mint)
+    # 2) Handle JSON result → return signature if we have one
+    return await _handle_trade_response(label, resp, kp, mint)
 
-async def _handle_trade_response(label: str, resp: Dict[str, Any], kp, mint: str) -> None:
+async def _handle_trade_response(label: str, resp: Dict[str, Any], kp, mint: str) -> Optional[str]:
     """
     Normalize PumpPortal responses:
-      - If 'errors' array has items:
-          • If they include 'Failed to get bonding curve...' → treat as transient (quiet skip).
-          • Else print once and return.
+      - If 'errors' → transient/skip.
       - If 'signature' → success (executed server-side).
       - If 'transaction' (base64) → sign & send locally.
+    Returns the broadcast signature or None.
     """
     errs = resp.get("errors") or []
     if isinstance(errs, list) and errs:
         msg = " | ".join(str(e) for e in errs)
         if "Failed to get bonding curve" in msg:
-            # Happens on very fresh or non-pump pools — not actionable, skip quietly.
             print(f"[BUY TEMP] bonding-curve not ready for {mint}; skipping for now.")
-            return
+            return None
         print(f"[BUY ERR] pumpportal errors for {mint}: {errs}")
-        return
+        return None
 
     sig = resp.get("signature")
     if sig:
         print(f"[BUY OK] {label} — executed via Lightning. https://solscan.io/tx/{sig}")
-        return
+        return sig
 
     tx_b64 = resp.get("transaction") or resp.get("tx")
     if tx_b64:
         try:
             sig2 = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
             print(f"[BUY OK] {label} — signed & sent. https://solscan.io/tx/{sig2}")
+            return sig2
         except Exception as e:
             print(f"[BUY ERR] send failed for {mint}: {e}")
-        return
+            return None
 
-    # No signature nor transaction -> strange but not fatal
-    short = str(resp)[:300]
-    print(f"[BUY ERR] unexpected PumpPortal response for {mint}: {short}")
+    print(f"[BUY ERR] unexpected PumpPortal response for {mint}: {str(resp)[:300]}")
+    return None
