@@ -356,7 +356,6 @@ async def sell_on_jupiter(mint: str, *, pct_of_wallet: float = 1.0) -> Optional[
 # =============================================================================
 # Exit Engine (positions + rules) — FINAL PATCH
 # =============================================================================
-from __future__ import annotations
 import os, time, asyncio, requests
 from typing import Dict, Any, Optional, Tuple
 
