@@ -13,7 +13,7 @@ from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.signature import Signature
-
+from solders.pubkey import Pubkey
 
 # -----------------------------------------------------------------------------
 # RPC endpoint
@@ -63,7 +63,14 @@ async def get_balance_sol(pub: Union[str, Pubkey]) -> float:
         r = await c.get_balance(pk)
         return r.value / 1e9
 
+# --- compat helpers for pubkey access ---
+def get_pubkey(kp) -> Pubkey:
+    """Return a Pubkey from either solders.Keypair or solana-py Keypair."""
+    return kp.pubkey() if hasattr(kp, "pubkey") else kp.public_key
 
+def get_pubkey_str(kp) -> str:
+    """Base58 string form of the wallet pubkey."""
+    return str(get_pubkey(kp))
 # -----------------------------------------------------------------------------
 # Transaction signing & sending (LEGACY ONLY)
 # -----------------------------------------------------------------------------
