@@ -36,6 +36,9 @@ def _istrue(name: str, default: str = "0") -> bool:
 
 IS_DRYRUN = _istrue("DRY_RUN", "0")
 RPC_URL   = os.getenv("SOL_RPC_URL")
+TX_RPC_URL = os.getenv("SOL_RPC_TX_URL") or os.getenv("PF_TX_RPC_URL") or RPC_URL
+PF_PP_ACCOUNT = (os.getenv("PF_PP_ACCOUNT") or "").strip() or None
+PF_DEBUG_TX = str(os.getenv("PF_DEBUG_TX", "0")).lower() in {"1","true","yes","y","on"}
 
 # Canonical mints
 SOL_MINT  = "So11111111111111111111111111111111111111112"
@@ -97,11 +100,11 @@ def _priority_lamports() -> Optional[int]:
 # RPC helpers
 # =============================================================================
 
-def _rpc(method: str, params: list) -> Any:
-    if not RPC_URL:
-        raise RuntimeError("SOL_RPC_URL is not set")
+def _rpc_node(url: str, method: str, params: list) -> Any:
+    if not url:
+        raise RuntimeError("RPC URL is not set")
     r = requests.post(
-        RPC_URL,
+        url,
         json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
         timeout=20,
     )
@@ -110,6 +113,12 @@ def _rpc(method: str, params: list) -> Any:
     if "error" in js:
         raise RuntimeError(js["error"])
     return js["result"]
+
+def _rpc(method: str, params: list) -> Any:
+    return _rpc_node(RPC_URL, method, params)
+
+def _rpc_tx(method: str, params: list) -> Any:
+    return _rpc_node(TX_RPC_URL, method, params)
 
 def _sum_token_balance_iu_via_program_scan(owner: str, mint: str) -> Tuple[int, int]:
     total = 0
@@ -213,7 +222,9 @@ def _parse_tx_token_delta_for_owner(tx: dict, owner: str, mint: str) -> Tuple[in
         if total_delta > 0:
             return total_delta, decimals
         return post_sum, decimals  # fallback
-
+ if PF_DEBUG_TX and (post):
+        owners = {(b.get("owner"), b.get("mint")) for b in post}
+        print(f"[pos:debug] postTokenBalances owners for tx include: {owners}", flush=True)
     return 0, 0
 
 async def _learn_from_tx_sig(owner: str, mint: str, sig: str, *, max_wait: float = 45.0) -> Tuple[int, int]:
@@ -224,7 +235,7 @@ async def _learn_from_tx_sig(owner: str, mint: str, sig: str, *, max_wait: float
     t0 = time.time()
     while time.time() - t0 < max_wait:
         try:
-            tx = _rpc("getTransaction", [
+            tx = _rpc_tx("getTransaction", [
                 sig,
                 {
                     "encoding": "jsonParsed",
@@ -241,6 +252,9 @@ async def _learn_from_tx_sig(owner: str, mint: str, sig: str, *, max_wait: float
                 return amt_iu, dec
         await asyncio.sleep(1.2)
 
+if PF_DEBUG_TX:
+        print(f"[pos] tx not visible on TX RPC for {sig}. "
+              f"Set SOL_RPC_TX_URL to a node that supports getTransaction.", flush=True)
     return 0, 0
 
 # =============================================================================
@@ -356,8 +370,9 @@ def _extract_mint(msg: Dict[str, Any]) -> str:
 
 class PositionsExitEngine:
     def __init__(self) -> None:
-        self.owner = get_pubkey_str(load_keypair())
-        self.pos: Dict[str, Dict[str, Any]] = {}  # mint -> state
+        # prefer explicit PF_PP_ACCOUNT, else local keypair pubkey
+        self.owner = PF_PP_ACCOUNT or get_pubkey_str(load_keypair())
+        self.pos: Dict[str, Dict[str, Any]] = {}
 
     async def on_buy_filled(self, mint: str, *, tx_sig: Optional[str] = None,
                             poll_sec: float = POS_LEARN_BASE_DELAY_SEC) -> None:

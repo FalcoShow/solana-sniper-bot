@@ -23,6 +23,7 @@ PF_SLIPPAGE_BPS  = int(os.getenv("PF_SLIPPAGE_BPS", "800"))       # default 8.00
 PF_PRIORITY_SOL  = float(os.getenv("PF_PRIORITY_SOL", "0.002"))
 PF_POOLS         = {p.strip().lower() for p in (os.getenv("PF_POOLS", "pump").split(","))}
 USE_LOCAL_FALLBK = _is_true(os.getenv("PF_USE_LOCAL_FALLBACK", "0"))
+PF_PP_ACCOUNT = (os.getenv("PF_PP_ACCOUNT") or "").strip() or None
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -136,7 +137,7 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
         return None
 
     kp = load_keypair()
-    payer_pub = get_pubkey_str(kp)
+    payer_pub = PF_PP_ACCOUNT or get_pubkey_str(kp) 
 
     body = _build_body(
         action="buy",
