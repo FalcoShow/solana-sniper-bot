@@ -1,11 +1,25 @@
 # utils_pkg/trader.py
-import os, math, json, time, asyncio, requests, base58
+from __future__ import annotations
+
+import os
+import math
+import time
+import asyncio
 from typing import Tuple, Optional, Dict, Any
 
-from utils_pkg.solana_wallet import load_keypair, sign_and_send_b64_tx
+import requests
 import base58
 
-# ----------------- Config helpers -----------------
+from utils_pkg.solana_wallet import (
+    load_keypair,
+    get_pubkey_str,
+    sign_and_send_b64_tx,
+)
+
+# =============================================================================
+# Env & config helpers
+# =============================================================================
+
 def _envf(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
@@ -18,37 +32,50 @@ def _envi(name: str, default: int) -> int:
     except Exception:
         return default
 
-IS_DRYRUN = os.getenv("DRY_RUN", "0") == "1"
+IS_DRYRUN = str(os.getenv("DRY_RUN", "0")).strip() in {"1", "true", "yes", "y", "on"}
 RPC_URL   = os.getenv("SOL_RPC_URL")
 
 # Canonical mints
 SOL_MINT  = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
-# ----------------- Mint validation -----------------
+# =============================================================================
+# Mint validation & Jupiter legacy toggle
+# =============================================================================
+
 def _assert_mint(m: str) -> None:
     try:
         if len(base58.b58decode(m)) != 32:
-            raise ValueError("mint must decode to 32 bytes")
+            raise ValueError("decoded length is not 32 bytes")
     except Exception as e:
         raise ValueError(f"Invalid mint '{m}': {e}")
 
 def _jup_as_legacy() -> bool:
-    # default ON so we only get legacy txs (matches your wallet patch)
+    """
+    Default to legacy Jupiter transactions so our signer path (legacy-only)
+    works consistently. Set JUP_AS_LEGACY=0 if you later add v0 support.
+    """
     v = os.getenv("JUP_AS_LEGACY", "1")
-    return str(v).lower() in ("1", "true", "yes", "y")
-# ----------------- Exit tuning (override in env for aggressiveness) -----------------
-EXIT_TP1_PCT         = _envf("EXIT_TP1_PCT", 40.0)      # +40% → take partial
-EXIT_TP1_SELL_PCT    = _envf("EXIT_TP1_SELL_PCT", 0.40) # sell 40% at TP1
-EXIT_TP2_PCT         = _envf("EXIT_TP2_PCT", 100.0)     # +100% → take more
-EXIT_TP2_SELL_PCT    = _envf("EXIT_TP2_SELL_PCT", 0.30) # sell 30% at TP2
-EXIT_TSL_ARM_PCT     = _envf("EXIT_TSL_ARM_PCT", 60.0)  # arm trailing stop when +60%
-EXIT_TSL_TRAIL_PCT   = _envf("EXIT_TSL_TRAIL_PCT", 20.0)# trail gap 20% off the peak
-EXIT_HARD_STOP_PCT   = _envf("HARD_STOP_PCT", -32.0)    # kill if drawdown from entry <= -32%
+    return str(v).lower() in {"1", "true", "yes", "y"}
 
-# ----------------- Sell path settings -----------------
+# =============================================================================
+# Exit / risk tuning (override with env to adjust aggressiveness)
+# =============================================================================
+
+EXIT_TP1_PCT         = _envf("EXIT_TP1_PCT", 40.0)       # +40% → take partial
+EXIT_TP1_SELL_PCT    = _envf("EXIT_TP1_SELL_PCT", 0.40)  # sell 40% at TP1
+EXIT_TP2_PCT         = _envf("EXIT_TP2_PCT", 100.0)      # +100% → take more
+EXIT_TP2_SELL_PCT    = _envf("EXIT_TP2_SELL_PCT", 0.30)  # sell 30% at TP2
+EXIT_TSL_ARM_PCT     = _envf("EXIT_TSL_ARM_PCT", 60.0)   # arm trailing stop when +60%
+EXIT_TSL_TRAIL_PCT   = _envf("EXIT_TSL_TRAIL_PCT", 20.0) # trail gap 20% off the peak
+EXIT_HARD_STOP_PCT   = _envf("HARD_STOP_PCT", -32.0)     # kill if drawdown <= -32%
+
+# =============================================================================
+# Sell path helpers
+# =============================================================================
+
 def _slippage_bps() -> int:
-    # JUPITER_MAX_SLIPPAGE stored as fraction (e.g. 0.0125 = 1.25%)
+    # JUPITER_MAX_SLIPPAGE as fraction (e.g. 0.0125 = 1.25%)
     s = _envf("JUPITER_MAX_SLIPPAGE", 0.0125)
     return max(1, int(round(s * 10_000)))
 
@@ -61,7 +88,10 @@ def _priority_lamports() -> Optional[int]:
     except Exception:
         return None
 
-# ----------------- RPC helpers -----------------
+# =============================================================================
+# RPC helpers
+# =============================================================================
+
 def _rpc(method: str, params: list) -> Any:
     if not RPC_URL:
         raise RuntimeError("SOL_RPC_URL is not set")
@@ -80,6 +110,7 @@ def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
     """
     Return (amount_in_base_units, decimals) across all token accounts for `mint`.
     """
+    _assert_mint(mint)
     res = _rpc("getTokenAccountsByOwner", [
         owner, {"mint": mint}, {"encoding": "jsonParsed"}
     ])
@@ -93,19 +124,24 @@ def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
         total += amt
     return total, decimals
 
-# ----------------- Jupiter quote/swap -----------------
+# =============================================================================
+# Jupiter quote / swap (LEGACY tx)
+# =============================================================================
+
 def _jup_quote(input_mint: str, output_mint: str, amount_iu: int) -> dict:
     _assert_mint(input_mint); _assert_mint(output_mint)
 
     url = "https://quote-api.jup.ag/v6/quote"
+    # Some Jupiter edge deployments are picky about types on these two flags,
+    # so we send them as strings here (works reliably in practice).
     q = {
         "inputMint": input_mint,
         "outputMint": output_mint,
         "amount": str(amount_iu),
         "slippageBps": _slippage_bps(),
         "swapMode": "ExactIn",
-        "onlyDirectRoutes": "false",                                  # <- string
-        "asLegacyTransaction": "true" if _jup_as_legacy() else "false",  # <- string
+        "onlyDirectRoutes": "false",
+        "asLegacyTransaction": "true" if _jup_as_legacy() else "false",
     }
     r = requests.get(url, params=q, timeout=20)
     if not r.ok:
@@ -117,17 +153,16 @@ def _jup_swap(user_pubkey: str, quote: dict, priority_lamports: Optional[int]) -
     body = {
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": True,
-        "dynamicComputeUnitLimit": True,  # optional but helpful
+        "dynamicComputeUnitLimit": True,
         "quoteResponse": quote,
-        "asLegacyTransaction": True,      # <-- boolean, not string; only once
+        # swap endpoint accepts real booleans
+        "asLegacyTransaction": True if _jup_as_legacy() else False,
     }
     if priority_lamports is not None:
-        # you can also send the advanced structure shown in docs; this simple int is fine
         body["prioritizationFeeLamports"] = priority_lamports
 
     r = requests.post(url, json=body, timeout=20)
     if not r.ok:
-        # bubble up server’s message so we’re not debugging blind
         try:
             detail = r.json()
         except Exception:
@@ -139,7 +174,11 @@ def _jup_swap(user_pubkey: str, quote: dict, priority_lamports: Optional[int]) -
     if not tx_b64:
         raise RuntimeError(f"Jupiter swap returned no transaction: {js}")
     return tx_b64
-# ----------------- Telegram (optional) -----------------
+
+# =============================================================================
+# Telegram (optional)
+# =============================================================================
+
 def _tg_send(text: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat  = os.getenv("TELEGRAM_CHAT_ID")
@@ -154,17 +193,25 @@ def _tg_send(text: str) -> None:
     except Exception:
         pass
 
-# ----------------- Public: SELL -----------------
+# =============================================================================
+# Public: SELL
+# =============================================================================
+
 async def sell_on_jupiter(mint: str, *, pct_of_wallet: float = 1.0) -> Optional[str]:
     """
-    Sell `pct_of_wallet` of the SPL token `mint` into SOL using Jupiter.
+    Sell `pct_of_wallet` of the SPL token `mint` into SOL via Jupiter.
     Returns the signature if broadcasted, or None if nothing to sell.
     Respects DRY_RUN=1.
     """
     kp = load_keypair()
-    owner = str(kp.pubkey())
+    owner = get_pubkey_str(kp)
 
-    bal_iu, decimals = _sum_token_balance_iu(owner, mint)
+    try:
+        bal_iu, _decimals = _sum_token_balance_iu(owner, mint)
+    except Exception as e:
+        print(f"[SELL] balance query failed for {mint}: {e}")
+        return None
+
     if bal_iu <= 0:
         print(f"[SELL] no balance for {mint}")
         return None
@@ -175,7 +222,6 @@ async def sell_on_jupiter(mint: str, *, pct_of_wallet: float = 1.0) -> Optional[
         print(f"[SELL] computed 0 amount for {mint}")
         return None
 
-    # price discovery & route
     quote = _jup_quote(mint, SOL_MINT, sell_iu)
 
     if IS_DRYRUN:
@@ -190,7 +236,10 @@ async def sell_on_jupiter(mint: str, *, pct_of_wallet: float = 1.0) -> Optional[
     _tg_send(f"✅ SOLD {mint} • pct={pct:.0%} • tx: https://solscan.io/tx/{sig}")
     return sig
 
-# ----------------- Exit Engine (positions + rules) -----------------
+# =============================================================================
+# Exit Engine (positions + rules)
+# =============================================================================
+
 def _extract_mint(msg: Dict[str, Any]) -> str:
     return (msg.get("mint") or msg.get("mintAddress") or msg.get("mint_address") or "").strip()
 
@@ -203,7 +252,7 @@ class PositionsExitEngine:
     """
 
     def __init__(self) -> None:
-        self.owner = str(load_keypair().pubkey())
+        self.owner = get_pubkey_str(load_keypair())
         self.pos: Dict[str, Dict[str, Any]] = {}  # mint -> state
 
     async def on_buy_filled(self, mint: str, *, poll_sec: float = 6.0) -> None:
@@ -212,10 +261,18 @@ class PositionsExitEngine:
         Safe to call even if the buy failed; it’ll just see 0 and return.
         """
         await asyncio.sleep(poll_sec)  # let the fill settle
-        amt_iu, dec = _sum_token_balance_iu(self.owner, mint)
+
+        try:
+            amt_iu, dec = _sum_token_balance_iu(self.owner, mint)
+        except Exception as e:
+            # e.g., RPC: "could not find mint" or transient index lag — just skip quietly
+            print(f"[pos] skip learn {mint}: {e}")
+            return
+
         if amt_iu <= 0:
             return
-        # estimate entry price via a tiny quote (1% of size, clamped)
+
+        # estimate entry price via a tiny quote (≈1% of size, clamped)
         sample = max(1, min(amt_iu // 100, amt_iu))
         try:
             q = _jup_quote(mint, SOL_MINT, sample)
@@ -298,10 +355,9 @@ class PositionsExitEngine:
         # ----- Trailing stop (armed after EXIT_TSL_ARM_PCT) -----
         if pnl_pct >= EXIT_TSL_ARM_PCT:
             if drawdown_from_peak_pct <= -EXIT_TSL_TRAIL_PCT:
-                sell_pct = 1.0  # close remainder
                 print(f"[exit] TSL {mint} drop_from_peak={drawdown_from_peak_pct:.1f}% -> exit")
                 _tg_send(f"🪢 TSL {mint} drop={drawdown_from_peak_pct:.1f}% -> exit")
-                await sell_on_jupiter(mint, pct_of_wallet=sell_pct)
+                await sell_on_jupiter(mint, pct_of_wallet=1.0)  # close remainder
                 st["size_iu"] = 0
                 return
 
