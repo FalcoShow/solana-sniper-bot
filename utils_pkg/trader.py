@@ -38,6 +38,8 @@ RPC_URL   = os.getenv("SOL_RPC_URL")
 # Canonical mints
 SOL_MINT  = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
 # =============================================================================
 # Mint validation & Jupiter legacy toggle
@@ -106,24 +108,63 @@ def _rpc(method: str, params: list) -> Any:
         raise RuntimeError(js["error"])
     return js["result"]
 
+def _sum_token_balance_iu_via_program_scan(owner: str, mint: str) -> Tuple[int, int]:
+    """
+    Fallback: enumerate token accounts by programId (both classic + 2022),
+    then filter by mint client-side. Works even if the RPC refuses the "mint" filter.
+    """
+    total = 0
+    decimals: Optional[int] = None
+
+    for prog in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
+        res = _rpc("getTokenAccountsByOwner", [
+            owner, {"programId": prog}, {"encoding": "jsonParsed"}
+        ]) or {}
+        for it in res.get("value", []):
+            info = it["account"]["data"]["parsed"]["info"]
+            if info.get("mint") != mint:
+                continue
+            ta = info.get("tokenAmount", {})
+            total += int(ta.get("amount", "0"))
+            if decimals is None:
+                decimals = int(ta.get("decimals", 0))
+
+    return total, (decimals or 0)
+
+
 def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
     """
-    Return (amount_in_base_units, decimals) across all token accounts for `mint`.
+    Try the fast path with {"mint": mint}. If the RPC complains (or returns nothing),
+    fall back to scanning by programId across Token + Token-2022.
     """
-    _assert_mint(mint)
-    res = _rpc("getTokenAccountsByOwner", [
-        owner, {"mint": mint}, {"encoding": "jsonParsed"}
-    ])
-    total = 0
-    decimals = 0
-    for it in res.get("value", []):
-        info = it["account"]["data"]["parsed"]["info"]
-        ta = info["tokenAmount"]
-        decimals = int(ta.get("decimals", 0))
-        amt = int(ta.get("amount", "0"))
-        total += amt
-    return total, decimals
+    try:
+        res = _rpc("getTokenAccountsByOwner", [
+            owner, {"mint": mint}, {"encoding": "jsonParsed"}
+        ]) or {}
+        value = res.get("value", [])
+        if not value:
+            # empty result can be a race; scan programs to be sure
+            return _sum_token_balance_iu_via_program_scan(owner, mint)
 
+        total = 0
+        decimals = 0
+        for it in value:
+            info = it["account"]["data"]["parsed"]["info"]
+            ta = info["tokenAmount"]
+            decimals = int(ta.get("decimals", 0)) or decimals
+            total += int(ta.get("amount", "0"))
+        return total, decimals
+
+    except Exception as e:
+        # Handle "Invalid param: could not find mint" and similar
+        msg = str(e)
+        if "could not find mint" in msg or "Invalid param" in msg:
+            return _sum_token_balance_iu_via_program_scan(owner, mint)
+        # Unknown failure: still try the robust path, then rethrow if zero
+        total, dec = _sum_token_balance_iu_via_program_scan(owner, mint)
+        if total > 0:
+            return total, dec
+        raise
 # =============================================================================
 # Jupiter quote / swap (LEGACY tx)
 # =============================================================================
