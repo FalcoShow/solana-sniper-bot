@@ -357,30 +357,8 @@ async def sell_on_jupiter(mint: str, *, pct_of_wallet: float = 1.0) -> Optional[
 # Exit Engine (positions + rules)
 # =============================================================================
 
-# --- helpers -----------------------------------------------------------------
-def _norm_mint(m: str) -> str:
-    """Strip trailing 'pump' that PumpPortal appends to many mint strings."""
-    m = (m or "").strip()
-    return m[:-4] if m.lower().endswith("pump") else m
-
 def _extract_mint(msg: Dict[str, Any]) -> str:
-    raw = (msg.get("mint") or msg.get("mintAddress") or msg.get("mint_address") or "")
-    m = _norm_mint(raw)
-    if PF_DEBUG_TX and raw and raw != m:
-        print(f"[engine] normalized mint {raw} -> {m}", flush=True)
-    return m
-
-def _safe_account_key(keys: list, idx: int) -> str | None:
-    """Account keys in parsed tx can be strings or objects {pubkey:...}."""
-    try:
-        k = keys[idx]
-        if isinstance(k, str):
-            return k
-        if isinstance(k, dict):
-            return k.get("pubkey")
-    except Exception:
-        pass
-    return None
+    return (msg.get("mint") or msg.get("mintAddress") or msg.get("mint_address") or "").strip()
 
 # --- Config knobs (env) -------------------------------------------------------
 OWNER_FROM_ENV        = (os.getenv("PF_PP_ACCOUNT") or "").strip()
@@ -391,17 +369,14 @@ LEARN_MAX_ATTEMPTS    = _envi("PF_POS_LEARN_MAX_ATTEMPTS", 10)
 LEARN_BACKOFF         = _envf("PF_POS_LEARN_BACKOFF", 1.5)
 LEARN_LOG_EVERY       = _envi("PF_POS_LEARN_LOG_EVERY", 3)
 
-TXLEARN_TRIES         = _envi("PF_TXLEARN_TRIES", 3)        # quick attempts to read tx meta
-TXLEARN_DELAY         = _envf("PF_TXLEARN_DELAY_SEC", 0.7)  # between those tx meta attempts
+TXLEARN_TRIES         = _envi("PF_TXLEARN_TRIES", 3)           # quick attempts to read tx meta
+TXLEARN_DELAY         = _envf("PF_TXLEARN_DELAY_SEC", 0.7)     # between those tx meta attempts
+TXLEARN_PREFETCH_ATAS = str(os.getenv("PF_TXLEARN_PREFETCH_ATAS", "0")).strip().lower() in {"1","true","yes","y","on"}
 
 # Prefer a separate, faster RPC for transaction/meta lookups if provided
 RPC_TX_URL            = os.getenv("SOL_RPC_TX_URL") or os.getenv("SOL_RPC_URL")
 
 def _rpc_tx(method: str, params: list) -> Any:
-    """
-    Transaction/meta RPC. Falls back to SOL_RPC_URL if SOL_RPC_TX_URL is not set.
-    Separate from _rpc() so you can aim it at a Helius/QuickNode endpoint optimized for tx lookups.
-    """
     url = RPC_TX_URL
     if not url:
         raise RuntimeError("No RPC URL for tx lookups (set SOL_RPC_TX_URL or SOL_RPC_URL).")
@@ -418,14 +393,15 @@ def _rpc_tx(method: str, params: list) -> Any:
 
 def _owner_token_accounts(owner: str, mint: str) -> set[str]:
     """
-    Fetch the owner's token accounts (ATAs) for this mint. Useful when 'owner' is missing in postTokenBalances
-    and we must match by accountIndex -> account key.
+    Optional: fetch owner's token accounts for this mint.
+    Useful when 'owner' is missing in postTokenBalances and we want a precise index match.
+    Can be disabled via PF_TXLEARN_PREFETCH_ATAS=0 to avoid provider quirks.
     """
     try:
         res = _rpc_tx("getTokenAccountsByOwner", [
             owner,
             {"mint": mint},
-            {"encoding": "jsonParsed", "commitment": "confirmed"},
+            {"encoding": "jsonParsed", "commitment": "finalized"},
         ])
         out = set()
         for it in (res or {}).get("value", []):
@@ -437,22 +413,27 @@ def _owner_token_accounts(owner: str, mint: str) -> set[str]:
             print(f"[txlearn] owner ATAs for {mint}: {len(out)} found", flush=True)
         return out
     except Exception as e:
+        # Non-fatal; just skip this optimization
         if PF_DEBUG_TX:
             print(f"[txlearn] getTokenAccountsByOwner failed for {mint}: {e}", flush=True)
         return set()
 
 def _learn_from_tx_sig(owner: str, mint: str, tx_sig: str, owner_atas: Optional[set[str]] = None) -> Tuple[int, int]:
     """
-    Learn post-balance of `mint` for `owner` from a parsed transaction.
-    - Matches by (owner && mint) OR (accountIndex -> accountKey ∈ owner_atas && mint)
-    Returns (amount_iu, decimals). (0, 0) if not found.
+    Learn position size from a parsed transaction.
+    Strategy:
+      1) Direct owner+mint match (fast path when RPC includes 'owner').
+      2) Match by accountIndex -> accountKey ∈ owner_atas (if provided).
+      3) NEW: Pick the account for `mint` with the *largest positive delta* (post - pre).
+         This is robust across Token/Token-2022 and does not need owner/ATAs.
+    Returns (amount_iu, decimals). (0,0) if not found.
     """
     params = [
         tx_sig,
         {
             "encoding": "jsonParsed",
-            "commitment": "confirmed",
-            "maxSupportedTransactionVersion": 0,
+            "commitment": "finalized",
+            "maxSupportedTransactionVersion": 0
         },
     ]
     res = _rpc_tx("getTransaction", params)
@@ -466,24 +447,7 @@ def _learn_from_tx_sig(owner: str, mint: str, tx_sig: str, owner_atas: Optional[
     post_bal = meta.get("postTokenBalances") or []
     pre_bal  = meta.get("preTokenBalances") or []
 
-    # Build quick maps for delta checks (accountIndex -> (mint, amount, decimals))
-    def _to_map(bals: list) -> Dict[int, Tuple[str, int, int]]:
-        m: Dict[int, Tuple[str, int, int]] = {}
-        for b in bals:
-            try:
-                idx = int(b.get("accountIndex"))
-                ui  = b.get("uiTokenAmount") or {}
-                amt = int(ui.get("amount", "0"))
-                dec = int(ui.get("decimals", 0) or 0)
-                m[idx] = (b.get("mint", ""), amt, dec)
-            except Exception:
-                continue
-        return m
-
-    pre_map  = _to_map(pre_bal)
-    post_map = _to_map(post_bal)
-
-    # 1) Direct owner+mint match (when RPC includes 'owner')
+    # ---- Pass 1: direct owner+mint (when RPC includes 'owner') ----
     for b in post_bal:
         try:
             if b.get("mint") != mint:
@@ -496,14 +460,18 @@ def _learn_from_tx_sig(owner: str, mint: str, tx_sig: str, owner_atas: Optional[
         except Exception:
             continue
 
-    # 2) Match by accountIndex -> accountKey ∈ owner_atas
+    # ---- Pass 2: match by accountIndex -> accountKey ∈ owner_atas ----
     if owner_atas:
         for b in post_bal:
             try:
                 if b.get("mint") != mint:
                     continue
                 idx = int(b.get("accountIndex"))
-                acct_key = _safe_account_key(account_keys, idx)
+                acct_key = (
+                    account_keys[idx]
+                    if isinstance(account_keys[idx], str)
+                    else (account_keys[idx] or {}).get("pubkey")
+                )
                 if acct_key and acct_key in owner_atas:
                     ui  = b.get("uiTokenAmount") or {}
                     amt = int(ui.get("amount", "0"))
@@ -512,21 +480,47 @@ def _learn_from_tx_sig(owner: str, mint: str, tx_sig: str, owner_atas: Optional[
             except Exception:
                 continue
 
-    # 3) Positive delta on any account that belongs to owner (by ATA set)
-    if owner_atas and post_map:
-        for idx, (m_mint, post_amt, dec) in post_map.items():
-            if m_mint != mint:
+    # ---- Pass 3 (robust): choose the line with largest positive delta ----
+    pre_map: Dict[int, int] = {}
+    for b in pre_bal:
+        try:
+            if b.get("mint") != mint:
                 continue
-            acct_key = _safe_account_key(account_keys, idx)
-            if not acct_key or acct_key not in owner_atas:
+            idx = int(b.get("accountIndex"))
+            ui  = b.get("uiTokenAmount") or {}
+            pre_map[idx] = int(ui.get("amount", "0"))
+        except Exception:
+            pass
+
+    best = None  # (delta, post_amt, dec, idx)
+    for b in post_bal:
+        try:
+            if b.get("mint") != mint:
                 continue
-            pre_amt = (pre_map.get(idx) or ("", 0, dec))[1]
-            if post_amt > pre_amt:
-                return post_amt, dec
+            idx = int(b.get("accountIndex"))
+            ui  = b.get("uiTokenAmount") or {}
+            post_amt = int(ui.get("amount", "0"))
+            dec = int(ui.get("decimals", 0) or 0)
+            delta = post_amt - pre_map.get(idx, 0)
+            if delta > 0 and (best is None or delta > best[0]):
+                best = (delta, post_amt, dec, idx)
+        except Exception:
+            pass
+
+    if best:
+        _, post_amt, dec, idx = best
+        if PF_DEBUG_TX:
+            acct_key = (
+                account_keys[idx]
+                if isinstance(account_keys[idx], str)
+                else (account_keys[idx] or {}).get("pubkey")
+            )
+            print(f"[txlearn] chose idx={idx} acct={acct_key} post={post_amt} (largest +delta)", flush=True)
+        return post_amt, dec
 
     return 0, 0
 
-# --- Engine -------------------------------------------------------------------
+
 class PositionsExitEngine:
     def __init__(self) -> None:
         # Use PF_PP_ACCOUNT when provided to match PumpPortal payer
@@ -540,17 +534,12 @@ class PositionsExitEngine:
         mint: str,
         *,
         tx_sig: Optional[str] = None,
-        poll_sec: float = LEARN_BASE_DELAY_SEC,
+        poll_sec: float = LEARN_BASE_DELAY_SEC
     ) -> None:
         """
         After a buy, prefer to learn size from the transaction meta (instant, low-variance).
         If that fails, fall back to wallet polling with backoff.
         """
-        raw_mint = mint
-        mint = _norm_mint(mint)
-        if PF_DEBUG_TX and raw_mint != mint:
-            print(f"[txlearn] normalized mint {raw_mint} -> {mint}", flush=True)
-
         amt_iu, dec = 0, 0
 
         # ---------- Path 1: learn from transaction signature (quick retries) ----------
@@ -559,11 +548,12 @@ class PositionsExitEngine:
             if PF_DEBUG_TX:
                 print(f"[txlearn] start mint={mint} from tx={tx_sig}", flush=True)
 
-            # Pre-fetch owner's ATA(s) for this mint (helps when 'owner' is omitted in postTokenBalances)
-            try:
-                owner_atas = _owner_token_accounts(self.owner, mint)
-            except Exception:
-                owner_atas = set()
+            # (Optional) prefetch user's token accounts for this mint
+            if TXLEARN_PREFETCH_ATAS:
+                try:
+                    owner_atas = _owner_token_accounts(self.owner, mint)
+                except Exception:
+                    owner_atas = set()
 
             tries = max(1, int(TXLEARN_TRIES))
             for k in range(1, tries + 1):
@@ -588,7 +578,7 @@ class PositionsExitEngine:
             for i in range(1, attempts + 1):
                 await asyncio.sleep(delay)
                 try:
-                    amt_iu, dec = _sum_token_balance_iu(self.owner, mint)  # expects normalized mint
+                    amt_iu, dec = _sum_token_balance_iu(self.owner, mint)
                     if amt_iu > 0:
                         break
                 except Exception as e:
@@ -599,11 +589,14 @@ class PositionsExitEngine:
                     print(f"[pos] retry learn {mint} attempt {i}/{attempts}... last_bal={amt_iu}", flush=True)
 
             if amt_iu <= 0:
-                print(f"[pos] giving up learn {mint}: {last_err or 'still zero after retries'}", flush=True)
+                if last_err:
+                    print(f"[pos] giving up learn {mint}: {last_err}", flush=True)
+                else:
+                    print(f"[pos] giving up learn {mint}: still zero after retries", flush=True)
                 return
 
         # ---------- Estimate entry price via small quote ----------
-        sample = max(1, min(amt_iu // 100, amt_iu))  # ~1% of position
+        sample = max(1, min(amt_iu // 100, amt_iu))
         try:
             q = _jup_quote(mint, SOL_MINT, sample)
             out_lamports = float(q.get("outAmount", 0))
@@ -633,7 +626,7 @@ class PositionsExitEngine:
         if st.get("size_iu", 0) <= 0:
             return
 
-        # Price via small quote (~0.5–1% of position)
+        # price via small quote (~0.5–1% of position)
         sample = max(1, min(st["size_iu"] // 200, st["size_iu"]))
         try:
             q = _jup_quote(mint, SOL_MINT, sample)
@@ -650,7 +643,7 @@ class PositionsExitEngine:
             st["entry_sol"] = px_sol
             st["peak_sol"]  = px_sol
 
-        # Update peak (for TSL)
+        # update peak (for TSL)
         st["peak_sol"] = max(st.get("peak_sol") or px_sol, px_sol)
         st["last_ts"]  = time.time()
 
@@ -665,7 +658,7 @@ class PositionsExitEngine:
         if pnl_pct <= EXIT_HARD_STOP_PCT:
             print(f"[exit] HARD STOP {mint} pnl={pnl_pct:.1f}%")
             _tg_send(f"⛔ HARD STOP {mint} pnl={pnl_pct:.1f}%")
-            await sell_on_jupiter(mint, pct_of_wallet=1.0)  # close all
+            await sell_on_jupiter(mint, pct_of_wallet=1.0)
             st["size_iu"] = 0
             return
 
@@ -686,12 +679,13 @@ class PositionsExitEngine:
             return
 
         # ----- Trailing stop (armed after EXIT_TSL_ARM_PCT) -----
-        if pnl_pct >= EXIT_TSL_ARM_PCT and drawdown_from_peak_pct <= -EXIT_TSL_TRAIL_PCT:
-            print(f"[exit] TSL {mint} drop_from_peak={drawdown_from_peak_pct:.1f}% -> exit")
-            _tg_send(f"🪢 TSL {mint} drop={drawdown_from_peak_pct:.1f}% -> exit")
-            await sell_on_jupiter(mint, pct_of_wallet=1.0)  # close remainder
-            st["size_iu"] = 0
-            return
+        if pnl_pct >= EXIT_TSL_ARM_PCT:
+            if drawdown_from_peak_pct <= -EXIT_TSL_TRAIL_PCT:
+                print(f"[exit] TSL {mint} drop_from_peak={drawdown_from_peak_pct:.1f}% -> exit")
+                _tg_send(f"🪢 TSL {mint} drop={drawdown_from_peak_pct:.1f}% -> exit")
+                await sell_on_jupiter(mint, pct_of_wallet=1.0)  # close remainder
+                st["size_iu"] = 0
+                return
 
 # exported singleton
 exit_engine = PositionsExitEngine()
