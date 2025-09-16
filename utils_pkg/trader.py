@@ -13,7 +13,7 @@ import base58
 from utils_pkg.solana_wallet import (
     load_keypair,
     get_pubkey_str,
-    sign_and_send_b64_tx,
+    sign_and_send_b64_tx,  # async
 )
 
 # =============================================================================
@@ -32,14 +32,21 @@ def _envi(name: str, default: int) -> int:
     except Exception:
         return default
 
-IS_DRYRUN = str(os.getenv("DRY_RUN", "0")).strip() in {"1", "true", "yes", "y", "on"}
-RPC_URL   = os.getenv("SOL_RPC_URL")
+def _istrue(v: str | None, default: bool = False) -> bool:
+    s = str(v if v is not None else ("1" if default else "0")).strip().lower()
+    return s in {"1", "true", "yes", "y", "on"}
+
+IS_DRYRUN = _istrue(os.getenv("DRY_RUN", "0"))
+RPC_URL   = (os.getenv("SOL_RPC_URL") or "").strip()
 
 # Canonical mints
 SOL_MINT  = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+# SPL Token program IDs
 TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+
 # =============================================================================
 # Mint validation & Jupiter legacy toggle
 # =============================================================================
@@ -57,7 +64,7 @@ def _jup_as_legacy() -> bool:
     works consistently. Set JUP_AS_LEGACY=0 if you later add v0 support.
     """
     v = os.getenv("JUP_AS_LEGACY", "1")
-    return str(v).lower() in {"1", "true", "yes", "y"}
+    return str(v).strip().lower() in {"1", "true", "yes", "y"}
 
 # =============================================================================
 # Exit / risk tuning (override with env to adjust aggressiveness)
@@ -115,9 +122,12 @@ def _sum_token_balance_iu_via_program_scan(owner: str, mint: str) -> Tuple[int, 
     total = 0
     decimals: Optional[int] = None
     for prog in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
-        res = _rpc("getTokenAccountsByOwner", [
-            owner, {"programId": prog}, {"encoding": "jsonParsed"}
-        ]) or {}
+        try:
+            res = _rpc("getTokenAccountsByOwner", [
+                owner, {"programId": prog}, {"encoding": "jsonParsed"}
+            ]) or {}
+        except Exception:
+            continue
         for it in res.get("value", []):
             info = it["account"]["data"]["parsed"]["info"]
             if info.get("mint") != mint:
@@ -126,12 +136,11 @@ def _sum_token_balance_iu_via_program_scan(owner: str, mint: str) -> Tuple[int, 
             total += int(ta.get("amount", "0"))
             if decimals is None:
                 decimals = int(ta.get("decimals", 0))
-    return total, (decimals or 0)
-
+    return total, int(decimals or 0)
 
 def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
     """
-    Try the fast path with {"mint": mint}. If empty or RPC says "could not find mint",
+    Try fast path with {"mint": mint}. If empty or RPC says "could not find mint",
     fall back to scanning by programId across both token programs.
     """
     try:
@@ -147,7 +156,7 @@ def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
         for it in value:
             info = it["account"]["data"]["parsed"]["info"]
             ta = info["tokenAmount"]
-            decimals = int(ta.get("decimals", 0)) or decimals
+            decimals = int(ta.get("decimals", decimals or 0))
             total += int(ta.get("amount", "0"))
         return total, decimals
 
@@ -160,6 +169,24 @@ def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
         if total > 0:
             return total, dec
         raise
+
+async def _wait_tx_confirmed(sig: str, *, max_secs: float = 30.0) -> bool:
+    """
+    Poll getSignatureStatuses until confirmed/finalized or timeout.
+    """
+    t0 = time.time()
+    while time.time() - t0 < max_secs:
+        res = _rpc("getSignatureStatuses", [[sig], {"searchTransactionHistory": True}])
+        v = (res or {}).get("value", [None])[0]
+        if v:
+            if v.get("err"):
+                return False
+            st = v.get("confirmationStatus") or v.get("confirmation_status")
+            if st in ("confirmed", "finalized"):
+                return True
+        await asyncio.sleep(0.8)
+    return False
+
 # =============================================================================
 # Jupiter quote / swap (LEGACY tx)
 # =============================================================================
@@ -294,7 +321,7 @@ class PositionsExitEngine:
         delay = max(3.0, float(poll_sec))
 
         amt_iu, dec = 0, 0
-        last_err = None
+        last_err: Optional[Exception] = None
         for i in range(1, max_attempts + 1):
             await asyncio.sleep(delay)
             try:
@@ -304,10 +331,11 @@ class PositionsExitEngine:
             except Exception as e:
                 last_err = e
 
-            # next delay: 6, 8, 12, 18, 27, ...
             delay = min(delay * 1.4, 30.0)
-            print(f"[pos] retry learn {mint} attempt {i}/{max_attempts}..."
-                  f" last_bal={amt_iu} err={last_err}", flush=True)
+            print(
+                f"[pos] retry learn {mint} attempt {i}/{max_attempts}..."
+                f" last_bal={amt_iu} err={last_err}", flush=True
+            )
 
         if amt_iu <= 0:
             # give up politely; we'll just never manage this position
