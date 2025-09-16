@@ -3,10 +3,9 @@ from __future__ import annotations
 
 import os
 import json
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any
 
 import requests
-import base58
 
 from utils_pkg.solana_wallet import (
     load_keypair,
@@ -15,21 +14,21 @@ from utils_pkg.solana_wallet import (
 )
 
 # -----------------------------------------------------------------------------
-# env / config
+# Env / config
 # -----------------------------------------------------------------------------
-PP_BASE = "https://pumpportal.fun"
-PP_KEY  = (os.getenv("PF_PP_KEY") or "").strip()
-
-def _is_true(v: Optional[str]) -> bool:
+def _is_true(v: str | None) -> bool:
     return str(v).lower() in {"1", "true", "yes", "y", "on"}
 
-DRY_RUN = _is_true(os.getenv("DRY_RUN", "1"))
+PP_API_KEY      = (os.getenv("PF_PP_KEY") or "").strip()
+DRY_RUN         = _is_true(os.getenv("DRY_RUN", "1"))
+PF_SLIPPAGE_BPS = int(os.getenv("PF_SLIPPAGE_BPS", "1000"))    # 1000 bps = 10.0%
+PF_PRIORITY_SOL = float(os.getenv("PF_PRIORITY_SOL", "0.0005"))
 
-# Trade sizing (entrypoint may update PF_TRADE_SOL dynamically)
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 def current_trade_sol() -> float:
+    """Read PF_TRADE_SOL (autosized externally) and clamp to min/max."""
     try:
         sz = float(os.getenv("PF_TRADE_SOL", "0.01"))
     except Exception:
@@ -41,165 +40,115 @@ def current_trade_sol() -> float:
         mn, mx = 0.005, 1000.0
     return _clamp(sz, mn, mx)
 
-# Swap params
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return default
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except Exception:
-        return default
-
-PF_SLIPPAGE_BPS = _env_int("PF_SLIPPAGE_BPS", 1000)       # 10.00% default safety for new pairs
-PF_PRIORITY_SOL = _env_float("PF_PRIORITY_SOL", 0.0005)   # 5e-4 SOL
-
 # -----------------------------------------------------------------------------
-# PumpPortal HTTP helpers
+# PumpPortal Lightning (/api/trade) — server-side execution
 # -----------------------------------------------------------------------------
-def _pp_headers() -> dict:
-    if not PP_KEY:
-        raise RuntimeError("PF_PP_KEY is not set; PumpPortal trades need an API key")
-    # send in both common places; some deployments check one or the other
-    return {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "api-key": PP_KEY,
-        "x-api-key": PP_KEY,
-        "authorization": f"Bearer {PP_KEY}",
-    }
-
-def _pp_post_json(path: str, payload: dict, timeout: int = 20) -> dict:
-    r = requests.post(f"{PP_BASE}{path}", headers=_pp_headers(), json=payload, timeout=timeout)
-    if r.status_code == 403:
-        raise PermissionError(
-            "PumpPortal returned 403 Forbidden. Your PF_PP_KEY likely lacks trading permissions "
-            "(WS read-only keys can’t POST). Request trading access for your key."
-        )
-    r.raise_for_status()
-    return r.json()
-
-def build_buy_tx_via_portal(
+def call_lightning_trade(
+    *,
+    action: str,
     mint: str,
     payer_pubkey: str,
-    *,
     amount_sol: float,
     slippage_bps: int,
     priority_sol: float,
-) -> str:
-    js = _pp_post_json("/api/trade", {
-        "apiKey": PP_KEY,           # some builders also check this in the JSON
-        "publicKey": payer_pubkey,
-        "action": "buy",
-        "mint": mint,
-        "amount": amount_sol,       # SOL amount
-        "slippage": slippage_bps,   # integer BPS
-        "priorityFee": priority_sol,
-        "pool": "pump",
-    })
-    tx_b64 = js.get("transaction") or js.get("tx")
-    if not tx_b64:
-        raise RuntimeError(f"Builder response missing transaction: {js}")
-    return tx_b64
-# -----------------------------------------------------------------------------
-# Validation
-# -----------------------------------------------------------------------------
-def _assert_mint(mint: str) -> None:
-    try:
-        if len(base58.b58decode(mint)) != 32:
-            raise ValueError("decoded length != 32")
-    except Exception as e:
-        raise ValueError(f"Invalid mint '{mint}': {e}")
-
-# -----------------------------------------------------------------------------
-# Builder: BUY
-# -----------------------------------------------------------------------------
-def build_buy_tx_via_portal(
-    mint: str,
-    payer_pubkey: str,
-    *,
-    amount_sol: float,
-    slippage_bps: int,
-    priority_sol: float,
-) -> str:
+    pool: str = "pump",
+    timeout: int = 20,
+) -> Dict[str, Any]:
     """
-    Build a BUY tx via PumpPortal Lightning Transaction API.
-
-    Auth is ONLY via the query param `api-key`, not headers.
+    POST https://pumpportal.fun/api/trade?api-key=...
+    Lightning API executes and typically returns {"signature": "...", "errors": []}.
+    Some flows may also return {"transaction": "..."} (rare). We bubble the json.
     """
-    api_key = (os.getenv("PF_PP_KEY") or "").strip()
-    if not api_key:
-        raise RuntimeError("PF_PP_KEY is not set")
+    if not PP_API_KEY:
+        raise RuntimeError("PF_PP_KEY is not set (trading requires a PumpPortal API key).")
 
-    # per docs, slippage is a percent (e.g., 1.0 == 1%) not bps
-    slippage_percent = max(0.01, float(slippage_bps) / 100.0)
+    url = f"https://pumpportal.fun/api/trade?api-key={PP_API_KEY}"
 
-    url = f"https://pumpportal.fun/api/trade?api-key={api_key}"
+    # Lightning expects slippage as PERCENT, not bps.
     body = {
-        "action": "buy",
+        "action": action,                 # "buy" or "sell"
         "mint": mint,
-        "amount": float(amount_sol),     # SOL amount
-        "denominatedInSol": True,        # amount is in SOL, not tokens
-        "slippage": slippage_percent,    # percent
+        "amount": float(amount_sol),
+        "denominatedInSol": True,         # amount is in SOL
+        "slippage": float(slippage_bps) / 100.0,   # convert bps -> %
         "priorityFee": float(priority_sol),
-        "pool": "pump",                  # or 'auto' / other pools if you want
-        # "skipPreflight": True,         # optional; defaults true per docs
-        # "jitoOnly": False,             # optional
-        "publicKey": payer_pubkey,       # they also accept this field
+        "pool": pool,
+        "publicKey": payer_pubkey,
     }
 
-    r = requests.post(url, json=body, timeout=20)
-    if r.status_code == 403:
-        raise PermissionError(
-            "PumpPortal returned 403. The key in the URL is missing/invalid, or not enabled for trading."
-        )
-    r.raise_for_status()
-    js = r.json()
-    tx_b64 = js.get("transaction") or js.get("tx")
-    if not tx_b64:
-        raise RuntimeError(f"Builder response missing tx: {js}")
-    return tx_b64
+    r = requests.post(url, json=body, timeout=timeout)
+    # Lightning returns 200 even for some errors; always parse the body.
+    try:
+        js = r.json()
+    except Exception:
+        r.raise_for_status()
+        raise
+
+    # Normalize keys so callers can branch once.
+    if "tx" in js and "transaction" not in js:
+        js["transaction"] = js["tx"]
+
+    if not r.ok:
+        raise RuntimeError(f"Lightning {r.status_code}: {js}")
+
+    return js
 
 # -----------------------------------------------------------------------------
-# Public: maybe_buy
+# Maybe buy helper
 # -----------------------------------------------------------------------------
-async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
+async def maybe_buy(mint: str, **kwargs) -> None:
     """
-    Execute a buy via PumpPortal.
-    Returns the signature string when broadcasted; None on dry-run or failure.
-    Accepts **kwargs (e.g., ui, symbol) for logging context.
+    Execute a buy through PumpPortal Lightning. If Lightning returns a signature,
+    we treat it as success. If it (unusually) returns a base64 transaction, we
+    sign & send with our wallet.
     """
     symbol = (kwargs.get("symbol") or (kwargs.get("ui") or {}).get("symbol") or "").strip()
-    label  = f"{symbol} ({mint})" if symbol else mint
+    label = f"{symbol} ({mint})" if symbol else mint
 
     amt_sol = current_trade_sol()
 
     if DRY_RUN:
         print(f"[DRYRUN] would buy {label} for {amt_sol} SOL")
-        return None
+        return
 
     kp = load_keypair()
-    owner = get_pubkey_str(kp)
+    payer_pub = get_pubkey_str(kp)
 
     try:
-        tx_b64 = build_buy_tx_via_portal(
+        resp = call_lightning_trade(
+            action="buy",
             mint=mint,
-            payer_pubkey=owner,
+            payer_pubkey=payer_pub,
             amount_sol=amt_sol,
             slippage_bps=PF_SLIPPAGE_BPS,
             priority_sol=PF_PRIORITY_SOL,
+            pool="pump",
         )
     except Exception as e:
-        print(f"[BUY ERR] builder failed for {mint}: {e}")
-        return None
+        print(f"[BUY ERR] lightning call failed for {mint}: {e}")
+        return
 
-    try:
-        sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
-        print(f"[BUY OK] {label} -> https://solscan.io/tx/{sig}")
-        return sig
-    except Exception as e:
-        print(f"[BUY ERR] send failed for {mint}: {e}")
-        return None
+    # PumpPortal may include an 'errors' array even with HTTP 200
+    errs = resp.get("errors") or []
+    if isinstance(errs, list) and len(errs) > 0:
+        print(f"[BUY ERR] lightning returned errors for {mint}: {errs}")
+        return
+
+    # Most common: server executed and we get a signature back.
+    sig = resp.get("signature")
+    if sig:
+        print(f"[BUY OK] {label} — executed via Lightning. https://solscan.io/tx/{sig}")
+        return
+
+    # Rare builder-style response: server gave us a base64 tx to sign.
+    tx_b64 = resp.get("transaction")
+    if tx_b64:
+        try:
+            sig2 = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
+            print(f"[BUY OK] {label} — signed & sent. https://solscan.io/tx/{sig2}")
+        except Exception as e:
+            print(f"[BUY ERR] send failed for {mint}: {e}")
+        return
+
+    # If we get here, the response had neither signature nor transaction.
+    print(f"[BUY ERR] unexpected Lightning response for {mint}: {json.dumps(resp)[:400]}")
