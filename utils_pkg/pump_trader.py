@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import os
 import json
-from typing import Optional, Tuple, Dict, Any
+import asyncio
+from typing import Dict, Any, Optional
 
 import requests
 
@@ -13,16 +14,25 @@ from utils_pkg.solana_wallet import (
     sign_and_send_b64_tx,
 )
 
+# Optional: notify the exit engine after a buy fills.
+# This import does NOT create a circular import (trader.py doesn't import this file).
+try:
+    from utils_pkg.trader import exit_engine, _wait_tx_confirmed  # type: ignore
+    _HAS_EXIT_ENGINE = True
+except Exception:
+    _HAS_EXIT_ENGINE = False
+
+
 # -----------------------------------------------------------------------------
 # Env / config
 # -----------------------------------------------------------------------------
-def _is_true(v: str | None) -> bool:
+def _is_true(v: Optional[str]) -> bool:
     return str(v).lower() in {"1", "true", "yes", "y", "on"}
 
-PP_API_KEY      = (os.getenv("PF_PP_KEY") or "").strip()
-DRY_RUN         = _is_true(os.getenv("DRY_RUN", "1"))
-PF_SLIPPAGE_BPS = int(os.getenv("PF_SLIPPAGE_BPS", "1000"))    # 1000 bps = 10.0%
-PF_PRIORITY_SOL = float(os.getenv("PF_PRIORITY_SOL", "0.0005"))
+PP_API_KEY       = (os.getenv("PF_PP_KEY") or "").strip()
+DRY_RUN          = _is_true(os.getenv("DRY_RUN", "1"))
+PF_SLIPPAGE_BPS  = int(os.getenv("PF_SLIPPAGE_BPS", "1000"))     # 1000 bps = 10.00%
+PF_PRIORITY_SOL  = float(os.getenv("PF_PRIORITY_SOL", "0.0005")) # in SOL
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -40,12 +50,30 @@ def current_trade_sol() -> float:
         mn, mx = 0.005, 1000.0
     return _clamp(sz, mn, mx)
 
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _is_probably_pump_mint(mint: str) -> bool:
+    """
+    Lightning 'pump' pool only works for pump.fun bonding-curve tokens.
+    Heuristic: pump mints end with 'pump'.
+    """
+    return mint.endswith("pump")
+
+
+def _derive_pool(ui: Dict[str, Any]) -> str:
+    """Prefer any pool/platform hint from upstream UI payloads; default 'pump'."""
+    pool = (ui.get("pool") or ui.get("platform") or "").strip().lower()
+    return pool if pool else "pump"
+
+
 # -----------------------------------------------------------------------------
 # PumpPortal Lightning (/api/trade) — server-side execution
 # -----------------------------------------------------------------------------
 def call_lightning_trade(
     *,
-    action: str,
+    action: str,            # "buy" | "sell"
     mint: str,
     payer_pubkey: str,
     amount_sol: float,
@@ -56,59 +84,77 @@ def call_lightning_trade(
 ) -> Dict[str, Any]:
     """
     POST https://pumpportal.fun/api/trade?api-key=...
-    Lightning API executes and typically returns {"signature": "...", "errors": []}.
-    Some flows may also return {"transaction": "..."} (rare). We bubble the json.
+    Lightning executes on their side and returns JSON like:
+      { "signature": "...", "errors": [] }
+    or more rarely:
+      { "transaction": "<base64 tx>", "errors": [] }
     """
     if not PP_API_KEY:
         raise RuntimeError("PF_PP_KEY is not set (trading requires a PumpPortal API key).")
 
     url = f"https://pumpportal.fun/api/trade?api-key={PP_API_KEY}"
 
-    # Lightning expects slippage as PERCENT, not bps.
     body = {
-        "action": action,                 # "buy" or "sell"
+        "action": action,                   # "buy" or "sell"
         "mint": mint,
         "amount": float(amount_sol),
-        "denominatedInSol": True,         # amount is in SOL
-        "slippage": float(slippage_bps) / 100.0,   # convert bps -> %
+        "denominatedInSol": True,           # 'amount' is in SOL
+        "slippage": float(slippage_bps) / 100.0,  # bps -> percent for Lightning
         "priorityFee": float(priority_sol),
-        "pool": pool,
+        "pool": pool,                       # usually "pump"
         "publicKey": payer_pubkey,
     }
 
     r = requests.post(url, json=body, timeout=timeout)
-    # Lightning returns 200 even for some errors; always parse the body.
+
+    # Lightning frequently returns HTTP 200 even on logical errors — always parse.
     try:
         js = r.json()
     except Exception:
         r.raise_for_status()
         raise
 
-    # Normalize keys so callers can branch once.
+    # Normalize rare alt key
     if "tx" in js and "transaction" not in js:
         js["transaction"] = js["tx"]
 
+    # If non-200, include parsed JSON context
     if not r.ok:
         raise RuntimeError(f"Lightning {r.status_code}: {js}")
 
     return js
 
+
 # -----------------------------------------------------------------------------
-# Maybe buy helper
+# Maybe buy
 # -----------------------------------------------------------------------------
 async def maybe_buy(mint: str, **kwargs) -> None:
     """
-    Execute a buy through PumpPortal Lightning. If Lightning returns a signature,
-    we treat it as success. If it (unusually) returns a base64 transaction, we
-    sign & send with our wallet.
+    Attempt a buy via PumpPortal Lightning.
+    - Skips non-pump pools/tokens (prevents 'Failed to get bonding curve' spam).
+    - Respects DRY_RUN.
+    - If Lightning returns a signature, we log success.
+    - If Lightning returns a transaction, we sign & send it.
+    - Optionally triggers the exit engine after confirmation (if available).
     """
-    symbol = (kwargs.get("symbol") or (kwargs.get("ui") or {}).get("symbol") or "").strip()
+    ui = (kwargs.get("ui") or {})
+    symbol = (kwargs.get("symbol") or ui.get("symbol") or "").strip()
+    pool = _derive_pool(ui)
     label = f"{symbol} ({mint})" if symbol else mint
 
-    amt_sol = current_trade_sol()
+    # Only send Lightning orders to the 'pump' pool / pump.fun mints
+    if pool == "pump" and not _is_probably_pump_mint(mint):
+        print(f"[skip] non-pump mint pattern for {label} (pool='pump'); skipping.")
+        return
+    if pool != "pump":
+        # We currently only support Lightning 'pump' pool here.
+        print(f"[skip] unsupported pool '{pool}' for {label}; skipping.")
+        return
+
+    amount_sol = current_trade_sol()
 
     if DRY_RUN:
-        print(f"[DRYRUN] would buy {label} for {amt_sol} SOL")
+        print(f"[DRYRUN] would buy {label} for {amount_sol} SOL")
         return
 
     kp = load_keypair()
@@ -119,7 +165,7 @@ async def maybe_buy(mint: str, **kwargs) -> None:
             action="buy",
             mint=mint,
             payer_pubkey=payer_pub,
-            amount_sol=amt_sol,
+            amount_sol=amount_sol,
             slippage_bps=PF_SLIPPAGE_BPS,
             priority_sol=PF_PRIORITY_SOL,
             pool="pump",
@@ -128,27 +174,54 @@ async def maybe_buy(mint: str, **kwargs) -> None:
         print(f"[BUY ERR] lightning call failed for {mint}: {e}")
         return
 
-    # PumpPortal may include an 'errors' array even with HTTP 200
+    # Common error payloads still return 200 with {"errors": [...]}
     errs = resp.get("errors") or []
-    if isinstance(errs, list) and len(errs) > 0:
+    if isinstance(errs, list) and errs:
+        # Special-case a frequent error for clarity
+        joined = " | ".join(map(str, errs))
+        if "Failed to get bonding curve" in joined:
+            print(f"[skip] {label}: Lightning says token is not on pump bonding curve.")
+            return
         print(f"[BUY ERR] lightning returned errors for {mint}: {errs}")
         return
 
-    # Most common: server executed and we get a signature back.
+    # The happy path: server executed already and returns a signature.
     sig = resp.get("signature")
     if sig:
         print(f"[BUY OK] {label} — executed via Lightning. https://solscan.io/tx/{sig}")
+
+        # Optionally ping the exit engine after confirmation, if available.
+        if _HAS_EXIT_ENGINE:
+            try:
+                # Wait a moment to reduce “not indexed yet” races on some RPCs
+                ok = await _wait_tx_confirmed(sig, max_secs=30)  # type: ignore
+                if not ok:
+                    # Not fatal; the exit engine has internal polling/fallbacks
+                    print(f"[BUY WARN] {mint} signature not confirmed within timeout.")
+                # Hand off to the exit engine (fire-and-forget)
+                asyncio.create_task(exit_engine.on_buy_filled(mint))  # type: ignore
+            except Exception:
+                # Non-fatal: the trade already landed
+                pass
         return
 
-    # Rare builder-style response: server gave us a base64 tx to sign.
+    # Less common: server returned a base64 transaction to sign locally.
     tx_b64 = resp.get("transaction")
     if tx_b64:
         try:
             sig2 = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
             print(f"[BUY OK] {label} — signed & sent. https://solscan.io/tx/{sig2}")
+            if _HAS_EXIT_ENGINE:
+                try:
+                    ok = await _wait_tx_confirmed(sig2, max_secs=30)  # type: ignore
+                    if not ok:
+                        print(f"[BUY WARN] {mint} signature not confirmed within timeout.")
+                    asyncio.create_task(exit_engine.on_buy_filled(mint))  # type: ignore
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[BUY ERR] send failed for {mint}: {e}")
         return
 
-    # If we get here, the response had neither signature nor transaction.
+    # If neither signature nor transaction was present, log the payload for debugging.
     print(f"[BUY ERR] unexpected Lightning response for {mint}: {json.dumps(resp)[:400]}")
