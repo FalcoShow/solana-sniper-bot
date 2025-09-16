@@ -6,6 +6,7 @@ import json
 import requests
 
 from utils_pkg.solana_wallet import load_keypair, sign_and_send_b64_tx
+from utils_pkg.solana_wallet import load_keypair, get_pubkey_str
 
 PP_API_KEY       = os.getenv("PF_PP_KEY") or ""
 PF_SLIPPAGE_BPS  = int(os.getenv("PF_SLIPPAGE_BPS", "1000"))
@@ -87,7 +88,7 @@ async def maybe_buy(mint: str, **kwargs) -> None:
         return
 
     kp = load_keypair()
-    pub = str(kp.public_key)
+    pub = get_pubkey_str(kp)
 
     try:
         tx_b64 = build_buy_tx_via_portal(
