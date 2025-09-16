@@ -126,28 +126,41 @@ def build_buy_tx_via_portal(
     priority_sol: float,
 ) -> str:
     """
-    Ask PumpPortal to build a BUY transaction (base64).
-    Endpoint: POST /api/trade
-    """
-    _assert_mint(mint)
+    Build a BUY tx via PumpPortal Lightning Transaction API.
 
-    payload = {
-        # many deployments also accept apiKey in-body; harmless to include
-        "apiKey": PP_KEY,
-        "publicKey": payer_pubkey,
+    Auth is ONLY via the query param `api-key`, not headers.
+    """
+    api_key = (os.getenv("PF_PP_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("PF_PP_KEY is not set")
+
+    # per docs, slippage is a percent (e.g., 1.0 == 1%) not bps
+    slippage_percent = max(0.01, float(slippage_bps) / 100.0)
+
+    url = f"https://pumpportal.fun/api/trade?api-key={api_key}"
+    body = {
         "action": "buy",
         "mint": mint,
-        "amount": amount_sol,      # SOL amount to spend
-        "slippage": slippage_bps,  # integer BPS
-        "priorityFee": priority_sol,
-        "pool": "pump",
+        "amount": float(amount_sol),     # SOL amount
+        "denominatedInSol": True,        # amount is in SOL, not tokens
+        "slippage": slippage_percent,    # percent
+        "priorityFee": float(priority_sol),
+        "pool": "pump",                  # or 'auto' / other pools if you want
+        # "skipPreflight": True,         # optional; defaults true per docs
+        # "jitoOnly": False,             # optional
+        "publicKey": payer_pubkey,       # they also accept this field
     }
 
-    js = _pp_post_json("/api/trade", payload)
-    # Different builders use different keys; check a few common ones.
-    tx_b64 = js.get("transaction") or js.get("tx") or js.get("swapTransaction")
+    r = requests.post(url, json=body, timeout=20)
+    if r.status_code == 403:
+        raise PermissionError(
+            "PumpPortal returned 403. The key in the URL is missing/invalid, or not enabled for trading."
+        )
+    r.raise_for_status()
+    js = r.json()
+    tx_b64 = js.get("transaction") or js.get("tx")
     if not tx_b64:
-        raise RuntimeError(f"Builder response missing base64 tx: {json.dumps(js)[:400]}")
+        raise RuntimeError(f"Builder response missing tx: {js}")
     return tx_b64
 
 # -----------------------------------------------------------------------------
