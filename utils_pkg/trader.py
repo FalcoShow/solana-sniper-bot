@@ -1,4 +1,3 @@
-# utils_pkg/trader.py
 from __future__ import annotations
 
 import os
@@ -13,7 +12,7 @@ import base58
 from utils_pkg.solana_wallet import (
     load_keypair,
     get_pubkey_str,
-    sign_and_send_b64_tx,  # async
+    sign_and_send_b64_tx,
 )
 
 # =============================================================================
@@ -32,20 +31,23 @@ def _envi(name: str, default: int) -> int:
     except Exception:
         return default
 
-def _istrue(v: str | None, default: bool = False) -> bool:
-    s = str(v if v is not None else ("1" if default else "0")).strip().lower()
-    return s in {"1", "true", "yes", "y", "on"}
+def _istrue(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-IS_DRYRUN = _istrue(os.getenv("DRY_RUN", "0"))
-RPC_URL   = (os.getenv("SOL_RPC_URL") or "").strip()
+IS_DRYRUN = _istrue("DRY_RUN", "0")
+RPC_URL   = os.getenv("SOL_RPC_URL")
 
 # Canonical mints
 SOL_MINT  = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-
-# SPL Token program IDs
 TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+
+# Position learning tunables
+POS_LEARN_MAX_ATTEMPTS   = _envi("PF_POS_LEARN_MAX_ATTEMPTS", 10)
+POS_LEARN_BASE_DELAY_SEC = _envf("PF_POS_LEARN_BASE_DELAY_SEC", 6.0)
+POS_LEARN_BACKOFF        = _envf("PF_POS_LEARN_BACKOFF", 1.5)
+POS_LEARN_LOG_EVERY      = _envi("PF_POS_LEARN_LOG_EVERY", 3)
 
 # =============================================================================
 # Mint validation & Jupiter legacy toggle
@@ -59,32 +61,27 @@ def _assert_mint(m: str) -> None:
         raise ValueError(f"Invalid mint '{m}': {e}")
 
 def _jup_as_legacy() -> bool:
-    """
-    Default to legacy Jupiter transactions so our signer path (legacy-only)
-    works consistently. Set JUP_AS_LEGACY=0 if you later add v0 support.
-    """
     v = os.getenv("JUP_AS_LEGACY", "1")
-    return str(v).strip().lower() in {"1", "true", "yes", "y"}
+    return str(v).lower() in {"1", "true", "yes", "y"}
 
 # =============================================================================
-# Exit / risk tuning (override with env to adjust aggressiveness)
+# Exit / risk tuning
 # =============================================================================
 
-EXIT_TP1_PCT         = _envf("EXIT_TP1_PCT", 40.0)       # +40% → take partial
-EXIT_TP1_SELL_PCT    = _envf("EXIT_TP1_SELL_PCT", 0.40)  # sell 40% at TP1
-EXIT_TP2_PCT         = _envf("EXIT_TP2_PCT", 100.0)      # +100% → take more
-EXIT_TP2_SELL_PCT    = _envf("EXIT_TP2_SELL_PCT", 0.30)  # sell 30% at TP2
-EXIT_TSL_ARM_PCT     = _envf("EXIT_TSL_ARM_PCT", 60.0)   # arm trailing stop when +60%
-EXIT_TSL_TRAIL_PCT   = _envf("EXIT_TSL_TRAIL_PCT", 20.0) # trail gap 20% off the peak
-EXIT_HARD_STOP_PCT   = _envf("HARD_STOP_PCT", -32.0)     # kill if drawdown <= -32%
+EXIT_TP1_PCT         = _envf("EXIT_TP1_PCT", 40.0)
+EXIT_TP1_SELL_PCT    = _envf("EXIT_TP1_SELL_PCT", 0.40)
+EXIT_TP2_PCT         = _envf("EXIT_TP2_PCT", 100.0)
+EXIT_TP2_SELL_PCT    = _envf("EXIT_TP2_SELL_PCT", 0.30)
+EXIT_TSL_ARM_PCT     = _envf("EXIT_TSL_ARM_PCT", 60.0)
+EXIT_TSL_TRAIL_PCT   = _envf("EXIT_TSL_TRAIL_PCT", 20.0)
+EXIT_HARD_STOP_PCT   = _envf("HARD_STOP_PCT", -32.0)
 
 # =============================================================================
 # Sell path helpers
 # =============================================================================
 
 def _slippage_bps() -> int:
-    # JUPITER_MAX_SLIPPAGE as fraction (e.g. 0.0125 = 1.25%)
-    s = _envf("JUPITER_MAX_SLIPPAGE", 0.0125)
+    s = _envf("JUPITER_MAX_SLIPPAGE", 0.0125)  # 1.25%
     return max(1, int(round(s * 10_000)))
 
 def _priority_lamports() -> Optional[int]:
@@ -122,12 +119,9 @@ def _sum_token_balance_iu_via_program_scan(owner: str, mint: str) -> Tuple[int, 
     total = 0
     decimals: Optional[int] = None
     for prog in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
-        try:
-            res = _rpc("getTokenAccountsByOwner", [
-                owner, {"programId": prog}, {"encoding": "jsonParsed"}
-            ]) or {}
-        except Exception:
-            continue
+        res = _rpc("getTokenAccountsByOwner", [
+            owner, {"programId": prog}, {"encoding": "jsonParsed"}
+        ]) or {}
         for it in res.get("value", []):
             info = it["account"]["data"]["parsed"]["info"]
             if info.get("mint") != mint:
@@ -136,11 +130,11 @@ def _sum_token_balance_iu_via_program_scan(owner: str, mint: str) -> Tuple[int, 
             total += int(ta.get("amount", "0"))
             if decimals is None:
                 decimals = int(ta.get("decimals", 0))
-    return total, int(decimals or 0)
+    return total, (decimals or 0)
 
 def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
     """
-    Try fast path with {"mint": mint}. If empty or RPC says "could not find mint",
+    Try the fast path with {"mint": mint}. If empty or RPC says "could not find mint",
     fall back to scanning by programId across both token programs.
     """
     try:
@@ -156,7 +150,7 @@ def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
         for it in value:
             info = it["account"]["data"]["parsed"]["info"]
             ta = info["tokenAmount"]
-            decimals = int(ta.get("decimals", decimals or 0))
+            decimals = int(ta.get("decimals", 0)) or decimals
             total += int(ta.get("amount", "0"))
         return total, decimals
 
@@ -164,16 +158,12 @@ def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
         msg = str(e)
         if "could not find mint" in msg or "Invalid param" in msg:
             return _sum_token_balance_iu_via_program_scan(owner, mint)
-        # As a last resort try the scan; if still zero, bubble up
         total, dec = _sum_token_balance_iu_via_program_scan(owner, mint)
         if total > 0:
             return total, dec
         raise
 
 async def _wait_tx_confirmed(sig: str, *, max_secs: float = 30.0) -> bool:
-    """
-    Poll getSignatureStatuses until confirmed/finalized or timeout.
-    """
     t0 = time.time()
     while time.time() - t0 < max_secs:
         res = _rpc("getSignatureStatuses", [[sig], {"searchTransactionHistory": True}])
@@ -195,8 +185,6 @@ def _jup_quote(input_mint: str, output_mint: str, amount_iu: int) -> dict:
     _assert_mint(input_mint); _assert_mint(output_mint)
 
     url = "https://quote-api.jup.ag/v6/quote"
-    # Some Jupiter edge deployments are picky about types on these two flags,
-    # so we send them as strings here (works reliably in practice).
     q = {
         "inputMint": input_mint,
         "outputMint": output_mint,
@@ -218,7 +206,6 @@ def _jup_swap(user_pubkey: str, quote: dict, priority_lamports: Optional[int]) -
         "wrapAndUnwrapSol": True,
         "dynamicComputeUnitLimit": True,
         "quoteResponse": quote,
-        # swap endpoint accepts real booleans
         "asLegacyTransaction": True if _jup_as_legacy() else False,
     }
     if priority_lamports is not None:
@@ -311,14 +298,14 @@ class PositionsExitEngine:
         self.owner = get_pubkey_str(load_keypair())
         self.pos: Dict[str, Dict[str, Any]] = {}  # mint -> state
 
-    async def on_buy_filled(self, mint: str, *, poll_sec: float = 6.0) -> None:
+    async def on_buy_filled(self, mint: str, *, poll_sec: float = POS_LEARN_BASE_DELAY_SEC) -> None:
         """
         After a buy, poll the wallet for a while to learn the filled size.
         Newly-created pump mints sometimes aren't immediately readable on RPC,
-        so we retry with exponential-ish backoff.
+        so we retry with controlled backoff and quiet logging.
         """
-        max_attempts = 10                # ~ 2–3 minutes total
-        delay = max(3.0, float(poll_sec))
+        max_attempts = max(1, int(POS_LEARN_MAX_ATTEMPTS))
+        delay = max(1.0, float(poll_sec))
 
         amt_iu, dec = 0, 0
         last_err: Optional[Exception] = None
@@ -328,17 +315,19 @@ class PositionsExitEngine:
                 amt_iu, dec = _sum_token_balance_iu(self.owner, mint)
                 if amt_iu > 0:
                     break
+                last_err = None
             except Exception as e:
                 last_err = e
 
-            delay = min(delay * 1.4, 30.0)
-            print(
-                f"[pos] retry learn {mint} attempt {i}/{max_attempts}..."
-                f" last_bal={amt_iu} err={last_err}", flush=True
-            )
+            # backoff and throttle logs
+            delay = min(delay * float(POS_LEARN_BACKOFF), 30.0)
+            if i in (1, 2, 3) or (POS_LEARN_LOG_EVERY and i % POS_LEARN_LOG_EVERY == 0):
+                if last_err:
+                    print(f"[pos] retry learn {mint} attempt {i}/{max_attempts}... last_bal={amt_iu} err={last_err}", flush=True)
+                else:
+                    print(f"[pos] retry learn {mint} attempt {i}/{max_attempts}... last_bal={amt_iu}", flush=True)
 
         if amt_iu <= 0:
-            # give up politely; we'll just never manage this position
             if last_err:
                 print(f"[pos] giving up learn {mint}: {last_err}", flush=True)
             else:
@@ -364,7 +353,6 @@ class PositionsExitEngine:
             "last_ts": time.time(),
         }
         print(f"[pos] learned entry for {mint}: size_iu={amt_iu} entry≈{price_sol} SOL", flush=True)
-        _tg_send(f"📥 ENTRY {mint} size_iu={amt_iu} entry≈{(price_sol or 0):.6f} SOL")
 
     async def on_trade_tick(self, msg: Dict[str, Any]) -> None:
         """Call on every PumpPortal trade tick."""
@@ -404,7 +392,6 @@ class PositionsExitEngine:
         # ----- Hard stop -----
         if pnl_pct <= EXIT_HARD_STOP_PCT:
             print(f"[exit] HARD STOP {mint} pnl={pnl_pct:.1f}%")
-            _tg_send(f"⛔ HARD STOP {mint} pnl={pnl_pct:.1f}%")
             await sell_on_jupiter(mint, pct_of_wallet=1.0)
             st["size_iu"] = 0
             return
@@ -412,7 +399,6 @@ class PositionsExitEngine:
         # ----- TP1 -----
         if (not st["tp1_done"]) and (pnl_pct >= EXIT_TP1_PCT):
             print(f"[exit] TP1 {mint} pnl={pnl_pct:.1f}% sell={EXIT_TP1_SELL_PCT:.0%}")
-            _tg_send(f"🎯 TP1 {mint} pnl={pnl_pct:.1f}% sell={EXIT_TP1_SELL_PCT:.0%}")
             await sell_on_jupiter(mint, pct_of_wallet=EXIT_TP1_SELL_PCT)
             st["tp1_done"] = True
             return
@@ -420,7 +406,6 @@ class PositionsExitEngine:
         # ----- TP2 -----
         if (not st["tp2_done"]) and (pnl_pct >= EXIT_TP2_PCT):
             print(f"[exit] TP2 {mint} pnl={pnl_pct:.1f}% sell={EXIT_TP2_SELL_PCT:.0%}")
-            _tg_send(f"🎯 TP2 {mint} pnl={pnl_pct:.1f}% sell={EXIT_TP2_SELL_PCT:.0%}")
             await sell_on_jupiter(mint, pct_of_wallet=EXIT_TP2_SELL_PCT)
             st["tp2_done"] = True
             return
@@ -429,8 +414,7 @@ class PositionsExitEngine:
         if pnl_pct >= EXIT_TSL_ARM_PCT:
             if drawdown_from_peak_pct <= -EXIT_TSL_TRAIL_PCT:
                 print(f"[exit] TSL {mint} drop_from_peak={drawdown_from_peak_pct:.1f}% -> exit")
-                _tg_send(f"🪢 TSL {mint} drop={drawdown_from_peak_pct:.1f}% -> exit")
-                await sell_on_jupiter(mint, pct_of_wallet=1.0)  # close remainder
+                await sell_on_jupiter(mint, pct_of_wallet=1.0)
                 st["size_iu"] = 0
                 return
 

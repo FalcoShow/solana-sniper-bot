@@ -1,4 +1,3 @@
-# utils_pkg/pump_trader.py
 from __future__ import annotations
 
 import os
@@ -9,22 +8,21 @@ import requests
 from utils_pkg.solana_wallet import (
     load_keypair,
     get_pubkey_str,
-    sign_and_send_b64_tx,  # async
+    sign_and_send_b64_tx,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Env / config
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _is_true(v: Optional[str]) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 PP_API_KEY       = (os.getenv("PF_PP_KEY") or "").strip()
 DRY_RUN          = _is_true(os.getenv("DRY_RUN", "0"))
-PF_SLIPPAGE_BPS  = int(os.getenv("PF_SLIPPAGE_BPS", "1000"))       # e.g., 800 = 8.00%
-PF_PRIORITY_SOL  = float(os.getenv("PF_PRIORITY_SOL", "0.0005"))
+PF_SLIPPAGE_BPS  = int(os.getenv("PF_SLIPPAGE_BPS", "800"))       # default 8.00%
+PF_PRIORITY_SOL  = float(os.getenv("PF_PRIORITY_SOL", "0.002"))
 PF_POOLS         = {p.strip().lower() for p in (os.getenv("PF_POOLS", "pump").split(","))}
-USE_LOCAL_FALLBK = _is_true(os.getenv("PF_USE_LOCAL_FALLBACK", "0"))  # off by default
+USE_LOCAL_FALLBK = _is_true(os.getenv("PF_USE_LOCAL_FALLBACK", "0"))
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -45,23 +43,20 @@ def current_trade_sol() -> float:
 # ──────────────────────────────────────────────────────────────────────────────
 # PumpPortal helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-class TemporaryPumpPortal(RuntimeError):
+class TemporaryPumpPortal(Exception):
     """Non-fatal / transient response (retry later)."""
 
 def _slippage_percent_from_bps(bps: int) -> float:
     return float(bps) / 100.0
 
-def _ensure_api_key() -> None:
+def _lightning_url() -> str:
     if not PP_API_KEY:
         raise RuntimeError("PF_PP_KEY is not set (trading requires a PumpPortal API key).")
-
-def _lightning_url() -> str:
-    _ensure_api_key()
     return f"https://pumpportal.fun/api/trade?api-key={PP_API_KEY}"
 
 def _local_url() -> str:
-    _ensure_api_key()
+    if not PP_API_KEY:
+        raise RuntimeError("PF_PP_KEY is not set (trading requires a PumpPortal API key).")
     return f"https://pumpportal.fun/api/trade-local?api-key={PP_API_KEY}"
 
 def _build_body(
@@ -74,13 +69,13 @@ def _build_body(
     slippage_bps: int,
     priority_sol: float,
 ) -> Dict[str, Any]:
-    # Lightning/local both accept this shape. For slippage: they want percent, not bps.
+    # Lightning/local both accept this shape. Slippage is % (not bps).
     return {
-        "action": action,                                # "buy" or "sell"
+        "action": action,                 # "buy" or "sell"
         "mint": mint,
         "amount": float(amount_sol),
-        "denominatedInSol": True,                        # amount is in SOL
-        "slippage": _slippage_percent_from_bps(slippage_bps),  # PERCENT value
+        "denominatedInSol": True,         # amount is in SOL
+        "slippage": _slippage_percent_from_bps(slippage_bps),  # percent
         "priorityFee": float(priority_sol),
         "pool": pool,
         "publicKey": payer_pubkey,
@@ -91,26 +86,15 @@ def _post_expect_json(url: str, body: Dict[str, Any], timeout: int = 20) -> Dict
     POST and return JSON. If response is 200 but not JSON (e.g., application/octet-stream),
     raise TemporaryPumpPortal so the caller can treat it as a transient and back off.
     """
-    headers = {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "x-api-key": PP_API_KEY,  # redundant with query param; harmless and sometimes required by gateways
-    }
-    r = requests.post(url, headers=headers, json=body, timeout=timeout, allow_redirects=False)
-
+    r = requests.post(url, json=body, timeout=timeout, allow_redirects=False)
     ctype = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
 
-    # Some endpoints reply 200 with binary (octet-stream) or plain text; treat as transient/hard error.
+    # 200 but not JSON: Lightning sometimes does this under load → treat as transient.
     if r.status_code == 200 and ctype != "application/json":
-        head = (r.text or "").splitlines()[0][:200]
-        if ctype == "text/plain":
-            # Common from local builder when it can't parse: "Bad Request"
-            raise RuntimeError(f"{url} returned text/plain 200: {head or 'Bad Request'}")
-        # Lightning may rarely respond non-JSON during load; back off this token quietly.
         raise TemporaryPumpPortal(f"non-JSON 200 ({ctype})")
 
+    # Non-200: surface JSON if available.
     if r.status_code != 200:
-        # Surface JSON error if any, else status text/body
         try:
             js = r.json()
         except Exception:
@@ -120,20 +104,17 @@ def _post_expect_json(url: str, body: Dict[str, Any], timeout: int = 20) -> Dict
     try:
         return r.json()
     except Exception as e:
-        # Unexpected parse failure despite JSON content-type — don't crash the loop
         raise TemporaryPumpPortal(f"json parse error: {e}")
 
 def _call_lightning(body: Dict[str, Any]) -> Dict[str, Any]:
     return _post_expect_json(_lightning_url(), body)
 
 def _call_local(body: Dict[str, Any]) -> Dict[str, Any]:
-    # Local builder often replies 400 text/plain "Bad Request" when it can't build.
     return _post_expect_json(_local_url(), body)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public: BUY helper
 # ──────────────────────────────────────────────────────────────────────────────
-
 async def maybe_buy(mint: str, **kwargs) -> None:
     """
     Execute a buy via PumpPortal Lightning. Only trades tokens whose `pool` is allowed
@@ -144,7 +125,7 @@ async def maybe_buy(mint: str, **kwargs) -> None:
     symbol = (kwargs.get("symbol") or ui.get("symbol") or "").strip()
     pool   = (kwargs.get("pool")   or ui.get("pool")   or "pump").strip().lower()
 
-    if PF_POOLS and pool not in PF_POOLS:
+    if pool not in PF_POOLS:
         print(f"[skip] unsupported pool '{pool}' for {mint}; allowed={sorted(PF_POOLS)}; skipping.")
         return
 
@@ -172,44 +153,43 @@ async def maybe_buy(mint: str, **kwargs) -> None:
     try:
         resp = _call_lightning(body)
     except TemporaryPumpPortal as te:
-        # Known transient (e.g., 200 with non-JSON octet-stream). Just back off this token.
+        # Known transient; just back off for this token.
         print(f"[BUY TEMP] lightning quirk for {mint}: {te}")
         return
     except Exception as e:
         # Hard failure from Lightning. Optionally try local, otherwise bail.
         if USE_LOCAL_FALLBK:
             try:
-                lresp = _call_local(body)
+                resp = _call_local(body)
             except TemporaryPumpPortal as te2:
                 print(f"[BUY TEMP] local quirk for {mint}: {te2}")
                 return
             except Exception as e2:
                 print(f"[BUY ERR] local builder failed for {mint}: {e2}")
                 return
-            else:
-                await _handle_trade_response(label, lresp, kp, mint)
-                return
         else:
             print(f"[BUY ERR] lightning call failed for {mint}: {e}")
             return
 
-    # 2) Handle Lightning JSON result
+    # 2) Handle a successful JSON result
     await _handle_trade_response(label, resp, kp, mint)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Response handling
-# ──────────────────────────────────────────────────────────────────────────────
 
 async def _handle_trade_response(label: str, resp: Dict[str, Any], kp, mint: str) -> None:
     """
     Normalize PumpPortal responses:
-      - If 'errors' array has items -> print and exit.
-      - If 'signature' -> success (executed server-side).
-      - If 'transaction' (base64) -> sign & send locally.
+      - If 'errors' array has items:
+          • If they include 'Failed to get bonding curve...' → treat as transient (quiet skip).
+          • Else print once and return.
+      - If 'signature' → success (executed server-side).
+      - If 'transaction' (base64) → sign & send locally.
     """
     errs = resp.get("errors") or []
     if isinstance(errs, list) and errs:
-        # Common message: "Failed to get bonding curve ..." (non-pump pools or very new tokens)
+        msg = " | ".join(str(e) for e in errs)
+        if "Failed to get bonding curve" in msg:
+            # Happens on very fresh or non-pump pools — not actionable, skip quietly.
+            print(f"[BUY TEMP] bonding-curve not ready for {mint}; skipping for now.")
+            return
         print(f"[BUY ERR] pumpportal errors for {mint}: {errs}")
         return
 
@@ -220,74 +200,13 @@ async def _handle_trade_response(label: str, resp: Dict[str, Any], kp, mint: str
 
     tx_b64 = resp.get("transaction") or resp.get("tx")
     if tx_b64:
-        # Rare path: sign & send locally (legacy tx expected; our wallet code handles it)
         try:
             sig2 = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
             print(f"[BUY OK] {label} — signed & sent. https://solscan.io/tx/{sig2}")
         except Exception as e:
-            print(f"[BUY ERR] local send failed for {mint}: {e}")
+            print(f"[BUY ERR] send failed for {mint}: {e}")
         return
 
     # No signature nor transaction -> strange but not fatal
-    # Keep the body concise in logs.
-    try:
-        short = str({k: resp[k] for k in list(resp)[:5]})[:300]
-    except Exception:
-        short = str(resp)[:300]
+    short = str(resp)[:300]
     print(f"[BUY ERR] unexpected PumpPortal response for {mint}: {short}")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional: SELL via Lightning (useful if Lightning wallet != bot keypair)
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def sell_via_lightning(mint: str, pct_of_wallet: float = 1.0, *, pool: str = "pump") -> Optional[str]:
-    """
-    Sell a percentage of your position via Lightning (tokens must be in the wallet
-    linked to PF_PP_KEY). Returns signature if executed.
-    """
-    if PF_POOLS and pool not in PF_POOLS:
-        print(f"[skip] unsupported pool '{pool}' for {mint}; allowed={sorted(PF_POOLS)}; skipping.")
-        return None
-
-    if DRY_RUN:
-        print(f"[DRYRUN] would SELL {mint} {pct_of_wallet:.0%} via Lightning on {pool}")
-        return None
-
-    pct = max(0.0, min(1.0, pct_of_wallet))
-    pct_str = f"{pct*100:.0f}%"
-
-    kp = load_keypair()
-    payer_pub = get_pubkey_str(kp)
-
-    body = {
-        "action": "sell",
-        "mint": mint,
-        "amount": pct_str,            # percent-of-position string
-        "denominatedInSol": False,    # selling tokens (not specifying in SOL)
-        "slippage": _slippage_percent_from_bps(PF_SLIPPAGE_BPS),
-        "priorityFee": PF_PRIORITY_SOL,
-        "pool": pool,
-        "publicKey": payer_pub,
-    }
-
-    try:
-        resp = _call_lightning(body)
-    except TemporaryPumpPortal as te:
-        print(f"[SELL TEMP] lightning quirk for {mint}: {te}")
-        return None
-    except Exception as e:
-        print(f"[SELL ERR] lightning call failed for {mint}: {e}")
-        return None
-
-    errs = resp.get("errors") or []
-    if isinstance(errs, list) and errs:
-        print(f"[SELL ERR] pumpportal errors for {mint}: {errs}")
-        return None
-
-    sig = resp.get("signature")
-    if sig:
-        print(f"[SELL OK] {mint} — via Lightning. https://solscan.io/tx/{sig}")
-        return sig
-
-    print(f"[SELL WARN] unexpected Lightning response for {mint}: {str(resp)[:300]}")
-    return None

@@ -1,4 +1,3 @@
-# scripts/main.py
 from __future__ import annotations
 
 import asyncio
@@ -7,13 +6,12 @@ import traceback
 from typing import Any, Dict
 
 from utils_pkg.pumpportal_client import PumpPortalClient
-from utils_pkg.pump_trader import maybe_buy            # async: maybe_buy(mint=..., ui=...)
+from utils_pkg.pump_trader import maybe_buy            # expects: maybe_buy(mint=..., ui=...)
 from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN
 
+EXIT_ENGINE_ENABLED = str(os.getenv("EXIT_ENGINE_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Lightweight, overridable filters (env-tunable)
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------- lightweight, overridable filters ----------
 MIN_INITIAL_BUY_SOL = float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"))  # optional floor
 MAX_NAME_LEN        = int(os.getenv("ENTRY_MAX_NAME_LEN", "40"))
 SYMBOL_BLACKLIST    = {
@@ -44,8 +42,7 @@ def _extract_name(msg: Dict[str, Any]) -> str:
 
 def _passes_filters(msg: Dict[str, Any]) -> bool:
     # Only act on brand-new token creations seen by PumpPortal
-    tx_type = (msg.get("txType") or msg.get("type") or "").strip().lower()
-    if tx_type != "create":
+    if (msg.get("txType") or msg.get("type")) != "create":
         return False
 
     init_buy = _as_float(msg.get("initialBuy"), 0.0)  # PumpPortal sends a float
@@ -53,15 +50,15 @@ def _passes_filters(msg: Dict[str, Any]) -> bool:
         return False
 
     sym = _extract_symbol(msg).upper()
-    if any(bad in sym for bad in SYMBOL_BLACKLIST):
+    if any(bad and bad in sym for bad in SYMBOL_BLACKLIST):
         return False
 
     name = _extract_name(msg)
-    if MAX_NAME_LEN > 0 and len(name) > MAX_NAME_LEN:
+    if len(name) > MAX_NAME_LEN:
         return False
 
     return True
-
+# ------------------------------------------------------
 
 async def _post_buy_exit_test(mint: str) -> None:
     """
@@ -77,17 +74,11 @@ async def _post_buy_exit_test(mint: str) -> None:
         except Exception as e:
             print(f"[post-buy test] sell failed for {mint}: {e}", flush=True)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Strategy
-# ──────────────────────────────────────────────────────────────────────────────
 class Strategy:
     """Streams PumpPortal events and triggers buys for tokens that pass filters."""
     def __init__(self) -> None:
         self._seen_mints: set[str] = set()
-        # small spacing between attempts to avoid hammering builders
-        self._cooldown = float(os.getenv("SCANNER_PERIOD_SEC", "15"))
-        # backpressure on parallel buy attempts
+        self._cooldown = float(os.getenv("SCANNER_PERIOD_SEC", "15"))  # micro-cooldown
         self._max_conc = int(os.getenv("PF_MAX_CONCURRENT", "2"))
         self._sema = asyncio.Semaphore(max(1, self._max_conc))
 
@@ -102,15 +93,13 @@ class Strategy:
 
         async with self._sema:
             try:
-                # ✅ buy path (maybe real, maybe DRYRUN) — pump_trader decides size/slippage/prio,
-                # and will skip pools not allowed by PF_POOLS.
+                # ✅ buy path (maybe real, maybe DRYRUN) — pump_trader decides size/slippage/prio
                 await maybe_buy(mint=mint, ui=m)
 
                 # 🔔 after a *real* fill:
                 # either run the immediate-sell test OR register the position into the exit engine.
-                if not IS_DRYRUN:
-                    mode = os.getenv("POSTBUY_MODE", "").strip().lower()
-                    if mode == "immediate_sell_test":
+                if not IS_DRYRUN and EXIT_ENGINE_ENABLED:
+                    if os.getenv("POSTBUY_MODE", "").strip().lower() == "immediate_sell_test":
                         asyncio.create_task(_post_buy_exit_test(mint))
                     else:
                         asyncio.create_task(exit_engine.on_buy_filled(mint))
@@ -118,19 +107,15 @@ class Strategy:
                 print("[strategy] maybe_buy exception:", flush=True)
                 traceback.print_exc()
 
-        # avoid spamming back-to-back tokens (throttle)
+        # avoid spamming back-to-back tokens
         await asyncio.sleep(self._cooldown)
 
     async def on_trade(self, m: Dict[str, Any]) -> None:
-        # optional: analytics/hooks for your own dashboards
+        # optional analytics/hooks for your own dashboards
         return
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Streaming loop with auto-reconnect/backoff
-# ──────────────────────────────────────────────────────────────────────────────
 async def stream_loop() -> None:
-    client = PumpPortalClient()  # uses PF_PP_KEY / PF_PP_ACCOUNT / PF_PP_MINTS internally
+    client = PumpPortalClient()  # uses PF_PP_KEY / PF_PP_ACCOUNT / PF_PP_MINTS
     strat = Strategy()
 
     print("[main] Connecting:", client.masked_uri(), flush=True)
@@ -138,11 +123,10 @@ async def stream_loop() -> None:
         k, raw = ev["kind"], ev["raw"]
         if k == "new_token":
             await strat.on_new_token(raw)
-        elif k == "trade":
+        elif k == "trade" and EXIT_ENGINE_ENABLED:
             # feed live ticks into exit engine for TP/TP2/TSL/SL
             await exit_engine.on_trade_tick(raw)
             await strat.on_trade(raw)
-
 
 async def main() -> None:
     """Never returns: reconnects on socket end/crash with backoff."""
@@ -159,7 +143,6 @@ async def main() -> None:
             traceback.print_exc()
             backoff = min(backoff * 2, 30)
         await asyncio.sleep(backoff)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
