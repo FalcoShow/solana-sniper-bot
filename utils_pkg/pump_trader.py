@@ -119,11 +119,11 @@ def _call_local(body: Dict[str, Any]) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Public: BUY helper (returns tx signature or None)
 # ──────────────────────────────────────────────────────────────────────────────
+# utils_pkg/pump_trader.py (replace the whole maybe_buy with this)
 async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
     """
-    Execute a buy via PumpPortal Lightning.
-    Returns the transaction signature on success (Lightning 'signature' or locally
-    signed b64), else None. Respects pool allowlist PF_POOLS and DRY_RUN.
+    Execute a buy via PumpPortal.
+    Returns the transaction signature on success, else None.
     """
     ui = kwargs.get("ui") or {}
     symbol = (kwargs.get("symbol") or ui.get("symbol") or "").strip()
@@ -153,7 +153,7 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
         priority_sol=PF_PRIORITY_SOL,
     )
 
-    # 1) Lightning (primary path)
+    # 1) Lightning
     try:
         resp = _call_lightning(body)
     except TemporaryPumpPortal as te:
@@ -173,30 +173,27 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
             print(f"[BUY ERR] lightning call failed for {mint}: {e}")
             return None
 
-    # 2) Handle JSON result (return signature if we have it)
+    # 2) Handle response
     errs = resp.get("errors") or []
     if isinstance(errs, list) and errs:
         print(f"[BUY ERR] pumpportal errors for {mint}: {errs}")
         return None
 
-    # Lightning executed on server side
     sig = resp.get("signature")
-    if isinstance(sig, str) and sig:
+    if sig:
         print(f"[BUY OK] {label} — executed via Lightning. https://solscan.io/tx/{sig}")
         return sig
 
-    # Received a base64 transaction: sign & send locally
+    # Local path: sign & send base64 tx if provided
     tx_b64 = resp.get("transaction") or resp.get("tx")
-    if isinstance(tx_b64, str) and tx_b64:
+    if tx_b64:
         try:
             sig2 = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
-            print(f"[BUY OK] {label} — signed locally. https://solscan.io/tx/{sig2}")
+            print(f"[BUY OK] {label} — local sign. https://solscan.io/tx/{sig2}")
             return sig2
         except Exception as e:
-            print(f"[BUY ERR] local sign/send failed for {mint}: {e}")
+            print(f"[BUY ERR] signing local tx failed for {mint}: {e}")
             return None
 
-    # No signature nor transaction -> unexpected
-    short = str(resp)[:300]
-    print(f"[BUY ERR] unexpected PumpPortal response for {mint}: {short}")
+    print(f"[BUY ERR] unexpected PumpPortal response for {mint}: {json.dumps(resp)[:300]}")
     return None

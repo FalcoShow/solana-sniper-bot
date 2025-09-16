@@ -114,6 +114,9 @@ class Strategy:
                     else:
                         # pass the tx signature so we learn from the transaction itself
                         asyncio.create_task(exit_engine.on_buy_filled(mint, tx_sig=sig))
+                elif not sig:
+                    # Useful log when Lightning returns OK logs but not a sig payload
+                    print(f"[strategy] no tx signature for mint {mint}; skipping learner.", flush=True)
             except Exception:
                 print("[strategy] maybe_buy exception:", flush=True)
                 traceback.print_exc()
