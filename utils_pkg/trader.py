@@ -354,7 +354,7 @@ async def sell_on_jupiter(mint: str, *, pct_of_wallet: float = 1.0) -> Optional[
     return sig
 
 # =============================================================================
-# Exit Engine (positions + rules)
+# Exit Engine (positions + rules) — robust tx-learn (no mint-filter RPC)
 # =============================================================================
 
 def _extract_mint(msg: Dict[str, Any]) -> str:
@@ -363,15 +363,16 @@ def _extract_mint(msg: Dict[str, Any]) -> str:
 # --- Config knobs (env) -------------------------------------------------------
 OWNER_FROM_ENV        = (os.getenv("PF_PP_ACCOUNT") or "").strip()
 PF_DEBUG_TX           = str(os.getenv("PF_DEBUG_TX", "0")).strip().lower() in {"1","true","yes","y","on"}
+PF_TXLEARN_DUMP       = str(os.getenv("PF_TXLEARN_DUMP", "0")).strip().lower() in {"1","true","yes","y","on"}
 
 LEARN_BASE_DELAY_SEC  = _envf("PF_POS_LEARN_BASE_DELAY_SEC", 6.0)
 LEARN_MAX_ATTEMPTS    = _envi("PF_POS_LEARN_MAX_ATTEMPTS", 10)
 LEARN_BACKOFF         = _envf("PF_POS_LEARN_BACKOFF", 1.5)
 LEARN_LOG_EVERY       = _envi("PF_POS_LEARN_LOG_EVERY", 3)
 
-TXLEARN_TRIES         = _envi("PF_TXLEARN_TRIES", 3)           # quick attempts to read tx meta
-TXLEARN_DELAY         = _envf("PF_TXLEARN_DELAY_SEC", 0.7)     # between those tx meta attempts
-TXLEARN_PREFETCH_ATAS = str(os.getenv("PF_TXLEARN_PREFETCH_ATAS", "0")).strip().lower() in {"1","true","yes","y","on"}
+TXLEARN_TRIES         = _envi("PF_TXLEARN_TRIES", 3)           # fast tx-meta attempts
+TXLEARN_DELAY         = _envf("PF_TXLEARN_DELAY_SEC", 0.7)     # between tx-meta attempts
+TXLEARN_WARMUP        = _envf("PF_TXLEARN_WARMUP_SEC", 0.25)   # tiny delay before first try
 
 # Prefer a separate, faster RPC for transaction/meta lookups if provided
 RPC_TX_URL            = os.getenv("SOL_RPC_TX_URL") or os.getenv("SOL_RPC_URL")
@@ -391,132 +392,141 @@ def _rpc_tx(method: str, params: list) -> Any:
         raise RuntimeError(js["error"])
     return js.get("result")
 
-def _owner_token_accounts(owner: str, mint: str) -> set[str]:
-    """
-    Optional: fetch owner's token accounts for this mint.
-    Useful when 'owner' is missing in postTokenBalances and we want a precise index match.
-    Can be disabled via PF_TXLEARN_PREFETCH_ATAS=0 to avoid provider quirks.
-    """
-    try:
-        res = _rpc_tx("getTokenAccountsByOwner", [
-            owner,
-            {"mint": mint},
-            {"encoding": "jsonParsed", "commitment": "finalized"},
-        ])
-        out = set()
-        for it in (res or {}).get("value", []):
-            try:
-                out.add(it["pubkey"])
-            except Exception:
-                continue
-        if PF_DEBUG_TX:
-            print(f"[txlearn] owner ATAs for {mint}: {len(out)} found", flush=True)
-        return out
-    except Exception as e:
-        # Non-fatal; just skip this optimization
-        if PF_DEBUG_TX:
-            print(f"[txlearn] getTokenAccountsByOwner failed for {mint}: {e}", flush=True)
-        return set()
-
-def _learn_from_tx_sig(owner: str, mint: str, tx_sig: str, owner_atas: Optional[set[str]] = None) -> Tuple[int, int]:
-    """
-    Learn position size from a parsed transaction.
-    Strategy:
-      1) Direct owner+mint match (fast path when RPC includes 'owner').
-      2) Match by accountIndex -> accountKey ∈ owner_atas (if provided).
-      3) NEW: Pick the account for `mint` with the *largest positive delta* (post - pre).
-         This is robust across Token/Token-2022 and does not need owner/ATAs.
-    Returns (amount_iu, decimals). (0,0) if not found.
-    """
-    params = [
-        tx_sig,
+def _tx_get(meta_sig: str) -> Dict[str, Any] | None:
+    return _rpc_tx("getTransaction", [
+        meta_sig,
         {
             "encoding": "jsonParsed",
             "commitment": "finalized",
             "maxSupportedTransactionVersion": 0
         },
-    ]
-    res = _rpc_tx("getTransaction", params)
-    if not res:
+    ])
+
+def _acct_info_jsonParsed(pubkey: str) -> Dict[str, Any] | None:
+    """Fetch jsonParsed account; return result['value'] or None."""
+    res = _rpc_tx("getAccountInfo", [
+        pubkey,
+        {"encoding": "jsonParsed", "commitment": "finalized"}
+    ])
+    return (res or {}).get("value")
+
+def _learn_from_tx_sig(owner: str, mint: str, tx_sig: str) -> Tuple[int, int]:
+    """
+    Learn post-balance of `mint` for `owner` using the transaction data alone.
+    Tries three passes:
+      1) Direct owner+mint match in postTokenBalances (if RPC includes owner).
+      2) Largest positive delta for this mint among postTokenBalances that belong to owner
+         (inferred via accountKeys + jsonParsed getAccountInfo).
+      3) If deltas not available, scan all accountKeys via getAccountInfo and return the
+         token account owned by `owner` for `mint` with its parsed 'tokenAmount'.
+    Returns (amount_iu, decimals). (0,0) if not found.
+    """
+    tx = _tx_get(tx_sig)
+    if not tx:
         return 0, 0
 
-    meta = res.get("meta") or {}
-    message = (res.get("transaction") or {}).get("message") or {}
-    account_keys = message.get("accountKeys") or []
+    meta    = tx.get("meta") or {}
+    message = (tx.get("transaction") or {}).get("message") or {}
+    keys    = message.get("accountKeys") or []
 
-    post_bal = meta.get("postTokenBalances") or []
-    pre_bal  = meta.get("preTokenBalances") or []
+    # Normalize keys to simple list of base58 strings
+    key_list: list[str] = []
+    for k in keys:
+        if isinstance(k, str):
+            key_list.append(k)
+        else:
+            pk = (k or {}).get("pubkey")
+            if pk: key_list.append(pk)
 
-    # ---- Pass 1: direct owner+mint (when RPC includes 'owner') ----
-    for b in post_bal:
+    pre  = meta.get("preTokenBalances")  or []
+    post = meta.get("postTokenBalances") or []
+
+    if PF_TXLEARN_DUMP and PF_DEBUG_TX:
+        try:
+            mints_post = [(b.get("mint"), b.get("owner"), b.get("accountIndex")) for b in post]
+            print(f"[txlearn] dump postTokenBalances (mint,owner,idx): {mints_post[:12]}", flush=True)
+        except Exception:
+            pass
+
+    # Quick maps by accountIndex for delta checks
+    def _map(bals: list) -> Dict[int, Tuple[str,int,int,str]]:
+        out: Dict[int, Tuple[str,int,int,str]] = {}
+        for b in bals:
+            try:
+                idx = int(b.get("accountIndex"))
+                ui  = b.get("uiTokenAmount") or {}
+                out[idx] = (
+                    b.get("mint",""),
+                    int(ui.get("amount", "0")),
+                    int(ui.get("decimals", 0) or 0),
+                    b.get("owner") or "",   # may be missing on some RPCs
+                )
+            except Exception:
+                continue
+        return out
+
+    pre_map  = _map(pre)
+    post_map = _map(post)
+
+    # ----- Pass 1: direct owner + mint in postTokenBalances -----
+    for b in post:
         try:
             if b.get("mint") != mint:
                 continue
-            if b.get("owner") == owner:
+            if (b.get("owner") or "") == owner:
                 ui  = b.get("uiTokenAmount") or {}
                 amt = int(ui.get("amount", "0"))
                 dec = int(ui.get("decimals", 0) or 0)
-                return amt, dec
+                if amt > 0:
+                    return amt, dec
         except Exception:
             continue
 
-    # ---- Pass 2: match by accountIndex -> accountKey ∈ owner_atas ----
-    if owner_atas:
-        for b in post_bal:
-            try:
-                if b.get("mint") != mint:
-                    continue
-                idx = int(b.get("accountIndex"))
-                acct_key = (
-                    account_keys[idx]
-                    if isinstance(account_keys[idx], str)
-                    else (account_keys[idx] or {}).get("pubkey")
-                )
-                if acct_key and acct_key in owner_atas:
-                    ui  = b.get("uiTokenAmount") or {}
-                    amt = int(ui.get("amount", "0"))
-                    dec = int(ui.get("decimals", 0) or 0)
-                    return amt, dec
-            except Exception:
-                continue
-
-    # ---- Pass 3 (robust): choose the line with largest positive delta ----
-    pre_map: Dict[int, int] = {}
-    for b in pre_bal:
+    # Helper: probe account by key via getAccountInfo jsonParsed
+    def _probe_account_for_owner_amount(acct_key: str) -> Tuple[int,int] | None:
         try:
-            if b.get("mint") != mint:
-                continue
-            idx = int(b.get("accountIndex"))
-            ui  = b.get("uiTokenAmount") or {}
-            pre_map[idx] = int(ui.get("amount", "0"))
+            val = _acct_info_jsonParsed(acct_key)  # {'data':{'parsed':{'info':{...}}}}
+            if not val:
+                return None
+            data = (val.get("data") or {}).get("parsed") or {}
+            info = data.get("info") or {}
+            if (info.get("mint") == mint) and (info.get("owner") == owner):
+                ta = (info.get("tokenAmount") or {})
+                amt = int((ta.get("amount") or "0"))
+                dec = int((ta.get("decimals") or 0))
+                return (amt, dec) if amt > 0 else None
         except Exception:
-            pass
+            return None
+        return None
 
-    best = None  # (delta, post_amt, dec, idx)
-    for b in post_bal:
-        try:
-            if b.get("mint") != mint:
-                continue
-            idx = int(b.get("accountIndex"))
-            ui  = b.get("uiTokenAmount") or {}
-            post_amt = int(ui.get("amount", "0"))
-            dec = int(ui.get("decimals", 0) or 0)
-            delta = post_amt - pre_map.get(idx, 0)
-            if delta > 0 and (best is None or delta > best[0]):
-                best = (delta, post_amt, dec, idx)
-        except Exception:
-            pass
+    # ----- Pass 2: infer owner via accountIndex -> accountKey -> getAccountInfo; pick largest +delta -----
+    best_amt, best_dec = 0, 0
+    for idx, (m_mint, post_amt, dec, b_owner) in post_map.items():
+        if m_mint != mint:
+            continue
+        # If owner present and matches, we can use it immediately
+        if b_owner == owner and post_amt > 0:
+            return post_amt, dec
+        # Else, resolve the accountKey and probe it
+        if 0 <= idx < len(key_list):
+            key = key_list[idx]
+            probed = _probe_account_for_owner_amount(key)
+            if probed:
+                amt, d = probed
+                # delta preference if we have pre
+                pre_amt = (pre_map.get(idx) or ("",0,d,""))[1]
+                eff_amt = max(amt - pre_amt, 0) or amt  # prefer delta, else absolute
+                if eff_amt > best_amt:
+                    best_amt, best_dec = amt, d
 
-    if best:
-        _, post_amt, dec, idx = best
-        if PF_DEBUG_TX:
-            acct_key = (
-                account_keys[idx]
-                if isinstance(account_keys[idx], str)
-                else (account_keys[idx] or {}).get("pubkey")
-            )
-            print(f"[txlearn] chose idx={idx} acct={acct_key} post={post_amt} (largest +delta)", flush=True)
-        return post_amt, dec
+    if best_amt > 0:
+        return best_amt, best_dec
+
+    # ----- Pass 3: brute scan all accountKeys (jsonParsed) for owner's token acct of this mint -----
+    for key in key_list:
+        probed = _probe_account_for_owner_amount(key)
+        if probed:
+            return probed
 
     return 0, 0
 
@@ -537,28 +547,23 @@ class PositionsExitEngine:
         poll_sec: float = LEARN_BASE_DELAY_SEC
     ) -> None:
         """
-        After a buy, prefer to learn size from the transaction meta (instant, low-variance).
+        After a buy, prefer to learn size from the transaction meta (low-variance).
         If that fails, fall back to wallet polling with backoff.
         """
         amt_iu, dec = 0, 0
 
         # ---------- Path 1: learn from transaction signature (quick retries) ----------
-        owner_atas: set[str] = set()
         if tx_sig:
             if PF_DEBUG_TX:
                 print(f"[txlearn] start mint={mint} from tx={tx_sig}", flush=True)
 
-            # (Optional) prefetch user's token accounts for this mint
-            if TXLEARN_PREFETCH_ATAS:
-                try:
-                    owner_atas = _owner_token_accounts(self.owner, mint)
-                except Exception:
-                    owner_atas = set()
+            # tiny warmup to avoid racing indexer
+            await asyncio.sleep(max(0.0, float(TXLEARN_WARMUP)))
 
             tries = max(1, int(TXLEARN_TRIES))
             for k in range(1, tries + 1):
                 try:
-                    amt_iu, dec = _learn_from_tx_sig(self.owner, mint, tx_sig, owner_atas or None)
+                    amt_iu, dec = _learn_from_tx_sig(self.owner, mint, tx_sig)
                     if amt_iu > 0:
                         if PF_DEBUG_TX:
                             print(f"[txlearn] success on try {k}: amount={amt_iu} dec={dec}", flush=True)
