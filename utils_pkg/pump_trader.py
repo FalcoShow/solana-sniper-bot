@@ -18,7 +18,7 @@ from utils_pkg.solana_wallet import (
 # env / config
 # -----------------------------------------------------------------------------
 PP_BASE = "https://pumpportal.fun"
-PP_KEY: str = (os.getenv("PF_PP_KEY") or "").strip()
+PP_KEY  = (os.getenv("PF_PP_KEY") or "").strip()
 
 def _is_true(v: Optional[str]) -> bool:
     return str(v).lower() in {"1", "true", "yes", "y", "on"}
@@ -62,13 +62,14 @@ PF_PRIORITY_SOL = _env_float("PF_PRIORITY_SOL", 0.0005)   # 5e-4 SOL
 # -----------------------------------------------------------------------------
 def _pp_headers() -> dict:
     if not PP_KEY:
-        raise RuntimeError("PF_PP_KEY is not set; PumpPortal trades require an API key.")
-    # Both headers are accepted by many proxies/backends; include both to be safe.
+        raise RuntimeError("PF_PP_KEY is not set; PumpPortal trades need an API key")
+    # send in both common places; some deployments check one or the other
     return {
         "accept": "application/json",
         "content-type": "application/json",
-        "api-key": PP_KEY,     # <- REQUIRED by /api/trade
-        "x-api-key": PP_KEY,   # <- some infra expects this
+        "api-key": PP_KEY,
+        "x-api-key": PP_KEY,
+        "authorization": f"Bearer {PP_KEY}",
     }
 
 def _pp_post_json(path: str, payload: dict, timeout: int = 20) -> dict:
@@ -79,11 +80,30 @@ def _pp_post_json(path: str, payload: dict, timeout: int = 20) -> dict:
             "(WS read-only keys can’t POST). Request trading access for your key."
         )
     r.raise_for_status()
-    try:
-        return r.json()
-    except Exception:
-        raise RuntimeError(f"PumpPortal JSON parse failed: {r.text[:400]}")
+    return r.json()
 
+def build_buy_tx_via_portal(
+    mint: str,
+    payer_pubkey: str,
+    *,
+    amount_sol: float,
+    slippage_bps: int,
+    priority_sol: float,
+) -> str:
+    js = _pp_post_json("/api/trade", {
+        "apiKey": PP_KEY,           # some builders also check this in the JSON
+        "publicKey": payer_pubkey,
+        "action": "buy",
+        "mint": mint,
+        "amount": amount_sol,       # SOL amount
+        "slippage": slippage_bps,   # integer BPS
+        "priorityFee": priority_sol,
+        "pool": "pump",
+    })
+    tx_b64 = js.get("transaction") or js.get("tx")
+    if not tx_b64:
+        raise RuntimeError(f"Builder response missing transaction: {js}")
+    return tx_b64
 # -----------------------------------------------------------------------------
 # Validation
 # -----------------------------------------------------------------------------
