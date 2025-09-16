@@ -393,22 +393,33 @@ def _rpc_tx(method: str, params: list) -> Any:
     return js.get("result")
 
 def _tx_get(meta_sig: str) -> Dict[str, Any] | None:
-    return _rpc_tx("getTransaction", [
-        meta_sig,
-        {
-            "encoding": "jsonParsed",
-            "commitment": "finalized",
-            "maxSupportedTransactionVersion": 0
-        },
-    ])
+    # Try confirmed first (faster availability), then finalized
+    for commitment in ("confirmed", "finalized"):
+        try:
+            return _rpc_tx("getTransaction", [
+                meta_sig,
+                {
+                    "encoding": "jsonParsed",
+                    "commitment": commitment,
+                    "maxSupportedTransactionVersion": 0
+                },
+            ])
+        except Exception:
+            continue
+    return None
 
 def _acct_info_jsonParsed(pubkey: str) -> Dict[str, Any] | None:
-    """Fetch jsonParsed account; return result['value'] or None."""
-    res = _rpc_tx("getAccountInfo", [
-        pubkey,
-        {"encoding": "jsonParsed", "commitment": "finalized"}
-    ])
-    return (res or {}).get("value")
+    # Same: confirmed first, then finalized
+    for commitment in ("confirmed", "finalized"):
+        try:
+            res = _rpc_tx("getAccountInfo", [
+                pubkey,
+                {"encoding": "jsonParsed", "commitment": commitment}
+            ])
+            return (res or {}).get("value")
+        except Exception:
+            continue
+    return None
 
 def _learn_from_tx_sig(owner: str, mint: str, tx_sig: str) -> Tuple[int, int]:
     """

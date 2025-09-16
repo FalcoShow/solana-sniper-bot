@@ -150,100 +150,98 @@ def _label_from_ui(mint: str, ui: Dict[str, Any]) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 # Public: BUY helper (returns tx signature or None)
 # ──────────────────────────────────────────────────────────────────────────────
+PP_ACCOUNT = (os.getenv("PF_PP_ACCOUNT") or "").strip()
+
+def _normalize_mint(m: str) -> str:
+    m = (m or "").strip()
+    # Many PumpPortal “mint” strings have an extra "pump" suffix; strip if present
+    if len(m) > 44 and m.endswith("pump"):
+        return m[:-4]
+    return m
 
 async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
     """
     Execute a buy via PumpPortal.
     Returns the transaction signature on success, else None.
-
-    IMPORTANT:
-      - Use the RAW mint with '...pump' for PumpPortal endpoints.
-      - Do NOT strip the suffix here. (Exit/quotes may normalize separately.)
     """
-    ui: Dict[str, Any] = kwargs.get("ui") or {}
-    pool = (kwargs.get("pool") or ui.get("pool") or ui.get("poolType") or ui.get("amm") or "pump").strip().lower()
+    ui = kwargs.get("ui") or {}
+    symbol = (kwargs.get("symbol") or ui.get("symbol") or "").strip()
+    pool   = (kwargs.get("pool")   or ui.get("pool")   or "pump").strip().lower()
+
+    mint = _normalize_mint(mint)
 
     if pool not in PF_POOLS:
-        print(f"[skip] unsupported pool '{pool}' for {mint}; allowed={sorted(PF_POOLS)}; skipping.", flush=True)
+        print(f"[skip] unsupported pool '{pool}' for {mint}; allowed={sorted(PF_POOLS)}; skipping.")
         return None
 
-    trade_mint = _raw_mint_for_trade(mint, ui, pool)
-    label      = _label_from_ui(trade_mint, ui)
-    amount_sol = current_trade_sol()
-
-    if not trade_mint:
-        print("[BUY ERR] no mint provided", flush=True)
-        return None
+    label   = f"{symbol} ({mint})" if symbol else mint
+    amt_sol = current_trade_sol()
 
     if DRY_RUN:
-        print(f"[DRYRUN] would BUY {label} on {pool} for {amount_sol} SOL (mint={trade_mint})", flush=True)
+        print(f"[DRYRUN] would buy {label} on {pool} for {amt_sol} SOL")
         return None
 
-    # Load wallet and build body
     kp = load_keypair()
-    payer_pub = get_pubkey_str(kp)
+    kp_pub = get_pubkey_str(kp)
+    payer_pub = PP_ACCOUNT or kp_pub  # 🔒 ALWAYS send PF_PP_ACCOUNT if provided
+
+    if PP_ACCOUNT and PP_ACCOUNT != kp_pub:
+        print(f"[warn] PF_PP_ACCOUNT ({PP_ACCOUNT}) != keypair pubkey ({kp_pub}). "
+              f"Lightning will deposit to PF_PP_ACCOUNT; local-sign fallback is disabled.", flush=True)
 
     body = _build_body(
         action="buy",
-        mint=trade_mint,          # keep ...pump suffix for PumpPortal
-        payer_pubkey=payer_pub,
-        amount_sol=amount_sol,
+        mint=mint,
+        payer_pubkey=payer_pub,              # 🔑 ensure deposits land in PF_PP_ACCOUNT
+        amount_sol=amt_sol,
         pool=pool,
         slippage_bps=PF_SLIPPAGE_BPS,
         priority_sol=PF_PRIORITY_SOL,
     )
 
-    # 1) Try Lightning route
+    # 1) Lightning
     try:
         resp = _call_lightning(body)
     except TemporaryPumpPortal as te:
-        print(f"[BUY TEMP] lightning quirk for {trade_mint}: {te}", flush=True)
+        print(f"[BUY TEMP] lightning quirk for {mint}: {te}")
         return None
     except Exception as e:
         if USE_LOCAL_FALLBK:
-            # 2) Optional local builder fallback
             try:
                 resp = _call_local(body)
             except TemporaryPumpPortal as te2:
-                print(f"[BUY TEMP] local quirk for {trade_mint}: {te2}", flush=True)
+                print(f"[BUY TEMP] local quirk for {mint}: {te2}")
                 return None
             except Exception as e2:
-                print(f"[BUY ERR] local builder failed for {trade_mint}: {e2}", flush=True)
+                print(f"[BUY ERR] local builder failed for {mint}: {e2}")
                 return None
         else:
-            print(f"[BUY ERR] lightning call failed for {trade_mint}: {e}", flush=True)
+            print(f"[BUY ERR] lightning call failed for {mint}: {e}")
             return None
 
-    # 3) Handle response consistently
-    errs = resp.get("errors")
+    errs = resp.get("errors") or []
     if isinstance(errs, list) and errs:
-        print(f"[BUY ERR] pumpportal errors for {trade_mint}: {errs}", flush=True)
-        return None
-    if isinstance(errs, str) and errs.strip():
-        print(f"[BUY ERR] pumpportal error for {trade_mint}: {errs.strip()}", flush=True)
+        print(f"[BUY ERR] pumpportal errors for {mint}: {errs}")
         return None
 
-    # Lightning path usually returns a signature directly
-    sig = resp.get("signature") or resp.get("txSig") or resp.get("tx")
-    if isinstance(sig, str) and len(sig) > 20:  # crude sanity check
-        print(f"[BUY OK] {label} — executed via Lightning. https://solscan.io/tx/{sig}", flush=True)
+    sig = resp.get("signature")
+    if sig:
+        print(f"[BUY OK] {label} — executed via Lightning. https://solscan.io/tx/{sig} [payer={payer_pub}]")
         return sig
 
-    # Local path generally returns a base64 transaction to sign
-    tx_b64 = resp.get("transaction") or resp.get("txBase64") or resp.get("tx")
-    if isinstance(tx_b64, str) and tx_b64:
+    # Local path: only sign if the tx matches our keypair’s pubkey (safety)
+    tx_b64 = resp.get("transaction") or resp.get("tx")
+    if tx_b64:
+        if payer_pub != kp_pub:
+            print(f"[BUY ERR] refusing to locally sign a tx for payer {payer_pub} with key {kp_pub}.")
+            return None
         try:
             sig2 = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
-            print(f"[BUY OK] {label} — local sign. https://solscan.io/tx/{sig2}", flush=True)
+            print(f"[BUY OK] {label} — local sign. https://solscan.io/tx/{sig2} [payer={payer_pub}]")
             return sig2
         except Exception as e:
-            print(f"[BUY ERR] signing local tx failed for {trade_mint}: {e}", flush=True)
+            print(f"[BUY ERR] signing local tx failed for {mint}: {e}")
             return None
 
-    # Unexpected shape
-    try:
-        preview = json.dumps(resp)[:300]
-    except Exception:
-        preview = str(resp)[:300]
-    print(f"[BUY ERR] unexpected PumpPortal response for {trade_mint}: {preview}", flush=True)
+    print(f"[BUY ERR] unexpected PumpPortal response for {mint}: {json.dumps(resp)[:300]}")
     return None
