@@ -244,35 +244,44 @@ def _extract_mint(msg: Dict[str, Any]) -> str:
     return (msg.get("mint") or msg.get("mintAddress") or msg.get("mint_address") or "").strip()
 
 class PositionsExitEngine:
-    """
-    Minimal in-memory positions + exits.
-    - Learns size after buy (`on_buy_filled`).
-    - Uses Jupiter quotes for price in SOL.
-    - Does TP1 / TP2 partials, TSL, and hard stop.
-    """
-
     def __init__(self) -> None:
         self.owner = get_pubkey_str(load_keypair())
         self.pos: Dict[str, Dict[str, Any]] = {}  # mint -> state
 
     async def on_buy_filled(self, mint: str, *, poll_sec: float = 6.0) -> None:
         """
-        Called after you send a buy. Poll wallet to learn size.
-        Safe to call even if the buy failed; it’ll just see 0 and return.
+        After a buy, poll the wallet for a while to learn the filled size.
+        Newly-created pump mints sometimes aren't immediately readable on RPC,
+        so we retry with exponential-ish backoff.
         """
-        await asyncio.sleep(poll_sec)  # let the fill settle
+        max_attempts = 10                # ~ 2–3 minutes total
+        delay = max(3.0, float(poll_sec))
 
-        try:
-            amt_iu, dec = _sum_token_balance_iu(self.owner, mint)
-        except Exception as e:
-            # e.g., RPC: "could not find mint" or transient index lag — just skip quietly
-            print(f"[pos] skip learn {mint}: {e}")
-            return
+        amt_iu, dec = 0, 0
+        last_err = None
+        for i in range(1, max_attempts + 1):
+            await asyncio.sleep(delay)
+            try:
+                amt_iu, dec = _sum_token_balance_iu(self.owner, mint)
+                if amt_iu > 0:
+                    break
+            except Exception as e:
+                last_err = e
+
+            # next delay: 6, 8, 12, 18, 27, ...
+            delay = min(delay * 1.4, 30.0)
+            print(f"[pos] retry learn {mint} attempt {i}/{max_attempts}..."
+                  f" last_bal={amt_iu} err={last_err}", flush=True)
 
         if amt_iu <= 0:
+            # give up politely; we'll just never manage this position
+            if last_err:
+                print(f"[pos] giving up learn {mint}: {last_err}", flush=True)
+            else:
+                print(f"[pos] giving up learn {mint}: still zero after retries", flush=True)
             return
 
-        # estimate entry price via a tiny quote (≈1% of size, clamped)
+        # estimate entry price via a tiny quote (1% of size, clamped)
         sample = max(1, min(amt_iu // 100, amt_iu))
         try:
             q = _jup_quote(mint, SOL_MINT, sample)
@@ -286,8 +295,8 @@ class PositionsExitEngine:
             "decimals": dec,
             "tp1_done": False,
             "tp2_done": False,
-            "peak_sol": price_sol,   # track peak for TSL
-            "entry_sol": price_sol,  # None if quote failed, we’ll handle it
+            "peak_sol": price_sol,
+            "entry_sol": price_sol,
             "last_ts": time.time(),
         }
         print(f"[pos] learned entry for {mint}: size_iu={amt_iu} entry≈{price_sol} SOL", flush=True)
