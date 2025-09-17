@@ -1,3 +1,4 @@
+# utils_pkg/txlearn.py
 from __future__ import annotations
 
 import asyncio
@@ -9,13 +10,13 @@ import aiohttp
 
 # ------------------------ env + defaults ------------------------
 
-# Prefer a dedicated TX RPC if present (faster meta visibility), else fall back.
-RPC_URL = (os.getenv("SOL_RPC_TX_URL", "").strip()
-           or os.getenv("SOL_RPC_URL", "").strip()
-           or "https://api.mainnet-beta.solana.com")
+# Prefer a dedicated TX RPC if present (faster meta/signature visibility), else fall back.
+RPC_URL     = os.getenv("SOL_RPC_URL", "").strip() or "https://api.mainnet-beta.solana.com"
+TX_RPC_URL  = os.getenv("SOL_RPC_TX_URL", "").strip() or RPC_URL
 
-TX_COMMITMENT = (os.getenv("PF_TXLEARN_COMMITMENT", "confirmed").strip().lower()
-                 or "confirmed")  # "processed" | "confirmed" | "finalized"
+# Commitment for TX lookups / balance reads: "processed" | "confirmed" | "finalized"
+TX_COMMITMENT = (os.getenv("PF_TXLEARN_COMMITMENT", "processed").strip().lower()
+                 or "processed")
 
 TX_TRIES      = int(os.getenv("PF_TXLEARN_TRIES", "20"))
 TX_DELAY_SEC  = float(os.getenv("PF_TXLEARN_DELAY_SEC", "1.2"))
@@ -100,7 +101,7 @@ class _Rpc:
             raise RuntimeError(str(data["error"]))
         return data.get("result")
 
-    # --- specific RPC helpers ---
+    # --- specific RPC helpers (used on TX-RPC for tx/signature, on RPC for balances) ---
 
     async def get_signature_status(self, sig: str) -> Optional[dict]:
         try:
@@ -186,8 +187,8 @@ def _extract_ui_amount(token_acc: dict) -> Tuple[int, int, float]:
         return 0, 0, 0.0
 
 
-async def _sum_owned_ui_amount(rpc: _Rpc, owner: str, mint: str) -> float:
-    accounts = await rpc.get_token_accounts_by_owner_mint(owner, mint)
+async def _sum_owned_ui_amount(rpc_general: _Rpc, owner: str, mint: str) -> float:
+    accounts = await rpc_general.get_token_accounts_by_owner_mint(owner, mint)
     if DEBUG:
         print(f"[txlearn] owner ATAs for {mint}: {len(accounts)} found", flush=True)
     total_ui = 0.0
@@ -199,13 +200,13 @@ async def _sum_owned_ui_amount(rpc: _Rpc, owner: str, mint: str) -> float:
 
 # ------------------------ mint validation & resolution ------------------------
 
-async def _is_valid_mint_account(rpc: _Rpc, addr: str) -> bool:
+async def _is_valid_mint_account(rpc_general: _Rpc, addr: str) -> bool:
     """
     Quick mint sanity: RPC getMultipleAccounts parsed.type == 'mint'
     """
     if not _is_likely_pubkey(addr):
         return False
-    res = await rpc.get_multiple_accounts([addr])
+    res = await rpc_general.get_multiple_accounts([addr])
     try:
         v = (res or {}).get("value") or []
         if not v or not v[0]:
@@ -222,8 +223,8 @@ async def _is_valid_mint_account(rpc: _Rpc, addr: str) -> bool:
 
 async def _hel_parse_for_mint(session: aiohttp.ClientSession, sig: str, owner: Optional[str]) -> Optional[str]:
     """
-    Ask Helius Parse API for the transaction and infer the purchased mint
-    from token balance changes or events.
+    Ask Helius Parse API for the transaction and infer the purchased mint.
+    More forgiving: prefer a positive change on `owner`, else take the largest positive change.
     """
     if not HELIUS_PARSE_URL:
         return None
@@ -239,25 +240,30 @@ async def _hel_parse_for_mint(session: aiohttp.ClientSession, sig: str, owner: O
         return None
     tx = data[0] or {}
 
-    # 1) tokenBalanceChanges: look for +amount on our owner (if given)
+    # 1) tokenBalanceChanges
     tbc = tx.get("tokenBalanceChanges") or []
-    best: Optional[Tuple[str, float]] = None  # (mint, delta_ui)
+    best_owner: Optional[Tuple[str, float]] = None  # (mint, ui_delta)
+    best_any: Optional[Tuple[str, float]] = None
     for change in tbc:
         try:
-            who = change.get("userAccount") or change.get("owner")
-            if owner and who and who != owner:
-                continue
             mint = change.get("mint")
-            raw = float(change.get("rawTokenAmount", {}).get("tokenAmount", 0))
-            dec = int(change.get("rawTokenAmount", {}).get("decimals", 0))
-            ui  = float(change.get("tokenAmount", raw / (10 ** dec) if dec else raw))
-            if ui > 0 and _is_likely_pubkey(mint):
-                if best is None or ui > best[1]:
-                    best = (mint, ui)
+            raw  = float(change.get("rawTokenAmount", {}).get("tokenAmount", 0))
+            dec  = int(change.get("rawTokenAmount", {}).get("decimals", 0))
+            ui   = float(change.get("tokenAmount", raw / (10 ** dec) if dec else raw))
+            if not (_is_likely_pubkey(mint) and ui > 0):
+                continue
+            who = change.get("userAccount") or change.get("owner")
+            if owner and who == owner:
+                if best_owner is None or ui > best_owner[1]:
+                    best_owner = (mint, ui)
+            if best_any is None or ui > best_any[1]:
+                best_any = (mint, ui)
         except Exception:
             continue
-    if best:
-        return best[0]
+    if best_owner:
+        return best_owner[0]
+    if best_any:
+        return best_any[0]
 
     # 2) fallback: events list sometimes includes "mint" field
     events = tx.get("events") or {}
@@ -271,12 +277,12 @@ async def _hel_parse_for_mint(session: aiohttp.ClientSession, sig: str, owner: O
     return None
 
 
-async def _infer_mint_from_rpc_tx(rpc: _Rpc, sig: str, owner: Optional[str]) -> Optional[str]:
+async def _infer_mint_from_rpc_tx(tx_rpc: _Rpc, sig: str, owner: Optional[str]) -> Optional[str]:
     """
     Infer mint directly from RPC getTransaction (jsonParsed) using postTokenBalances.
     Prioritizes entries owned by `owner` (if provided), else returns the largest post amount.
     """
-    tx = await rpc.get_transaction(sig, TX_COMMITMENT)
+    tx = await tx_rpc.get_transaction(sig, TX_COMMITMENT)
     if not tx:
         return None
 
@@ -293,6 +299,7 @@ async def _infer_mint_from_rpc_tx(rpc: _Rpc, sig: str, owner: Optional[str]) -> 
                 continue
             m = b.get("mint")
             ui = b.get("uiTokenAmount") or {}
+            # 'amount' is string of raw units at this point
             amt = int(str(ui.get("amount", "0")))
             if amt > 0 and _is_likely_pubkey(m):
                 if best is None or amt > best[1]:
@@ -323,15 +330,16 @@ async def _maybe_await(x):
 
 
 async def resolve_mint_best_effort(
-    rpc: _Rpc,
+    tx_rpc: _Rpc,
+    rpc_general: _Rpc,
     raw_id_or_mint: str,
     signature: Optional[str],
     owner: Optional[str],
 ) -> Optional[str]:
     """
     Resolve a real spl-token mint address from:
-      1) Helius parse of `signature` (best)
-      2) RPC getTransaction → postTokenBalances inference (new, robust)
+      1) Helius parse of `signature` (owner-first, then largest positive)
+      2) RPC getTransaction → postTokenBalances inference (robust)
       3) local pump resolver if the id ends with 'pump'
       4) direct RPC validation if the input is already a mint
     """
@@ -339,7 +347,7 @@ async def resolve_mint_best_effort(
 
     # 1) Helius parse by signature (if available)
     if signature and HELIUS_API_KEY:
-        session = await rpc._ensure()
+        session = await tx_rpc._ensure()
         m = await _hel_parse_for_mint(session, signature, owner)
         if m:
             return m
@@ -347,7 +355,7 @@ async def resolve_mint_best_effort(
     # 2) RPC-based inference from the tx itself
     if signature:
         try:
-            m = await _infer_mint_from_rpc_tx(rpc, signature, owner)
+            m = await _infer_mint_from_rpc_tx(tx_rpc, signature, owner)
             if m:
                 return m
         except Exception:
@@ -379,7 +387,7 @@ async def resolve_mint_best_effort(
 
     # 4) If it's already a plausible key, verify it's a mint account
     if _is_likely_pubkey(raw):
-        if await _is_valid_mint_account(rpc, raw):
+        if await _is_valid_mint_account(rpc_general, raw):
             return raw
 
     return None
@@ -390,8 +398,8 @@ async def resolve_mint_best_effort(
 class TxLearner:
     """
     Polls a recent buy transaction until:
-      - the RPC returns it, and/or
-      - the wallet shows a non-zero balance for the mint.
+      - the TX-RPC returns it, and/or
+      - the wallet shows a non-zero balance for the mint (via general RPC).
 
     Intended to be called *after* you submit a buy so the exit engine
     can start managing the position.
@@ -399,14 +407,18 @@ class TxLearner:
 
     def __init__(
         self,
-        rpc_url: str = RPC_URL,
+        # Use dedicated TX RPC for signature/tx
+        rpc_url_tx: str = TX_RPC_URL,
+        # Use general RPC for balances/mint validation
+        rpc_url_general: str = RPC_URL,
         owner: Optional[str] = None,
         commitment: str = TX_COMMITMENT,
         tries: int = TX_TRIES,
         delay_sec: float = TX_DELAY_SEC,
         warmup_sec: float = TX_WARMUP_SEC,
     ) -> None:
-        self.rpc = _Rpc(rpc_url)
+        self.tx_rpc = _Rpc(rpc_url_tx)
+        self.rpc    = _Rpc(rpc_url_general)
         self.owner = (owner or os.getenv("PF_PP_ACCOUNT", "")).strip()
         self.commitment = commitment
         self.tries = max(1, int(tries))
@@ -414,6 +426,7 @@ class TxLearner:
         self.warmup = max(0.0, float(warmup_sec))
 
     async def close(self) -> None:
+        await self.tx_rpc.close()
         await self.rpc.close()
 
     async def resolve_then_learn(self, raw_id_or_mint: str, tx_sig: str) -> Dict[str, Any]:
@@ -431,7 +444,8 @@ class TxLearner:
         attempts = 0
 
         for attempts in range(1, RESOLVE_TRIES + 1):
-            resolved = await resolve_mint_best_effort(self.rpc, raw_id_or_mint, signature=tx_sig, owner=self.owner)
+            resolved = await resolve_mint_best_effort(self.tx_rpc, self.rpc, raw_id_or_mint,
+                                                      signature=tx_sig, owner=self.owner)
             if resolved:
                 break
             if attempts < RESOLVE_TRIES:
@@ -447,7 +461,7 @@ class TxLearner:
 
     async def _learn_tx_only(self, tx_sig: str, attempts: int = 0) -> Dict[str, Any]:
         """
-        Only check signature status + transaction presence, skip mint balance probes.
+        Only check signature status + transaction presence (on TX-RPC), skip mint balance probes.
         Used when we can't resolve a safe mint yet.
         """
         tx_obj: Optional[dict] = None
@@ -457,7 +471,7 @@ class TxLearner:
         max_tries = min(5, self.tries)
         i = 0
         for i in range(1, max_tries + 1):
-            status = await self.rpc.get_signature_status(tx_sig)
+            status = await self.tx_rpc.get_signature_status(tx_sig)
             # early exit on tx error
             if status and status.get("err") is not None:
                 if DEBUG:
@@ -470,7 +484,7 @@ class TxLearner:
                     "transaction": None,
                 }
 
-            tx_obj = await self.rpc.get_transaction(tx_sig, self.commitment)
+            tx_obj = await self.tx_rpc.get_transaction(tx_sig, self.commitment)
             if tx_obj:
                 break
             if i < max_tries:
@@ -501,7 +515,8 @@ class TxLearner:
         mint = original
         resolved_once: Optional[str] = None
         if (not _is_likely_pubkey(mint)) or mint.endswith("pump"):
-            resolved_once = await resolve_mint_best_effort(self.rpc, original, signature=tx_sig, owner=self.owner)
+            resolved_once = await resolve_mint_best_effort(self.tx_rpc, self.rpc, original,
+                                                           signature=tx_sig, owner=self.owner)
             if resolved_once:
                 if DEBUG:
                     print(f"[txlearn] resolved id -> mint {resolved_once} (from {original})", flush=True)
@@ -532,8 +547,8 @@ class TxLearner:
 
         attempt = 0
         for attempt in range(1, self.tries + 1):
-            # 1) Check signature status (cheap)
-            status = await self.rpc.get_signature_status(tx_sig)
+            # 1) Check signature status (cheap; TX-RPC)
+            status = await self.tx_rpc.get_signature_status(tx_sig)
 
             # ---- Early-exit on explicit transaction error ----
             if status and status.get("err") is not None:
@@ -548,11 +563,11 @@ class TxLearner:
                 }
 
             # 2) Try to fetch the transaction (some RPCs are slow to index)
-            tx_obj = await self.rpc.get_transaction(tx_sig, self.commitment)
+            tx_obj = await self.tx_rpc.get_transaction(tx_sig, self.commitment)
             if not tx_obj and (DEBUG or attempt % noisy_every == 0):
                 print(f"[txlearn] getTransaction returned no result (sig={tx_sig})", flush=True)
 
-            # 3) Check owned balance for the mint
+            # 3) Check owned balance for the mint (general RPC)
             try:
                 last_balance_ui = await _sum_owned_ui_amount(self.rpc, self.owner, mint)
             except Exception:
@@ -583,14 +598,15 @@ async def learn_position(
     mint: str,
     tx_sig: str,
     owner: Optional[str] = None,
-    rpc_url: str = RPC_URL,
+    rpc_url_tx: str = TX_RPC_URL,
+    rpc_url_general: str = RPC_URL,
 ) -> Dict[str, Any]:
     """
     One-shot helper when you already know the real mint:
         from utils_pkg.txlearn import learn_position
         res = await learn_position(mint, sig, owner=PUBKEY)
     """
-    learner = TxLearner(rpc_url=rpc_url, owner=owner)
+    learner = TxLearner(rpc_url_tx=rpc_url_tx, rpc_url_general=rpc_url_general, owner=owner)
     try:
         return await learner.learn(mint, tx_sig)
     finally:
@@ -601,14 +617,15 @@ async def resolve_then_learn_position(
     raw_id_or_mint: str,
     tx_sig: str,
     owner: Optional[str] = None,
-    rpc_url: str = RPC_URL,
+    rpc_url_tx: str = TX_RPC_URL,
+    rpc_url_general: str = RPC_URL,
 ) -> Dict[str, Any]:
     """
     Preferred one-shot when you have a pump id or uncertain mint:
         from utils_pkg.txlearn import resolve_then_learn_position
         res = await resolve_then_learn_position(raw_id, sig, owner=PUBKEY)
     """
-    learner = TxLearner(rpc_url=rpc_url, owner=owner)
+    learner = TxLearner(rpc_url_tx=rpc_url_tx, rpc_url_general=rpc_url_general, owner=owner)
     try:
         return await learner.resolve_then_learn(raw_id_or_mint, tx_sig)
     finally:
