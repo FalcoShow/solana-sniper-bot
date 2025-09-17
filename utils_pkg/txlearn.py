@@ -15,22 +15,22 @@ RPC_URL = os.getenv("SOL_RPC_URL", "").strip() or "https://api.mainnet-beta.sola
 TX_COMMITMENT = (os.getenv("PF_TXLEARN_COMMITMENT", "confirmed").strip().lower()
                  or "confirmed")  # "processed" | "confirmed" | "finalized"
 
-TX_TRIES       = int(os.getenv("PF_TXLEARN_TRIES", "20"))
-TX_DELAY_SEC   = float(os.getenv("PF_TXLEARN_DELAY_SEC", "1.2"))
-TX_WARMUP_SEC  = float(os.getenv("PF_TXLEARN_WARMUP_SEC", "2.0"))
+TX_TRIES      = int(os.getenv("PF_TXLEARN_TRIES", "20"))
+TX_DELAY_SEC  = float(os.getenv("PF_TXLEARN_DELAY_SEC", "1.2"))
+TX_WARMUP_SEC = float(os.getenv("PF_TXLEARN_WARMUP_SEC", "2.0"))
 
-# Optional extra wait between learn cycles if your stack wants it.
+# Optional base delay between learner cycles (helps keep noise down)
 POS_LEARN_BASE_DELAY_SEC = float(os.getenv("PF_POS_LEARN_BASE_DELAY_SEC", "0"))
 
-# Resolver knobs
-RESOLVE_TRIES      = int(os.getenv("PF_TXLEARN_RESOLVE_TRIES", "6"))
-RESOLVE_DELAY_SEC  = float(os.getenv("PF_TXLEARN_RESOLVE_DELAY_SEC", "0.8"))
+# Resolver knobs (pre-learn)
+RESOLVE_TRIES     = int(os.getenv("PF_TXLEARN_RESOLVE_TRIES", "6"))
+RESOLVE_DELAY_SEC = float(os.getenv("PF_TXLEARN_RESOLVE_DELAY_SEC", "0.8"))
 
-HELIUS_API_KEY     = (os.getenv("HELIUS_API_KEY") or "").strip()
-HELIUS_PARSE_URL   = f"https://api.helius.xyz/v0/transactions?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
+HELIUS_API_KEY   = (os.getenv("HELIUS_API_KEY") or "").strip()
+HELIUS_PARSE_URL = f"https://api.helius.xyz/v0/transactions?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
 
 # Optional noisy debug
-DEBUG = str(os.getenv("PF_DEBUG_TX", "0")).strip().lower() in {"1","true","yes","y","on"}
+DEBUG = str(os.getenv("PF_DEBUG_TX", "0")).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 # Simple base58 char whitelist (NOT a full validator—just fast sanity)
 _BASE58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
@@ -50,7 +50,7 @@ def _is_probably_pump_id(s: str) -> bool:
 
 def _jitter(t: float, frac: float = 0.25) -> float:
     if t <= 0:
-        return 0
+        return 0.0
     d = t * frac
     return max(0.0, t + random.uniform(-d, d))
 
@@ -75,7 +75,7 @@ class _Rpc:
 
     async def call(self, method: str, params: list) -> Any:
         """
-        Barebones JSON-RPC 2.0 call with very defensive parsing.
+        Barebones JSON-RPC 2.0 call with defensive parsing.
         """
         session = await self._ensure()
         self._req_id += 1
@@ -109,7 +109,6 @@ class _Rpc:
         """
         Try several encodings/params so we work across mixed RPC providers.
         """
-        # Try #1: jsonParsed + v0 support flag (best)
         for attempt in (1, 2, 3):
             try:
                 if attempt == 1:
@@ -119,13 +118,11 @@ class _Rpc:
                                "maxSupportedTransactionVersion": 0}],
                     )
                 elif attempt == 2:
-                    # Some nodes don't like maxSupportedTransactionVersion
                     return await self.call(
                         "getTransaction",
                         [sig, {"commitment": commitment, "encoding": "jsonParsed"}],
                     )
                 else:
-                    # Fallback to base64 if the node refuses parsed
                     return await self.call(
                         "getTransaction",
                         [sig, {"commitment": commitment, "encoding": "base64"}],
@@ -150,7 +147,6 @@ class _Rpc:
             )
             return (res or {}).get("value") or []
         except Exception as e:
-            # Avoid spamming logs every attempt
             if DEBUG:
                 print(f"[txlearn] getTokenAccountsByOwner failed for {mint}: {e}", flush=True)
             return []
@@ -209,11 +205,11 @@ async def _is_valid_mint_account(rpc: _Rpc, addr: str) -> bool:
         v = (res or {}).get("value") or []
         if not v or not v[0]:
             return False
-        data = v[0]["data"]
-        if isinstance(data, dict):
-            # jsonParsed
+        data = v[0].get("data")
+        if isinstance(data, dict):  # jsonParsed
             parsed = data.get("parsed") or {}
-            return (parsed.get("type") == "mint")
+            if parsed.get("type") == "mint":
+                return True
     except Exception:
         return False
     return False
@@ -261,12 +257,8 @@ async def _hel_parse_for_mint(session: aiohttp.ClientSession, sig: str, owner: O
     # 2) fallback: events list sometimes includes "mint" field
     events = tx.get("events") or {}
     for group in events.values():
-        if isinstance(group, dict):
-            # events.<name> may be dict or list
-            listish = group if isinstance(group, list) else [group]
-        else:
-            listish = []
-        for ev in listish:
+        seq = group if isinstance(group, list) else [group]
+        for ev in seq:
             if isinstance(ev, dict):
                 m = ev.get("mint") or ev.get("mintAddress") or ev.get("token")
                 if _is_likely_pubkey(m):
@@ -274,7 +266,13 @@ async def _hel_parse_for_mint(session: aiohttp.ClientSession, sig: str, owner: O
     return None
 
 
-async def resolve_true_mint(
+async def _maybe_await(x):
+    if asyncio.iscoroutine(x):
+        return await x
+    return x
+
+
+async def resolve_mint_best_effort(
     rpc: _Rpc,
     raw_id_or_mint: str,
     signature: Optional[str],
@@ -284,7 +282,7 @@ async def resolve_true_mint(
     Resolve a real spl-token mint address from:
       1) Helius parse of `signature` (best)
       2) local pump resolver if the id ends with 'pump'
-      3) if the input already is a mint (RPC-validated)
+      3) direct RPC validation if the input is already a mint
     """
     raw = (raw_id_or_mint or "").strip()
 
@@ -295,7 +293,7 @@ async def resolve_true_mint(
         if m:
             return m
 
-    # 2) pump id -> mint via your utils_pkg.pump_trader resolver
+    # 2) pump id -> mint via your utils_pkg.pump_trader resolvers
     if _is_probably_pump_id(raw):
         try:
             # Lazy import to avoid cycles
@@ -304,7 +302,6 @@ async def resolve_true_mint(
             _rtm = None  # type: ignore
             _rtm_pid = None  # type: ignore
 
-        # Prefer signature-based resolver if available
         if signature and _rtm:
             try:
                 m = await _maybe_await(_rtm(raw, signature=signature))  # supports async or sync impl
@@ -327,12 +324,6 @@ async def resolve_true_mint(
             return raw
 
     return None
-
-
-async def _maybe_await(x):
-    if asyncio.iscoroutine(x):
-        return await x
-    return x
 
 
 # ------------------------ learner ------------------------
@@ -381,7 +372,7 @@ class TxLearner:
         attempts = 0
 
         for attempts in range(1, RESOLVE_TRIES + 1):
-            resolved = await resolve_true_mint(self.rpc, raw_id_or_mint, signature=tx_sig, owner=self.owner)
+            resolved = await resolve_mint_best_effort(self.rpc, raw_id_or_mint, signature=tx_sig, owner=self.owner)
             if resolved:
                 break
             if attempts < RESOLVE_TRIES:
@@ -405,8 +396,20 @@ class TxLearner:
 
         # A small bounded probe so we still get visibility
         max_tries = min(5, self.tries)
+        i = 0
         for i in range(1, max_tries + 1):
             status = await self.rpc.get_signature_status(tx_sig)
+
+            # Early-exit on explicit tx failure
+            if status and status.get("err") is not None:
+                return {
+                    "tx_found": False,
+                    "owner_balance_ui": 0.0,
+                    "attempts": attempts + i,
+                    "status": status,
+                    "transaction": None,
+                }
+
             tx_obj = await self.rpc.get_transaction(tx_sig, self.commitment)
             if tx_obj:
                 break
@@ -423,28 +426,35 @@ class TxLearner:
             "transaction": tx_obj,
         }
 
-    async def learn(self, mint: str, tx_sig: str) -> Dict[str, Any]:
+    async def learn(self, mint_or_id: str, tx_sig: str) -> Dict[str, Any]:
         """
-        Returns a dict with what we learned:
-          {
-            "tx_found": bool,
-            "owner_balance_ui": float,
-            "attempts": int,
-            "status": Optional[dict],   # from getSignatureStatuses (best-effort)
-            "transaction": Optional[dict],  # from getTransaction (best-effort)
-          }
+        Learn using a mint or pump id. If a pump id / invalid mint is provided,
+        we will attempt a single best-effort resolution; if still unresolved,
+        we switch to tx-only learning to avoid RPC mint errors.
         """
-        if not _is_likely_pubkey(mint):
-            print(f"[txlearn] WARNING: '{mint}' does not look like a base58 mint", flush=True)
+        original = (mint_or_id or "").strip()
 
-        # Validate mint account first to avoid "could not find mint" spam.
-        is_mint = await _is_valid_mint_account(self.rpc, mint)
-        if not is_mint:
-            print(f"[txlearn] '{mint}' is not a valid mint account yet → switching to tx-only learn", flush=True)
+        # One quick best-effort resolve pass if this doesn't look like a mint
+        mint = original
+        resolved_once: Optional[str] = None
+        if (not _is_likely_pubkey(mint)) or mint.endswith("pump"):
+            resolved_once = await resolve_mint_best_effort(self.rpc, original, signature=tx_sig, owner=self.owner)
+            if resolved_once:
+                if DEBUG:
+                    print(f"[txlearn] resolved id -> mint {resolved_once} (from {original})", flush=True)
+                mint = resolved_once
+
+        if not _is_likely_pubkey(mint):
+            print(f"[txlearn] unresolved id '{original}', switching to tx-only learn", flush=True)
             return await self._learn_tx_only(tx_sig)
 
         if not _is_likely_pubkey(self.owner):
             print(f"[txlearn] WARNING: owner '{self.owner}' does not look like a base58 pubkey", flush=True)
+
+        # Validate mint account first to avoid 'could not find mint' spam.
+        if not await _is_valid_mint_account(self.rpc, mint):
+            print(f"[txlearn] '{mint}' is not a valid mint account yet → tx-only learn", flush=True)
+            return await self._learn_tx_only(tx_sig)
 
         print(f"[txlearn] start mint={mint} from tx={tx_sig}", flush=True)
 
@@ -457,9 +467,20 @@ class TxLearner:
         last_balance_ui: float = 0.0
         noisy_every = 3  # throttle getTransaction 'no result' prints
 
+        attempt = 0
         for attempt in range(1, self.tries + 1):
             # 1) Check signature status (cheap)
             status = await self.rpc.get_signature_status(tx_sig)
+
+            # ---- Early-exit on explicit transaction error ----
+            if status and status.get("err") is not None:
+                return {
+                    "tx_found": False,
+                    "owner_balance_ui": 0.0,
+                    "attempts": attempt,
+                    "status": status,
+                    "transaction": None,
+                }
 
             # 2) Try to fetch the transaction (some RPCs are slow to index)
             tx_obj = await self.rpc.get_transaction(tx_sig, self.commitment)
@@ -500,7 +521,7 @@ async def learn_position(
     rpc_url: str = RPC_URL,
 ) -> Dict[str, Any]:
     """
-    One-shot helper you can import and call when you already know the real mint:
+    One-shot helper when you already know the real mint:
         from utils_pkg.txlearn import learn_position
         res = await learn_position(mint, sig, owner=PUBKEY)
     """

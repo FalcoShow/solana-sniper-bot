@@ -7,7 +7,11 @@ import traceback
 from typing import Any, Dict, Optional
 
 from utils_pkg.pumpportal_client import PumpPortalClient
-from utils_pkg.pump_trader import maybe_buy
+from utils_pkg.pump_trader import (
+    maybe_buy,
+    resolve_true_mint,
+    resolve_true_mint_from_pump_id,
+)
 from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN
 
 
@@ -63,8 +67,7 @@ def _get_first(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
 def _extract_raw_mint(msg: Dict[str, Any]) -> str:
     """
     DO NOT normalize or strip '.pump'.
-    We pass the raw string directly to the trader so it can decide
-    whether it's a bondingCurve id or a real mint address.
+    We pass the raw string initially; trader/txlearn handle resolution.
     """
     raw = _get_first(
         msg,
@@ -76,7 +79,7 @@ def _extract_raw_mint(msg: Dict[str, Any]) -> str:
         default="",
     )
     raw = ("" if raw is None else str(raw)).strip()
-    # Always show this so you can correlate logs precisely like before
+    # Always show this so logs line up with upstream feed
     print(f"[main] raw pump id = {raw}", flush=True)
     return raw
 
@@ -137,6 +140,29 @@ class Strategy:
         self._seen_mints: set[str] = set()
         self._sema = asyncio.Semaphore(MAX_CONCURRENCY)
 
+    async def _resolve_after_buy(self, raw_id: str, sig: str) -> str:
+        """
+        Try signature-based resolution first (best), then id-only.
+        Returns the resolved mint or the original raw id if unresolved.
+        """
+        resolved = None
+        try:
+            resolved = resolve_true_mint(raw_id, signature=sig)
+        except Exception:
+            resolved = None
+        if not resolved:
+            try:
+                resolved = resolve_true_mint_from_pump_id(raw_id)
+            except Exception:
+                resolved = None
+
+        if resolved:
+            # Keep logs concise; pump_trader may already print a [buy-hint].
+            if DEBUG_TX:
+                print(f"[main] mint resolved -> {resolved} (from {raw_id})", flush=True)
+            return resolved
+        return raw_id
+
     async def on_new_token(self, raw_event: Dict[str, Any]) -> None:
         mint_raw = _extract_raw_mint(raw_event)
         if not mint_raw:
@@ -153,13 +179,13 @@ class Strategy:
         if not _passes_filters(raw_event):
             return
 
-        # Build UI context for trader; DO NOT strip the mint.
-        ui: Dict[str, Any] = dict(raw_event)  # shallow copy to augment safely
+        # Build UI context for trader; keep raw id intact.
+        ui: Dict[str, Any] = dict(raw_event)  # shallow copy
         ui.setdefault("pool", "pump")
         ui.setdefault("symbol", _extract_symbol(raw_event))
         ui.setdefault("name", _extract_name(raw_event))
         ui["rawMint"] = mint_raw
-        ui.setdefault("normalized", False)  # signal we passed it raw
+        ui.setdefault("normalized", False)
 
         # Two log lines to mirror your previous output style
         symbol = ui.get("symbol", "") or "?"
@@ -168,15 +194,24 @@ class Strategy:
 
         async with self._sema:
             try:
-                # Pass the raw '...pump' (or base58) directly.
+                # Pass the raw id (may be ...pump) to the trader.
                 sig = await maybe_buy(mint=mint_raw, ui=ui)
 
-                if not IS_DRYRUN and EXIT_ENGINE_ENABLED and sig:
+                if not sig:
+                    # BUY didn't happen — either dry-run, route error, or skipped.
+                    return
+
+                # Resolve best-effort so the exit engine learns on the real mint.
+                mint_for_engine = await self._resolve_after_buy(mint_raw, sig)
+
+                if not IS_DRYRUN and EXIT_ENGINE_ENABLED:
                     mode = str(os.getenv("POSTBUY_MODE", "")).strip().lower()
                     if mode == "immediate_sell_test":
-                        asyncio.create_task(_post_buy_exit_test(mint_raw))
+                        asyncio.create_task(_post_buy_exit_test(mint_for_engine))
                     else:
-                        asyncio.create_task(exit_engine.on_buy_filled(mint_raw, tx_sig=sig))
+                        # Exit engine will still self-heal via txlearn if given a raw id,
+                        # but we hand it the resolved mint when we have it.
+                        asyncio.create_task(exit_engine.on_buy_filled(mint_for_engine, tx_sig=sig))
 
             except Exception:
                 print("[strategy] maybe_buy exception:", flush=True)
@@ -201,7 +236,7 @@ async def stream_loop() -> None:
     async for ev in client.events():
         try:
             kind = ev.get("kind")
-            raw = ev.get("raw", {})
+            raw = ev.get("raw", {}) or {}
             if kind == "new_token":
                 await strat.on_new_token(raw)
             elif kind == "trade" and EXIT_ENGINE_ENABLED:
