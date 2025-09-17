@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import os
 import json
-from typing import Dict, Any, Optional, Tuple
+import urllib.parse
+from typing import Dict, Any, Optional, Tuple, List
 
 import requests
 
@@ -25,8 +26,12 @@ PF_SLIPPAGE_BPS  = int(os.getenv("PF_SLIPPAGE_BPS", "1000"))     # 10%
 PF_PRIORITY_SOL  = float(os.getenv("PF_PRIORITY_SOL", "0.0005"))
 PF_POOLS         = {p.strip().lower() for p in (os.getenv("PF_POOLS", "pump").split(","))}
 PF_DEBUG_TX      = _is_true(os.getenv("PF_DEBUG_TX", "0"))
-PF_PP_DOUBLETRY  = _is_true(os.getenv("PF_PP_DOUBLETRY", "1"))    # try one flip if needed
-USE_LOCAL_FALLBK = _is_true(os.getenv("PF_USE_LOCAL_FALLBACK", "1"))  # default ON
+PF_PP_DOUBLETRY  = _is_true(os.getenv("PF_PP_DOUBLETRY", "1"))
+# Local fallback causes HTML / non-JSON responses for many keys → default OFF
+USE_LOCAL_FALLBK = _is_true(os.getenv("PF_USE_LOCAL_FALLBACK", "0"))
+
+SOL_RPC_URL      = (os.getenv("SOL_RPC_URL") or "").strip()
+HELIUS_API_KEY   = (os.getenv("HELIUS_API_KEY") or "").strip()
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -53,22 +58,39 @@ def _looks_base58(s: str) -> bool:
 
 def _split_id(raw: str) -> Tuple[Optional[str], Optional[str], bool]:
     """
-    Given a raw string, return (mint, bonding_curve, is_pump_id).
-    - If raw endswith 'pump' and the base is base58 => it's a Pump bonding curve id.
-    - If raw is base58 and not ending with 'pump' => it's a mint.
+    Returns (mint, bonding_curve, is_pump_id).
+    - "....pump" → bonding curve id
+    - plain base58 → mint
     """
     s = (raw or "").strip()
     if not s:
         return None, None, False
-
     if s.endswith("pump"):
         base = s[:-4].strip()
         return (None, base if _looks_base58(base) else None, True)
-
     return (s if _looks_base58(s) else None, None, False)
 
 def _slippage_percent_from_bps(bps: int) -> float:
     return float(bps) / 100.0
+
+def _extract_qp(url: str, key: str) -> Optional[str]:
+    try:
+        q = urllib.parse.urlparse(url).query
+        return urllib.parse.parse_qs(q).get(key, [None])[0]
+    except Exception:
+        return None
+
+def _helius_key() -> Optional[str]:
+    if HELIUS_API_KEY:
+        return HELIUS_API_KEY
+    k = _extract_qp(SOL_RPC_URL, "api-key")
+    return (k or "").strip() or None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PumpPortal HTTP
+# ──────────────────────────────────────────────────────────────────────────────
+class TemporaryPumpPortal(Exception):
+    pass
 
 def _url_lightning() -> str:
     if not PP_API_KEY:
@@ -100,15 +122,12 @@ def _build_body(
         "pool": pool,
         "publicKey": payer_pubkey,
     }
-    # STRICTLY send only one of these
+    # IMPORTANT: only one of these
     if bonding_curve and not mint:
         body["bondingCurve"] = bonding_curve
     elif mint and not bonding_curve:
         body["mint"] = mint
     return body
-
-class TemporaryPumpPortal(Exception):
-    pass
 
 def _post_json(url: str, body: Dict[str, Any], timeout: int = 20) -> Dict[str, Any]:
     r = requests.post(url, json=body, timeout=timeout, allow_redirects=False)
@@ -124,15 +143,51 @@ def _post_json(url: str, body: Dict[str, Any], timeout: int = 20) -> Dict[str, A
         raise RuntimeError(f"{url} {r.status_code}: {js}")
     return js
 
-def _resp_errors(resp: Dict[str, Any]) -> list[str]:
+def _resp_errors(resp: Dict[str, Any]) -> List[str]:
     errs = resp.get("errors") or []
     if isinstance(errs, dict):
         errs = [str(errs)]
     return [str(e) for e in errs] if isinstance(errs, list) else ([str(errs)] if errs else [])
 
-def _is_schemaish(errs: list[str]) -> bool:
+def _is_schemaish(errs: List[str]) -> bool:
     t = " | ".join(e.lower() for e in errs)
     return any(k in t for k in ["invalid public key input", "mint must be a string", "invalid param", "wrongsize"])
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helius fallback: resolve bondingCurve → token mint from recent txs
+# ──────────────────────────────────────────────────────────────────────────────
+def _resolve_curve_to_mint(curve: str) -> Optional[str]:
+    """
+    Heuristic resolver using Helius Enhanced Transaction History.
+    Looks for any token MINT transfer mentioning a mint address.
+    """
+    key = _helius_key()
+    if not key:
+        return None
+    try:
+        url = f"https://api.helius.xyz/v0/addresses/{curve}/transactions?api-key={key}&limit=25"
+        r = requests.get(url, timeout=8)
+        data = r.json() if r.status_code == 200 else []
+    except Exception:
+        return None
+
+    # scan recent txs for a plausible token mint address
+    for tx in data or []:
+        # 1) tokenTransfers with a 'mint'
+        for t in tx.get("tokenTransfers", []) or []:
+            m = (t.get("mint") or "").strip()
+            if _looks_base58(m):
+                return m
+        # 2) generic events someone might include mint addresses
+        ev = tx.get("events") or {}
+        for k in ("mint", "token", "swap", "amm"):
+            maybe = ev.get(k) or {}
+            # look for common key names
+            for key_name in ("mint", "mintAddress", "mint_address", "tokenMint", "token_mint"):
+                m = (maybe.get(key_name) or "").strip()
+                if _looks_base58(m):
+                    return m
+    return None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # BUY
@@ -153,7 +208,6 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
         print(f"[DRYRUN] would buy {label} on {pool} for {amt_sol} SOL")
         return None
 
-    # Decide strictly which field to send
     raw_hint: str = (ui.get("rawMint") or ui.get("raw") or mint or "").strip()
     tok_mint, curve_id, is_pump_id = _split_id(raw_hint)
 
@@ -161,10 +215,7 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
     if not is_pump_id and not tok_mint and _looks_base58(mint):
         tok_mint = mint
 
-    # For pump ids: favor bondingCurve only
-    if is_pump_id and curve_id:
-        tok_mint = None
-
+    # For pump ids prefer bondingCurve first; if that fails we may resolve to mint
     if PF_DEBUG_TX:
         if is_pump_id:
             print(f"[trade] pool={pool} symbol={symbol} "
@@ -176,7 +227,7 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
     kp = load_keypair()
     payer_pub = get_pubkey_str(kp)
 
-    def _try(url: str, body: Dict[str, Any], tag: str) -> Tuple[Optional[str], Optional[list[str]], Optional[Dict[str, Any]]]:
+    def _try(url: str, body: Dict[str, Any], tag: str) -> Tuple[Optional[str], Optional[List[str]], Optional[Dict[str, Any]]]:
         try:
             resp = _post_json(url, body)
         except TemporaryPumpPortal as te:
@@ -188,6 +239,7 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
 
         errs = _resp_errors(resp)
         if errs:
+            print(f"[BUY ERR] {tag} errors for {label}: {errs}")
             return None, errs, resp
 
         sig = resp.get("signature")
@@ -207,7 +259,7 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
             print(f"[BUY ERR] unexpected response for {label}: {json.dumps(resp)[:300]}")
         return None, None, None
 
-    async def _attempt(one_mint: Optional[str], one_curve: Optional[str], note: str) -> Optional[str]:
+    async def _attempt(one_mint: Optional[str], one_curve: Optional[str], note: str) -> Tuple[Optional[str], Optional[List[str]]]:
         body = _build_body(
             action="buy",
             pool=pool,
@@ -218,42 +270,47 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
             mint=one_mint,
             bonding_curve=one_curve,
         )
-        # Lightning
+        # 1) Lightning
         sig, errs, _ = _try(_url_lightning(), body, f"lightning/{note}")
         if sig:
-            return sig
-        # Local fallback when schema-ish issues pop (common when using bondingCurve)
+            return sig, None
+        # 2) Local builder (optional)
         if errs and _is_schemaish(errs) and USE_LOCAL_FALLBK:
             sig2, errs2, _ = _try(_url_local(), body, f"local/{note}")
             if sig2:
-                return sig2
+                return sig2, None
             if errs2:
-                print(f"[BUY ERR] pumpportal errors ({note}) for {one_mint or one_curve or mint}: {errs2}")
-        elif errs:
-            print(f"[BUY ERR] pumpportal errors ({note}) for {one_mint or one_curve or mint}: {errs}")
-        return None
+                return None, errs2
+        return None, errs
 
-    # Strict order:
-    # 1) If the raw looked like a pump id, use bondingCurve ONLY
+    # Primary try depending on the id type
     if pool == "pump" and curve_id and not tok_mint:
-        sig0 = await _attempt(None, curve_id, "curve")
+        sig0, errs0 = await _attempt(None, curve_id, "curve")
         if sig0:
             return sig0
+        # Resolve curve → mint via Helius and retry
+        resolved = _resolve_curve_to_mint(curve_id)
+        if resolved and _looks_base58(resolved):
+            if PF_DEBUG_TX:
+                print(f"[resolver] curve {curve_id} → mint {resolved}")
+            sigR, _ = await _attempt(resolved, None, "mint-from-curve")
+            if sigR:
+                return sigR
 
-    # 2) Otherwise, try with mint ONLY
+    # Otherwise try with mint directly
     if tok_mint:
-        sig1 = await _attempt(tok_mint, None, "mint")
+        sig1, _ = await _attempt(tok_mint, None, "mint")
         if sig1:
             return sig1
 
-    # 3) Optionally flip once (mint <-> curve) if enabled
+    # Optional flip once
     if PF_PP_DOUBLETRY and pool == "pump":
         if tok_mint:
-            sig2 = await _attempt(None, tok_mint, "flip-mint→curve")
+            sig2, _ = await _attempt(None, tok_mint, "flip-mint→curve")
             if sig2:
                 return sig2
         elif curve_id:
-            sig3 = await _attempt(curve_id, None, "flip-curve→mint")
+            sig3, _ = await _attempt(curve_id, None, "flip-curve→mint")
             if sig3:
                 return sig3
 
