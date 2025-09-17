@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import json
+import time
 import urllib.parse
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -26,12 +27,17 @@ PF_SLIPPAGE_BPS  = int(os.getenv("PF_SLIPPAGE_BPS", "1000"))     # 10%
 PF_PRIORITY_SOL  = float(os.getenv("PF_PRIORITY_SOL", "0.0005"))
 PF_POOLS         = {p.strip().lower() for p in (os.getenv("PF_POOLS", "pump").split(","))}
 PF_DEBUG_TX      = _is_true(os.getenv("PF_DEBUG_TX", "0"))
-PF_PP_DOUBLETRY  = _is_true(os.getenv("PF_PP_DOUBLETRY", "1"))
-# Local fallback often returns HTML / non-JSON; keep OFF unless you know it works.
+
+# Local builder often returns HTML/non-JSON; keep OFF unless you’ve verified it.
 USE_LOCAL_FALLBK = _is_true(os.getenv("PF_USE_LOCAL_FALLBACK", "0"))
 
 SOL_RPC_URL      = (os.getenv("SOL_RPC_URL") or "").strip()
 HELIUS_API_KEY   = (os.getenv("HELIUS_API_KEY") or "").strip()
+
+# Optional: tiny post-buy resolve (sig→mint) poll
+PF_RESOLVE_MINT_AFTER_BUY = _is_true(os.getenv("PF_RESOLVE_MINT_AFTER_BUY", "1"))
+PF_RESOLVE_TRIES          = int(os.getenv("PF_RESOLVE_TRIES", "6"))     # ~6s
+PF_RESOLVE_SLEEP_SEC      = float(os.getenv("PF_RESOLVE_SLEEP_SEC", "1"))
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -59,8 +65,7 @@ def _looks_base58(s: str) -> bool:
 def _strip_pump_suffix(raw: str) -> Tuple[str, bool]:
     s = (raw or "").strip()
     if s.endswith("pump"):
-        base = s[:-4].strip()
-        return base, True
+        return s[:-4].strip(), True
     return s, False
 
 def _slippage_percent_from_bps(bps: int) -> float:
@@ -103,10 +108,9 @@ def _build_body(
     amount_sol: float,
     slippage_bps: int,
     priority_sol: float,
-    mint: Optional[str] = None,
-    bonding_curve: Optional[str] = None,
+    mint: str,   # NOTE: PumpPortal expects a *mint string only*. For Pump, this may be a real SPL mint *or* a pump id.
 ) -> Dict[str, Any]:
-    body: Dict[str, Any] = {
+    return {
         "action": action,
         "amount": float(amount_sol),
         "denominatedInSol": True,
@@ -114,18 +118,12 @@ def _build_body(
         "priorityFee": float(priority_sol),
         "pool": pool,
         "publicKey": payer_pubkey,
+        "mint": str(mint),  # <- only field supported now
     }
-    # Exactly one of these:
-    if bonding_curve and not mint:
-        body["bondingCurve"] = str(bonding_curve)
-    elif mint and not bonding_curve:
-        body["mint"] = str(mint)
-    return body
 
 def _post_json(url: str, body: Dict[str, Any], timeout: int = 20) -> Dict[str, Any]:
     r = requests.post(url, json=body, timeout=timeout, allow_redirects=False)
     content_type = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
-    # A lot of non-JSON 200s happen on trade-local
     if r.status_code == 200 and content_type != "application/json":
         head = (r.text or "")[:200].replace("\n", " ")
         raise TemporaryPumpPortal(f"non-JSON 200 ({content_type}): {head or 'Bad Request'}")
@@ -143,80 +141,113 @@ def _resp_errors(resp: Dict[str, Any]) -> List[str]:
         errs = [str(errs)]
     return [str(e) for e in errs] if isinstance(errs, list) else ([str(errs)] if errs else [])
 
-def _is_schemaish(errs: List[str]) -> bool:
-    t = " | ".join(e.lower() for e in errs)
-    return any(k in t for k in [
-        "invalid public key input",
-        "mint must be a string",
-        "invalid param",
-        "wrongsize",
-    ])
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Helius fallback: resolve bondingCurve → token mint from recent txs
+# Mint resolvers (for your positions/txlearn, not required for trades)
 # ──────────────────────────────────────────────────────────────────────────────
-def _resolve_curve_to_mint(curve: str) -> Optional[str]:
+def resolve_true_mint_from_pump_id(pump_id: str) -> Optional[str]:
     """
-    Heuristic resolver using Helius Enhanced Transaction History.
-    Looks for any token transfer mentioning a mint address.
+    Best-effort: Given a PUMP ID (usually '<base>pump'), try to infer the real SPL mint.
+    Uses Helius Enhanced Tx History on the *base* address.
     """
     key = _helius_key()
-    if not key or not _looks_base58(curve):
+    base, had = _strip_pump_suffix(pump_id)
+    if not (key and had and _looks_base58(base)):
         return None
     try:
-        url = f"https://api.helius.xyz/v0/addresses/{curve}/transactions?api-key={key}&limit=25"
+        url = f"https://api.helius.xyz/v0/addresses/{base}/transactions?api-key={key}&limit=25"
         r = requests.get(url, timeout=8)
         data = r.json() if r.status_code == 200 else []
     except Exception:
         return None
-
     for tx in data or []:
         for t in (tx.get("tokenTransfers") or []):
             m = (t.get("mint") or "").strip()
             if _looks_base58(m):
                 return m
-        ev = tx.get("events") or {}
-        for k in ("mint", "token", "swap", "amm"):
-            maybe = ev.get(k) or {}
-            for key_name in ("mint", "mintAddress", "mint_address", "tokenMint", "token_mint"):
-                m = (maybe.get(key_name) or "").strip()
-                if _looks_base58(m):
-                    return m
+        for ev in (tx.get("events") or {}).values():
+            if isinstance(ev, dict):
+                for k in ("mint", "mintAddress", "mint_address", "tokenMint", "token_mint"):
+                    m = (ev.get(k) or "").strip()
+                    if _looks_base58(m):
+                        return m
+    return None
+
+def resolve_true_mint_from_signature(sig: str) -> Optional[str]:
+    """
+    Best-effort: Pull the transaction via Helius Parse API and extract a token mint we interacted with.
+    """
+    key = _helius_key()
+    if not (key and sig):
+        return None
+    try:
+        url = f"https://api.helius.xyz/v0/transactions?api-key={key}"
+        r = requests.post(url, json={"transactions": [sig]}, timeout=8)
+        arr = r.json() if r.status_code == 200 else []
+    except Exception:
+        return None
+    for tx in arr or []:
+        for t in (tx.get("tokenTransfers") or []):
+            m = (t.get("mint") or "").strip()
+            if _looks_base58(m):
+                return m
+        for ev in (tx.get("events") or {}).values():
+            if isinstance(ev, dict):
+                for k in ("mint", "mintAddress", "mint_address", "tokenMint", "token_mint"):
+                    m = (ev.get(k) or "").strip()
+                    if _looks_base58(m):
+                        return m
+    return None
+
+def resolve_true_mint(pump_or_mint: str, *, signature: Optional[str] = None) -> Optional[str]:
+    """
+    Convenience: try signature first (most precise), then pump id base address.
+    Returns a base58 SPL mint or None.
+    """
+    m = resolve_true_mint_from_signature(signature) if signature else None
+    if m:
+        return m
+    m2 = resolve_true_mint_from_pump_id(pump_or_mint)
+    if m2:
+        return m2
+    # If it's already a plausible base58 and not a pump id, return as-is
+    s, had = _strip_pump_suffix(pump_or_mint)
+    if not had and _looks_base58(s):
+        return s
     return None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Candidates builder: prefer treating “…pump” base as MINT first, then CURVE
+# Candidate mints to send to PumpPortal (no bondingCurve anymore)
 # ──────────────────────────────────────────────────────────────────────────────
-def _candidates_from_raw(raw_hint: str, default_mint: Optional[str]) -> List[Tuple[Optional[str], Optional[str], str]]:
+def _candidate_mints(raw_hint: str) -> List[Tuple[str, str]]:
     """
-    Returns a list of (mint, curve, note) attempts, in order.
-    We favor interpreting `<base>pump` as a *mint* first. If that fails, try as *curve*.
-    Finally, try whatever explicit mint the caller passed.
+    Returns a list of (mint_to_send, note).
+    If the input ends with 'pump', try the *full* id first (this is what PumpPortal expects),
+    then optionally try the base as a fallback.
+    For plain base58, just try it as-is.
     """
-    cands: List[Tuple[Optional[str], Optional[str], str]] = []
-    base, had_suffix = _strip_pump_suffix(raw_hint)
-    base_ok = _looks_base58(base)
-
-    if had_suffix and base_ok:
-        # 1) Try base as mint (most feeds actually append 'pump' to a mint)
-        cands.append((base, None, "as-mint-from-id"))
-        # 2) Try base as curve
-        cands.append((None, base, "as-curve-from-id"))
-
-    elif base_ok:
-        # Plain base58 string → treat as mint
-        cands.append((base, None, "as-mint-plain"))
-
-    # If the caller gave an explicit plain mint that differs, try it too
-    if default_mint and _looks_base58(default_mint) and default_mint != base:
-        cands.append((default_mint, None, "as-mint-explicit"))
-
-    return cands
+    out: List[Tuple[str, str]] = []
+    base, had = _strip_pump_suffix((raw_hint or "").strip())
+    if had:
+        out.append((raw_hint.strip(), "as-pump-id"))
+        if _looks_base58(base):
+            out.append((base, "as-base58-from-id"))
+    else:
+        if _looks_base58(base):
+            out.append((base, "as-base58"))
+        else:
+            # last resort: pass-through; server may still accept non-standard ids
+            out.append((raw_hint.strip(), "as-raw"))
+    return out
 
 # ──────────────────────────────────────────────────────────────────────────────
 # BUY
 # ──────────────────────────────────────────────────────────────────────────────
 async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
+    """
+    Buy on PumpPortal. `mint` may be:
+      - a real SPL mint (base58), or
+      - a Pump id (like '<base>pump'), which the API accepts in the 'mint' field.
+    """
     ui = kwargs.get("ui") or {}
     symbol = (kwargs.get("symbol") or ui.get("symbol") or "").strip()
     pool   = (kwargs.get("pool")   or ui.get("pool")   or "pump").strip().lower()
@@ -233,52 +264,15 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
         return None
 
     raw_hint: str = (ui.get("rawMint") or ui.get("raw") or mint or "").strip()
+
     kp = load_keypair()
     payer_pub = get_pubkey_str(kp)
 
-    # Build attempts
-    attempts: List[Tuple[Optional[str], Optional[str], str]] = _candidates_from_raw(raw_hint, mint)
-
-    # If we have a curve candidate, we'll optionally try to resolve it → mint via Helius at the end
-    curve_bases = [c for m,c,_ in attempts if c]
-
     if PF_DEBUG_TX:
-        for m,c,n in attempts:
-            print(f"[route] {label} try={n} mint={m or '-'} curve={c or '-'}")
+        print(f"[trade] pool={pool} symbol={symbol or '-'} "
+              f"raw={raw_hint} label={label}")
 
-    def _try(url: str, body: Dict[str, Any], tag: str) -> Tuple[Optional[str], Optional[List[str]], Optional[Dict[str, Any]]]:
-        try:
-            resp = _post_json(url, body)
-        except TemporaryPumpPortal as te:
-            print(f"[BUY TEMP] {tag} for {label}: {te}")
-            return None, None, None
-        except Exception as e:
-            print(f"[BUY ERR] {tag} HTTP for {label}: {e}")
-            return None, None, None
-
-        errs = _resp_errors(resp)
-        if errs:
-            print(f"[BUY ERR] {tag} errors for {label}: {errs}")
-            return None, errs, resp
-
-        sig = resp.get("signature")
-        if sig:
-            print(f"[BUY OK] {label} — executed via Lightning. https://solscan.io/tx/{sig} [payer={payer_pub}]")
-            return sig, None, None
-
-        tx_b64 = resp.get("transaction") or resp.get("tx")
-        if tx_b64:
-            try:
-                sig2 = sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
-                print(f"[BUY OK] {label} — local sign. https://solscan.io/tx/{sig2} [payer={payer_pub}]")
-                return sig2, None, None
-            except Exception as e:
-                print(f"[BUY ERR] local sign failed for {label}: {e}")
-        else:
-            print(f"[BUY ERR] unexpected response for {label}: {json.dumps(resp)[:300]}")
-        return None, None, None
-
-    async def _attempt(one_mint: Optional[str], one_curve: Optional[str], note: str) -> Tuple[Optional[str], Optional[List[str]]]:
+    def _try_once(send_mint: str, note: str) -> Tuple[Optional[str], Optional[List[str]], Optional[Dict[str, Any]]]:
         body = _build_body(
             action="buy",
             pool=pool,
@@ -286,50 +280,75 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
             amount_sol=amt_sol,
             slippage_bps=PF_SLIPPAGE_BPS,
             priority_sol=PF_PRIORITY_SOL,
-            mint=one_mint,
-            bonding_curve=one_curve,
+            mint=send_mint,
         )
-        # 1) Lightning
-        sig, errs, _ = _try(_url_lightning(), body, f"lightning/{note}")
-        if sig:
-            return sig, None
-        # 2) Local builder (optional)
-        if errs and _is_schemaish(errs) and USE_LOCAL_FALLBK:
-            sig2, errs2, _ = _try(_url_local(), body, f"local/{note}")
-            if sig2:
-                return sig2, None
-            if errs2:
-                return None, errs2
-        return None, errs
+        try:
+            resp = _post_json(_url_lightning(), body)
+        except TemporaryPumpPortal as te:
+            print(f"[BUY TEMP] lightning/{note} for {label}: {te}")
+            return None, None, None
+        except Exception as e:
+            print(f"[BUY ERR] lightning/{note} HTTP for {label}: {e}")
+            return None, None, None
 
-    # Try candidates in order (prefer interpreting “…pump” base as mint)
-    for cand_mint, cand_curve, note in attempts:
-        sig, _ = await _attempt(cand_mint, cand_curve, note)
+        errs = _resp_errors(resp)
+        if errs:
+            print(f"[BUY ERR] lightning/{note} errors for {label}: {errs}")
+            return None, errs, resp
+
+        sig = resp.get("signature")
         if sig:
+            print(f"[BUY OK] {label} — executed via Lightning. https://solscan.io/tx/{sig} [payer={payer_pub}]")
+            return sig, None, resp
+
+        tx_b64 = resp.get("transaction") or resp.get("tx")
+        if tx_b64:
+            try:
+                sig2 = sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
+                print(f"[BUY OK] {label} — local sign. https://solscan.io/tx/{sig2} [payer={payer_pub}]")
+                return sig2, None, resp
+            except Exception as e:
+                print(f"[BUY ERR] local sign failed for {label}: {e}")
+        else:
+            print(f"[BUY ERR] unexpected response for {label}: {json.dumps(resp)[:300]}")
+        return None, None, resp
+
+    # Attempt in smart order
+    attempts = _candidate_mints(raw_hint)
+    for send_mint, note in attempts:
+        if PF_DEBUG_TX:
+            print(f"[route] {label} try={note} mint={send_mint}")
+        sig, errs, _resp = _try_once(send_mint, note)
+        if sig:
+            # Optional: try to resolve a real SPL mint for downstream consumers
+            if PF_RESOLVE_MINT_AFTER_BUY:
+                try:
+                    resolved = resolve_true_mint(raw_hint, signature=sig)
+                    if resolved:
+                        print(f"[buy-hint] resolved_mint={resolved} for {label}")
+                except Exception:
+                    pass
             return sig
-
-    # If none succeeded and we had a curve base, try resolve curve → mint via Helius then buy with mint
-    if pool == "pump":
-        for curve in curve_bases:
-            resolved = _resolve_curve_to_mint(curve)
-            if resolved and _looks_base58(resolved):
-                if PF_DEBUG_TX:
-                    print(f"[resolver] curve {curve} → mint {resolved}")
-                sigR, _ = await _attempt(resolved, None, "mint-from-curve")
-                if sigR:
-                    return sigR
-
-    # Optional flip once, just in case
-    if PF_PP_DOUBLETRY and attempts:
-        m0, c0, _ = attempts[0]
-        # flip whichever we tried first
-        if m0:
-            sig2, _ = await _attempt(None, m0, "flip-mint→curve")
-            if sig2:
-                return sig2
-        if c0:
-            sig3, _ = await _attempt(c0, None, "flip-curve→mint")
-            if sig3:
-                return sig3
+        # Local builder rarely helps; keep the hook for completeness
+        if errs and USE_LOCAL_FALLBK:
+            try:
+                body = _build_body(
+                    action="buy",
+                    pool=pool,
+                    payer_pubkey=payer_pub,
+                    amount_sol=amt_sol,
+                    slippage_bps=PF_SLIPPAGE_BPS,
+                    priority_sol=PF_PRIORITY_SOL,
+                    mint=send_mint,
+                )
+                resp2 = _post_json(_url_local(), body)
+                e2 = _resp_errors(resp2)
+                if not e2:
+                    sig2 = resp2.get("signature")
+                    if sig2:
+                        print(f"[BUY OK] {label} — executed via Local. https://solscan.io/tx/{sig2} [payer={payer_pub}]")
+                        return sig2
+            except Exception as e:
+                print(f"[BUY ERR] local/{note} HTTP for {label}: {e}")
 
     return None
