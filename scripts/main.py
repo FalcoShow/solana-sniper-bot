@@ -35,7 +35,7 @@ def _as_int(val: Any, default: int) -> int:
 
 EXIT_ENGINE_ENABLED = _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True)
 
-# Entry filters (all optional; tune via env)
+# Entry filters (optional; tweak via env)
 MIN_INITIAL_BUY_SOL = _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
 MAX_NAME_LEN        = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
 SYMBOL_BLACKLIST    = {
@@ -45,10 +45,11 @@ SYMBOL_BLACKLIST    = {
 }
 
 # Concurrency / pacing
-MAX_CONCURRENCY     = max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2))
-LOOP_COOLDOWN_SEC   = _as_float(os.getenv("PF_COOLDOWN_SEC", "15"), 15.0)
+MAX_CONCURRENCY   = max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2))
+LOOP_COOLDOWN_SEC = _as_float(os.getenv("PF_COOLDOWN_SEC", "15"), 15.0)
 
-DEBUG_TX            = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
+# Debug
+DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
 
 
 # ------------------------ small utils ------------------------
@@ -61,14 +62,22 @@ def _get_first(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
 
 def _extract_raw_mint(msg: Dict[str, Any]) -> str:
     """
-    DO NOT normalize. We pass the raw value (which may end with 'pump').
+    DO NOT normalize or strip '.pump'.
+    We pass the raw string directly to the trader so it can decide
+    whether it's a bondingCurve id or a real mint address.
     """
-    raw = _get_first(msg, "mint", "mintAddress", "mint_address", "bondingCurve", "bonding_curve", default="")
-    if raw is None:
-        raw = ""
-    raw = str(raw).strip()
-    if DEBUG_TX:
-        print(f"[main] raw pump id = {raw}", flush=True)
+    raw = _get_first(
+        msg,
+        "mint",
+        "mintAddress",
+        "mint_address",
+        "bondingCurve",
+        "bonding_curve",
+        default="",
+    )
+    raw = ("" if raw is None else str(raw)).strip()
+    # Always show this so you can correlate logs precisely like before
+    print(f"[main] raw pump id = {raw}", flush=True)
     return raw
 
 def _extract_symbol(msg: Dict[str, Any]) -> str:
@@ -144,20 +153,22 @@ class Strategy:
         if not _passes_filters(raw_event):
             return
 
-        # Build UI context the trader expects; DO NOT strip the mint.
-        ui: Dict[str, Any] = dict(raw_event)  # shallow copy so we can augment
+        # Build UI context for trader; DO NOT strip the mint.
+        ui: Dict[str, Any] = dict(raw_event)  # shallow copy to augment safely
         ui.setdefault("pool", "pump")
         ui.setdefault("symbol", _extract_symbol(raw_event))
         ui.setdefault("name", _extract_name(raw_event))
         ui["rawMint"] = mint_raw
-        # (Some UIs like to know we didn't normalize.)
-        ui.setdefault("normalized", False)
+        ui.setdefault("normalized", False)  # signal we passed it raw
 
-        # One-at-a-time within the semaphore
+        # Two log lines to mirror your previous output style
+        symbol = ui.get("symbol", "") or "?"
+        print(f"[trade] pool=pump symbol={symbol} mint={mint_raw} curve=-", flush=True)
+        print(f"[trade] pool=pump symbol={symbol} mint={mint_raw} curve=- for {symbol} ({mint_raw})", flush=True)
+
         async with self._sema:
             try:
                 # Pass the raw '...pump' (or base58) directly.
-                print(f"[trade] pool=pump symbol={ui.get('symbol','?')} mint={mint_raw} curve=-", flush=True)
                 sig = await maybe_buy(mint=mint_raw, ui=ui)
 
                 if not IS_DRYRUN and EXIT_ENGINE_ENABLED and sig:
@@ -171,7 +182,7 @@ class Strategy:
                 print("[strategy] maybe_buy exception:", flush=True)
                 traceback.print_exc()
 
-        # light pacing so we don't hammer
+        # Light pacing so we don't hammer the stream/trader
         await asyncio.sleep(LOOP_COOLDOWN_SEC)
 
     async def on_trade(self, raw_event: Dict[str, Any]) -> None:

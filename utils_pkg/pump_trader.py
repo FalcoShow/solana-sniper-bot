@@ -1,9 +1,10 @@
 # utils_pkg/pump_trader.py
 from __future__ import annotations
 
-import os
+import asyncio
 import json
-from typing import Dict, Any, Optional, Tuple
+import os
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 
@@ -12,6 +13,8 @@ from utils_pkg.solana_wallet import (
     get_pubkey_str,
     sign_and_send_b64_tx,
 )
+from utils_pkg.txlearn import TxLearner
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Env / config
@@ -19,17 +22,33 @@ from utils_pkg.solana_wallet import (
 def _is_true(v: Optional[str]) -> bool:
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-PP_API_KEY       = (os.getenv("PF_PP_KEY") or "").strip()
-DRY_RUN          = _is_true(os.getenv("DRY_RUN", "0"))
-PF_SLIPPAGE_BPS  = int(os.getenv("PF_SLIPPAGE_BPS", "1000"))     # 10%
-PF_PRIORITY_SOL  = float(os.getenv("PF_PRIORITY_SOL", "0.0005"))
-PF_POOLS         = {p.strip().lower() for p in (os.getenv("PF_POOLS", "pump").split(","))}
-PF_DEBUG_TX      = _is_true(os.getenv("PF_DEBUG_TX", "0"))
-PF_PP_DOUBLETRY  = _is_true(os.getenv("PF_PP_DOUBLETRY", "1"))    # try flipped param once
-USE_LOCAL_FALLBK = _is_true(os.getenv("PF_USE_LOCAL_FALLBACK", "1"))  # ← enable by default
+PP_API_KEY         = (os.getenv("PF_PP_KEY") or "").strip()
+DRY_RUN            = _is_true(os.getenv("DRY_RUN", "0"))
+PF_SLIPPAGE_BPS    = int(os.getenv("PF_SLIPPAGE_BPS", "1000"))        # 10%
+PF_PRIORITY_SOL    = float(os.getenv("PF_PRIORITY_SOL", "0.0005"))
+PF_POOLS           = {p.strip().lower() for p in (os.getenv("PF_POOLS", "pump").split(","))}
+PF_DEBUG_TX        = _is_true(os.getenv("PF_DEBUG_TX", "0"))
+PF_PP_DOUBLETRY    = _is_true(os.getenv("PF_PP_DOUBLETRY", "1"))      # flip once between mint/curve on schema errs
+USE_LOCAL_FALLBK   = _is_true(os.getenv("PF_USE_LOCAL_FALLBACK", "0")) # default OFF per your latest setup
+
+# Post-buy learning controller (outer loop)
+POS_RETRY_TRIES        = int(os.getenv("PF_POS_RETRY_TRIES", "10"))
+POS_RETRY_SLEEP_SEC    = float(os.getenv("PF_POS_RETRY_SLEEP_SEC", "0"))  # extra pause between outer attempts
+TXLEARN_AUTORUN        = _is_true(os.getenv("PF_TXLEARN_AUTORUN", "1"))   # run learner after buy by default
+
+# txlearn inner loop knobs (forwarded to TxLearner)
+TX_COMMITMENT          = os.getenv("PF_TXLEARN_COMMITMENT", "confirmed")
+TX_TRIES               = int(os.getenv("PF_TXLEARN_TRIES", "20"))
+TX_DELAY_SEC           = float(os.getenv("PF_TXLEARN_DELAY_SEC", "1.2"))
+TX_WARMUP_SEC          = float(os.getenv("PF_TXLEARN_WARMUP_SEC", "2.0"))
+
+OWNER_PUBKEY           = (os.getenv("PF_PP_ACCOUNT") or "").strip()
+SOL_RPC_URL            = (os.getenv("SOL_RPC_URL") or "").strip()
+
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
 
 def current_trade_sol() -> float:
     try:
@@ -42,6 +61,7 @@ def current_trade_sol() -> float:
     except Exception:
         mn, mx = 0.005, 1000.0
     return _clamp(sz, mn, mx)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Base58 helpers & pump splitter
@@ -68,10 +88,12 @@ def _split_mint_or_curve(raw: str) -> Tuple[Optional[str], Optional[str]]:
         return s, None
     return None, None
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# PumpPortal HTTP
+# PumpPortal HTTP helpers
 # ──────────────────────────────────────────────────────────────────────────────
 class TemporaryPumpPortal(Exception):
+    """Non-fatal, retryable issues like non-JSON 200s or parse errors."""
     pass
 
 def _slippage_percent_from_bps(bps: int) -> float:
@@ -142,10 +164,63 @@ def _is_schema_err(errs: list[str]) -> bool:
         "invalid param",
     ])
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# BUY
+# Post-buy learner (background)
+# ──────────────────────────────────────────────────────────────────────────────
+async def _learn_position_bg(mint: str, sig: str) -> None:
+    """
+    Outer retry loop (to match your prior logs like:
+      [pos] retry learn <mint> attempt X/N... last_bal=0
+    Each outer attempt runs an inner TxLearner loop that probes signature status,
+    getTransaction, and owned token balance.
+    """
+    if not TXLEARN_AUTORUN:
+        return
+
+    tries = max(1, POS_RETRY_TRIES)
+    last_bal = 0.0
+
+    for i in range(1, tries + 1):
+        # run one inner learn cycle
+        learner = TxLearner(
+            rpc_url=SOL_RPC_URL or None,
+            owner=OWNER_PUBKEY or None,
+            commitment=TX_COMMITMENT,
+            tries=TX_TRIES,
+            delay_sec=TX_DELAY_SEC,
+            warmup_sec=TX_WARMUP_SEC,
+        )
+        try:
+            res = await learner.learn(mint, sig)
+        finally:
+            await learner.close()
+
+        last_bal = float(res.get("owner_balance_ui") or 0.0)
+        if last_bal > 0:
+            break
+
+        if i < tries:
+            print(f"[pos] retry learn {mint} attempt {i}/{tries}... last_bal={last_bal}", flush=True)
+            if POS_RETRY_SLEEP_SEC > 0:
+                await asyncio.sleep(POS_RETRY_SLEEP_SEC)
+
+    # Final state log (optional)
+    if last_bal <= 0:
+        print(f"[pos] learn finished for {mint} with balance {last_bal} (no tokens detected)", flush=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BUY entry point
 # ──────────────────────────────────────────────────────────────────────────────
 async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
+    """
+    Attempts to buy using PumpPortal Lightning.
+    Accepts either a token mint (base58) or a Pump bonding-curve id ending with 'pump'.
+    Will flip once between mint/curve if schema errors are returned.
+    Spawns a background balance learner after success.
+    Returns the signature on success, otherwise None.
+    """
     ui = kwargs.get("ui") or {}
     symbol = (kwargs.get("symbol") or ui.get("symbol") or "").strip()
     pool   = (kwargs.get("pool")   or ui.get("pool")   or "pump").strip().lower()
@@ -178,7 +253,7 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
 
     if PF_DEBUG_TX:
         print(f"[trade] pool={pool} symbol={symbol} "
-              f"mint={token_mint or '-'} curve={bonding_curve or '-'} for {label}")
+              f"mint={token_mint or '-'} curve={bonding_curve or '-'} for {label}", flush=True)
 
     kp = load_keypair()
     payer_pub = get_pubkey_str(kp)
@@ -187,29 +262,33 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
         try:
             resp = _post_json(url, body)
         except TemporaryPumpPortal as te:
-            print(f"[BUY TEMP] {tag} for {label}: {te}")
+            print(f"[BUY TEMP] {tag} for {label}: {te}", flush=True)
             return None, None, None
         except Exception as e:
-            print(f"[BUY ERR] {tag} HTTP for {label}: {e}")
+            print(f"[BUY ERR] {tag} HTTP for {label}: {e}", flush=True)
             return None, None, None
+
         errs = _resp_errors(resp)
         if errs:
             return None, errs, resp
+
         # success: signature or unsigned tx
         sig = resp.get("signature")
         if sig:
-            print(f"[BUY OK] {label} — executed via Lightning. https://solscan.io/tx/{sig} [payer={payer_pub}]")
+            print(f"[BUY OK] {label} — executed via Lightning. https://solscan.io/tx/{sig} [payer={payer_pub}]", flush=True)
             return sig, None, None
+
         tx_b64 = resp.get("transaction") or resp.get("tx")
         if tx_b64:
             try:
                 sig2 = sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
-                print(f"[BUY OK] {label} — local sign. https://solscan.io/tx/{sig2} [payer={payer_pub}]")
+                print(f"[BUY OK] {label} — local sign. https://solscan.io/tx/{sig2} [payer={payer_pub}]", flush=True)
                 return sig2, None, None
             except Exception as e:
-                print(f"[BUY ERR] local sign failed for {label}: {e}")
+                print(f"[BUY ERR] local sign failed for {label}: {e}", flush=True)
         else:
-            print(f"[BUY ERR] unexpected response for {label}: {json.dumps(resp)[:300]}")
+            print(f"[BUY ERR] unexpected response for {label}: {json.dumps(resp)[:300]}", flush=True)
+
         return None, None, None
 
     async def _attempt(one_mint: Optional[str], one_curve: Optional[str], note: str) -> Optional[str]:
@@ -223,39 +302,51 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
             mint=one_mint,
             bonding_curve=one_curve,
         )
-        # 1) Lightning
+
+        # 1) Lightning (primary)
         sig, errs, _ = _try(_url_lightning(), body, f"lightning/{note}")
         if sig:
             return sig
-        # 2) If schema-ish, try local builder with SAME params
+
+        # 2) Optional local fallback on schema-ish errors (off by default)
         if errs and _is_schema_err(errs) and USE_LOCAL_FALLBK:
             sig2, errs2, _ = _try(_url_local(), body, f"local/{note}")
             if sig2:
                 return sig2
             if errs2:
-                print(f"[BUY ERR] pumpportal errors for {one_mint or one_curve or mint} ({note}): {errs2}")
+                print(f"[BUY ERR] pumpportal errors for {one_mint or one_curve or mint} ({note}): {errs2}", flush=True)
         elif errs:
-            print(f"[BUY ERR] pumpportal errors for {one_mint or one_curve or mint} ({note}): {errs}")
+            print(f"[BUY ERR] pumpportal errors for {one_mint or one_curve or mint} ({note}): {errs}", flush=True)
+
         return None
 
     # Prefer curve on Pump when we have a curve hint or a raw ...pump
     if pool == "pump" and bonding_curve and not token_mint:
         sig0 = await _attempt(None, bonding_curve, "curve-first")
         if sig0:
+            if TXLEARN_AUTORUN:
+                asyncio.create_task(_learn_position_bg(bonding_curve, sig0 if sig0 else ""))  # pass curve as the mint-id source if we bought via curve
             return sig0
 
     # Otherwise try mint first
     first_sig = await _attempt(token_mint, bonding_curve if token_mint is None else None, "first")
     if first_sig:
+        if TXLEARN_AUTORUN:
+            # if we sent mint, use the true token mint for learning; else fall back to whatever we have
+            learn_key = token_mint or bonding_curve or mint
+            asyncio.create_task(_learn_position_bg(learn_key, first_sig))
         return first_sig
 
     # Flip & retry once
     if PF_PP_DOUBLETRY and pool == "pump":
         flip_mint, flip_curve = (None, token_mint) if token_mint else (bonding_curve or mint, None)
         if PF_DEBUG_TX:
-            print(f"[BUY RETRY] flipping to {'bondingCurve' if flip_curve else 'mint'}={flip_curve or flip_mint}")
+            print(f"[BUY RETRY] flipping to {'bondingCurve' if flip_curve else 'mint'}={flip_curve or flip_mint}", flush=True)
         second_sig = await _attempt(flip_mint, flip_curve, "retry-flip")
         if second_sig:
+            if TXLEARN_AUTORUN:
+                learn_key = flip_mint or flip_curve or mint
+                asyncio.create_task(_learn_position_bg(learn_key, second_sig))
             return second_sig
 
     return None
