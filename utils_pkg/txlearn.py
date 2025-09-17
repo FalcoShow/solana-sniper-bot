@@ -1,4 +1,3 @@
-# utils_pkg/txlearn.py
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +9,10 @@ import aiohttp
 
 # ------------------------ env + defaults ------------------------
 
-RPC_URL = os.getenv("SOL_RPC_URL", "").strip() or "https://api.mainnet-beta.solana.com"
+# Prefer a dedicated TX RPC if present (faster meta visibility), else fall back.
+RPC_URL = (os.getenv("SOL_RPC_TX_URL", "").strip()
+           or os.getenv("SOL_RPC_URL", "").strip()
+           or "https://api.mainnet-beta.solana.com")
 
 TX_COMMITMENT = (os.getenv("PF_TXLEARN_COMMITMENT", "confirmed").strip().lower()
                  or "confirmed")  # "processed" | "confirmed" | "finalized"
@@ -121,13 +123,11 @@ class _Rpc:
                                "maxSupportedTransactionVersion": 0}],
                     )
                 elif attempt == 2:
-                    # Some nodes don't like maxSupportedTransactionVersion
                     return await self.call(
                         "getTransaction",
                         [sig, {"commitment": commitment, "encoding": "jsonParsed"}],
                     )
                 else:
-                    # Fallback to base64 if the node refuses parsed
                     return await self.call(
                         "getTransaction",
                         [sig, {"commitment": commitment, "encoding": "base64"}],
@@ -271,6 +271,51 @@ async def _hel_parse_for_mint(session: aiohttp.ClientSession, sig: str, owner: O
     return None
 
 
+async def _infer_mint_from_rpc_tx(rpc: _Rpc, sig: str, owner: Optional[str]) -> Optional[str]:
+    """
+    Infer mint directly from RPC getTransaction (jsonParsed) using postTokenBalances.
+    Prioritizes entries owned by `owner` (if provided), else returns the largest post amount.
+    """
+    tx = await rpc.get_transaction(sig, TX_COMMITMENT)
+    if not tx:
+        return None
+
+    meta = (tx or {}).get("meta") or {}
+    post = meta.get("postTokenBalances") or []
+    if not post:
+        return None
+
+    # 1) Prefer owner match
+    best: Optional[Tuple[str, int]] = None
+    for b in post:
+        try:
+            if owner and b.get("owner") and b.get("owner") != owner:
+                continue
+            m = b.get("mint")
+            ui = b.get("uiTokenAmount") or {}
+            amt = int(str(ui.get("amount", "0")))
+            if amt > 0 and _is_likely_pubkey(m):
+                if best is None or amt > best[1]:
+                    best = (m, amt)
+        except Exception:
+            continue
+    if best:
+        return best[0]
+
+    # 2) Fallback: largest post amount regardless of owner
+    for b in post:
+        try:
+            m = b.get("mint")
+            ui = b.get("uiTokenAmount") or {}
+            amt = int(str(ui.get("amount", "0")))
+            if amt > 0 and _is_likely_pubkey(m):
+                if best is None or amt > best[1]:
+                    best = (m, amt)
+        except Exception:
+            continue
+    return best[0] if best else None
+
+
 async def _maybe_await(x):
     if asyncio.iscoroutine(x):
         return await x
@@ -286,8 +331,9 @@ async def resolve_mint_best_effort(
     """
     Resolve a real spl-token mint address from:
       1) Helius parse of `signature` (best)
-      2) local pump resolver if the id ends with 'pump'
-      3) direct RPC validation if the input is already a mint
+      2) RPC getTransaction → postTokenBalances inference (new, robust)
+      3) local pump resolver if the id ends with 'pump'
+      4) direct RPC validation if the input is already a mint
     """
     raw = (raw_id_or_mint or "").strip()
 
@@ -298,10 +344,18 @@ async def resolve_mint_best_effort(
         if m:
             return m
 
-    # 2) pump id -> mint via your utils_pkg.pump_trader resolvers
+    # 2) RPC-based inference from the tx itself
+    if signature:
+        try:
+            m = await _infer_mint_from_rpc_tx(rpc, signature, owner)
+            if m:
+                return m
+        except Exception:
+            pass
+
+    # 3) pump id -> mint via your utils_pkg.pump_trader resolvers
     if _is_probably_pump_id(raw):
         try:
-            # Lazy import to avoid cycles
             from utils_pkg.pump_trader import resolve_true_mint as _rtm, resolve_true_mint_from_pump_id as _rtm_pid
         except Exception:
             _rtm = None  # type: ignore
@@ -323,7 +377,7 @@ async def resolve_mint_best_effort(
             except Exception:
                 pass
 
-    # 3) If it's already a plausible key, verify it's a mint account
+    # 4) If it's already a plausible key, verify it's a mint account
     if _is_likely_pubkey(raw):
         if await _is_valid_mint_account(rpc, raw):
             return raw
@@ -365,7 +419,7 @@ class TxLearner:
     async def resolve_then_learn(self, raw_id_or_mint: str, tx_sig: str) -> Dict[str, Any]:
         """
         Fully managed path:
-          - Try to resolve a real token mint (signature → pump id → rpc).
+          - Try to resolve a real token mint (signature → RPC/Helius → pump resolvers → rpc-validate).
           - If resolved, learn balances/tx.
           - If not yet resolved, retry a few times with backoff, then return best-effort.
         """
@@ -403,11 +457,11 @@ class TxLearner:
         max_tries = min(5, self.tries)
         i = 0
         for i in range(1, max_tries + 1):
-            # Check status first; early-exit if definitively errored
             status = await self.rpc.get_signature_status(tx_sig)
+            # early exit on tx error
             if status and status.get("err") is not None:
                 if DEBUG:
-                    print(f"[txlearn] tx {tx_sig} errored: {status.get('err')}", flush=True)
+                    print(f"[txlearn] tx-only: signature {tx_sig} errored: {status.get('err')}", flush=True)
                 return {
                     "tx_found": False,
                     "owner_balance_ui": 0.0,
@@ -423,6 +477,9 @@ class TxLearner:
                 if POS_LEARN_BASE_DELAY_SEC > 0:
                     await asyncio.sleep(POS_LEARN_BASE_DELAY_SEC)
                 await asyncio.sleep(_jitter(self.delay))
+
+        if DEBUG and not tx_obj:
+            print(f"[txlearn] tx-only: no getTransaction result for sig={tx_sig}", flush=True)
 
         return {
             "tx_found": tx_obj is not None,
@@ -480,6 +537,8 @@ class TxLearner:
 
             # ---- Early-exit on explicit transaction error ----
             if status and status.get("err") is not None:
+                if DEBUG:
+                    print(f"[txlearn] tx errored early: {status.get('err')}", flush=True)
                 return {
                     "tx_found": False,
                     "owner_balance_ui": 0.0,
