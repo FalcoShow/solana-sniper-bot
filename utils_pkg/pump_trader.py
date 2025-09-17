@@ -25,8 +25,8 @@ PF_SLIPPAGE_BPS  = int(os.getenv("PF_SLIPPAGE_BPS", "1000"))     # 10%
 PF_PRIORITY_SOL  = float(os.getenv("PF_PRIORITY_SOL", "0.0005"))
 PF_POOLS         = {p.strip().lower() for p in (os.getenv("PF_POOLS", "pump").split(","))}
 PF_DEBUG_TX      = _is_true(os.getenv("PF_DEBUG_TX", "0"))
-# default OFF since you said you removed it from env
-USE_LOCAL_FALLBK = _is_true(os.getenv("PF_USE_LOCAL_FALLBACK", "0"))
+PF_PP_DOUBLETRY  = _is_true(os.getenv("PF_PP_DOUBLETRY", "1"))    # try one flip if needed
+USE_LOCAL_FALLBK = _is_true(os.getenv("PF_USE_LOCAL_FALLBACK", "1"))  # default ON
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -51,31 +51,21 @@ _BASE58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 def _looks_base58(s: str) -> bool:
     return bool(s) and isinstance(s, str) and all(ch in _BASE58 for ch in s)
 
-def _strip_pump_suffix(s: str) -> str:
-    s = (s or "").strip()
-    return s[:-4] if s.endswith("pump") else s
-
-def _mint_for_pump(raw_id: str) -> Optional[str]:
+def _split_id(raw: str) -> Tuple[Optional[str], Optional[str], bool]:
     """
-    Normalize to the exact value we will put in the `mint` field for Lightning:
-
-    - If the ID ends with 'pump', strip it and use the remainder as mint.
-    - Else, if it already looks base58, use it as-is.
-    - Else, return None (we don't know what this is).
+    Given a raw string, return (mint, bonding_curve, is_pump_id).
+    - If raw endswith 'pump' and the base is base58 => it's a Pump bonding curve id.
+    - If raw is base58 and not ending with 'pump' => it's a mint.
     """
-    raw = (raw_id or "").strip()
-    if not raw:
-        return None
-    if raw.endswith("pump"):
-        base = _strip_pump_suffix(raw)
-        return base if _looks_base58(base) else None
-    return raw if _looks_base58(raw) else None
+    s = (raw or "").strip()
+    if not s:
+        return None, None, False
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PumpPortal HTTP
-# ──────────────────────────────────────────────────────────────────────────────
-class TemporaryPumpPortal(Exception):
-    pass
+    if s.endswith("pump"):
+        base = s[:-4].strip()
+        return (None, base if _looks_base58(base) else None, True)
+
+    return (s if _looks_base58(s) else None, None, False)
 
 def _slippage_percent_from_bps(bps: int) -> float:
     return float(bps) / 100.0
@@ -98,9 +88,10 @@ def _build_body(
     amount_sol: float,
     slippage_bps: int,
     priority_sol: float,
-    mint: str,
+    mint: Optional[str] = None,
+    bonding_curve: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return {
+    body: Dict[str, Any] = {
         "action": action,
         "amount": float(amount_sol),
         "denominatedInSol": True,
@@ -108,8 +99,16 @@ def _build_body(
         "priorityFee": float(priority_sol),
         "pool": pool,
         "publicKey": payer_pubkey,
-        "mint": mint,  # ← always present and always a base58 string
     }
+    # STRICTLY send only one of these
+    if bonding_curve and not mint:
+        body["bondingCurve"] = bonding_curve
+    elif mint and not bonding_curve:
+        body["mint"] = mint
+    return body
+
+class TemporaryPumpPortal(Exception):
+    pass
 
 def _post_json(url: str, body: Dict[str, Any], timeout: int = 20) -> Dict[str, Any]:
     r = requests.post(url, json=body, timeout=timeout, allow_redirects=False)
@@ -131,14 +130,9 @@ def _resp_errors(resp: Dict[str, Any]) -> list[str]:
         errs = [str(errs)]
     return [str(e) for e in errs] if isinstance(errs, list) else ([str(errs)] if errs else [])
 
-def _is_schema_err(errs: list[str]) -> bool:
-    text = " | ".join(e.lower() for e in errs)
-    return any(k in text for k in [
-        "invalid public key input",
-        "mint must be a string",
-        "wrongsize",
-        "invalid param",
-    ])
+def _is_schemaish(errs: list[str]) -> bool:
+    t = " | ".join(e.lower() for e in errs)
+    return any(k in t for k in ["invalid public key input", "mint must be a string", "invalid param", "wrongsize"])
 
 # ──────────────────────────────────────────────────────────────────────────────
 # BUY
@@ -152,24 +146,32 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
         print(f"[skip] unsupported pool '{pool}' for {mint}; allowed={sorted(PF_POOLS)}; skipping.")
         return None
 
-    # Prefer the raw id from upstream if present (so we can strip 'pump' correctly).
-    raw_hint = ui.get("rawMint") or ui.get("raw") or ui.get("raw_mint") or mint
-    id_for_mint = _mint_for_pump(str(raw_hint))
-
-    label   = f"{(symbol or '').strip()} ({raw_hint})".strip() or str(raw_hint)
+    label   = f"{symbol} ({mint})" if symbol else mint
     amt_sol = current_trade_sol()
-
-    if not id_for_mint:
-        print(f"[BUY ERR] could not derive base58 mint from '{raw_hint}' for {label}")
-        return None
-
-    if PF_DEBUG_TX:
-        # show both raw id and normalized mint we will send
-        print(f"[trade] pool={pool} symbol={(symbol or '?')} mint={id_for_mint} (from raw='{raw_hint}') for {label}")
 
     if DRY_RUN:
         print(f"[DRYRUN] would buy {label} on {pool} for {amt_sol} SOL")
         return None
+
+    # Decide strictly which field to send
+    raw_hint: str = (ui.get("rawMint") or ui.get("raw") or mint or "").strip()
+    tok_mint, curve_id, is_pump_id = _split_id(raw_hint)
+
+    # If caller passed a plain base58 mint, respect that
+    if not is_pump_id and not tok_mint and _looks_base58(mint):
+        tok_mint = mint
+
+    # For pump ids: favor bondingCurve only
+    if is_pump_id and curve_id:
+        tok_mint = None
+
+    if PF_DEBUG_TX:
+        if is_pump_id:
+            print(f"[trade] pool={pool} symbol={symbol} "
+                  f"mint=- curve={curve_id} (from raw='{raw_hint}') for {label}")
+        else:
+            print(f"[trade] pool={pool} symbol={symbol} "
+                  f"mint={tok_mint or '-'} curve=- (from raw='{raw_hint}') for {label}")
 
     kp = load_keypair()
     payer_pub = get_pubkey_str(kp)
@@ -183,14 +185,16 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
         except Exception as e:
             print(f"[BUY ERR] {tag} HTTP for {label}: {e}")
             return None, None, None
+
         errs = _resp_errors(resp)
         if errs:
             return None, errs, resp
-        # success: signature or unsigned tx
+
         sig = resp.get("signature")
         if sig:
             print(f"[BUY OK] {label} — executed via Lightning. https://solscan.io/tx/{sig} [payer={payer_pub}]")
             return sig, None, None
+
         tx_b64 = resp.get("transaction") or resp.get("tx")
         if tx_b64:
             try:
@@ -203,29 +207,54 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
             print(f"[BUY ERR] unexpected response for {label}: {json.dumps(resp)[:300]}")
         return None, None, None
 
-    body = _build_body(
-        action="buy",
-        pool=pool,
-        payer_pubkey=payer_pub,
-        amount_sol=amt_sol,
-        slippage_bps=PF_SLIPPAGE_BPS,
-        priority_sol=PF_PRIORITY_SOL,
-        mint=id_for_mint,              # ← ALWAYS set
-    )
+    async def _attempt(one_mint: Optional[str], one_curve: Optional[str], note: str) -> Optional[str]:
+        body = _build_body(
+            action="buy",
+            pool=pool,
+            payer_pubkey=payer_pub,
+            amount_sol=amt_sol,
+            slippage_bps=PF_SLIPPAGE_BPS,
+            priority_sol=PF_PRIORITY_SOL,
+            mint=one_mint,
+            bonding_curve=one_curve,
+        )
+        # Lightning
+        sig, errs, _ = _try(_url_lightning(), body, f"lightning/{note}")
+        if sig:
+            return sig
+        # Local fallback when schema-ish issues pop (common when using bondingCurve)
+        if errs and _is_schemaish(errs) and USE_LOCAL_FALLBK:
+            sig2, errs2, _ = _try(_url_local(), body, f"local/{note}")
+            if sig2:
+                return sig2
+            if errs2:
+                print(f"[BUY ERR] pumpportal errors ({note}) for {one_mint or one_curve or mint}: {errs2}")
+        elif errs:
+            print(f"[BUY ERR] pumpportal errors ({note}) for {one_mint or one_curve or mint}: {errs}")
+        return None
 
-    # 1) Lightning
-    sig, errs, _ = _try(_url_lightning(), body, "lightning")
-    if sig:
-        return sig
+    # Strict order:
+    # 1) If the raw looked like a pump id, use bondingCurve ONLY
+    if pool == "pump" and curve_id and not tok_mint:
+        sig0 = await _attempt(None, curve_id, "curve")
+        if sig0:
+            return sig0
 
-    # 2) Optional local fallback on schema-ish failures
-    if errs and _is_schema_err(errs) and USE_LOCAL_FALLBK:
-        sig2, errs2, _ = _try(_url_local(), body, "local")
-        if sig2:
-            return sig2
-        if errs2:
-            print(f"[BUY ERR] pumpportal errors (local): {errs2}")
-    elif errs:
-        print(f"[BUY ERR] pumpportal errors: {errs}")
+    # 2) Otherwise, try with mint ONLY
+    if tok_mint:
+        sig1 = await _attempt(tok_mint, None, "mint")
+        if sig1:
+            return sig1
+
+    # 3) Optionally flip once (mint <-> curve) if enabled
+    if PF_PP_DOUBLETRY and pool == "pump":
+        if tok_mint:
+            sig2 = await _attempt(None, tok_mint, "flip-mint→curve")
+            if sig2:
+                return sig2
+        elif curve_id:
+            sig3 = await _attempt(curve_id, None, "flip-curve→mint")
+            if sig3:
+                return sig3
 
     return None
