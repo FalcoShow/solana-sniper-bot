@@ -15,7 +15,10 @@ from utils_pkg.solana_wallet import (
     get_pubkey_str,
     sign_and_send_b64_tx,
 )
-from utils_pkg.txlearn import resolve_then_learn_position
+
+# Always use resolver-first learner after buys
+from utils_pkg.txlearn import resolve_then_learn_position as _tx_resolve_then_learn
+
 
 # =============================================================================
 # Env & config helpers
@@ -27,16 +30,19 @@ def _envf(name: str, default: float) -> float:
     except Exception:
         return float(default)
 
+
 def _envi(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
     except Exception:
         return int(default)
 
+
 def _is_true(v: Optional[str], default: bool = False) -> bool:
     if v is None:
         return default
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
 
 # -----------------------------------------------------------------------------
 # Global env/config
@@ -57,8 +63,8 @@ EXIT_TSL_TRAIL_PCT = _envf("EXIT_TSL_TRAIL_PCT", 20.0)  # trail 20% off peak
 EXIT_HARD_STOP_PCT = _envf("HARD_STOP_PCT", -32.0)      # hard stop
 
 # Learner/engine pacing
-POS_RETRY_MAX        = _envi("PF_POS_RETRY_MAX", 10)            # upper-bound retries around learn
-POS_RETRY_DELAY_SEC  = _envf("PF_POS_RETRY_DELAY_SEC", 1.8)     # between those retries
+POS_RETRY_MAX        = _envi("PF_POS_RETRY_MAX", 10)          # resolve-then-learn retries
+POS_RETRY_DELAY_SEC  = _envf("PF_POS_RETRY_DELAY_SEC", 1.2)   # delay between those retries
 
 # Jupiter / slippage / priority
 SOL_MINT                = "So11111111111111111111111111111111111111112"
@@ -66,14 +72,17 @@ USDC_MINT               = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 TOKEN_PROGRAM_ID        = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM_ID   = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
+
 def _jup_as_legacy() -> bool:
     v = os.getenv("JUP_AS_LEGACY", "1")
     return str(v).lower() in {"1", "true", "yes", "y"}
+
 
 def _slippage_bps() -> int:
     # JUPITER_MAX_SLIPPAGE as fraction (e.g. 0.0125 = 1.25%)
     s = _envf("JUPITER_MAX_SLIPPAGE", 0.0125)
     return max(1, int(round(s * 10_000)))
+
 
 def _priority_lamports() -> Optional[int]:
     p = os.getenv("PF_PRIORITY_SOL")
@@ -84,16 +93,21 @@ def _priority_lamports() -> Optional[int]:
     except Exception:
         return None
 
+
 # =============================================================================
 # Small utils
 # =============================================================================
 
 def _assert_mint(m: str) -> None:
+    """
+    Fast sanity: base58 decode to 32 bytes.
+    """
     try:
         if len(base58.b58decode(m)) != 32:
             raise ValueError("decoded length is not 32 bytes")
     except Exception as e:
         raise ValueError(f"Invalid mint '{m}': {e}")
+
 
 def _rpc_json(url: str, method: str, params: list) -> Any:
     if not url:
@@ -109,8 +123,10 @@ def _rpc_json(url: str, method: str, params: list) -> Any:
         raise RuntimeError(js["error"])
     return js["result"]
 
+
 def _rpc(method: str, params: list) -> Any:
     return _rpc_json(RPC_URL, method, params)
+
 
 # =============================================================================
 # Balance helpers
@@ -132,6 +148,7 @@ def _sum_token_balance_iu_via_program_scan(owner: str, mint: str) -> Tuple[int, 
             if decimals is None:
                 decimals = int(ta.get("decimals", 0))
     return total, (decimals or 0)
+
 
 def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
     """
@@ -155,6 +172,7 @@ def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
         return total, decimals
 
     except Exception as e:
+        # Some nodes error with "could not find mint" until accounts exist
         msg = str(e)
         if "could not find mint" in msg or "Invalid param" in msg:
             return _sum_token_balance_iu_via_program_scan(owner, mint)
@@ -163,12 +181,14 @@ def _sum_token_balance_iu(owner: str, mint: str) -> Tuple[int, int]:
             return total, dec
         raise
 
+
 # =============================================================================
 # Jupiter quote / swap
 # =============================================================================
 
 def _jup_quote(input_mint: str, output_mint: str, amount_iu: int) -> dict:
-    _assert_mint(input_mint); _assert_mint(output_mint)
+    _assert_mint(input_mint)
+    _assert_mint(output_mint)
     url = "https://quote-api.jup.ag/v6/quote"
     q = {
         "inputMint": input_mint,
@@ -183,6 +203,7 @@ def _jup_quote(input_mint: str, output_mint: str, amount_iu: int) -> dict:
     if not r.ok:
         raise RuntimeError(f"Jupiter quote {r.status_code}: {r.text[:400]}")
     return r.json()
+
 
 def _jup_swap(user_pubkey: str, quote: dict, priority_lamports: Optional[int]) -> str:
     url = "https://quote-api.jup.ag/v6/swap"
@@ -210,6 +231,7 @@ def _jup_swap(user_pubkey: str, quote: dict, priority_lamports: Optional[int]) -
         raise RuntimeError(f"Jupiter swap returned no transaction: {js}")
     return tx_b64
 
+
 # =============================================================================
 # Telegram (optional)
 # =============================================================================
@@ -227,6 +249,7 @@ def _tg_send(text: str) -> None:
         )
     except Exception:
         pass
+
 
 # =============================================================================
 # Public: SELL
@@ -271,6 +294,7 @@ async def sell_on_jupiter(mint: str, *, pct_of_wallet: float = 1.0) -> Optional[
     _tg_send(f"✅ SOLD {mint} • pct={pct:.0%} • tx: https://solscan.io/tx/{sig}")
     return sig
 
+
 # =============================================================================
 # Exit Engine (resolver-first)
 # =============================================================================
@@ -281,6 +305,7 @@ class PositionsExitEngine:
       - **always** use resolver-first learner (handles '...pump' ids)
       - if the tx failed → bail early
       - if balance > 0 → record entry & start managing position
+
     Live trade ticks:
       - maintain peak/entry
       - TP1, TP2, trailing & hard-stop exits
@@ -304,28 +329,29 @@ class PositionsExitEngine:
             return
 
         async with self._sema:
-            # Wrap in a bounded retry loop (keeps logs tidy during indexer lag)
+            # Bounded retry loop (keeps logs tidy during indexer lag)
             last_bal = 0.0
+            last_res: Optional[Dict[str, Any]] = None
+
             for i in range(1, POS_RETRY_MAX + 1):
                 try:
-                    res = await resolve_then_learn_position(
+                    last_res = await _tx_resolve_then_learn(
                         raw_id_or_mint=raw_id_or_mint,
                         tx_sig=tx_sig,
                         owner=self.owner,
-                        rpc_url=RPC_URL or None,
+                        rpc_url=TX_RPC_URL or RPC_URL or None,
                     )
                 except Exception as e:
-                    print(f"[pos] resolve_then_learn error (attempt {i}/{POS_RETRY_MAX}): {e}", flush=True)
-                    res = None
+                    print(f"[pos] resolve_then_learn error ({i}/{POS_RETRY_MAX}): {e}", flush=True)
+                    last_res = None
 
-                if res:
-                    status = res.get("status") or {}
-                    err = status.get("err")
-                    if err is not None:
-                        print(f"[pos] tx failed (sig={tx_sig}) — err={err}", flush=True)
+                if last_res:
+                    status = last_res.get("status") or {}
+                    if status.get("err") is not None:
+                        print(f"[pos] tx failed (sig={tx_sig}) — err={status.get('err')}", flush=True)
                         return
 
-                    last_bal = float(res.get("owner_balance_ui") or 0.0)
+                    last_bal = float(last_res.get("owner_balance_ui") or 0.0)
                     if last_bal > 0:
                         break
 
@@ -379,8 +405,8 @@ class PositionsExitEngine:
         try:
             from utils_pkg.pump_trader import resolve_true_mint, resolve_true_mint_from_pump_id
         except Exception:
-            resolve_true_mint = None
-            resolve_true_mint_from_pump_id = None
+            resolve_true_mint = None  # type: ignore
+            resolve_true_mint_from_pump_id = None  # type: ignore
 
         # 1) Signature-aided resolver (best)
         if resolve_true_mint is not None:
@@ -409,6 +435,14 @@ class PositionsExitEngine:
             _assert_mint(raw_id_or_mint)
             return raw_id_or_mint
         except Exception:
+            # tiny best-effort: some ids appear like "<base58>pump"
+            s = (raw_id_or_mint or "").strip()
+            if s.endswith("pump"):
+                try:
+                    _assert_mint(s[:-4])
+                    return s[:-4]
+                except Exception:
+                    return None
             return None
 
     async def on_trade_tick(self, raw_event: Dict[str, Any]) -> None:
@@ -488,6 +522,7 @@ class PositionsExitEngine:
                 await sell_on_jupiter(mint, pct_of_wallet=1.0)
                 st["size_iu"] = 0
                 return
+
 
 # exported singleton used by scripts/main.py
 exit_engine = PositionsExitEngine()

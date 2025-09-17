@@ -38,6 +38,9 @@ _BASE58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
 def _is_likely_pubkey(s: str) -> bool:
     s = (s or "").strip()
+    # never treat pump ids as pubkeys
+    if s.endswith("pump"):
+        return False
     if not (32 <= len(s) <= 64):
         return False
     return all(ch in _BASE58 for ch in s)
@@ -118,11 +121,13 @@ class _Rpc:
                                "maxSupportedTransactionVersion": 0}],
                     )
                 elif attempt == 2:
+                    # Some nodes don't like maxSupportedTransactionVersion
                     return await self.call(
                         "getTransaction",
                         [sig, {"commitment": commitment, "encoding": "jsonParsed"}],
                     )
                 else:
+                    # Fallback to base64 if the node refuses parsed
                     return await self.call(
                         "getTransaction",
                         [sig, {"commitment": commitment, "encoding": "base64"}],
@@ -398,10 +403,11 @@ class TxLearner:
         max_tries = min(5, self.tries)
         i = 0
         for i in range(1, max_tries + 1):
+            # Check status first; early-exit if definitively errored
             status = await self.rpc.get_signature_status(tx_sig)
-
-            # Early-exit on explicit tx failure
             if status and status.get("err") is not None:
+                if DEBUG:
+                    print(f"[txlearn] tx {tx_sig} errored: {status.get('err')}", flush=True)
                 return {
                     "tx_found": False,
                     "owner_balance_ui": 0.0,
@@ -465,7 +471,7 @@ class TxLearner:
         tx_obj: Optional[dict] = None
         status: Optional[dict] = None
         last_balance_ui: float = 0.0
-        noisy_every = 3  # throttle getTransaction 'no result' prints
+        noisy_every = 6  # throttle getTransaction 'no result' prints
 
         attempt = 0
         for attempt in range(1, self.tries + 1):
