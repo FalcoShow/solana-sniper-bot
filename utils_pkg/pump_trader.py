@@ -21,18 +21,17 @@ def _is_true(v: Optional[str]) -> bool:
 
 PP_API_KEY       = (os.getenv("PF_PP_KEY") or "").strip()
 DRY_RUN          = _is_true(os.getenv("DRY_RUN", "0"))
-PF_SLIPPAGE_BPS  = int(os.getenv("PF_SLIPPAGE_BPS", "1000"))     # 1000 bps = 10%
+PF_SLIPPAGE_BPS  = int(os.getenv("PF_SLIPPAGE_BPS", "1000"))     # 10%
 PF_PRIORITY_SOL  = float(os.getenv("PF_PRIORITY_SOL", "0.0005"))
 PF_POOLS         = {p.strip().lower() for p in (os.getenv("PF_POOLS", "pump").split(","))}
-USE_LOCAL_FALLBK = _is_true(os.getenv("PF_USE_LOCAL_FALLBACK", "0"))
 PF_DEBUG_TX      = _is_true(os.getenv("PF_DEBUG_TX", "0"))
-PF_PP_DOUBLETRY  = _is_true(os.getenv("PF_PP_DOUBLETRY", "1"))    # try other param once on schema error
+PF_PP_DOUBLETRY  = _is_true(os.getenv("PF_PP_DOUBLETRY", "1"))    # try flipped param once
+USE_LOCAL_FALLBK = _is_true(os.getenv("PF_USE_LOCAL_FALLBACK", "1"))  # ← enable by default
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 def current_trade_sol() -> float:
-    """Read PF_TRADE_SOL (autosized externally) and clamp to min/max."""
     try:
         sz = float(os.getenv("PF_TRADE_SOL", "0.01"))
     except Exception:
@@ -45,7 +44,7 @@ def current_trade_sol() -> float:
     return _clamp(sz, mn, mx)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Base58 helpers & mint/bondingCurve splitter
+# Base58 helpers & pump splitter
 # ──────────────────────────────────────────────────────────────────────────────
 _BASE58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
@@ -54,8 +53,9 @@ def _looks_base58(s: str) -> bool:
 
 def _split_mint_or_curve(raw: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Returns (mint, bonding_curve). Exactly one will be set when possible.
-    If the feed gave '<base58>pump', that's a bonding-curve id; otherwise try mint.
+    Returns (mint, bonding_curve).
+    If input endswith 'pump' => it's a Pump bonding-curve id (strip suffix).
+    Else treat as a token mint if it looks base58.
     """
     s = (raw or "").strip()
     if not s:
@@ -69,22 +69,22 @@ def _split_mint_or_curve(raw: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PumpPortal helpers
+# PumpPortal HTTP
 # ──────────────────────────────────────────────────────────────────────────────
 class TemporaryPumpPortal(Exception):
-    """Non-fatal / transient response (retry later)."""
+    pass
 
 def _slippage_percent_from_bps(bps: int) -> float:
     return float(bps) / 100.0
 
-def _lightning_url() -> str:
+def _url_lightning() -> str:
     if not PP_API_KEY:
-        raise RuntimeError("PF_PP_KEY is not set (trading requires a PumpPortal API key).")
+        raise RuntimeError("PF_PP_KEY missing.")
     return f"https://pumpportal.fun/api/trade?api-key={PP_API_KEY}"
 
-def _local_url() -> str:
+def _url_local() -> str:
     if not PP_API_KEY:
-        raise RuntimeError("PF_PP_KEY is not set (trading requires a PumpPortal API key).")
+        raise RuntimeError("PF_PP_KEY missing.")
     return f"https://pumpportal.fun/api/trade-local?api-key={PP_API_KEY}"
 
 def _build_body(
@@ -113,39 +113,25 @@ def _build_body(
         body["mint"] = mint
     return body
 
-def _post_expect_json(url: str, body: Dict[str, Any], timeout: int = 20) -> Dict[str, Any]:
+def _post_json(url: str, body: Dict[str, Any], timeout: int = 20) -> Dict[str, Any]:
     r = requests.post(url, json=body, timeout=timeout, allow_redirects=False)
-    ctype = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
-
-    if r.status_code == 200 and ctype != "application/json":
-        head = (r.text or "")[:180].replace("\n", " ")
-        if ctype == "text/plain":
-            raise RuntimeError(f"{url} returned text/plain 200: {head or 'Bad Request'}")
-        raise TemporaryPumpPortal(f"non-JSON 200 ({ctype})")
-
-    if r.status_code != 200:
-        try:
-            js = r.json()
-        except Exception:
-            js = {"error": (r.text or "").strip()[:240] or r.reason}
-        raise RuntimeError(f"{url} {r.status_code}: {js}")
-
+    content_type = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if r.status_code == 200 and content_type != "application/json":
+        head = (r.text or "")[:200].replace("\n", " ")
+        raise TemporaryPumpPortal(f"non-JSON 200 ({content_type}): {head or 'Bad Request'}")
     try:
-        return r.json()
+        js = r.json()
     except Exception as e:
         raise TemporaryPumpPortal(f"json parse error: {e}")
-
-def _call_lightning(body: Dict[str, Any]) -> Dict[str, Any]:
-    return _post_expect_json(_lightning_url(), body)
-
-def _call_local(body: Dict[str, Any]) -> Dict[str, Any]:
-    return _post_expect_json(_local_url(), body)
+    if r.status_code != 200:
+        raise RuntimeError(f"{url} {r.status_code}: {js}")
+    return js
 
 def _resp_errors(resp: Dict[str, Any]) -> list[str]:
     errs = resp.get("errors") or []
     if isinstance(errs, dict):
         errs = [str(errs)]
-    return [str(e) for e in errs] if isinstance(errs, list) else [str(errs)]
+    return [str(e) for e in errs] if isinstance(errs, list) else ([str(errs)] if errs else [])
 
 def _is_schema_err(errs: list[str]) -> bool:
     text = " | ".join(e.lower() for e in errs)
@@ -157,13 +143,9 @@ def _is_schema_err(errs: list[str]) -> bool:
     ])
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public: BUY helper (returns tx signature or None)
+# BUY
 # ──────────────────────────────────────────────────────────────────────────────
 async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
-    """
-    Execute a buy via PumpPortal.
-    Returns the transaction signature on success, else None.
-    """
     ui = kwargs.get("ui") or {}
     symbol = (kwargs.get("symbol") or ui.get("symbol") or "").strip()
     pool   = (kwargs.get("pool")   or ui.get("pool")   or "pump").strip().lower()
@@ -179,18 +161,56 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
         print(f"[DRYRUN] would buy {label} on {pool} for {amt_sol} SOL")
         return None
 
-    # Decide between {mint} vs {bondingCurve}
+    # Hints from upstream (IMPORTANT: pass raw ...pump here if you keep normalization upstream)
+    curve_hint = ui.get("bondingCurve") or kwargs.get("bondingCurve")
+    raw_hint   = ui.get("rawMint") or ui.get("raw") or ui.get("raw_mint") or kwargs.get("raw_mint")
+    if isinstance(raw_hint, str) and raw_hint.endswith("pump"):
+        raw_base = raw_hint[:-4].strip()
+        if _looks_base58(raw_base):
+            curve_hint = curve_hint or raw_base
+
     token_mint, bonding_curve = _split_mint_or_curve(mint)
+    if curve_hint:
+        bonding_curve = curve_hint
+        # if engine already normalized to curve, avoid sending as mint
+        if token_mint == bonding_curve:
+            token_mint = None
+
     if PF_DEBUG_TX:
-        if bonding_curve and not token_mint:
-            print(f"[trade] using bondingCurve={bonding_curve} (pump) for {label}")
-        elif token_mint:
-            print(f"[trade] using mint={token_mint} for {label}")
-        else:
-            print(f"[trade] cannot parse mint '{mint}' as token or bonding curve; will try both if enabled.")
+        print(f"[trade] pool={pool} symbol={symbol} "
+              f"mint={token_mint or '-'} curve={bonding_curve or '-'} for {label}")
 
     kp = load_keypair()
     payer_pub = get_pubkey_str(kp)
+
+    def _try(url: str, body: Dict[str, Any], tag: str) -> Tuple[Optional[str], Optional[list[str]], Optional[Dict[str, Any]]]:
+        try:
+            resp = _post_json(url, body)
+        except TemporaryPumpPortal as te:
+            print(f"[BUY TEMP] {tag} for {label}: {te}")
+            return None, None, None
+        except Exception as e:
+            print(f"[BUY ERR] {tag} HTTP for {label}: {e}")
+            return None, None, None
+        errs = _resp_errors(resp)
+        if errs:
+            return None, errs, resp
+        # success: signature or unsigned tx
+        sig = resp.get("signature")
+        if sig:
+            print(f"[BUY OK] {label} — executed via Lightning. https://solscan.io/tx/{sig} [payer={payer_pub}]")
+            return sig, None, None
+        tx_b64 = resp.get("transaction") or resp.get("tx")
+        if tx_b64:
+            try:
+                sig2 = sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
+                print(f"[BUY OK] {label} — local sign. https://solscan.io/tx/{sig2} [payer={payer_pub}]")
+                return sig2, None, None
+            except Exception as e:
+                print(f"[BUY ERR] local sign failed for {label}: {e}")
+        else:
+            print(f"[BUY ERR] unexpected response for {label}: {json.dumps(resp)[:300]}")
+        return None, None, None
 
     async def _attempt(one_mint: Optional[str], one_curve: Optional[str], note: str) -> Optional[str]:
         body = _build_body(
@@ -203,63 +223,39 @@ async def maybe_buy(mint: str, **kwargs) -> Optional[str]:
             mint=one_mint,
             bonding_curve=one_curve,
         )
-        try:
-            resp = _call_lightning(body)
-        except TemporaryPumpPortal as te:
-            print(f"[BUY TEMP] lightning quirk for {mint} ({note}): {te}")
-            return None
-        except Exception as e:
-            if USE_LOCAL_FALLBK:
-                try:
-                    resp = _call_local(body)
-                except TemporaryPumpPortal as te2:
-                    print(f"[BUY TEMP] local quirk for {mint} ({note}): {te2}")
-                    return None
-                except Exception as e2:
-                    print(f"[BUY ERR] local builder failed for {mint} ({note}): {e2}")
-                    return None
-            else:
-                print(f"[BUY ERR] lightning call failed for {mint} ({note}): {e}")
-                return None
-
-        errs = _resp_errors(resp)
-        if errs:
-            print(f"[BUY ERR] pumpportal errors for {one_mint or one_curve or mint} ({note}): {errs}")
-            return None
-
-        sig = resp.get("signature")
+        # 1) Lightning
+        sig, errs, _ = _try(_url_lightning(), body, f"lightning/{note}")
         if sig:
-            print(f"[BUY OK] {label} — executed via Lightning. https://solscan.io/tx/{sig} [payer={payer_pub}]")
             return sig
-
-        tx_b64 = resp.get("transaction") or resp.get("tx")
-        if tx_b64:
-            try:
-                sig2 = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
-                print(f"[BUY OK] {label} — local sign. https://solscan.io/tx/{sig2} [payer={payer_pub}]")
+        # 2) If schema-ish, try local builder with SAME params
+        if errs and _is_schema_err(errs) and USE_LOCAL_FALLBK:
+            sig2, errs2, _ = _try(_url_local(), body, f"local/{note}")
+            if sig2:
                 return sig2
-            except Exception as e:
-                print(f"[BUY ERR] signing local tx failed for {mint} ({note}): {e}")
-                return None
-
-        print(f"[BUY ERR] unexpected PumpPortal response for {mint} ({note}): {json.dumps(resp)[:300]}")
+            if errs2:
+                print(f"[BUY ERR] pumpportal errors for {one_mint or one_curve or mint} ({note}): {errs2}")
+        elif errs:
+            print(f"[BUY ERR] pumpportal errors for {one_mint or one_curve or mint} ({note}): {errs}")
         return None
 
-    # First attempt: what we believe is correct
-    first_sig = await _attempt(token_mint, bonding_curve, "first")
+    # Prefer curve on Pump when we have a curve hint or a raw ...pump
+    if pool == "pump" and bonding_curve and not token_mint:
+        sig0 = await _attempt(None, bonding_curve, "curve-first")
+        if sig0:
+            return sig0
+
+    # Otherwise try mint first
+    first_sig = await _attempt(token_mint, bonding_curve if token_mint is None else None, "first")
     if first_sig:
         return first_sig
 
-    # If the first attempt failed with schema-ish errors, flip and retry once
-    if PF_PP_DOUBLETRY:
-        # flip params only if pool is pump (other pools don't use bondingCurve)
-        if pool == "pump":
-            # If we started with mint, try bondingCurve=raw (or stripped); else try mint=raw.
-            flip_mint, flip_curve = (None, mint) if token_mint else (mint, None)
-            if PF_DEBUG_TX:
-                print(f"[BUY RETRY] flipping to {'bondingCurve' if flip_curve else 'mint'}={mint}")
-            second_sig = await _attempt(flip_mint, flip_curve, "retry-flip")
-            if second_sig:
-                return second_sig
+    # Flip & retry once
+    if PF_PP_DOUBLETRY and pool == "pump":
+        flip_mint, flip_curve = (None, token_mint) if token_mint else (bonding_curve or mint, None)
+        if PF_DEBUG_TX:
+            print(f"[BUY RETRY] flipping to {'bondingCurve' if flip_curve else 'mint'}={flip_curve or flip_mint}")
+        second_sig = await _attempt(flip_mint, flip_curve, "retry-flip")
+        if second_sig:
+            return second_sig
 
     return None
