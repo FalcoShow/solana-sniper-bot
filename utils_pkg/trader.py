@@ -294,7 +294,6 @@ async def sell_on_jupiter(mint: str, *, pct_of_wallet: float = 1.0) -> Optional[
     _tg_send(f"✅ SOLD {mint} • pct={pct:.0%} • tx: https://solscan.io/tx/{sig}")
     return sig
 
-
 # =============================================================================
 # Exit Engine (resolver-first)
 # =============================================================================
@@ -302,7 +301,7 @@ async def sell_on_jupiter(mint: str, *, pct_of_wallet: float = 1.0) -> Optional[
 class PositionsExitEngine:
     """
     After a BUY fill:
-      - **always** use resolver-first learner (handles '...pump' ids)
+      - resolver-first learner (handles '<...>pump' ids + signature inference)
       - if the tx failed → bail early
       - if balance > 0 → record entry & start managing position
 
@@ -329,17 +328,17 @@ class PositionsExitEngine:
             return
 
         async with self._sema:
-            # Bounded retry loop (keeps logs tidy during indexer lag)
-            last_bal = 0.0
+            last_bal_ui = 0.0
             last_res: Optional[Dict[str, Any]] = None
 
             for i in range(1, POS_RETRY_MAX + 1):
                 try:
-                    last_res = await _tx_resolve_then_learn(
+                    last_res = await resolve_then_learn_position(
                         raw_id_or_mint=raw_id_or_mint,
                         tx_sig=tx_sig,
                         owner=self.owner,
-                        rpc_url=TX_RPC_URL or RPC_URL or None,
+                        rpc_url_tx=TX_RPC_URL,
+                        rpc_url_general=RPC_URL,
                     )
                 except Exception as e:
                     print(f"[pos] resolve_then_learn error ({i}/{POS_RETRY_MAX}): {e}", flush=True)
@@ -351,23 +350,22 @@ class PositionsExitEngine:
                         print(f"[pos] tx failed (sig={tx_sig}) — err={status.get('err')}", flush=True)
                         return
 
-                    last_bal = float(last_res.get("owner_balance_ui") or 0.0)
-                    if last_bal > 0:
-                        break
+                    last_bal_ui = float(last_res.get("owner_balance_ui") or 0.0)
+                    if last_bal_ui > 0:
+                        break  # we own tokens—good enough to proceed
 
                 if i < POS_RETRY_MAX:
                     await asyncio.sleep(POS_RETRY_DELAY_SEC)
 
-            if last_bal <= 0:
+            if last_bal_ui <= 0:
                 if PF_DEBUG_TX:
                     print(f"[pos] finished learn loop (no balance) id={raw_id_or_mint}", flush=True)
                 return
 
-            # We have a position; resolve the real mint string for future quotes/sells.
+            # Resolve a real mint string for quoting/exits.
             resolved_mint = await self._resolve_mint_text(raw_id_or_mint, tx_sig)
             if not resolved_mint:
-                # Fallback: assume the passed value is already a mint (best-effort).
-                resolved_mint = raw_id_or_mint
+                resolved_mint = raw_id_or_mint  # best-effort fallback
 
             # Snapshot wallet amount to set entry state precisely
             try:
@@ -376,13 +374,14 @@ class PositionsExitEngine:
                 amt_iu = 0
 
             # Estimate entry price via a small quote
-            entry_sol = None
+            entry_sol: Optional[float] = None
             if amt_iu > 0:
                 sample = max(1, min(amt_iu // 100, amt_iu))
                 try:
                     q = _jup_quote(resolved_mint, SOL_MINT, sample)
                     out_lamports = float(q.get("outAmount", 0))
-                    entry_sol = (out_lamports / sample) / 1_000_000_000.0 if sample > 0 else None
+                    if sample > 0 and out_lamports > 0:
+                        entry_sol = (out_lamports / sample) / 1_000_000_000.0
                 except Exception:
                     entry_sol = None
 
@@ -435,9 +434,9 @@ class PositionsExitEngine:
             _assert_mint(raw_id_or_mint)
             return raw_id_or_mint
         except Exception:
-            # tiny best-effort: some ids appear like "<base58>pump"
             s = (raw_id_or_mint or "").strip()
             if s.endswith("pump"):
+                # tiny best-effort: some ids appear like "<base58>pump"
                 try:
                     _assert_mint(s[:-4])
                     return s[:-4]
@@ -445,17 +444,30 @@ class PositionsExitEngine:
                     return None
             return None
 
+    async def _refresh_size_iu(self, mint: str) -> int:
+        try:
+            amt_iu, _dec = _sum_token_balance_iu(self.owner, mint)
+            self.pos[mint]["size_iu"] = int(amt_iu)
+            return int(amt_iu)
+        except Exception:
+            return int(self.pos.get(mint, {}).get("size_iu") or 0)
+
     async def on_trade_tick(self, raw_event: Dict[str, Any]) -> None:
         """
         Optional live-tick hook. Call this with each PumpPortal trade tick.
         Maintains TP/TSL logic using small Jupiter quotes for pricing.
         """
-        mint = str(raw_event.get("mint") or raw_event.get("mintAddress") or raw_event.get("mint_address") or "").strip()
+        mint = str(
+            raw_event.get("mint")
+            or raw_event.get("mintAddress")
+            or raw_event.get("mint_address")
+            or ""
+        ).strip()
         if not mint:
             return
+
         # Normalize to our stored (resolved) key if present
         if mint not in self.pos:
-            # If the feed emits pump ids, try to map once
             resolved = await self._resolve_mint_text(mint, raw_event.get("signature") or "")
             if not resolved or resolved not in self.pos:
                 return
@@ -470,18 +482,18 @@ class PositionsExitEngine:
         try:
             q = _jup_quote(mint, SOL_MINT, sample)
             out_lamports = float(q.get("outAmount", 0))
-            px_sol = (out_lamports / sample) / 1_000_000_000.0 if sample > 0 else None
+            px_sol = (out_lamports / sample) / 1_000_000_000.0 if sample > 0 and out_lamports > 0 else None
         except Exception:
-            return  # skip if quote fails briefly
+            return  # transient quote failure
         if px_sol is None:
             return
 
         if not st.get("entry_sol"):
             st["entry_sol"] = px_sol
-            st["peak_sol"]  = px_sol
+            st["peak_sol"] = px_sol
 
         st["peak_sol"] = max(st.get("peak_sol") or px_sol, px_sol)
-        st["last_ts"]  = time.time()
+        st["last_ts"] = time.time()
 
         entry = st["entry_sol"]
         if not entry or entry <= 0:
@@ -495,7 +507,7 @@ class PositionsExitEngine:
             print(f"[exit] HARD STOP {mint} pnl={pnl_pct:.1f}%")
             _tg_send(f"⛔ HARD STOP {mint} pnl={pnl_pct:.1f}%")
             await sell_on_jupiter(mint, pct_of_wallet=1.0)
-            st["size_iu"] = 0
+            await self._refresh_size_iu(mint)
             return
 
         # TP1
@@ -504,6 +516,7 @@ class PositionsExitEngine:
             _tg_send(f"🎯 TP1 {mint} pnl={pnl_pct:.1f}% sell={EXIT_TP1_SELL_PCT:.0%}")
             await sell_on_jupiter(mint, pct_of_wallet=EXIT_TP1_SELL_PCT)
             st["tp1_done"] = True
+            await self._refresh_size_iu(mint)
             return
 
         # TP2
@@ -512,16 +525,16 @@ class PositionsExitEngine:
             _tg_send(f"🎯 TP2 {mint} pnl={pnl_pct:.1f}% sell={EXIT_TP2_SELL_PCT:.0%}")
             await sell_on_jupiter(mint, pct_of_wallet=EXIT_TP2_SELL_PCT)
             st["tp2_done"] = True
+            await self._refresh_size_iu(mint)
             return
 
         # Trailing stop (armed)
-        if pnl_pct >= EXIT_TSL_ARM_PCT:
-            if drawdown_from_peak_pct <= -EXIT_TSL_TRAIL_PCT:
-                print(f"[exit] TSL {mint} drop_from_peak={drawdown_from_peak_pct:.1f}% -> exit")
-                _tg_send(f"🪢 TSL {mint} drop={drawdown_from_peak_pct:.1f}% -> exit")
-                await sell_on_jupiter(mint, pct_of_wallet=1.0)
-                st["size_iu"] = 0
-                return
+        if pnl_pct >= EXIT_TSL_ARM_PCT and drawdown_from_peak_pct <= -EXIT_TSL_TRAIL_PCT:
+            print(f"[exit] TSL {mint} drop_from_peak={drawdown_from_peak_pct:.1f}% -> exit")
+            _tg_send(f"🪢 TSL {mint} drop={drawdown_from_peak_pct:.1f}% -> exit")
+            await sell_on_jupiter(mint, pct_of_wallet=1.0)
+            await self._refresh_size_iu(mint)
+            return
 
 
 # exported singleton used by scripts/main.py
