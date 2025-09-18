@@ -17,6 +17,7 @@ from utils_pkg.solana_wallet import (
 )
 
 # Always use resolver-first learner after buys
+# (Import under a private alias and use that alias everywhere.)
 from utils_pkg.txlearn import resolve_then_learn_position as _tx_resolve_then_learn
 
 
@@ -48,8 +49,13 @@ def _is_true(v: Optional[str], default: bool = False) -> bool:
 # Global env/config
 # -----------------------------------------------------------------------------
 IS_DRYRUN        = _is_true(os.getenv("DRY_RUN"), False)
+
+# General RPC for normal calls
 RPC_URL          = (os.getenv("SOL_RPC_URL") or "").strip()
-TX_RPC_URL       = (os.getenv("SOL_RPC_TX_URL") or RPC_URL).strip()
+
+# TX RPC override for faster tx/meta visibility; falls back to general RPC
+TX_RPC_URL       = (os.getenv("SOL_RPC_TX_URL") or RPC_URL or "https://api.mainnet-beta.solana.com").strip()
+
 OWNER_FROM_ENV   = (os.getenv("PF_PP_ACCOUNT") or "").strip()
 PF_DEBUG_TX      = _is_true(os.getenv("PF_DEBUG_TX"), False)
 
@@ -119,13 +125,14 @@ def _rpc_json(url: str, method: str, params: list) -> Any:
     )
     r.raise_for_status()
     js = r.json()
-    if "error" in js:
+    if "error" in js and js["error"]:
         raise RuntimeError(js["error"])
-    return js["result"]
+    return js.get("result")
 
 
 def _rpc(method: str, params: list) -> Any:
-    return _rpc_json(RPC_URL, method, params)
+    # Default to general RPC for standard calls
+    return _rpc_json(RPC_URL or TX_RPC_URL, method, params)
 
 
 # =============================================================================
@@ -294,6 +301,7 @@ async def sell_on_jupiter(mint: str, *, pct_of_wallet: float = 1.0) -> Optional[
     _tg_send(f"✅ SOLD {mint} • pct={pct:.0%} • tx: https://solscan.io/tx/{sig}")
     return sig
 
+
 # =============================================================================
 # Exit Engine (resolver-first)
 # =============================================================================
@@ -333,12 +341,13 @@ class PositionsExitEngine:
 
             for i in range(1, POS_RETRY_MAX + 1):
                 try:
-                    last_res = await resolve_then_learn_position(
+                    # >>> IMPORTANT: call the learner with the TX RPC override <<<
+                    last_res = await _tx_resolve_then_learn(
                         raw_id_or_mint=raw_id_or_mint,
                         tx_sig=tx_sig,
                         owner=self.owner,
                         rpc_url_tx=TX_RPC_URL,
-                        rpc_url_general=RPC_URL,
+                        rpc_url_general=RPC_URL or TX_RPC_URL,
                     )
                 except Exception as e:
                     print(f"[pos] resolve_then_learn error ({i}/{POS_RETRY_MAX}): {e}", flush=True)
