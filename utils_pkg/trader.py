@@ -17,7 +17,6 @@ from utils_pkg.solana_wallet import (
 )
 
 # Always use resolver-first learner after buys
-# (Import under a private alias and use that alias everywhere.)
 from utils_pkg.txlearn import resolve_then_learn_position as _tx_resolve_then_learn
 
 
@@ -59,7 +58,7 @@ TX_RPC_URL       = (os.getenv("SOL_RPC_TX_URL") or RPC_URL or "https://api.mainn
 OWNER_FROM_ENV   = (os.getenv("PF_PP_ACCOUNT") or "").strip()
 PF_DEBUG_TX      = _is_true(os.getenv("PF_DEBUG_TX"), False)
 
-# Exit rules (can be tuned via env)
+# --- Exit rules (can be tuned via env) ---
 EXIT_TP1_PCT       = _envf("EXIT_TP1_PCT", 40.0)        # +40% → partial
 EXIT_TP1_SELL_PCT  = _envf("EXIT_TP1_SELL_PCT", 0.40)   # sell 40%
 EXIT_TP2_PCT       = _envf("EXIT_TP2_PCT", 100.0)       # +100% → more
@@ -68,9 +67,16 @@ EXIT_TSL_ARM_PCT   = _envf("EXIT_TSL_ARM_PCT", 60.0)    # arm TSL at +60%
 EXIT_TSL_TRAIL_PCT = _envf("EXIT_TSL_TRAIL_PCT", 20.0)  # trail 20% off peak
 EXIT_HARD_STOP_PCT = _envf("HARD_STOP_PCT", -32.0)      # hard stop
 
-# Learner/engine pacing
-POS_RETRY_MAX        = _envi("PF_POS_RETRY_MAX", 10)          # resolve-then-learn retries
-POS_RETRY_DELAY_SEC  = _envf("PF_POS_RETRY_DELAY_SEC", 1.2)   # delay between those retries
+# --- Learner/engine pacing (match your logs) ---
+POS_RETRY_MAX               = _envi("PF_POS_RETRY_MAX", 10)
+POS_RETRY_DELAY_SEC         = _envf("PF_POS_RETRY_DELAY_SEC", 1.2)
+
+PF_TXLEARN_RESOLVE_TRIES    = _envi("PF_TXLEARN_RESOLVE_TRIES", 18)
+PF_TXLEARN_RESOLVE_DELAY_SEC= _envf("PF_TXLEARN_RESOLVE_DELAY_SEC", 1.0)
+PF_TXLEARN_TRIES            = _envi("PF_TXLEARN_TRIES", 24)
+PF_TXLEARN_DELAY_SEC        = _envf("PF_TXLEARN_DELAY_SEC", 1.0)
+PF_TXLEARN_WARMUP_SEC       = _envf("PF_TXLEARN_WARMUP_SEC", 1.5)
+PF_POS_LEARN_BASE_DELAY_SEC = _envf("PF_POS_LEARN_BASE_DELAY_SEC", 0.2)
 
 # Jupiter / slippage / priority
 SOL_MINT                = "So11111111111111111111111111111111111111112"
@@ -131,7 +137,7 @@ def _rpc_json(url: str, method: str, params: list) -> Any:
 
 
 def _rpc(method: str, params: list) -> Any:
-    # Default to general RPC for standard calls
+    # Default to general RPC for standard calls; fall back to TX RPC if needed.
     return _rpc_json(RPC_URL or TX_RPC_URL, method, params)
 
 
@@ -259,6 +265,89 @@ def _tg_send(text: str) -> None:
 
 
 # =============================================================================
+# Transaction helpers (fallback resolver)
+# =============================================================================
+
+def _get_transaction(sig: str) -> Optional[dict]:
+    """
+    Fetch parsed transaction from TX RPC (or general RPC as fallback).
+    """
+    enc = {
+        "encoding": "jsonParsed",
+        "maxSupportedTransactionVersion": 0,
+        "commitment": "confirmed",
+    }
+    try:
+        res = _rpc_json(TX_RPC_URL or RPC_URL, "getTransaction", [sig, enc])
+        return res
+    except Exception:
+        # try general RPC once if TX RPC fails
+        try:
+            res = _rpc_json(RPC_URL or TX_RPC_URL, "getTransaction", [sig, enc])
+            return res
+        except Exception:
+            return None
+
+
+def _resolve_mint_from_tx(sig: str, owner: str) -> Optional[str]:
+    """
+    Parse getTransaction(meta.postTokenBalances) to find the mint we just received.
+    """
+    tx = _get_transaction(sig)
+    if not tx:
+        return None
+
+    meta = tx.get("meta") or {}
+    pre = meta.get("preTokenBalances") or []
+    post = meta.get("postTokenBalances") or []
+
+    # Build quick lookup: mint -> (pre_amount, post_amount) for owner
+    def _amt(x: dict) -> int:
+        ui = x.get("uiTokenAmount") or {}
+        # use raw integer "amount" (string)
+        try:
+            return int((ui.get("amount") or "0"))
+        except Exception:
+            return 0
+
+    pre_map: Dict[Tuple[str, str], int] = {}
+    for b in pre:
+        if b.get("owner") == owner:
+            pre_map[(b.get("mint", ""), b.get("owner", ""))] = _amt(b)
+
+    candidate_mint = None
+    best_delta = 0
+
+    for b in post:
+        if b.get("owner") != owner:
+            continue
+        mint = b.get("mint", "")
+        if not mint or mint == SOL_MINT:
+            continue
+        after_amt = _amt(b)
+        before_amt = pre_map.get((mint, owner), 0)
+        delta = after_amt - before_amt
+        if delta > best_delta:
+            best_delta = delta
+            candidate_mint = mint
+
+    # Fallback: if nothing delta-positive, still return the only owned mint if unique
+    if not candidate_mint:
+        owned_post = [b.get("mint") for b in post if b.get("owner") == owner and b.get("mint")]
+        uniq = list({m for m in owned_post if m and m != SOL_MINT})
+        if len(uniq) == 1:
+            candidate_mint = uniq[0]
+
+    try:
+        if candidate_mint:
+            _assert_mint(candidate_mint)
+            return candidate_mint
+    except Exception:
+        return None
+    return None
+
+
+# =============================================================================
 # Public: SELL
 # =============================================================================
 
@@ -303,15 +392,16 @@ async def sell_on_jupiter(mint: str, *, pct_of_wallet: float = 1.0) -> Optional[
 
 
 # =============================================================================
-# Exit Engine (resolver-first)
+# Exit Engine (resolver-first + local fallback)
 # =============================================================================
 
 class PositionsExitEngine:
     """
     After a BUY fill:
-      - resolver-first learner (handles '<...>pump' ids + signature inference)
+      - resolver-first learner (handles '<...>pump' ids + signature inference) using TX RPC override
       - if the tx failed → bail early
       - if balance > 0 → record entry & start managing position
+      - fallback: parse getTransaction on TX RPC to resolve mint & proceed
 
     Live trade ticks:
       - maintain peak/entry
@@ -324,6 +414,36 @@ class PositionsExitEngine:
         self._sema = asyncio.Semaphore(max(1, _envi("PF_MAX_CONCURRENT", 2)))
         if PF_DEBUG_TX:
             print(f"[engine] owner set to {self.owner}", flush=True)
+
+    async def _record_entry(self, resolved_mint: str) -> None:
+        # Snapshot wallet amount to set entry state precisely
+        try:
+            amt_iu, _dec = _sum_token_balance_iu(self.owner, resolved_mint)
+        except Exception:
+            amt_iu = 0
+
+        # Estimate entry price via a small quote
+        entry_sol: Optional[float] = None
+        if amt_iu > 0:
+            sample = max(1, min(amt_iu // 100, amt_iu))
+            try:
+                q = _jup_quote(resolved_mint, SOL_MINT, sample)
+                out_lamports = float(q.get("outAmount", 0))
+                if sample > 0 and out_lamports > 0:
+                    entry_sol = (out_lamports / sample) / 1_000_000_000.0
+            except Exception:
+                entry_sol = None
+
+        self.pos[resolved_mint] = {
+            "size_iu": int(amt_iu),
+            "tp1_done": False,
+            "tp2_done": False,
+            "entry_sol": entry_sol,
+            "peak_sol": entry_sol,
+            "last_ts": time.time(),
+        }
+        print(f"[pos] learned entry for {resolved_mint}: size_iu={amt_iu} entry≈{entry_sol} SOL", flush=True)
+        _tg_send(f"📥 ENTRY {resolved_mint} size_iu={amt_iu} entry≈{(entry_sol or 0):.6f} SOL")
 
     async def on_buy_filled(self, raw_id_or_mint: str, *, tx_sig: Optional[str] = None) -> None:
         """
@@ -339,9 +459,9 @@ class PositionsExitEngine:
             last_bal_ui = 0.0
             last_res: Optional[Dict[str, Any]] = None
 
+            # --- Primary path: tx-learner (with TX RPC override) ---
             for i in range(1, POS_RETRY_MAX + 1):
                 try:
-                    # >>> IMPORTANT: call the learner with the TX RPC override <<<
                     last_res = await _tx_resolve_then_learn(
                         raw_id_or_mint=raw_id_or_mint,
                         tx_sig=tx_sig,
@@ -361,49 +481,51 @@ class PositionsExitEngine:
 
                     last_bal_ui = float(last_res.get("owner_balance_ui") or 0.0)
                     if last_bal_ui > 0:
-                        break  # we own tokens—good enough to proceed
+                        # Try to use their resolved mint if provided
+                        resolved_mint = last_res.get("resolved_mint") or await self._resolve_mint_text(raw_id_or_mint, tx_sig)
+                        if not resolved_mint:
+                            resolved_mint = raw_id_or_mint
+                        await self._record_entry(resolved_mint)
+                        return  # done
 
                 if i < POS_RETRY_MAX:
                     await asyncio.sleep(POS_RETRY_DELAY_SEC)
 
-            if last_bal_ui <= 0:
+            # --- Fallback path: resolve from TX directly on TX RPC ---
+            # small warmup to let the tx land on indexers
+            if PF_TXLEARN_WARMUP_SEC > 0:
+                await asyncio.sleep(PF_TXLEARN_WARMUP_SEC)
+
+            resolved_mint = None
+            for j in range(1, PF_TXLEARN_RESOLVE_TRIES + 1):
+                resolved_mint = _resolve_mint_from_tx(tx_sig, self.owner)
+                if resolved_mint:
+                    break
+                if j < PF_TXLEARN_RESOLVE_TRIES:
+                    await asyncio.sleep(PF_TXLEARN_RESOLVE_DELAY_SEC)
+
+            if not resolved_mint:
                 if PF_DEBUG_TX:
-                    print(f"[pos] finished learn loop (no balance) id={raw_id_or_mint}", flush=True)
+                    print(f"[pos] fallback: could not resolve mint from tx (sig={tx_sig}) id={raw_id_or_mint}", flush=True)
                 return
 
-            # Resolve a real mint string for quoting/exits.
-            resolved_mint = await self._resolve_mint_text(raw_id_or_mint, tx_sig)
-            if not resolved_mint:
-                resolved_mint = raw_id_or_mint  # best-effort fallback
-
-            # Snapshot wallet amount to set entry state precisely
-            try:
-                amt_iu, _dec = _sum_token_balance_iu(self.owner, resolved_mint)
-            except Exception:
-                amt_iu = 0
-
-            # Estimate entry price via a small quote
-            entry_sol: Optional[float] = None
-            if amt_iu > 0:
-                sample = max(1, min(amt_iu // 100, amt_iu))
+            # Once we have a mint, poll balance briefly until wallet reflects it
+            have_balance = False
+            for k in range(1, PF_TXLEARN_TRIES + 1):
                 try:
-                    q = _jup_quote(resolved_mint, SOL_MINT, sample)
-                    out_lamports = float(q.get("outAmount", 0))
-                    if sample > 0 and out_lamports > 0:
-                        entry_sol = (out_lamports / sample) / 1_000_000_000.0
+                    amt_iu, _ = _sum_token_balance_iu(self.owner, resolved_mint)
                 except Exception:
-                    entry_sol = None
+                    amt_iu = 0
+                if amt_iu > 0:
+                    have_balance = True
+                    break
+                if k < PF_TXLEARN_TRIES:
+                    await asyncio.sleep(PF_TXLEARN_DELAY_SEC)
 
-            self.pos[resolved_mint] = {
-                "size_iu": int(amt_iu),
-                "tp1_done": False,
-                "tp2_done": False,
-                "entry_sol": entry_sol,
-                "peak_sol": entry_sol,
-                "last_ts": time.time(),
-            }
-            print(f"[pos] learned entry for {resolved_mint}: size_iu={amt_iu} entry≈{entry_sol} SOL", flush=True)
-            _tg_send(f"📥 ENTRY {resolved_mint} size_iu={amt_iu} entry≈{(entry_sol or 0):.6f} SOL")
+            if not have_balance and PF_DEBUG_TX:
+                print(f"[pos] fallback: mint={resolved_mint} but no balance yet (sig={tx_sig})", flush=True)
+
+            await self._record_entry(resolved_mint)
 
     async def _resolve_mint_text(self, raw_id_or_mint: str, tx_sig: str) -> Optional[str]:
         """
