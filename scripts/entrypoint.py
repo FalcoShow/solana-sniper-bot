@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import logging
 import math
 import os
 import signal
@@ -9,6 +11,13 @@ import sys
 from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Optional
+
+from logging_setup import (
+    get_logger,
+    start_global_heartbeat,
+    bump,
+    install_excepthook,
+)
 
 BANNER = "sniper-entrypoint v1"
 
@@ -60,12 +69,22 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Logger (global)
+# ──────────────────────────────────────────────────────────────────────────────
+LOG_SERVICE = os.getenv("PF_SERVICE", "sniper")
+LOG_VERSION = os.getenv("PF_VERSION", "v1")
+log = get_logger(service=LOG_SERVICE, version=LOG_VERSION)
+install_excepthook(log)  # log uncaught exceptions as JSON
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Autosizer
 # ──────────────────────────────────────────────────────────────────────────────
 async def autosize_once() -> float:
     """
     Compute PF_TRADE_SOL from wallet balance + guardrails, then set in env.
     Sizing = balance(SOL) * PF_TRADE_RISK_PCT, clamped & stepped.
+    Emits a compact event only when value changes; otherwise rate-limited debug.
     """
     enable = _envb("PF_TRADE_AUTOSIZE", False)
     # Guardrails / tuning (with sanity)
@@ -80,18 +99,58 @@ async def autosize_once() -> float:
 
     step_sol = max(0.0, _envf("PF_TRADE_STEP_SOL", 0.001))
 
+    def _finalize(val: float, why: str, **extra):
+        os.environ["PF_TRADE_SOL"] = _fmt_amt(val)
+        # Only emit an update event if PF_TRADE_SOL actually changed
+        prev = extra.pop("prev", None)
+        if prev is None or _fmt_amt(prev) != os.environ["PF_TRADE_SOL"]:
+            log.event(
+                "AUTOSIZE_UPDATE",
+                bal_sol=extra.get("bal_sol"),
+                risk_pct=risk_pct,
+                min_sol=min_sol,
+                max_sol=max_sol,
+                step_sol=step_sol,
+                trade_sol=val,
+                why=why,
+            )
+            bump("autosize_updates")
+        else:
+            # Rate-limit 'same' lines
+            log.every(
+                "autosize.same",
+                n=max(5, _envi("PF_TRADE_AUTOSIZE_EVERY_N", 10)),
+                level=logging.DEBUG,
+                msg="AUTOSIZE_SAME",
+                bal_sol=extra.get("bal_sol"),
+                risk_pct=risk_pct,
+                trade_sol=val,
+            )
+            bump("autosize_ticks")
+
     if not enable:
         # Respect an explicitly set PF_TRADE_SOL if autosize is disabled.
         val = _envf("PF_TRADE_SOL", max(min_sol, 0.01))
         val = _clamp(val, min_sol, max_sol)
         if step_sol > 0:
             val = max(min_sol, _round_down_step(val, step_sol))
-        os.environ["PF_TRADE_SOL"] = _fmt_amt(val)
-        print(f"[autosize] disabled -> PF_TRADE_SOL={os.environ['PF_TRADE_SOL']}", flush=True)
+        prev = _envf("PF_TRADE_SOL", val)
+        _finalize(val, why="disabled", prev=prev, bal_sol=None)
         return val
 
     # Lazy import to avoid loading Solana libs before we need them
-    from utils_pkg.solana_wallet import load_keypair, get_balance_sol
+    try:
+        from utils_pkg.solana_wallet import load_keypair, get_balance_sol
+    except Exception as e:
+        # If wallet lib is missing during early boot, fall back
+        fallback = _envf("PF_TRADE_SOL", min_sol)
+        fallback = _clamp(fallback, min_sol, max_sol)
+        if step_sol > 0:
+            fallback = max(min_sol, _round_down_step(fallback, step_sol))
+        prev = _envf("PF_TRADE_SOL", fallback)
+        log.once("autosize.wallet_import_fail", ttl=60, level=logging.WARNING, msg="AUTOSIZE_WALLET_IMPORT_FAIL", error=str(e))
+        _finalize(fallback, why="wallet-import-fail", prev=prev, bal_sol=None)
+        return fallback
 
     # Get balance
     kp = load_keypair()
@@ -103,8 +162,9 @@ async def autosize_once() -> float:
         fallback = _clamp(fallback, min_sol, max_sol)
         if step_sol > 0:
             fallback = max(min_sol, _round_down_step(fallback, step_sol))
-        os.environ["PF_TRADE_SOL"] = _fmt_amt(fallback)
-        print(f"[autosize] balance fetch failed: {e!r} -> keeping PF_TRADE_SOL={os.environ['PF_TRADE_SOL']}", flush=True)
+        prev = _envf("PF_TRADE_SOL", fallback)
+        log.once("autosize.balance_fetch_fail", ttl=30, level=logging.WARNING, msg="AUTOSIZE_BALANCE_FAIL", error=str(e))
+        _finalize(fallback, why="balance-fetch-fail", prev=prev, bal_sol=None)
         return fallback
 
     # Raw sizing (SOL terms), clamp, then step
@@ -114,11 +174,8 @@ async def autosize_once() -> float:
     if sized <= 0 and min_sol > 0:
         sized = min_sol
 
-    os.environ["PF_TRADE_SOL"] = _fmt_amt(sized)
-    print(
-        f"[autosize] bal_sol={bal_sol:.4f}, risk={risk_pct*100:.2f}% -> PF_TRADE_SOL={os.environ['PF_TRADE_SOL']}",
-        flush=True,
-    )
+    prev = _envf("PF_TRADE_SOL", sized)
+    _finalize(sized, why="ok", prev=prev, bal_sol=bal_sol)
     return sized
 
 
@@ -127,33 +184,16 @@ async def _autosize_loop(refresh_sec: int, stop_evt: asyncio.Event):
         try:
             await asyncio.wait_for(stop_evt.wait(), timeout=max(1, refresh_sec))
         except asyncio.TimeoutError:
-            # Timer fired
             with suppress(Exception):
                 await autosize_once()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Boot banner
+# Boot banner (structured)
 # ──────────────────────────────────────────────────────────────────────────────
-def _print_banner() -> None:
+def _boot_event() -> None:
     now = datetime.now(timezone.utc).isoformat()
-    print(f"\n=== {BANNER} boot @ {now} ===", flush=True)
-    print("PYTHONUNBUFFERED =", os.getenv("PYTHONUNBUFFERED", ""))
-    print("DRY_RUN          =", os.getenv("DRY_RUN", ""))
-    print("PF_PP_KEY        =", _mask(os.getenv("PF_PP_KEY", "")))
-    print("PF_PP_ACCOUNT    =", os.getenv("PF_PP_ACCOUNT", ""))
-    print("PF_PP_MINTS      =", os.getenv("PF_PP_MINTS"))
-    print("SOL_RPC_URL      =", _mask(os.getenv("SOL_RPC_URL", "")))
-    print("HELIUS_API_KEY   =", _mask(os.getenv("HELIUS_API_KEY", "")))
-    print("TELEGRAM_CHAT_ID =", _mask(os.getenv("TELEGRAM_CHAT_ID", ""), 6))
-
-    # Nice-to-have trading knobs (if present)
-    for k in ("PF_SLIPPAGE_BPS", "PF_PRIORITY_SOL", "PF_POOLS"):
-        if k in os.environ:
-            print(f"{k:16s} =", os.getenv(k, ""))
-
-    print("— guardrails —")
-    for k in (
+    guardrails_keys = (
         "PF_TRADE_RISK_PCT",
         "PF_TRADE_MIN_SOL",
         "PF_TRADE_MAX_SOL",
@@ -164,14 +204,64 @@ def _print_banner() -> None:
         "PF_COOLDOWN_SEC",
         "PF_TRADE_AUTOSIZE",
         "PF_TRADE_AUTOSIZE_REFRESH_SEC",
-    ):
-        print(f"{k:27s}= {os.getenv(k, '')}")
-    print("====================================================", flush=True)
+    )
+    knobs = {k: os.getenv(k) for k in ("PF_SLIPPAGE_BPS", "PF_PRIORITY_SOL", "PF_POOLS") if k in os.environ}
+
+    log.event(
+        "BOOT",
+        banner=BANNER,
+        time=now,
+        py_unbuffered=os.getenv("PYTHONUNBUFFERED", ""),
+        dry_run=os.getenv("DRY_RUN", ""),
+        pf_service=LOG_SERVICE,
+        pf_version=LOG_VERSION,
+        pf_pp_key=_mask(os.getenv("PF_PP_KEY", "")),
+        pf_pp_account=os.getenv("PF_PP_ACCOUNT", ""),
+        pf_pp_mints=os.getenv("PF_PP_MINTS"),
+        sol_rpc_url=_mask(os.getenv("SOL_RPC_URL", "")),
+        helius_api_key=_mask(os.getenv("HELIUS_API_KEY", "")),
+        telegram_chat_id=_mask(os.getenv("TELEGRAM_CHAT_ID", ""), 6),
+        guardrails={k: os.getenv(k, "") for k in guardrails_keys},
+        knobs=knobs,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
+async def _run_handoff(stop_evt: asyncio.Event) -> int:
+    """
+    Hand off to scripts.main.main; works for async or sync variants, with or without a stop_evt arg.
+    """
+    try:
+        from scripts.main import main as run_main
+    except Exception as e:  # pragma: no cover
+        log.event("HANDOFF_IMPORT_FAIL", error=str(e))
+        return 1
+
+    log.event("HANDOFF_START")
+    try:
+        # Try with stop_evt kwarg
+        try:
+            result = run_main(stop_evt=stop_evt)
+        except TypeError:
+            # Try without args
+            result = run_main()
+
+        # If coroutine/awaitable, await it; otherwise assume sync completion
+        if inspect.isawaitable(result):
+            await result
+
+        log.event("HANDOFF_DONE")
+        return 0
+    except asyncio.CancelledError:
+        log.event("HANDOFF_CANCELLED")
+        return 130
+    except Exception as e:
+        log.event("HANDOFF_ERROR", error=str(e))
+        return 1
+
+
 async def _run_main_with_shutdown() -> int:
     """
     Runs autosizer (once + optional loop) and then hands off to scripts.main.main().
@@ -182,7 +272,7 @@ async def _run_main_with_shutdown() -> int:
 
     # Wire signals for graceful shutdown
     def _sig_handler(signame: str):
-        print(f"[entrypoint] received {signame} → shutting down…", flush=True)
+        log.event("SIGNAL", signal=signame, action="shutdown")
         stop_evt.set()
 
     loop = asyncio.get_running_loop()
@@ -190,7 +280,7 @@ async def _run_main_with_shutdown() -> int:
         with suppress(NotImplementedError):
             loop.add_signal_handler(sig, _sig_handler, sig.name)
 
-    # One shot before we start
+    # One shot autosize before we start
     await autosize_once()
 
     # Optional refresh loop
@@ -199,25 +289,14 @@ async def _run_main_with_shutdown() -> int:
         autosize_task = asyncio.create_task(_autosize_loop(refresh, stop_evt))
 
     # Hand off to trading loop
-    rc = 0
-    try:
-        from scripts.main import main as run_main
-        await run_main(stop_evt=stop_evt)  # pass the stop signal if your main supports it
-    except TypeError:
-        # Back-compat: if scripts.main.main() doesn't accept stop_evt
-        from scripts.main import main as run_main_noarg
-        await run_main_noarg()
-    except asyncio.CancelledError:
-        rc = 130
-    except Exception as e:
-        print(f"[entrypoint] fatal error in main: {e!r}", flush=True)
-        rc = 1
-    finally:
-        stop_evt.set()
-        if autosize_task:
-            autosize_task.cancel()
-            with suppress(Exception):
-                await autosize_task
+    rc = await _run_handoff(stop_evt)
+
+    # Cleanup
+    stop_evt.set()
+    if autosize_task:
+        autosize_task.cancel()
+        with suppress(Exception):
+            await autosize_task
 
     return rc
 
@@ -239,13 +318,22 @@ def _maybe_enable_uvloop():
 
 
 async def main():
-    _print_banner()
+    _boot_event()
+
+    # Heartbeat every PF_HEARTBEAT_SEC (default 30s)
+    hb_sec = _envi("PF_HEARTBEAT_SEC", 30)
+    start_global_heartbeat(log, interval=max(5, hb_sec))
+
     rc = await _run_main_with_shutdown()
+
     # Exit code is informative when running under supervisors
     if rc:
-        # Make sure logs flush before supervisor kills us
+        # small delay so logs flush
         await asyncio.sleep(0.05)
+        log.event("EXIT", code=rc)
         sys.exit(rc)
+    else:
+        log.event("EXIT", code=0)
 
 
 if __name__ == "__main__":
