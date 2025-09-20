@@ -15,9 +15,11 @@ from utils_pkg.solana_wallet import (
     sign_and_send_b64_tx,
 )
 from utils_pkg.solana_token import fetch_mint_info
-from utils_pkg.txlearn import _Rpc, TX_RPC_URL, TX_COMMITMENT
+from utils_pkg.txlearn import _Rpc, TX_RPC_URL, TX_COMMITMENT  # TX_COMMITMENT kept for compatibility
 
-# Budget hooks (soft gates). Fail open if module not present.
+# ---------------------------------------------------------------------------
+# Optional budget hooks (soft gates). Fail open if module is missing.
+# ---------------------------------------------------------------------------
 try:
     from utils_pkg import budget  # type: ignore
 except Exception:  # graceful no-ops
@@ -78,7 +80,7 @@ QUOTE_TTL_SEC = max(0.0, _envf("ROUTER_QUOTE_TTL_SEC", 2.0))
 PRICE_TTL_SEC = max(0.0, _envf("PF_PRICE_TTL_SEC", 5.0))  # shared with other modules
 _QUOTE_CACHE: Dict[str, Tuple[float, dict]] = {}          # key -> (expiry_ts, payload)
 _PRICE_CACHE: Dict[str, Tuple[float, float]] = {}         # mint -> (expiry_ts, price_ui)
-_QUOTE_FLIGHT: Dict[str, asyncio.Future] = {}             # key -> future
+_QUOTE_FLIGHT: Dict[str, asyncio.Future[Any]] = {}        # key -> future
 _quote_lock = asyncio.Lock()
 
 # QuickNode priority hint (optional)
@@ -86,7 +88,7 @@ QN_PRIORITY_HINT   = _envb("QN_PRIORITY_HINT", False)
 QN_RPC_URL         = (os.getenv("SOL_RPC_URL") or "").strip()
 QN_HINT_TIMEOUT_S  = max(0.8, _envf("QN_PRIORITY_TIMEOUT_SEC", 2.5))
 
-# Signature status poll cadence (this is what you asked for)
+# Signature status poll cadence
 STATUS_POLL_SEC    = max(0.2, _envf("PF_STATUS_POLL_SEC", 0.9))
 
 # Common HTTP headers
@@ -143,7 +145,7 @@ async def _get_decimals(mint: str) -> Optional[int]:
         return None
 
 # =============================================================================
-# Dynamic priority fee controller (with QuickNode seed)
+# Dynamic priority fee controller (with optional QuickNode seed)
 # =============================================================================
 def _to_sol_from_lamports_like(x: float) -> float:
     """
@@ -158,9 +160,7 @@ def _to_sol_from_lamports_like(x: float) -> float:
     return lamports / 1e9
 
 async def _seed_priority_from_quicknode() -> Optional[float]:
-    """
-    Best-effort fetch of a sane network priority baseline from QuickNode.
-    """
+    """Best-effort fetch of a sane network priority baseline from QuickNode."""
     if not (QN_PRIORITY_HINT and QN_RPC_URL):
         return None
 
@@ -207,7 +207,7 @@ class DynPriority:
       - If recent inclusion >> target → step up fee
       - If recent inclusion << target → step down fee
       - Clamp between [min_sol, max_sol]
-      - Optionally seed from QuickNode priority hint on init (QN_PRIORITY_HINT=1).
+      - Optionally seed from QuickNode priority hint on start().
     """
     def __init__(self) -> None:
         base = _envf("PF_PRIORITY_SOL", 0.002)
@@ -220,10 +220,20 @@ class DynPriority:
         self.current_sol    = max(self.min_sol, min(self.max_sol, base))
         self._pending: Dict[str, float] = {}  # sig -> t0
         self._rpc = _Rpc(TX_RPC_URL or "")
+        self._seed_task: Optional[asyncio.Task[None]] = None  # no scheduling at import time
 
-        # seed from QuickNode (fire-and-forget; safe if feature is off)
-        if self.enabled and QN_PRIORITY_HINT and QN_RPC_URL:
-            asyncio.create_task(self._seed_from_qn())
+    async def start(self) -> None:
+        """Call once after the event loop is running to optionally seed from QuickNode."""
+        if not (self.enabled and QN_PRIORITY_HINT and QN_RPC_URL):
+            return
+        if self._seed_task and not self._seed_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Not inside a running loop yet; caller can retry later.
+            return
+        self._seed_task = loop.create_task(self._seed_from_qn())
 
     async def _seed_from_qn(self) -> None:
         try:
@@ -254,6 +264,7 @@ class DynPriority:
         if not (self.enabled and sig):
             return
         self._pending[sig] = t0
+        # This runs only after transactions are submitted (i.e., loop is running)
         asyncio.create_task(self._watch(sig))
 
     async def _watch(self, sig: str) -> None:
@@ -290,7 +301,12 @@ class DynPriority:
         if abs(self.current_sol - old) / max(1e-9, old) >= 0.10:
             log.event("PRIO_TUNE", old_sol=old, new_sol=self.current_sol, incl_sec=inclusion_sec)
 
+# module-level instance (safe: no tasks scheduled here)
 _PRIO = DynPriority()
+
+# Public hook to start optional background seeding (safe to call multiple times)
+async def start() -> None:
+    await _PRIO.start()
 
 # =============================================================================
 # Quote cache/single-flight helpers
@@ -314,7 +330,7 @@ async def _set_cached_quote(key: str, payload: dict, ttl: float) -> None:
     if ttl > 0:
         _QUOTE_CACHE[key] = (time.time() + ttl, payload)
 
-async def _singleflight_quote(key: str, maker: Callable[[], "asyncio.Future"]) -> dict:
+async def _singleflight_quote(key: str, maker: Callable[[], "asyncio.Future[Any]"]) -> dict:
     async with _quote_lock:
         fut = _QUOTE_FLIGHT.get(key)
         if fut is None:
@@ -585,6 +601,7 @@ async def sell_via_lightning(
             await asyncio.sleep(RETRY_BACKOFF * attempt)
 
 __all__ = [
+    "start",              # NEW, optional
     "get_sell_quote",
     "get_buy_quote",
     "get_price_ui",

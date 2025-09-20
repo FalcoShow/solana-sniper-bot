@@ -41,10 +41,12 @@ except Exception:
         while not stop_evt.is_set():
             await asyncio.sleep(5)
 
-# Router price helper (for momentum price change)
+# Router pieces
 try:
-    from utils_pkg.router import get_price_ui as _route_price_ui  # type: ignore
+    from utils_pkg import router  # to call router.start()
+    from utils_pkg.router import get_price_ui as _route_price_ui  # price helper
 except Exception:
+    router = None  # type: ignore
     async def _route_price_ui(mint: str) -> float:  # type: ignore
         return 0.0
 
@@ -171,7 +173,6 @@ def _approx_minutes_since(ts_any: Any) -> Optional[float]:
                 pass
             # try ISO
             try:
-                # allow both 'Z' and offset
                 dt = _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
                 return max(0.0, (_dt.datetime.utcnow().timestamp() - dt.timestamp()) / 60.0)
             except Exception:
@@ -207,7 +208,6 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
         return False
 
     # age gating (best-effort; only applied if event exposes timestamps)
-    # accept any of these fields: created_at/createdAt/timestamp/ts/poolCreatedAt
     mins_since_token = _approx_minutes_since(_get_first(msg, "created_at", "createdAt", "timestamp", "ts", default=None))
     if mins_since_token is not None and ENTRY_MAX_AGE_MIN > 0 and mins_since_token > ENTRY_MAX_AGE_MIN:
         if DEBUG_TX:
@@ -405,7 +405,6 @@ class Strategy:
 
         # Dedupe gating/buying across dynos
         if DEDUPE_ENABLED and ENTRY_MOMENTUM_ENABLED:
-            # only one dyno should even attempt to gate this mint
             if not claim_once(f"gate-propose:{mint_raw}", ttl=max(ENTRY_MOMO_WINDOW_SEC * 2, 90)):
                 if DEBUG_TX:
                     print(f"[dedupe] gate-propose taken for {mint_raw} — skip", flush=True)
@@ -479,6 +478,20 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
             traceback.print_exc()
 
 async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
+    # Touch a startup heartbeat (optional; keeps your logger pattern intact)
+    try:
+        bump("boot")
+    except Exception:
+        pass
+
+    # Initialize dynamic priority (safe if router is missing)
+    try:
+        if router and hasattr(router, "start"):
+            await router.start()
+            log.event("ROUTER_PRIO_INIT_STARTED", ok=1)
+    except Exception as e:
+        log.event("ROUTER_PRIO_INIT_FAIL", error=str(e))
+
     # Start sell loop on boot if there are existing positions (important on restarts)
     try:
         if list(all_positions()):
@@ -505,4 +518,5 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
         await asyncio.sleep(backoff)
 
 if __name__ == "__main__":
+    # No argparse on purpose: running with "--help" won’t crash; it’ll just be ignored.
     asyncio.run(main())
