@@ -1,0 +1,80 @@
+services:
+  # Health endpoint (optional but handy)
+  - type: web
+    name: pnlbot-health
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.health
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PF_POSITIONS_BACKEND
+        value: "pg"           # or "sqlite"
+      - key: DATABASE_URL
+        sync: false           # add in Render dashboard if using PG
+    # If you run sqlite and want to inspect state, mount a small disk
+    disk:
+      name: state
+      mountPath: /opt/render/project/src/state
+      sizeGB: 1
+
+  # The trading worker
+  - type: worker
+    name: pnlbot-worker
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.main
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: DRY_RUN
+        value: "0"
+      - key: SOL_RPC_URL
+        sync: false
+      - key: SOL_RPC_TX_URL
+        sync: false
+      - key: QN_PRIORITY_HINT
+        value: "1"
+      - key: PF_STATUS_POLL_SEC
+        value: "0.9"
+      - key: PF_RPC_CACHE_TTL_SEC
+        value: "1.5"
+      - key: PF_BUDGET_CREDITS_MONTHLY
+        value: "80000000"
+      - key: PF_BUDGET_WARN_PCT
+        value: "0.85"
+      - key: PF_BUDGET_HARD_PCT
+        value: "0.98"
+      - key: PF_TRADE_AUTOSIZE
+        value: "1"
+      - key: PF_TRADE_RISK_PCT
+        value: "0.05"
+      - key: PF_TRADE_MIN_SOL
+        value: "0.005"
+      - key: PF_TRADE_MAX_SOL
+        value: "0.08"
+      - key: ENTRY_MOMENTUM_ENABLED
+        value: "1"
+      - key: ENTRY_LIQ_FILTER
+        value: "1"
+      - key: PF_DEDUPE_ENABLED
+        value: "1"
+      - key: REDIS_URL
+        sync: false
+      - key: PF_POSITIONS_BACKEND
+        value: "pg"           # strongly recommended for multiple instances
+      - key: DATABASE_URL
+        sync: false
+      - key: PF_PP_KEY       # optional PumpPortal fallback
+        sync: false
+      - key: PF_PP_ACCOUNT   # optional preferred payer pubkey
+        sync: false
+      - key: KEYPAIR_PATH    # or SOL_PRIVATE_KEY; match your solana_wallet loader
+        sync: false
+    # If you insist on sqlite, mount the same path as the web service. Otherwise omit.
+    disk:
+      name: state
+      mountPath: /opt/render/project/src/state
+      sizeGB: 1

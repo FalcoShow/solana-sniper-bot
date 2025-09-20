@@ -1,18 +1,33 @@
 # logging_setup.py
 # stdlib-only structured logging helpers for high-throughput bots/services
-import os, sys, time, json, socket, hashlib, threading, collections, logging
+
+from __future__ import annotations
+
+import collections
+import hashlib
+import json
+import logging
+import os
+import socket
+import sys
+import threading
+import time
+from io import TextIOBase
 from typing import Any, Dict
 
-# ---------- JSON formatter ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# JSON formatter
+# ──────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_EXCLUDE = {
-    "name","msg","args","levelname","levelno","pathname","filename","module",
-    "exc_info","exc_text","stack_info","lineno","funcName","created","msecs",
-    "relativeCreated","thread","threadName","processName","process","asctime"
+    "name", "msg", "args", "levelname", "levelno", "pathname", "filename", "module",
+    "exc_info", "exc_text", "stack_info", "lineno", "funcName", "created", "msecs",
+    "relativeCreated", "thread", "threadName", "processName", "process", "asctime",
 }
 
+
 def _coerce(obj: Any) -> Any:
-    # Make extras JSON-safe without exploding on weird types
+    """Coerce unknown types to JSON-safe values."""
     if isinstance(obj, (str, int, float, bool)) or obj is None:
         return obj
     if isinstance(obj, (list, tuple)):
@@ -25,6 +40,7 @@ def _coerce(obj: Any) -> Any:
         except Exception:
             return repr(obj)
     return str(obj)
+
 
 class JsonFormatter(logging.Formatter):
     def __init__(self, service: str, version: str | None = None):
@@ -46,37 +62,75 @@ class JsonFormatter(logging.Formatter):
             "pid": self.pid,
         }
 
-        # Pull extras (anything added via extra=... or EventLogger helpers)
+        # extras (from extra=...)
         extras = {k: v for k, v in record.__dict__.items() if k not in DEFAULT_EXCLUDE}
         if extras:
             for k, v in extras.items():
                 base[k] = _coerce(v)
 
-        # Message & event
+        # message/event
         msg = record.getMessage()
         if "event" not in base and msg:
-            # If caller used plain log.info("text"), keep it in msg
             base["msg"] = msg
         elif msg and msg != base.get("event"):
-            # If caller used event(...), let "event" be primary and keep msg if different
             base["msg"] = msg
 
-        # Source hints for quick grep (cheap)
+        # quick source hint
         base.setdefault("source", f"{record.filename}:{record.lineno}")
 
-        # Exceptions
+        # exceptions
         if record.exc_info:
             base["exc_type"] = record.exc_info[0].__name__ if record.exc_info[0] else None
             base["exc"] = self.formatException(record.exc_info)
 
         return json.dumps(base, separators=(",", ":"), ensure_ascii=False)
 
-# ---------- Handler & Logger class with helpers ----------
 
 class JsonStreamHandler(logging.StreamHandler):
     def __init__(self, service: str, version: str | None = None, stream=None):
         super().__init__(stream or sys.stdout)
         self.setFormatter(JsonFormatter(service=service, version=version))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dedup / rate-limit filter
+# ──────────────────────────────────────────────────────────────────────────────
+
+class DedupFilter(logging.Filter):
+    """
+    Collapse identical messages for a window. When the message is allowed again,
+    the emitted record gets `suppressed: N` if any were skipped.
+    """
+    def __init__(self, window_sec: float = 20.0):
+        super().__init__()
+        self.window = float(window_sec)
+        self._state: dict[tuple, tuple[float, int]] = {}  # key -> (next_ok_at, suppressed)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        event = getattr(record, "event", None)
+        line = getattr(record, "line", None)
+        # Build stable key from logger/level + event/line/message
+        key = (
+            record.name,
+            record.levelno,
+            event,
+            line if line is not None else record.getMessage(),
+        )
+        now = time.time()
+        next_ok_at, suppressed = self._state.get(key, (0.0, 0))
+        if now >= next_ok_at:
+            if suppressed:
+                setattr(record, "suppressed", suppressed)
+            self._state[key] = (now + self.window, 0)
+            return True
+        else:
+            self._state[key] = (next_ok_at, suppressed + 1)
+            return False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Logger with helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 class EventLogger(logging.Logger):
     """
@@ -93,6 +147,7 @@ class EventLogger(logging.Logger):
 
     def event(self, name: str, level: int = logging.INFO, **fields):
         fields.setdefault("event", name)
+        # use stacklevel so source points to the caller
         self.log(level, name, extra=fields, stacklevel=2)
 
     def once(self, key: str, ttl: float = 30.0, level: int = logging.INFO, msg: str | None = None, **fields):
@@ -119,21 +174,24 @@ class EventLogger(logging.Logger):
         if i == 1:
             self.log(level, msg or fields.get("event") or key, extra=fields, stacklevel=2)
             return
-        # Simple stable hash sampling
         h = hashlib.md5(f"{key}:{i}".encode()).digest()
         bucket = int.from_bytes(h[:2], "big") / 65535.0
         if bucket < max(0.0, min(1.0, rate)):
             self.log(level, msg or fields.get("event") or key, extra=fields, stacklevel=2)
 
-# ---------- Heartbeat counter (optional) ----------
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Heartbeat counter
+# ──────────────────────────────────────────────────────────────────────────────
 
 class Heartbeat:
     """
-    Lightweight counter you can bump from hot paths; emits a summary line every `interval` seconds.
+    Lightweight counter you can bump from hot paths; emits a summary line
+    every `interval` seconds with event name `name` (default: HEARTBEAT).
     """
     def __init__(self, logger: EventLogger, interval: float = 30.0, name: str = "HEARTBEAT"):
         self.log = logger
-        self.interval = interval
+        self.interval = float(interval)
         self.name = name
         self._ctr = collections.Counter()
         self._lock = threading.Lock()
@@ -164,15 +222,38 @@ class Heartbeat:
             if snapshot:
                 self.log.event(self.name, **snapshot)
 
-# ---------- Factory & setup ----------
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Factory & setup
+# ──────────────────────────────────────────────────────────────────────────────
 
 _LOGGER_CLASS_SET = False
+
+
+def _env_level() -> int:
+    lvl = os.getenv("PF_LOG_LEVEL") or os.getenv("LOG_LEVEL") or "INFO"
+    mapping = {
+        "CRITICAL": logging.CRITICAL, "FATAL": logging.CRITICAL,
+        "ERROR": logging.ERROR,
+        "WARN": logging.WARNING, "WARNING": logging.WARNING,
+        "INFO": logging.INFO,
+        "DEBUG": logging.DEBUG,
+        "TRACE": logging.DEBUG,  # alias
+    }
+    return mapping.get(lvl.upper(), logging.INFO)
+
+
+def _env_to_level(level_str: str) -> int:
+    os.environ["PF_LOG_LEVEL"] = level_str
+    return _env_level()
+
 
 def get_logger(
     name: str = "sniper",
     level: int | None = None,
     service: str | None = None,
     version: str | None = None,
+    dedup_window_sec: float | None = 20.0,
 ) -> EventLogger:
     """
     Create or retrieve a JSON logger configured for stdout.
@@ -191,26 +272,18 @@ def get_logger(
 
     log: EventLogger = logging.getLogger(name)  # type: ignore[assignment]
     log.setLevel(level)
+    log.propagate = False
 
     # Attach one JsonStreamHandler (idempotent)
     if not any(isinstance(h, JsonStreamHandler) for h in log.handlers):
         handler = JsonStreamHandler(service=service, version=version)
         handler.setLevel(level)
+        if dedup_window_sec and dedup_window_sec > 0:
+            handler.addFilter(DedupFilter(window_sec=dedup_window_sec))
         log.addHandler(handler)
 
     return log
 
-def _env_level() -> int:
-    lvl = os.getenv("PF_LOG_LEVEL") or os.getenv("LOG_LEVEL") or "INFO"
-    mapping = {
-        "CRITICAL": logging.CRITICAL, "FATAL": logging.CRITICAL,
-        "ERROR": logging.ERROR,
-        "WARN": logging.WARNING, "WARNING": logging.WARNING,
-        "INFO": logging.INFO,
-        "DEBUG": logging.DEBUG,
-        "TRACE": logging.DEBUG,  # alias
-    }
-    return mapping.get(lvl.upper(), logging.INFO)
 
 def set_level(logger: logging.Logger, level_str: str):
     """Hot-switch log level (e.g., from a Telegram command)."""
@@ -221,29 +294,104 @@ def set_level(logger: logging.Logger, level_str: str):
     if isinstance(logger, EventLogger):
         logger.event("LOG_LEVEL_CHANGED", level=level_str.upper())
 
-def _env_to_level(level_str: str) -> int:
-    os.environ["PF_LOG_LEVEL"] = level_str
-    return _env_level()
 
-# ---------- Convenience: global heartbeat (optional) ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# Stdout/stderr capture (route print() to JSON logs)
+# ──────────────────────────────────────────────────────────────────────────────
 
-_global_hb: Heartbeat | None = None
+class _PrintToLogger(TextIOBase):
+    def __init__(self, logger: EventLogger, level: int):
+        self.logger = logger
+        self.level = level
+        self._buf = ""
 
-def start_global_heartbeat(logger: EventLogger, interval: float = 30.0) -> Heartbeat:
-    global _global_hb
-    _global_hb = Heartbeat(logger, interval=interval).start()
-    return _global_hb
+    def writable(self) -> bool:
+        return True
 
-def bump(key: str, n: int = 1):
-    if _global_hb:
-        _global_hb.bump(key, n)
+    def write(self, s: str) -> int:
+        if not isinstance(s, str):
+            try:
+                s = s.decode("utf-8", "replace")  # type: ignore[attr-defined]
+            except Exception:
+                s = str(s)
+        self._buf += s
+        # flush on newline(s)
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.strip()
+            if line:
+                # Emit each line as a structured record
+                self.logger.log(self.level, "STDIO", extra={"event": "STDIO", "line": line}, stacklevel=3)
+        return len(s)
 
-# ---------- Exception hook (optional) ----------
+    def flush(self):
+        if self._buf.strip():
+            self.logger.log(self.level, "STDIO", extra={"event": "STDIO", "line": self._buf.strip()}, stacklevel=3)
+            self._buf = ""
+
+
+_stdout_original = sys.stdout
+_stderr_original = sys.stderr
+
+
+def hook_stdio(logger: EventLogger, stdout_level: int = logging.INFO, stderr_level: int = logging.ERROR):
+    """
+    Route print()/stdout/stderr to structured logs. Call early in your process.
+    """
+    global _stdout_original, _stderr_original
+    sys.stdout = _PrintToLogger(logger, stdout_level)  # type: ignore[assignment]
+    sys.stderr = _PrintToLogger(logger, stderr_level)  # type: ignore[assignment]
+
+
+def restore_stdio():
+    """Undo hook_stdio (mainly useful for tests)."""
+    global _stdout_original, _stderr_original
+    sys.stdout = _stdout_original  # type: ignore[assignment]
+    sys.stderr = _stderr_original  # type: ignore[assignment]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Uncaught exception hook
+# ──────────────────────────────────────────────────────────────────────────────
 
 def install_excepthook(logger: EventLogger):
     """Log uncaught exceptions as JSON (does not swallow them)."""
     def _hook(exc_type, exc, tb):
         logger.error("UNCAUGHT", exc_info=(exc_type, exc, tb))
-        # Delegate to default hook so Render still marks exits properly
+        # Delegate so the platform/supervisor can still see the crash
         sys.__excepthook__(exc_type, exc, tb)
     sys.excepthook = _hook
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Global heartbeat convenience
+# ──────────────────────────────────────────────────────────────────────────────
+
+_global_hb: Heartbeat | None = None
+
+
+def start_global_heartbeat(logger: EventLogger, interval: float = 30.0, name: str = "HEARTBEAT") -> Heartbeat:
+    global _global_hb
+    _global_hb = Heartbeat(logger, interval=interval, name=name).start()
+    return _global_hb
+
+
+def bump(key: str, n: int = 1):
+    if _global_hb:
+        _global_hb.bump(key, n)
+
+
+__all__ = [
+    "JsonFormatter",
+    "JsonStreamHandler",
+    "EventLogger",
+    "get_logger",
+    "set_level",
+    "Heartbeat",
+    "start_global_heartbeat",
+    "bump",
+    "hook_stdio",
+    "restore_stdio",
+    "install_excepthook",
+    "DedupFilter",
+]
