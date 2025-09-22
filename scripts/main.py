@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import traceback
 from typing import Any, Dict, Optional
 
@@ -25,7 +26,7 @@ try:
 except Exception:
     def buys_allowed() -> bool:  # type: ignore
         return True
-    def record_buy_result(*args, **kwargs):  # type: ignore
+    def record_buy_result(*_args, **_kwargs):  # type: ignore
         return None
 
 try:
@@ -47,19 +48,41 @@ try:
     from utils_pkg.router import get_price_ui as _route_price_ui  # price helper
 except Exception:
     router = None  # type: ignore
-    async def _route_price_ui(mint: str) -> float:  # type: ignore
+    async def _route_price_ui(_mint: str) -> float:  # type: ignore
         return 0.0
 
-# Liquidity screen
+# Liquidity screen (we'll add our own fallback too)
 try:
-    from utils_pkg.liquidity import looks_like_mint, screen_token
+    from utils_pkg.liquidity import looks_like_mint as _looks_like_mint, screen_token
 except Exception:
-    def looks_like_mint(s: str) -> bool:  # type: ignore
-        return False
-    async def screen_token(mint: str):  # type: ignore
+    _looks_like_mint = None  # type: ignore
+    async def screen_token(_mint: str):  # type: ignore
         return True, {"ok": True}
 
 log = get_logger()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Mint normalization / validation
+# ──────────────────────────────────────────────────────────────────────────────
+# Base58 alphabet (no 0,O,I,l) – 32–44 chars typical for Solana mints
+_BASE58_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
+
+def normalize_mint(maybe: str) -> str:
+    """Extract the first token-like base58 substring (handles '...pump'/'...bonk' tails)."""
+    if not maybe:
+        return ""
+    m = _BASE58_RE.search(str(maybe))
+    return m.group(0) if m else str(maybe).strip()
+
+def is_probable_mint(s: str) -> bool:
+    """True if it looks like a Solana mint; uses utils if present + regex fallback."""
+    try:
+        if _looks_like_mint is not None:
+            if _looks_like_mint(s):  # type: ignore
+                return True
+    except Exception:
+        pass
+    return bool(_BASE58_RE.fullmatch(s or ""))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # env helpers
@@ -133,7 +156,8 @@ def _get_first(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
 
 def _extract_raw_mint(msg: Dict[str, Any]) -> str:
     raw = _get_first(
-        msg, "mint", "mintAddress", "mint_address", "bondingCurve", "bonding_curve", default=""
+        msg, "mint", "mintAddress", "mint_address", "bondingCurve", "bonding_curve",
+        "address", "id", default=""
     )
     raw = ("" if raw is None else str(raw)).strip()
     print(f"[main] raw pump id = {raw}", flush=True)
@@ -163,7 +187,6 @@ def _approx_minutes_since(ts_any: Any) -> Optional[float]:
             s = ts_any.strip()
             if not s:
                 return None
-            # try int/float inside string
             try:
                 f = float(s)
                 if f > 10_000_000_000:
@@ -171,7 +194,6 @@ def _approx_minutes_since(ts_any: Any) -> Optional[float]:
                 return max(0.0, (_dt.datetime.utcnow().timestamp() - f) / 60.0)
             except Exception:
                 pass
-            # try ISO
             try:
                 dt = _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
                 return max(0.0, (_dt.datetime.utcnow().timestamp() - dt.timestamp()) / 60.0)
@@ -225,12 +247,12 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 # optional post-buy immediate test
 # ──────────────────────────────────────────────────────────────────────────────
-async def _post_buy_exit_test(raw_id_or_mint: str, tx_sig: str) -> None:
+async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
     if str(os.getenv("POSTBUY_MODE", "")).strip().lower() != "immediate_sell_test":
         return
     await asyncio.sleep(5)
     try:
-        await sell_on_jupiter(raw_id_or_mint, pct_of_wallet=1.0)
+        await sell_on_jupiter(mint_norm, pct_of_wallet=1.0)
     except Exception:
         if DEBUG_TX:
             traceback.print_exc()
@@ -241,7 +263,7 @@ async def _post_buy_exit_test(raw_id_or_mint: str, tx_sig: str) -> None:
 class Strategy:
     def __init__(self) -> None:
         self._sema = asyncio.Semaphore(MAX_CONCURRENCY)
-        # gate_state: mint_raw -> {"trades": int, "price0": float}
+        # gate_state: **key by raw mint** to match incoming trade ticks exactly
         self._gate_state: Dict[str, Dict[str, Any]] = {}
 
     # --- trade tick feed for momentum counters
@@ -254,8 +276,8 @@ class Strategy:
                 if DEBUG_TX:
                     traceback.print_exc()
 
-        # momentum counters
-        m = str(_get_first(raw_event, "mint", "mintAddress", "mint_address", default="")).strip()
+        # momentum counters keyed by **raw** id (matches Pump feed)
+        m = str(_get_first(raw_event, "mint", "mintAddress", "mint_address", "id", default="")).strip()
         if not m:
             return
         st = self._gate_state.get(m)
@@ -263,7 +285,7 @@ class Strategy:
             st["trades"] = int(st.get("trades", 0)) + 1
 
     # --- momentum gate worker
-    async def _gate_candidate(self, ui: Dict[str, Any], mint_raw: str) -> None:
+    async def _gate_candidate(self, ui: Dict[str, Any], mint_raw: str, mint_norm: str) -> None:
         # Take a local claim so only one dyno runs the gate
         if DEDUPE_ENABLED:
             if not claim_once(f"gate:{mint_raw}", ttl=max(ENTRY_MOMO_WINDOW_SEC * 2, 60)):
@@ -271,15 +293,15 @@ class Strategy:
                     print(f"[dedupe] gate already running for {mint_raw} — skip", flush=True)
                 return
 
-        # init state
+        # init state keyed by **raw**
         self._gate_state[mint_raw] = {"trades": 0, "price0": 0.0}
 
         # Try a few times to get an initial price (mint may be too fresh)
         price0 = 0.0
-        if looks_like_mint(mint_raw):
+        if is_probable_mint(mint_norm):
             for _ in range(max(1, ENTRY_MOMO_PRICE_TRIES)):
                 try:
-                    price0 = await _route_price_ui(mint_raw)
+                    price0 = await _route_price_ui(mint_norm)
                 except Exception:
                     price0 = 0.0
                 if price0 > 0:
@@ -294,9 +316,9 @@ class Strategy:
         st = self._gate_state.get(mint_raw, {})
         trades = int(st.get("trades", 0))
         price1 = 0.0
-        if looks_like_mint(mint_raw):
+        if is_probable_mint(mint_norm):
             try:
-                price1 = await _route_price_ui(mint_raw)
+                price1 = await _route_price_ui(mint_norm)
             except Exception:
                 price1 = 0.0
 
@@ -306,9 +328,17 @@ class Strategy:
             up_ok = up_pct >= ENTRY_MOMO_MIN_UP_PCT
         trades_ok = trades >= ENTRY_MOMO_MIN_TRADES
 
-        log.event("MOMO_EVAL", mint=mint_raw, trades=trades, price0=price0, price1=price1,
-                  min_trades=ENTRY_MOMO_MIN_TRADES, min_up_pct=ENTRY_MOMO_MIN_UP_PCT, up_ok=int(up_ok),
-                  trades_ok=int(trades_ok))
+        log.event(
+            "MOMO_EVAL",
+            mint=mint_raw,
+            trades=trades,
+            price0=price0,
+            price1=price1,
+            min_trades=ENTRY_MOMO_MIN_TRADES,
+            min_up_pct=ENTRY_MOMO_MIN_UP_PCT,
+            up_ok=int(up_ok),
+            trades_ok=int(trades_ok),
+        )
 
         # cleanup state
         self._gate_state.pop(mint_raw, None)
@@ -337,16 +367,16 @@ class Strategy:
                 record_buy_result(ok=False, reason="buy_claimed_elsewhere")
                 return
 
-            # Execute buy
+            # Execute buy using **normalized** mint
             try:
-                tx_sig = await maybe_buy(mint=mint_raw, ui=ui)
+                tx_sig = await maybe_buy(mint=mint_norm, ui=ui)
                 if tx_sig:
                     record_buy_result(ok=True, reason="executed", sig=tx_sig)
                     if EXIT_ENGINE_ENABLED and not IS_DRYRUN:
                         asyncio.create_task(
-                            exit_engine.on_buy_filled(raw_id_or_mint=mint_raw, tx_sig=tx_sig)
+                            exit_engine.on_buy_filled(raw_id_or_mint=mint_norm, tx_sig=tx_sig)
                         )
-                    asyncio.create_task(_post_buy_exit_test(mint_raw, tx_sig))
+                    asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
                 else:
                     record_buy_result(ok=False, reason="no_tx_sig")
             except Exception:
@@ -378,32 +408,44 @@ class Strategy:
                 print("[strategy] missing mint — skip", flush=True)
             return
 
+        # Normalize for price/liquidity/routing
+        mint_norm = normalize_mint(mint_raw)
+        if mint_norm != mint_raw:
+            # helpful while testing
+            print(f"[main] normalized mint = {mint_norm}", flush=True)
+
         if not _passes_basic_filters(raw_event):
             return
 
-        # Liquidity + safety screen (only when the id already looks like a real mint)
-        if LIQ_FILTER_ENABLED and looks_like_mint(mint_raw):
-            ok, rep = await screen_token(mint_raw)
+        # Liquidity + safety screen – use normalized mint
+        if LIQ_FILTER_ENABLED and is_probable_mint(mint_norm):
+            ok, rep = await screen_token(mint_norm)
             if not ok:
                 if DEBUG_TX:
-                    print(f"[liquidity] screen failed for {mint_raw}: {rep}", flush=True)
+                    print(f"[liquidity] screen failed for {mint_norm}: {rep}", flush=True)
                 return
-            log.event("ENTRY_LIQ_OK", mint=mint_raw, priceImpactPct=rep.get("priceImpactPct"), dec=rep.get("decimals"))
+            log.event(
+                "ENTRY_LIQ_OK",
+                mint=mint_norm,
+                priceImpactPct=rep.get("priceImpactPct"),
+                dec=rep.get("decimals"),
+            )
 
-        # Build UI context for trader; keep raw id intact.
+        # Build UI context for trader; include both forms
         ui: Dict[str, Any] = dict(raw_event)
         ui.setdefault("pool", "pump")
         ui.setdefault("symbol", _extract_symbol(raw_event))
         ui.setdefault("name", _extract_name(raw_event))
         ui["rawMint"] = mint_raw
-        ui.setdefault("normalized", False)
+        ui["mint"] = mint_norm
+        ui["normalized"] = (mint_norm != mint_raw)
 
-        # Legacy-style noisy logs (kept)
+        # Legacy-style noisy logs (kept) – show **raw** as it appears on the wire
         symbol = ui.get("symbol", "") or "?"
         print(f"[trade] pool=pump symbol={symbol} mint={mint_raw} curve=-", flush=True)
         print(f"[trade] pool=pump symbol={symbol} mint={mint_raw} curve=- for {symbol} ({mint_raw})", flush=True)
 
-        # Dedupe gating/buying across dynos
+        # Dedupe gating/buying across dynos keyed by **raw** id
         if DEDUPE_ENABLED and ENTRY_MOMENTUM_ENABLED:
             if not claim_once(f"gate-propose:{mint_raw}", ttl=max(ENTRY_MOMO_WINDOW_SEC * 2, 90)):
                 if DEBUG_TX:
@@ -412,7 +454,7 @@ class Strategy:
 
         # Momentum gate or immediate buy
         if ENTRY_MOMENTUM_ENABLED:
-            asyncio.create_task(self._gate_candidate(ui, mint_raw))
+            asyncio.create_task(self._gate_candidate(ui, mint_raw, mint_norm))
         else:
             # Immediate path (legacy behavior + dedupe)
             if DEDUPE_ENABLED and not claim_once(f"buy:{mint_raw}", ttl=600):
@@ -433,7 +475,9 @@ class Strategy:
                                 return
                         except Exception:
                             pass
-                    tx_sig = await maybe_buy(mint=mint_raw, ui=ui)
+
+                    # BUY with **normalized** mint
+                    tx_sig = await maybe_buy(mint=mint_norm, ui=ui)
                     if not tx_sig:
                         record_buy_result(ok=False, reason="no_tx_sig")
                         return
@@ -441,16 +485,15 @@ class Strategy:
 
                     if EXIT_ENGINE_ENABLED and not IS_DRYRUN:
                         asyncio.create_task(
-                            exit_engine.on_buy_filled(raw_id_or_mint=mint_raw, tx_sig=tx_sig)
+                            exit_engine.on_buy_filled(raw_id_or_mint=mint_norm, tx_sig=tx_sig)
                         )
-                    asyncio.create_task(_post_buy_exit_test(mint_raw, tx_sig))
+                    asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
                 except Exception:
                     print("[strategy] maybe_buy exception:", flush=True)
                     traceback.print_exc()
                     record_buy_result(ok=False, reason="exception")
 
         await asyncio.sleep(LOOP_COOLDOWN_SEC)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # stream loop & main
@@ -518,5 +561,4 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
         await asyncio.sleep(backoff)
 
 if __name__ == "__main__":
-    # No argparse on purpose: running with "--help" won’t crash; it’ll just be ignored.
     asyncio.run(main())
