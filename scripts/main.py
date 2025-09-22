@@ -44,14 +44,14 @@ except Exception:
 
 # Router pieces
 try:
-    from utils_pkg import router  # to call router.start()
+    from utils_pkg import router  # to call router.start()/shutdown()
     from utils_pkg.router import get_price_ui as _route_price_ui  # price helper
 except Exception:
     router = None  # type: ignore
     async def _route_price_ui(_mint: str) -> float:  # type: ignore
         return 0.0
 
-# Liquidity screen (we'll add our own fallback too)
+# Liquidity screen (fallback provided)
 try:
     from utils_pkg.liquidity import looks_like_mint as _looks_like_mint, screen_token
 except Exception:
@@ -156,8 +156,10 @@ def _get_first(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
 
 def _extract_raw_mint(msg: Dict[str, Any]) -> str:
     raw = _get_first(
-        msg, "mint", "mintAddress", "mint_address", "bondingCurve", "bonding_curve",
-        "address", "id", default=""
+        msg,
+        "mint", "mintAddress", "mint_address", "bondingCurve", "bonding_curve",
+        "address", "id",
+        default=""
     )
     raw = ("" if raw is None else str(raw)).strip()
     print(f"[main] raw pump id = {raw}", flush=True)
@@ -536,29 +538,48 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
         log.event("ROUTER_PRIO_INIT_FAIL", error=str(e))
 
     # Start sell loop on boot if there are existing positions (important on restarts)
+    _sell_stop: Optional[asyncio.Event] = None
+    _sell_task: Optional[asyncio.Task] = None
     try:
         if list(all_positions()):
             log.event("BOOT_START_SELL_LOOP", reason="existing_positions")
             _sell_stop = asyncio.Event()
-            asyncio.create_task(run_sell_loop(_sell_stop))
+            _sell_task = asyncio.create_task(run_sell_loop(_sell_stop))
     except Exception as e:
         log.event("BOOT_SELL_LOOP_START_FAIL", error=str(e))
 
-    backoff = 3
-    while True:
-        if stop_evt and stop_evt.is_set():
-            break
+    try:
+        backoff = 3
+        while True:
+            if stop_evt and stop_evt.is_set():
+                break
+            try:
+                await stream_loop(stop_evt)
+                print("[main] stream ended (remote closed). Reconnecting...", flush=True)
+                backoff = 3
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                print("[main] stream_loop crashed:", flush=True)
+                traceback.print_exc()
+                backoff = min(backoff * 2, 30)
+            await asyncio.sleep(backoff)
+    finally:
+        # Graceful shutdown: stop sell loop and close router session (prevents aiohttp leaks)
         try:
-            await stream_loop(stop_evt)
-            print("[main] stream ended (remote closed). Reconnecting...", flush=True)
-            backoff = 3
-        except asyncio.CancelledError:
-            raise
+            if _sell_stop is not None:
+                _sell_stop.set()
+            if _sell_task is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(_sell_task, timeout=2.0)
         except Exception:
-            print("[main] stream_loop crashed:", flush=True)
-            traceback.print_exc()
-            backoff = min(backoff * 2, 30)
-        await asyncio.sleep(backoff)
+            pass
+        try:
+            if router and hasattr(router, "shutdown"):
+                await router.shutdown()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
+    import contextlib
     asyncio.run(main())

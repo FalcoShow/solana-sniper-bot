@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import random
+import contextlib
 from typing import Any, Dict, Optional, Tuple, Callable
 
 import requests
@@ -15,7 +17,7 @@ from utils_pkg.solana_wallet import (
     sign_and_send_b64_tx,
 )
 from utils_pkg.solana_token import fetch_mint_info
-from utils_pkg.txlearn import _Rpc, TX_RPC_URL, TX_COMMITMENT  # TX_COMMITMENT kept for compatibility
+from utils_pkg.txlearn import _Rpc, TX_RPC_URL, TX_COMMITMENT  # keep import for compatibility
 
 # ---------------------------------------------------------------------------
 # Optional budget hooks (soft gates). Fail open if module is missing.
@@ -61,8 +63,16 @@ DRY_RUN = _envb("DRY_RUN", False)
 JUP_QUOTE_URL = os.getenv("JUP_QUOTE_URL", "https://quote-api.jup.ag/v6/quote")
 JUP_SWAP_URL  = os.getenv("JUP_SWAP_URL",  "https://quote-api.jup.ag/v6/swap")
 
-# Slippage: env is fraction (e.g. 0.0125 => 1.25%)
+# Slippage: support BOTH env styles → prefer explicit BPS if present
 def _slippage_bps() -> int:
+    try:
+        bps_env = os.getenv("PF_SLIPPAGE_BPS")
+        if bps_env is not None:
+            bps = int(bps_env)
+            return max(1, bps)
+    except Exception:
+        pass
+    # Fallback: JUPITER_MAX_SLIPPAGE as fraction (e.g., 0.0125 => 125 bps)
     s = _envf("JUPITER_MAX_SLIPPAGE", 0.0125)
     return max(1, int(round(s * 10_000)))
 
@@ -74,6 +84,15 @@ def _as_legacy() -> bool:
 QUOTE_RETRIES = max(1, _envi("ROUTER_QUOTE_RETRIES", 2))
 SWAP_RETRIES  = max(1, _envi("ROUTER_SWAP_RETRIES", 2))
 RETRY_BACKOFF = max(0.05, _envf("ROUTER_RETRY_BACKOFF_SEC", 0.35))
+
+# Global HTTP throttling (helps avoid Jupiter 429)
+ROUTER_HTTP_MAX_CONCURRENCY = max(1, _envi("ROUTER_HTTP_MAX_CONCURRENCY", 4))
+JUP_MIN_INTERVAL_MS = max(0, _envi("JUP_MIN_INTERVAL_MS", 120))   # ~8 QPS by default
+JUP_JITTER_MS       = max(0, _envi("JUP_JITTER_MS", 40))          # add small jitter
+
+_http_sema = asyncio.Semaphore(ROUTER_HTTP_MAX_CONCURRENCY)
+_rate_lock = asyncio.Lock()
+_LAST_HTTP_AT = 0.0
 
 # Caching / single-flight to cut quote storms
 QUOTE_TTL_SEC = max(0.0, _envf("ROUTER_QUOTE_TTL_SEC", 2.0))
@@ -95,21 +114,37 @@ STATUS_POLL_SEC    = max(0.2, _envf("PF_STATUS_POLL_SEC", 0.9))
 _UA = {"user-agent": "pnlsniper/1.0 (+router)"}
 
 # =============================================================================
-# Non-blocking HTTP helpers (requests in worker thread)
+# Throttled, non-blocking HTTP helpers (requests in worker thread)
 # =============================================================================
+async def _throttle_http() -> None:
+    """Simple per-process min-interval gate + jitter to reduce 429s."""
+    global _LAST_HTTP_AT
+    min_interval = JUP_MIN_INTERVAL_MS / 1000.0
+    jitter = (random.uniform(0, JUP_JITTER_MS) / 1000.0) if JUP_JITTER_MS > 0 else 0.0
+    async with _rate_lock:
+        now = time.time()
+        wait = (min_interval + jitter) - (now - _LAST_HTTP_AT)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _LAST_HTTP_AT = time.time()
+
 async def _get_json(url: str, *, params: Optional[dict] = None, timeout: int = 20) -> dict:
-    def _req():
-        r = requests.get(url, params=params, timeout=timeout, headers=_UA)
-        r.raise_for_status()
-        return r.json()
-    return await asyncio.to_thread(_req)
+    await _throttle_http()
+    async with _http_sema:
+        def _req():
+            r = requests.get(url, params=params, timeout=timeout, headers=_UA)
+            r.raise_for_status()
+            return r.json()
+        return await asyncio.to_thread(_req)
 
 async def _post_json(url: str, *, json_body: dict, timeout: int = 25) -> dict:
-    def _req():
-        r = requests.post(url, json=json_body, timeout=timeout, headers=_UA)
-        r.raise_for_status()
-        return r.json()
-    return await asyncio.to_thread(_req)
+    await _throttle_http()
+    async with _http_sema:
+        def _req():
+            r = requests.post(url, json=json_body, timeout=timeout, headers=_UA)
+            r.raise_for_status()
+            return r.json()
+        return await asyncio.to_thread(_req)
 
 async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: str, **kwargs) -> Any:
     last_err: Optional[Exception] = None
@@ -119,6 +154,9 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
         except Exception as e:
             last_err = e
             if i < tries:
+                # log first failure at info level to reduce noise
+                if i == 1:
+                    log.event("ROUTER_RETRY_WARN", label=label, err=str(e))
                 await asyncio.sleep(backoff * i)
             else:
                 log.event("ROUTER_RETRY_FAIL", label=label, err=str(e))
@@ -220,7 +258,7 @@ class DynPriority:
         self.current_sol    = max(self.min_sol, min(self.max_sol, base))
         self._pending: Dict[str, float] = {}  # sig -> t0
         self._rpc = _Rpc(TX_RPC_URL or "")
-        self._seed_task: Optional[asyncio.Task[None]] = None  # no scheduling at import time
+        self._seed_task: Optional[asyncio.Task[None]] = None  # created on start()
 
     async def start(self) -> None:
         """Call once after the event loop is running to optionally seed from QuickNode."""
@@ -231,7 +269,6 @@ class DynPriority:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # Not inside a running loop yet; caller can retry later.
             return
         self._seed_task = loop.create_task(self._seed_from_qn())
 
@@ -264,7 +301,6 @@ class DynPriority:
         if not (self.enabled and sig):
             return
         self._pending[sig] = t0
-        # This runs only after transactions are submitted (i.e., loop is running)
         asyncio.create_task(self._watch(sig))
 
     async def _watch(self, sig: str) -> None:
@@ -304,9 +340,20 @@ class DynPriority:
 # module-level instance (safe: no tasks scheduled here)
 _PRIO = DynPriority()
 
-# Public hook to start optional background seeding (safe to call multiple times)
+# Public hooks to start/stop optional background seeding
 async def start() -> None:
     await _PRIO.start()
+
+async def shutdown() -> None:
+    # No open aiohttp sessions here; clear caches and stop seed task if running
+    with contextlib.suppress(Exception):
+        _QUOTE_CACHE.clear()
+        _PRICE_CACHE.clear()
+    t = getattr(_PRIO, "_seed_task", None)
+    if t and not t.done():
+        t.cancel()
+        with contextlib.suppress(Exception):
+            await t
 
 # =============================================================================
 # Quote cache/single-flight helpers
@@ -458,6 +505,7 @@ async def get_price_ui(mint: str) -> float:
 
     dec = await _get_decimals(mint)
     if dec is None:
+        # try a 1 SOL buy-quote to infer decimals if missing
         try:
             q = await get_buy_quote(mint=mint, amount_sol=1.0)
             out_raw = int(q.get("outAmount", "0"))
@@ -601,7 +649,8 @@ async def sell_via_lightning(
             await asyncio.sleep(RETRY_BACKOFF * attempt)
 
 __all__ = [
-    "start",              # NEW, optional
+    "start",
+    "shutdown",
     "get_sell_quote",
     "get_buy_quote",
     "get_price_ui",
