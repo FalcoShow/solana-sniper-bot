@@ -1,12 +1,10 @@
-# utils_pkg/router.py
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
-import time
-import json
 import random
-from collections import deque
+import time
 from typing import Any, Dict, Optional, Tuple, Callable
 
 import requests
@@ -17,9 +15,8 @@ from utils_pkg.solana_wallet import (
     get_pubkey_str,
     sign_and_send_b64_tx,
 )
-from utils_pkg.solana_token import fetch_mint_info
-# Only take constants; DO NOT pull in _Rpc (it uses aiohttp and leaks sessions)
-from utils_pkg.txlearn import TX_RPC_URL, TX_COMMITMENT  # keep compatibility
+# Only take constants; DO NOT import objects that open aiohttp sessions
+from utils_pkg.txlearn import TX_RPC_URL, TX_COMMITMENT  # noqa: F401  # keep compatibility
 
 log = get_logger()
 
@@ -46,21 +43,22 @@ def _envi(k: str, d: int) -> int:
     except Exception:
         return int(d)
 
+# DRY-RUN
 DRY_RUN = _envb("DRY_RUN", False)
 
 # Jupiter endpoints
 JUP_QUOTE_URL = os.getenv("JUP_QUOTE_URL", "https://quote-api.jup.ag/v6/quote")
 JUP_SWAP_URL  = os.getenv("JUP_SWAP_URL",  "https://quote-api.jup.ag/v6/swap")
 
-# Slippage: prefer PF_SLIPPAGE_BPS if present, else JUPITER_MAX_SLIPPAGE fraction
+# Slippage: prefer PF_SLIPPAGE_BPS, else JUPITER_MAX_SLIPPAGE (fraction), else default
 def _slippage_bps() -> int:
-    pf_bps = os.getenv("PF_SLIPPAGE_BPS")
-    if pf_bps:
+    v = os.getenv("PF_SLIPPAGE_BPS")
+    if v:
         try:
-            return max(1, int(pf_bps))
+            return max(1, int(v))
         except Exception:
             pass
-    s = _envf("JUPITER_MAX_SLIPPAGE", 0.0125)  # 1.25% default
+    s = _envf("JUPITER_MAX_SLIPPAGE", 0.0125)  # fraction, e.g. 0.06 => 600 bps
     return max(1, int(round(s * 10_000)))
 
 def _as_legacy() -> bool:
@@ -72,41 +70,21 @@ QUOTE_RETRIES = max(1, _envi("ROUTER_QUOTE_RETRIES", 1))
 SWAP_RETRIES  = max(1, _envi("ROUTER_SWAP_RETRIES", 2))
 RETRY_BACKOFF = max(0.05, _envf("ROUTER_RETRY_BACKOFF_SEC", 0.35))
 
-# Global Jupiter rate gate (strict token-bucket over 1s window)
-JUP_MAX_QPS = max(1, _envi("JUP_MAX_QPS", 3))
-class _QPSLimiter:
-    def __init__(self, qps: int) -> None:
-        self.qps = max(1, qps)
-        self._hits: deque[float] = deque()
-        self._lock = asyncio.Lock()
+# Global Jupiter rate gate (QPS)
+JUP_MAX_QPS   = max(1, _envi("JUP_MAX_QPS", 2))
+_JUP_MIN_INTERVAL = 1.0 / float(JUP_MAX_QPS)
+_JUP_RATE_LOCK = asyncio.Lock()
+_JUP_LAST_TS: float = 0.0
 
-    async def wait(self) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            # drop older than 1s
-            while self._hits and now - self._hits[0] > 1.0:
-                self._hits.popleft()
-            if len(self._hits) >= self.qps:
-                sleep_for = 1.0 - (now - self._hits[0])
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
-                # cleanup after sleeping
-                now = time.monotonic()
-                while self._hits and now - self._hits[0] > 1.0:
-                    self._hits.popleft()
-            self._hits.append(time.monotonic())
-
-_QPS = _QPSLimiter(JUP_MAX_QPS)
-
-# Caching / single-flight to cut quote storms
+# Caching / single-flight
 QUOTE_TTL_SEC = max(0.0, _envf("ROUTER_QUOTE_TTL_SEC", 2.0))
-PRICE_TTL_SEC = max(0.0, _envf("PF_PRICE_TTL_SEC", 5.0))  # shared with other modules
+PRICE_TTL_SEC = max(0.0, _envf("PF_PRICE_TTL_SEC", 5.0))
 _QUOTE_CACHE: Dict[str, Tuple[float, dict]] = {}          # key -> (expiry_ts, payload)
 _PRICE_CACHE: Dict[str, Tuple[float, float]] = {}         # mint -> (expiry_ts, price_ui)
 _QUOTE_FLIGHT: Dict[str, asyncio.Future[Any]] = {}        # key -> future
 _quote_lock = asyncio.Lock()
 
-# Optional budget hooks (soft gates). Fail open if module is missing.
+# Budget hooks (soft gates). Fail open if module missing.
 try:
     from utils_pkg import budget  # type: ignore
 except Exception:  # graceful no-ops
@@ -118,73 +96,26 @@ except Exception:  # graceful no-ops
     budget = _BudgetNoop()  # type: ignore
 
 # Common HTTP headers
-_UA = {"user-agent": "pnlsniper/1.1 (+router)"}
-
-# =============================================================================
-# Helpers
-# =============================================================================
-def normalize_pump_mint(raw: str) -> str:
-    """
-    Pump.fun sometimes appends 'pump' to the base58 mint.
-    Strip trailing 'pump' if present and the length is abnormally long.
-    """
-    s = (raw or "").strip()
-    if s.endswith("pump") and len(s) > 44:
-        s = s[:-4]
-    return s
+_UA = {"user-agent": "pnlsniper/1.0 (+router)"}
 
 # =============================================================================
 # Non-blocking HTTP helpers (requests in worker thread)
 # =============================================================================
-def _json_or_none(text: str) -> Optional[dict]:
-    try:
-        return json.loads(text)
-    except Exception:
-        return None
-
 async def _get_json(url: str, *, params: Optional[dict] = None, timeout: int = 20) -> dict:
     def _req():
         r = requests.get(url, params=params, timeout=timeout, headers=_UA)
-        # We inspect status ourselves (so we can treat 400/404/429 as soft)
-        status = r.status_code
-        body = r.text
-        if status == 200:
-            js = _json_or_none(body)
-            if isinstance(js, dict):
-                return js
-            raise requests.HTTPError(f"Malformed JSON (200) from {url}", response=r)
-        # For non-200, raise an HTTPError with response attached
-        err = requests.HTTPError(f"{status} {r.reason} for url: {r.url}", response=r)
-        raise err
+        r.raise_for_status()
+        return r.json()
     return await asyncio.to_thread(_req)
 
 async def _post_json(url: str, *, json_body: dict, timeout: int = 25) -> dict:
     def _req():
         r = requests.post(url, json=json_body, timeout=timeout, headers=_UA)
-        status = r.status_code
-        body = r.text
-        if 200 <= status < 300:
-            js = _json_or_none(body)
-            if isinstance(js, dict):
-                return js
-            raise requests.HTTPError(f"Malformed JSON ({status}) from {url}", response=r)
-        err = requests.HTTPError(f"{status} {r.reason} for url: {r.url}", response=r)
-        raise err
+        r.raise_for_status()
+        return r.json()
     return await asyncio.to_thread(_req)
 
-async def _backoff_sleep(i: int, base: float, *, jitter: bool = True) -> None:
-    t = base * max(1, i)
-    if jitter:
-        t *= (0.75 + random.random() * 0.5)
-    await asyncio.sleep(min(t, 8.0))
-
 async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: str, **kwargs) -> Any:
-    """
-    Retry wrapper that:
-      - treats 400/404 as soft-fail (no retry)
-      - honors Retry-After on 429
-      - does capped backoff for 5xx / timeouts
-    """
     last_err: Optional[Exception] = None
     for i in range(1, tries + 1):
         try:
@@ -192,56 +123,23 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
         except Exception as e:
             last_err = e
             status = getattr(getattr(e, "response", None), "status_code", None)
-            headers = getattr(getattr(e, "response", None), "headers", {}) or {}
-
-            # Soft-fail, do not retry
             if status in (400, 404):
                 log.event("ROUTER_RETRY_FAIL", label=label, err=str(e))
                 raise
-
-            # 429: honor Retry-After, else exponential-ish backoff
-            if status == 429:
-                ra = headers.get("Retry-After")
-                try:
-                    delay = float(ra) if ra is not None else None
-                except Exception:
-                    delay = None
+            if i < tries:
+                sleep_for = backoff * i * (0.75 + random.random() * 0.5)
                 log.event("ROUTER_RETRY_WARN", label=label, err=str(e))
-                await asyncio.sleep(delay if (delay is not None and delay >= 0) else min(1.0 * (2 ** (i - 1)), 8.0))
-            # 5xx / network: backoff
-            elif status is None or (500 <= int(status) < 600):
-                log.event("ROUTER_RETRY_WARN", label=label, err=str(e))
-                await _backoff_sleep(i, backoff)
+                await asyncio.sleep(sleep_for)
             else:
-                # Unknown code – single log then give up
                 log.event("ROUTER_RETRY_FAIL", label=label, err=str(e))
                 raise
-    # out of tries
     raise last_err if last_err else RuntimeError(f"{label} failed")
 
 # =============================================================================
-# Async decimals cache
+# Async decimals cache (pure RPC; no aiohttp)
 # =============================================================================
 _DECIMALS: Dict[str, int] = {}
 
-async def _get_decimals(mint: str) -> Optional[int]:
-    m = normalize_pump_mint(mint)
-    d = _DECIMALS.get(m)
-    if d is not None:
-        return d
-    try:
-        info = await fetch_mint_info(m)
-        if not info:
-            return None
-        dec, _owner = info
-        _DECIMALS[m] = int(dec)
-        return int(dec)
-    except Exception:
-        return None
-
-# =============================================================================
-# Minimal RPC helper (requests) — replaces txlearn._Rpc to avoid aiohttp leaks
-# =============================================================================
 def _rpc_post(method: str, params: list) -> dict:
     if not TX_RPC_URL:
         return {}
@@ -250,6 +148,43 @@ def _rpc_post(method: str, params: list) -> dict:
     r.raise_for_status()
     return r.json()
 
+def _mint_decimals_from_data(b: bytes) -> Optional[int]:
+    # SPL Mint layout: decimals at byte offset 44
+    try:
+        if len(b) >= 45:
+            return int(b[44])
+    except Exception:
+        pass
+    return None
+
+async def _get_decimals(mint: str) -> Optional[int]:
+    d = _DECIMALS.get(mint)
+    if d is not None:
+        return d
+
+    def _call() -> Optional[int]:
+        try:
+            js = _rpc_post("getAccountInfo", [mint, {"encoding": "base64"}])
+            val = js.get("result", {}).get("value", {})
+            data = val.get("data")
+            if isinstance(data, list) and data:
+                raw_b64 = data[0]
+                buf = base64.b64decode(raw_b64)
+                dec = _mint_decimals_from_data(buf)
+                if dec is not None:
+                    return int(dec)
+        except Exception:
+            return None
+        return None
+
+    dec = await asyncio.to_thread(_call)
+    if dec is not None:
+        _DECIMALS[mint] = int(dec)
+    return dec
+
+# =============================================================================
+# Signature status (pure RPC; used by dynamic priority feedback)
+# =============================================================================
 async def _get_signature_status(sig: str) -> Optional[dict]:
     def _call() -> Optional[dict]:
         try:
@@ -263,7 +198,7 @@ async def _get_signature_status(sig: str) -> Optional[dict]:
     return await asyncio.to_thread(_call)
 
 # =============================================================================
-# Dynamic priority fee controller (no aiohttp, uses _get_signature_status)
+# Dynamic priority fee controller (no aiohttp)
 # =============================================================================
 def _to_sol_from_lamports_like(x: float) -> float:
     lamports = float(x)
@@ -271,7 +206,6 @@ def _to_sol_from_lamports_like(x: float) -> float:
         lamports = lamports / 1e6  # micro-lamports -> lamports
     return lamports / 1e9
 
-# Optional QuickNode seed (best-effort)
 QN_PRIORITY_HINT   = _envb("QN_PRIORITY_HINT", False)
 QN_RPC_URL         = (os.getenv("SOL_RPC_URL") or "").strip()
 QN_HINT_TIMEOUT_S  = max(0.8, _envf("QN_PRIORITY_TIMEOUT_SEC", 2.5))
@@ -319,12 +253,21 @@ class DynPriority:
         self.max_sol        = _envf("PF_PRIORITY_MAX_SOL", max(self.min_sol, base * 5))
         self.current_sol    = max(self.min_sol, min(self.max_sol, base))
         self._pending: Dict[str, float] = {}  # sig -> t0
+        self._seed_task: Optional[asyncio.Task[None]] = None
 
     async def start(self) -> None:
         if not (self.enabled and QN_PRIORITY_HINT and QN_RPC_URL):
             return
+        if self._seed_task and not self._seed_task.done():
+            return
         try:
-            # seed once, in background
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._seed_task = loop.create_task(self._seed_from_qn())
+
+    async def _seed_from_qn(self) -> None:
+        try:
             seed = await asyncio.to_thread(_qn_priority_seed_blocking)
             if seed and seed > 0:
                 old = self.current_sol
@@ -337,7 +280,7 @@ class DynPriority:
     def choose_lamports(self, override_sol: Optional[float]) -> Optional[int]:
         if override_sol is not None:
             try:
-                return int(max(0.0, override_sol) * 1_000_000_000)
+                return int(max(0, override_sol) * 1_000_000_000)
             except Exception:
                 return None
         if not self.enabled:
@@ -356,7 +299,6 @@ class DynPriority:
 
     async def _watch(self, sig: str) -> None:
         deadline = time.time() + 45
-        poll = max(0.2, _envf("PF_STATUS_POLL_SEC", 0.9))
         while time.time() < deadline:
             try:
                 st = await _get_signature_status(sig)
@@ -371,7 +313,7 @@ class DynPriority:
                     return
             except Exception:
                 pass
-            await asyncio.sleep(poll)
+            await asyncio.sleep(max(0.2, _envf("PF_STATUS_POLL_SEC", 0.9)))
         self._pending.pop(sig, None)
         self._tune(self.target_sec * 2.0, had_error=False)
 
@@ -393,6 +335,22 @@ _PRIO = DynPriority()
 # Public hook to start optional background seeding (safe to call multiple times)
 async def start() -> None:
     await _PRIO.start()
+
+# Provide a no-op shutdown for compatibility (no aiohttp to close here)
+async def shutdown() -> None:
+    return None
+
+# =============================================================================
+# Jupiter rate gate
+# =============================================================================
+async def _jup_gate() -> None:
+    global _JUP_LAST_TS
+    async with _JUP_RATE_LOCK:
+        now = time.time()
+        wait_for = _JUP_MIN_INTERVAL - (now - _JUP_LAST_TS)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        _JUP_LAST_TS = time.time()
 
 # =============================================================================
 # Quote cache/single-flight helpers
@@ -429,26 +387,22 @@ async def _singleflight_quote(key: str, maker: Callable[[], "asyncio.Future[Any]
             _QUOTE_FLIGHT.pop(key, None)
 
 # =============================================================================
-# Low-level Jupiter helpers (async) with budget hooks + cache + QPS limiter
+# Low-level Jupiter helpers (async) with budget hooks + cache + rate gate
 # =============================================================================
 async def _jup_quote(
-    input_mint_raw: str,
-    output_mint_raw: str,
+    input_mint: str,
+    output_mint: str,
     amount_iu: int,
     *,
     slippage_bps: Optional[int] = None,
     swap_mode: str = "ExactIn",
     only_direct: bool = False,
-    as_legacy: Optional[bool] = None,  # kept for signature parity; NOT sent to /quote
 ) -> dict:
     if amount_iu <= 0:
         raise ValueError("amount_iu must be > 0")
 
-    input_mint = normalize_pump_mint(input_mint_raw)
-    output_mint = normalize_pump_mint(output_mint_raw)
-
     sbps = int(slippage_bps if slippage_bps is not None else _slippage_bps())
-    legacy = True if (as_legacy if as_legacy is not None else _as_legacy()) else False
+    legacy = _as_legacy()
     key = _qkey(input_mint, output_mint, amount_iu, sbps, swap_mode, only_direct, legacy)
 
     # cache hit?
@@ -460,10 +414,8 @@ async def _jup_quote(
         if not budget.before_quote():
             raise RuntimeError("quote blocked by budget")
 
-        # Global QPS limiter
-        await _QPS.wait()
+        await _jup_gate()
 
-        # DO NOT send asLegacyTransaction to /quote
         params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
@@ -472,27 +424,21 @@ async def _jup_quote(
             "swapMode": swap_mode,
             "onlyDirectRoutes": "true" if only_direct else "false",
         }
-
-        try:
-            js = await _get_json(JUP_QUOTE_URL, params=params, timeout=20)
-        finally:
-            budget.after_quote()
-
+        js = await _get_json(JUP_QUOTE_URL, params=params, timeout=20)
+        budget.after_quote()
         await _set_cached_quote(key, js, QUOTE_TTL_SEC)
         return js
 
     return await _singleflight_quote(key, _fetch)
 
 async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optional[int]) -> str:
-    # Rate-limit swap builds as well
-    await _QPS.wait()
+    await _jup_gate()
 
     body = {
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": True,
         "dynamicComputeUnitLimit": True,
         "quoteResponse": quote,
-        # asLegacy belongs here, not on /quote
         "asLegacyTransaction": True if _as_legacy() else False,
     }
     if priority_lamports is not None:
@@ -510,9 +456,8 @@ async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optiona
 async def get_sell_quote(*, mint: str, amount_raw: int, slippage_bps: Optional[int] = None) -> Dict[str, Any]:
     if amount_raw <= 0:
         raise ValueError("amount_raw must be > 0")
-    nm = normalize_pump_mint(mint)
     quote = await _retry(
-        _jup_quote, nm, SOL_MINT, amount_raw,
+        _jup_quote, mint, SOL_MINT, amount_raw,
         tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-sell",
         slippage_bps=slippage_bps,
     )
@@ -530,8 +475,6 @@ async def get_buy_quote(
     amount_sol: Optional[float] = None,
     slippage_bps: Optional[int] = None,
 ) -> Dict[str, Any]:
-    nm = normalize_pump_mint(mint)
-
     if lamports_in is None and amount_sol is None:
         pf = os.getenv("PF_TRADE_SOL")
         if pf:
@@ -540,37 +483,33 @@ async def get_buy_quote(
             raise ValueError("Provide lamports_in or amount_sol")
 
     if lamports_in is None:
-        lamports_in = int(max(0.0, amount_sol or 0.0) * 1_000_000_000)
+        lamports_in = int((amount_sol or 0.0) * 1_000_000_000)
 
     q = await _retry(
-        _jup_quote, SOL_MINT, nm, lamports_in,
+        _jup_quote, SOL_MINT, mint, lamports_in,
         tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-buy",
         slippage_bps=slippage_bps,
     )
     out_raw = int(q.get("outAmount", "0"))
-    dec = await _get_decimals(nm)
+    dec = await _get_decimals(mint)
     ui = out_raw / (10 ** dec) if (dec is not None and dec >= 0) else 0.0
     return {**q, "lamports_in": lamports_in, "out_amount_raw": out_raw, "out_amount_ui": ui, "decimals": dec}
 
 async def get_price_ui(mint: str) -> float:
-    nm = normalize_pump_mint(mint)
-
     # price cache
     if PRICE_TTL_SEC > 0:
-        rec = _PRICE_CACHE.get(nm)
+        rec = _PRICE_CACHE.get(mint)
         if rec and rec[0] >= time.time():
             return float(rec[1])
 
-    # Only compute price if we know decimals; otherwise return 0.0 (prevents storms)
-    dec = await _get_decimals(nm)
+    dec = await _get_decimals(mint)
     if dec is None or dec < 0:
         return 0.0
 
-    # tiny probe (in token units) – OK if route not yet available
-    tiny_raw = max(1, 10 ** max(0, dec - 3))
+    tiny_raw = max(1, 10 ** max(0, dec - 3))  # small, but avoids rounding to zero
     try:
         q = await _retry(
-            _jup_quote, nm, SOL_MINT, tiny_raw,
+            _jup_quote, mint, SOL_MINT, tiny_raw,
             tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-price",
         )
         lamports = int(q.get("outAmount", "0"))
@@ -580,7 +519,7 @@ async def get_price_ui(mint: str) -> float:
         tokens_ui = tiny_raw / (10 ** dec)
         px = sol_out / tokens_ui if tokens_ui > 0 else 0.0
         if PRICE_TTL_SEC > 0:
-            _PRICE_CACHE[nm] = (time.time() + PRICE_TTL_SEC, px)
+            _PRICE_CACHE[mint] = (time.time() + PRICE_TTL_SEC, px)
         return px
     except Exception:
         return 0.0
@@ -603,15 +542,13 @@ async def buy_via_lightning(
     slippage_bps: Optional[int] = None,
     priority_sol: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
-    nm = normalize_pump_mint(mint)
-
     kp = load_keypair()
     owner = get_pubkey_str(kp)
 
     if lamports_in is None:
         if amount_sol is None:
             amount_sol = _envf("PF_TRADE_SOL", 0.0)
-        lamports_in = int(max(0.0, amount_sol) * 1_000_000_000)
+        lamports_in = int(amount_sol * 1_000_000_000)
 
     if lamports_in <= 0:
         return False, None
@@ -619,19 +556,19 @@ async def buy_via_lightning(
     # Quote with retries (budget-aware via _jup_quote)
     try:
         quote = await _retry(
-            _jup_quote, SOL_MINT, nm, lamports_in,
+            _jup_quote, SOL_MINT, mint, lamports_in,
             tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-buy",
             slippage_bps=slippage_bps,
         )
     except Exception as e:
-        log.event("ROUTER_BUY_QUOTE_FAIL", mint=nm, err=str(e))
+        log.event("ROUTER_BUY_QUOTE_FAIL", mint=mint, err=str(e))
         return False, None
 
     if DRY_RUN:
         out_raw = int(quote.get("outAmount", "0"))
-        dec = await _get_decimals(nm)
+        dec = await _get_decimals(mint)
         out_ui = out_raw / (10 ** dec) if (dec is not None and dec >= 0) else 0.0
-        log.event("DRYRUN_BUY", mint=nm, lamports_in=lamports_in, out_ui=out_ui)
+        log.event("DRYRUN_BUY", mint=mint, lamports_in=lamports_in, out_ui=out_ui)
         return True, None
 
     # Swap with retries; bump priority between attempts
@@ -645,7 +582,7 @@ async def buy_via_lightning(
             return True, sig
         except Exception as e:
             if attempt >= SWAP_RETRIES:
-                log.event("ROUTER_BUY_SWAP_FAIL", mint=nm, err=str(e))
+                log.event("ROUTER_BUY_SWAP_FAIL", mint=mint, err=str(e))
                 return False, None
             _PRIO._tune(_PRIO.target_sec * 1.6, had_error=True)  # nudge up
             await asyncio.sleep(RETRY_BACKOFF * attempt)
@@ -659,7 +596,6 @@ async def sell_via_lightning(
     priority_sol: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
     del token_program  # not needed by Jupiter
-    nm = normalize_pump_mint(mint)
 
     if amount_raw <= 0:
         return False, None
@@ -670,17 +606,17 @@ async def sell_via_lightning(
     # Quote with retries (budget-aware via _jup_quote)
     try:
         quote = await _retry(
-            _jup_quote, nm, SOL_MINT, amount_raw,
+            _jup_quote, mint, SOL_MINT, amount_raw,
             tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-sell",
             slippage_bps=slippage_bps,
         )
     except Exception as e:
-        log.event("ROUTER_SELL_QUOTE_FAIL", mint=nm, err=str(e))
+        log.event("ROUTER_SELL_QUOTE_FAIL", mint=mint, err=str(e))
         return False, None
 
     if DRY_RUN:
         lamports = int(quote.get("outAmount", "0"))
-        log.event("DRYRUN_SELL", mint=nm, amount_raw=amount_raw, out_sol=lamports / 1e9)
+        log.event("DRYRUN_SELL", mint=mint, amount_raw=amount_raw, out_sol=lamports / 1e9)
         return True, None
 
     # Swap with retries; bump priority between attempts
@@ -694,13 +630,14 @@ async def sell_via_lightning(
             return True, sig
         except Exception as e:
             if attempt >= SWAP_RETRIES:
-                log.event("ROUTER_SELL_SWAP_FAIL", mint=nm, err=str(e))
+                log.event("ROUTER_SELL_SWAP_FAIL", mint=mint, err=str(e))
                 return False, None
             _PRIO._tune(_PRIO.target_sec * 1.6, had_error=True)
             await asyncio.sleep(RETRY_BACKOFF * attempt)
 
 __all__ = [
     "start",
+    "shutdown",
     "get_sell_quote",
     "get_buy_quote",
     "get_price_ui",
