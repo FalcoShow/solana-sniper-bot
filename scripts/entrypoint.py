@@ -20,7 +20,7 @@ from logging_setup import (
     hook_stdio,
 )
 
-BANNER = "sniper-entrypoint v1"
+BANNER = "sniper-entrypoint v2"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Tiny helpers
@@ -31,13 +31,11 @@ def _envf(name: str, default: float) -> float:
     except Exception:
         return float(default)
 
-
 def _envi(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
     except Exception:
         return int(default)
-
 
 def _envb(name: str, default: bool = False) -> bool:
     v = (os.getenv(name, "") or "").strip().lower()
@@ -45,26 +43,21 @@ def _envb(name: str, default: bool = False) -> bool:
         return default
     return v in {"1", "true", "yes", "y", "on"}
 
-
 def _round_down_step(x: float, step: float) -> float:
     if step <= 0:
         return x
     return math.floor(x / step) * step
 
-
 def _mask(s: str, head: int = 4) -> str:
     return (s[:head] + "...") if s else ""
 
-
 def _fmt_amt(x: float) -> str:
     return f"{x:.9f}".rstrip("0").rstrip(".")
-
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     if lo > hi:
         lo, hi = hi, lo
     return max(lo, min(hi, x))
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logger (global)
@@ -73,7 +66,6 @@ LOG_SERVICE = os.getenv("PF_SERVICE", "sniper")
 LOG_VERSION = os.getenv("PF_VERSION", "v1")
 log = get_logger(service=LOG_SERVICE, version=LOG_VERSION)
 install_excepthook(log)  # log uncaught exceptions as JSON
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Autosizer
@@ -170,7 +162,6 @@ async def autosize_once() -> float:
     _finalize(sized, why="ok", prev=prev, bal_sol=bal_sol)
     return sized
 
-
 async def _autosize_loop(refresh_sec: int, stop_evt: asyncio.Event):
     while not stop_evt.is_set():
         try:
@@ -179,12 +170,37 @@ async def _autosize_loop(refresh_sec: int, stop_evt: asyncio.Event):
             with suppress(Exception):
                 await autosize_once()
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Router bootstrap (safe, once)
+# ──────────────────────────────────────────────────────────────────────────────
+async def _start_subsystems() -> None:
+    """
+    Start optional background subsystems (currently: router priority seeder).
+    This is safe to call multiple times; the internal implementation is idempotent.
+    """
+    try:
+        from utils_pkg import router
+    except Exception as e:
+        log.once("router.import_fail", ttl=120, level=logging.ERROR,
+                 msg="ROUTER_IMPORT_FAIL", error=str(e))
+        return
+    try:
+        # don’t let a slow seed block boot forever
+        await asyncio.wait_for(router.start(), timeout=_envi("ROUTER_START_TIMEOUT_SEC", 3))
+        log.event("ROUTER_STARTED")
+    except asyncio.TimeoutError:
+        log.once("router.start.timeout", ttl=60, level=logging.WARNING,
+                 msg="ROUTER_START_TIMEOUT")
+    except Exception as e:
+        log.once("router.start.error", ttl=60, level=logging.WARNING,
+                 msg="ROUTER_START_ERROR", error=str(e))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Boot event (structured)
 # ──────────────────────────────────────────────────────────────────────────────
 def _boot_event() -> None:
     now = datetime.now(timezone.utc).isoformat()
+
     guardrails_keys = (
         "PF_TRADE_RISK_PCT",
         "PF_TRADE_MIN_SOL",
@@ -199,10 +215,21 @@ def _boot_event() -> None:
     )
     knobs = {k: os.getenv(k) for k in ("PF_SLIPPAGE_BPS", "PF_PRIORITY_SOL", "PF_POOLS") if k in os.environ}
 
+    # Router/Jupiter knobs (for observability)
+    router_keys = (
+        "JUP_MAX_QPS",
+        "ROUTER_QUOTE_RETRIES",
+        "ROUTER_SWAP_RETRIES",
+        "ROUTER_RETRY_BACKOFF_SEC",
+        "ROUTER_QUOTE_TTL_SEC",
+        "PF_PRICE_TTL_SEC",
+        "JUPITER_MAX_SLIPPAGE",
+        "JUP_AS_LEGACY",
+    )
+
     log.event(
         "BOOT",
         banner=BANNER,
-        time=now,
         py_unbuffered=os.getenv("PYTHONUNBUFFERED", ""),
         dry_run=os.getenv("DRY_RUN", ""),
         pf_service=LOG_SERVICE,
@@ -215,8 +242,8 @@ def _boot_event() -> None:
         telegram_chat_id=_mask(os.getenv("TELEGRAM_CHAT_ID", ""), 6),
         guardrails={k: os.getenv(k, "") for k in guardrails_keys},
         knobs=knobs,
+        router={k: os.getenv(k, "") for k in router_keys},
     )
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Handoff to scripts.main.main
@@ -248,7 +275,6 @@ async def _run_handoff(stop_evt: asyncio.Event) -> int:
         log.event("HANDOFF_ERROR", error=str(e))
         return 1
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Orchestration / shutdown wiring
 # ──────────────────────────────────────────────────────────────────────────────
@@ -264,6 +290,9 @@ async def _run_main_with_shutdown() -> int:
     for sig in (signal.SIGINT, signal.SIGTERM):
         with suppress(NotImplementedError):
             loop.add_signal_handler(sig, _sig_handler, sig.name)
+
+    # Hook subsystems (router priority seeding, etc.)
+    await _start_subsystems()
 
     # One shot autosize before we start
     await autosize_once()
@@ -285,12 +314,10 @@ async def _run_main_with_shutdown() -> int:
 
     return rc
 
-
 def _maybe_set_windows_policy():
     if sys.platform.startswith("win"):
         with suppress(Exception):
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())  # type: ignore[attr-defined]
-
 
 def _maybe_enable_uvloop():
     if sys.platform.startswith("linux"):
@@ -298,13 +325,11 @@ def _maybe_enable_uvloop():
             import uvloop  # type: ignore
             uvloop.install()
 
-
 def _maybe_hook_stdio():
     """Route print()/stderr to JSON logs based on PF_STDIO_HOOK (default: on)."""
     if _envb("PF_STDIO_HOOK", True):
         hook_stdio(log)
         log.event("STDIO_HOOKED", stdout_level="INFO", stderr_level="ERROR")
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint
@@ -324,7 +349,6 @@ async def main():
     if rc:
         await asyncio.sleep(0.05)  # give logs a tick to flush
         sys.exit(rc)
-
 
 if __name__ == "__main__":
     _maybe_set_windows_policy()

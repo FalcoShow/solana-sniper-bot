@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import traceback
@@ -42,10 +43,10 @@ except Exception:
         while not stop_evt.is_set():
             await asyncio.sleep(5)
 
-# Router pieces
+# Router pieces (price helper)
 try:
-    from utils_pkg import router  # to call router.start()/shutdown()
-    from utils_pkg.router import get_price_ui as _route_price_ui  # price helper
+    from utils_pkg import router  # safe: start() is idempotent in our rewrite
+    from utils_pkg.router import get_price_ui as _route_price_ui
 except Exception:
     router = None  # type: ignore
     async def _route_price_ui(_mint: str) -> float:  # type: ignore
@@ -77,9 +78,8 @@ def normalize_mint(maybe: str) -> str:
 def is_probable_mint(s: str) -> bool:
     """True if it looks like a Solana mint; uses utils if present + regex fallback."""
     try:
-        if _looks_like_mint is not None:
-            if _looks_like_mint(s):  # type: ignore
-                return True
+        if _looks_like_mint is not None and _looks_like_mint(s):  # type: ignore
+            return True
     except Exception:
         pass
     return bool(_BASE58_RE.fullmatch(s or ""))
@@ -369,9 +369,10 @@ class Strategy:
                 record_buy_result(ok=False, reason="buy_claimed_elsewhere")
                 return
 
-            # Execute buy using **normalized** mint
+            # Execute buy using **normalized** mint behind the concurrency semaphore
             try:
-                tx_sig = await maybe_buy(mint=mint_norm, ui=ui)
+                async with self._sema:
+                    tx_sig = await maybe_buy(mint=mint_norm, ui=ui)
                 if tx_sig:
                     record_buy_result(ok=True, reason="executed", sig=tx_sig)
                     if EXIT_ENGINE_ENABLED and not IS_DRYRUN:
@@ -524,12 +525,10 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
 
 async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     # Touch a startup heartbeat (optional; keeps your logger pattern intact)
-    try:
+    with contextlib.suppress(Exception):
         bump("boot")
-    except Exception:
-        pass
 
-    # Initialize dynamic priority (safe if router is missing)
+    # Initialize dynamic priority (safe if router is missing; idempotent)
     try:
         if router and hasattr(router, "start"):
             await router.start()
@@ -565,7 +564,7 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
                 backoff = min(backoff * 2, 30)
             await asyncio.sleep(backoff)
     finally:
-        # Graceful shutdown: stop sell loop and close router session (prevents aiohttp leaks)
+        # Graceful shutdown: stop sell loop; nothing to close in router now (requests-only)
         try:
             if _sell_stop is not None:
                 _sell_stop.set()
@@ -574,12 +573,6 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
                     await asyncio.wait_for(_sell_task, timeout=2.0)
         except Exception:
             pass
-        try:
-            if router and hasattr(router, "shutdown"):
-                await router.shutdown()
-        except Exception:
-            pass
 
 if __name__ == "__main__":
-    import contextlib
     asyncio.run(main())
