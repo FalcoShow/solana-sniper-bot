@@ -100,6 +100,7 @@ class DedupFilter(logging.Filter):
     """
     Collapse identical messages for a window. When the message is allowed again,
     the emitted record gets `suppressed: N` if any were skipped.
+    Uses monotonic time to be resilient to clock changes.
     """
     def __init__(self, window_sec: float = 20.0):
         super().__init__()
@@ -116,7 +117,7 @@ class DedupFilter(logging.Filter):
             event,
             line if line is not None else record.getMessage(),
         )
-        now = time.time()
+        now = time.monotonic()
         next_ok_at, suppressed = self._state.get(key, (0.0, 0))
         if now >= next_ok_at:
             if suppressed:
@@ -151,7 +152,7 @@ class EventLogger(logging.Logger):
         self.log(level, name, extra=fields, stacklevel=2)
 
     def once(self, key: str, ttl: float = 30.0, level: int = logging.INFO, msg: str | None = None, **fields):
-        now = time.time()
+        now = time.monotonic()
         with self._once_lock:
             last = self._once_seen.get(key, 0.0)
             if now - last < ttl:
@@ -229,7 +230,6 @@ class Heartbeat:
 
 _LOGGER_CLASS_SET = False
 
-
 def _env_level() -> int:
     lvl = os.getenv("PF_LOG_LEVEL") or os.getenv("LOG_LEVEL") or "INFO"
     mapping = {
@@ -242,22 +242,21 @@ def _env_level() -> int:
     }
     return mapping.get(lvl.upper(), logging.INFO)
 
-
 def _env_to_level(level_str: str) -> int:
     os.environ["PF_LOG_LEVEL"] = level_str
     return _env_level()
-
 
 def get_logger(
     name: str = "sniper",
     level: int | None = None,
     service: str | None = None,
     version: str | None = None,
-    dedup_window_sec: float | None = 20.0,
+    dedup_window_sec: float | None = None,
 ) -> EventLogger:
     """
     Create or retrieve a JSON logger configured for stdout.
     Honors env PF_LOG_LEVEL or LOG_LEVEL if `level` not provided.
+    Set PF_LOG_DEDUP_WINDOW_SEC to tune the default dedup window (seconds).
     """
     global _LOGGER_CLASS_SET
     if not _LOGGER_CLASS_SET:
@@ -269,6 +268,12 @@ def get_logger(
 
     if service is None:
         service = os.getenv("PF_SERVICE", "sniper")
+
+    if dedup_window_sec is None:
+        try:
+            dedup_window_sec = float(os.getenv("PF_LOG_DEDUP_WINDOW_SEC", "20.0"))
+        except Exception:
+            dedup_window_sec = 20.0
 
     log: EventLogger = logging.getLogger(name)  # type: ignore[assignment]
     log.setLevel(level)
@@ -283,7 +288,6 @@ def get_logger(
         log.addHandler(handler)
 
     return log
-
 
 def set_level(logger: logging.Logger, level_str: str):
     """Hot-switch log level (e.g., from a Telegram command)."""
@@ -333,7 +337,6 @@ class _PrintToLogger(TextIOBase):
 _stdout_original = sys.stdout
 _stderr_original = sys.stderr
 
-
 def hook_stdio(logger: EventLogger, stdout_level: int = logging.INFO, stderr_level: int = logging.ERROR):
     """
     Route print()/stdout/stderr to structured logs. Call early in your process.
@@ -341,7 +344,6 @@ def hook_stdio(logger: EventLogger, stdout_level: int = logging.INFO, stderr_lev
     global _stdout_original, _stderr_original
     sys.stdout = _PrintToLogger(logger, stdout_level)  # type: ignore[assignment]
     sys.stderr = _PrintToLogger(logger, stderr_level)  # type: ignore[assignment]
-
 
 def restore_stdio():
     """Undo hook_stdio (mainly useful for tests)."""
@@ -369,12 +371,10 @@ def install_excepthook(logger: EventLogger):
 
 _global_hb: Heartbeat | None = None
 
-
 def start_global_heartbeat(logger: EventLogger, interval: float = 30.0, name: str = "HEARTBEAT") -> Heartbeat:
     global _global_hb
     _global_hb = Heartbeat(logger, interval=interval, name=name).start()
     return _global_hb
-
 
 def bump(key: str, n: int = 1):
     if _global_hb:

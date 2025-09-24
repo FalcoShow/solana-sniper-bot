@@ -5,16 +5,15 @@ import os
 import math
 import asyncio
 import time
-from functools import lru_cache
 from typing import Optional, Dict, Any
 
 import aiohttp
 
 from utils_pkg.solana_token import fetch_mint_info
 
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Config / ENV
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 WSOL = "So11111111111111111111111111111111111111112"
 JUP_QUOTE_URL = os.getenv("JUP_QUOTE_URL", "https://quote-api.jup.ag/v6/quote")
 
@@ -37,28 +36,35 @@ TTL_SEC = _envf("PF_PRICE_TTL_SEC", 5.0)
 RETRIES = max(0, _envi("PF_PRICE_RETRIES", 1))
 BACKOFF_BASE = max(0.05, _envf("PF_PRICE_BACKOFF_BASE", 0.25))  # seconds
 
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Lightweight async HTTP
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 _session: aiohttp.ClientSession | None = None
 
 async def _get_session() -> aiohttp.ClientSession:
     global _session
     if _session is None or _session.closed:
-        timeout = aiohttp.ClientTimeout(total=9, connect=4)
-        _session = aiohttp.ClientSession(timeout=timeout)
+        timeout = aiohttp.ClientTimeout(total=10, connect=4)
+        _session = aiohttp.ClientSession(timeout=timeout, headers={"user-agent": "pnlsniper/1.0 (+pricefeed)"})
     return _session
 
 async def _http_json(url: str, params: Dict[str, Any]) -> Optional[dict]:
-    s = await _get_session()
+    sess = await _get_session()
     for attempt in range(RETRIES + 1):
         try:
-            async with s.get(url, params=params) as r:
+            async with sess.get(url, params=params) as r:
+                txt = await r.text()
                 if r.status != 200:
-                    # try next attempt
-                    await asyncio.sleep(BACKOFF_BASE * (attempt + 1)) if attempt < RETRIES else None
+                    if attempt < RETRIES:
+                        await asyncio.sleep(BACKOFF_BASE * (attempt + 1))
                     continue
-                return await r.json(content_type=None)
+                try:
+                    return await r.json(content_type=None)
+                except Exception:
+                    # Malformed JSON; retry if allowed
+                    if attempt < RETRIES:
+                        await asyncio.sleep(BACKOFF_BASE * (attempt + 1))
+                    continue
         except Exception:
             if attempt < RETRIES:
                 await asyncio.sleep(BACKOFF_BASE * (attempt + 1))
@@ -66,76 +72,55 @@ async def _http_json(url: str, params: Dict[str, Any]) -> Optional[dict]:
                 return None
     return None
 
-# -----------------------------------------------------------------------------
-# Decimals helper (cached)
-# -----------------------------------------------------------------------------
-@lru_cache(maxsize=2048)
-def _decimals_cached_sync(mint: str) -> Optional[int]:
-    """
-    Synchronously fetch mint decimals by bouncing into the running loop or creating one.
-    We keep this for places where we may be called from a background thread.
-    """
-    try:
-        coro = fetch_mint_info(mint)
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop and loop.is_running():
-            dec_owner = asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=8)
-        else:
-            dec_owner = asyncio.run(coro)
-        if not dec_owner:
-            return None
-        dec, _owner = dec_owner
-        return int(dec)
-    except Exception:
-        return None
+# ──────────────────────────────────────────────────────────────────────────────
+# Decimals cache (async)
+# ──────────────────────────────────────────────────────────────────────────────
+_DECIMALS: Dict[str, int] = {}
 
 async def _decimals_async(mint: str) -> Optional[int]:
+    d = _DECIMALS.get(mint)
+    if d is not None:
+        return d
     try:
-        dec_owner = await fetch_mint_info(mint)
-        if not dec_owner:
+        info = await fetch_mint_info(mint)
+        if not info:
             return None
-        dec, _owner = dec_owner
-        # warm the sync cache too
-        _decimals_cached_sync.cache_clear()  # avoid growing unbounded on rare mismatches
-        _decimals_cached_sync(mint)  # repopulate
+        dec, _owner = info
+        _DECIMALS[mint] = int(dec)
         return int(dec)
     except Exception:
         return None
 
-# -----------------------------------------------------------------------------
-# In-process cache for prices
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# In-process cache for prices (monotonic TTL)
+# ──────────────────────────────────────────────────────────────────────────────
 # key -> (price_sol_per_token (float), expires_at_monotonic (float))
 _CACHE: Dict[str, tuple[float, float]] = {}
 
-def _now() -> float:
-    # monotonic clock (doesn't jump)
+def _now_mono() -> float:
     return time.monotonic()
 
 def _cache_get(key: str) -> Optional[float]:
-    v = _CACHE.get(key)
-    if not v:
+    rec = _CACHE.get(key)
+    if not rec:
         return None
-    price, exp = v
-    if _now() < exp:
+    price, exp = rec
+    if _now_mono() < exp:
         return price
     _CACHE.pop(key, None)
     return None
 
 def _cache_put(key: str, price: float) -> None:
-    _CACHE[key] = (price, _now() + TTL_SEC)
+    _CACHE[key] = (float(price), _now_mono() + TTL_SEC)
 
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Quote helpers
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 async def _jup_quote(input_mint: str, output_mint: str, amount_iu: int) -> Optional[dict]:
     """
     Minimal Jupiter v6 /quote wrapper.
     - swapMode: ExactIn
-    - slippage is irrelevant for just quoting
+    - slippage is irrelevant for pricing
     """
     if amount_iu <= 0:
         return None
@@ -143,7 +128,7 @@ async def _jup_quote(input_mint: str, output_mint: str, amount_iu: int) -> Optio
         "inputMint": input_mint,
         "outputMint": output_mint,
         "amount": str(amount_iu),
-        "slippageBps": "50",        # irrelevant for quotes, but accepted
+        "slippageBps": "50",        # accepted by API; not used for pricing
         "swapMode": "ExactIn",
         "onlyDirectRoutes": "false",
         "asLegacyTransaction": "true",
@@ -154,8 +139,8 @@ async def _price_from_sell_probe(mint: str, decimals: int, probe_tokens_ui: floa
     """
     Compute price by selling a tiny token amount and dividing outAmount(SOL) / tokens_ui.
     """
-    tokens_ui = max(1e-9, probe_tokens_ui)
-    amount_raw = int(max(1, round(tokens_ui * (10 ** decimals))))
+    tokens_ui = max(1e-9, float(probe_tokens_ui))
+    amount_raw = int(max(1, round(tokens_ui * (10 ** int(decimals)))))
     data = await _jup_quote(mint, WSOL, amount_raw)
     if not data:
         return 0.0
@@ -164,8 +149,8 @@ async def _price_from_sell_probe(mint: str, decimals: int, probe_tokens_ui: floa
         if lamports <= 0:
             return 0.0
         sol_out = lamports / 1_000_000_000.0
-        price = sol_out / tokens_ui
-        return price if price > 0 and math.isfinite(price) else 0.0
+        px = sol_out / tokens_ui if tokens_ui > 0 else 0.0
+        return px if px > 0 and math.isfinite(px) else 0.0
     except Exception:
         return 0.0
 
@@ -178,34 +163,32 @@ async def _price_from_buy_invert(mint: str) -> float:
         return 0.0
     try:
         out_raw = int(data.get("outAmount", "0"))
-        # Need decimals to convert UI
         dec = await _decimals_async(mint)
         if dec is None or out_raw <= 0:
             return 0.0
-        tokens_ui = out_raw / (10 ** dec)
+        tokens_ui = out_raw / (10 ** int(dec))
         return (1.0 / tokens_ui) if tokens_ui > 0 else 0.0
     except Exception:
         return 0.0
 
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Public API
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 async def price_in_sol(mint: str, decimals_hint: Optional[int] = None, probe_tokens: float = 0.001) -> float:
     """
     Return estimated price in SOL for 1 token (UI units) for `mint`.
     - Uses tiny *sell* quote first (ExactIn), then falls back to *buy invert*.
     - Results are cached in-process for TTL_SEC seconds.
-    - `decimals_hint` speeds up first lookup; we’ll self-resolve if not provided.
+    - `decimals_hint` speeds up the first lookup; we’ll self-resolve if not provided.
     """
-    # Resolve decimals
+    # Resolve decimals (if unknown)
     decimals: Optional[int] = int(decimals_hint) if decimals_hint is not None else None
     if decimals is None or decimals < 0:
         decimals = await _decimals_async(mint)
         if decimals is None:
-            # as a last resort try inverse path without decimals first
+            # Fallback path that doesn’t need decimals
             price = await _price_from_buy_invert(mint)
             if price > 0:
-                # cache and return
                 _cache_put(f"{mint}:inv", price)
                 return price
             return 0.0

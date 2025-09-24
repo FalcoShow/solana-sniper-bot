@@ -22,7 +22,7 @@ from utils_pkg.router import sell_via_lightning  # returns (ok: bool, sig: Optio
 try:
     from utils_pkg.guardrails import note_close  # type: ignore
 except Exception:  # pragma: no cover
-    def note_close(*args, **kwargs):  # type: ignore
+    def note_close(*_args, **_kwargs):  # type: ignore
         return None
 
 log = get_logger()
@@ -90,10 +90,10 @@ MIN_NOTIONAL_SOL = max(0.0, _envf("PF_MIN_SELL_SOL", 0.0))
 SLIPPAGE_BPS     = _envi("PF_SLIPPAGE_BPS", 600)
 PRIORITY_SOL     = _envf("PF_PRIORITY_SOL", 0.002)
 
-LOOP_SEC             = max(2, _envi("PF_SELL_LOOP_SEC", 5))
-RETRY_COOLDOWN_SEC   = max(5, _envi("PF_SELL_RETRY_SEC", 20))
-PER_MINT_COOLDOWN_SEC= max(5, _envi("PF_SELL_MINT_COOLDOWN_SEC", 10))
-PRICE_TTL_SEC        = max(1, _envi("PF_PRICE_TTL_SEC", 5))  # credit-friendly
+LOOP_SEC              = max(2, _envi("PF_SELL_LOOP_SEC", 5))
+RETRY_COOLDOWN_SEC    = max(5, _envi("PF_SELL_RETRY_SEC", 20))
+PER_MINT_COOLDOWN_SEC = max(5, _envi("PF_SELL_MINT_COOLDOWN_SEC", 10))
+PRICE_TTL_SEC         = max(1, _envi("PF_PRICE_TTL_SEC", 5))  # credit-friendly
 
 MAX_CONC = _envi("PF_SELL_MAX_CONCURRENT", _envi("PF_MAX_CONCURRENT", 2))
 DRY_RUN  = _envb("DRY_RUN", False)
@@ -150,7 +150,14 @@ async def _fetch_price_ui(mint: str, *, decimals_hint: Optional[int]) -> float:
     tiny_raw = max(1, 10 ** max(0, decimals - 3))  # ~0.001 token
     try:
         q = await q_fn(mint=mint, amount_raw=int(tiny_raw)) if asyncio.iscoroutinefunction(q_fn) else q_fn(mint=mint, amount_raw=int(tiny_raw))  # type: ignore
-        out_sol = (q.get("out_amount_sol") or q.get("out_sol") or q.get("outSOL") or 0.0)
+        # Prefer direct SOL field; else compute from lamports_out
+        out_sol = (
+            q.get("out_amount_sol")
+            or q.get("out_sol")
+            or q.get("outSOL")
+            or (q.get("lamports_out", 0) / 1e9 if q.get("lamports_out") else 0.0)
+            or 0.0
+        )
         if not out_sol:
             return 0.0
         return float(out_sol) / (tiny_raw / (10 ** decimals))
@@ -229,17 +236,22 @@ async def _execute_sell(p: Dict[str, Any], *, reason: str, price_sol: float) -> 
     qty_raw = int(p.get("qty_raw", 0))
     decimals = int(p.get("decimals", 0) or 0)
     entry = float(p.get("avg_cost_sol", 0.0))
-    qty_ui = float(p.get("qty_ui", qty_raw / (10 ** decimals) if decimals else 0.0))
+    qty_ui = float(p.get("qty_ui", 0.0)) or (qty_raw / (10 ** decimals) if decimals else 0.0)
 
     if qty_raw <= 0 or qty_ui <= 0.0:
         log.event("SELL_SKIP_EMPTY", mint=mint)
         return
 
     sell_frac = _frac_for(reason)
-    sell_raw = int(max(1, math.floor(qty_raw * sell_frac)))
+    if sell_frac <= 0.0:
+        log.event("SELL_SKIP_ZERO_FRAC", mint=mint, reason=reason)
+        return
+
+    sell_raw = min(qty_raw, int(max(1, math.floor(qty_raw * sell_frac))))
 
     # min notional on selected slice
-    notional_sol = price_sol * ((sell_raw / (10 ** decimals)) if decimals else qty_ui * sell_frac)
+    sold_ui = (sell_raw / (10 ** decimals)) if decimals else qty_ui * (sell_raw / max(1, qty_raw))
+    notional_sol = price_sol * sold_ui
     if notional_sol < MIN_NOTIONAL_SOL:
         log.event("SELL_SKIP_SMALL", mint=mint, reason=reason,
                   notional_sol=notional_sol, min_sol=MIN_NOTIONAL_SOL, sell_frac=sell_frac)
@@ -254,7 +266,6 @@ async def _execute_sell(p: Dict[str, Any], *, reason: str, price_sol: float) -> 
     _last_attempt_at[mint] = now
 
     # est realized pnl for this slice
-    sold_ui = (sell_raw / (10 ** decimals)) if decimals else qty_ui * sell_frac
     est_realized_pnl = (price_sol - entry) * sold_ui
 
     if DRY_RUN:
@@ -325,8 +336,8 @@ async def _execute_sell(p: Dict[str, Any], *, reason: str, price_sol: float) -> 
 # Worker
 # ──────────────────────────────────────────────────────────────────────────────
 async def _process_one(p: Dict[str, Any], sem: asyncio.Semaphore):
-    mint = p["mint"]
-    if mint in _in_flight:
+    mint = p.get("mint")
+    if not mint or mint in _in_flight:
         return
 
     async with sem:

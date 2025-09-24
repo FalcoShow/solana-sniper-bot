@@ -1,7 +1,6 @@
 # utils_pkg/routeguard.py
 from __future__ import annotations
 
-import asyncio
 import os
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -26,19 +25,13 @@ def _envi(k: str, d: int) -> int:
     except Exception:
         return int(d)
 
-def _envf(k: str, d: float) -> float:
-    try:
-        return float(os.getenv(k, str(d)))
-    except Exception:
-        return float(d)
-
 # Global policy
 ALLOW_NO_BUY_ROUTE     = _envb("ROUTEGUARD_ALLOW_NO_ROUTE", True)
 REQUIRE_SELL_ROUTE     = _envb("ROUTEGUARD_REQUIRE_SELL", True)
 
 # Quote hygiene
-QUOTE_TTL_SEC          = max(1, _envi("PF_PRICE_TTL_SEC", 5))     # reuse buy quotes for a few seconds
-MAX_IMPACT_BPS         = max(0, _envi("ROUTEGUARD_MAX_IMPACT_BPS", 1500))  # ~15% price impact hard cap
+QUOTE_TTL_SEC          = max(1, _envi("PF_PRICE_TTL_SEC", 5))                 # reuse buy quotes briefly
+MAX_IMPACT_BPS         = max(0, _envi("ROUTEGUARD_MAX_IMPACT_BPS", 1500))     # ~15% cap
 
 # Cooldown to avoid hammering the same mint when no route
 NOROUTE_COOLDOWN_SEC   = max(60, _envi("ROUTEGUARD_NOROUTE_COOLDOWN_SEC", 600))
@@ -76,7 +69,7 @@ def clear_cache() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 def _impact_bps(q: Dict[str, Any]) -> int:
     """
-    Jupiter v6 returns priceImpactPct (fraction like 0.0123 for 1.23%).
+    Jupiter v6 returns priceImpactPct as a fraction (e.g., 0.0123 for 1.23%).
     Convert to BPS for easier thresholding.
     """
     try:
@@ -107,11 +100,16 @@ async def preflight(*, mint: str, lamports_in: int) -> Tuple[bool, Optional[Dict
       - Serve cached buy quotes for QUOTE_TTL_SEC to save credits.
       - If buy quote missing:
           - if ALLOW_NO_BUY_ROUTE → allow (return (True, None)) so PumpPortal fallback can run;
-          - else block.
-      - If REQUIRE_SELL_ROUTE → we also require a tiny sell quote to succeed.
-      - Block routes with absurd price impact (> MAX_IMPACT_BPS).
-      - Apply a per-mint no-route cooldown to reduce spam.
+          - else block and set per-mint cooldown.
+      - If REQUIRE_SELL_ROUTE → also require a tiny sell quote to succeed.
+      - Block routes with excessive price impact (> MAX_IMPACT_BPS).
+      - Per-mint cooldown after no-route to reduce spam.
     """
+    lamports_in = int(lamports_in)
+    if lamports_in <= 0:
+        log.event("RG_BAD_AMOUNT", mint=mint, lamports_in=lamports_in)
+        return False, None
+
     if not _cooldown_ok(mint):
         log.event("RG_COOLDOWN", mint=mint, secs_left=int(_noroute_until[mint] - time.time()))
         return False, None
@@ -120,12 +118,17 @@ async def preflight(*, mint: str, lamports_in: int) -> Tuple[bool, Optional[Dict
     q_buy = _get_cached_buy(mint, lamports_in)
     if q_buy is None:
         try:
-            q_buy = await get_buy_quote(mint=mint, lamports_in=int(lamports_in))
+            q_buy = await get_buy_quote(mint=mint, lamports_in=lamports_in)
             _put_cached_buy(mint, lamports_in, q_buy)
-            log.every(f"rg.buy.{mint}", n=12, msg="RG_BUY_QUOTE_OK",
-                      mint=mint, lamports_in=int(lamports_in),
-                      out_raw=int(q_buy.get("outAmount", 0)),
-                      impact_bps=_impact_bps(q_buy))
+            log.every(
+                f"rg.buy.{mint}",
+                n=12,
+                msg="RG_BUY_QUOTE_OK",
+                mint=mint,
+                lamports_in=lamports_in,
+                out_raw=int(q_buy.get("outAmount", 0)),
+                impact_bps=_impact_bps(q_buy),
+            )
         except Exception as e:
             if not ALLOW_NO_BUY_ROUTE:
                 _note_no_route(mint)

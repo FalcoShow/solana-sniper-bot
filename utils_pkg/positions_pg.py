@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 from logging_setup import get_logger
 
-# Prefer SQLAlchemy Core (sync) so we can safely call from async code without awaits
+# SQLAlchemy Core (sync) – safe to call from async code via threadpool if needed
 from sqlalchemy import (
     BigInteger,
     Column,
@@ -20,13 +20,12 @@ from sqlalchemy import (
     create_engine,
     func,
     select,
-    text,
     update as sa_update,
     insert as sa_insert,
     delete as sa_delete,
 )
-from sqlalchemy.engine import Engine, URL
-from sqlalchemy.exc import OperationalError, ProgrammingError, SQLAlchemyError
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 log = get_logger()
 
@@ -43,13 +42,9 @@ def _pick_dsn() -> str:
     else:
         raise RuntimeError("No Postgres DSN found. Set PG_DSN_INTERNAL/EXTERNAL or DATABASE_URL.")
 
-    # If user supplied an async DSN (e.g. postgresql+asyncpg), flip to a sync driver.
-    # Try psycopg2 first; fallback to psycopg if present.
+    # If async driver is provided, switch to sync (SQLAlchemy chooses default driver)
     if "+asyncpg" in dsn:
         dsn = dsn.replace("+asyncpg", "")
-
-    # If DSN is bare "postgresql://", SQLAlchemy will pick a default driver (usually psycopg2).
-    # You can force psycopg2 using: postgresql+psycopg2://...
     return dsn
 
 
@@ -79,7 +74,7 @@ positions = Table(
 sells = Table(
     "sells",
     _META,
-    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("id", Integer, primary_key=True, autoincrement=True),
     Column("mint", String, nullable=False),
     Column("qty_raw", BigInteger, nullable=False),
     Column("sig", String, nullable=True),
@@ -89,7 +84,7 @@ sells = Table(
 buys = Table(
     "buys",
     _META,
-    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("id", Integer, primary_key=True, autoincrement=True),
     Column("mint", String, nullable=False),
     Column("qty_raw", BigInteger, nullable=False),
     Column("price_per_token_sol", Float, nullable=False),
@@ -106,8 +101,6 @@ def _ensure_engine() -> Engine:
         return _ENGINE
 
     dsn = _pick_dsn()
-
-    # Build engine with sensible pooling. pool_pre_ping avoids stale connections.
     _ENGINE = create_engine(
         dsn,
         pool_size=int(os.getenv("PG_POOL_SIZE", "5") or 5),
@@ -116,13 +109,14 @@ def _ensure_engine() -> Engine:
         future=True,
     )
 
-    # Create tables if needed
     try:
         _META.create_all(_ENGINE)
     except SQLAlchemyError as e:
         raise RuntimeError(f"positions_pg: failed to create tables: {e}") from e
 
-    log.event("PG_POS_ENGINE_READY", dsn=dsn.split("@")[-1])  # mask creds
+    # mask credentials in log
+    masked = dsn.split("@")[-1]
+    log.event("PG_POS_ENGINE_READY", dsn=masked)
     return _ENGINE
 
 
@@ -134,24 +128,18 @@ def _qty_ui(qty_raw: int, decimals: int) -> float:
 
 
 def _row_to_pos(row) -> Dict[str, Any]:
-    # row is a RowMapping
-    d = dict(row._mapping)
+    d = dict(row._mapping)  # RowMapping -> dict
     d["qty_ui"] = _qty_ui(int(d.get("qty_raw", 0)), int(d.get("decimals", 0) or 0))
     return d
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public API (sync) — drop-in replacements for utils_pkg.positions
 # ──────────────────────────────────────────────────────────────────────────────
 def all() -> List[Dict[str, Any]]:
-    """
-    Return a list of open positions as dictionaries.
-    """
     eng = _ensure_engine()
     with eng.connect() as cx:
         res = cx.execute(select(positions))
-        out = [_row_to_pos(r) for r in res.fetchall()]
-    return out
+        return [_row_to_pos(r) for r in res.fetchall()]
 
 
 def get(mint: str) -> Optional[Dict[str, Any]]:
@@ -168,14 +156,10 @@ def remove(mint: str) -> None:
 
 
 def decrement_qty(mint: str, sold_raw: int) -> None:
-    """
-    Reduce qty_raw by sold_raw (will not go below zero).
-    """
     if sold_raw <= 0:
         return
     eng = _ensure_engine()
     with eng.begin() as cx:
-        # Fetch current qty to clamp
         res = cx.execute(select(positions.c.qty_raw).where(positions.c.mint == mint)).first()
         if not res:
             return
@@ -192,20 +176,12 @@ def decrement_qty(mint: str, sold_raw: int) -> None:
 
 
 def update_after_sell(*, mint: str, sold_raw: int, tx_sig: Optional[str], closed: bool) -> None:
-    """
-    After a successful sell:
-      - insert into sells log
-      - reduce position qty or remove entirely
-      - set last_sig
-    """
     if sold_raw <= 0:
         return
     eng = _ensure_engine()
     with eng.begin() as cx:
-        # log sell slice
         cx.execute(sa_insert(sells).values(mint=mint, qty_raw=int(sold_raw), sig=(tx_sig or None)))
 
-        # fetch current qty
         res = cx.execute(select(positions.c.qty_raw).where(positions.c.mint == mint)).first()
         if not res:
             return
@@ -222,9 +198,6 @@ def update_after_sell(*, mint: str, sold_raw: int, tx_sig: Optional[str], closed
 
 
 def record_sell(*, mint: str, qty_raw: int, sig: Optional[str]) -> None:
-    """
-    Convenience used by trader.sell_on_jupiter: log and decrement.
-    """
     update_after_sell(mint=mint, sold_raw=int(qty_raw), tx_sig=sig, closed=False)
 
 
@@ -255,7 +228,6 @@ def record_buy(
     now = time.time()
 
     with eng.begin() as cx:
-        # fetch existing (qty, avg_cost, decimals)
         cur = cx.execute(
             select(positions.c.qty_raw, positions.c.avg_cost_sol, positions.c.decimals)
             .where(positions.c.mint == mint)
@@ -263,12 +235,9 @@ def record_buy(
 
         if cur:
             old_qty_raw = int(cur[0] or 0)
-            old_dec = int(cur[2] or decimals)
-            # If decimals changed (shouldn’t in practice), trust the new decimals for UI math.
-            old_ui = _qty_ui(old_qty_raw, decimals)
+            old_ui = _qty_ui(old_qty_raw, decimals)  # trust latest decimals
             total_ui = old_ui + new_ui
             if total_ui <= 0:
-                # edge case: should not happen, but avoid div-by-zero
                 new_avg = px
             else:
                 old_avg = float(cur[1] or 0.0)
@@ -305,7 +274,6 @@ def record_buy(
                 )
             )
 
-        # buys log
         cx.execute(
             sa_insert(buys).values(
                 mint=mint,
@@ -315,8 +283,6 @@ def record_buy(
             )
         )
 
-
-# Convenience alias to match other modules’ imports
 __all__ = [
     "all",
     "get",

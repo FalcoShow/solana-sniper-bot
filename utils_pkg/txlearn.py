@@ -124,6 +124,8 @@ class _Rpc:
             await self._session.close()
 
     async def _call_raw(self, method: str, params: list, *, weight: int = 1) -> Any:
+        if not self.present:
+            raise RuntimeError("RPC URL not set")
         # soft budget gate
         if not budget.before_rpc(method, weight=weight):
             raise _SoftBudgetBlock()
@@ -251,6 +253,17 @@ class _Rpc:
             return []
         except Exception:
             return []
+
+    async def get_balance(self, owner: str) -> Optional[dict]:
+        """
+        Returns {"value": <lamports>} or None on error/soft budget block.
+        """
+        try:
+            return await self._call_raw("getBalance", [owner, {"commitment": TX_COMMITMENT}], weight=1)
+        except _SoftBudgetBlock:
+            return None
+        except Exception:
+            return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -721,7 +734,6 @@ async def resolve_mint_best_effort(
 
     # 1) Helius Parse API (if available)
     if signature and HELIUS_API_KEY:
-        # Reuse one session if available
         try:
             session = await (tx_rpcs[0]._ensure() if tx_rpcs else aiohttp.ClientSession(headers=_UA))
             m = await _hel_parse_for_mint(session, signature, owner)
@@ -816,3 +828,13 @@ async def resolve_then_learn_position(
         return await learner.resolve_then_learn(raw_id_or_mint, tx_sig)
     finally:
         await learner.close()
+
+
+__all__ = [
+    "RPC_URL",
+    "TX_RPC_URL",
+    "TX_COMMITMENT",
+    "_Rpc",
+    "learn_position",
+    "resolve_then_learn_position",
+]

@@ -19,15 +19,19 @@ from utils_pkg.router import (
     get_price_ui,
 )
 
-# Wallet + lightweight RPC
-from utils_pkg.solana_wallet import load_keypair, get_pubkey_str, sign_and_send_b64_tx
-from utils_pkg.txlearn import _Rpc, RPC_URL
+# Wallet & helpers
+from utils_pkg.solana_wallet import (
+    load_keypair,
+    get_pubkey_str,
+    sign_and_send_b64_tx,
+    get_balance_sol,  # <— use wallet helper for reliable balance
+)
 
 # Optional sizer (preferred)
 try:
     from utils_pkg.sizer import suggest_trade_sol as _auto_size_sol  # type: ignore
 except Exception:
-    _auto_size_sol = None  # fallback below
+    _auto_size_sol = None  # type: ignore
 
 # Optional safety filters (best-effort)
 try:
@@ -85,6 +89,10 @@ MIN_SOL_PER_TRADE        = _envf("PF_TRADE_MIN_SOL", 0.005)
 MAX_SOL_PER_TRADE        = _envf("PF_TRADE_MAX_SOL", 0.08)
 STEP_SOL                 = _envf("PF_TRADE_STEP_SOL", 0.005)
 
+# Clamp safety if misconfigured
+if MIN_SOL_PER_TRADE > MAX_SOL_PER_TRADE:
+    MIN_SOL_PER_TRADE, MAX_SOL_PER_TRADE = MAX_SOL_PER_TRADE, MIN_SOL_PER_TRADE
+
 # Buy pacing
 BUY_COOLDOWN_SEC         = _envi("BUY_COOLDOWN_SEC", 120)
 MAX_CONCURRENT_BUYS      = _envi("MAX_CONCURRENT_BUYS", 2)
@@ -94,12 +102,13 @@ NOROUTE_COOLDOWN_SEC     = _envi("NOROUTE_COOLDOWN_SEC", 600)
 ROUTE_ALLOW_NO_ROUTE     = _envb("ROUTEGUARD_ALLOW_NO_ROUTE", True)
 ROUTE_REQUIRE_SELL       = _envb("ROUTEGUARD_REQUIRE_SELL", True)
 
-# Momentum gate (optional)
+# Momentum gate (optional) — cache-aware to avoid false rejects
 MOMO_ENABLED             = _envb("ENTRY_MOMENTUM_ENABLED", True)
 MOMO_MIN_UP_PCT          = _envf("ENTRY_MOMO_MIN_UP_PCT", 5.0)     # +5% in window
-MOMO_WINDOW_SEC          = _envf("ENTRY_MOMO_WINDOW_SEC", 10.0)    # (informational)
+MOMO_WINDOW_SEC          = _envf("ENTRY_MOMO_WINDOW_SEC", 10.0)
 MOMO_PRICE_TRIES         = _envi("ENTRY_MOMO_PRICE_TRIES", 4)
 MOMO_PRICE_DELAY_S       = _envf("ENTRY_MOMO_PRICE_DELAY_S", 0.7)
+PRICE_TTL_SEC_ENV        = _envf("PF_PRICE_TTL_SEC", 5.0)          # from router cache
 
 # Liquidity screen (Strategy may run it; we reuse for sizing)
 LIQ_FILTER_ENABLED       = _envb("ENTRY_LIQ_FILTER", True)
@@ -123,9 +132,6 @@ _inflight = asyncio.Semaphore(MAX_CONCURRENT_BUYS)
 _last_autosize_at: float = 0.0
 _cached_wallet_sol: float = 0.0
 
-# RPC
-_rpc = _Rpc(RPC_URL or "")
-
 # =============================================================================
 # Small utils
 # =============================================================================
@@ -141,10 +147,9 @@ def _strip_pump_suffix(raw: str) -> Tuple[str, bool]:
     return s, False
 
 async def _get_sol_balance(owner: str) -> float:
+    """Best-effort SOL balance using wallet helper."""
     try:
-        res = await _rpc.get_balance(owner)
-        lamports = int((res or {}).get("value", 0))
-        return lamports / 1_000_000_000.0
+        return await get_balance_sol(owner)
     except Exception:
         return 0.0
 
@@ -162,21 +167,23 @@ def _note_no_route(key: str) -> None:
     _last_no_route[key] = time.time()
 
 # -----------------------------------------------------------------------------
-# Momentum gate (credit-efficient)
+# Momentum gate (credit-efficient & cache-aware)
 # -----------------------------------------------------------------------------
 async def _momentum_ok(mint: str) -> bool:
     """
-    Use a small, cached price probe only if the string looks like a real mint.
-    If it doesn't (newly-created pump ids), skip the price check here and let Strategy's
-    trade-count gate handle momentum, saving credits.
+    Lightweight momentum confirmation. To avoid false negatives when the router
+    price cache (PF_PRICE_TTL_SEC) ≈ momentum window, we skip internal momentum
+    if the TTL would mask price movement; Strategy's gate already covers it.
     """
     if not MOMO_ENABLED:
         return True
     if not looks_like_mint(mint):
         return True  # can't price pre-mint reliably; defer to external gate
+    if PRICE_TTL_SEC_ENV >= MOMO_WINDOW_SEC * 0.9:
+        return True
 
     tries = max(2, MOMO_PRICE_TRIES)
-    delay = max(0.2, MOMO_PRICE_DELAY_S)
+    delay = max(MOMO_PRICE_DELAY_S, PRICE_TTL_SEC_ENV + 0.1)
 
     px0 = await get_price_ui(mint)
     if px0 <= 0:
@@ -191,8 +198,16 @@ async def _momentum_ok(mint: str) -> bool:
 
     pct_up = (last_px / px0 - 1.0) * 100.0
     ok = pct_up >= MOMO_MIN_UP_PCT
-    log.every(f"momo.{mint}", n=8, msg="ENTRY_MOMO",
-              mint=mint, px0=px0, px1=last_px, pct_up=round(pct_up, 2), ok=int(ok))
+    log.every(
+        f"momo.{mint}",
+        n=8,
+        msg="ENTRY_MOMO",
+        mint=mint,
+        px0=px0,
+        px1=last_px,
+        pct_up=round(pct_up, 2),
+        ok=int(ok),
+    )
     return ok
 
 # -----------------------------------------------------------------------------
@@ -376,7 +391,7 @@ async def maybe_buy(*, mint: str, ui: Optional[Dict[str, Any]] = None) -> Option
         log.event("BUY_BLOCK_LOW_BAL", owner=owner, bal_sol=bal, min_sol=MIN_SOL_BALANCE)
         return None
 
-    # Momentum gate (cheap & safe)
+    # Momentum gate (cheap & safe; cache-aware)
     if not await _momentum_ok(mint):
         log.event("BUY_BLOCK_MOMENTUM", mint=mint)
         return None
@@ -421,7 +436,7 @@ async def maybe_buy(*, mint: str, ui: Optional[Dict[str, Any]] = None) -> Option
                 ok2, sig = await buy_via_lightning(
                     mint=mint,
                     amount_sol=spend_sol,
-                    slippage_bps=None,   # router has its own slippage/env
+                    slippage_bps=None,   # router/env decide
                     priority_sol=None,   # dynamic priority inside router
                 )
                 if ok2 and sig:
@@ -486,7 +501,7 @@ async def maybe_buy(*, mint: str, ui: Optional[Dict[str, Any]] = None) -> Option
                 tx_b64 = resp.get("transaction") or resp.get("tx")
                 if tx_b64:
                     try:
-                        sig2 = sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
+                        sig2 = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
                         _last_buy_at_global = time.time()
                         bump("buys_ok")
                         log.event("BUY_EXEC_OK_PP_SIGN", mint=mint, pool=pool, spend_sol=spend_sol, sig=sig2)

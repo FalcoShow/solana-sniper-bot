@@ -1,3 +1,4 @@
+# utils_pkg/router.py
 from __future__ import annotations
 
 import asyncio
@@ -15,10 +16,19 @@ from utils_pkg.solana_wallet import (
     get_pubkey_str,
     sign_and_send_b64_tx,
 )
-# Only take constants; DO NOT import objects that open aiohttp sessions
-from utils_pkg.txlearn import TX_RPC_URL, TX_COMMITMENT  # noqa: F401  # keep compatibility
 
 log = get_logger()
+
+# Try to import txlearn constants; fall back to env-safe defaults.
+try:
+    from utils_pkg.txlearn import RPC_URL as _TX_RPC_URL, TX_COMMITMENT as _TX_COMMITMENT  # type: ignore
+except Exception:
+    _TX_RPC_URL = os.getenv("SOL_RPC_URL") or "https://api.mainnet-beta.solana.com"
+    _TX_COMMITMENT = "confirmed"
+
+# Expose for compatibility with older imports that expect these names here
+TX_RPC_URL = _TX_RPC_URL
+TX_COMMITMENT = _TX_COMMITMENT
 
 # =============================================================================
 # Config / ENV
@@ -46,6 +56,11 @@ def _envi(k: str, d: int) -> int:
 # DRY-RUN
 DRY_RUN = _envb("DRY_RUN", False)
 
+# HTTP knobs
+HTTP_TIMEOUT_GET  = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
+HTTP_TIMEOUT_POST = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_POST_SEC", 25.0))
+RPC_TIMEOUT_SEC   = max(3.0, _envf("ROUTER_RPC_TIMEOUT_SEC", 10.0))
+
 # Jupiter endpoints
 JUP_QUOTE_URL = os.getenv("JUP_QUOTE_URL", "https://quote-api.jup.ag/v6/quote")
 JUP_SWAP_URL  = os.getenv("JUP_SWAP_URL",  "https://quote-api.jup.ag/v6/swap")
@@ -71,9 +86,9 @@ SWAP_RETRIES  = max(1, _envi("ROUTER_SWAP_RETRIES", 2))
 RETRY_BACKOFF = max(0.05, _envf("ROUTER_RETRY_BACKOFF_SEC", 0.35))
 
 # Global Jupiter rate gate (QPS)
-JUP_MAX_QPS   = max(1, _envi("JUP_MAX_QPS", 2))
+JUP_MAX_QPS       = max(1, _envi("JUP_MAX_QPS", 2))
 _JUP_MIN_INTERVAL = 1.0 / float(JUP_MAX_QPS)
-_JUP_RATE_LOCK = asyncio.Lock()
+_JUP_RATE_LOCK    = asyncio.Lock()
 _JUP_LAST_TS: float = 0.0
 
 # Caching / single-flight
@@ -101,17 +116,30 @@ _UA = {"user-agent": "pnlsniper/1.0 (+router)"}
 # =============================================================================
 # Non-blocking HTTP helpers (requests in worker thread)
 # =============================================================================
-async def _get_json(url: str, *, params: Optional[dict] = None, timeout: int = 20) -> dict:
+async def _get_json(url: str, *, params: Optional[dict] = None, timeout: float | int = HTTP_TIMEOUT_GET) -> dict:
     def _req():
         r = requests.get(url, params=params, timeout=timeout, headers=_UA)
         r.raise_for_status()
+        ctype = (r.headers.get("content-type") or "").lower()
+        if "application/json" not in ctype:
+            # Jupiter sometimes still returns JSON with odd ctype; try best-effort
+            try:
+                return r.json()
+            except Exception:
+                raise RuntimeError(f"Non-JSON response: {ctype} {r.text[:200]}")
         return r.json()
     return await asyncio.to_thread(_req)
 
-async def _post_json(url: str, *, json_body: dict, timeout: int = 25) -> dict:
+async def _post_json(url: str, *, json_body: dict, timeout: float | int = HTTP_TIMEOUT_POST) -> dict:
     def _req():
         r = requests.post(url, json=json_body, timeout=timeout, headers=_UA)
         r.raise_for_status()
+        ctype = (r.headers.get("content-type") or "").lower()
+        if "application/json" not in ctype:
+            try:
+                return r.json()
+            except Exception:
+                raise RuntimeError(f"Non-JSON response: {ctype} {r.text[:200]}")
         return r.json()
     return await asyncio.to_thread(_req)
 
@@ -123,6 +151,7 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
         except Exception as e:
             last_err = e
             status = getattr(getattr(e, "response", None), "status_code", None)
+            # Don't waste time on guaranteed-bad inputs
             if status in (400, 404):
                 log.event("ROUTER_RETRY_FAIL", label=label, err=str(e))
                 raise
@@ -144,7 +173,10 @@ def _rpc_post(method: str, params: list) -> dict:
     if not TX_RPC_URL:
         return {}
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    r = requests.post(TX_RPC_URL, json=payload, timeout=10, headers=_UA)
+    if not budget.before_rpc(method):
+        return {}
+    r = requests.post(TX_RPC_URL, json=payload, timeout=RPC_TIMEOUT_SEC, headers=_UA)
+    budget.after_rpc(method)
     r.raise_for_status()
     return r.json()
 
@@ -374,11 +406,11 @@ async def _set_cached_quote(key: str, payload: dict, ttl: float) -> None:
     if ttl > 0:
         _QUOTE_CACHE[key] = (time.time() + ttl, payload)
 
-async def _singleflight_quote(key: str, maker: Callable[[], "asyncio.Future[Any]"]) -> dict:
+async def _singleflight_quote(key: str, maker: Callable[[], Any]) -> dict:
     async with _quote_lock:
         fut = _QUOTE_FLIGHT.get(key)
         if fut is None:
-            fut = asyncio.ensure_future(maker())
+            fut = asyncio.ensure_future(maker())  # maker returns a coroutine
             _QUOTE_FLIGHT[key] = fut
     try:
         return await fut
@@ -424,7 +456,7 @@ async def _jup_quote(
             "swapMode": swap_mode,
             "onlyDirectRoutes": "true" if only_direct else "false",
         }
-        js = await _get_json(JUP_QUOTE_URL, params=params, timeout=20)
+        js = await _get_json(JUP_QUOTE_URL, params=params, timeout=HTTP_TIMEOUT_GET)
         budget.after_quote()
         await _set_cached_quote(key, js, QUOTE_TTL_SEC)
         return js
@@ -444,7 +476,7 @@ async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optiona
     if priority_lamports is not None:
         body["prioritizationFeeLamports"] = int(priority_lamports)
 
-    js = await _post_json(JUP_SWAP_URL, json_body=body, timeout=25)
+    js = await _post_json(JUP_SWAP_URL, json_body=body, timeout=HTTP_TIMEOUT_POST)
     tx_b64 = js.get("swapTransaction")
     if not tx_b64:
         raise RuntimeError(f"Jupiter returned no swapTransaction: {js}")
@@ -645,4 +677,6 @@ __all__ = [
     "price_of",
     "buy_via_lightning",
     "sell_via_lightning",
+    "TX_RPC_URL",
+    "TX_COMMITMENT",
 ]

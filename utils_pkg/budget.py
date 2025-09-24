@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 try:
     import redis  # type: ignore
@@ -120,13 +120,22 @@ def _billing_month_key(ts: Optional[float] = None) -> Tuple[str, int]:
 # ──────────────────────────────────────────────────────────────────────────────
 class _RedisStore:
     def __init__(self, url: str):
-        self.r = redis.Redis.from_url(url, socket_timeout=1.5, socket_connect_timeout=1.5, decode_responses=True)
+        self.r = redis.Redis.from_url(  # type: ignore[attr-defined]
+            url,
+            socket_timeout=1.5,
+            socket_connect_timeout=1.5,
+            decode_responses=True,
+        )
+        try:
+            self.r.ping()
+        except Exception as e:
+            raise RuntimeError(f"Redis ping failed: {e}") from e
 
     # Minute counters (soft rate limit)
     def minute_incr(self, bucket: str, n: int) -> int:
         key = f"budget:minute:{bucket}"
         pipe = self.r.pipeline()
-        pipe.incrby(key, n)
+        pipe.incrby(key, int(n))
         pipe.expire(key, 120)  # keep ~2 minutes
         v, _ = pipe.execute()
         return int(v or 0)
@@ -138,7 +147,7 @@ class _RedisStore:
     def day_incr(self, bucket: str, n: int) -> int:
         key = f"budget:day:{bucket}"
         pipe = self.r.pipeline()
-        pipe.incrby(key, n)
+        pipe.incrby(key, int(n))
         pipe.expire(key, 48 * 3600)
         v, _ = pipe.execute()
         return int(v or 0)
@@ -149,7 +158,7 @@ class _RedisStore:
     # Monthly credits (QuickNode)
     def month_incr(self, month_key: str, n: int) -> int:
         key = f"budget:month_used:{month_key}"
-        return int(self.r.incrby(key, n) or 0)
+        return int(self.r.incrby(key, int(n)) or 0)
 
     def month_get(self, month_key: str) -> int:
         return int(self.r.get(f"budget:month_used:{month_key}") or 0)
@@ -157,81 +166,94 @@ class _RedisStore:
 class _FileStore:
     """
     Simple JSON file; best-effort single-dyno. Safe under one process,
-    not atomic across multiple dynos. We still provide it as a hard fallback.
+    not atomic across multiple dynos. Provides per-bucket counters.
     """
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.Lock()
-        self._state = self._load()
+        self._state: Dict[str, Any] = self._load()
 
-    def _load(self) -> Dict[str, any]:
+    def _load(self) -> Dict[str, Any]:
         try:
             d = os.path.dirname(self.path)
             if d and not os.path.exists(d):
                 os.makedirs(d, exist_ok=True)
             if os.path.exists(self.path):
-                with open(self.path, "r") as f:
-                    return json.load(f)
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        # ensure sub-structures
+                        data.setdefault("minute", {})
+                        data.setdefault("day", {})
+                        data.setdefault("month_used", {})
+                        return data
         except Exception:
             pass
-        return {}
+        return {"minute": {}, "day": {}, "month_used": {}}
 
     def _save(self) -> None:
         try:
-            with open(self.path, "w") as f:
+            with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(self._state, f)
         except Exception:
             pass
 
+    def _prune_minutes(self, keep_bucket: str) -> None:
+        # Keep only current minute buckets to cap growth
+        pref = keep_bucket.split(":")[0] + ":"
+        minute_root: Dict[str, int] = self._state.setdefault("minute", {})
+        for k in list(minute_root.keys()):
+            # drop any minute buckets not equal to current minute for same prefix
+            if k.startswith(pref) and k != keep_bucket:
+                minute_root.pop(k, None)
+
     def minute_incr(self, bucket: str, n: int) -> int:
         with self._lock:
-            now_key = bucket
-            cur = int(self._state.get("minute_key") == now_key and int(self._state.get("minute_count", 0)) or 0)
-            if self._state.get("minute_key") != now_key:
-                self._state["minute_key"] = now_key
-                self._state["minute_count"] = 0
-                cur = 0
-            cur += int(n)
-            self._state["minute_count"] = cur
+            minute_root: Dict[str, int] = self._state.setdefault("minute", {})
+            cur = int(minute_root.get(bucket, 0)) + int(n)
+            minute_root[bucket] = cur
+            self._prune_minutes(bucket)
             self._save()
             return cur
 
     def minute_get(self, bucket: str) -> int:
         with self._lock:
-            if self._state.get("minute_key") != bucket:
-                return 0
-            return int(self._state.get("minute_count", 0))
+            minute_root: Dict[str, int] = self._state.setdefault("minute", {})
+            return int(minute_root.get(bucket, 0))
 
     def day_incr(self, bucket: str, n: int) -> int:
         with self._lock:
-            if self._state.get("day_key") != bucket:
-                self._state["day_key"] = bucket
-                self._state["day_count"] = 0
-            cur = int(self._state.get("day_count", 0)) + int(n)
-            self._state["day_count"] = cur
+            day_root: Dict[str, int] = self._state.setdefault("day", {})
+            cur = int(day_root.get(bucket, 0)) + int(n)
+            day_root[bucket] = cur
+            # optional prune: keep only current day buckets for same prefix
+            pref = bucket.split(":")[0] + ":"
+            for k in list(day_root.keys()):
+                if k.startswith(pref) and k != bucket:
+                    day_root.pop(k, None)
             self._save()
             return cur
 
     def day_get(self, bucket: str) -> int:
         with self._lock:
-            if self._state.get("day_key") != bucket:
-                return 0
-            return int(self._state.get("day_count", 0))
+            day_root: Dict[str, int] = self._state.setdefault("day", {})
+            return int(day_root.get(bucket, 0))
 
     def month_incr(self, month_key: str, n: int) -> int:
         with self._lock:
-            mk = f"used:{month_key}"
-            used = int(self._state.get(mk, 0)) + int(n)
-            self._state[mk] = used
+            m: Dict[str, int] = self._state.setdefault("month_used", {})
+            used = int(m.get(month_key, 0)) + int(n)
+            m[month_key] = used
             self._save()
             return used
 
     def month_get(self, month_key: str) -> int:
         with self._lock:
-            return int(self._state.get(f"used:{month_key}", 0))
+            m: Dict[str, int] = self._state.setdefault("month_used", {})
+            return int(m.get(month_key, 0))
 
 # pick backend
-_store = None  # type: ignore
+_store: Any
 if REDIS_URL and redis is not None:
     try:
         _store = _RedisStore(REDIS_URL)
@@ -262,7 +284,10 @@ def _forecast_frac(used: int, period_start: int, cap: int) -> float:
     el = max(1.0, time.time() - period_start)
     per_sec = used / el
     approx_month_secs = 30 * 24 * 3600  # close enough for guard purposes
-    return min(1.5, (per_sec * approx_month_secs) / max(1, cap))
+    try:
+        return min(1.5, (per_sec * approx_month_secs) / max(1, cap))
+    except Exception:
+        return 0.0
 
 def snapshot() -> BudgetSnapshot:
     mk, start = _billing_month_key()
@@ -298,8 +323,14 @@ def allow_rpc(method: str, *, weight: Optional[int] = None) -> bool:
         return False
     if s.forecast_frac >= ALERT_FRAC:
         # still allow, but we’ll log a warning
-        log.every("budget.forecast", n=10, msg="BUDGET_FORECAST_HIGH",
-                  used=s.used, cap=s.cap, forecast_frac=round(s.forecast_frac, 3))
+        log.every(
+            "budget.forecast",
+            n=10,
+            msg="BUDGET_FORECAST_HIGH",
+            used=s.used,
+            cap=s.cap,
+            forecast_frac=round(s.forecast_frac, 3),
+        )
     # minute gate
     w = int(weight if weight is not None else _method_weight(method))
     cur_min = _store.minute_get(f"rpc:{_minute_key()}")
@@ -314,10 +345,22 @@ def note_rpc(method: str, *, weight: Optional[int] = None) -> None:
     # minute bucket
     cur_min = _store.minute_incr(f"rpc:{_minute_key()}", w)
     if used / max(1, MONTHLY_CAP) >= ALERT_FRAC:
-        log.every("budget.alert", n=5, msg="BUDGET_ALERT_USAGE",
-                  used=used, cap=MONTHLY_CAP, pct=round(100 * used / max(1, MONTHLY_CAP), 2))
+        log.every(
+            "budget.alert",
+            n=5,
+            msg="BUDGET_ALERT_USAGE",
+            used=used,
+            cap=MONTHLY_CAP,
+            pct=round(100 * used / max(1, MONTHLY_CAP), 2),
+        )
     if cur_min > RPC_PER_MIN:
-        log.every("budget.rpm", n=5, msg="BUDGET_MINUTE_RPC_HOT", count=cur_min, limit=RPC_PER_MIN)
+        log.every(
+            "budget.rpm",
+            n=5,
+            msg="BUDGET_MINUTE_RPC_HOT",
+            count=cur_min,
+            limit=RPC_PER_MIN,
+        )
 
 def allow_quote(kind: str = "jup_quote", *, units: int = 1) -> bool:
     """
@@ -348,9 +391,15 @@ def before_rpc(method: str, *, weight: Optional[int] = None) -> bool:
     ok = allow_rpc(method, weight=weight)
     if not ok:
         s = snapshot()
-        log.event("BUDGET_BLOCK_RPC",
-                  method=method, used=s.used, cap=s.cap, used_pct=round(100*s.used/s.cap, 2),
-                  minute=_store.minute_get(f"rpc:{_minute_key()}"), rpm_limit=RPC_PER_MIN)
+        log.event(
+            "BUDGET_BLOCK_RPC",
+            method=method,
+            used=s.used,
+            cap=s.cap,
+            used_pct=round(100 * s.used / max(1, s.cap), 2),
+            minute=_store.minute_get(f"rpc:{_minute_key()}"),
+            rpm_limit=RPC_PER_MIN,
+        )
     return ok
 
 def after_rpc(method: str, *, weight: Optional[int] = None) -> None:
@@ -361,10 +410,27 @@ def before_quote(units: int = 1) -> bool:
     ok = allow_quote(units=units)
     if not ok:
         s = snapshot()
-        log.event("BUDGET_BLOCK_QUOTE",
-                  minute=s.jup_this_min, rpm_limit=JUP_PER_MIN,
-                  day=s.jup_today, daily_limit=JUP_DAILY_CAP)
+        log.event(
+            "BUDGET_BLOCK_QUOTE",
+            minute=s.jup_this_min,
+            rpm_limit=JUP_PER_MIN,
+            day=s.jup_today,
+            daily_limit=JUP_DAILY_CAP,
+        )
     return ok
 
 def after_quote(units: int = 1) -> None:
     note_quote(units=units)
+
+__all__ = [
+    "BudgetSnapshot",
+    "snapshot",
+    "allow_rpc",
+    "note_rpc",
+    "allow_quote",
+    "note_quote",
+    "before_rpc",
+    "after_rpc",
+    "before_quote",
+    "after_quote",
+]

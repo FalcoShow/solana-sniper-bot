@@ -1,1 +1,1 @@
-worker: py core.py
+worker: python -m scripts.main
