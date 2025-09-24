@@ -114,6 +114,75 @@ except Exception:  # graceful no-ops
 _UA = {"user-agent": "pnlsniper/1.0 (+router)"}
 
 # =============================================================================
+# Base58 helpers (no external dep required)
+# =============================================================================
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_IDX = {c: i for i, c in enumerate(_B58_ALPHABET)}
+
+def _b58decode(s: str) -> bytes:
+    """Minimal base58 decode (no checksum)."""
+    s = (s or "").strip()
+    if not s:
+        return b""
+    n = 0
+    for ch in s:
+        i = _B58_IDX.get(ch)
+        if i is None:
+            raise ValueError("invalid base58 char")
+        n = n * 58 + i
+    full = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    # add leading zero bytes for each leading '1'
+    pad = len(s) - len(s.lstrip("1"))
+    return b"\x00" * pad + full
+
+def _is_valid_pubkey_str(s: str) -> bool:
+    try:
+        return len(_b58decode(s)) == 32
+    except Exception:
+        return False
+
+def normalize_pump_id_to_mint(raw: str) -> str:
+    """
+    Robustly extract a 32-byte mint pubkey from a Pump Portal id or a raw mint.
+    We DO NOT strip 'pump' unless the result passes base58 length=32 validation.
+    """
+    s = (raw or "").strip()
+    if not s:
+        raise ValueError("empty pump id")
+
+    # Already a valid pubkey?
+    if _is_valid_pubkey_str(s):
+        return s
+
+    # Common case: "...<mint>pump" (suffix appended by portal)
+    if s.endswith("pump"):
+        cand = s[:-4]
+        if _is_valid_pubkey_str(cand):
+            return cand
+        # Try a 43/44-char window just before the suffix
+        base = s[:-4]
+        for L in (44, 43):
+            if len(base) >= L:
+                sub = base[-L:]
+                if _is_valid_pubkey_str(sub):
+                    return sub
+
+    # Last resort: scan the whole string for a 43/44 window that decodes to 32 bytes
+    for i in range(0, max(0, len(s) - 43) + 1):
+        for L in (44, 43):
+            j = i + L
+            if j <= len(s):
+                sub = s[i:j]
+                if _is_valid_pubkey_str(sub):
+                    return sub
+
+    raise ValueError(f"Cannot normalize pump id to a mint: '{raw}'")
+
+def _assert_pubkey(s: str, name: str) -> None:
+    if not _is_valid_pubkey_str(s):
+        raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
+
+# =============================================================================
 # Non-blocking HTTP helpers (requests in worker thread)
 # =============================================================================
 async def _get_json(url: str, *, params: Optional[dict] = None, timeout: float | int = HTTP_TIMEOUT_GET) -> dict:
@@ -433,6 +502,10 @@ async def _jup_quote(
     if amount_iu <= 0:
         raise ValueError("amount_iu must be > 0")
 
+    # validate mints early to avoid pointless HTTP 400s
+    _assert_pubkey(input_mint, "inputMint")
+    _assert_pubkey(output_mint, "outputMint")
+
     sbps = int(slippage_bps if slippage_bps is not None else _slippage_bps())
     legacy = _as_legacy()
     key = _qkey(input_mint, output_mint, amount_iu, sbps, swap_mode, only_direct, legacy)
@@ -446,20 +519,26 @@ async def _jup_quote(
         if not budget.before_quote():
             raise RuntimeError("quote blocked by budget")
 
-        await _jup_gate()
+        try:
+            await _jup_gate()
 
-        params = {
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": str(amount_iu),
-            "slippageBps": sbps,
-            "swapMode": swap_mode,
-            "onlyDirectRoutes": "true" if only_direct else "false",
-        }
-        js = await _get_json(JUP_QUOTE_URL, params=params, timeout=HTTP_TIMEOUT_GET)
-        budget.after_quote()
-        await _set_cached_quote(key, js, QUOTE_TTL_SEC)
-        return js
+            params = {
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(amount_iu),
+                "slippageBps": sbps,
+                "swapMode": swap_mode,
+                "onlyDirectRoutes": "true" if only_direct else "false",
+            }
+            js = await _get_json(JUP_QUOTE_URL, params=params, timeout=HTTP_TIMEOUT_GET)
+            await _set_cached_quote(key, js, QUOTE_TTL_SEC)
+            return js
+        finally:
+            # ensure we always release budget unit
+            try:
+                budget.after_quote()
+            except Exception:
+                pass
 
     return await _singleflight_quote(key, _fetch)
 
@@ -488,6 +567,8 @@ async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optiona
 async def get_sell_quote(*, mint: str, amount_raw: int, slippage_bps: Optional[int] = None) -> Dict[str, Any]:
     if amount_raw <= 0:
         raise ValueError("amount_raw must be > 0")
+    _assert_pubkey(mint, "mint")
+
     quote = await _retry(
         _jup_quote, mint, SOL_MINT, amount_raw,
         tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-sell",
@@ -507,6 +588,8 @@ async def get_buy_quote(
     amount_sol: Optional[float] = None,
     slippage_bps: Optional[int] = None,
 ) -> Dict[str, Any]:
+    _assert_pubkey(mint, "mint")
+
     if lamports_in is None and amount_sol is None:
         pf = os.getenv("PF_TRADE_SOL")
         if pf:
@@ -528,6 +611,8 @@ async def get_buy_quote(
     return {**q, "lamports_in": lamports_in, "out_amount_raw": out_raw, "out_amount_ui": ui, "decimals": dec}
 
 async def get_price_ui(mint: str) -> float:
+    _assert_pubkey(mint, "mint")
+
     # price cache
     if PRICE_TTL_SEC > 0:
         rec = _PRICE_CACHE.get(mint)
@@ -574,6 +659,8 @@ async def buy_via_lightning(
     slippage_bps: Optional[int] = None,
     priority_sol: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
+    _assert_pubkey(mint, "mint")
+
     kp = load_keypair()
     owner = get_pubkey_str(kp)
 
@@ -628,6 +715,7 @@ async def sell_via_lightning(
     priority_sol: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
     del token_program  # not needed by Jupiter
+    _assert_pubkey(mint, "mint")
 
     if amount_raw <= 0:
         return False, None
@@ -677,6 +765,8 @@ __all__ = [
     "price_of",
     "buy_via_lightning",
     "sell_via_lightning",
+    "normalize_pump_id_to_mint",
+    "_is_valid_pubkey_str",
     "TX_RPC_URL",
     "TX_COMMITMENT",
 ]
