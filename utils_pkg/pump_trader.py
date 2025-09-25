@@ -19,24 +19,33 @@ from utils_pkg.router import (
     get_price_ui,
 )
 
-# Wallet & helpers
-from utils_pkg.solana_wallet import (
-    load_keypair,
-    get_pubkey_str,
-    sign_and_send_b64_tx,
-    get_balance_sol,  # <— use wallet helper for reliable balance
-)
+# Wallet & helpers (import defensively)
+try:
+    from utils_pkg.solana_wallet import (
+        load_keypair,
+        get_pubkey_str,
+        sign_and_send_b64_tx,
+    )
+except Exception as e:  # pragma: no cover
+    raise RuntimeError(f"solana_wallet core helpers missing: {e}")
+
+try:
+    # Prefer async helper if available
+    from utils_pkg.solana_wallet import get_balance_sol as _get_balance_sol  # type: ignore
+except Exception:  # pragma: no cover
+    async def _get_balance_sol(_owner: str) -> float:  # type: ignore
+        return 0.0
 
 # Optional sizer (preferred)
 try:
     from utils_pkg.sizer import suggest_trade_sol as _auto_size_sol  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     _auto_size_sol = None  # type: ignore
 
 # Optional safety filters (best-effort)
 try:
     from utils_pkg.liquidity import looks_like_mint, screen_token  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     def looks_like_mint(_: str) -> bool:  # type: ignore
         return False
     async def screen_token(_: str):  # type: ignore
@@ -45,14 +54,14 @@ except Exception:
 # Optional global guardrails (Strategy checks first; we re-check here too)
 try:
     from utils_pkg.guardrails import buys_allowed  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     def buys_allowed() -> bool:  # type: ignore
         return True
 
 # Optional external routeguard (preferred); internal fallback if missing
 try:
     from utils_pkg.routeguard import preflight as rg_preflight  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     rg_preflight = None  # type: ignore
 
 log = get_logger()
@@ -108,7 +117,7 @@ MOMO_MIN_UP_PCT          = _envf("ENTRY_MOMO_MIN_UP_PCT", 5.0)     # +5% in wind
 MOMO_WINDOW_SEC          = _envf("ENTRY_MOMO_WINDOW_SEC", 10.0)
 MOMO_PRICE_TRIES         = _envi("ENTRY_MOMO_PRICE_TRIES", 4)
 MOMO_PRICE_DELAY_S       = _envf("ENTRY_MOMO_PRICE_DELAY_S", 0.7)
-PRICE_TTL_SEC_ENV        = _envf("PF_PRICE_TTL_SEC", 5.0)          # from router cache
+PRICE_TTL_SEC_ENV        = _envf("PF_PRICE_TTL_SEC", 5.0)          # router cache TTL
 
 # Liquidity screen (Strategy may run it; we reuse for sizing)
 LIQ_FILTER_ENABLED       = _envb("ENTRY_LIQ_FILTER", True)
@@ -149,7 +158,7 @@ def _strip_pump_suffix(raw: str) -> Tuple[str, bool]:
 async def _get_sol_balance(owner: str) -> float:
     """Best-effort SOL balance using wallet helper."""
     try:
-        return await get_balance_sol(owner)
+        return await _get_balance_sol(owner)
     except Exception:
         return 0.0
 
@@ -167,7 +176,7 @@ def _note_no_route(key: str) -> None:
     _last_no_route[key] = time.time()
 
 # -----------------------------------------------------------------------------
-# Momentum gate (credit-efficient & cache-aware)
+// Momentum gate (credit-efficient & cache-aware)
 # -----------------------------------------------------------------------------
 async def _momentum_ok(mint: str) -> bool:
     """
@@ -211,7 +220,7 @@ async def _momentum_ok(mint: str) -> bool:
     return ok
 
 # -----------------------------------------------------------------------------
-# Liquidity-aware size boost
+// Liquidity-aware size boost
 # -----------------------------------------------------------------------------
 async def _liquidity_size_boost(mint: str, base_sol: float) -> float:
     if not LIQ_FILTER_ENABLED or not looks_like_mint(mint):
@@ -236,7 +245,7 @@ async def _liquidity_size_boost(mint: str, base_sol: float) -> float:
     return min(MAX_SOL_PER_TRADE, max(MIN_SOL_PER_TRADE, sized))
 
 # -----------------------------------------------------------------------------
-# Fallback autosizer (only used when sizer module is unavailable)
+// Fallback autosizer (only used when sizer module is unavailable)
 # -----------------------------------------------------------------------------
 async def _autosize_by_wallet(owner: str) -> float:
     global _last_autosize_at, _cached_wallet_sol
@@ -250,7 +259,7 @@ async def _autosize_by_wallet(owner: str) -> float:
     return _round_step(base, STEP_SOL)
 
 # -----------------------------------------------------------------------------
-# Internal Route Guard (used only if utils_pkg.routeguard is not present)
+// Internal Route Guard (used only if utils_pkg.routeguard is not present)
 # -----------------------------------------------------------------------------
 async def _internal_preflight(mint: str, spend_lamports: int) -> Tuple[bool, Optional[Dict[str, Any]]]:
     """

@@ -10,16 +10,18 @@ import sys
 import traceback
 from typing import Any, Dict, Optional
 
-from logging_setup import get_logger, bump
+from logging_setup import get_logger, bump, start_global_heartbeat
 from utils_pkg.pumpportal_client import PumpPortalClient
 from utils_pkg.pump_trader import maybe_buy
 from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN
 
+# ──────────────────────────────────────────────────────────────────────────────
 # Optional helpers (graceful fallbacks)
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     from utils_pkg.dedupe import claim_once  # (key:str, ttl:int) -> bool
 except Exception:  # pragma: no cover
-    def claim_once(key: str, ttl: int = 3600) -> bool:  # type: ignore
+    def claim_once(_key: str, _ttl: int = 3600) -> bool:  # type: ignore
         return True
 
 try:
@@ -43,14 +45,25 @@ except Exception:  # pragma: no cover
         while not stop_evt.is_set():
             await asyncio.sleep(5)
 
-# Router (price helper + priority fee background)
+# Router (priority seeding + price helper + mint normalizer)
 try:
-    from utils_pkg import router  # start()/shutdown() available
+    from utils_pkg import router  # provides start()/shutdown()
     from utils_pkg.router import get_price_ui as _route_price_ui
+    try:
+        from utils_pkg.router import is_valid_pubkey_str as _is_valid_pubkey_str  # type: ignore
+    except Exception:
+        from utils_pkg.router import _is_valid_pubkey_str  # type: ignore
+    try:
+        from utils_pkg.router import normalize_pump_id_to_mint
+    except Exception:
+        normalize_pump_id_to_mint = None  # type: ignore
 except Exception:  # pragma: no cover
     router = None  # type: ignore
     async def _route_price_ui(_mint: str) -> float:  # type: ignore
         return 0.0
+    def _is_valid_pubkey_str(_s: str) -> bool:  # type: ignore
+        return False
+    normalize_pump_id_to_mint = None  # type: ignore
 
 # Liquidity screen (fallback provided)
 try:
@@ -60,58 +73,59 @@ except Exception:  # pragma: no cover
     async def screen_token(_mint: str):  # type: ignore
         return True, {"ok": True}
 
-# Optional price feed tidy shutdown (if you use utils_pkg/price_feed)
+# Optional price feed tidy shutdown (if used)
 try:
     from utils_pkg.price_feed import close as pricefeed_close  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     async def pricefeed_close():  # type: ignore
         return None
 
 log = get_logger()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Mint normalization / validation
+# Mint validation / normalization helpers
 # ──────────────────────────────────────────────────────────────────────────────
 _BASE58_WHOLE_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
-_BASE58_ANY_RE   = re.compile(r"[1-9A-HJ-NP-Za-km-z]+")
-_SUFFIXES        = ("pump", "bonk")
 
-def normalize_mint(maybe: str) -> str:
-    s = (maybe or "").strip()
+def _is_probable_mint(s: str) -> bool:
+    """Lightweight guard usable even without router helpers."""
     if not s:
-        return ""
+        return False
     if _BASE58_WHOLE_RE.fullmatch(s):
-        for suf in _SUFFIXES:
-            if s.lower().endswith(suf):
-                t = s[:-len(suf)]
-                if _BASE58_WHOLE_RE.fullmatch(t):
-                    return t
-        return s
-    for suf in _SUFFIXES:
-        if s.lower().endswith(suf):
-            t = s[:-len(suf)].strip()
-            if _BASE58_WHOLE_RE.fullmatch(t):
-                return t
-    m = _BASE58_ANY_RE.search(s)
-    if not m:
-        return s
-    span = m.group(0)
-    for i in range(min(44, len(span)), 32 - 1, -1):
-        cand = span[:i]
-        if _BASE58_WHOLE_RE.fullmatch(cand):
-            return cand
-    return s
-
-def is_probable_mint(s: str) -> bool:
+        return True
     try:
         if _looks_like_mint is not None and _looks_like_mint(s):  # type: ignore
             return True
     except Exception:
         pass
-    return bool(_BASE58_WHOLE_RE.fullmatch(s or ""))
+    try:
+        return bool(_is_valid_pubkey_str(s))  # type: ignore
+    except Exception:
+        return False
+
+def normalize_mint_from_source(raw: str) -> str:
+    """
+    Normalize any Pump Portal id / possibly-suffixed id to a 32–44 char base58 mint.
+    Prefer the router's trusted normalizer (handles ...pump suffix, etc.).
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if normalize_pump_id_to_mint:
+        try:
+            return normalize_pump_id_to_mint(s)  # type: ignore
+        except Exception:
+            pass
+    # Minimal fallback: trim common suffixes and validate length.
+    for suf in ("pump", "bonk"):
+        if s.lower().endswith(suf) and len(s) - len(suf) >= 32:
+            cand = s[:-len(suf)]
+            if _BASE58_WHOLE_RE.fullmatch(cand):
+                return cand
+    return s
 
 # ──────────────────────────────────────────────────────────────────────────────
-# env helpers
+# ENV helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _as_bool(val: Optional[str], default: bool = False) -> bool:
     if val is None:
@@ -131,7 +145,7 @@ def _as_int(val: Any, default: int) -> int:
         return default
 
 # ──────────────────────────────────────────────────────────────────────────────
-# config
+# Config
 # ──────────────────────────────────────────────────────────────────────────────
 EXIT_ENGINE_ENABLED      = _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True)
 DEDUPE_ENABLED           = _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True)
@@ -173,7 +187,7 @@ PAUSE_TRADING            = _as_bool(os.getenv("PAUSE_TRADING", "0"), False)
 DEBUG_TX                 = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# small utils
+# Utilities
 # ──────────────────────────────────────────────────────────────────────────────
 def _get_first(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
     for k in keys:
@@ -267,7 +281,7 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
     return True
 
 # ──────────────────────────────────────────────────────────────────────────────
-# optional post-buy immediate test
+# Optional post-buy immediate test
 # ──────────────────────────────────────────────────────────────────────────────
 async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
     if str(os.getenv("POSTBUY_MODE", "")).strip().lower() != "immediate_sell_test":
@@ -280,7 +294,7 @@ async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
             traceback.print_exc()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# strategy with momentum gate
+# Strategy with momentum gate
 # ──────────────────────────────────────────────────────────────────────────────
 class Strategy:
     def __init__(self) -> None:
@@ -313,8 +327,9 @@ class Strategy:
 
             self._gate_state[mint_raw] = {"trades": 0, "price0": 0.0}
 
+            # price sample at t0 (with retries)
             price0 = 0.0
-            if is_probable_mint(mint_norm):
+            if _is_probable_mint(mint_norm):
                 for _ in range(max(1, ENTRY_MOMO_PRICE_TRIES)):
                     try:
                         price0 = await _route_price_ui(mint_norm)
@@ -331,7 +346,7 @@ class Strategy:
             trades = int(st.get("trades", 0))
 
             price1 = 0.0
-            if is_probable_mint(mint_norm):
+            if _is_probable_mint(mint_norm):
                 try:
                     price1 = await _route_price_ui(mint_norm)
                 except Exception:
@@ -417,12 +432,13 @@ class Strategy:
                 print("[strategy] missing mint — skip", flush=True)
             return
 
+        # Normalize using router helper (handles "...pump" etc.)
         mint_source = str(_get_first(raw_event, "mint", "mintAddress", "mint_address", default=mint_raw)).strip()
-        mint_norm = normalize_mint(mint_source)
+        mint_norm = normalize_mint_from_source(mint_source)
         if mint_norm != mint_raw:
             print(f"[main] normalized mint = {mint_norm}", flush=True)
 
-        if not is_probable_mint(mint_norm):
+        if not _is_probable_mint(mint_norm):
             if DEBUG_TX:
                 print(f"[strategy] implausible mint after normalize => skip ({mint_source})", flush=True)
             return
@@ -501,7 +517,7 @@ class Strategy:
         await asyncio.sleep(LOOP_COOLDOWN_SEC)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# stream loop & main
+# Stream loop & main
 # ──────────────────────────────────────────────────────────────────────────────
 async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
     # Prefer async context manager if available
@@ -564,8 +580,9 @@ async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asynci
         await pricefeed_close()
 
 async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
-    # Boot heartbeat
+    # Start heartbeat early (idempotent)
     with contextlib.suppress(Exception):
+        start_global_heartbeat(log, interval=float(os.getenv("PF_HEARTBEAT_SEC", "45")))
         bump("boot")
 
     # Initialize router (priority seeding, idempotent)

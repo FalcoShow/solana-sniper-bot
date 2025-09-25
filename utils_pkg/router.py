@@ -19,22 +19,23 @@ from utils_pkg.solana_wallet import (
 
 log = get_logger()
 
-# Try to import txlearn constants; fall back to env-safe defaults.
+# =============================================================================
+# Chain / RPC config (with safe fallbacks)
+# =============================================================================
 try:
     from utils_pkg.txlearn import RPC_URL as _TX_RPC_URL, TX_COMMITMENT as _TX_COMMITMENT  # type: ignore
 except Exception:
     _TX_RPC_URL = os.getenv("SOL_RPC_URL") or "https://api.mainnet-beta.solana.com"
     _TX_COMMITMENT = "confirmed"
 
-# Expose for compatibility with older imports that expect these names here
 TX_RPC_URL = _TX_RPC_URL
 TX_COMMITMENT = _TX_COMMITMENT
 
-# =============================================================================
-# Config / ENV
-# =============================================================================
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
+# =============================================================================
+# Env helpers
+# =============================================================================
 def _envb(k: str, default: bool = False) -> bool:
     v = (os.getenv(k, "") or "").strip().lower()
     if not v:
@@ -53,56 +54,58 @@ def _envi(k: str, d: int) -> int:
     except Exception:
         return int(d)
 
-# DRY-RUN
+# =============================================================================
+# Feature toggles / HTTP knobs
+# =============================================================================
 DRY_RUN = _envb("DRY_RUN", False)
 
-# HTTP knobs
 HTTP_TIMEOUT_GET  = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
 HTTP_TIMEOUT_POST = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_POST_SEC", 25.0))
 RPC_TIMEOUT_SEC   = max(3.0, _envf("ROUTER_RPC_TIMEOUT_SEC", 10.0))
 
-# Jupiter endpoints
 JUP_QUOTE_URL = os.getenv("JUP_QUOTE_URL", "https://quote-api.jup.ag/v6/quote")
 JUP_SWAP_URL  = os.getenv("JUP_SWAP_URL",  "https://quote-api.jup.ag/v6/swap")
 
-# Slippage: prefer PF_SLIPPAGE_BPS, else JUPITER_MAX_SLIPPAGE (fraction), else default
 def _slippage_bps() -> int:
+    """
+    Slippage priority: PF_SLIPPAGE_BPS (int bps) >
+                       JUPITER_MAX_SLIPPAGE (fraction) >
+                       default 0.0125 (125 bps)
+    """
     v = os.getenv("PF_SLIPPAGE_BPS")
     if v:
         try:
             return max(1, int(v))
         except Exception:
             pass
-    s = _envf("JUPITER_MAX_SLIPPAGE", 0.0125)  # fraction, e.g. 0.06 => 600 bps
+    s = _envf("JUPITER_MAX_SLIPPAGE", 0.0125)  # fraction -> bps
     return max(1, int(round(s * 10_000)))
 
 def _as_legacy() -> bool:
-    v = os.getenv("JUP_AS_LEGACY", "1")
-    return str(v).strip().lower() in {"1", "true", "yes", "y"}
+    return (os.getenv("JUP_AS_LEGACY", "1") or "1").strip().lower() in {"1", "true", "yes", "y"}
 
-# Router retry knobs
+# Retries / pacing
 QUOTE_RETRIES = max(1, _envi("ROUTER_QUOTE_RETRIES", 1))
 SWAP_RETRIES  = max(1, _envi("ROUTER_SWAP_RETRIES", 2))
 RETRY_BACKOFF = max(0.05, _envf("ROUTER_RETRY_BACKOFF_SEC", 0.35))
 
-# Global Jupiter rate gate (QPS)
 JUP_MAX_QPS       = max(1, _envi("JUP_MAX_QPS", 2))
 _JUP_MIN_INTERVAL = 1.0 / float(JUP_MAX_QPS)
 _JUP_RATE_LOCK    = asyncio.Lock()
 _JUP_LAST_TS: float = 0.0
 
-# Caching / single-flight
+# Cache / single-flight
 QUOTE_TTL_SEC = max(0.0, _envf("ROUTER_QUOTE_TTL_SEC", 2.0))
 PRICE_TTL_SEC = max(0.0, _envf("PF_PRICE_TTL_SEC", 5.0))
-_QUOTE_CACHE: Dict[str, Tuple[float, dict]] = {}          # key -> (expiry_ts, payload)
-_PRICE_CACHE: Dict[str, Tuple[float, float]] = {}         # mint -> (expiry_ts, price_ui)
-_QUOTE_FLIGHT: Dict[str, asyncio.Future[Any]] = {}        # key -> future
+_QUOTE_CACHE: Dict[str, Tuple[float, dict]] = {}
+_PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
+_QUOTE_FLIGHT: Dict[str, asyncio.Future[Any]] = {}
 _quote_lock = asyncio.Lock()
 
-# Budget hooks (soft gates). Fail open if module missing.
+# Budget hooks (soft gates). Fail open if missing.
 try:
     from utils_pkg import budget  # type: ignore
-except Exception:  # graceful no-ops
+except Exception:  # pragma: no cover
     class _BudgetNoop:
         def before_quote(self, units: int = 1) -> bool: return True
         def after_quote(self, units: int = 1) -> None:  return None
@@ -110,11 +113,11 @@ except Exception:  # graceful no-ops
         def after_rpc(self, method: str, *, weight: Optional[int] = None) -> None:  return None
     budget = _BudgetNoop()  # type: ignore
 
-# Common HTTP headers
-_UA = {"user-agent": "pnlsniper/1.0 (+router)"}
+# Common headers
+_UA = {"user-agent": "pnlsniper/1.0 (+router)", "accept": "application/json"}
 
 # =============================================================================
-# Base58 helpers (no external dep required)
+# Base58 helpers (no external deps)
 # =============================================================================
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58_IDX = {c: i for i, c in enumerate(_B58_ALPHABET)}
@@ -131,43 +134,45 @@ def _b58decode(s: str) -> bytes:
             raise ValueError("invalid base58 char")
         n = n * 58 + i
     full = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
-    # add leading zero bytes for each leading '1'
     pad = len(s) - len(s.lstrip("1"))
     return b"\x00" * pad + full
 
 def _is_valid_pubkey_str(s: str) -> bool:
+    """True iff base58 string decodes to exactly 32 bytes."""
     try:
         return len(_b58decode(s)) == 32
     except Exception:
         return False
 
+# Public-friendly alias (imported by some callers)
+def is_valid_pubkey_str(s: str) -> bool:
+    return _is_valid_pubkey_str(s)
+
 def normalize_pump_id_to_mint(raw: str) -> str:
     """
-    Robustly extract a 32-byte mint pubkey from a Pump Portal id or a raw mint.
-    We DO NOT strip 'pump' unless the result passes base58 length=32 validation.
+    Robustly extract a 32-byte mint pubkey from a Pump Portal id or raw mint.
+    Accepts …pump / …bonk suffixes, and scans windows if needed.
+    Raises ValueError on failure.
     """
     s = (raw or "").strip()
     if not s:
         raise ValueError("empty pump id")
 
-    # Already a valid pubkey?
     if _is_valid_pubkey_str(s):
         return s
 
-    # Common case: "...<mint>pump" (suffix appended by portal)
-    if s.endswith("pump"):
-        cand = s[:-4]
-        if _is_valid_pubkey_str(cand):
-            return cand
-        # Try a 43/44-char window just before the suffix
-        base = s[:-4]
-        for L in (44, 43):
-            if len(base) >= L:
-                sub = base[-L:]
-                if _is_valid_pubkey_str(sub):
-                    return sub
+    for suf in ("pump", "bonk"):
+        if s.endswith(suf):
+            base = s[:-len(suf)]
+            if _is_valid_pubkey_str(base):
+                return base
+            for L in (44, 43):
+                if len(base) >= L:
+                    sub = base[-L:]
+                    if _is_valid_pubkey_str(sub):
+                        return sub
 
-    # Last resort: scan the whole string for a 43/44 window that decodes to 32 bytes
+    # brute window scan across whole string
     for i in range(0, max(0, len(s) - 43) + 1):
         for L in (44, 43):
             j = i + L
@@ -183,7 +188,7 @@ def _assert_pubkey(s: str, name: str) -> None:
         raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
 
 # =============================================================================
-# Non-blocking HTTP helpers (requests in worker thread)
+# Non-blocking HTTP (requests in worker threads)
 # =============================================================================
 async def _get_json(url: str, *, params: Optional[dict] = None, timeout: float | int = HTTP_TIMEOUT_GET) -> dict:
     def _req():
@@ -191,7 +196,6 @@ async def _get_json(url: str, *, params: Optional[dict] = None, timeout: float |
         r.raise_for_status()
         ctype = (r.headers.get("content-type") or "").lower()
         if "application/json" not in ctype:
-            # Jupiter sometimes still returns JSON with odd ctype; try best-effort
             try:
                 return r.json()
             except Exception:
@@ -220,7 +224,7 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
         except Exception as e:
             last_err = e
             status = getattr(getattr(e, "response", None), "status_code", None)
-            # Don't waste time on guaranteed-bad inputs
+            # 400/404 are almost always invalid inputs; don't spin
             if status in (400, 404):
                 log.event("ROUTER_RETRY_FAIL", label=label, err=str(e))
                 raise
@@ -234,7 +238,7 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
     raise last_err if last_err else RuntimeError(f"{label} failed")
 
 # =============================================================================
-# Async decimals cache (pure RPC; no aiohttp)
+# Simple RPC helpers (for decimals & sig status)
 # =============================================================================
 _DECIMALS: Dict[str, int] = {}
 
@@ -283,9 +287,6 @@ async def _get_decimals(mint: str) -> Optional[int]:
         _DECIMALS[mint] = int(dec)
     return dec
 
-# =============================================================================
-# Signature status (pure RPC; used by dynamic priority feedback)
-# =============================================================================
 async def _get_signature_status(sig: str) -> Optional[dict]:
     def _call() -> Optional[dict]:
         try:
@@ -299,7 +300,7 @@ async def _get_signature_status(sig: str) -> Optional[dict]:
     return await asyncio.to_thread(_call)
 
 # =============================================================================
-# Dynamic priority fee controller (no aiohttp)
+# Dynamic priority fee controller
 # =============================================================================
 def _to_sol_from_lamports_like(x: float) -> float:
     lamports = float(x)
@@ -430,19 +431,18 @@ class DynPriority:
         if abs(self.current_sol - old) / max(1e-9, old) >= 0.10:
             log.event("PRIO_TUNE", old_sol=old, new_sol=self.current_sol, incl_sec=inclusion_sec)
 
-# module-level instance
 _PRIO = DynPriority()
 
-# Public hook to start optional background seeding (safe to call multiple times)
 async def start() -> None:
+    """Optional background seeding (idempotent)."""
     await _PRIO.start()
 
-# Provide a no-op shutdown for compatibility (no aiohttp to close here)
 async def shutdown() -> None:
+    """No-op for compatibility (no aiohttp session to close)."""
     return None
 
 # =============================================================================
-# Jupiter rate gate
+# Jupiter pacing
 # =============================================================================
 async def _jup_gate() -> None:
     global _JUP_LAST_TS
@@ -454,7 +454,7 @@ async def _jup_gate() -> None:
         _JUP_LAST_TS = time.time()
 
 # =============================================================================
-# Quote cache/single-flight helpers
+# Quote cache / single-flight
 # =============================================================================
 def _qkey(input_mint: str, output_mint: str, amount_iu: int, slippage_bps: int, swap_mode: str, direct: bool, legacy: bool) -> str:
     return f"{input_mint}:{output_mint}:{amount_iu}:{slippage_bps}:{swap_mode}:{int(direct)}:{int(legacy)}"
@@ -488,7 +488,7 @@ async def _singleflight_quote(key: str, maker: Callable[[], Any]) -> dict:
             _QUOTE_FLIGHT.pop(key, None)
 
 # =============================================================================
-# Low-level Jupiter helpers (async) with budget hooks + cache + rate gate
+# Low-level Jupiter helpers
 # =============================================================================
 async def _jup_quote(
     input_mint: str,
@@ -502,7 +502,6 @@ async def _jup_quote(
     if amount_iu <= 0:
         raise ValueError("amount_iu must be > 0")
 
-    # validate mints early to avoid pointless HTTP 400s
     _assert_pubkey(input_mint, "inputMint")
     _assert_pubkey(output_mint, "outputMint")
 
@@ -510,7 +509,6 @@ async def _jup_quote(
     legacy = _as_legacy()
     key = _qkey(input_mint, output_mint, amount_iu, sbps, swap_mode, only_direct, legacy)
 
-    # cache hit?
     cached = await _get_cached_quote(key)
     if cached is not None:
         return cached
@@ -518,10 +516,8 @@ async def _jup_quote(
     async def _fetch():
         if not budget.before_quote():
             raise RuntimeError("quote blocked by budget")
-
         try:
             await _jup_gate()
-
             params = {
                 "inputMint": input_mint,
                 "outputMint": output_mint,
@@ -534,7 +530,6 @@ async def _jup_quote(
             await _set_cached_quote(key, js, QUOTE_TTL_SEC)
             return js
         finally:
-            # ensure we always release budget unit
             try:
                 budget.after_quote()
             except Exception:
@@ -562,7 +557,7 @@ async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optiona
     return tx_b64
 
 # =============================================================================
-# Quotes & price helpers (public)
+# Public quote & price helpers
 # =============================================================================
 async def get_sell_quote(*, mint: str, amount_raw: int, slippage_bps: Optional[int] = None) -> Dict[str, Any]:
     if amount_raw <= 0:
@@ -613,7 +608,6 @@ async def get_buy_quote(
 async def get_price_ui(mint: str) -> float:
     _assert_pubkey(mint, "mint")
 
-    # price cache
     if PRICE_TTL_SEC > 0:
         rec = _PRICE_CACHE.get(mint)
         if rec and rec[0] >= time.time():
@@ -623,7 +617,7 @@ async def get_price_ui(mint: str) -> float:
     if dec is None or dec < 0:
         return 0.0
 
-    tiny_raw = max(1, 10 ** max(0, dec - 3))  # small, but avoids rounding to zero
+    tiny_raw = max(1, 10 ** max(0, dec - 3))  # small, avoids rounding to zero
     try:
         q = await _retry(
             _jup_quote, mint, SOL_MINT, tiny_raw,
@@ -641,15 +635,15 @@ async def get_price_ui(mint: str) -> float:
     except Exception:
         return 0.0
 
-# Backward-compat aliases
-async def price_of_ui(mint: str) -> float:  # alias
+# Compat aliases
+async def price_of_ui(mint: str) -> float:
     return await get_price_ui(mint)
 
-async def price_of(mint: str) -> float:  # alias
+async def price_of(mint: str) -> float:
     return await get_price_ui(mint)
 
 # =============================================================================
-# Swaps (public) — return (ok, signature | None)
+# Swaps (public) — return (ok, signature|None)
 # =============================================================================
 async def buy_via_lightning(
     *,
@@ -672,7 +666,6 @@ async def buy_via_lightning(
     if lamports_in <= 0:
         return False, None
 
-    # Quote with retries (budget-aware via _jup_quote)
     try:
         quote = await _retry(
             _jup_quote, SOL_MINT, mint, lamports_in,
@@ -690,7 +683,6 @@ async def buy_via_lightning(
         log.event("DRYRUN_BUY", mint=mint, lamports_in=lamports_in, out_ui=out_ui)
         return True, None
 
-    # Swap with retries; bump priority between attempts
     t0 = time.time()
     for attempt in range(1, SWAP_RETRIES + 1):
         try:
@@ -703,7 +695,7 @@ async def buy_via_lightning(
             if attempt >= SWAP_RETRIES:
                 log.event("ROUTER_BUY_SWAP_FAIL", mint=mint, err=str(e))
                 return False, None
-            _PRIO._tune(_PRIO.target_sec * 1.6, had_error=True)  # nudge up
+            _PRIO._tune(_PRIO.target_sec * 1.6, had_error=True)
             await asyncio.sleep(RETRY_BACKOFF * attempt)
 
 async def sell_via_lightning(
@@ -714,7 +706,7 @@ async def sell_via_lightning(
     slippage_bps: Optional[int] = None,
     priority_sol: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
-    del token_program  # not needed by Jupiter
+    del token_program  # Jupiter doesn't need this here
     _assert_pubkey(mint, "mint")
 
     if amount_raw <= 0:
@@ -723,7 +715,6 @@ async def sell_via_lightning(
     kp = load_keypair()
     owner = get_pubkey_str(kp)
 
-    # Quote with retries (budget-aware via _jup_quote)
     try:
         quote = await _retry(
             _jup_quote, mint, SOL_MINT, amount_raw,
@@ -739,7 +730,6 @@ async def sell_via_lightning(
         log.event("DRYRUN_SELL", mint=mint, amount_raw=amount_raw, out_sol=lamports / 1e9)
         return True, None
 
-    # Swap with retries; bump priority between attempts
     t0 = time.time()
     for attempt in range(1, SWAP_RETRIES + 1):
         try:
@@ -756,17 +746,14 @@ async def sell_via_lightning(
             await asyncio.sleep(RETRY_BACKOFF * attempt)
 
 __all__ = [
-    "start",
-    "shutdown",
-    "get_sell_quote",
-    "get_buy_quote",
-    "get_price_ui",
-    "price_of_ui",
-    "price_of",
-    "buy_via_lightning",
-    "sell_via_lightning",
-    "normalize_pump_id_to_mint",
-    "_is_valid_pubkey_str",
-    "TX_RPC_URL",
-    "TX_COMMITMENT",
+    # lifecycle
+    "start", "shutdown",
+    # quotes / price
+    "get_sell_quote", "get_buy_quote", "get_price_ui", "price_of_ui", "price_of",
+    # swaps
+    "buy_via_lightning", "sell_via_lightning",
+    # mint helpers
+    "normalize_pump_id_to_mint", "_is_valid_pubkey_str", "is_valid_pubkey_str",
+    # exposed RPC config for legacy callers
+    "TX_RPC_URL", "TX_COMMITMENT",
 ]

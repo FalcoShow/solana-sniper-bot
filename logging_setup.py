@@ -13,18 +13,17 @@ import sys
 import threading
 import time
 from io import TextIOBase
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 # ──────────────────────────────────────────────────────────────────────────────
 # JSON formatter
 # ──────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_EXCLUDE = {
+_DEFAULT_EXCLUDE = {
     "name", "msg", "args", "levelname", "levelno", "pathname", "filename", "module",
     "exc_info", "exc_text", "stack_info", "lineno", "funcName", "created", "msecs",
     "relativeCreated", "thread", "threadName", "processName", "process", "asctime",
 }
-
 
 def _coerce(obj: Any) -> Any:
     """Coerce unknown types to JSON-safe values."""
@@ -41,13 +40,12 @@ def _coerce(obj: Any) -> Any:
             return repr(obj)
     return str(obj)
 
-
 class JsonFormatter(logging.Formatter):
-    def __init__(self, service: str, version: str | None = None):
+    def __init__(self, service: str, version: Optional[str] = None):
         super().__init__()
         self.service = service
-        self.version = version
-        self.host = socket.gethostname()
+        self.version = version or os.getenv("APP_VERSION") or os.getenv("VERSION") or "v1"
+        self.host = os.getenv("HOSTNAME") or socket.gethostname()
         self.pid = os.getpid()
 
     def format(self, record: logging.LogRecord) -> str:
@@ -63,7 +61,7 @@ class JsonFormatter(logging.Formatter):
         }
 
         # extras (from extra=...)
-        extras = {k: v for k, v in record.__dict__.items() if k not in DEFAULT_EXCLUDE}
+        extras = {k: v for k, v in record.__dict__.items() if k not in _DEFAULT_EXCLUDE}
         if extras:
             for k, v in extras.items():
                 base[k] = _coerce(v)
@@ -80,17 +78,16 @@ class JsonFormatter(logging.Formatter):
 
         # exceptions
         if record.exc_info:
-            base["exc_type"] = record.exc_info[0].__name__ if record.exc_info[0] else None
+            etype = record.exc_info[0].__name__ if record.exc_info[0] else None
+            base["exc_type"] = etype
             base["exc"] = self.formatException(record.exc_info)
 
         return json.dumps(base, separators=(",", ":"), ensure_ascii=False)
 
-
 class JsonStreamHandler(logging.StreamHandler):
-    def __init__(self, service: str, version: str | None = None, stream=None):
+    def __init__(self, service: str, version: Optional[str] = None, stream=None):
         super().__init__(stream or sys.stdout)
         self.setFormatter(JsonFormatter(service=service, version=version))
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Dedup / rate-limit filter
@@ -110,7 +107,6 @@ class DedupFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         event = getattr(record, "event", None)
         line = getattr(record, "line", None)
-        # Build stable key from logger/level + event/line/message
         key = (
             record.name,
             record.levelno,
@@ -127,7 +123,6 @@ class DedupFilter(logging.Filter):
         else:
             self._state[key] = (next_ok_at, suppressed + 1)
             return False
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logger with helpers
@@ -148,7 +143,6 @@ class EventLogger(logging.Logger):
 
     def event(self, name: str, level: int = logging.INFO, **fields):
         fields.setdefault("event", name)
-        # use stacklevel so source points to the caller
         self.log(level, name, extra=fields, stacklevel=2)
 
     def once(self, key: str, ttl: float = 30.0, level: int = logging.INFO, msg: str | None = None, **fields):
@@ -179,7 +173,6 @@ class EventLogger(logging.Logger):
         bucket = int.from_bytes(h[:2], "big") / 65535.0
         if bucket < max(0.0, min(1.0, rate)):
             self.log(level, msg or fields.get("event") or key, extra=fields, stacklevel=2)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Heartbeat counter
@@ -223,12 +216,12 @@ class Heartbeat:
             if snapshot:
                 self.log.event(self.name, **snapshot)
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Factory & setup
 # ──────────────────────────────────────────────────────────────────────────────
 
 _LOGGER_CLASS_SET = False
+_global_hb: Optional[Heartbeat] = None
 
 def _env_level() -> int:
     lvl = os.getenv("PF_LOG_LEVEL") or os.getenv("LOG_LEVEL") or "INFO"
@@ -242,23 +235,23 @@ def _env_level() -> int:
     }
     return mapping.get(lvl.upper(), logging.INFO)
 
-def _env_to_level(level_str: str) -> int:
-    os.environ["PF_LOG_LEVEL"] = level_str
-    return _env_level()
+def _env_service() -> str:
+    return os.getenv("PF_SERVICE") or os.getenv("APP_SERVICE") or "sniper"
 
 def get_logger(
     name: str = "sniper",
-    level: int | None = None,
-    service: str | None = None,
-    version: str | None = None,
-    dedup_window_sec: float | None = None,
+    level: Optional[int] = None,
+    service: Optional[str] = None,
+    version: Optional[str] = None,
+    dedup_window_sec: Optional[float] = None,
 ) -> EventLogger:
     """
     Create or retrieve a JSON logger configured for stdout.
-    Honors env PF_LOG_LEVEL or LOG_LEVEL if `level` not provided.
+    Honors PF_LOG_LEVEL or LOG_LEVEL if `level` not provided.
     Set PF_LOG_DEDUP_WINDOW_SEC to tune the default dedup window (seconds).
+    To auto-start heartbeat, set PF_HEARTBEAT_SEC (e.g., 30). Name via PF_HEARTBEAT_NAME.
     """
-    global _LOGGER_CLASS_SET
+    global _LOGGER_CLASS_SET, _global_hb
     if not _LOGGER_CLASS_SET:
         logging.setLoggerClass(EventLogger)
         _LOGGER_CLASS_SET = True
@@ -267,7 +260,7 @@ def get_logger(
         level = _env_level()
 
     if service is None:
-        service = os.getenv("PF_SERVICE", "sniper")
+        service = _env_service()
 
     if dedup_window_sec is None:
         try:
@@ -287,17 +280,36 @@ def get_logger(
             handler.addFilter(DedupFilter(window_sec=dedup_window_sec))
         log.addHandler(handler)
 
+    # Optional: auto-start global heartbeat if PF_HEARTBEAT_SEC is set (>0)
+    hb_sec = os.getenv("PF_HEARTBEAT_SEC")
+    if hb_sec and _global_hb is None:
+        try:
+            iv = float(hb_sec)
+            if iv > 0:
+                name_override = os.getenv("PF_HEARTBEAT_NAME", "HEARTBEAT")
+                _global_hb = Heartbeat(log, interval=iv, name=name_override).start()
+        except Exception:
+            pass
+
     return log
 
 def set_level(logger: logging.Logger, level_str: str):
     """Hot-switch log level (e.g., from a Telegram command)."""
-    level = _env_to_level(level_str)
+    mapping = {
+        "CRITICAL": logging.CRITICAL, "FATAL": logging.CRITICAL,
+        "ERROR": logging.ERROR,
+        "WARN": logging.WARNING, "WARNING": logging.WARNING,
+        "INFO": logging.INFO,
+        "DEBUG": logging.DEBUG,
+        "TRACE": logging.DEBUG,
+    }
+    level = mapping.get(level_str.upper(), logging.INFO)
+    os.environ["PF_LOG_LEVEL"] = level_str.upper()
     logger.setLevel(level)
     for h in logger.handlers:
         h.setLevel(level)
     if isinstance(logger, EventLogger):
         logger.event("LOG_LEVEL_CHANGED", level=level_str.upper())
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Stdout/stderr capture (route print() to JSON logs)
@@ -319,12 +331,10 @@ class _PrintToLogger(TextIOBase):
             except Exception:
                 s = str(s)
         self._buf += s
-        # flush on newline(s)
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
             line = line.strip()
             if line:
-                # Emit each line as a structured record
                 self.logger.log(self.level, "STDIO", extra={"event": "STDIO", "line": line}, stacklevel=3)
         return len(s)
 
@@ -333,14 +343,11 @@ class _PrintToLogger(TextIOBase):
             self.logger.log(self.level, "STDIO", extra={"event": "STDIO", "line": self._buf.strip()}, stacklevel=3)
             self._buf = ""
 
-
 _stdout_original = sys.stdout
 _stderr_original = sys.stderr
 
 def hook_stdio(logger: EventLogger, stdout_level: int = logging.INFO, stderr_level: int = logging.ERROR):
-    """
-    Route print()/stdout/stderr to structured logs. Call early in your process.
-    """
+    """Route print()/stdout/stderr to structured logs. Call early in your process."""
     global _stdout_original, _stderr_original
     sys.stdout = _PrintToLogger(logger, stdout_level)  # type: ignore[assignment]
     sys.stderr = _PrintToLogger(logger, stderr_level)  # type: ignore[assignment]
@@ -351,7 +358,6 @@ def restore_stdio():
     sys.stdout = _stdout_original  # type: ignore[assignment]
     sys.stderr = _stderr_original  # type: ignore[assignment]
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Uncaught exception hook
 # ──────────────────────────────────────────────────────────────────────────────
@@ -360,16 +366,12 @@ def install_excepthook(logger: EventLogger):
     """Log uncaught exceptions as JSON (does not swallow them)."""
     def _hook(exc_type, exc, tb):
         logger.error("UNCAUGHT", exc_info=(exc_type, exc, tb))
-        # Delegate so the platform/supervisor can still see the crash
         sys.__excepthook__(exc_type, exc, tb)
     sys.excepthook = _hook
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Global heartbeat convenience
 # ──────────────────────────────────────────────────────────────────────────────
-
-_global_hb: Heartbeat | None = None
 
 def start_global_heartbeat(logger: EventLogger, interval: float = 30.0, name: str = "HEARTBEAT") -> Heartbeat:
     global _global_hb
@@ -379,7 +381,6 @@ def start_global_heartbeat(logger: EventLogger, interval: float = 30.0, name: st
 def bump(key: str, n: int = 1):
     if _global_hb:
         _global_hb.bump(key, n)
-
 
 __all__ = [
     "JsonFormatter",

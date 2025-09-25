@@ -1,15 +1,14 @@
 # --- core runtime ---
 requests==2.32.4
-aiohttp==3.9.5
 websockets==11.0.3
 python-dotenv==1.0.1
-redis>=4.6,<6
 
 # --- solana stack ---
 solana==0.36.9
 solders==0.26.0
 base58==2.1.1
 
-# --- persistence / db ---
+# --- optional infra (keep if you use them elsewhere) ---
+redis>=4.6,<6
 SQLAlchemy>=2.0,<2.1
 psycopg2-binary==2.9.9

@@ -50,13 +50,16 @@ def _rpc_post_blocking(method: str, params: list) -> dict:
         # behave as if the call failed pre-flight
         return {}
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    r = requests.post(TX_RPC_URL, json=payload, timeout=_RPC_TIMEOUT, headers=_UA)
     try:
+        r = requests.post(TX_RPC_URL, json=payload, timeout=_RPC_TIMEOUT, headers=_UA)
         r.raise_for_status()
         return r.json()
     finally:
-        # book usage only if HTTP succeeded; cheap and safe
-        budget.after_rpc(method)
+        # always release budget unit
+        try:
+            budget.after_rpc(method)
+        except Exception:
+            pass
 
 
 async def _rpc_post(method: str, params: list) -> dict:

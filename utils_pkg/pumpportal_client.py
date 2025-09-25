@@ -8,7 +8,11 @@ import asyncio
 from typing import AsyncGenerator, Optional, List, Dict, Any
 
 import websockets
-from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
+from websockets.exceptions import (
+    ConnectionClosed,
+    ConnectionClosedError,
+    ConnectionClosedOK,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV + small helpers
@@ -28,11 +32,15 @@ def _envf(k: str, d: float) -> float:
     except Exception:
         return d
 
+# connection/ping knobs
 _WS_PING_INTERVAL = _envf("PF_PP_WS_PING_INTERVAL", 20.0)
 _WS_PING_TIMEOUT  = _envf("PF_PP_WS_PING_TIMEOUT", 30.0)
 _WS_CLOSE_TIMEOUT = _envf("PF_PP_WS_CLOSE_TIMEOUT", 5.0)
 _WS_MAX_SIZE      = _envi("PF_PP_WS_MAX_SIZE", 2**23)  # ~8MB
 _WS_BACKOFF_MAX   = _envf("PF_PP_WS_BACKOFF_MAX", 30.0)
+_WS_CONNECT_TIMEOUT = _envf("PF_PP_WS_CONNECT_TIMEOUT", 15.0)
+
+__all__ = ["PumpPortalClient"]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Client
@@ -40,10 +48,16 @@ _WS_BACKOFF_MAX   = _envf("PF_PP_WS_BACKOFF_MAX", 30.0)
 class PumpPortalClient:
     """
     Minimal PumpPortal websocket client with:
-      - Async context manager (prevents resource leaks)
-      - Auto-reconnect inside .events()
-      - Masked URI for logs
-      - Subscriptions: new tokens, optional token trades, optional account trades
+      • Async context manager (prevents resource leaks)
+      • Auto-reconnect inside .events()
+      • Masked URI for logs
+      • Subscriptions: new tokens, optional token trades, optional account trades
+
+    Public API:
+      - masked_uri() -> str
+      - async events() -> AsyncGenerator[{"kind": str, "raw": dict}, None]
+      - async close() -> None
+      - usable as:  `async with PumpPortalClient() as c: ...`
     """
 
     def __init__(
@@ -54,12 +68,18 @@ class PumpPortalClient:
         tokens: Optional[List[str]] = None,
         uri: Optional[str] = None,
     ) -> None:
+        # API key is required (but even with an invalid key, the free "new_token"
+        # channel still works; we keep the socket open if the server complains).
         self.api_key = api_key or _envs("PF_PP_KEY")
         if not self.api_key:
             raise RuntimeError("PF_PP_KEY not set")
 
+        # Optional account + token list (comma-separated env)
         self.account = account or _envs("PF_PP_ACCOUNT") or ""
-        self.tokens  = tokens if tokens is not None else [t for t in _envs("PF_PP_MINTS").split(",") if t.strip()]
+        toks_env = [t.strip() for t in _envs("PF_PP_MINTS").split(",") if t.strip()]
+        self.tokens = list(tokens) if tokens is not None else toks_env
+
+        # Build URI with api-key query param
         base_uri = uri or _envs("PF_PP_URI") or "wss://pumpportal.fun/api/data"
         sep = "&" if "?" in base_uri else "?"
         self.uri = f"{base_uri}{sep}api-key={self.api_key}"
@@ -82,13 +102,14 @@ class PumpPortalClient:
         self._ws = None
         if ws is not None:
             try:
+                # Close may hang if the TCP is torn; bound with timeout.
                 await asyncio.wait_for(ws.close(code=1000), timeout=_WS_CLOSE_TIMEOUT)
             except Exception:
-                # swallow; socket may already be gone
-                pass
+                pass  # swallow; best-effort cleanup
 
     # ── misc helpers ──────────────────────────────────────────────────────────
     def masked_uri(self) -> str:
+        """Return the websocket URI with the api-key masked for logging."""
         def mask(s: str) -> str:
             return s[:4] + "..." + s[-4:] if s and len(s) > 12 else "<hidden>"
         return re.sub(r"(api-key=)[^&]+", r"\1" + mask(self.api_key), self.uri)
@@ -130,13 +151,17 @@ class PumpPortalClient:
         backoff = 1.0
         while not self._closed:
             try:
-                async with websockets.connect(
+                # guard against connect hanging forever
+                conn = websockets.connect(
                     self.uri,
                     ping_interval=_WS_PING_INTERVAL,
                     ping_timeout=_WS_PING_TIMEOUT,
                     close_timeout=_WS_CLOSE_TIMEOUT,
                     max_size=_WS_MAX_SIZE,
-                ) as ws:
+                )
+                async with asyncio.timeout(_WS_CONNECT_TIMEOUT):
+                    ws = await conn.__aenter__()  # manual to pair __aexit__ reliably
+                try:
                     self._ws = ws
                     await self._subscribe(ws)
                     backoff = 1.0  # reset after successful connect
@@ -144,18 +169,34 @@ class PumpPortalClient:
                     async for raw in ws:
                         if self._closed:
                             break
+                        # Fast path: ensure it's JSON object; skip noise
                         try:
                             msg = json.loads(raw)
+                            if not isinstance(msg, dict):
+                                continue
                         except Exception:
                             continue
 
-                        # Common server-side complaint for bad API keys — ignore line noise
+                        # Known server text when API key is invalid – we still keep socket
                         if msg.get("errors") == "Invalid API key. PumpSwap data will not be streamed.":
-                            # Keep the socket alive (we still want new_token feed which is free)
+                            # Keep the socket alive (new_token remains free)
                             continue
 
                         yield {"kind": self._classify(msg), "raw": msg}
 
+                finally:
+                    # ensure underlying context exits cleanly
+                    self._ws = None
+                    with asyncio.CancelledError:  # type: ignore
+                        pass
+                    try:
+                        await conn.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+
+            except asyncio.TimeoutError:
+                # connect timeout; fall through to backoff
+                pass
             except asyncio.CancelledError:
                 # Consumer cancelled; respect it
                 break
@@ -166,11 +207,10 @@ class PumpPortalClient:
             except Exception:
                 # transient; backoff below
                 pass
-            finally:
-                self._ws = None
 
             if self._closed:
                 break
+
             # backoff with gentle growth
             await asyncio.sleep(backoff)
             backoff = min(_WS_BACKOFF_MAX, backoff * 1.7)
