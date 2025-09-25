@@ -32,6 +32,7 @@ TX_RPC_URL = _TX_RPC_URL
 TX_COMMITMENT = _TX_COMMITMENT
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
+LAMPORTS_PER_SOL = 1_000_000_000
 
 # =============================================================================
 # Env helpers
@@ -148,6 +149,16 @@ def _is_valid_pubkey_str(s: str) -> bool:
 def is_valid_pubkey_str(s: str) -> bool:
     return _is_valid_pubkey_str(s)
 
+def _strip_pseudo_suffix(raw: str) -> tuple[str, Optional[str]]:
+    """
+    Returns (base, suffix) where suffix ∈ {"pump","bonk",None}.
+    """
+    s = (raw or "").strip()
+    for suf in ("pump", "bonk"):
+        if s.endswith(suf):
+            return s[:-len(suf)].strip(), suf
+    return s, None
+
 def normalize_pump_id_to_mint(raw: str) -> str:
     """
     Robustly extract a 32-byte mint pubkey from a Pump Portal id or raw mint.
@@ -161,18 +172,20 @@ def normalize_pump_id_to_mint(raw: str) -> str:
     if _is_valid_pubkey_str(s):
         return s
 
-    for suf in ("pump", "bonk"):
-        if s.endswith(suf):
-            base = s[:-len(suf)]
-            if _is_valid_pubkey_str(base):
-                return base
-            for L in (44, 43):
-                if len(base) >= L:
-                    sub = base[-L:]
-                    if _is_valid_pubkey_str(sub):
-                        return sub
+    base, suf = _strip_pseudo_suffix(s)
+    if suf and _is_valid_pubkey_str(base):
+        return base
 
-    # brute window scan across whole string
+    # tolerant scan around the tail or entire string
+    for i in range(0, max(0, len(base) - 43) + 1):
+        for L in (44, 43):
+            j = i + L
+            if j <= len(base):
+                sub = base[i:j]
+                if _is_valid_pubkey_str(sub):
+                    return sub
+
+    # last resort: scan whole input
     for i in range(0, max(0, len(s) - 43) + 1):
         for L in (44, 43):
             j = i + L
@@ -382,7 +395,7 @@ class DynPriority:
     def choose_lamports(self, override_sol: Optional[float]) -> Optional[int]:
         if override_sol is not None:
             try:
-                return int(max(0, override_sol) * 1_000_000_000)
+                return int(max(0, override_sol) * LAMPORTS_PER_SOL)
             except Exception:
                 return None
         if not self.enabled:
@@ -390,8 +403,8 @@ class DynPriority:
                 base = float(os.getenv("PF_PRIORITY_SOL") or "0")
             except Exception:
                 base = 0.0
-            return int(base * 1e9) if base > 0 else None
-        return int(self.current_sol * 1_000_000_000)
+            return int(base * LAMPORTS_PER_SOL) if base > 0 else None
+        return int(self.current_sol * LAMPORTS_PER_SOL)
 
     def observe(self, sig: Optional[str], t0: float) -> None:
         if not (self.enabled and sig):
@@ -524,7 +537,7 @@ async def _jup_quote(
                 "amount": str(amount_iu),
                 "slippageBps": sbps,
                 "swapMode": swap_mode,
-                "onlyDirectRoutes": "true" if only_direct else "false",
+                "onlyDirectRoutes": bool(only_direct),
             }
             js = await _get_json(JUP_QUOTE_URL, params=params, timeout=HTTP_TIMEOUT_GET)
             await _set_cached_quote(key, js, QUOTE_TTL_SEC)
@@ -562,6 +575,11 @@ async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optiona
 async def get_sell_quote(*, mint: str, amount_raw: int, slippage_bps: Optional[int] = None) -> Dict[str, Any]:
     if amount_raw <= 0:
         raise ValueError("amount_raw must be > 0")
+
+    # tolerate pseudo IDs by normalizing
+    if not _is_valid_pubkey_str(mint):
+        mint = normalize_pump_id_to_mint(mint)
+
     _assert_pubkey(mint, "mint")
 
     quote = await _retry(
@@ -573,7 +591,7 @@ async def get_sell_quote(*, mint: str, amount_raw: int, slippage_bps: Optional[i
     return {
         **quote,
         "lamports_out": lamports_out,
-        "out_amount_sol": lamports_out / 1_000_000_000.0,
+        "out_amount_sol": lamports_out / LAMPORTS_PER_SOL,
     }
 
 async def get_buy_quote(
@@ -583,6 +601,10 @@ async def get_buy_quote(
     amount_sol: Optional[float] = None,
     slippage_bps: Optional[int] = None,
 ) -> Dict[str, Any]:
+    # tolerate pseudo IDs by normalizing
+    if not _is_valid_pubkey_str(mint):
+        mint = normalize_pump_id_to_mint(mint)
+
     _assert_pubkey(mint, "mint")
 
     if lamports_in is None and amount_sol is None:
@@ -593,7 +615,7 @@ async def get_buy_quote(
             raise ValueError("Provide lamports_in or amount_sol")
 
     if lamports_in is None:
-        lamports_in = int((amount_sol or 0.0) * 1_000_000_000)
+        lamports_in = int((amount_sol or 0.0) * LAMPORTS_PER_SOL)
 
     q = await _retry(
         _jup_quote, SOL_MINT, mint, lamports_in,
@@ -606,7 +628,12 @@ async def get_buy_quote(
     return {**q, "lamports_in": lamports_in, "out_amount_raw": out_raw, "out_amount_ui": ui, "decimals": dec}
 
 async def get_price_ui(mint: str) -> float:
-    _assert_pubkey(mint, "mint")
+    # If not a real mint, do NOT call Jupiter (prevents 400/429 spam).
+    if not _is_valid_pubkey_str(mint):
+        try:
+            mint = normalize_pump_id_to_mint(mint)
+        except Exception:
+            return 0.0
 
     if PRICE_TTL_SEC > 0:
         rec = _PRICE_CACHE.get(mint)
@@ -626,7 +653,7 @@ async def get_price_ui(mint: str) -> float:
         lamports = int(q.get("outAmount", "0"))
         if lamports <= 0:
             return 0.0
-        sol_out = lamports / 1_000_000_000.0
+        sol_out = lamports / LAMPORTS_PER_SOL
         tokens_ui = tiny_raw / (10 ** dec)
         px = sol_out / tokens_ui if tokens_ui > 0 else 0.0
         if PRICE_TTL_SEC > 0:
@@ -653,6 +680,10 @@ async def buy_via_lightning(
     slippage_bps: Optional[int] = None,
     priority_sol: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
+    # tolerate pseudo IDs by normalizing
+    if not _is_valid_pubkey_str(mint):
+        mint = normalize_pump_id_to_mint(mint)
+
     _assert_pubkey(mint, "mint")
 
     kp = load_keypair()
@@ -661,7 +692,7 @@ async def buy_via_lightning(
     if lamports_in is None:
         if amount_sol is None:
             amount_sol = _envf("PF_TRADE_SOL", 0.0)
-        lamports_in = int(amount_sol * 1_000_000_000)
+        lamports_in = int(amount_sol * LAMPORTS_PER_SOL)
 
     if lamports_in <= 0:
         return False, None
@@ -707,6 +738,11 @@ async def sell_via_lightning(
     priority_sol: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
     del token_program  # Jupiter doesn't need this here
+
+    # tolerate pseudo IDs by normalizing
+    if not _is_valid_pubkey_str(mint):
+        mint = normalize_pump_id_to_mint(mint)
+
     _assert_pubkey(mint, "mint")
 
     if amount_raw <= 0:
@@ -727,7 +763,7 @@ async def sell_via_lightning(
 
     if DRY_RUN:
         lamports = int(quote.get("outAmount", "0"))
-        log.event("DRYRUN_SELL", mint=mint, amount_raw=amount_raw, out_sol=lamports / 1e9)
+        log.event("DRYRUN_SELL", mint=mint, amount_raw=amount_raw, out_sol=lamports / LAMPORTS_PER_SOL)
         return True, None
 
     t0 = time.time()

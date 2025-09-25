@@ -117,7 +117,7 @@ if MIN_SOL_PER_TRADE > MAX_SOL_PER_TRADE:
 
 # Buy pacing (with aliases used by your entrypoint logs)
 BUY_COOLDOWN_SEC         = _envi_alias(["BUY_COOLDOWN_SEC", "PF_COOLDOWN_SEC"], 120)
-MAX_CONCURRENT_BUYS      = _envi_alias(["MAX_CONCURRENT_BUYS", "PF_MAX_CONCURRENT"], 2)
+MAX_CONCURRENT_BUYS      = max(1, _envi_alias(["MAX_CONCURRENT_BUYS", "PF_MAX_CONCURRENT"], 2))
 NOROUTE_COOLDOWN_SEC     = _envi("NOROUTE_COOLDOWN_SEC", 600)
 
 # Route guard policies (only used by internal fallback)
@@ -147,6 +147,8 @@ PF_POOLS                 = {p.strip().lower() for p in (os.getenv("PF_POOLS", "p
 PF_DEBUG_TX              = _envb("PF_DEBUG_TX", False)
 USE_LOCAL_FALLBK         = _envb("PF_USE_LOCAL_FALLBACK", False)
 
+LAMPORTS_PER_SOL = 1_000_000_000
+
 # Internal pacing state
 _last_buy_at_global: float = 0.0
 _last_no_route: Dict[str, float] = {}
@@ -162,11 +164,23 @@ _BASE58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 def _looks_base58(s: str) -> bool:
     return bool(s) and isinstance(s, str) and all(ch in _BASE58 for ch in s)
 
-def _strip_pump_suffix(raw: str) -> Tuple[str, bool]:
+def _strip_pseudo_suffix(raw: str) -> Tuple[str, Optional[str]]:
+    """
+    Returns (base, suffix) where suffix in {"pump","bonk",None}.
+    Examples:
+      "XXXpump" -> ("XXX", "pump")
+      "YYYbonk" -> ("YYY", "bonk")
+      "Z"       -> ("Z", None)
+    """
     s = (raw or "").strip()
-    if s.endswith("pump"):
-        return s[:-4].strip(), True
-    return s, False
+    for suf in ("pump", "bonk"):
+        if s.endswith(suf):
+            return s[:-len(suf)].strip(), suf
+    return s, None
+
+def _is_pseudo_id(s: str) -> bool:
+    """True for strings ending with ...pump / ...bonk (PumpPortal IDs)."""
+    return (s or "").strip().endswith(("pump", "bonk"))
 
 async def _get_sol_balance(owner: str) -> float:
     """Best-effort SOL balance using wallet helper."""
@@ -220,7 +234,6 @@ async def _momentum_ok(mint: str) -> bool:
 
     pct_up = (last_px / px0 - 1.0) * 100.0
     ok = pct_up >= MOMO_MIN_UP_PCT
-    # Use .event (widely available) instead of .every to avoid attribute issues
     log.event(
         "ENTRY_MOMO",
         mint=mint,
@@ -358,17 +371,25 @@ def _pp_errors(resp: Dict[str, Any]) -> List[str]:
     return [str(e) for e in errs] if isinstance(errs, list) else ([str(errs)] if errs else [])
 
 def _pp_candidates(raw_hint: str) -> List[Tuple[str, str]]:
+    """
+    Build a list of candidate mint-like identifiers to try with PumpPortal.
+    Priority order:
+      1) exact pseudo id (...pump / ...bonk) if present,
+      2) the base58 extracted from the pseudo id (if base58),
+      3) the raw string if neither of the above is base58.
+    """
     out: List[Tuple[str, str]] = []
-    base, had = _strip_pump_suffix((raw_hint or "").strip())
-    if had:
-        out.append((raw_hint.strip(), "as-pump-id"))
+    s = (raw_hint or "").strip()
+    base, suf = _strip_pseudo_suffix(s)
+    if suf in ("pump", "bonk"):
+        out.append((s, f"as-{suf}-id"))
         if _looks_base58(base):
-            out.append((base, "as-base58-from-id"))
+            out.append((base, f"as-base58-from-{suf}"))
     else:
         if _looks_base58(base):
             out.append((base, "as-base58"))
         else:
-            out.append((raw_hint.strip(), "as-raw"))
+            out.append((s, "as-raw"))
     return out
 
 # =============================================================================
@@ -377,7 +398,9 @@ def _pp_candidates(raw_hint: str) -> List[Tuple[str, str]]:
 async def maybe_buy(*, mint: str, ui: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
     Main buy entry called by Strategy.
-    Tries Jupiter (router) first; if buy route is missing but allowed, falls back to PumpPortal Lightning.
+    Tries Jupiter (router) first for *real SPL mints*; if buy route is missing
+    but allowed, or the input is a PumpPortal pseudo id (…pump/…bonk), falls
+    back to PumpPortal Lightning.
     Returns signature on success, or None if skipped/failed.
     """
     ui = ui or {}
@@ -426,11 +449,11 @@ async def maybe_buy(*, mint: str, ui: Optional[Dict[str, Any]] = None) -> Option
     else:
         spend_sol = await _autosize_by_wallet(owner)
 
-    # Liquidity-aware tweak
+    # Liquidity-aware tweak (only when we have a real SPL mint)
     spend_sol = await _liquidity_size_boost(mint, spend_sol)
     # Clamp hard to env rails
     spend_sol = min(MAX_SOL_PER_TRADE, max(MIN_SOL_PER_TRADE, spend_sol))
-    lamports_in = int(spend_sol * 1_000_000_000)
+    lamports_in = int(spend_sol * LAMPORTS_PER_SOL)
 
     # >>> EARLY DRY-RUN EXIT (no quotes burned) <<<
     if IS_DRYRUN:
@@ -439,19 +462,27 @@ async def maybe_buy(*, mint: str, ui: Optional[Dict[str, Any]] = None) -> Option
         _last_buy_at_global = time.time()
         return None
 
-    # Route preflight — prefer external routeguard if present, else internal
-    if rg_preflight:
-        try:
-            allow_buy, q_buy = await rg_preflight(mint=mint, lamports_in=lamports_in)  # type: ignore
-        except Exception:
-            allow_buy, q_buy = True, None
-    else:
-        allow_buy, q_buy = await _internal_preflight(mint, lamports_in)
+    # If the "mint" is a PumpPortal pseudo id or otherwise not a real SPL mint,
+    # we skip Jupiter preflight entirely and go straight to PumpPortal.
+    skip_jupiter = _is_pseudo_id(mint) or not looks_like_mint(mint)
 
-    jupiter_path_allowed = allow_buy and q_buy is not None
+    # Route preflight — prefer external routeguard if present, else internal
+    allow_buy: bool = True
+    q_buy: Optional[Dict[str, Any]] = None
+
+    if not skip_jupiter:
+        if rg_preflight:
+            try:
+                allow_buy, q_buy = await rg_preflight(mint=mint, lamports_in=lamports_in)  # type: ignore
+            except Exception:
+                allow_buy, q_buy = True, None
+        else:
+            allow_buy, q_buy = await _internal_preflight(mint, lamports_in)
+
+    jupiter_path_allowed = (not skip_jupiter) and allow_buy and (q_buy is not None)
 
     async with _inflight:
-        # Preferred: Jupiter router
+        # Preferred: Jupiter router for true SPL mints with a ready path
         if jupiter_path_allowed:
             try:
                 ok2, sig = await buy_via_lightning(
@@ -469,8 +500,8 @@ async def maybe_buy(*, mint: str, ui: Optional[Dict[str, Any]] = None) -> Option
             except Exception as e:
                 log.event("BUY_EXEC_ERROR", mint=mint, error=str(e))
 
-        # Fallback: PumpPortal Lightning (when allowed to buy without a Jupiter route)
-        if not jupiter_path_allowed and PP_API_KEY:
+        # Fallback: PumpPortal Lightning
+        if (not jupiter_path_allowed) and PP_API_KEY:
             payer = owner
             attempts = _pp_candidates(raw_hint)
             for send_mint, note in attempts:
@@ -552,14 +583,15 @@ def _helius_key() -> Optional[str]:
     except Exception:
         return None
 
-def resolve_true_mint_from_pump_id(pump_id: str) -> Optional[str]:
+def resolve_true_mint_from_pseudo_id(pid: str) -> Optional[str]:
     """
-    Given a PUMP ID (usually '<base>pump'), try to infer the real SPL mint.
-    Uses Helius Enhanced Tx History on the base address (if available).
+    Given a PumpPortal pseudo id (usually '<base>pump' or '<base>bonk'),
+    try to infer the real SPL mint by scanning Helius Enhanced Tx History
+    on the base address (if available).
     """
     key = _helius_key()
-    base, had = _strip_pump_suffix(pump_id)
-    if not (key and had and _looks_base58(base)):
+    base, suf = _strip_pseudo_suffix(pid)
+    if not (key and suf and _looks_base58(base)):
         return None
     try:
         url = f"https://api.helius.xyz/v0/addresses/{base}/transactions?api-key={key}&limit=25"
@@ -605,21 +637,24 @@ def resolve_true_mint_from_signature(sig: str) -> Optional[str]:
     return None
 
 def resolve_true_mint(pump_or_mint: str, *, signature: Optional[str] = None) -> Optional[str]:
-    """Try signature first (most precise), then pump-id base address; else accept plausible base58."""
+    """
+    Try signature first (most precise), then pseudo id base address; else accept
+    plausible base58 strings. Supports both '...pump' and '...bonk'.
+    """
     m = resolve_true_mint_from_signature(signature) if signature else None
     if m:
         return m
-    m2 = resolve_true_mint_from_pump_id(pump_or_mint)
+    m2 = resolve_true_mint_from_pseudo_id(pump_or_mint)
     if m2:
         return m2
-    s, had = _strip_pump_suffix(pump_or_mint)
-    if not had and _looks_base58(s):
-        return s
+    base, suf = _strip_pseudo_suffix(pump_or_mint)
+    if (suf is None) and _looks_base58(base):
+        return base
     return None
 
 __all__ = [
     "maybe_buy",
     "resolve_true_mint",
-    "resolve_true_mint_from_pump_id",
+    "resolve_true_mint_from_pseudo_id",
     "resolve_true_mint_from_signature",
 ]
