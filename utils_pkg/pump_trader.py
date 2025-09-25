@@ -67,7 +67,7 @@ except Exception:  # pragma: no cover
 log = get_logger()
 
 # =============================================================================
-# ENV & helpers
+# ENV helpers
 # =============================================================================
 def _envb(k: str, d: bool = False) -> bool:
     v = (os.getenv(k, "") or "").strip().lower()
@@ -87,6 +87,19 @@ def _envi(k: str, d: int) -> int:
     except Exception:
         return int(d)
 
+def _envi_alias(keys: List[str], d: int) -> int:
+    for k in keys:
+        v = os.getenv(k)
+        if v is not None and v != "":
+            try:
+                return int(v)
+            except Exception:
+                pass
+    return d
+
+# =============================================================================
+# ENV & knobs
+# =============================================================================
 IS_DRYRUN                = _envb("DRY_RUN", False)
 OWNER_FROM_ENV           = (os.getenv("PF_PP_ACCOUNT") or "").strip()
 MIN_SOL_BALANCE          = _envf("MIN_SOL_BALANCE", 0.20)
@@ -102,9 +115,9 @@ STEP_SOL                 = _envf("PF_TRADE_STEP_SOL", 0.005)
 if MIN_SOL_PER_TRADE > MAX_SOL_PER_TRADE:
     MIN_SOL_PER_TRADE, MAX_SOL_PER_TRADE = MAX_SOL_PER_TRADE, MIN_SOL_PER_TRADE
 
-# Buy pacing
-BUY_COOLDOWN_SEC         = _envi("BUY_COOLDOWN_SEC", 120)
-MAX_CONCURRENT_BUYS      = _envi("MAX_CONCURRENT_BUYS", 2)
+# Buy pacing (with aliases used by your entrypoint logs)
+BUY_COOLDOWN_SEC         = _envi_alias(["BUY_COOLDOWN_SEC", "PF_COOLDOWN_SEC"], 120)
+MAX_CONCURRENT_BUYS      = _envi_alias(["MAX_CONCURRENT_BUYS", "PF_MAX_CONCURRENT"], 2)
 NOROUTE_COOLDOWN_SEC     = _envi("NOROUTE_COOLDOWN_SEC", 600)
 
 # Route guard policies (only used by internal fallback)
@@ -175,9 +188,9 @@ def _cooldown_ok(key: str, ttl: int) -> bool:
 def _note_no_route(key: str) -> None:
     _last_no_route[key] = time.time()
 
-# -----------------------------------------------------------------------------
-// Momentum gate (credit-efficient & cache-aware)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Momentum gate (credit-efficient & cache-aware)
+# =============================================================================
 async def _momentum_ok(mint: str) -> bool:
     """
     Lightweight momentum confirmation. To avoid false negatives when the router
@@ -207,10 +220,9 @@ async def _momentum_ok(mint: str) -> bool:
 
     pct_up = (last_px / px0 - 1.0) * 100.0
     ok = pct_up >= MOMO_MIN_UP_PCT
-    log.every(
-        f"momo.{mint}",
-        n=8,
-        msg="ENTRY_MOMO",
+    # Use .event (widely available) instead of .every to avoid attribute issues
+    log.event(
+        "ENTRY_MOMO",
         mint=mint,
         px0=px0,
         px1=last_px,
@@ -219,9 +231,9 @@ async def _momentum_ok(mint: str) -> bool:
     )
     return ok
 
-# -----------------------------------------------------------------------------
-// Liquidity-aware size boost
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Liquidity-aware size boost
+# =============================================================================
 async def _liquidity_size_boost(mint: str, base_sol: float) -> float:
     if not LIQ_FILTER_ENABLED or not looks_like_mint(mint):
         return base_sol
@@ -244,9 +256,9 @@ async def _liquidity_size_boost(mint: str, base_sol: float) -> float:
     sized = base_sol * boost
     return min(MAX_SOL_PER_TRADE, max(MIN_SOL_PER_TRADE, sized))
 
-# -----------------------------------------------------------------------------
-// Fallback autosizer (only used when sizer module is unavailable)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Fallback autosizer (only used when sizer module is unavailable)
+# =============================================================================
 async def _autosize_by_wallet(owner: str) -> float:
     global _last_autosize_at, _cached_wallet_sol
     now = time.time()
@@ -258,9 +270,9 @@ async def _autosize_by_wallet(owner: str) -> float:
     base = min(MAX_SOL_PER_TRADE, max(MIN_SOL_PER_TRADE, base))
     return _round_step(base, STEP_SOL)
 
-# -----------------------------------------------------------------------------
-// Internal Route Guard (used only if utils_pkg.routeguard is not present)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Internal Route Guard (used only if utils_pkg.routeguard is not present)
+# =============================================================================
 async def _internal_preflight(mint: str, spend_lamports: int) -> Tuple[bool, Optional[Dict[str, Any]]]:
     """
     Returns (allow_buy, jupiter_buy_quote_or_None).
