@@ -18,6 +18,7 @@ from utils_pkg.solana_wallet import (
 )
 
 log = get_logger()
+
 # ---- logging safety shim (so .every always exists) ---------------------------
 if not hasattr(log, "every"):
     def _every(_key: str, n: int = 10, msg: str | None = None, **kw):
@@ -92,7 +93,7 @@ def _as_legacy() -> bool:
 
 # Retries / pacing
 QUOTE_RETRIES = max(1, _envi("ROUTER_QUOTE_RETRIES", 1))
-SWAP_RETRIES  = max(1, _envi("ROUTER_SWAP_RETRIES", 2))
+SWAP_RETRIES  = max(1, _envi("ROUTER_SWAP_RETRIES", 3))
 RETRY_BACKOFF = max(0.05, _envf("ROUTER_RETRY_BACKOFF_SEC", 0.35))
 
 JUP_MAX_QPS       = max(1, _envi("JUP_MAX_QPS", 2))
@@ -179,32 +180,42 @@ def _strip_pseudo_suffix(raw: str) -> tuple[str, Optional[str]]:
 
 def normalize_pump_id_to_mint(raw: str) -> str:
     """
-    Extract a 32-byte mint pubkey from a Pump Portal id or raw string.
-    Accepts …pump / …bonk suffixes, and scans windows if needed.
-    Raises ValueError on failure.
+    Extract a clean 32-byte mint pubkey from:
+      - a plain mint
+      - a Pump Portal id that may end in 'pump'/'bonk'
+      - strings that contain the mint (scan windows)
+    Always strip known suffixes before validating.
     """
     s = (raw or "").strip()
     if not s:
         raise ValueError("empty pump id")
 
+    # 1) strip known suffixes first
+    base, suf = _strip_pseudo_suffix(s)
+    if suf:
+        s = base
+
+    # 2) if already clean, accept
     if _is_valid_pubkey_str(s):
         return s
 
-    base, _ = _strip_pseudo_suffix(s)
-
-    # scan likely base tail first
+    # 3) scan the base (without suffix) for any 32-byte pubkey window
     for i in range(0, max(0, len(base) - 43) + 1):
         for L in (44, 43):
-            sub = base[i:i+L]
-            if _is_valid_pubkey_str(sub):
-                return sub
+            j = i + L
+            if j <= len(base):
+                sub = base[i:j]
+                if _is_valid_pubkey_str(sub):
+                    return sub
 
-    # last resort: scan whole string
-    for i in range(0, max(0, len(s) - 43) + 1):
+    # 4) last resort: scan whole original input
+    for i in range(0, max(0, len(raw) - 43) + 1):
         for L in (44, 43):
-            sub = s[i:i+L]
-            if _is_valid_pubkey_str(sub):
-                return sub
+            j = i + L
+            if j <= len(raw):
+                sub = raw[i:j]
+                if _is_valid_pubkey_str(sub):
+                    return sub
 
     raise ValueError(f"Cannot normalize pump id to a mint: '{raw}'")
 
@@ -549,8 +560,7 @@ async def _jup_quote(
                 "amount": str(amount_iu),
                 "slippageBps": sbps,
                 "swapMode": swap_mode,
-                # Jupiter expects truthy string flags; avoid "True"/"False"
-                "onlyDirectRoutes": "true" if only_direct else "false",
+                "onlyDirectRoutes": bool(only_direct),
             }
             js = await _get_json(JUP_QUOTE_URL, params=params, timeout=HTTP_TIMEOUT_GET)
             await _set_cached_quote(key, js, QUOTE_TTL_SEC)
@@ -589,9 +599,8 @@ async def get_sell_quote(*, mint: str, amount_raw: int, slippage_bps: Optional[i
     if amount_raw <= 0:
         raise ValueError("amount_raw must be > 0")
 
-    # tolerate pseudo IDs by normalizing
-    if not _is_valid_pubkey_str(mint):
-        mint = normalize_pump_id_to_mint(mint)
+    # Always normalize first (strips pump/bonk and scans if needed)
+    mint = normalize_pump_id_to_mint(mint)
     _assert_pubkey(mint, "mint")
 
     quote = await _retry(
@@ -613,9 +622,8 @@ async def get_buy_quote(
     amount_sol: Optional[float] = None,
     slippage_bps: Optional[int] = None,
 ) -> Dict[str, Any]:
-    # tolerate pseudo IDs by normalizing
-    if not _is_valid_pubkey_str(mint):
-        mint = normalize_pump_id_to_mint(mint)
+    # Always normalize first
+    mint = normalize_pump_id_to_mint(mint)
     _assert_pubkey(mint, "mint")
 
     if lamports_in is None and amount_sol is None:
@@ -651,13 +659,13 @@ async def get_price_ui(mint: str) -> float:
 
     # Normalize to a real mint, or bail quietly
     try:
-        norm = normalize_pump_id_to_mint(raw) if not _is_valid_pubkey_str(raw) else raw
+        norm = normalize_pump_id_to_mint(raw)
     except Exception:
         _bl_set(raw)
         log.every("price.bad", n=20, msg="PRICE_BAD_ID", raw=raw)
         return 0.0
 
-    # Get decimals (also implicitly validates it's a mint)
+    # decimals
     dec = await _get_decimals(norm)
     if dec is None or dec < 0 or dec > 18:
         _bl_set(raw)
@@ -709,9 +717,8 @@ async def buy_via_lightning(
     slippage_bps: Optional[int] = None,
     priority_sol: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
-    # tolerate pseudo IDs by normalizing
-    if not _is_valid_pubkey_str(mint):
-        mint = normalize_pump_id_to_mint(mint)
+    # Always normalize first
+    mint = normalize_pump_id_to_mint(mint)
     _assert_pubkey(mint, "mint")
 
     kp = load_keypair()
@@ -767,9 +774,8 @@ async def sell_via_lightning(
 ) -> Tuple[bool, Optional[str]]:
     del token_program  # Jupiter doesn't need this here
 
-    # tolerate pseudo IDs by normalizing
-    if not _is_valid_pubkey_str(mint):
-        mint = normalize_pump_id_to_mint(mint)
+    # Always normalize first
+    mint = normalize_pump_id_to_mint(mint)
     _assert_pubkey(mint, "mint")
 
     if amount_raw <= 0:
