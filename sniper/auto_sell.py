@@ -1,3 +1,6 @@
+# sniper/auto_sell.py
+from __future__ import annotations
+
 import os
 import asyncio
 import logging
@@ -10,13 +13,19 @@ from utils_pkg.core_utils import (
     session,
     redis,
     get_wallet_tokens,
-    get_token_price,
-    swap_token_jupiter,
     convert_sol_to_usd,
     send_telegram,
     log_to_notion,
     save_entry_price,
     get_entry_price,
+)
+
+# Router: single source of truth for mint handling, price & swaps
+from utils_pkg.router import (
+    normalize_pump_id_to_mint,
+    get_decimals,
+    get_price_ui,
+    sell_via_lightning,
 )
 
 # circuit-breakers (best-effort)
@@ -26,12 +35,12 @@ try:
         record_error_and_maybe_halt,
         record_pnl_and_maybe_halt,
     )
-except Exception:
-    async def trading_halted(*args, **kwargs) -> bool:  # type: ignore
+except Exception:  # pragma: no cover
+    async def trading_halted(*_a, **_k) -> bool:  # type: ignore
         return False
-    async def record_error_and_maybe_halt(*args, **kwargs):  # type: ignore
+    async def record_error_and_maybe_halt(*_a, **_k):  # type: ignore
         return None
-    async def record_pnl_and_maybe_halt(*args, **kwargs):  # type: ignore
+    async def record_pnl_and_maybe_halt(*_a, **_k):  # type: ignore
         return None
 
 from utils_pkg.ai_sell_logic import should_hold_token
@@ -61,7 +70,7 @@ try:
         get_strategy_params,
         process_trade_closure,
     )
-except Exception:
+except Exception:  # pragma: no cover
     async def get_strategy_params(_redis=None) -> Dict[str, Any]:
         return {
             "STOP_LOSS_PERCENT": float(os.getenv("STOP_LOSS_PERCENT", "20")),
@@ -74,7 +83,6 @@ except Exception:
     async def process_trade_closure(**kwargs):
         return None
 
-
 logger = logging.getLogger("auto_sell")
 logging.basicConfig(level=logging.INFO)
 
@@ -86,10 +94,23 @@ WALLET_PUBKEY = os.getenv("WALLET_PUBKEY") or os.getenv("WALLET_PUBLIC_KEY")
 ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "900"))
 POSITION_MONITOR_INTERVAL = int(os.getenv("POSITION_MONITOR_INTERVAL", "20"))
 PARTIAL_SELL_CHUNKS = int(os.getenv("PARTIAL_SELL_CHUNKS", "4"))  # laddered TP count
+DRY_RUN = (os.getenv("DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y"})
+
+# Router knobs
+DEFAULT_PRIORITY_SOL = float(os.getenv("PF_PRIORITY_SOL", "0.002") or 0.0)
+DEFAULT_SLIPPAGE_BPS_ENV = os.getenv("PF_SLIPPAGE_BPS")  # if set, overrides % slippage input
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _slippage_to_bps(slippage_percent: float) -> int:
+    # 0.5 (%) -> 50 bps
+    try:
+        return max(1, int(round(float(slippage_percent) * 100)))
+    except Exception:
+        return 50
 
 
 async def _get_buytime(mint: str, pos: Optional[Dict[str, Any]]) -> Optional[datetime]:
@@ -136,15 +157,60 @@ def _should_partial_take_profit(pct_change: float, target_profit: float, chunks_
     return pct_change >= needed
 
 
-async def _sell_token(mint: str, amount: float, slippage: float) -> Optional[str]:
-    ok, sig = await swap_token_jupiter(
-        input_mint=mint,
-        output_mint=SOL_MINT,
-        amount_float=amount,
-        buy=False,
-        slippage=slippage,
+async def _router_price_ui(mint: str) -> float:
+    try:
+        return float(await get_price_ui(mint) or 0.0)
+    except Exception:
+        return 0.0
+
+
+async def _sell_token(mint_raw: str, amount_ui: float, slippage_percent: float) -> Optional[str]:
+    """
+    Execute sell using router (Jupiter v6 under the hood).
+    Handles Pump IDs → real mint, fetches decimals, scales UI → raw, and submits.
+    """
+    try:
+        norm = normalize_pump_id_to_mint(mint_raw)
+    except Exception:
+        await record_error_and_maybe_halt(reason="autosell_normalize_fail")
+        return None
+
+    try:
+        dec = await get_decimals(norm)
+    except Exception:
+        dec = None
+    if dec is None:
+        # conservative default
+        dec = 9
+
+    try:
+        amount_raw = int(round(float(amount_ui) * (10 ** int(dec))))
+    except Exception:
+        await record_error_and_maybe_halt(reason="autosell_amount_scale_fail")
+        return None
+    if amount_raw <= 0:
+        return None
+
+    # honor global BPS override if set; otherwise derive from provided percentage
+    if DEFAULT_SLIPPAGE_BPS_ENV is not None:
+        try:
+            slippage_bps = max(1, int(DEFAULT_SLIPPAGE_BPS_ENV))
+        except Exception:
+            slippage_bps = _slippage_to_bps(slippage_percent)
+    else:
+        slippage_bps = _slippage_to_bps(slippage_percent)
+
+    if DRY_RUN:
+        return f"DRYRUN-{os.urandom(4).hex()}"
+
+    ok, sig = await sell_via_lightning(
+        mint=norm,
+        token_program=None,
+        amount_raw=amount_raw,
+        slippage_bps=slippage_bps,
+        priority_sol=DEFAULT_PRIORITY_SOL,
     )
-    if not ok:
+    if not ok or not sig:
         await record_error_and_maybe_halt(reason="autosell_swap_failed")
         return None
     return sig
@@ -152,6 +218,9 @@ async def _sell_token(mint: str, amount: float, slippage: float) -> Optional[str
 
 async def _alert_once(redis_key: str, cooldown_sec: int, fn):
     try:
+        if not redis:
+            await fn()
+            return
         last = await redis.get(redis_key)
         now = _now_utc().timestamp()
         if last and (now - float(last)) < cooldown_sec:
@@ -170,22 +239,22 @@ async def _handle_partial_sell(
     mint: str,
     symbol: str,
     pos: Dict[str, Any],
-    sell_amount: float,
+    sell_amount_ui: float,
     entry_price: float,
     current_price: float,
-    slippage: float,
+    slippage_percent: float,
 ):
-    sig = await _sell_token(mint, sell_amount, slippage)
+    sig = await _sell_token(mint, sell_amount_ui, slippage_percent)
     if not sig:
         logger.warning(f"[{symbol}] partial sell failed")
         return
 
-    pos["amount_invested"] = max(0.0, float(pos.get("amount_invested", 0.0)) - sell_amount)
+    pos["amount_invested"] = max(0.0, float(pos.get("amount_invested", 0.0)) - sell_amount_ui)
     pos["chunks_sold"] = int(pos.get("chunks_sold", 0)) + 1
     await save_position(mint, pos)
 
-    profit_sol = max(0.0, (current_price - entry_price) * sell_amount)
-    usd_proceeds = await convert_sol_to_usd(current_price * sell_amount)
+    profit_sol = max(0.0, (current_price - entry_price) * sell_amount_ui)
+    usd_proceeds = await convert_sol_to_usd(current_price * sell_amount_ui)
     profit_usd = await convert_sol_to_usd(profit_sol)
 
     # Record realized PnL for daily stop logic
@@ -198,7 +267,7 @@ async def _handle_partial_sell(
     await log_to_notion(
         token=mint,
         symbol=symbol,
-        balance=sell_amount,
+        balance=sell_amount_ui,
         entry=entry_price,
         current=current_price,
         profit=profit_sol,
@@ -206,14 +275,16 @@ async def _handle_partial_sell(
     )
     msg = (
         f"🟡 Partial TP {symbol}\n"
-        f"∆ {((current_price-entry_price)/entry_price)*100:.2f}% | Sold {sell_amount:.4f}\n"
+        f"∆ {((current_price-entry_price)/entry_price)*100:.2f}% | Sold {sell_amount_ui:.4f}\n"
         f"≈ ${usd_proceeds:.2f}\nTx: {sig}"
     )
     await send_telegram(msg)
 
     if AlertManager and alert_mgr:
         try:
-            await alert_mgr.send_sell_alert(symbol, current_price, profit_sol, f"https://dexscreener.com/solana/{mint}", sol_value=sell_amount)
+            await alert_mgr.send_sell_alert(
+                symbol, current_price, profit_sol, f"https://dexscreener.com/solana/{mint}", sol_value=sell_amount_ui
+            )
         except Exception:
             pass
 
@@ -222,7 +293,7 @@ async def _handle_partial_sell(
         token_address=mint,
         buy_price=entry_price,
         sell_price=current_price,
-        amount=sell_amount,
+        amount=sell_amount_ui,
         partial=True,
         timestamp=_now_utc().isoformat(),
     )
@@ -235,20 +306,20 @@ async def _handle_full_exit(
     pos: Dict[str, Any],
     entry_price: float,
     current_price: float,
-    slippage: float,
+    slippage_percent: float,
     reason: str,
 ):
-    amt = float(pos.get("amount_invested", 0.0))
-    if amt <= 0:
+    amt_ui = float(pos.get("amount_invested", 0.0))
+    if amt_ui <= 0:
         return
 
-    sig = await _sell_token(mint, amt, slippage)
+    sig = await _sell_token(mint, amt_ui, slippage_percent)
     if not sig:
         logger.warning(f"[{symbol}] full exit failed")
         return
 
-    profit_sol = (current_price - entry_price) * amt
-    usd_proceeds = await convert_sol_to_usd(current_price * amt)
+    profit_sol = (current_price - entry_price) * amt_ui
+    usd_proceeds = await convert_sol_to_usd(current_price * amt_ui)
     profit_usd = await convert_sol_to_usd(profit_sol)
 
     # Record realized PnL for daily stop logic
@@ -260,7 +331,7 @@ async def _handle_full_exit(
     await log_to_notion(
         token=mint,
         symbol=symbol,
-        balance=amt,
+        balance=amt_ui,
         entry=entry_price,
         current=current_price,
         profit=profit_sol,
@@ -268,14 +339,16 @@ async def _handle_full_exit(
     )
     msg = (
         f"🔴 Exit {symbol} — {reason}\n"
-        f"∆ {((current_price-entry_price)/entry_price)*100:.2f}% | Sold {amt:.4f}\n"
+        f"∆ {((current_price-entry_price)/entry_price)*100:.2f}% | Sold {amt_ui:.4f}\n"
         f"≈ ${usd_proceeds:.2f}\nTx: {sig}"
     )
     await send_telegram(msg)
 
     if AlertManager and alert_mgr:
         try:
-            await alert_mgr.send_sell_alert(symbol, current_price, profit_sol, f"https://dexscreener.com/solana/{mint}", sol_value=amt)
+            await alert_mgr.send_sell_alert(
+                symbol, current_price, profit_sol, f"https://dexscreener.com/solana/{mint}", sol_value=amt_ui
+            )
         except Exception:
             pass
 
@@ -283,7 +356,7 @@ async def _handle_full_exit(
         token_address=mint,
         buy_price=entry_price,
         sell_price=current_price,
-        amount=amt,
+        amount=amt_ui,
         partial=False,
         timestamp=_now_utc().isoformat(),
     )
@@ -293,8 +366,9 @@ async def _handle_full_exit(
     except Exception:
         pass
     try:
-        await redis.delete(f"entry_price:{mint}")
-        await redis.delete(f"buytime:{mint}")
+        if redis:
+            await redis.delete(f"entry_price:{mint}")
+            await redis.delete(f"buytime:{mint}")
     except Exception:
         pass
 
@@ -311,7 +385,7 @@ async def sweep_loop():
             stop_loss = float(params["STOP_LOSS_PERCENT"])
             target_profit = float(params["TARGET_PROFIT_PERCENT"])
             hold_score = float(params["HOLD_IF_SCORE_ABOVE"])
-            slippage = float(params["SLIPPAGE"])
+            slippage_percent = float(params["SLIPPAGE"])
             max_hold_min = int(params["MAX_HOLD_TIME_MINUTES"])
 
             positions = await load_positions() or {}
@@ -319,29 +393,35 @@ async def sweep_loop():
             wallet_map = {t["mint"]: float(t.get("balance", 0.0)) for t in (tokens or [])}
 
             # We still proceed even if halted; exits reduce risk.
-            halted = False
             try:
-                halted = await trading_halted(redis)
+                _ = await trading_halted(redis)  # noqa: F841
             except Exception:
-                halted = False
+                pass
 
             for mint, pos in list(positions.items()):
                 symbol = pos.get("symbol") or mint[:6]
-                balance = wallet_map.get(mint, 0.0)
-                if balance <= 0:
+                balance_ui = wallet_map.get(mint, 0.0)
+                if balance_ui <= 0:
                     await remove_position(mint)
+                    continue
+
+                # Normalize for router calls
+                try:
+                    norm = normalize_pump_id_to_mint(mint)
+                except Exception:
+                    # keep original for storage; but we can't price/sell without a mint
                     continue
 
                 entry_price = await _get_entry(mint, pos)
                 if not entry_price or entry_price <= 0:
-                    cp = await get_token_price(mint)
-                    if not cp:
+                    cp = await _router_price_ui(norm)
+                    if cp <= 0:
                         continue
                     entry_price = cp
                     await save_entry_price(redis, mint, entry_price)
 
-                current_price = await get_token_price(mint)
-                if not current_price or current_price <= 0:
+                current_price = await _router_price_ui(norm)
+                if current_price <= 0:
                     continue
 
                 pct_change = ((current_price - entry_price) / entry_price) * 100.0
@@ -354,17 +434,17 @@ async def sweep_loop():
                 # LADDERED TPs
                 chunks_sold = int(pos.get("chunks_sold", 0))
                 if chunks_sold < PARTIAL_SELL_CHUNKS and _should_partial_take_profit(pct_change, target_profit, chunks_sold):
-                    sell_amount = max(0.0, balance / float(PARTIAL_SELL_CHUNKS - chunks_sold))
-                    if sell_amount > 0:
+                    sell_amount_ui = max(0.0, balance_ui / float(PARTIAL_SELL_CHUNKS - chunks_sold))
+                    if sell_amount_ui > 0:
                         await _handle_partial_sell(
                             alert_mgr=alert_mgr,
                             mint=mint,
                             symbol=symbol,
                             pos=pos,
-                            sell_amount=sell_amount,
+                            sell_amount_ui=sell_amount_ui,
                             entry_price=entry_price,
                             current_price=current_price,
-                            slippage=slippage,
+                            slippage_percent=slippage_percent,
                         )
                         continue
 
@@ -377,7 +457,7 @@ async def sweep_loop():
                         pos=pos,
                         entry_price=entry_price,
                         current_price=current_price,
-                        slippage=slippage,
+                        slippage_percent=slippage_percent,
                         reason="Trailing Stop",
                     )
                     continue
@@ -391,7 +471,7 @@ async def sweep_loop():
                         pos=pos,
                         entry_price=entry_price,
                         current_price=current_price,
-                        slippage=slippage,
+                        slippage_percent=slippage_percent,
                         reason="Max Hold",
                     )
                     continue
@@ -412,7 +492,7 @@ async def sweep_loop():
                         pos=pos,
                         entry_price=entry_price,
                         current_price=current_price,
-                        slippage=slippage,
+                        slippage_percent=slippage_percent,
                         reason="AI Signal",
                     )
                     continue

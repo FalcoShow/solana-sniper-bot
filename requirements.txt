@@ -1,14 +1,21 @@
-# --- core runtime ---
+# === core runtime ===
+aiohttp==3.10.5
+aiosqlite==0.21.0
+redis==5.3.1
+certifi==2024.8.30
+python-dotenv==1.0.1
 requests==2.32.4
 websockets==11.0.3
-python-dotenv==1.0.1
 
-# --- solana stack ---
+# === solana stack ===
 solana==0.36.9
 solders==0.26.0
 base58==2.1.1
 
-# --- optional infra (keep if you use them elsewhere) ---
-redis>=4.6,<6
-SQLAlchemy>=2.0,<2.1
-psycopg2-binary==2.9.9
+# === database / ORM ===
+SQLAlchemy==2.0.43
+psycopg[binary]==3.2.3   # psycopg v3 wheels; fixes pg_config build issue on Windows/Py3.13
+
+# === test deps (keep here so CI/Render build can run tests) ===
+pytest==8.4.1
+pytest-asyncio==0.23.8

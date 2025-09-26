@@ -10,7 +10,7 @@ from utils_pkg.router import (
     get_buy_quote,
     get_sell_quote,
     normalize_pump_id_to_mint,
-    is_valid_pubkey_str,   # public alias from router
+    is_valid_pubkey_str,  # public alias from router
 )
 
 log = get_logger()
@@ -62,6 +62,9 @@ SELL_PROBE_RAW       = max(1_000, _envi("ROUTEGUARD_SELL_PROBE_RAW", 1_000))
 # Per-mint cooldown when no Jupiter route is available
 NOROUTE_COOLDOWN_SEC = max(60, _envi("ROUTEGUARD_NOROUTE_COOLDOWN_SEC", 600))
 
+# (Optional) cap for in-memory caches to avoid unlimited growth
+CACHE_MAX_KEYS       = max(100, _envi("ROUTEGUARD_CACHE_MAX_KEYS", 2000))
+
 # -----------------------------------------------------------------------------
 # Small caches
 # -----------------------------------------------------------------------------
@@ -73,6 +76,13 @@ _noroute_until: dict[str, float] = {}
 def clear_cache() -> None:
     _buy_cache.clear()
     _noroute_until.clear()
+
+def _trim_cache_if_needed() -> None:
+    if len(_buy_cache) > CACHE_MAX_KEYS:
+        # drop oldest ~20% entries
+        cutoff = int(len(_buy_cache) * 0.2)
+        for k, _ in sorted(_buy_cache.items(), key=lambda kv: kv[1][0])[:cutoff]:
+            _buy_cache.pop(k, None)
 
 def _get_cached_buy(norm_mint: str, lamports_in: int) -> Optional[Dict[str, Any]]:
     key = (norm_mint, int(lamports_in))
@@ -87,6 +97,7 @@ def _get_cached_buy(norm_mint: str, lamports_in: int) -> Optional[Dict[str, Any]
 
 def _put_cached_buy(norm_mint: str, lamports_in: int, quote: Dict[str, Any]) -> None:
     _buy_cache[(norm_mint, int(lamports_in))] = (time.time(), quote)
+    _trim_cache_if_needed()
 
 def _cooldown_ok(norm_mint: str) -> bool:
     return time.time() >= _noroute_until.get(norm_mint, 0.0)
@@ -155,17 +166,17 @@ async def preflight(*, mint: str, lamports_in: int) -> Tuple[bool, Optional[Dict
     force_fallback_only = not raw_is_valid_mint
 
     # 4) Optionally run Jupiter checks on the normalized mint to guard liquidity
-    #    (We still do this even if we plan to force fallback, to block obvious
-    #     junk: no route / crazy impact / no sell path)
     q_buy = _get_cached_buy(norm, lamports_in)
     if q_buy is None:
         try:
             q_buy = await get_buy_quote(mint=norm, lamports_in=lamports_in)
             _put_cached_buy(norm, lamports_in, q_buy)
-            log.every("rg.buy", n=12, msg="RG_BUY_QUOTE_OK",
-                      mint=norm, lamports_in=lamports_in,
-                      out_raw=int(q_buy.get("outAmount", 0)),
-                      impact_bps=_impact_bps(q_buy))
+            log.every(
+                "rg.buy", n=12, msg="RG_BUY_QUOTE_OK",
+                mint=norm, lamports_in=lamports_in,
+                out_raw=int(q_buy.get("outAmount", 0)),
+                impact_bps=_impact_bps(q_buy),
+            )
         except Exception as e:
             if not ALLOW_NO_BUY_ROUTE:
                 _note_no_route(norm)

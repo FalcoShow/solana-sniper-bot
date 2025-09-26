@@ -7,7 +7,7 @@ import math
 import os
 import random
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from logging_setup import get_logger, bump
 
@@ -18,7 +18,7 @@ from utils_pkg.positions import remove as remove_position  # noqa: N812
 # Router sell executor (Jupiter via Lightning-style router)
 from utils_pkg.router import sell_via_lightning  # returns (ok: bool, sig: Optional[str])
 
-# Guardrails: realized PnL record (buys are halted upstream; sells always allowed)
+# Guardrails: realized PnL record (buys can be halted upstream; sells always allowed)
 try:
     from utils_pkg.guardrails import note_close  # type: ignore
 except Exception:  # pragma: no cover
@@ -109,17 +109,27 @@ _tp2_done: Dict[str, bool] = {}
 _be_floor: Dict[str, float] = {}         # SOL per token floor after TP1
 
 # Per-mint price cache to shrink quote/RPC load
-_price_cache: Dict[str, tuple[float, float]] = {}  # mint -> (ts, priceSOL)
+_price_cache: Dict[str, Tuple[float, float]] = {}  # mint -> (ts, priceSOL)
 
-# Optional helpers from utils_pkg.positions
+# Optional hooks from utils_pkg.positions (works with positions_pg too)
 _positions_mod = importlib.import_module("utils_pkg.positions")
 _positions_reduce_qty: Optional[Callable[[str, int], None]] = getattr(_positions_mod, "decrement_qty", None)  # type: ignore[attr-defined]
 _positions_update_after_fill: Optional[Callable[..., None]] = getattr(_positions_mod, "update_after_sell", None)  # type: ignore[attr-defined]
+
+# Provide log.every if missing
+if not hasattr(log, "every"):
+    def _every(_key: str, n: int = 10, msg: Optional[str] = None, **kw):
+        return log.event(msg or _key, **kw)
+    setattr(log, "every", _every)  # type: ignore[attr-defined]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Price discovery (SOL per token) with cache
 # ──────────────────────────────────────────────────────────────────────────────
 async def _fetch_price_ui(mint: str, *, decimals_hint: Optional[int]) -> float:
+    """
+    Try router.get_price_ui / price_of_ui / price_of.
+    Fallback: tiny sell-quote to derive px. Returns 0.0 on failure.
+    """
     try:
         router = importlib.import_module("utils_pkg.router")
     except Exception:
@@ -147,7 +157,8 @@ async def _fetch_price_ui(mint: str, *, decimals_hint: Optional[int]) -> float:
         return 0.0
 
     decimals = int(decimals_hint or 6)
-    tiny_raw = max(1, 10 ** max(0, decimals - 3))  # ~0.001 token
+    decimals = max(0, min(18, decimals))
+    tiny_raw = max(1, 10 ** max(0, decimals - 3))  # ≈0.001 token
     try:
         q = await q_fn(mint=mint, amount_raw=int(tiny_raw)) if asyncio.iscoroutinefunction(q_fn) else q_fn(mint=mint, amount_raw=int(tiny_raw))  # type: ignore
         # Prefer direct SOL field; else compute from lamports_out
@@ -166,9 +177,9 @@ async def _fetch_price_ui(mint: str, *, decimals_hint: Optional[int]) -> float:
 
 async def _get_price_ui(mint: str, *, decimals_hint: Optional[int]) -> float:
     now = time.time()
-    ts_price = _price_cache.get(mint)
-    if ts_price and (now - ts_price[0]) <= PRICE_TTL_SEC:
-        return ts_price[1]
+    rec = _price_cache.get(mint)
+    if rec and (now - rec[0]) <= PRICE_TTL_SEC:
+        return rec[1]
     price = await _fetch_price_ui(mint, decimals_hint=decimals_hint)
     _price_cache[mint] = (now, price)
     return price
@@ -182,7 +193,7 @@ def _decide_sell(
     entry_price_sol: float,
     now_price_sol: float,
     opened_at: float,
-) -> tuple[bool, str, float]:
+) -> Tuple[bool, str, float]:
     if entry_price_sol <= 0 or now_price_sol <= 0:
         return False, "", 0.0
 
@@ -234,7 +245,7 @@ async def _execute_sell(p: Dict[str, Any], *, reason: str, price_sol: float) -> 
     mint = p["mint"]
     token_program = p.get("token_program")
     qty_raw = int(p.get("qty_raw", 0))
-    decimals = int(p.get("decimals", 0) or 0)
+    decimals = max(0, min(18, int(p.get("decimals", 0) or 0)))
     entry = float(p.get("avg_cost_sol", 0.0))
     qty_ui = float(p.get("qty_ui", 0.0)) or (qty_raw / (10 ** decimals) if decimals else 0.0)
 
@@ -253,8 +264,14 @@ async def _execute_sell(p: Dict[str, Any], *, reason: str, price_sol: float) -> 
     sold_ui = (sell_raw / (10 ** decimals)) if decimals else qty_ui * (sell_raw / max(1, qty_raw))
     notional_sol = price_sol * sold_ui
     if notional_sol < MIN_NOTIONAL_SOL:
-        log.event("SELL_SKIP_SMALL", mint=mint, reason=reason,
-                  notional_sol=notional_sol, min_sol=MIN_NOTIONAL_SOL, sell_frac=sell_frac)
+        log.event(
+            "SELL_SKIP_SMALL",
+            mint=mint,
+            reason=reason,
+            notional_sol=notional_sol,
+            min_sol=MIN_NOTIONAL_SOL,
+            sell_frac=sell_frac,
+        )
         return
 
     # per-mint cooldown
@@ -269,8 +286,16 @@ async def _execute_sell(p: Dict[str, Any], *, reason: str, price_sol: float) -> 
     est_realized_pnl = (price_sol - entry) * sold_ui
 
     if DRY_RUN:
-        log.event("SELL_DRY_RUN", mint=mint, reason=reason, sell_raw=sell_raw, sell_frac=sell_frac,
-                  slippage_bps=SLIPPAGE_BPS, priority_sol=PRIORITY_SOL, est_pnl_sol=est_realized_pnl)
+        log.event(
+            "SELL_DRY_RUN",
+            mint=mint,
+            reason=reason,
+            sell_raw=sell_raw,
+            sell_frac=sell_frac,
+            slippage_bps=SLIPPAGE_BPS,
+            priority_sol=PRIORITY_SOL,
+            est_pnl_sol=est_realized_pnl,
+        )
         return
 
     ok = False
@@ -288,8 +313,15 @@ async def _execute_sell(p: Dict[str, Any], *, reason: str, price_sol: float) -> 
         bump("sells_fail")
         return
 
-    log.event("SELL_SUBMIT", mint=mint, reason=reason, ok=ok, sig=sig,
-              sell_raw=sell_raw, sell_frac=sell_frac)
+    log.event(
+        "SELL_SUBMIT",
+        mint=mint,
+        reason=reason,
+        ok=ok,
+        sig=sig,
+        sell_raw=sell_raw,
+        sell_frac=sell_frac,
+    )
 
     if ok:
         try:
@@ -345,7 +377,7 @@ async def _process_one(p: Dict[str, Any], sem: asyncio.Semaphore):
         try:
             entry = float(p.get("avg_cost_sol", 0.0))
             opened_at = float(p.get("opened_at", 0.0))
-            decimals = int(p.get("decimals", 0) or 0)
+            decimals = max(0, min(18, int(p.get("decimals", 0) or 0)))
 
             price = await _get_price_ui(mint, decimals_hint=decimals)
             if price <= 0.0 or entry <= 0.0:
@@ -376,8 +408,16 @@ async def _process_one(p: Dict[str, Any], sem: asyncio.Semaphore):
             qty_ui = float(p.get("qty_ui", 0.0)) or (qty_raw / (10 ** decimals) if decimals else 0.0)
             sell_frac = _frac_for(reason)
             est_pnl = (price - entry) * qty_ui * sell_frac
-            log.event("SELL_DECISION", mint=mint, reason=reason, price_sol=price, entry_sol=entry,
-                      change=change, sell_frac=sell_frac, est_pnl_sol=est_pnl)
+            log.event(
+                "SELL_DECISION",
+                mint=mint,
+                reason=reason,
+                price_sol=price,
+                entry_sol=entry,
+                change=change,
+                sell_frac=sell_frac,
+                est_pnl_sol=est_pnl,
+            )
 
             await _execute_sell(p, reason=reason, price_sol=price)
 

@@ -6,11 +6,12 @@ import base64
 import os
 import random
 import time
-from typing import Any, Dict, Optional, Tuple, Callable, List
+from typing import Any, Dict, Optional, Tuple, Callable
 
 import requests
 
 from logging_setup import get_logger
+from utils_pkg.mints import normalize_mint  # single source of truth
 from utils_pkg.solana_wallet import (
     load_keypair,
     get_pubkey_str,
@@ -166,93 +167,26 @@ def _is_valid_pubkey_str(s: str) -> bool:
     except Exception:
         return False
 
-# Public-friendly alias
+# Public-friendly alias (kept for compatibility)
 def is_valid_pubkey_str(s: str) -> bool:
     return _is_valid_pubkey_str(s)
 
-def _scan_for_mints(s: str) -> List[str]:
-    """Scan a string for any 43/44-char windows that decode to 32 bytes."""
-    found: List[str] = []
-    s = (s or "").strip()
-    for i in range(0, max(0, len(s) - 43) + 1):
-        for L in (44, 43):
-            j = i + L
-            if j <= len(s):
-                sub = s[i:j]
-                if _is_valid_pubkey_str(sub) and sub not in found:
-                    found.append(sub)
-    return found
-
-def _strip_pseudo_suffix(raw: str) -> tuple[str, Optional[str]]:
-    """
-    Returns (base, suffix) where suffix ∈ {"pump","bonk",None}.
-    """
-    s = (raw or "").strip()
-    for suf in ("pump", "bonk"):
-        if s.endswith(suf):
-            return s[:-len(suf)].strip(), suf
-    return s, None
-
-def normalize_pump_id_to_mint(raw: str) -> str:
-    """
-    Extract a clean 32-byte mint pubkey from:
-      - a plain mint
-      - a Pump Portal id that may end in 'pump'/'bonk'
-      - strings that contain the mint (scan windows)
-
-    Strategy:
-      1) If it ends with 'pump'/'bonk', try dropping the suffix. If that
-         decodes to 32 bytes, return it.
-      2) If the cleaned string is already a 32-byte base58, return it.
-      3) Scan the cleaned string for any 43/44-char window that decodes to 32.
-      4) Scan the ORIGINAL raw string for any 43/44 window that decodes to 32.
-         - If multiple distinct candidates are found, refuse (avoid false hits).
-      5) LAST RESORT: if the raw itself decodes to 32, return raw.
-      6) Else raise.
-    """
-    s = (raw or "").strip()
-    if not s:
-        raise ValueError("empty pump id")
-
-    base, suf = _strip_pseudo_suffix(s)
-    if suf:
-        if _is_valid_pubkey_str(base):
-            return base
-        # base failed; be conservative and only accept an unambiguous single match
-        cands = _scan_for_mints(s)
-        if len(cands) == 1:
-            log.every("mint.scan_suffix", n=20, msg="MINT_SCAN_SUFFIX", raw=s, cand=cands[0])
-            return cands[0]
-        raise ValueError(f"Cannot normalize pump id to a mint: '{raw}'")
-
-    if _is_valid_pubkey_str(base):
-        return base
-
-    cands = _scan_for_mints(base)
-    if len(cands) == 1:
-        return cands[0]
-    if len(cands) > 1:
-        raise ValueError(f"ambiguous candidates in '{raw}'")
-
-    if _is_valid_pubkey_str(s):
-        return s
-
-    raise ValueError(f"Cannot normalize pump id to a mint: '{raw}'")
-
+# Router-local sanitizer that delegates to our single source of truth.
 def _sanitize_mint(m: str) -> str:
-    """
-    Always sanitize potential pump/bonk ids before sending to Jupiter/RPC.
-    Never throws if the input at least decodes to 32 bytes; raises otherwise.
-    """
     m = (m or "").strip()
     if not m:
         raise ValueError("empty mint")
     try:
-        return normalize_pump_id_to_mint(m)
+        return normalize_mint(m)
     except Exception:
+        # last-chance: accept any 32-byte base58 to avoid false negatives
         if _is_valid_pubkey_str(m):
             return m
         raise
+
+# Back-compat export name (used elsewhere)
+def normalize_pump_id_to_mint(raw: str) -> str:
+    return normalize_mint(raw)
 
 def _assert_pubkey(s: str, name: str) -> None:
     if not _is_valid_pubkey_str(s):
@@ -378,7 +312,7 @@ async def _get_signature_status(sig: str) -> Optional[dict]:
     return await asyncio.to_thread(_call)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Dynamic priority fee controller
+# Dynamic priority fee controller (optional QuickNode hints)
 # ──────────────────────────────────────────────────────────────────────────────
 def _to_sol_from_lamports_like(x: float) -> float:
     lamports = float(x)
@@ -602,7 +536,6 @@ async def _jup_quote(
                 "amount": str(amount_iu),
                 "slippageBps": sbps,
                 "swapMode": swap_mode,
-                # Jupiter expects lowercase true/false strings in query params.
                 "onlyDirectRoutes": "true" if only_direct else "false",
             }
             js = await _get_json(JUP_QUOTE_URL, params=params, timeout=HTTP_TIMEOUT_GET)

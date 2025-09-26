@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from logging_setup import get_logger
 
-# SQLAlchemy Core (sync) – safe to call from async code via threadpool if needed
+# SQLAlchemy Core (sync)
 from sqlalchemy import (
     BigInteger,
     Column,
@@ -17,6 +17,7 @@ from sqlalchemy import (
     MetaData,
     String,
     Table,
+    Index,
     create_engine,
     func,
     select,
@@ -33,16 +34,20 @@ log = get_logger()
 # DSN / Engine
 # ──────────────────────────────────────────────────────────────────────────────
 def _pick_dsn() -> str:
-    # Priority: explicit DSNs, then DATABASE_URL
+    """
+    Priority: explicit DSNs, then DATABASE_URL.
+    If an async driver is provided (e.g. postgresql+asyncpg), swap to sync driver.
+    """
+    dsn = ""
     for k in ("PG_DSN_INTERNAL", "PG_DSN_EXTERNAL", "DATABASE_URL"):
         v = (os.getenv(k) or "").strip()
         if v:
             dsn = v
             break
-    else:
+    if not dsn:
         raise RuntimeError("No Postgres DSN found. Set PG_DSN_INTERNAL/EXTERNAL or DATABASE_URL.")
 
-    # If async driver is provided, switch to sync (SQLAlchemy chooses default driver)
+    # Force sync driver
     if "+asyncpg" in dsn:
         dsn = dsn.replace("+asyncpg", "")
     return dsn
@@ -61,7 +66,7 @@ positions = Table(
     Column("qty_raw", BigInteger, nullable=False),
     Column("decimals", Integer, nullable=False),
     Column("token_program", String, nullable=True),
-    Column("avg_cost_sol", Float, nullable=False),         # SOL per token
+    Column("avg_cost_sol", Float, nullable=False),         # SOL per token (UI)
     Column("opened_at", Float, nullable=False),            # epoch seconds
     Column("owner_ata", String, nullable=True),
     Column("symbol", String, nullable=True),
@@ -87,10 +92,15 @@ buys = Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("mint", String, nullable=False),
     Column("qty_raw", BigInteger, nullable=False),
-    Column("price_per_token_sol", Float, nullable=False),
+    Column("price_per_token_sol", Float, nullable=False),  # SOL per token (UI)
     Column("sig", String, nullable=True),
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
 )
+
+# Helpful lightweight indexes
+Index("idx_positions_updated_at", positions.c.updated_at)
+Index("idx_sells_mint_created", sells.c.mint, sells.c.created_at)
+Index("idx_buys_mint_created", buys.c.mint, buys.c.created_at)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Engine init + schema ensure
@@ -101,10 +111,14 @@ def _ensure_engine() -> Engine:
         return _ENGINE
 
     dsn = _pick_dsn()
+    # Pool knobs; safe defaults
+    pool_size = int(os.getenv("PG_POOL_SIZE", "5") or 5)
+    max_overflow = int(os.getenv("PG_POOL_MAX_OVERFLOW", "10") or 10)
+
     _ENGINE = create_engine(
         dsn,
-        pool_size=int(os.getenv("PG_POOL_SIZE", "5") or 5),
-        max_overflow=int(os.getenv("PG_POOL_MAX_OVERFLOW", "10") or 10),
+        pool_size=pool_size,
+        max_overflow=max_overflow,
         pool_pre_ping=True,
         future=True,
     )
@@ -114,15 +128,20 @@ def _ensure_engine() -> Engine:
     except SQLAlchemyError as e:
         raise RuntimeError(f"positions_pg: failed to create tables: {e}") from e
 
-    # mask credentials in log
-    masked = dsn.split("@")[-1]
+    # Mask credentials in log (show host/db only)
+    masked = dsn.split("@")[-1] if "@" in dsn else dsn
     log.event("PG_POS_ENGINE_READY", dsn=masked)
     return _ENGINE
 
 
 def _qty_ui(qty_raw: int, decimals: int) -> float:
     try:
-        return float(qty_raw) / (10 ** int(decimals))
+        d = int(decimals)
+        if d < 0:
+            d = 0
+        if d > 18:
+            d = 18
+        return float(qty_raw) / (10 ** d)
     except Exception:
         return 0.0
 
@@ -205,7 +224,7 @@ def record_buy(
     *,
     mint: str,
     qty_raw: int,
-    price_per_token_sol: float,  # SOL per token
+    price_per_token_sol: float,  # SOL per token (UI)
     decimals: int,
     token_program: Optional[str],
     owner_ata: str = "",
@@ -223,6 +242,12 @@ def record_buy(
     eng = _ensure_engine()
     qty_raw = int(qty_raw)
     decimals = int(decimals)
+    # normalize decimals range
+    if decimals < 0:
+        decimals = 0
+    if decimals > 18:
+        decimals = 18
+
     new_ui = _qty_ui(qty_raw, decimals)
     px = float(price_per_token_sol or 0.0)
     now = time.time()
@@ -235,7 +260,8 @@ def record_buy(
 
         if cur:
             old_qty_raw = int(cur[0] or 0)
-            old_ui = _qty_ui(old_qty_raw, decimals)  # trust latest decimals
+            # Always compute UI using the *latest* decimals we believe for this mint
+            old_ui = _qty_ui(old_qty_raw, decimals)
             total_ui = old_ui + new_ui
             if total_ui <= 0:
                 new_avg = px

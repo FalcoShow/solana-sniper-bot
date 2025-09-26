@@ -1,188 +1,110 @@
+# scripts/sell_adapter.py
+from __future__ import annotations
+
 import os
-import base64
 import logging
+import inspect
 from typing import Optional, Tuple, Dict, Any
 
-from solana.rpc.types import TxOpts
+# Prefer project logger (has .event/.every shims)
+try:
+    from logging_setup import get_logger
+    logger = get_logger()
+except Exception:  # pragma: no cover
+    logger = logging.getLogger("sell_adapter")
 
-# Import the module (not symbols) so globals are fresh after init_resources()
-from utils_pkg import core_utils as CU
-
-# Optional circuit-breakers (best-effort imports)
+# Optional circuit-breakers (no-ops if missing)
 try:
     from utils_pkg.circuit_breakers import (
         trading_halted,
         record_error_and_maybe_halt,
         record_pnl_and_maybe_halt,
     )
-except Exception:  # graceful fallbacks
-    async def trading_halted(*args, **kwargs) -> bool:  # type: ignore
+except Exception:  # pragma: no cover
+    async def trading_halted(*_a, **_k) -> bool:  # type: ignore
         return False
-    async def record_error_and_maybe_halt(*args, **kwargs):  # type: ignore
+    async def record_error_and_maybe_halt(*_a, **_k):  # type: ignore
         return None
-    async def record_pnl_and_maybe_halt(*args, **kwargs):  # type: ignore
+    async def record_pnl_and_maybe_halt(*_a, **_k):  # type: ignore
         return None
 
-# Fixed mints (mainnet)
-SOL_MINT = "So11111111111111111111111111111111111111112"
+# Best-effort core utils (for telemetry / db / telegram)
+try:
+    from utils_pkg import core_utils as CU  # type: ignore
+except Exception:  # pragma: no cover
+    CU = None  # type: ignore
+
+# Router = single source of truth for mint handling, quotes & swaps
+from utils_pkg.router import (
+    normalize_pump_id_to_mint,
+    get_decimals,
+    get_sell_quote,
+    get_price_ui,
+    sell_via_lightning,
+)
+
+SOL_MINT  = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 
-logger = logging.getLogger("sell_adapter")
-
-
-def _maybe_call(x):
+# ————————————————————————————————————————————————————————————————————————
+# Helpers
+# ————————————————————————————————————————————————————————————————————————
+def _slippage_to_bps(slippage: float) -> int:
+    """0.005 → 50 bps."""
     try:
-        return x() if callable(x) else x
-    except TypeError:
-        return x
+        return max(1, int(round(float(slippage) * 10_000)))
+    except Exception:
+        return 50
 
-
-def _extract_signer_from_wallet(wallet):
-    """
-    Return (solders.Keypair signer, secret_bytes_or_None).
-    Tries wallet directly, then wallet._keypair. Handles 32-byte seed and 64-byte secret.
-    """
-    from solders.keypair import Keypair as SKeypair
-
-    if hasattr(wallet, "pubkey") and not callable(getattr(wallet, "pubkey")):
-        # If someone passed a raw Keypair, just try to parse below.
-        pass
-
-    if wallet.__class__.__name__ == "Keypair":  # solders Keypair
-        return wallet, None
-
-    sk = None
-    for attr in ("secret_key", "secret", "to_bytes", "__bytes__", "seed"):
-        if hasattr(wallet, attr):
-            val = _maybe_call(getattr(wallet, attr))
-            if isinstance(val, (bytes, bytearray)):
-                sk = bytes(val)
-                break
-
-    if sk is None and hasattr(wallet, "_keypair"):
-        inner = wallet._keypair
-        for attr in ("secret_key", "secret", "to_bytes", "__bytes__", "seed"):
-            if hasattr(inner, attr):
-                val = _maybe_call(getattr(inner, attr))
-                if isinstance(val, (bytes, bytearray)):
-                    sk = bytes(val)
-                    break
-
-    if sk is None:
-        raise RuntimeError("wallet keypair bytes not accessible for signing")
-
-    from solders.keypair import Keypair as SKeypair
-    if len(sk) == 64:
-        signer = SKeypair.from_bytes(sk)
-    elif len(sk) == 32:
-        signer = SKeypair.from_seed(sk)
-    else:
-        raise RuntimeError(f"unexpected secret length {len(sk)}; expected 32 or 64")
-    return signer, sk
-
-
-async def _perform_jupiter_swap_v6(quote_json: dict) -> Tuple[bool, Optional[str]]:
-    """
-    Pure v6 swap using core_utils globals. Posts {quoteResponse, userPublicKey, wrapAndUnwrapSol}
-    to /swap, then signs and submits the versioned tx with **solders only**.
-    """
-    # pull fresh references AFTER init_resources()
-    session = CU.session
-    solana_client = CU.solana_client
-    wallet = CU.wallet
-    JUPITER_SWAP_API = CU.JUPITER_SWAP_API
-    aiohttp = CU.aiohttp
-    Confirmed = CU.Confirmed
-
-    try:
-        if session is None or solana_client is None or wallet is None:
-            await record_error_and_maybe_halt(reason="swap_missing_infra")
-            logger.warning("swap v6: session/solana_client/wallet not initialized")
-            return False, None
-        if not isinstance(quote_json, dict):
-            await record_error_and_maybe_halt(reason="swap_invalid_quote")
-            logger.warning("swap v6: invalid quote")
-            return False, None
-
-        user_pubkey = os.getenv("WALLET_PUBKEY") or str(wallet.pubkey())
-        payload: Dict[str, Any] = {
-            "quoteResponse": quote_json,
-            "userPublicKey": user_pubkey,
-            "wrapAndUnwrapSol": True,
-        }
-
-        # Optional priority fee knobs (best-effort)
+async def _maybe_tele(msg: str) -> None:
+    if CU and hasattr(CU, "send_telegram"):
         try:
-            jito_enabled = str(os.getenv("JITO_ENABLED", "false")).lower() in ("1", "true", "yes", "y")
-            fee_micro = int(float(os.getenv("JITO_FEE_MICROLAMPORTS", "0")))
-            tip_lamports = int(float(os.getenv("JITO_TIP_LAMPORTS", "0")))
-            if jito_enabled:
-                if fee_micro > 0:
-                    payload["computeUnitPriceMicroLamports"] = fee_micro
-                elif tip_lamports > 0:
-                    payload["jitoTipLamports"] = tip_lamports
+            await CU.send_telegram(msg)  # type: ignore
         except Exception:
             pass
 
-        # Call Jupiter v6 /swap
-        url = f"{JUPITER_SWAP_API.rstrip('/')}/swap"
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            body = await resp.text()
-            if resp.status != 200:
-                await record_error_and_maybe_halt(reason=f"swap_http_{resp.status}")
-                logger.warning(f"swap v6 HTTP {resp.status}: {body}")
-                return False, None
-            try:
-                data = await resp.json()
-            except Exception:
-                await record_error_and_maybe_halt(reason="swap_non_json")
-                logger.warning(f"swap v6: non-JSON response: {body[:200]}")
-                return False, None
+async def _log_trade_event(payload: Dict[str, Any]) -> None:
+    """Adapt to your CU.log_trade_event signature if present."""
+    if not CU or not hasattr(CU, "log_trade_event"):
+        return
+    try:
+        fn = CU.log_trade_event  # type: ignore
+        sig = inspect.signature(fn)
+        params = sig.parameters
 
-        tx_b64 = data.get("swapTransaction") or data.get("swapTransactionBase64")
-        if not tx_b64:
-            await record_error_and_maybe_halt(reason="swap_missing_tx")
-            logger.warning(f"swap v6: missing swapTransaction in response: keys={list(data.keys())}")
-            return False, None
+        # Massage field names to whatever your impl expects.
+        rename_map = {
+            "sol_out": ("sol_amount", "amount_sol", "sol", "balance"),
+            "price_sol": ("price_sol", "price", "current"),
+            "token_amount": ("token_amount", "amount"),
+        }
+        out = dict(payload)
+        for src, alts in rename_map.items():
+            if src in out:
+                for alt in alts:
+                    if alt in params and alt not in out:
+                        out[alt] = out[src]
 
-        # Decode, sign, and send with **solders** only (versioned tx)
-        from solders.transaction import VersionedTransaction as SVTx
+        # Fill any required-but-missing args with safe defaults.
+        required = [
+            name for name, p in params.items()
+            if p.default is inspect._empty and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        ]
+        for r in required:
+            if r not in out:
+                out[r] = 0 if "amount" in r or "sol" in r or "price" in r or r in {"balance", "profit"} else payload.get(r)
 
-        raw = base64.b64decode(tx_b64)
-        signer, _sk = _extract_signer_from_wallet(wallet)
-
-        vtx = SVTx.from_bytes(raw)
-        msg = vtx.message
-        new_vtx = SVTx(msg, [signer])
-
-        try:
-            raw_signed = new_vtx.to_bytes()
-        except Exception:
-            raw_signed = bytes(new_vtx)
-
-        resp = await solana_client.send_raw_transaction(raw_signed, opts=TxOpts(skip_preflight=True))
-
-        # Normalize signature from various return shapes
-        tx_sig = None
-        for k in ("value", "result", "signature"):
-            if hasattr(resp, k):
-                tx_sig = getattr(resp, k)
-                break
-        if tx_sig is None and isinstance(resp, dict):
-            tx_sig = resp.get("result") or resp.get("value")
-        if tx_sig is None:
-            tx_sig = str(resp)
-
-        await solana_client.confirm_transaction(tx_sig, commitment=Confirmed)
-        return True, tx_sig
-
+        if inspect.iscoroutinefunction(fn):
+            await fn(**out)
+        else:
+            fn(**out)
     except Exception as e:
-        await record_error_and_maybe_halt(reason="swap_exception")
-        logger.warning(f"swap v6 exception: {e}")
-        return False, None
+        logger.warning(f"trade log skipped: {e}")
 
-
+# ————————————————————————————————————————————————————————————————————————
+# Main entrypoint
+# ————————————————————————————————————————————————————————————————————————
 async def execute_sell(
     mint: str,
     symbol: str,
@@ -193,126 +115,141 @@ async def execute_sell(
     dry_run: bool = False,
 ) -> bool:
     """
-    Sell <token_amount> of `mint` into SOL using Jupiter v6:
-      1) CU.get_jupiter_quote (v6)
-      2) _perform_jupiter_swap_v6 (posts quoteResponse, signs v0 tx) unless dry_run=True
-      3) Log to Postgres/Telegram
-      4) Record realized PnL in USD (circuit-breaker daily stops)
-    NOTE: even if trading is halted for the day, sells are allowed to flatten risk.
+    Sell <token_amount> of `mint` into SOL using router (Jupiter v6 under the hood).
+
+    Steps:
+      1) Normalize mint (handles '...pump'/'...bonk' IDs).
+      2) Fetch SPL decimals.
+      3) Pre-sell quote (for expected SOL and basic sanity).
+      4) Execute via sell_via_lightning (respects PF_PRIORITY_SOL / PF_SLIPPAGE_BPS).
+      5) Best-effort PnL log & Telegram.
+
+    Returns True on success, False on failure.
     """
     try:
-        # USDC/USDT = 6 decimals; most other tokens = 9
-        decimals = 6 if mint in (USDC_MINT, USDT_MINT) else 9
-        amount_atoms = int(round(float(token_amount) * (10 ** decimals)))
+        # Sells should always be allowed to reduce risk. We skip the trading_halted gate on purpose.
 
-        q = await CU.get_jupiter_quote(mint, SOL_MINT, amount_atoms, slippage)
-        if not (isinstance(q, dict) and "routePlan" in q and "outAmount" in q):
-            await record_error_and_maybe_halt(reason="sell_no_route")
-            logger.warning(f"[{symbol}] Jupiter sell: no v6 route (quote missing routePlan/outAmount)")
+        # 1) Normalize (robust to Pump Portal ids)
+        try:
+            norm = normalize_pump_id_to_mint(mint)
+        except Exception as e:
+            await record_error_and_maybe_halt(reason="sell_normalize_fail")
+            logger.warning(f"[{symbol}] normalize failed for {mint}: {e}")
             return False
 
-        # Expected SOL out (lamports → SOL)
+        # 2) Decimals (router cached RPC)
         try:
-            sol_out = int(q.get("outAmount", 0)) / 1_000_000_000
+            dec = await get_decimals(norm)
         except Exception:
-            sol_out = None
+            dec = None
+        if dec is None:
+            # Heuristic fallback
+            dec = 6 if norm in (USDC_MINT, USDT_MINT) else 9
+        dec = max(0, min(18, int(dec)))
 
-        # approx price per token in SOL if we can estimate it
-        price_sol = None
+        # Amount in raw atoms
         try:
-            if token_amount and sol_out is not None:
-                price_sol = float(sol_out) / float(token_amount)
+            amount_raw = int(round(float(token_amount) * (10 ** dec)))
+        except Exception:
+            await record_error_and_maybe_halt(reason="sell_bad_amount")
+            logger.warning(f"[{symbol}] invalid token_amount={token_amount}")
+            return False
+        if amount_raw <= 0:
+            await record_error_and_maybe_halt(reason="sell_zero_amount")
+            logger.warning(f"[{symbol}] zero amount after scaling (dec={dec})")
+            return False
+
+        # 3) Pre-sell quote for telemetry & sanity (doesn't submit)
+        sol_out_exp: Optional[float] = None
+        try:
+            q = await get_sell_quote(mint=norm, amount_raw=amount_raw, slippage_bps=_slippage_to_bps(slippage))
+            lamports_out = int(q.get("lamports_out") or q.get("outAmount") or 0)
+            sol_out_exp = lamports_out / 1_000_000_000 if lamports_out > 0 else None
+        except Exception:
+            q = None
+            sol_out_exp = None
+
+        # Also estimate a price per token (SOL / UI token)
+        price_sol: Optional[float] = None
+        try:
+            if token_amount > 0:
+                if sol_out_exp is None:
+                    px = await get_price_ui(norm)
+                    price_sol = float(px) if px else None
+                else:
+                    price_sol = float(sol_out_exp) / float(token_amount)
         except Exception:
             price_sol = None
 
+        # 4) Dry-run: report & exit
         if dry_run:
             tx_sig = f"DRYRUN-{os.urandom(4).hex()}"
-            ok = True
-        else:
-            ok, tx_sig = await _perform_jupiter_swap_v6(q)
+            await _maybe_tele(
+                f"🧪 [SELL DRY RUN] {symbol}\nMint: {norm}\nAmount: {token_amount}\n"
+                + (f"Est SOL out: {sol_out_exp:.9f}\n" if sol_out_exp is not None else "")
+                + f"Tx: {tx_sig}"
+            )
+            logger.info(f"[{symbol}] DRYRUN sell OK: {tx_sig}")
+            return True
 
+        # 5) Live sell via router
+        priority_sol = float(os.getenv("PF_PRIORITY_SOL", "0.002") or 0.0)
+        slippage_bps = int(os.getenv("PF_SLIPPAGE_BPS", str(_slippage_to_bps(slippage))) or _slippage_to_bps(slippage))
+
+        ok, tx_sig = await sell_via_lightning(
+            mint=norm,
+            token_program=None,         # router/Jupiter doesn't need it for the swap request
+            amount_raw=amount_raw,
+            slippage_bps=slippage_bps,
+            priority_sol=priority_sol,
+        )
         if not ok:
             await record_error_and_maybe_halt(reason="sell_swap_failed")
             logger.warning(f"[{symbol}] Jupiter sell failed")
             return False
 
-        # --- best-effort realized PnL tracking (power daily stops) ---
+        # 6) PnL bookkeeping (best-effort, powers daily circuit breaker)
         try:
-            entry_sol = None
-            if hasattr(CU, "get_entry_price"):
-                entry_sol = await CU.get_entry_price(CU.redis, mint)  # type: ignore
-            if entry_sol is not None and price_sol is not None:
-                profit_sol = (float(price_sol) - float(entry_sol)) * float(token_amount)
-                profit_usd = await CU.convert_sol_to_usd(profit_sol)
-                try:
-                    await record_pnl_and_maybe_halt(pnl_usd=float(profit_usd))
-                except TypeError:
-                    # Some implementations accept (redis, pnl_usd=...)
-                    await record_pnl_and_maybe_halt(CU.redis, pnl_usd=float(profit_usd))  # type: ignore
+            if CU and hasattr(CU, "get_entry_price") and hasattr(CU, "convert_sol_to_usd"):
+                entry_sol = await CU.get_entry_price(CU.redis, norm)  # type: ignore
+                if entry_sol is not None:
+                    # pick latest price if we have it
+                    p_now = price_sol
+                    if p_now is None:
+                        px = await get_price_ui(norm)
+                        p_now = float(px) if px else None
+                    if p_now is not None:
+                        profit_sol = (float(p_now) - float(entry_sol)) * float(token_amount)
+                        profit_usd = await CU.convert_sol_to_usd(float(profit_sol))  # type: ignore
+                        try:
+                            await record_pnl_and_maybe_halt(pnl_usd=float(profit_usd))
+                        except TypeError:
+                            await record_pnl_and_maybe_halt(CU.redis, pnl_usd=float(profit_usd))  # type: ignore
         except Exception:
             pass
 
-        # --- Write sell event to Postgres (best-effort, auto-adapts to your function signature) ---
+        # 7) Adaptive trade log → Postgres (if your impl exists)
         try:
-            import inspect
-            sig_obj = inspect.signature(CU.log_trade_event)
-            params = sig_obj.parameters
-
             payload = {
                 "side": "sell",
-                "token": mint,
+                "token": norm,
                 "symbol": symbol,
                 "signature": tx_sig,
                 "reason": reason,
+                "token_amount": float(token_amount),
             }
-
-            if sol_out is not None:
-                if "sol_amount" in params:
-                    payload["sol_amount"] = sol_out
-                elif "amount_sol" in params:
-                    payload["amount_sol"] = sol_out
-                elif "sol" in params:
-                    payload["sol"] = sol_out
-                elif "balance" in params:
-                    payload["balance"] = sol_out
+            if sol_out_exp is not None:
+                payload["sol_out"] = float(sol_out_exp)
             if price_sol is not None:
-                if "price_sol" in params:
-                    payload["price_sol"] = price_sol
-                elif "price" in params:
-                    payload["price"] = price_sol
-                if "current" in params:
-                    payload["current"] = price_sol
-
-            if "token_amount" in params:
-                payload["token_amount"] = float(token_amount)
-            elif "amount" in params:
-                payload["amount"] = float(token_amount)
-
-            required = [
-                name
-                for name, p in params.items()
-                if p.default is inspect._empty and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
-            ]
-            if "balance" in required and "balance" not in payload:
-                payload["balance"] = 0.0 if sol_out is None else float(sol_out)
-            if "entry" in required and "entry" not in payload:
-                payload["entry"] = 0.0
-            if "current" in required and "current" not in payload:
-                payload["current"] = 0.0 if price_sol is None else float(price_sol)
-            if "profit" in required and "profit" not in payload:
-                payload["profit"] = 0.0
-            if "reason" in required and "reason" not in payload:
-                payload["reason"] = reason
-
-            await CU.log_trade_event(**payload)
+                payload["price_sol"] = float(price_sol)
+            await _log_trade_event(payload)
         except Exception as e:
             logger.warning(f"trade log skipped: {e}")
 
-        # Telegram notify (best-effort)
+        # 8) Telegram (best-effort)
         try:
-            note = "DRY RUN" if dry_run else "Sell complete"
-            out_line = f"\nSOL out: {sol_out:.9f}" if sol_out is not None else ""
-            await CU.send_telegram(f"✅ [{symbol}] {note}\nAmount (token): {token_amount}{out_line}\nTx: {tx_sig}")
+            out_line = f"\nSOL out (est): {sol_out_exp:.9f}" if sol_out_exp is not None else ""
+            await _maybe_tele(f"✅ [SELL] {symbol}\nMint: {norm}\nAmount: {token_amount}{out_line}\nTx: {tx_sig}")
         except Exception:
             pass
 

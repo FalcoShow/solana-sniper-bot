@@ -4,20 +4,42 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import re
 import signal
 import sys
 import traceback
 from typing import Any, Dict, Optional
 
 from logging_setup import get_logger, bump, start_global_heartbeat
-from utils_pkg.pumpportal_client import PumpPortalClient
-from utils_pkg.pump_trader import maybe_buy
-from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN
 
-# ──────────────────────────────────────────────────────────────────────────────
+# Primary event source + trading entry point
+try:
+    from utils_pkg.pumpportal_client import PumpPortalClient
+except Exception:  # pragma: no cover
+    # Minimal stub that will raise at runtime if used
+    class PumpPortalClient:
+        def __init__(self, *a, **kw):  # type: ignore
+            raise RuntimeError("PumpPortalClient not available")
+
+# Buy path (core)
+try:
+    from utils_pkg.pump_trader import maybe_buy
+except Exception:  # pragma: no cover
+    async def maybe_buy(*, mint: str, ui: Dict[str, Any]) -> Optional[str]:
+        raise RuntimeError("maybe_buy not available")
+
+# Exit engine / sell helpers
+try:
+    from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN
+except Exception:  # pragma: no cover
+    async def sell_on_jupiter(*a, **kw):  # type: ignore
+        raise RuntimeError("sell_on_jupiter not available")
+    class _NoopExit:
+        async def on_trade_tick(self, *_a, **_kw): pass
+        async def on_buy_filled(self, *_a, **_kw): pass
+    exit_engine = _NoopExit()  # type: ignore
+    IS_DRYRUN = True
+
 # Optional helpers (graceful fallbacks)
-# ──────────────────────────────────────────────────────────────────────────────
 try:
     from utils_pkg.dedupe import claim_once  # (key:str, ttl:int) -> bool
 except Exception:  # pragma: no cover
@@ -38,6 +60,7 @@ except Exception:  # pragma: no cover
     def all_positions():  # type: ignore
         return []
 
+# Sell loop starter
 try:
     from scripts.sell_engine import run_sell_loop
 except Exception:  # pragma: no cover
@@ -45,36 +68,24 @@ except Exception:  # pragma: no cover
         while not stop_evt.is_set():
             await asyncio.sleep(5)
 
-# Router (priority seeding + price helper + mint normalizer)
+# Router: price helpers (+ lifecycle)
 try:
     from utils_pkg import router  # provides start()/shutdown()
-    from utils_pkg.router import get_price_ui as _route_price_ui
+    from utils_pkg.router import get_price_ui as _route_price_ui  # type: ignore
     try:
         from utils_pkg.router import get_decimals as _route_get_decimals  # optional helper
     except Exception:
         _route_get_decimals = None  # type: ignore
-    try:
-        from utils_pkg.router import is_valid_pubkey_str as _is_valid_pubkey_str  # type: ignore
-    except Exception:
-        from utils_pkg.router import _is_valid_pubkey_str  # type: ignore
-    try:
-        from utils_pkg.router import normalize_pump_id_to_mint
-    except Exception:
-        normalize_pump_id_to_mint = None  # type: ignore
 except Exception:  # pragma: no cover
     router = None  # type: ignore
     async def _route_price_ui(_mint: str) -> float:  # type: ignore
         return 0.0
-    def _is_valid_pubkey_str(_s: str) -> bool:  # type: ignore
-        return False
     _route_get_decimals = None  # type: ignore
-    normalize_pump_id_to_mint = None  # type: ignore
 
 # Liquidity screen (fallback provided)
 try:
-    from utils_pkg.liquidity import looks_like_mint as _looks_like_mint, screen_token
+    from utils_pkg.liquidity import screen_token
 except Exception:  # pragma: no cover
-    _looks_like_mint = None  # type: ignore
     async def screen_token(_mint: str):  # type: ignore
         return True, {"ok": True}
 
@@ -85,53 +96,33 @@ except Exception:  # pragma: no cover
     async def pricefeed_close():  # type: ignore
         return None
 
+# 🔒 Central mint guard
+from utils_pkg.mint_guard import (
+    normalize_from_any as _normalize_from_any,
+    is_probable_mint as _guard_prob,
+)
+
 log = get_logger()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Mint validation / normalization helpers
-# ──────────────────────────────────────────────────────────────────────────────
-_BASE58_WHOLE_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
-
+# -------------------------
+# Mint validation / normalization (wrappers → mint_guard)
+# -------------------------
 def _is_probable_mint(s: str) -> bool:
-    """Lightweight guard usable even without router helpers."""
-    if not s:
-        return False
-    if _BASE58_WHOLE_RE.fullmatch(s):
-        return True
     try:
-        if _looks_like_mint is not None and _looks_like_mint(s):  # type: ignore
-            return True
-    except Exception:
-        pass
-    try:
-        return bool(_is_valid_pubkey_str(s))  # type: ignore
+        return _guard_prob(s)
     except Exception:
         return False
 
 def normalize_mint_from_source(raw: str) -> str:
-    """
-    Normalize any Pump Portal id / possibly-suffixed id to a 32–44 char base58 mint.
-    Prefer the router's trusted normalizer (handles ...pump suffix, etc.).
-    """
-    s = (raw or "").strip()
-    if not s:
-        return ""
-    if normalize_pump_id_to_mint:
-        try:
-            return normalize_pump_id_to_mint(s)  # type: ignore
-        except Exception:
-            pass
-    # Minimal fallback: trim common suffixes and validate length.
-    for suf in ("pump", "bonk"):
-        if s.lower().endswith(suf) and len(s) - len(suf) >= 32:
-            cand = s[:-len(suf)]
-            if _BASE58_WHOLE_RE.fullmatch(cand):
-                return cand
-    return s
+    try:
+        return _normalize_from_any(raw)
+    except Exception:
+        # Keep permissive behavior at the edge; downstream filters will reject.
+        return (raw or "").strip()
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------
 # ENV helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------
 def _as_bool(val: Optional[str], default: bool = False) -> bool:
     if val is None:
         return default
@@ -149,15 +140,14 @@ def _as_int(val: Any, default: int) -> int:
     except Exception:
         return default
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------
+# Config (same defaults / flags as your original)
+# -------------------------
 EXIT_ENGINE_ENABLED      = _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True)
 DEDUPE_ENABLED           = _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True)
 DEDUPE_TTL_SEC           = _as_int(os.getenv("PF_DEDUPE_TTL_SEC", "3600"), 3600)
 LIQ_FILTER_ENABLED       = _as_bool(os.getenv("ENTRY_LIQ_FILTER", "1"), True)
 
-# Momentum confirmation gate
 ENTRY_MOMENTUM_ENABLED   = _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True)
 ENTRY_MOMO_WINDOW_SEC    = _as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10)
 ENTRY_MOMO_MIN_TRADES    = _as_int(os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6)
@@ -166,34 +156,26 @@ ENTRY_MOMO_PRICE_TRIES   = _as_int(os.getenv("ENTRY_MOMO_PRICE_TRIES", "4"), 4)
 ENTRY_MOMO_PRICE_DELAY_S = _as_float(os.getenv("ENTRY_MOMO_PRICE_DELAY_S", "0.7"), 0.7)
 ENTRY_MOMO_MAX_PARALLEL  = max(1, _as_int(os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"), 6))
 
-# Entry filters
 MIN_INITIAL_BUY_SOL      = _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
 MAX_NAME_LEN             = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
 ENTRY_MAX_AGE_MIN        = _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20)
 MIN_POOL_AGE_MIN         = _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3)
 
-SYMBOL_BLACKLIST         = {
+SYMBOL_BLACKLIST = {
     s.strip().upper()
     for s in os.getenv("ENTRY_SYMBOL_BLACKLIST", "RUG,SCAM").split(",")
     if s.strip()
 }
 
-# Concurrency / pacing
 MAX_CONCURRENCY          = max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2))
 LOOP_COOLDOWN_SEC        = _as_float(os.getenv("PF_COOLDOWN_SEC", "15"), 15.0)
-
-# Portfolio caps
 MAX_TRADEABLE            = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)  # 0 = unlimited
-
-# Pause toggle
 PAUSE_TRADING            = _as_bool(os.getenv("PAUSE_TRADING", "0"), False)
-
-# Debug
 DEBUG_TX                 = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------
+# Utilities / small helpers
+# -------------------------
 def _get_first(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
     for k in keys:
         if k in d and d[k] is not None:
@@ -208,7 +190,8 @@ def _extract_raw_mint(msg: Dict[str, Any]) -> str:
         default=""
     )
     raw = ("" if raw is None else str(raw)).strip()
-    print(f"[main] raw pump id = {raw}", flush=True)
+    if DEBUG_TX:
+        print(f"[main] raw pump id = {raw}", flush=True)
     return raw
 
 def _extract_symbol(msg: Dict[str, Any]) -> str:
@@ -285,9 +268,7 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
 
     return True
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional post-buy immediate test
-# ──────────────────────────────────────────────────────────────────────────────
+# Optional immediate sell test after buy
 async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
     if str(os.getenv("POSTBUY_MODE", "")).strip().lower() != "immediate_sell_test":
         return
@@ -298,14 +279,14 @@ async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
         if DEBUG_TX:
             traceback.print_exc()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Strategy with momentum gate
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------
+# Strategy implementation
+# -------------------------
 class Strategy:
     def __init__(self) -> None:
         self._sema = asyncio.Semaphore(MAX_CONCURRENCY)
         self._gate_sema = asyncio.Semaphore(ENTRY_MOMO_MAX_PARALLEL)
-        self._gate_state: Dict[str, Dict[str, Any]] = {}  # keyed by raw id (as received from feed)
+        self._gate_state: Dict[str, Dict[str, Any]] = {}
 
     async def on_trade(self, raw_event: Dict[str, Any]) -> None:
         if EXIT_ENGINE_ENABLED:
@@ -437,10 +418,9 @@ class Strategy:
                 print("[strategy] missing mint — skip", flush=True)
             return
 
-        # Normalize using router helper (handles "...pump" etc.); ALWAYS use normalized below.
         mint_source = str(_get_first(raw_event, "mint", "mintAddress", "mint_address", default=mint_raw)).strip()
         mint_norm = normalize_mint_from_source(mint_source)
-        if mint_norm != mint_raw:
+        if mint_norm != mint_raw and DEBUG_TX:
             print(f"[main] normalized mint = {mint_norm}", flush=True)
 
         if not _is_probable_mint(mint_norm):
@@ -451,7 +431,6 @@ class Strategy:
         if not _passes_basic_filters(raw_event):
             return
 
-        # Liquidity screen
         dec_from_liq: Optional[int] = None
         if LIQ_FILTER_ENABLED:
             ok, rep = await screen_token(mint_norm)
@@ -460,7 +439,6 @@ class Strategy:
                     print(f"[liquidity] screen failed for {mint_norm}: {rep}", flush=True)
                 return
             dec_from_liq = rep.get("decimals")
-            # Optional: backfill decimals via router if missing.
             if dec_from_liq is None and _route_get_decimals is not None:
                 try:
                     dec_from_liq = await _route_get_decimals(mint_norm)  # type: ignore
@@ -473,7 +451,6 @@ class Strategy:
                 dec=dec_from_liq,
             )
 
-        # UI payload passed into buy path
         ui: Dict[str, Any] = dict(raw_event)
         ui.setdefault("pool", "pump")
         ui.setdefault("symbol", _extract_symbol(raw_event))
@@ -484,10 +461,8 @@ class Strategy:
         if dec_from_liq is not None:
             ui["decimals"] = dec_from_liq
 
-        # IMPORTANT: log using the normalized mint (raw attached as metadata)
         symbol = ui.get("symbol", "") or "?"
         print(f"[trade] pool=pump symbol={symbol} mint={mint_norm} curve=-", flush=True)
-        print(f"[trade] pool=pump symbol={symbol} mint={mint_norm} curve=- for {symbol} ({mint_norm})", flush=True)
 
         if DEDUPE_ENABLED and ENTRY_MOMENTUM_ENABLED:
             if not claim_once(f"gate-propose:{mint_raw}", ttl=int(max(ENTRY_MOMO_WINDOW_SEC * 2, 90))):
@@ -534,15 +509,16 @@ class Strategy:
 
         await asyncio.sleep(LOOP_COOLDOWN_SEC)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Stream loop & main
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------
+# Streaming loop / main
+# -------------------------
 async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
+    strat = Strategy()
+
     # Prefer async context manager if available
     if hasattr(PumpPortalClient, "__aenter__"):
         async with PumpPortalClient() as client:  # type: ignore[misc]
-            strat = Strategy()
-            print("[main] Connecting:", client.masked_uri(), flush=True)
+            print("[main] Connecting:", getattr(client, "masked_uri", lambda: "<uri?>")(), flush=True)
             async for ev in client.events():
                 if stop_evt and stop_evt.is_set():
                     break
@@ -559,9 +535,8 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
                     print("[main] event handling error:", flush=True)
                     traceback.print_exc()
     else:
-        client = PumpPortalClient()
-        strat = Strategy()
-        print("[main] Connecting:", client.masked_uri(), flush=True)
+        client = PumpPortalClient()  # may raise if not available
+        print("[main] Connecting:", getattr(client, "masked_uri", lambda: "<uri?>")(), flush=True)
         try:
             async for ev in client.events():
                 if stop_evt and stop_evt.is_set():
@@ -598,12 +573,11 @@ async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asynci
         await pricefeed_close()
 
 async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
-    # Start heartbeat early (idempotent)
     with contextlib.suppress(Exception):
         start_global_heartbeat(log, interval=float(os.getenv("PF_HEARTBEAT_SEC", "45")))
         bump("boot")
 
-    # Initialize router (priority seeding, idempotent)
+    # Router initialization
     try:
         if router and hasattr(router, "start"):
             await router.start()
@@ -611,7 +585,7 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     except Exception as e:
         log.event("ROUTER_PRIO_INIT_FAIL", error=str(e))
 
-    # Start sell loop on boot if there are existing positions
+    # Start sell loop if positions exist
     sell_stop_evt: Optional[asyncio.Event] = None
     sell_task: Optional[asyncio.Task] = None
     try:
@@ -622,7 +596,6 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     except Exception as e:
         log.event("BOOT_SELL_LOOP_START_FAIL", error=str(e))
 
-    # Signal handlers for graceful shutdown
     local_stop = stop_evt or asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -631,7 +604,6 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
         except NotImplementedError:
             pass  # Windows
 
-    # Main reconnect loop
     backoff = 3
     try:
         while not local_stop.is_set():
@@ -647,7 +619,6 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
                 backoff = min(backoff * 2, 30)
             await asyncio.sleep(backoff)
     finally:
-        # Graceful stop of sell engine + subsystems
         try:
             if sell_stop_evt is not None:
                 sell_stop_evt.set()
