@@ -185,15 +185,10 @@ def normalize_pump_id_to_mint(raw: str) -> str:
       - a Pump Portal id that may end in 'pump'/'bonk'
       - strings that contain the mint (scan windows)
 
-    Strategy:
-      1) If it ends with 'pump'/'bonk', try dropping the suffix. If that
-         decodes to 32 bytes, return it.
-      2) If the cleaned string is already a 32-byte base58, return it.
-      3) Scan the cleaned string for any 43/44-char window that decodes to 32.
-      4) Scan the ORIGINAL raw string for any 43/44 window that decodes to 32.
-      5) LAST RESORT: if the raw itself decodes to 32, return raw.
-         (Keeps backward-compatibility; follow-up callers still validate via RPC.)
-      6) Else raise.
+    STRONG RULE:
+      If a suffix ('pump'/'bonk') is present but the base is not itself a
+      32-byte pubkey, we DO NOT heuristically scan windows — we bail.
+      (Prevents false positives from random long strings.)
     """
     s = (raw or "").strip()
     if not s:
@@ -203,15 +198,15 @@ def normalize_pump_id_to_mint(raw: str) -> str:
     if suf:
         if _is_valid_pubkey_str(base):
             return base
-        # keep going with cleaned
-        cleaned = base
-    else:
-        cleaned = s
+        # suffix-only style id; do not scan arbitrary windows
+        raise ValueError(f"Cannot normalize pump id to a mint: '{raw}'")
 
-    if _is_valid_pubkey_str(cleaned):
-        return cleaned
+    # No suffix: accept obvious wins
+    if _is_valid_pubkey_str(s):
+        return s
 
-    # scan cleaned for 43/44
+    # Scan for any 43/44 window in s that decodes to 32 bytes
+    cleaned = s
     for i in range(0, max(0, len(cleaned) - 43) + 1):
         for L in (44, 43):
             j = i + L
@@ -220,16 +215,7 @@ def normalize_pump_id_to_mint(raw: str) -> str:
                 if _is_valid_pubkey_str(sub):
                     return sub
 
-    # scan original raw for 43/44
-    for i in range(0, max(0, len(s) - 43) + 1):
-        for L in (44, 43):
-            j = i + L
-            if j <= len(s):
-                sub = s[i:j]
-                if _is_valid_pubkey_str(sub):
-                    return sub
-
-    # last resort
+    # Last resort: if somehow the raw itself decodes to 32, allow it
     if _is_valid_pubkey_str(s):
         return s
 
