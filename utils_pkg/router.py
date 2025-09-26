@@ -6,7 +6,7 @@ import base64
 import os
 import random
 import time
-from typing import Any, Dict, Optional, Tuple, Callable
+from typing import Any, Dict, Optional, Tuple, Callable, List
 
 import requests
 
@@ -19,15 +19,17 @@ from utils_pkg.solana_wallet import (
 
 log = get_logger()
 
-# ---- logging safety shim (so .every always exists) ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# logging safety shim (so .every always exists)
+# ──────────────────────────────────────────────────────────────────────────────
 if not hasattr(log, "every"):
     def _every(_key: str, n: int = 10, msg: str | None = None, **kw):
         return log.event(msg or _key, **kw)
     setattr(log, "every", _every)  # type: ignore[attr-defined]
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 # Chain / RPC config (with safe fallbacks)
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     from utils_pkg.txlearn import RPC_URL as _TX_RPC_URL, TX_COMMITMENT as _TX_COMMITMENT  # type: ignore
 except Exception:
@@ -40,9 +42,9 @@ TX_COMMITMENT = _TX_COMMITMENT
 SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 # Env helpers
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 def _envb(k: str, default: bool = False) -> bool:
     v = (os.getenv(k, "") or "").strip().lower()
     if not v:
@@ -61,9 +63,9 @@ def _envi(k: str, d: int) -> int:
     except Exception:
         return int(d)
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 # Feature toggles / HTTP knobs
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 DRY_RUN = _envb("DRY_RUN", False)
 
 HTTP_TIMEOUT_GET  = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
@@ -136,9 +138,9 @@ except Exception:  # pragma: no cover
 # Common headers
 _UA = {"user-agent": "pnlsniper/1.0 (+router)", "accept": "application/json"}
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 # Base58 helpers (no external deps)
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58_IDX = {c: i for i, c in enumerate(_B58_ALPHABET)}
 
@@ -168,6 +170,19 @@ def _is_valid_pubkey_str(s: str) -> bool:
 def is_valid_pubkey_str(s: str) -> bool:
     return _is_valid_pubkey_str(s)
 
+def _scan_for_mints(s: str) -> List[str]:
+    """Scan a string for any 43/44-char windows that decode to 32 bytes."""
+    found: List[str] = []
+    s = (s or "").strip()
+    for i in range(0, max(0, len(s) - 43) + 1):
+        for L in (44, 43):
+            j = i + L
+            if j <= len(s):
+                sub = s[i:j]
+                if _is_valid_pubkey_str(sub) and sub not in found:
+                    found.append(sub)
+    return found
+
 def _strip_pseudo_suffix(raw: str) -> tuple[str, Optional[str]]:
     """
     Returns (base, suffix) where suffix ∈ {"pump","bonk",None}.
@@ -185,10 +200,15 @@ def normalize_pump_id_to_mint(raw: str) -> str:
       - a Pump Portal id that may end in 'pump'/'bonk'
       - strings that contain the mint (scan windows)
 
-    STRONG RULE:
-      If a suffix ('pump'/'bonk') is present but the base is not itself a
-      32-byte pubkey, we DO NOT heuristically scan windows — we bail.
-      (Prevents false positives from random long strings.)
+    Strategy:
+      1) If it ends with 'pump'/'bonk', try dropping the suffix. If that
+         decodes to 32 bytes, return it.
+      2) If the cleaned string is already a 32-byte base58, return it.
+      3) Scan the cleaned string for any 43/44-char window that decodes to 32.
+      4) Scan the ORIGINAL raw string for any 43/44 window that decodes to 32.
+         - If multiple distinct candidates are found, refuse (avoid false hits).
+      5) LAST RESORT: if the raw itself decodes to 32, return raw.
+      6) Else raise.
     """
     s = (raw or "").strip()
     if not s:
@@ -198,24 +218,22 @@ def normalize_pump_id_to_mint(raw: str) -> str:
     if suf:
         if _is_valid_pubkey_str(base):
             return base
-        # suffix-only style id; do not scan arbitrary windows
+        # base failed; be conservative and only accept an unambiguous single match
+        cands = _scan_for_mints(s)
+        if len(cands) == 1:
+            log.every("mint.scan_suffix", n=20, msg="MINT_SCAN_SUFFIX", raw=s, cand=cands[0])
+            return cands[0]
         raise ValueError(f"Cannot normalize pump id to a mint: '{raw}'")
 
-    # No suffix: accept obvious wins
-    if _is_valid_pubkey_str(s):
-        return s
+    if _is_valid_pubkey_str(base):
+        return base
 
-    # Scan for any 43/44 window in s that decodes to 32 bytes
-    cleaned = s
-    for i in range(0, max(0, len(cleaned) - 43) + 1):
-        for L in (44, 43):
-            j = i + L
-            if j <= len(cleaned):
-                sub = cleaned[i:j]
-                if _is_valid_pubkey_str(sub):
-                    return sub
+    cands = _scan_for_mints(base)
+    if len(cands) == 1:
+        return cands[0]
+    if len(cands) > 1:
+        raise ValueError(f"ambiguous candidates in '{raw}'")
 
-    # Last resort: if somehow the raw itself decodes to 32, allow it
     if _is_valid_pubkey_str(s):
         return s
 
@@ -240,9 +258,9 @@ def _assert_pubkey(s: str, name: str) -> None:
     if not _is_valid_pubkey_str(s):
         raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 # Non-blocking HTTP (requests in worker threads)
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 async def _get_json(url: str, *, params: Optional[dict] = None, timeout: float | int = HTTP_TIMEOUT_GET) -> dict:
     def _req():
         r = requests.get(url, params=params, timeout=timeout, headers=_UA)
@@ -290,9 +308,9 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
                 raise
     raise last_err if last_err else RuntimeError(f"{label} failed")
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 # Simple RPC helpers (for decimals & sig status)
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 _DECIMALS: Dict[str, int] = {}
 
 def _rpc_post(method: str, params: list) -> dict:
@@ -340,6 +358,13 @@ async def _get_decimals(mint: str) -> Optional[int]:
         _DECIMALS[mint] = int(dec)
     return dec
 
+# public export (optional helper used by main.py)
+async def get_decimals(mint: str) -> Optional[int]:
+    """Return SPL token decimals for a mint (cached)."""
+    mint = _sanitize_mint(mint)
+    _assert_pubkey(mint, "mint")
+    return await _get_decimals(mint)
+
 async def _get_signature_status(sig: str) -> Optional[dict]:
     def _call() -> Optional[dict]:
         try:
@@ -352,9 +377,9 @@ async def _get_signature_status(sig: str) -> Optional[dict]:
         return None
     return await asyncio.to_thread(_call)
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 # Dynamic priority fee controller
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 def _to_sol_from_lamports_like(x: float) -> float:
     lamports = float(x)
     if lamports >= 1e9:
@@ -494,9 +519,9 @@ async def shutdown() -> None:
     """No-op for compatibility (no aiohttp session to close)."""
     return None
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 # Jupiter pacing
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 async def _jup_gate() -> None:
     global _JUP_LAST_TS
     async with _JUP_RATE_LOCK:
@@ -506,9 +531,9 @@ async def _jup_gate() -> None:
             await asyncio.sleep(wait_for)
         _JUP_LAST_TS = time.time()
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 # Quote cache / single-flight
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 def _qkey(input_mint: str, output_mint: str, amount_iu: int, slippage_bps: int, swap_mode: str, direct: bool, legacy: bool) -> str:
     return f"{input_mint}:{output_mint}:{amount_iu}:{slippage_bps}:{swap_mode}:{int(direct)}:{int(legacy)}"
 
@@ -540,9 +565,9 @@ async def _singleflight_quote(key: str, maker: Callable[[], Any]) -> dict:
         async with _quote_lock:
             _QUOTE_FLIGHT.pop(key, None)
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 # Low-level Jupiter helpers
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 async def _jup_quote(
     input_mint: str,
     output_mint: str,
@@ -610,9 +635,9 @@ async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optiona
         raise RuntimeError(f"Jupiter returned no swapTransaction: {js}")
     return tx_b64
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 # Public quote & price helpers
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 async def get_sell_quote(*, mint: str, amount_raw: int, slippage_bps: Optional[int] = None) -> Dict[str, Any]:
     if amount_raw <= 0:
         raise ValueError("amount_raw must be > 0")
@@ -722,9 +747,9 @@ async def price_of_ui(mint: str) -> float:
 async def price_of(mint: str) -> float:
     return await get_price_ui(mint)
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 # Swaps (public) — return (ok, signature|None)
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 async def buy_via_lightning(
     *,
     mint: str,
@@ -837,6 +862,8 @@ __all__ = [
     "buy_via_lightning", "sell_via_lightning",
     # mint helpers
     "normalize_pump_id_to_mint", "_is_valid_pubkey_str", "is_valid_pubkey_str",
+    # extras exposed for callers
+    "get_decimals",
     # exposed RPC config for legacy callers
     "TX_RPC_URL", "TX_COMMITMENT",
 ]

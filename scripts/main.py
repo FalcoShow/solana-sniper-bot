@@ -50,6 +50,10 @@ try:
     from utils_pkg import router  # provides start()/shutdown()
     from utils_pkg.router import get_price_ui as _route_price_ui
     try:
+        from utils_pkg.router import get_decimals as _route_get_decimals  # optional helper
+    except Exception:
+        _route_get_decimals = None  # type: ignore
+    try:
         from utils_pkg.router import is_valid_pubkey_str as _is_valid_pubkey_str  # type: ignore
     except Exception:
         from utils_pkg.router import _is_valid_pubkey_str  # type: ignore
@@ -63,6 +67,7 @@ except Exception:  # pragma: no cover
         return 0.0
     def _is_valid_pubkey_str(_s: str) -> bool:  # type: ignore
         return False
+    _route_get_decimals = None  # type: ignore
     normalize_pump_id_to_mint = None  # type: ignore
 
 # Liquidity screen (fallback provided)
@@ -251,31 +256,31 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
     init_buy = _as_float(_get_first(msg, "initialBuy", "initial_buy", default=0.0), 0.0)
     if init_buy < MIN_INITIAL_BUY_SOL:
         if DEBUG_TX:
-            print(f"[filter] initialBuy {init_buy} < min {MIN_INITIAL_BUY_SOL} — skip", flush=True)
+            print(f".[filter] initialBuy {init_buy} < min {MIN_INITIAL_BUY_SOL} — skip", flush=True)
         return False
 
     sym = _extract_symbol(msg).upper()
     if any(bad and bad in sym for bad in SYMBOL_BLACKLIST):
         if DEBUG_TX:
-            print(f"[filter] symbol '{sym}' hits blacklist {SYMBOL_BLACKLIST} — skip", flush=True)
+            print(f".[filter] symbol '{sym}' hits blacklist {SYMBOL_BLACKLIST} — skip", flush=True)
         return False
 
     nm = _extract_name(msg)
     if MAX_NAME_LEN > 0 and len(nm) > MAX_NAME_LEN:
         if DEBUG_TX:
-            print(f"[filter] name too long ({len(nm)} > {MAX_NAME_LEN}) — skip", flush=True)
+            print(f".[filter] name too long ({len(nm)} > {MAX_NAME_LEN}) — skip", flush=True)
         return False
 
     mins_since_token = _approx_minutes_since(_get_first(msg, "created_at", "createdAt", "timestamp", "ts", default=None))
     if mins_since_token is not None and ENTRY_MAX_AGE_MIN > 0 and mins_since_token > ENTRY_MAX_AGE_MIN:
         if DEBUG_TX:
-            print(f"[filter] token age {mins_since_token:.1f}m > max {ENTRY_MAX_AGE_MIN}m — skip", flush=True)
+            print(f".[filter] token age {mins_since_token:.1f}m > max {ENTRY_MAX_AGE_MIN}m — skip", flush=True)
         return False
 
     mins_since_pool = _approx_minutes_since(_get_first(msg, "poolCreatedAt", "pool_created_at", default=None))
     if mins_since_pool is not None and MIN_POOL_AGE_MIN > 0 and mins_since_pool < MIN_POOL_AGE_MIN:
         if DEBUG_TX:
-            print(f"[filter] pool age {mins_since_pool:.1f}m < min {MIN_POOL_AGE_MIN}m — skip", flush=True)
+            print(f".[filter] pool age {mins_since_pool:.1f}m < min {MIN_POOL_AGE_MIN}m — skip", flush=True)
         return False
 
     return True
@@ -322,7 +327,7 @@ class Strategy:
             if DEDUPE_ENABLED:
                 if not claim_once(f"gate:{mint_raw}", ttl=int(max(ENTRY_MOMO_WINDOW_SEC * 2, 60))):
                     if DEBUG_TX:
-                        print(f"[dedupe] gate already running for {mint_raw} — skip", flush=True)
+                        print(f".[dedupe] gate already running for {mint_raw} — skip", flush=True)
                     return
 
             self._gate_state[mint_raw] = {"trades": 0, "price0": 0.0}
@@ -390,7 +395,7 @@ class Strategy:
             if trades_ok and up_ok:
                 if DEDUPE_ENABLED and not claim_once(f"buy:{mint_raw}", ttl=600):
                     if DEBUG_TX:
-                        print(f"[dedupe] buy already claimed for {mint_raw} — skip", flush=True)
+                        print(f".[dedupe] buy already claimed for {mint_raw} — skip", flush=True)
                     record_buy_result(ok=False, reason="buy_claimed_elsewhere")
                     return
 
@@ -432,7 +437,7 @@ class Strategy:
                 print("[strategy] missing mint — skip", flush=True)
             return
 
-        # Normalize using router helper (handles "...pump" etc.)
+        # Normalize using router helper (handles "...pump" etc.); ALWAYS use normalized below.
         mint_source = str(_get_first(raw_event, "mint", "mintAddress", "mint_address", default=mint_raw)).strip()
         mint_norm = normalize_mint_from_source(mint_source)
         if mint_norm != mint_raw:
@@ -446,19 +451,29 @@ class Strategy:
         if not _passes_basic_filters(raw_event):
             return
 
+        # Liquidity screen
+        dec_from_liq: Optional[int] = None
         if LIQ_FILTER_ENABLED:
             ok, rep = await screen_token(mint_norm)
             if not ok:
                 if DEBUG_TX:
                     print(f"[liquidity] screen failed for {mint_norm}: {rep}", flush=True)
                 return
+            dec_from_liq = rep.get("decimals")
+            # Optional: backfill decimals via router if missing.
+            if dec_from_liq is None and _route_get_decimals is not None:
+                try:
+                    dec_from_liq = await _route_get_decimals(mint_norm)  # type: ignore
+                except Exception:
+                    dec_from_liq = None
             log.event(
                 "ENTRY_LIQ_OK",
                 mint=mint_norm,
                 priceImpactPct=rep.get("priceImpactPct"),
-                dec=rep.get("decimals"),
+                dec=dec_from_liq,
             )
 
+        # UI payload passed into buy path
         ui: Dict[str, Any] = dict(raw_event)
         ui.setdefault("pool", "pump")
         ui.setdefault("symbol", _extract_symbol(raw_event))
@@ -466,15 +481,18 @@ class Strategy:
         ui["rawMint"] = mint_raw
         ui["mint"] = mint_norm
         ui["normalized"] = (mint_norm != mint_raw)
+        if dec_from_liq is not None:
+            ui["decimals"] = dec_from_liq
 
+        # IMPORTANT: log using the normalized mint (raw attached as metadata)
         symbol = ui.get("symbol", "") or "?"
-        print(f"[trade] pool=pump symbol={symbol} mint={mint_raw} curve=-", flush=True)
-        print(f"[trade] pool=pump symbol={symbol} mint={mint_raw} curve=- for {symbol} ({mint_raw})", flush=True)
+        print(f"[trade] pool=pump symbol={symbol} mint={mint_norm} curve=-", flush=True)
+        print(f"[trade] pool=pump symbol={symbol} mint={mint_norm} curve=- for {symbol} ({mint_norm})", flush=True)
 
         if DEDUPE_ENABLED and ENTRY_MOMENTUM_ENABLED:
             if not claim_once(f"gate-propose:{mint_raw}", ttl=int(max(ENTRY_MOMO_WINDOW_SEC * 2, 90))):
                 if DEBUG_TX:
-                    print(f"[dedupe] gate-propose taken for {mint_raw} — skip", flush=True)
+                    print(f".[dedupe] gate-propose taken for {mint_raw} — skip", flush=True)
                 return
 
         if ENTRY_MOMENTUM_ENABLED:
@@ -482,7 +500,7 @@ class Strategy:
         else:
             if DEDUPE_ENABLED and not claim_once(f"buy:{mint_raw}", ttl=600):
                 if DEBUG_TX:
-                    print(f"[dedupe] buy already claimed for {mint_raw} — skip", flush=True)
+                    print(f".[dedupe] buy already claimed for {mint_raw} — skip", flush=True)
                 return
             async with self._sema:
                 try:
