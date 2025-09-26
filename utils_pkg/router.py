@@ -358,7 +358,7 @@ async def _get_decimals(mint: str) -> Optional[int]:
         _DECIMALS[mint] = int(dec)
     return dec
 
-# public export (optional helper used by main.py)
+# public exports (used by main.py)
 async def get_decimals(mint: str) -> Optional[int]:
     """Return SPL token decimals for a mint (cached)."""
     mint = _sanitize_mint(mint)
@@ -747,6 +747,12 @@ async def price_of_ui(mint: str) -> float:
 async def price_of(mint: str) -> float:
     return await get_price_ui(mint)
 
+# Minimal public helper (used by main.py to log decimals cleanly)
+async def mint_decimals(mint: str) -> Optional[int]:
+    mint = _sanitize_mint(mint)
+    _assert_pubkey(mint, "mint")
+    return await _get_decimals(mint)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Swaps (public) — return (ok, signature|None)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -862,8 +868,7 @@ __all__ = [
     "buy_via_lightning", "sell_via_lightning",
     # mint helpers
     "normalize_pump_id_to_mint", "_is_valid_pubkey_str", "is_valid_pubkey_str",
-    # extras exposed for callers
-    "get_decimals",
+    "mint_decimals", "get_decimals",
     # exposed RPC config for legacy callers
     "TX_RPC_URL", "TX_COMMITMENT",
 ]
