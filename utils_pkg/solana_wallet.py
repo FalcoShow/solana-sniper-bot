@@ -5,7 +5,7 @@ import os
 import json
 import asyncio
 from base64 import b64decode
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 
 import requests
 
@@ -77,7 +77,7 @@ def _norm_commitment(c: object) -> Commitment:
     and return a proper Commitment enum instance. Defaults to Confirmed.
     """
     if hasattr(c, "value"):
-        # Already a Commitment-like enum object
+        # Already a Commitment-like enum object (solana-py)
         return c  # type: ignore[return-value]
 
     s = str(c or "").strip().lower()
@@ -85,7 +85,7 @@ def _norm_commitment(c: object) -> Commitment:
         "processed": Processed,
         "confirmed": Confirmed,
         "finalized": Finalized,
-        "finalised": Finalized,  # common alt spelling
+        "finalised": Finalized,  # alt spelling
     }
     return mapping.get(s, Confirmed)
 
@@ -238,6 +238,46 @@ def _encode_shortvec(n: int) -> bytes:
     return bytes(out)
 
 
+def _sig_to_str(x: Any) -> str:
+    """
+    Normalize various response types to a plain base58 signature string.
+    Handles:
+      - solders.signature.Signature
+      - solana-py SendTransactionResp (has `.value`)
+      - dict RPCResponse-like shapes
+      - already-a-string
+      - last-resort: str(x)
+    """
+    # SendTransactionResp / objects with `.value`
+    if hasattr(x, "value"):
+        try:
+            return str(getattr(x, "value"))
+        except Exception:
+            pass
+
+    # solders Signature
+    if isinstance(x, Signature):
+        return str(x)
+
+    # dict responses
+    if isinstance(x, dict):
+        if "result" in x and x["result"]:
+            r = x["result"]
+            if isinstance(r, str):
+                return r
+            if isinstance(r, dict) and r.get("value"):
+                return str(r["value"])
+        if "value" in x and x["value"]:
+            return str(x["value"])
+
+    # already a string
+    if isinstance(x, str):
+        return x
+
+    # fallback
+    return str(x)
+
+
 # -----------------------------------------------------------------------------
 # Signing & sending Jupiter swap transactions (LEGACY ONLY)
 # -----------------------------------------------------------------------------
@@ -294,18 +334,7 @@ async def sign_and_send_b64_tx(
                 max_retries=max_retries,
             ),
         )
-        # solana-py may return a plain string or an RPCResponse-like dict
-        if isinstance(resp, str):
-            return resp
-        if isinstance(resp, dict):
-            if "result" in resp and resp["result"]:
-                return str(resp["result"])
-            # some versions use {"result": {"value": "<sig>"}}
-            r = resp.get("result")
-            if isinstance(r, dict) and r.get("value"):
-                return str(r["value"])
-        # Fallback best-effort
-        return str(resp)
+        return _sig_to_str(resp)
 
     return await asyncio.to_thread(_send_sync)
 
