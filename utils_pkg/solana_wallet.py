@@ -9,9 +9,9 @@ from typing import Optional, Tuple, Any
 
 import requests
 
-# -----------------------------------------------------------------------------
-# Optional base58 (small local fallback if "base58" isn't installed)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Optional base58 (local fallback)
+# ---------------------------------------------------------------------------
 try:
     from base58 import b58decode as _b58decode  # type: ignore
 except Exception:
@@ -32,9 +32,9 @@ except Exception:
         pad = len(s) - len(s.lstrip("1"))
         return b"\x00" * pad + out
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # solana-py / solders
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 from solana.rpc.api import Client as RpcClient
 from solana.rpc.types import TxOpts
 from solana.rpc.commitment import Commitment, Confirmed, Finalized, Processed
@@ -42,9 +42,9 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.signature import Signature
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # RPC endpoints & knobs
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 _SEND_RPC_URL = (
     os.getenv("SOL_RPC_TX_URL")
     or os.getenv("SOL_RPC_URL")
@@ -54,7 +54,6 @@ RPC_URL = _SEND_RPC_URL  # public alias used elsewhere
 
 _RPC_TIMEOUT_SEC = float(os.getenv("ROUTER_RPC_TIMEOUT_SEC", "10") or 10.0)
 
-# Commitment precedence (env), default "confirmed"
 _TX_COMMITMENT_RAW = (
     os.getenv("PF_TX_SEND_COMMITMENT")
     or os.getenv("PF_TXLEARN_COMMITMENT")
@@ -64,20 +63,20 @@ _TX_COMMITMENT_RAW = (
 
 _UA = {"user-agent": "pnlsniper/1.0 (+wallet)"}
 
-# Cache the loaded keypair so we don't re-read on every call
+# cache the trading keypair
 _KP: Optional[Keypair] = None
 
 
-# -----------------------------------------------------------------------------
-# Commitment normalization (prevents "'int' object has no attribute 'value'")
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Commitment normalization
+# ---------------------------------------------------------------------------
 def _norm_commitment(c: object) -> Commitment:
     """
     Accept a Commitment instance or string ('processed'|'confirmed'|'finalized')
     and return a proper Commitment enum instance. Defaults to Confirmed.
     """
     if hasattr(c, "value"):
-        # Already a Commitment-like enum object (solana-py)
+        # Already a Commitment-like object
         return c  # type: ignore[return-value]
 
     s = str(c or "").strip().lower()
@@ -90,25 +89,23 @@ def _norm_commitment(c: object) -> Commitment:
     return mapping.get(s, Confirmed)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Keypair loading
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _load_keypair_from_env_or_file() -> Keypair:
     """
     Load a keypair from either:
-      - WALLET_PRIVKEY_B58 : base58-encoded 64-byte secret key (secret||pub)
-      - WALLET_PRIVKEY_JSON / WALLET_KEYPAIR_JSON : JSON array string of 64 ints
+      - WALLET_PRIVKEY_B58  : base58-encoded 64-byte secret key (secret||pub)
+      - WALLET_PRIVKEY_JSON / WALLET_KEYPAIR_JSON : JSON array string (64 ints)
       - WALLET_KEYPAIR_PATH / KEYPAIR_PATH : path to JSON array file (64 ints)
       - default ~/.config/solana/id.json
     """
-    # 1) base58 (64 bytes: secret||pub)
+    # 1) base58 secret (64 bytes)
     b58 = (os.getenv("WALLET_PRIVKEY_B58") or "").strip()
     if b58:
         sk = _b58decode(b58)
         if len(sk) != 64:
-            raise RuntimeError(
-                "WALLET_PRIVKEY_B58 must be base58 of a 64-byte secret key"
-            )
+            raise RuntimeError("WALLET_PRIVKEY_B58 must be base58 of a 64-byte secret key")
         return Keypair.from_bytes(sk)
 
     # 2) inline JSON array in env
@@ -124,18 +121,14 @@ def _load_keypair_from_env_or_file() -> Keypair:
     # 3) file path(s)
     path = (
         os.getenv("WALLET_KEYPAIR_PATH")
-        or os.getenv("KEYPAIR_PATH")  # older env name in some setups
+        or os.getenv("KEYPAIR_PATH")
         or os.path.expanduser("~/.config/solana/id.json")
     ).strip()
-
     with open(path, "r", encoding="utf-8") as f:
         arr = json.load(f)
-
     sk_bytes = bytes(arr)
     if len(sk_bytes) != 64:
-        raise RuntimeError(
-            f"Keypair at {path} must contain a JSON array of 64 bytes"
-        )
+        raise RuntimeError(f"Keypair at {path} must contain a JSON array of 64 bytes")
     return Keypair.from_bytes(sk_bytes)
 
 
@@ -147,9 +140,9 @@ def load_keypair() -> Keypair:
     return _KP
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Pubkey helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def get_pubkey(kp: Keypair) -> Pubkey:
     return kp.pubkey()
 
@@ -158,24 +151,23 @@ def get_pubkey_str(kp: Keypair) -> str:
     return str(kp.pubkey())
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Balance helper (used by autosizer)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _rpc_url_for_balance() -> str:
-    # Prefer read RPC for balance; fall back to tx RPC if needed.
+    # Prefer read RPC for balances; fall back to TX RPC if needed.
     return (os.getenv("SOL_RPC_URL") or os.getenv("SOL_RPC_TX_URL") or RPC_URL).strip()
 
 
 async def get_balance_sol(owner: Optional[str] = None) -> float:
     """
     Async helper: returns SOL balance for `owner` (or current wallet if None).
-    Calls JSON-RPC in a worker thread via requests (no aiohttp dep).
+    Uses a lightweight JSON-RPC POST via requests in a worker thread.
     """
     try:
         if not owner:
             kp = load_keypair()
             owner = get_pubkey_str(kp)
-
         url = _rpc_url_for_balance()
         if not (url and owner):
             return 0.0
@@ -198,9 +190,9 @@ async def get_balance_sol(owner: Optional[str] = None) -> float:
         return 0.0
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Legacy transaction helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _is_legacy_tx_bytes(raw: bytes) -> bool:
     """
     Legacy wire format begins with shortvec-encoded signature count.
@@ -238,49 +230,43 @@ def _encode_shortvec(n: int) -> bytes:
     return bytes(out)
 
 
-def _sig_to_str(x: Any) -> str:
+def _unwrap_send_resp(resp: Any) -> str:
     """
-    Normalize various response types to a plain base58 signature string.
-    Handles:
-      - solders.signature.Signature
-      - solana-py SendTransactionResp (has `.value`)
-      - dict RPCResponse-like shapes
-      - already-a-string
-      - last-resort: str(x)
+    Normalize solana-py's send_raw_transaction response to a base58 signature string.
+    Handles: plain str, dicts, and SendTransactionResp / RPCResponse objects with .value.
     """
-    # SendTransactionResp / objects with `.value`
-    if hasattr(x, "value"):
+    # 1) Already a string
+    if isinstance(resp, str):
+        return resp
+
+    # 2) Newer solana-py typed responses: SendTransactionResp(...).value -> Signature
+    if hasattr(resp, "value"):
         try:
-            return str(getattr(x, "value"))
+            v = getattr(resp, "value")
+            return str(v)
         except Exception:
             pass
 
-    # solders Signature
-    if isinstance(x, Signature):
-        return str(x)
+    # 3) Dict-ish RPC responses
+    if isinstance(resp, dict):
+        # { "result": "<sig>" }
+        if isinstance(resp.get("result"), str):
+            return str(resp["result"])
+        # { "result": { "value": "<sig>" } }
+        r = resp.get("result")
+        if isinstance(r, dict) and r.get("value"):
+            return str(r["value"])
+        # { "value": "<sig>" }
+        if resp.get("value"):
+            return str(resp["value"])
 
-    # dict responses
-    if isinstance(x, dict):
-        if "result" in x and x["result"]:
-            r = x["result"]
-            if isinstance(r, str):
-                return r
-            if isinstance(r, dict) and r.get("value"):
-                return str(r["value"])
-        if "value" in x and x["value"]:
-            return str(x["value"])
-
-    # already a string
-    if isinstance(x, str):
-        return x
-
-    # fallback
-    return str(x)
+    # 4) Fallback best-effort
+    return str(resp)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Signing & sending Jupiter swap transactions (LEGACY ONLY)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 async def sign_and_send_b64_tx(
     tx_b64: str,
     kp: Keypair,
@@ -334,7 +320,7 @@ async def sign_and_send_b64_tx(
                 max_retries=max_retries,
             ),
         )
-        return _sig_to_str(resp)
+        return _unwrap_send_resp(resp)
 
     return await asyncio.to_thread(_send_sync)
 
