@@ -246,7 +246,7 @@ def _extract_raw_mint(msg: Dict[str, Any]) -> str:
 def _approx_minutes_since(ts_any: Any) -> Optional[float]:
     try:
         import datetime as _dt
-        now = _dt.datetime.utcnow().timestamp()
+        now = _dt.datetime.now(_dt.timezone.utc).timestamp()  # timezone-aware (no deprecation)
         if ts_any is None:
             return None
         if isinstance(ts_any, (int, float)):
@@ -352,7 +352,29 @@ async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
             traceback.print_exc()
 
 
-# -------- Soft retry for 'no_account' (liquidity) --------
+# -------- Soft retry helpers for 'no_account' (liquidity) --------
+async def _screen_with_retry(mint: str, tries: int = 3, first_wait: float = 0.8):
+    """
+    Retry screen_token a few times if it returns {'ok': False, 'reason': 'no_account'}.
+    This works even when router.get_decimals is unavailable.
+    """
+    wait = first_wait
+    last = None
+    for i in range(tries):
+        ok, rep = await screen_token(mint)
+        last = rep
+        if ok:
+            return True, rep
+        if str((rep or {}).get("reason")) != "no_account":
+            return False, rep
+        if i < tries - 1:
+            if DEBUG_TX:
+                print(f"[liquidity] retrying for {mint} (no_account) in {wait:.2f}s", flush=True)
+            await asyncio.sleep(wait)
+            wait *= 1.6
+    return False, last
+
+
 async def _await_mint_ready(
     mint_norm: str,
     max_wait_s: int = 45,
@@ -529,9 +551,9 @@ class Strategy:
         # 2) Liquidity screen (optional, adds decimals if available) with soft retry
         dec_from_liq: Optional[int] = None
         if LIQ_FILTER_ENABLED:
-            ok, rep = await screen_token(mint_norm)
-            if not ok and str(rep.get("reason")) == "no_account":
-                # Soft retry: give RPC some time for the mint account to appear
+            ok, rep = await _screen_with_retry(mint_norm, tries=3, first_wait=0.8)
+            if not ok and str((rep or {}).get("reason")) == "no_account":
+                # As a last resort, if router.get_decimals is available, wait for it
                 dec_from_liq = await _await_mint_ready(mint_norm, max_wait_s=45, step_s=3.0)
                 if dec_from_liq is not None:
                     ok = True
@@ -541,11 +563,11 @@ class Strategy:
                     print(f"[liquidity] screen failed for {mint_norm}: {rep}", flush=True)
                 return
             if dec_from_liq is None:
-                dec_from_liq = rep.get("decimals")
+                dec_from_liq = (rep or {}).get("decimals")
             log.event(
                 "ENTRY_LIQ_OK",
                 mint=mint_norm,
-                priceImpactPct=rep.get("priceImpactPct"),
+                priceImpactPct=(rep or {}).get("priceImpactPct"),
                 dec=dec_from_liq,
             )
 
