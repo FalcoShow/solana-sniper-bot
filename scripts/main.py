@@ -11,12 +11,25 @@ from typing import Any, Dict, Optional
 
 from logging_setup import get_logger, bump, start_global_heartbeat
 
+# ---- Normalization helper (our local util) ----
+from scripts.pp_utils import normalize_mint as _pp_normalize
+
+# Optional: if the shared mint_guard package exists, we’ll use it as a
+# second opinion (not required for this file to run).
+try:
+    from utils_pkg.mint_guard import (
+        normalize_from_any as _mg_normalize,
+        is_probable_mint as _mg_prob,
+    )
+except Exception:  # pragma: no cover
+    _mg_normalize = None  # type: ignore
+    _mg_prob = None  # type: ignore
+
 # Primary event source + trading entry point
 try:
     from utils_pkg.pumpportal_client import PumpPortalClient
 except Exception:  # pragma: no cover
-    # Minimal stub that will raise at runtime if used
-    class PumpPortalClient:
+    class PumpPortalClient:  # minimal stub to fail at runtime if used
         def __init__(self, *a, **kw):  # type: ignore
             raise RuntimeError("PumpPortalClient not available")
 
@@ -33,9 +46,11 @@ try:
 except Exception:  # pragma: no cover
     async def sell_on_jupiter(*a, **kw):  # type: ignore
         raise RuntimeError("sell_on_jupiter not available")
+
     class _NoopExit:
-        async def on_trade_tick(self, *_a, **_kw): pass
-        async def on_buy_filled(self, *_a, **_kw): pass
+        async def on_trade_tick(self, *_a, **_kw): ...
+        async def on_buy_filled(self, *_a, **_kw): ...
+
     exit_engine = _NoopExit()  # type: ignore
     IS_DRYRUN = True
 
@@ -51,6 +66,7 @@ try:
 except Exception:  # pragma: no cover
     def buys_allowed() -> bool:  # type: ignore
         return True
+
     def record_buy_result(*_args, **_kwargs):  # type: ignore
         return None
 
@@ -78,8 +94,10 @@ try:
         _route_get_decimals = None  # type: ignore
 except Exception:  # pragma: no cover
     router = None  # type: ignore
+
     async def _route_price_ui(_mint: str) -> float:  # type: ignore
         return 0.0
+
     _route_get_decimals = None  # type: ignore
 
 # Liquidity screen (fallback provided)
@@ -96,29 +114,45 @@ except Exception:  # pragma: no cover
     async def pricefeed_close():  # type: ignore
         return None
 
-# 🔒 Central mint guard
-from utils_pkg.mint_guard import (
-    normalize_from_any as _normalize_from_any,
-    is_probable_mint as _guard_prob,
-)
 
 log = get_logger()
 
 # -------------------------
-# Mint validation / normalization (wrappers → mint_guard)
+# Mint normalization / validation
 # -------------------------
-def _is_probable_mint(s: str) -> bool:
-    try:
-        return _guard_prob(s)
-    except Exception:
-        return False
+def _normalize_from_source(raw: str) -> str:
+    """
+    First try our local PP normalizer (strips pump/bonk & validates base58 length).
+    If that returns None and mint_guard is available, try that. As a last resort,
+    return a trimmed string so downstream filters can still reject safely.
+    """
+    if raw is None:
+        return ""
+    raw = str(raw).strip()
+    m = _pp_normalize(raw)
+    if m:
+        return m
+    if _mg_normalize:
+        try:
+            m2 = _mg_normalize(raw)
+            if isinstance(m2, str) and m2:
+                return m2
+        except Exception:
+            pass
+    return raw  # permissive fallback — later checks will drop it
 
-def normalize_mint_from_source(raw: str) -> str:
-    try:
-        return _normalize_from_any(raw)
-    except Exception:
-        # Keep permissive behavior at the edge; downstream filters will reject.
-        return (raw or "").strip()
+
+def _is_probable_mint(s: str) -> bool:
+    if not s:
+        return False
+    if _mg_prob:
+        try:
+            return bool(_mg_prob(s))
+        except Exception:
+            return False
+    # Cheap local check if mint_guard is absent: rely on our normalizer shape.
+    return bool(_pp_normalize(s))
+
 
 # -------------------------
 # ENV helpers
@@ -128,11 +162,13 @@ def _as_bool(val: Optional[str], default: bool = False) -> bool:
         return default
     return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
 def _as_float(val: Any, default: float) -> float:
     try:
         return float(val)
     except Exception:
         return default
+
 
 def _as_int(val: Any, default: int) -> int:
     try:
@@ -140,26 +176,27 @@ def _as_int(val: Any, default: int) -> int:
     except Exception:
         return default
 
+
 # -------------------------
 # Config (same defaults / flags as your original)
 # -------------------------
-EXIT_ENGINE_ENABLED      = _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True)
-DEDUPE_ENABLED           = _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True)
-DEDUPE_TTL_SEC           = _as_int(os.getenv("PF_DEDUPE_TTL_SEC", "3600"), 3600)
-LIQ_FILTER_ENABLED       = _as_bool(os.getenv("ENTRY_LIQ_FILTER", "1"), True)
+EXIT_ENGINE_ENABLED = _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True)
+DEDUPE_ENABLED = _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True)
+DEDUPE_TTL_SEC = _as_int(os.getenv("PF_DEDUPE_TTL_SEC", "3600"), 3600)
+LIQ_FILTER_ENABLED = _as_bool(os.getenv("ENTRY_LIQ_FILTER", "1"), True)
 
-ENTRY_MOMENTUM_ENABLED   = _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True)
-ENTRY_MOMO_WINDOW_SEC    = _as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10)
-ENTRY_MOMO_MIN_TRADES    = _as_int(os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6)
-ENTRY_MOMO_MIN_UP_PCT    = _as_float(os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0)
-ENTRY_MOMO_PRICE_TRIES   = _as_int(os.getenv("ENTRY_MOMO_PRICE_TRIES", "4"), 4)
+ENTRY_MOMENTUM_ENABLED = _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True)
+ENTRY_MOMO_WINDOW_SEC = _as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10)
+ENTRY_MOMO_MIN_TRADES = _as_int(os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6)
+ENTRY_MOMO_MIN_UP_PCT = _as_float(os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0)
+ENTRY_MOMO_PRICE_TRIES = _as_int(os.getenv("ENTRY_MOMO_PRICE_TRIES", "4"), 4)
 ENTRY_MOMO_PRICE_DELAY_S = _as_float(os.getenv("ENTRY_MOMO_PRICE_DELAY_S", "0.7"), 0.7)
-ENTRY_MOMO_MAX_PARALLEL  = max(1, _as_int(os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"), 6))
+ENTRY_MOMO_MAX_PARALLEL = max(1, _as_int(os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"), 6))
 
-MIN_INITIAL_BUY_SOL      = _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
-MAX_NAME_LEN             = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
-ENTRY_MAX_AGE_MIN        = _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20)
-MIN_POOL_AGE_MIN         = _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3)
+MIN_INITIAL_BUY_SOL = _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
+MAX_NAME_LEN = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
+ENTRY_MAX_AGE_MIN = _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20)
+MIN_POOL_AGE_MIN = _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3)
 
 SYMBOL_BLACKLIST = {
     s.strip().upper()
@@ -167,11 +204,12 @@ SYMBOL_BLACKLIST = {
     if s.strip()
 }
 
-MAX_CONCURRENCY          = max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2))
-LOOP_COOLDOWN_SEC        = _as_float(os.getenv("PF_COOLDOWN_SEC", "15"), 15.0)
-MAX_TRADEABLE            = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)  # 0 = unlimited
-PAUSE_TRADING            = _as_bool(os.getenv("PAUSE_TRADING", "0"), False)
-DEBUG_TX                 = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
+MAX_CONCURRENCY = max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2))
+LOOP_COOLDOWN_SEC = _as_float(os.getenv("PF_COOLDOWN_SEC", "15"), 15.0)
+MAX_TRADEABLE = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)  # 0 = unlimited
+PAUSE_TRADING = _as_bool(os.getenv("PAUSE_TRADING", "0"), False)
+DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
+
 
 # -------------------------
 # Utilities / small helpers
@@ -182,23 +220,30 @@ def _get_first(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
             return d[k]
     return default
 
-def _extract_raw_mint(msg: Dict[str, Any]) -> str:
-    raw = _get_first(
-        msg,
-        "mint", "mintAddress", "mint_address", "bondingCurve", "bonding_curve",
-        "address", "id",
-        default=""
-    )
-    raw = ("" if raw is None else str(raw)).strip()
-    if DEBUG_TX:
-        print(f"[main] raw pump id = {raw}", flush=True)
-    return raw
 
 def _extract_symbol(msg: Dict[str, Any]) -> str:
     return str(_get_first(msg, "symbol", "ticker", default="")).strip()
 
+
 def _extract_name(msg: Dict[str, Any]) -> str:
     return str(_get_first(msg, "name", default="")).strip()
+
+
+def _extract_raw_mint(msg: Dict[str, Any]) -> str:
+    # PP likes putting the id under several names. Grab anything plausible.
+    raw = _get_first(
+        msg,
+        "mint",
+        "mintAddress",
+        "mint_address",
+        "bondingCurve",
+        "bonding_curve",
+        "address",
+        "id",
+        default="",
+    )
+    return ("" if raw is None else str(raw)).strip()
+
 
 def _approx_minutes_since(ts_any: Any) -> Optional[float]:
     try:
@@ -231,6 +276,7 @@ def _approx_minutes_since(ts_any: Any) -> Optional[float]:
         return None
     return None
 
+
 def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
     typ = str(_get_first(msg, "txType", "type", default="")).strip().lower()
     if typ != "create":
@@ -239,34 +285,62 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
     init_buy = _as_float(_get_first(msg, "initialBuy", "initial_buy", default=0.0), 0.0)
     if init_buy < MIN_INITIAL_BUY_SOL:
         if DEBUG_TX:
-            print(f".[filter] initialBuy {init_buy} < min {MIN_INITIAL_BUY_SOL} — skip", flush=True)
+            print(
+                f".[filter] initialBuy {init_buy} < min {MIN_INITIAL_BUY_SOL} — skip",
+                flush=True,
+            )
         return False
 
     sym = _extract_symbol(msg).upper()
     if any(bad and bad in sym for bad in SYMBOL_BLACKLIST):
         if DEBUG_TX:
-            print(f".[filter] symbol '{sym}' hits blacklist {SYMBOL_BLACKLIST} — skip", flush=True)
+            print(
+                f".[filter] symbol '{sym}' hits blacklist {SYMBOL_BLACKLIST} — skip",
+                flush=True,
+            )
         return False
 
     nm = _extract_name(msg)
     if MAX_NAME_LEN > 0 and len(nm) > MAX_NAME_LEN:
         if DEBUG_TX:
-            print(f".[filter] name too long ({len(nm)} > {MAX_NAME_LEN}) — skip", flush=True)
+            print(
+                f".[filter] name too long ({len(nm)} > {MAX_NAME_LEN}) — skip",
+                flush=True,
+            )
         return False
 
-    mins_since_token = _approx_minutes_since(_get_first(msg, "created_at", "createdAt", "timestamp", "ts", default=None))
-    if mins_since_token is not None and ENTRY_MAX_AGE_MIN > 0 and mins_since_token > ENTRY_MAX_AGE_MIN:
+    mins_since_token = _approx_minutes_since(
+        _get_first(msg, "created_at", "createdAt", "timestamp", "ts", default=None)
+    )
+    if (
+        mins_since_token is not None
+        and ENTRY_MAX_AGE_MIN > 0
+        and mins_since_token > ENTRY_MAX_AGE_MIN
+    ):
         if DEBUG_TX:
-            print(f".[filter] token age {mins_since_token:.1f}m > max {ENTRY_MAX_AGE_MIN}m — skip", flush=True)
+            print(
+                f".[filter] token age {mins_since_token:.1f}m > max {ENTRY_MAX_AGE_MIN}m — skip",
+                flush=True,
+            )
         return False
 
-    mins_since_pool = _approx_minutes_since(_get_first(msg, "poolCreatedAt", "pool_created_at", default=None))
-    if mins_since_pool is not None and MIN_POOL_AGE_MIN > 0 and mins_since_pool < MIN_POOL_AGE_MIN:
+    mins_since_pool = _approx_minutes_since(
+        _get_first(msg, "poolCreatedAt", "pool_created_at", default=None)
+    )
+    if (
+        mins_since_pool is not None
+        and MIN_POOL_AGE_MIN > 0
+        and mins_since_pool < MIN_POOL_AGE_MIN
+    ):
         if DEBUG_TX:
-            print(f".[filter] pool age {mins_since_pool:.1f}m < min {MIN_POOL_AGE_MIN}m — skip", flush=True)
+            print(
+                f".[filter] pool age {mins_since_pool:.1f}m < min {MIN_POOL_AGE_MIN}m — skip",
+                flush=True,
+            )
         return False
 
     return True
+
 
 # Optional immediate sell test after buy
 async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
@@ -278,6 +352,7 @@ async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
     except Exception:
         if DEBUG_TX:
             traceback.print_exc()
+
 
 # -------------------------
 # Strategy implementation
@@ -296,6 +371,7 @@ class Strategy:
                 if DEBUG_TX:
                     traceback.print_exc()
 
+        # Track trades for momentum window keyed by *raw* id
         m = str(_get_first(raw_event, "mint", "mintAddress", "mint_address", "id", default="")).strip()
         if not m:
             return
@@ -386,9 +462,7 @@ class Strategy:
                     if tx_sig:
                         record_buy_result(ok=True, reason="executed", sig=tx_sig)
                         if EXIT_ENGINE_ENABLED and not IS_DRYRUN:
-                            asyncio.create_task(
-                                exit_engine.on_buy_filled(raw_id_or_mint=mint_norm, tx_sig=tx_sig)
-                            )
+                            asyncio.create_task(exit_engine.on_buy_filled(raw_id_or_mint=mint_norm, tx_sig=tx_sig))
                         asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
                     else:
                         record_buy_result(ok=False, reason="no_tx_sig")
@@ -412,17 +486,14 @@ class Strategy:
             except Exception:
                 pass
 
-        mint_raw = _extract_raw_mint(raw_event)
-        if not mint_raw:
+        # 1) Parse and normalize immediately (drop if not plausible)
+        mint_source = _extract_raw_mint(raw_event)
+        if not mint_source:
             if DEBUG_TX:
                 print("[strategy] missing mint — skip", flush=True)
             return
 
-        mint_source = str(_get_first(raw_event, "mint", "mintAddress", "mint_address", default=mint_raw)).strip()
-        mint_norm = normalize_mint_from_source(mint_source)
-        if mint_norm != mint_raw and DEBUG_TX:
-            print(f"[main] normalized mint = {mint_norm}", flush=True)
-
+        mint_norm = _normalize_from_source(mint_source)
         if not _is_probable_mint(mint_norm):
             if DEBUG_TX:
                 print(f"[strategy] implausible mint after normalize => skip ({mint_source})", flush=True)
@@ -431,6 +502,7 @@ class Strategy:
         if not _passes_basic_filters(raw_event):
             return
 
+        # 2) Liquidity screen (optional, adds decimals if available)
         dec_from_liq: Optional[int] = None
         if LIQ_FILTER_ENABLED:
             ok, rep = await screen_token(mint_norm)
@@ -451,31 +523,33 @@ class Strategy:
                 dec=dec_from_liq,
             )
 
+        # 3) Prepare UI payload for buy path
         ui: Dict[str, Any] = dict(raw_event)
         ui.setdefault("pool", "pump")
         ui.setdefault("symbol", _extract_symbol(raw_event))
         ui.setdefault("name", _extract_name(raw_event))
-        ui["rawMint"] = mint_raw
+        ui["rawMint"] = mint_source
         ui["mint"] = mint_norm
-        ui["normalized"] = (mint_norm != mint_raw)
+        ui["normalized"] = (mint_norm != mint_source)
         if dec_from_liq is not None:
             ui["decimals"] = dec_from_liq
 
         symbol = ui.get("symbol", "") or "?"
         print(f"[trade] pool=pump symbol={symbol} mint={mint_norm} curve=-", flush=True)
 
+        # 4) Momentum gate (or direct buy)
         if DEDUPE_ENABLED and ENTRY_MOMENTUM_ENABLED:
-            if not claim_once(f"gate-propose:{mint_raw}", ttl=int(max(ENTRY_MOMO_WINDOW_SEC * 2, 90))):
+            if not claim_once(f"gate-propose:{mint_source}", ttl=int(max(ENTRY_MOMO_WINDOW_SEC * 2, 90))):
                 if DEBUG_TX:
-                    print(f".[dedupe] gate-propose taken for {mint_raw} — skip", flush=True)
+                    print(f".[dedupe] gate-propose taken for {mint_source} — skip", flush=True)
                 return
 
         if ENTRY_MOMENTUM_ENABLED:
-            asyncio.create_task(self._gate_candidate(ui, mint_raw, mint_norm))
+            asyncio.create_task(self._gate_candidate(ui, mint_source, mint_norm))
         else:
-            if DEDUPE_ENABLED and not claim_once(f"buy:{mint_raw}", ttl=600):
+            if DEDUPE_ENABLED and not claim_once(f"buy:{mint_source}", ttl=600):
                 if DEBUG_TX:
-                    print(f".[dedupe] buy already claimed for {mint_raw} — skip", flush=True)
+                    print(f".[dedupe] buy already claimed for {mint_source} — skip", flush=True)
                 return
             async with self._sema:
                 try:
@@ -498,9 +572,7 @@ class Strategy:
                     record_buy_result(ok=True, reason="executed", sig=tx_sig)
 
                     if EXIT_ENGINE_ENABLED and not IS_DRYRUN:
-                        asyncio.create_task(
-                            exit_engine.on_buy_filled(raw_id_or_mint=mint_norm, tx_sig=tx_sig)
-                        )
+                        asyncio.create_task(exit_engine.on_buy_filled(raw_id_or_mint=mint_norm, tx_sig=tx_sig))
                     asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
                 except Exception:
                     print("[strategy] maybe_buy exception:", flush=True)
@@ -508,6 +580,7 @@ class Strategy:
                     record_buy_result(ok=False, reason="exception")
 
         await asyncio.sleep(LOOP_COOLDOWN_SEC)
+
 
 # -------------------------
 # Streaming loop / main
@@ -560,6 +633,7 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
                     if asyncio.iscoroutine(maybe_awaitable):
                         await maybe_awaitable  # type: ignore
 
+
 async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asyncio.Task]) -> None:
     stop_evt.set()
     with contextlib.suppress(Exception):
@@ -571,6 +645,7 @@ async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asynci
             await router.shutdown()
     with contextlib.suppress(Exception):
         await pricefeed_close()
+
 
 async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     with contextlib.suppress(Exception):
@@ -628,6 +703,7 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
         except Exception:
             pass
         await _graceful_shutdown(local_stop, sell_task)
+
 
 if __name__ == "__main__":
     try:
