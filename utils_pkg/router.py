@@ -73,8 +73,38 @@ HTTP_TIMEOUT_GET  = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
 HTTP_TIMEOUT_POST = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_POST_SEC", 25.0))
 RPC_TIMEOUT_SEC   = max(3.0, _envf("ROUTER_RPC_TIMEOUT_SEC", 10.0))
 
-JUP_QUOTE_URL = os.getenv("JUP_QUOTE_URL", "https://quote-api.jup.ag/v6/quote")
-JUP_SWAP_URL  = os.getenv("JUP_SWAP_URL",  "https://quote-api.jup.ag/v6/swap")
+# ---- Jupiter base + headers (supports QuickNode Function proxy) --------------
+def _jup_base() -> str:
+    # If set, this is your QuickNode Function / any proxy base.
+    base = (os.getenv("JUP_BASE_URL") or "").strip()
+    if base:
+        return base.rstrip("/")
+    # Fallback to public Jupiter host
+    return "https://quote-api.jup.ag"
+
+def _jup_url(path: str) -> str:
+    # path should start with "/"
+    return _jup_base() + path
+
+def _jup_headers() -> Dict[str, str]:
+    """
+    Build headers for Jupiter/Proxy calls.
+    - Always send UA + JSON accept.
+    - If JUP_API_KEY is present (QuickNode Function), send x-api-key.
+    """
+    h = {
+        "user-agent": "pnlsniper/1.0 (+router)",
+        "accept": "application/json",
+        "content-type": "application/json",
+    }
+    key = (os.getenv("JUP_API_KEY") or os.getenv("QUICKNODE_FUNCTION_KEY") or "").strip()
+    if key:
+        h["x-api-key"] = key
+    return h
+
+# Keep env overrides for direct endpoints, but default to base + path.
+JUP_QUOTE_URL = os.getenv("JUP_QUOTE_URL", _jup_url("/v6/quote"))
+JUP_SWAP_URL  = os.getenv("JUP_SWAP_URL",  _jup_url("/v6/swap"))
 
 def _slippage_bps() -> int:
     """
@@ -136,7 +166,7 @@ except Exception:  # pragma: no cover
         def after_rpc(self, method: str, *, weight: Optional[int] = None) -> None:  return None
     budget = _BudgetNoop()  # type: ignore
 
-# Common headers
+# Default UA for RPC; Jupiter headers are built by _jup_headers()
 _UA = {"user-agent": "pnlsniper/1.0 (+router)", "accept": "application/json"}
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -195,9 +225,15 @@ def _assert_pubkey(s: str, name: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Non-blocking HTTP (requests in worker threads)
 # ──────────────────────────────────────────────────────────────────────────────
-async def _get_json(url: str, *, params: Optional[dict] = None, timeout: float | int = HTTP_TIMEOUT_GET) -> dict:
+async def _get_json(
+    url: str,
+    *,
+    params: Optional[dict] = None,
+    timeout: float | int = HTTP_TIMEOUT_GET,
+    headers: Optional[Dict[str, str]] = None,
+) -> dict:
     def _req():
-        r = requests.get(url, params=params, timeout=timeout, headers=_UA)
+        r = requests.get(url, params=params, timeout=timeout, headers=headers or _UA)
         r.raise_for_status()
         ctype = (r.headers.get("content-type") or "").lower()
         if "application/json" not in ctype:
@@ -208,9 +244,15 @@ async def _get_json(url: str, *, params: Optional[dict] = None, timeout: float |
         return r.json()
     return await asyncio.to_thread(_req)
 
-async def _post_json(url: str, *, json_body: dict, timeout: float | int = HTTP_TIMEOUT_POST) -> dict:
+async def _post_json(
+    url: str,
+    *,
+    json_body: dict,
+    timeout: float | int = HTTP_TIMEOUT_POST,
+    headers: Optional[Dict[str, str]] = None,
+) -> dict:
     def _req():
-        r = requests.post(url, json=json_body, timeout=timeout, headers=_UA)
+        r = requests.post(url, json=json_body, timeout=timeout, headers=headers or _UA)
         r.raise_for_status()
         ctype = (r.headers.get("content-type") or "").lower()
         if "application/json" not in ctype:
@@ -500,7 +542,7 @@ async def _singleflight_quote(key: str, maker: Callable[[], Any]) -> dict:
             _QUOTE_FLIGHT.pop(key, None)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Low-level Jupiter helpers
+# Low-level Jupiter helpers (with proxy + API key)
 # ──────────────────────────────────────────────────────────────────────────────
 async def _jup_quote(
     input_mint: str,
@@ -538,7 +580,7 @@ async def _jup_quote(
                 "swapMode": swap_mode,
                 "onlyDirectRoutes": "true" if only_direct else "false",
             }
-            js = await _get_json(JUP_QUOTE_URL, params=params, timeout=HTTP_TIMEOUT_GET)
+            js = await _get_json(JUP_QUOTE_URL, params=params, timeout=HTTP_TIMEOUT_GET, headers=_jup_headers())
             await _set_cached_quote(key, js, QUOTE_TTL_SEC)
             return js
         finally:
@@ -562,7 +604,7 @@ async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optiona
     if priority_lamports is not None:
         body["prioritizationFeeLamports"] = int(priority_lamports)
 
-    js = await _post_json(JUP_SWAP_URL, json_body=body, timeout=HTTP_TIMEOUT_POST)
+    js = await _post_json(JUP_SWAP_URL, json_body=body, timeout=HTTP_TIMEOUT_POST, headers=_jup_headers())
     tx_b64 = js.get("swapTransaction")
     if not tx_b64:
         raise RuntimeError(f"Jupiter returned no swapTransaction: {js}")
