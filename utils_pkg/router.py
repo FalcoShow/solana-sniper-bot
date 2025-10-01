@@ -106,6 +106,17 @@ def _jup_headers() -> Dict[str, str]:
 JUP_QUOTE_URL = os.getenv("JUP_QUOTE_URL", _jup_url("/v6/quote"))
 JUP_SWAP_URL  = os.getenv("JUP_SWAP_URL",  _jup_url("/v6/swap"))
 
+def _build_jup_endpoint(kind: str) -> str:
+    """
+    If JUP_BASE_URL is a QuickNode Function REST endpoint that ends with /call,
+    we must send the target Jupiter path via ?path=/v6/<kind>.
+    Otherwise, append /v6/<kind> normally.
+    """
+    base = (os.getenv("JUP_BASE_URL") or "https://quote-api.jup.ag").rstrip("/")
+    if "/functions/rest/" in base and base.endswith("/call"):
+        return f"{base}?path=/v6/{kind}"
+    return f"{base}/v6/{kind}"
+
 def _slippage_bps() -> int:
     """
     Slippage priority: PF_SLIPPAGE_BPS (int bps) >
