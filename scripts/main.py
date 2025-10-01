@@ -44,7 +44,7 @@ except Exception:  # pragma: no cover
 try:
     from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN
 except Exception:  # pragma: no cover
-    async def sell_on_jupiter(*a, **kw):  # type: ignore
+    async def sell_on_jupiter(*a, **_kw):  # type: ignore
         raise RuntimeError("sell_on_jupiter not available")
 
     class _NoopExit:
@@ -113,7 +113,6 @@ try:
 except Exception:  # pragma: no cover
     async def pricefeed_close():  # type: ignore
         return None
-
 
 log = get_logger()
 
@@ -209,7 +208,6 @@ LOOP_COOLDOWN_SEC = _as_float(os.getenv("PF_COOLDOWN_SEC", "15"), 15.0)
 MAX_TRADEABLE = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)  # 0 = unlimited
 PAUSE_TRADING = _as_bool(os.getenv("PAUSE_TRADING", "0"), False)
 DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
-
 
 # -------------------------
 # Utilities / small helpers
@@ -352,6 +350,32 @@ async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
     except Exception:
         if DEBUG_TX:
             traceback.print_exc()
+
+
+# -------- Soft retry for 'no_account' (liquidity) --------
+async def _await_mint_ready(
+    mint_norm: str,
+    max_wait_s: int = 45,
+    step_s: float = 3.0,
+) -> Optional[int]:
+    """
+    Poll for the mint's decimals (as a proxy that the mint account exists).
+    Uses router.get_decimals if available. Returns decimals or None.
+    """
+    if _route_get_decimals is None:
+        return None
+
+    waited = 0.0
+    while waited < max_wait_s:
+        try:
+            dec = await _route_get_decimals(mint_norm)  # type: ignore
+            if isinstance(dec, int) and 0 <= dec <= 18:
+                return dec
+        except Exception:
+            pass
+        await asyncio.sleep(step_s)
+        waited += step_s
+    return None
 
 
 # -------------------------
@@ -502,20 +526,22 @@ class Strategy:
         if not _passes_basic_filters(raw_event):
             return
 
-        # 2) Liquidity screen (optional, adds decimals if available)
+        # 2) Liquidity screen (optional, adds decimals if available) with soft retry
         dec_from_liq: Optional[int] = None
         if LIQ_FILTER_ENABLED:
             ok, rep = await screen_token(mint_norm)
+            if not ok and str(rep.get("reason")) == "no_account":
+                # Soft retry: give RPC some time for the mint account to appear
+                dec_from_liq = await _await_mint_ready(mint_norm, max_wait_s=45, step_s=3.0)
+                if dec_from_liq is not None:
+                    ok = True
+                    rep = {"ok": True, "reason": "await_mint_ready", "decimals": dec_from_liq}
             if not ok:
                 if DEBUG_TX:
                     print(f"[liquidity] screen failed for {mint_norm}: {rep}", flush=True)
                 return
-            dec_from_liq = rep.get("decimals")
-            if dec_from_liq is None and _route_get_decimals is not None:
-                try:
-                    dec_from_liq = await _route_get_decimals(mint_norm)  # type: ignore
-                except Exception:
-                    dec_from_liq = None
+            if dec_from_liq is None:
+                dec_from_liq = rep.get("decimals")
             log.event(
                 "ENTRY_LIQ_OK",
                 mint=mint_norm,
