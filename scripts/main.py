@@ -400,6 +400,49 @@ async def _await_mint_ready(
     return None
 
 
+# -------- Step A: ensure wallet file exists on boot --------
+def _ensure_keypair_file() -> None:
+    """
+    Ensure ~/.config/solana/id.json exists. If the env KEYPAIR_JSON or
+    SOLANA_KEYPAIR_JSON is set (JSON array of 64 integers), write it with proper perms.
+    This makes the wallet resilient to pod restarts / ephemeral filesystems.
+    """
+    import json, pathlib, stat
+
+    try:
+        home = os.path.expanduser("~")
+        cfg_dir = pathlib.Path(home) / ".config" / "solana"
+        key_path = cfg_dir / "id.json"
+
+        if key_path.exists():
+            return
+
+        raw = os.getenv("KEYPAIR_JSON") or os.getenv("SOLANA_KEYPAIR_JSON")
+        if not raw:
+            # Nothing to write; buy paths will throw if a keypair is required.
+            log.event("KEYPAIR_ENV_MISSING", hint="set KEYPAIR_JSON to auto-create wallet")
+            return
+
+        kp = json.loads(raw)
+        if not (isinstance(kp, list) and len(kp) == 64 and all(isinstance(x, int) for x in kp)):
+            raise ValueError("KEYPAIR_JSON must be a JSON array of 64 integers")
+
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        key_path.write_text(json.dumps(kp), encoding="utf-8")
+
+        # chmod 600 for file, 700 for dir
+        key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        with contextlib.suppress(Exception):
+            cfg_dir.chmod(stat.S_IRWXU)
+
+        log.event("KEYPAIR_FILE_WRITTEN", path=str(key_path))
+    except Exception as e:
+        try:
+            log.event("KEYPAIR_FILE_WRITE_FAIL", error=str(e))
+        except Exception:
+            print(f"[boot] could not write wallet: {e}", flush=True)
+
+
 # -------------------------
 # Strategy implementation
 # -------------------------
@@ -699,6 +742,9 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     with contextlib.suppress(Exception):
         start_global_heartbeat(log, interval=float(os.getenv("PF_HEARTBEAT_SEC", "45")))
         bump("boot")
+
+    # --- Step A: ensure wallet file exists (no-op if already present)
+    _ensure_keypair_file()
 
     # Router initialization
     try:
