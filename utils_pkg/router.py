@@ -73,24 +73,35 @@ HTTP_TIMEOUT_GET  = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
 HTTP_TIMEOUT_POST = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_POST_SEC", 25.0))
 RPC_TIMEOUT_SEC   = max(3.0, _envf("ROUTER_RPC_TIMEOUT_SEC", 10.0))
 
-# ---- Jupiter base + headers (supports QuickNode Function proxy) --------------
-def _jup_base() -> str:
-    # If set, this is your QuickNode Function / any proxy base.
-    base = (os.getenv("JUP_BASE_URL") or "").strip()
-    if base:
-        return base.rstrip("/")
-    # Fallback to public Jupiter host
-    return "https://quote-api.jup.ag"
+# ──────────────────────────────────────────────────────────────────────────────
+# Jupiter base/headers (supports QuickNode Function proxy)
+# ──────────────────────────────────────────────────────────────────────────────
+def _is_qn_call_url(u: str) -> bool:
+    u = (u or "").rstrip("/")
+    return "/functions/" in u and u.endswith("/call")
 
-def _jup_url(path: str) -> str:
-    # path should start with "/"
-    return _jup_base() + path
+def _jup_base() -> str:
+    base = (os.getenv("JUP_BASE_URL") or "").strip()
+    return (base or "https://quote-api.jup.ag").rstrip("/")
+
+JUP_BASE = _jup_base()
+JUP_IS_QN_CALL = _is_qn_call_url(JUP_BASE)
+
+def _build_jup_endpoint(kind: str) -> str:
+    """
+    If JUP_BASE is a QuickNode Functions REST endpoint ending with /call,
+    we must send the Jupiter path using ?path=/v6/<kind>.
+    Otherwise, use normal https://quote-api.jup.ag/v6/<kind>.
+    """
+    if JUP_IS_QN_CALL:
+        return f"{JUP_BASE}?path=/v6/{kind}"
+    return f"{JUP_BASE}/v6/{kind}"
 
 def _jup_headers() -> Dict[str, str]:
     """
     Build headers for Jupiter/Proxy calls.
     - Always send UA + JSON accept.
-    - If JUP_API_KEY is present (QuickNode Function), send x-api-key.
+    - If JUP_API_KEY (or QUICKNODE_FUNCTION_KEY) is present, send x-api-key.
     """
     h = {
         "user-agent": "pnlsniper/1.0 (+router)",
@@ -102,20 +113,8 @@ def _jup_headers() -> Dict[str, str]:
         h["x-api-key"] = key
     return h
 
-# Keep env overrides for direct endpoints, but default to base + path.
-JUP_QUOTE_URL = os.getenv("JUP_QUOTE_URL", _jup_url("/v6/quote"))
-JUP_SWAP_URL  = os.getenv("JUP_SWAP_URL",  _jup_url("/v6/swap"))
-
-def _build_jup_endpoint(kind: str) -> str:
-    """
-    If JUP_BASE_URL is a QuickNode Function REST endpoint that ends with /call,
-    we must send the target Jupiter path via ?path=/v6/<kind>.
-    Otherwise, append /v6/<kind> normally.
-    """
-    base = (os.getenv("JUP_BASE_URL") or "https://quote-api.jup.ag").rstrip("/")
-    if "/functions/rest/" in base and base.endswith("/call"):
-        return f"{base}?path=/v6/{kind}"
-    return f"{base}/v6/{kind}"
+JUP_QUOTE_URL = _build_jup_endpoint("quote")
+JUP_SWAP_URL  = _build_jup_endpoint("swap")
 
 def _slippage_bps() -> int:
     """
@@ -258,12 +257,13 @@ async def _get_json(
 async def _post_json(
     url: str,
     *,
-    json_body: dict,
+    json_body: Optional[dict] = None,
+    params: Optional[dict] = None,
     timeout: float | int = HTTP_TIMEOUT_POST,
     headers: Optional[Dict[str, str]] = None,
 ) -> dict:
     def _req():
-        r = requests.post(url, json=json_body, timeout=timeout, headers=headers or _UA)
+        r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=headers or _UA)
         r.raise_for_status()
         ctype = (r.headers.get("content-type") or "").lower()
         if "application/json" not in ctype:
@@ -591,7 +591,14 @@ async def _jup_quote(
                 "swapMode": swap_mode,
                 "onlyDirectRoutes": "true" if only_direct else "false",
             }
-            js = await _get_json(JUP_QUOTE_URL, params=params, timeout=HTTP_TIMEOUT_GET, headers=_jup_headers())
+            headers = _jup_headers()
+
+            if JUP_IS_QN_CALL:
+                # QuickNode /call requires POST; query string carries params.
+                js = await _post_json(JUP_QUOTE_URL, json_body=None, params=params, timeout=HTTP_TIMEOUT_POST, headers=headers)
+            else:
+                js = await _get_json(JUP_QUOTE_URL, params=params, timeout=HTTP_TIMEOUT_GET, headers=headers)
+
             await _set_cached_quote(key, js, QUOTE_TTL_SEC)
             return js
         finally:
