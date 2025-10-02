@@ -238,78 +238,96 @@ def _assert_pubkey(s: str, name: str) -> None:
         raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# QN Action envelope → unwrap helper (robust)
+# QN Action envelope → unwrap helper (bullet-proof via deep search)
 # ──────────────────────────────────────────────────────────────────────────────
 def _maybe_parse_json_str(x: Any) -> Any:
     if isinstance(x, str):
-        try:
-            return json.loads(x)
-        except Exception:
-            return x
+        s = x.strip()
+        # Quick fast-path: only try to JSON-decode if it looks like JSON
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            try:
+                return json.loads(s)
+            except Exception:
+                return x
     return x
 
 def _looks_like_jupiter(js: Any) -> bool:
     if not isinstance(js, dict):
         return False
-    if "outAmount" in js or "routePlan" in js or "swapTransaction" in js:
+    # Minimal feature test for Jupiter responses
+    # (quote) outAmount / routePlan, (swap) swapTransaction
+    if "swapTransaction" in js:
         return True
-    # Jupiter sometimes returns arrays for things; keep simple signal
+    if "outAmount" in js or "routePlan" in js:
+        return True
+    # Some quote errors: { error: "...", code: ... } → don’t treat as Jupiter
     return False
+
+def _deep_find_jupiter(obj: Any, *, max_nodes: int = 5000) -> Any:
+    """
+    DFS through dicts/lists and return the first sub-dict that looks like a
+    Jupiter payload. Bounded to avoid pathological structures.
+    """
+    stack = [obj]
+    visited = 0
+    while stack and visited < max_nodes:
+        cur = stack.pop()
+        visited += 1
+        if isinstance(cur, dict):
+            # Try direct match
+            if _looks_like_jupiter(cur):
+                return cur
+            # Push child values (parsing JSON-like strings on the way)
+            for v in cur.values():
+                v = _maybe_parse_json_str(v)
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(cur, list):
+            for v in cur:
+                v = _maybe_parse_json_str(v)
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+    return None
 
 def _unwrap_qn_action(response: requests.Response, parsed: Any) -> Any:
     """
-    QuickNode Functions can return an "Action envelope" (201 or even 200) like:
-      { id, created_at, execution: { response: { status, body } }, user_data, ... }
-    This extracts the final Jupiter JSON so the rest of the router is agnostic.
+    Extract final Jupiter JSON from any QuickNode “Action” envelope shape.
+    We first check the usual fields, then fall back to a deep recursive scan.
     """
-    # Already Jupiter-ish? return as-is
+    # If we already have a Jupiter-looking object, return as-is.
     if _looks_like_jupiter(parsed):
         return parsed
 
-    body = parsed
-    if not isinstance(body, dict):
-        return parsed
+    # Heuristic common paths first (fast)
+    body = parsed if isinstance(parsed, dict) else {}
+    if body:
+        # 1) user_data
+        ud = _maybe_parse_json_str(body.get("user_data"))
+        if _looks_like_jupiter(ud):
+            return ud
 
-    # 1) user_data may directly be the Jupiter JSON (object or JSON string)
-    ud = body.get("user_data")
-    ud = _maybe_parse_json_str(ud)
-    if _looks_like_jupiter(ud):
-        return ud
+        # 2) execution.response.{body|rawBody|json}, execution.result
+        exec_obj = body.get("execution")
+        if isinstance(exec_obj, dict):
+            resp = exec_obj.get("response")
+            if isinstance(resp, dict):
+                for k in ("body", "rawBody", "json"):
+                    cand = _maybe_parse_json_str(resp.get(k))
+                    if _looks_like_jupiter(cand):
+                        return cand
+            cand_res = _maybe_parse_json_str(exec_obj.get("result"))
+            if _looks_like_jupiter(cand_res):
+                return cand_res
 
-    # 2) execution.response.body / rawBody may contain JSON or JSON string
-    exec_obj = body.get("execution")
-    if isinstance(exec_obj, dict):
-        resp = exec_obj.get("response")
-        if isinstance(resp, dict):
-            rb = _maybe_parse_json_str(resp.get("body"))
-            if _looks_like_jupiter(rb):
-                return rb
-            rb2 = _maybe_parse_json_str(resp.get("rawBody"))
-            if _looks_like_jupiter(rb2):
-                return rb2
+        # 3) occasional wrappers
+        for k in ("data", "payload", "result", "output"):
+            cand = _maybe_parse_json_str(body.get(k))
+            if _looks_like_jupiter(cand):
+                return cand
 
-        # Some templates put the final object under "result"
-        result = _maybe_parse_json_str(exec_obj.get("result"))
-        if _looks_like_jupiter(result):
-            return result
-
-    # 3) Occasionally, envelope embeds under "data" or "payload"
-    for k in ("data", "payload"):
-        cand = _maybe_parse_json_str(body.get(k))
-        if _looks_like_jupiter(cand):
-            return cand
-
-    # 4) If nothing matched but we do have status 201 and a string body,
-    #    try a last-chance parse if it looks like a JSON string
-    try:
-        status = int(getattr(response, "status_code", 0) or 0)
-    except Exception:
-        status = 0
-    if status == 201:
-        # already handled common places above; nothing more to do
-        return parsed
-
-    return parsed
+    # Last resort: deep scan anywhere in the structure.
+    found = _deep_find_jupiter(parsed)
+    return found if found is not None else parsed
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Non-blocking HTTP (requests in worker threads)
