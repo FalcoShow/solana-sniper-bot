@@ -81,6 +81,12 @@ def _is_qn_call_url(u: str) -> bool:
     u = (u or "").rstrip("/")
     return "/functions/" in u and u.endswith("/call")
 
+def _ensure_mode_raw(url: str) -> str:
+    """Append mode=RAW only once."""
+    if "mode=RAW" in url:
+        return url
+    return url + ("&" if "?" in url else "?") + "mode=RAW"
+
 def _jup_base() -> str:
     base = (os.getenv("JUP_BASE_URL") or "").strip()
     return (base or "https://quote-api.jup.ag").rstrip("/")
@@ -96,8 +102,7 @@ def _build_jup_endpoint(kind: str) -> str:
     """
     base = (os.getenv("JUP_BASE_URL") or "https://quote-api.jup.ag").rstrip("/")
     if "/functions/rest/" in base and base.endswith("/call"):
-        sep = "&" if "?" in base else "?"
-        return f"{base}{sep}mode=RAW&path=/v6/{kind}"
+        return _ensure_mode_raw(f"{base}?path=/v6/{kind}")
     return f"{base}/v6/{kind}"
 
 def _jup_headers() -> Dict[str, str]:
@@ -237,49 +242,90 @@ def _assert_pubkey(s: str, name: str) -> None:
         raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# QN Action 201 envelope → unwrap helper
+# QuickNode Action envelope unwrapping (robust)
 # ──────────────────────────────────────────────────────────────────────────────
+def _maybe_json_decode(x):
+    """Decode JSON if x is a JSON string, otherwise return as-is."""
+    if isinstance(x, (dict, list)):
+        return x
+    if isinstance(x, (bytes, bytearray)):
+        try:
+            return json.loads(x.decode("utf-8", "ignore"))
+        except Exception:
+            return x
+    if isinstance(x, str):
+        s = x.strip()
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            try:
+                return json.loads(s)
+            except Exception:
+                return x
+    return x
+
+def _looks_like_jupiter(js: dict) -> bool:
+    if not isinstance(js, dict):
+        return False
+    # Quote fields
+    if "outAmount" in js or "routePlan" in js or "otherAmountThreshold" in js:
+        return True
+    # Swap fields
+    if "swapTransaction" in js or ("data" in js and isinstance(js["data"], dict) and "swapTransaction" in js["data"]):
+        return True
+    return False
+
+def _unwrap_qn_action_envelope(js: dict | list | None) -> dict | list | None:
+    """Try to pull a Jupiter JSON object out of common QN Action envelopes."""
+    if not isinstance(js, dict):
+        return js
+    if _looks_like_jupiter(js):
+        return js
+
+    # Common nests
+    candidates = []
+
+    ud = js.get("user_data")
+    if isinstance(ud, dict):
+        candidates += [ud.get("raw"), ud.get("body")]
+        resp = ud.get("response")
+        if isinstance(resp, dict):
+            candidates.append(resp.get("body"))
+    elif isinstance(ud, (str, bytes, bytearray)):
+        candidates.append(ud)
+
+    ex = js.get("execution")
+    if isinstance(ex, dict):
+        res = ex.get("result") or ex.get("response")  # some schemas use 'response'
+        if isinstance(res, dict):
+            candidates += [res.get("json"), res.get("body")]
+
+    r0 = js.get("result")
+    if isinstance(r0, dict):
+        candidates += [r0.get("json"), r0.get("body")]
+
+    # Try each candidate
+    for cand in candidates:
+        cand = _maybe_json_decode(cand)
+        if isinstance(cand, dict) and _looks_like_jupiter(cand):
+            return cand
+
+    # Shallow scan for any JSON-looking string that is the Jupiter payload
+    for v in js.values():
+        v2 = _maybe_json_decode(v)
+        if isinstance(v2, dict) and _looks_like_jupiter(v2):
+            return v2
+
+    return js
+
 def _unwrap_qn_action(response: requests.Response, parsed: dict | list | None) -> dict | list | None:
     """
-    QuickNode Functions may reply HTTP 201 with an "Action" envelope:
-      { id, created_at, execution: { response: { status, body } }, user_data, ... }
-    This pulls the final Jupiter JSON out of the envelope so the rest of the
-    router code doesn't care whether it was 200 or 201.
+    If QuickNode returned an 'Action' envelope (commonly HTTP 201) unwrap it.
+    We also attempt unwrapping even on 200 in case the proxy wrapped it anyway.
     """
     try:
-        status = int(getattr(response, "status_code", 0) or 0)
+        parsed = _unwrap_qn_action_envelope(parsed)
     except Exception:
-        status = 0
-
-    if status != 201:
+        # Never let the unwrapping step crash the caller
         return parsed
-
-    body = parsed or {}
-    if not isinstance(body, dict):
-        return parsed
-
-    # 1) user_data may directly be the Jupiter JSON (object or JSON string)
-    ud = body.get("user_data")
-    if isinstance(ud, dict):
-        return ud
-    if isinstance(ud, str):
-        try:
-            return json.loads(ud)
-        except Exception:
-            pass
-
-    # 2) execution.response.body may contain a JSON string
-    try:
-        resp = body.get("execution", {}).get("response", {})
-        rb = resp.get("body")
-        if isinstance(rb, dict):
-            return rb
-        if isinstance(rb, str):
-            return json.loads(rb)
-    except Exception:
-        pass
-
-    # If we got here, leave it as-is (caller can still introspect)
     return parsed
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -294,20 +340,14 @@ async def _get_json(
 ) -> dict:
     def _req():
         r = requests.get(url, params=params, timeout=timeout, headers=headers or _UA)
-        # Don't raise yet; we want to unwrap possible 201 envelopes.
+        # Parse JSON first so we can unwrap potential 201 envelopes before raising.
         try:
             js = r.json()
         except Exception:
             r.raise_for_status()
             raise  # non-JSON
         js = _unwrap_qn_action(r, js)
-        # If still non-200/201, then raise
         if r.status_code not in (200, 201):
-            try:
-                # attach body to error for debugging
-                err_txt = json.dumps(js)[:300]
-            except Exception:
-                err_txt = str(js)[:300]
             r.raise_for_status()
         return js
     return await asyncio.to_thread(_req)
@@ -329,10 +369,6 @@ async def _post_json(
             raise
         js = _unwrap_qn_action(r, js)
         if r.status_code not in (200, 201):
-            try:
-                err_txt = json.dumps(js)[:300]
-            except Exception:
-                err_txt = str(js)[:300]
             r.raise_for_status()
         return js
     return await asyncio.to_thread(_req)
@@ -927,4 +963,6 @@ __all__ = [
     "mint_decimals", "get_decimals",
     # exposed RPC config for legacy callers
     "TX_RPC_URL", "TX_COMMITMENT",
+    # debug/low-level (kept for sanity scripts)
+    "JUP_QUOTE_URL", "JUP_IS_QN_CALL", "_jup_headers", "_get_json", "_post_json",
 ]
