@@ -238,170 +238,152 @@ def _assert_pubkey(s: str, name: str) -> None:
         raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# QN envelope → robust recursive unwrap (handles Action + status_code/result)
+# QN envelopes → ultra-robust unwrap + tiny debug when payload missing
 # ──────────────────────────────────────────────────────────────────────────────
-import json, base64
+import json, base64, re
 from typing import Any
 
-def _try_json_loads(s: str):
+def _jtry(s: str):
     try:
         return json.loads(s)
     except Exception:
         return None
 
-def _maybe_b64_to_text(s: str):
+def _b64txt(s: str):
     try:
         raw = base64.b64decode(s, validate=True)
         return raw.decode("utf-8", "replace")
     except Exception:
         return None
 
-_JUP_KEYS = {
-    "outAmount",           # quote
-    "routePlan",           # quote
-    "swapTransaction",     # swap
-    "otherAmountThreshold",
-    "priceImpactPct",
-    "expiration",
+# Jupiter “looks like” tests
+_JUP_POS_KEYS = {
+    "outAmount", "routePlan", "swapTransaction",
+    "otherAmountThreshold", "priceImpactPct", "expiration",
 }
 _JUP_ERR_KEYS = {"errorCode", "errorMessage", "error", "statusCode", "message"}
 
-def _looks_like_jup_dict(d: dict) -> bool:
-    if any(k in d for k in _JUP_KEYS):
-        return True
-    if any(k in d for k in _JUP_ERR_KEYS):
-        return True
-    sub = d.get("data") or d.get("result")  # some proxies wrap under these
-    return isinstance(sub, dict) and _looks_like_jup_dict(sub)
+def _looks_jup(d: dict) -> bool:
+    if any(k in d for k in _JUP_POS_KEYS): return True
+    if any(k in d for k in _JUP_ERR_KEYS): return True
+    sub = d.get("data") or d.get("result")
+    return isinstance(sub, dict) and _looks_jup(sub)
 
-def _extract_jupiter_payload(node: Any) -> Any:
-    """
-    DFS through dict/list; decode JSON strings and base64→JSON strings;
-    return first dict that matches a Jupiter response/error shape.
-    """
-    # Dict
-    if isinstance(node, dict):
-        if _looks_like_jup_dict(node):
-            return node
+# Extract JSON from common QN places
+def _from_result_container(obj: Any) -> Any:
+    if not isinstance(obj, dict): return None
+    res = obj.get("result")
+    if res is None: return None
 
-        # Common QN “result” runtime shape:
-        # { status_code, result: { body|text|data|... } }
-        if "status_code" in node and "result" in node:
-            res = node.get("result")
-            # If result is a string, try JSON/b64
-            if isinstance(res, str):
-                js = _try_json_loads(res)
-                if js is None:
-                    txt = _maybe_b64_to_text(res)
-                    if txt:
-                        js = _try_json_loads(txt)
-                if js is not None:
-                    got = _extract_jupiter_payload(js)
-                    if got is not None:
-                        return got
-            # If result is an object with a body/text/data
-            if isinstance(res, dict):
-                for key in ("body", "text", "data", "result"):
-                    if key in res:
-                        v = res[key]
-                        if isinstance(v, dict):
-                            got = _extract_jupiter_payload(v)
-                            if got is not None:
-                                return got
-                        if isinstance(v, str):
-                            js = _try_json_loads(v)
-                            if js is None:
-                                txt = _maybe_b64_to_text(v)
-                                if txt:
-                                    js = _try_json_loads(txt)
-                            if js is not None:
-                                got = _extract_jupiter_payload(js)
-                                if got is not None:
-                                    return got
-
-        # Classic Action envelope:
-        # { id, ..., user_data?, execution: { response: { body } } }
-        if "execution" in node:
-            resp = node.get("execution", {}).get("response", {})
-            body = resp.get("body")
-            if isinstance(body, dict):
-                got = _extract_jupiter_payload(body)
-                if got is not None:
-                    return got
-            if isinstance(body, str):
-                js = _try_json_loads(body)
-                if js is None:
-                    txt = _maybe_b64_to_text(body)
-                    if txt:
-                        js = _try_json_loads(txt)
-                if js is not None:
-                    got = _extract_jupiter_payload(js)
-                    if got is not None:
-                        return got
-
-        # user_data might already be the payload (object or JSON string)
-        ud = node.get("user_data")
-        if isinstance(ud, dict):
-            got = _extract_jupiter_payload(ud)
-            if got is not None:
-                return got
-        if isinstance(ud, str):
-            js = _try_json_loads(ud)
-            if js is None:
-                txt = _maybe_b64_to_text(ud)
-                if txt:
-                    js = _try_json_loads(txt)
-            if js is not None:
-                got = _extract_jupiter_payload(js)
-                if got is not None:
-                    return got
-
-        # Recurse into all values
-        for v in node.values():
-            got = _extract_jupiter_payload(v)
-            if got is not None:
-                return got
-        return None
-
-    # List
-    if isinstance(node, list):
-        for it in node:
-            got = _extract_jupiter_payload(it)
-            if got is not None:
-                return got
-        return None
-
-    # String → JSON or base64→JSON → recurse
-    if isinstance(node, str):
-        js = _try_json_loads(node)
-        if js is not None:
-            return _extract_jupiter_payload(js)
-        txt = _maybe_b64_to_text(node)
-        if txt:
-            js2 = _try_json_loads(txt)
-            if js2 is not None:
-                return _extract_jupiter_payload(js2)
-        return None
-
+    # direct dict with body/text/json/data/result
+    if isinstance(res, dict):
+        for k in ("json", "body", "text", "data", "result", "rawBody"):
+            if k in res:
+                v = res[k]
+                if isinstance(v, dict): return v
+                if isinstance(v, str):
+                    j = _jtry(v) or _jtry(_b64txt(v) or "")
+                    if j is not None: return j
+    # string → try json / base64→json
+    if isinstance(res, str):
+        j = _jtry(res) or _jtry(_b64txt(res) or "")
+        if j is not None: return j
     return None
 
-def _unwrap_qn_action(response: requests.Response, parsed: Any) -> Any:
-    """
-    If QN returns 201 Action or the status_code/result runtime wrapper,
-    crawl and return the inner Jupiter JSON. Otherwise return `parsed`.
-    """
-    try:
-        status = int(getattr(response, "status_code", 0) or 0)
-    except Exception:
-        status = 0
+def _from_action_envelope(obj: Any) -> Any:
+    if not isinstance(obj, dict): return None
+    # user_data
+    ud = obj.get("user_data")
+    if isinstance(ud, dict): return ud
+    if isinstance(ud, str):
+        j = _jtry(ud) or _jtry(_b64txt(ud) or "")
+        if j is not None: return j
+    # execution.response.body
+    resp = obj.get("execution", {}).get("response", {})
+    body = resp.get("body")
+    if isinstance(body, dict): return body
+    if isinstance(body, str):
+        j = _jtry(body) or _jtry(_b64txt(body) or "")
+        if j is not None: return j
+    return None
 
-    # Unwrap in both 201 Action and 200 runtime “status_code/result” shapes
-    if status not in (200, 201):
+# sometimes the real JSON is printed into logs
+_JSON_IN_LOGS = re.compile(r"\{.*\}")
+
+def _from_logs(obj: Any) -> Any:
+    if not isinstance(obj, dict): return None
+    logs = obj.get("logs")
+    if not isinstance(logs, (list, tuple)): return None
+    for line in logs:
+        if not isinstance(line, str): continue
+        m = _JSON_IN_LOGS.search(line)
+        if not m: continue
+        j = _jtry(m.group(0))
+        if isinstance(j, dict) and _looks_jup(j):
+            return j
+    return None
+
+def _dfs_extract(node: Any) -> Any:
+    # direct hit
+    if isinstance(node, dict) and _looks_jup(node):
+        return node
+
+    # known wrappers
+    got = _from_result_container(node) or _from_action_envelope(node) or _from_logs(node)
+    if isinstance(got, dict) and _looks_jup(got):
+        return got
+
+    # recurse dict
+    if isinstance(node, dict):
+        for v in node.values():
+            g = _dfs_extract(v)
+            if isinstance(g, dict) and _looks_jup(g): return g
+        return None
+
+    # recurse list
+    if isinstance(node, list):
+        for it in node:
+            g = _dfs_extract(it)
+            if isinstance(g, dict) and _looks_jup(g): return g
+        return None
+
+    # strings: JSON / base64→JSON
+    if isinstance(node, str):
+        j = _jtry(node) or _jtry(_b64txt(node) or "")
+        if j is not None: return _dfs_extract(j)
+    return None
+
+def _tiny_shape(o: Any) -> str:
+    if isinstance(o, dict): return "dict:" + ",".join(list(o.keys())[:6])
+    if isinstance(o, list): return f"list:{len(o)}"
+    return type(o).__name__
+
+def _unwrap_qn_action(response: requests.Response, parsed: Any) -> Any:
+    try:
+        st = int(getattr(response, "status_code", 0) or 0)
+    except Exception:
+        st = 0
+
+    # Only attempt on 200/201 responses
+    if st not in (200, 201):
         return parsed
 
     try:
-        candidate = _extract_jupiter_payload(parsed)
-        return candidate if candidate is not None else parsed
+        inner = _dfs_extract(parsed)
+        if isinstance(inner, dict) and _looks_jup(inner):
+            return inner
+        # one-time micro log so we can see the actual wrapper shape at runtime
+        try:
+            log.every("qn.unwrap.miss", n=30, msg="QN_UNWRAP_MISS",
+                      status=st,
+                      top=_tiny_shape(parsed),
+                      hint=("result" if isinstance(parsed, dict) and "result" in parsed else
+                            "execution" if isinstance(parsed, dict) and "execution" in parsed else
+                            "logs" if isinstance(parsed, dict) and "logs" in parsed else
+                            "no-hint"))
+        except Exception:
+            pass
+        return parsed
     except Exception:
         return parsed
 
