@@ -238,7 +238,7 @@ def _assert_pubkey(s: str, name: str) -> None:
         raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# QN Action 201 envelope → robust recursive unwrap (JSON/string/base64)
+# QN envelope → robust recursive unwrap (handles Action + status_code/result)
 # ──────────────────────────────────────────────────────────────────────────────
 import json, base64
 from typing import Any
@@ -257,40 +257,113 @@ def _maybe_b64_to_text(s: str):
         return None
 
 _JUP_KEYS = {
-    "outAmount",              # quote
-    "routePlan",              # quote
-    "swapTransaction",        # swap
-    "dynamicComputeUnits",    # sometimes present in swap/quote meta
-    "expiration",             # quote meta
+    "outAmount",           # quote
+    "routePlan",           # quote
+    "swapTransaction",     # swap
+    "otherAmountThreshold",
+    "priceImpactPct",
+    "expiration",
 }
-_JUP_ERR_KEYS = {"errorCode", "errorMessage", "error"}  # Jupiter-style errors
+_JUP_ERR_KEYS = {"errorCode", "errorMessage", "error", "statusCode", "message"}
 
 def _looks_like_jup_dict(d: dict) -> bool:
     if any(k in d for k in _JUP_KEYS):
         return True
     if any(k in d for k in _JUP_ERR_KEYS):
         return True
-    # Some proxies wrap under "data" or "result"
-    sub = d.get("data") or d.get("result")
+    sub = d.get("data") or d.get("result")  # some proxies wrap under these
     return isinstance(sub, dict) and _looks_like_jup_dict(sub)
 
 def _extract_jupiter_payload(node: Any) -> Any:
     """
-    DFS: return the first dict that matches Jupiter response/error shape.
-    Handles dict/list, JSON-encoded strings, and base64-encoded JSON blobs.
+    DFS through dict/list; decode JSON strings and base64→JSON strings;
+    return first dict that matches a Jupiter response/error shape.
     """
-    # Direct dict match
+    # Dict
     if isinstance(node, dict):
         if _looks_like_jup_dict(node):
             return node
-        # Recurse into values
+
+        # Common QN “result” runtime shape:
+        # { status_code, result: { body|text|data|... } }
+        if "status_code" in node and "result" in node:
+            res = node.get("result")
+            # If result is a string, try JSON/b64
+            if isinstance(res, str):
+                js = _try_json_loads(res)
+                if js is None:
+                    txt = _maybe_b64_to_text(res)
+                    if txt:
+                        js = _try_json_loads(txt)
+                if js is not None:
+                    got = _extract_jupiter_payload(js)
+                    if got is not None:
+                        return got
+            # If result is an object with a body/text/data
+            if isinstance(res, dict):
+                for key in ("body", "text", "data", "result"):
+                    if key in res:
+                        v = res[key]
+                        if isinstance(v, dict):
+                            got = _extract_jupiter_payload(v)
+                            if got is not None:
+                                return got
+                        if isinstance(v, str):
+                            js = _try_json_loads(v)
+                            if js is None:
+                                txt = _maybe_b64_to_text(v)
+                                if txt:
+                                    js = _try_json_loads(txt)
+                            if js is not None:
+                                got = _extract_jupiter_payload(js)
+                                if got is not None:
+                                    return got
+
+        # Classic Action envelope:
+        # { id, ..., user_data?, execution: { response: { body } } }
+        if "execution" in node:
+            resp = node.get("execution", {}).get("response", {})
+            body = resp.get("body")
+            if isinstance(body, dict):
+                got = _extract_jupiter_payload(body)
+                if got is not None:
+                    return got
+            if isinstance(body, str):
+                js = _try_json_loads(body)
+                if js is None:
+                    txt = _maybe_b64_to_text(body)
+                    if txt:
+                        js = _try_json_loads(txt)
+                if js is not None:
+                    got = _extract_jupiter_payload(js)
+                    if got is not None:
+                        return got
+
+        # user_data might already be the payload (object or JSON string)
+        ud = node.get("user_data")
+        if isinstance(ud, dict):
+            got = _extract_jupiter_payload(ud)
+            if got is not None:
+                return got
+        if isinstance(ud, str):
+            js = _try_json_loads(ud)
+            if js is None:
+                txt = _maybe_b64_to_text(ud)
+                if txt:
+                    js = _try_json_loads(txt)
+            if js is not None:
+                got = _extract_jupiter_payload(js)
+                if got is not None:
+                    return got
+
+        # Recurse into all values
         for v in node.values():
             got = _extract_jupiter_payload(v)
             if got is not None:
                 return got
         return None
 
-    # Lists: scan items
+    # List
     if isinstance(node, list):
         for it in node:
             got = _extract_jupiter_payload(it)
@@ -298,7 +371,7 @@ def _extract_jupiter_payload(node: Any) -> Any:
                 return got
         return None
 
-    # Strings: try JSON first, then base64→text→JSON
+    # String → JSON or base64→JSON → recurse
     if isinstance(node, str):
         js = _try_json_loads(node)
         if js is not None:
@@ -314,17 +387,18 @@ def _extract_jupiter_payload(node: Any) -> Any:
 
 def _unwrap_qn_action(response: requests.Response, parsed: Any) -> Any:
     """
-    If QuickNode returns HTTP 201 with an Action envelope, crawl the structure and
-    pull out the real Jupiter JSON (quote/swap/error). Otherwise return `parsed`.
+    If QN returns 201 Action or the status_code/result runtime wrapper,
+    crawl and return the inner Jupiter JSON. Otherwise return `parsed`.
     """
     try:
         status = int(getattr(response, "status_code", 0) or 0)
     except Exception:
         status = 0
-    if status != 201:
+
+    # Unwrap in both 201 Action and 200 runtime “status_code/result” shapes
+    if status not in (200, 201):
         return parsed
 
-    # Best-effort: search entire object for a Jupiter-looking payload
     try:
         candidate = _extract_jupiter_payload(parsed)
         return candidate if candidate is not None else parsed
