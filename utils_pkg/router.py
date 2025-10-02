@@ -88,11 +88,6 @@ JUP_BASE = _jup_base()
 JUP_IS_QN_CALL = _is_qn_call_url(JUP_BASE)
 
 def _build_jup_endpoint(kind: str) -> str:
-    """
-    If JUP_BASE_URL is a QuickNode Function REST endpoint that ends with /call,
-    we must send the target Jupiter path via ?mode=RAW&path=/v6/<kind>.
-    Otherwise, append /v6/<kind> normally.
-    """
     base = (os.getenv("JUP_BASE_URL") or "https://quote-api.jup.ag").rstrip("/")
     if "/functions/rest/" in base and base.endswith("/call"):
         sep = "&" if "?" in base else "?"
