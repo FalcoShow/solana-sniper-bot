@@ -88,6 +88,11 @@ JUP_BASE = _jup_base()
 JUP_IS_QN_CALL = _is_qn_call_url(JUP_BASE)
 
 def _build_jup_endpoint(kind: str) -> str:
+    """
+    If JUP_BASE_URL is a QuickNode Function REST endpoint that ends with /call,
+    we must send the target Jupiter path via ?mode=RAW&path=/v6/<kind>.
+    Otherwise, append /v6/<kind> normally.
+    """
     base = (os.getenv("JUP_BASE_URL") or "https://quote-api.jup.ag").rstrip("/")
     if "/functions/rest/" in base and base.endswith("/call"):
         sep = "&" if "?" in base else "?"
@@ -99,6 +104,7 @@ def _jup_headers() -> Dict[str, str]:
     Build headers for Jupiter/Proxy calls.
     - Always send UA + JSON accept.
     - If JUP_API_KEY (or QUICKNODE_FUNCTION_KEY) is present, send x-api-key.
+    - When targeting QuickNode /call, include x-quicknode-mode: RAW too.
     """
     h = {
         "user-agent": "pnlsniper/1.0 (+router)",
@@ -108,6 +114,9 @@ def _jup_headers() -> Dict[str, str]:
     key = (os.getenv("JUP_API_KEY") or os.getenv("QUICKNODE_FUNCTION_KEY") or "").strip()
     if key:
         h["x-api-key"] = key
+    if JUP_IS_QN_CALL:
+        # belt & suspenders: some accounts require the header even if mode=RAW is on the URL
+        h["x-quicknode-mode"] = "RAW"
     return h
 
 JUP_QUOTE_URL = _build_jup_endpoint("quote")
@@ -230,6 +239,33 @@ def _assert_pubkey(s: str, name: str) -> None:
         raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
+# QN Action envelope unwrapping
+# ──────────────────────────────────────────────────────────────────────────────
+def _maybe_unwrap_qn(js: dict) -> dict:
+    """
+    QuickNode Functions (REST) may return an Action envelope (HTTP 201), e.g.:
+      { id, created_at, ..., user_data: {...} }
+    or sometimes the payload is under execution.result.
+    This extracts the real Jupiter payload when present.
+    """
+    if not isinstance(js, dict):
+        return js
+
+    ud = js.get("user_data")
+    if isinstance(ud, dict):
+        # direct payload fields we expect
+        if any(k in ud for k in ("outAmount", "routePlan", "swapTransaction", "error", "message")):
+            return ud
+
+    ex = js.get("execution")
+    if isinstance(ex, dict):
+        res = ex.get("result")
+        if isinstance(res, dict) and any(k in res for k in ("outAmount", "routePlan", "swapTransaction", "error", "message")):
+            return res
+
+    return js
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Non-blocking HTTP (requests in worker threads)
 # ──────────────────────────────────────────────────────────────────────────────
 async def _get_json(
@@ -245,10 +281,11 @@ async def _get_json(
         ctype = (r.headers.get("content-type") or "").lower()
         if "application/json" not in ctype:
             try:
-                return r.json()
+                data = r.json()
             except Exception:
                 raise RuntimeError(f"Non-JSON response: {ctype} {r.text[:200]}")
-        return r.json()
+            return _maybe_unwrap_qn(data)
+        return _maybe_unwrap_qn(r.json())
     return await asyncio.to_thread(_req)
 
 async def _post_json(
@@ -265,10 +302,11 @@ async def _post_json(
         ctype = (r.headers.get("content-type") or "").lower()
         if "application/json" not in ctype:
             try:
-                return r.json()
+                data = r.json()
             except Exception:
                 raise RuntimeError(f"Non-JSON response: {ctype} {r.text[:200]}")
-        return r.json()
+            return _maybe_unwrap_qn(data)
+        return _maybe_unwrap_qn(r.json())
     return await asyncio.to_thread(_req)
 
 async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: str, **kwargs) -> Any:
@@ -591,7 +629,7 @@ async def _jup_quote(
             headers = _jup_headers()
 
             if JUP_IS_QN_CALL:
-                # QuickNode /call requires POST; query string carries params.
+                # QuickNode /call wants POST, with Jupiter params in the query string.
                 js = await _post_json(JUP_QUOTE_URL, json_body=None, params=params, timeout=HTTP_TIMEOUT_POST, headers=headers)
             else:
                 js = await _get_json(JUP_QUOTE_URL, params=params, timeout=HTTP_TIMEOUT_GET, headers=headers)
