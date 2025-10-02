@@ -238,9 +238,10 @@ def _assert_pubkey(s: str, name: str) -> None:
         raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# QN Action 201 envelope → unwrap helper (covers JSON, JSON-string, base64)
+# QN Action 201 envelope → robust recursive unwrap (JSON/string/base64)
 # ──────────────────────────────────────────────────────────────────────────────
 import json, base64
+from typing import Any
 
 def _try_json_loads(s: str):
     try:
@@ -255,10 +256,66 @@ def _maybe_b64_to_text(s: str):
     except Exception:
         return None
 
-def _unwrap_qn_action(response: requests.Response, parsed):
+_JUP_KEYS = {
+    "outAmount",              # quote
+    "routePlan",              # quote
+    "swapTransaction",        # swap
+    "dynamicComputeUnits",    # sometimes present in swap/quote meta
+    "expiration",             # quote meta
+}
+_JUP_ERR_KEYS = {"errorCode", "errorMessage", "error"}  # Jupiter-style errors
+
+def _looks_like_jup_dict(d: dict) -> bool:
+    if any(k in d for k in _JUP_KEYS):
+        return True
+    if any(k in d for k in _JUP_ERR_KEYS):
+        return True
+    # Some proxies wrap under "data" or "result"
+    sub = d.get("data") or d.get("result")
+    return isinstance(sub, dict) and _looks_like_jup_dict(sub)
+
+def _extract_jupiter_payload(node: Any) -> Any:
     """
-    If QuickNode returns HTTP 201 with an Action envelope, pull the *real* Jupiter
-    JSON out of user_data or execution.response.* fields. Otherwise return parsed.
+    DFS: return the first dict that matches Jupiter response/error shape.
+    Handles dict/list, JSON-encoded strings, and base64-encoded JSON blobs.
+    """
+    # Direct dict match
+    if isinstance(node, dict):
+        if _looks_like_jup_dict(node):
+            return node
+        # Recurse into values
+        for v in node.values():
+            got = _extract_jupiter_payload(v)
+            if got is not None:
+                return got
+        return None
+
+    # Lists: scan items
+    if isinstance(node, list):
+        for it in node:
+            got = _extract_jupiter_payload(it)
+            if got is not None:
+                return got
+        return None
+
+    # Strings: try JSON first, then base64→text→JSON
+    if isinstance(node, str):
+        js = _try_json_loads(node)
+        if js is not None:
+            return _extract_jupiter_payload(js)
+        txt = _maybe_b64_to_text(node)
+        if txt:
+            js2 = _try_json_loads(txt)
+            if js2 is not None:
+                return _extract_jupiter_payload(js2)
+        return None
+
+    return None
+
+def _unwrap_qn_action(response: requests.Response, parsed: Any) -> Any:
+    """
+    If QuickNode returns HTTP 201 with an Action envelope, crawl the structure and
+    pull out the real Jupiter JSON (quote/swap/error). Otherwise return `parsed`.
     """
     try:
         status = int(getattr(response, "status_code", 0) or 0)
@@ -267,61 +324,12 @@ def _unwrap_qn_action(response: requests.Response, parsed):
     if status != 201:
         return parsed
 
-    body = parsed
-    if not isinstance(body, dict):
-        return parsed
-
-    # 1) user_data (object or JSON-string or base64)
-    ud = body.get("user_data")
-    if isinstance(ud, dict):
-        return ud
-    if isinstance(ud, str):
-        js = _try_json_loads(ud)
-        if isinstance(js, (dict, list)):
-            return js
-        txt = _maybe_b64_to_text(ud)
-        if txt:
-            js = _try_json_loads(txt)
-            if isinstance(js, (dict, list)):
-                return js
-
-    # 2) execution.response.{body,rawBody,bodyText,body_base64,bodyBase64}
-    resp = {}
+    # Best-effort: search entire object for a Jupiter-looking payload
     try:
-        resp = body.get("execution", {}).get("response", {}) or {}
+        candidate = _extract_jupiter_payload(parsed)
+        return candidate if candidate is not None else parsed
     except Exception:
-        resp = {}
-
-    # direct dict
-    b = resp.get("body")
-    if isinstance(b, dict):
-        return b
-
-    # body as JSON string
-    if isinstance(b, str):
-        js = _try_json_loads(b)
-        if isinstance(js, (dict, list)):
-            return js
-
-    # other common fields with base64 payloads
-    for fld in ("rawBody", "body_base64", "bodyBase64"):
-        v = resp.get(fld)
-        if isinstance(v, str):
-            txt = _maybe_b64_to_text(v)
-            if txt:
-                js = _try_json_loads(txt)
-                if isinstance(js, (dict, list)):
-                    return js
-
-    # bodyText: already decoded text
-    bt = resp.get("bodyText")
-    if isinstance(bt, str):
-        js = _try_json_loads(bt)
-        if isinstance(js, (dict, list)):
-            return js
-
-    # No luck; return original parsed envelope (caller can inspect)
-    return parsed
+        return parsed
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Non-blocking HTTP (requests in worker threads)
