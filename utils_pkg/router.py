@@ -81,12 +81,6 @@ def _is_qn_call_url(u: str) -> bool:
     u = (u or "").rstrip("/")
     return "/functions/" in u and u.endswith("/call")
 
-def _ensure_mode_raw(url: str) -> str:
-    """Append mode=RAW only once."""
-    if "mode=RAW" in url:
-        return url
-    return url + ("&" if "?" in url else "?") + "mode=RAW"
-
 def _jup_base() -> str:
     base = (os.getenv("JUP_BASE_URL") or "").strip()
     return (base or "https://quote-api.jup.ag").rstrip("/")
@@ -102,7 +96,9 @@ def _build_jup_endpoint(kind: str) -> str:
     """
     base = (os.getenv("JUP_BASE_URL") or "https://quote-api.jup.ag").rstrip("/")
     if "/functions/rest/" in base and base.endswith("/call"):
-        return _ensure_mode_raw(f"{base}?path=/v6/{kind}")
+        sep = "&" if "?" in base else "?"
+        # order of path & mode does not matter, keep deterministic
+        return f"{base}{sep}path=/v6/{kind}&mode=RAW"
     return f"{base}/v6/{kind}"
 
 def _jup_headers() -> Dict[str, str]:
@@ -118,7 +114,7 @@ def _jup_headers() -> Dict[str, str]:
     key = (os.getenv("JUP_API_KEY") or os.getenv("QUICKNODE_FUNCTION_KEY") or "").strip()
     if key:
         h["x-api-key"] = key
-    # Extra opt-in header for QN — harmless elsewhere
+    # harmless elsewhere; helps QN interpret RAW mode
     h.setdefault("x-quicknode-mode", "RAW")
     return h
 
@@ -242,90 +238,77 @@ def _assert_pubkey(s: str, name: str) -> None:
         raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# QuickNode Action envelope unwrapping (robust)
+# QN Action envelope → unwrap helper (robust)
 # ──────────────────────────────────────────────────────────────────────────────
-def _maybe_json_decode(x):
-    """Decode JSON if x is a JSON string, otherwise return as-is."""
-    if isinstance(x, (dict, list)):
-        return x
-    if isinstance(x, (bytes, bytearray)):
+def _maybe_parse_json_str(x: Any) -> Any:
+    if isinstance(x, str):
         try:
-            return json.loads(x.decode("utf-8", "ignore"))
+            return json.loads(x)
         except Exception:
             return x
-    if isinstance(x, str):
-        s = x.strip()
-        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
-            try:
-                return json.loads(s)
-            except Exception:
-                return x
     return x
 
-def _looks_like_jupiter(js: dict) -> bool:
+def _looks_like_jupiter(js: Any) -> bool:
     if not isinstance(js, dict):
         return False
-    # Quote fields
-    if "outAmount" in js or "routePlan" in js or "otherAmountThreshold" in js:
+    if "outAmount" in js or "routePlan" in js or "swapTransaction" in js:
         return True
-    # Swap fields
-    if "swapTransaction" in js or ("data" in js and isinstance(js["data"], dict) and "swapTransaction" in js["data"]):
-        return True
+    # Jupiter sometimes returns arrays for things; keep simple signal
     return False
 
-def _unwrap_qn_action_envelope(js: dict | list | None) -> dict | list | None:
-    """Try to pull a Jupiter JSON object out of common QN Action envelopes."""
-    if not isinstance(js, dict):
-        return js
-    if _looks_like_jupiter(js):
-        return js
+def _unwrap_qn_action(response: requests.Response, parsed: Any) -> Any:
+    """
+    QuickNode Functions can return an "Action envelope" (201 or even 200) like:
+      { id, created_at, execution: { response: { status, body } }, user_data, ... }
+    This extracts the final Jupiter JSON so the rest of the router is agnostic.
+    """
+    # Already Jupiter-ish? return as-is
+    if _looks_like_jupiter(parsed):
+        return parsed
 
-    # Common nests
-    candidates = []
+    body = parsed
+    if not isinstance(body, dict):
+        return parsed
 
-    ud = js.get("user_data")
-    if isinstance(ud, dict):
-        candidates += [ud.get("raw"), ud.get("body")]
-        resp = ud.get("response")
+    # 1) user_data may directly be the Jupiter JSON (object or JSON string)
+    ud = body.get("user_data")
+    ud = _maybe_parse_json_str(ud)
+    if _looks_like_jupiter(ud):
+        return ud
+
+    # 2) execution.response.body / rawBody may contain JSON or JSON string
+    exec_obj = body.get("execution")
+    if isinstance(exec_obj, dict):
+        resp = exec_obj.get("response")
         if isinstance(resp, dict):
-            candidates.append(resp.get("body"))
-    elif isinstance(ud, (str, bytes, bytearray)):
-        candidates.append(ud)
+            rb = _maybe_parse_json_str(resp.get("body"))
+            if _looks_like_jupiter(rb):
+                return rb
+            rb2 = _maybe_parse_json_str(resp.get("rawBody"))
+            if _looks_like_jupiter(rb2):
+                return rb2
 
-    ex = js.get("execution")
-    if isinstance(ex, dict):
-        res = ex.get("result") or ex.get("response")  # some schemas use 'response'
-        if isinstance(res, dict):
-            candidates += [res.get("json"), res.get("body")]
+        # Some templates put the final object under "result"
+        result = _maybe_parse_json_str(exec_obj.get("result"))
+        if _looks_like_jupiter(result):
+            return result
 
-    r0 = js.get("result")
-    if isinstance(r0, dict):
-        candidates += [r0.get("json"), r0.get("body")]
-
-    # Try each candidate
-    for cand in candidates:
-        cand = _maybe_json_decode(cand)
-        if isinstance(cand, dict) and _looks_like_jupiter(cand):
+    # 3) Occasionally, envelope embeds under "data" or "payload"
+    for k in ("data", "payload"):
+        cand = _maybe_parse_json_str(body.get(k))
+        if _looks_like_jupiter(cand):
             return cand
 
-    # Shallow scan for any JSON-looking string that is the Jupiter payload
-    for v in js.values():
-        v2 = _maybe_json_decode(v)
-        if isinstance(v2, dict) and _looks_like_jupiter(v2):
-            return v2
-
-    return js
-
-def _unwrap_qn_action(response: requests.Response, parsed: dict | list | None) -> dict | list | None:
-    """
-    If QuickNode returned an 'Action' envelope (commonly HTTP 201) unwrap it.
-    We also attempt unwrapping even on 200 in case the proxy wrapped it anyway.
-    """
+    # 4) If nothing matched but we do have status 201 and a string body,
+    #    try a last-chance parse if it looks like a JSON string
     try:
-        parsed = _unwrap_qn_action_envelope(parsed)
+        status = int(getattr(response, "status_code", 0) or 0)
     except Exception:
-        # Never let the unwrapping step crash the caller
+        status = 0
+    if status == 201:
+        # already handled common places above; nothing more to do
         return parsed
+
     return parsed
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -340,13 +323,15 @@ async def _get_json(
 ) -> dict:
     def _req():
         r = requests.get(url, params=params, timeout=timeout, headers=headers or _UA)
-        # Parse JSON first so we can unwrap potential 201 envelopes before raising.
+        # Parse first; then unwrap any QN envelope regardless of status code.
         try:
             js = r.json()
         except Exception:
+            # If it's not JSON at all, now we can raise.
             r.raise_for_status()
-            raise  # non-JSON
+            raise
         js = _unwrap_qn_action(r, js)
+        # Only now enforce HTTP errors.
         if r.status_code not in (200, 201):
             r.raise_for_status()
         return js
@@ -963,6 +948,4 @@ __all__ = [
     "mint_decimals", "get_decimals",
     # exposed RPC config for legacy callers
     "TX_RPC_URL", "TX_COMMITMENT",
-    # debug/low-level (kept for sanity scripts)
-    "JUP_QUOTE_URL", "JUP_IS_QN_CALL", "_jup_headers", "_get_json", "_post_json",
 ]
