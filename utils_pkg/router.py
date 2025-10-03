@@ -104,18 +104,37 @@ def _build_jup_endpoint(kind: str) -> str:
 def _jup_headers() -> Dict[str, str]:
     """
     Build headers for Jupiter/Proxy calls.
-    Always send UA + JSON accept. Add x-api-key if provided (QuickNode Function).
+
+    Always:
+      - Send browser-ish UA + JSON accept
+      - If QUICKNODE_FUNCTION_KEY or JUP_API_KEY are present, attach x-api-key
+      - If JUP_PRO_KEY is present, attach x-jup-auth: Bearer <key>  (PRO MODE)
+
+    NOTE: We never hardcode auth into the Worker. The bot sends it; the Worker just forwards.
     """
-    h = {
+    h: Dict[str, str] = {
         "user-agent": "pnlsniper/1.0 (+router)",
         "accept": "application/json",
         "content-type": "application/json",
+        # These two help some edges/CDNs; harmless elsewhere
+        "origin": "https://jup.ag",
+        "referer": "https://jup.ag/",
     }
-    key = (os.getenv("JUP_API_KEY") or os.getenv("QUICKNODE_FUNCTION_KEY") or "").strip()
-    if key:
-        h["x-api-key"] = key
-    # harmless elsewhere; helps QN interpret RAW mode
-    h.setdefault("x-quicknode-mode", "RAW")
+
+    # QuickNode function / optional upstream API keys
+    x_api = (os.getenv("JUP_API_KEY") or os.getenv("QUICKNODE_FUNCTION_KEY") or "").strip()
+    if x_api:
+        h["x-api-key"] = x_api
+        # helps QN interpret pass-through RAW mode (harmless elsewhere)
+        h.setdefault("x-quicknode-mode", "RAW")
+
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # Jupiter PRO auth (from Render env). This is the important bit:
+    pro_key = (os.getenv("JUP_PRO_KEY") or "").strip()
+    if pro_key:
+        h["x-jup-auth"] = f"Bearer {pro_key}"
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
     return h
 
 JUP_QUOTE_URL = _build_jup_endpoint("quote")
@@ -398,7 +417,10 @@ async def _get_json(
     headers: Optional[Dict[str, str]] = None,
 ) -> dict:
     def _req():
-        r = requests.get(url, params=params, timeout=timeout, headers=headers or _UA)
+        # Merge order: base UA → Jupiter headers (includes PRO) → caller overrides
+        merged_headers: Dict[str, str] = {**_UA, **_jup_headers(), **(headers or {})}
+        r = requests.get(url, params=params, timeout=timeout, headers=merged_headers)
+
         # Parse first; then unwrap any QN envelope regardless of status code.
         try:
             js = r.json()
@@ -407,10 +429,17 @@ async def _get_json(
             r.raise_for_status()
             raise
         js = _unwrap_qn_action(r, js)
+
         # Only now enforce HTTP errors.
         if r.status_code not in (200, 201):
+            # Helpful one-time log on auth failures
+            if r.status_code == 401:
+                log.every("jup.pro.401", n=10, msg="JUP_PRO_401",
+                          url=url, has_pro=bool(os.getenv("JUP_PRO_KEY")))
             r.raise_for_status()
+
         return js
+
     return await asyncio.to_thread(_req)
 
 async def _post_json(
@@ -422,16 +451,24 @@ async def _post_json(
     headers: Optional[Dict[str, str]] = None,
 ) -> dict:
     def _req():
-        r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=headers or _UA)
+        merged_headers: Dict[str, str] = {**_UA, **_jup_headers(), **(headers or {})}
+        r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=merged_headers)
+
         try:
             js = r.json()
         except Exception:
             r.raise_for_status()
             raise
         js = _unwrap_qn_action(r, js)
+
         if r.status_code not in (200, 201):
+            if r.status_code == 401:
+                log.every("jup.pro.401", n=10, msg="JUP_PRO_401",
+                          url=url, has_pro=bool(os.getenv("JUP_PRO_KEY")))
             r.raise_for_status()
+
         return js
+
     return await asyncio.to_thread(_req)
 
 async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: str, **kwargs) -> Any:
