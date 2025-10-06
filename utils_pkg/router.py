@@ -943,50 +943,59 @@ async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optiona
     return tx_b64
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public quote & price helpers (robust, API-compatible)
+# Public quote & price helpers (hardened tiny-amount handling)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _clamp_slippage_bps(v: Optional[int]) -> int:
-    """Clamp/resolve slippage to a sane default using env -> _slippage_bps()."""
-    try:
-        if v is None:
-            return int(_slippage_bps())
-        v = int(v)
-        # hard guardrails: [1 bps, 5000 bps]
-        return max(1, min(5000, v))
-    except Exception:
-        return int(_slippage_bps())
-
-async def get_sell_quote(
-    *,
-    mint: str,
-    amount_raw: int,
-    slippage_bps: Optional[int] = None,
-    only_direct_routes: bool = False,
-    swap_mode: str = "ExactIn",
-) -> Dict[str, Any]:
+def _min_probe_raw(dec: int) -> int:
     """
-    Quote selling <amount_raw> of token 'mint' into SOL.
-
-    Returns Jupiter's quote JSON plus convenience fields:
-      - lamports_out: int
-      - out_amount_sol: float
+    Use a safe tiny ExactIn size that DEXes accept.
+    For 6-decimal tokens (USDC), 0.01 UI = 10^(6-2) = 10_000.
     """
-    if amount_raw is None or int(amount_raw) <= 0:
+    if dec is None or dec < 0:
+        return 1
+    return max(1, 10 ** max(0, dec - 2))
+
+async def _safe_price_probe(norm_mint: str, dec: int) -> Optional[tuple[dict, int]]:
+    """
+    Try up to 3 sizes to avoid 400s on dust amounts:
+      - 0.01 UI
+      - 0.10 UI
+      - 1.00 UI
+    Returns (quote_json, raw_in) or None.
+    """
+    candidates = [
+        _min_probe_raw(dec),                      # ~0.01 UI
+        max(1, 10 ** max(0, dec - 1)),           # ~0.10 UI
+        max(1, 10 ** max(0, dec)),               # 1.00 UI
+    ]
+    last_err = None
+    for raw_in in candidates:
+        try:
+            q = await _retry(
+                _jup_quote, norm_mint, SOL_MINT, raw_in,
+                tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-price",
+            )
+            return q, raw_in
+        except Exception as e:
+            last_err = e
+            # keep trying larger sizes
+            continue
+    # all failed
+    if last_err:
+        log.every("price.probe.err", n=20, msg="PRICE_PROBE_FAIL", mint=norm_mint, err=str(last_err))
+    return None
+
+async def get_sell_quote(*, mint: str, amount_raw: int, slippage_bps: Optional[int] = None) -> Dict[str, Any]:
+    if amount_raw <= 0:
         raise ValueError("amount_raw must be > 0")
 
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
 
-    if mint == SOL_MINT:
-        raise ValueError("Refusing to 'sell' SOL into SOL (input == output).")
-
-    sbps = _clamp_slippage_bps(slippage_bps)
-
     quote = await _retry(
-        _jup_quote, mint, SOL_MINT, int(amount_raw),
+        _jup_quote, mint, SOL_MINT, amount_raw,
         tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-sell",
-        slippage_bps=sbps, swap_mode=swap_mode, only_direct=bool(only_direct_routes),
+        slippage_bps=slippage_bps,
     )
     lamports_out = int(quote.get("outAmount", "0") or 0)
     return {
@@ -1001,54 +1010,97 @@ async def get_buy_quote(
     lamports_in: Optional[int] = None,
     amount_sol: Optional[float] = None,
     slippage_bps: Optional[int] = None,
-    only_direct_routes: bool = False,
-    swap_mode: str = "ExactIn",
 ) -> Dict[str, Any]:
-    """
-    Quote buying 'mint' with SOL (exact-in in lamports or SOL amount).
-    If neither 'lamports_in' nor 'amount_sol' provided, will read PF_TRADE_SOL.
-
-    Returns Jupiter's quote JSON plus:
-      - lamports_in: int
-      - out_amount_raw: int
-      - out_amount_ui: float
-      - decimals: Optional[int]
-    """
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
 
     if lamports_in is None and amount_sol is None:
-        if os.getenv("PF_TRADE_SOL"):
+        pf = os.getenv("PF_TRADE_SOL")
+        if pf:
             amount_sol = _envf("PF_TRADE_SOL", 0.0)
         else:
-            raise ValueError("Provide lamports_in or amount_sol (or set PF_TRADE_SOL).")
+            raise ValueError("Provide lamports_in or amount_sol")
 
     if lamports_in is None:
-        lamports_in = int(max(0.0, float(amount_sol or 0.0)) * LAMPORTS_PER_SOL)
-
-    if lamports_in <= 0:
-        raise ValueError("lamports_in must be > 0")
-
-    if mint == SOL_MINT:
-        raise ValueError("Refusing to 'buy' SOL with SOL (input == output).")
-
-    sbps = _clamp_slippage_bps(slippage_bps)
+        lamports_in = int((amount_sol or 0.0) * LAMPORTS_PER_SOL)
 
     q = await _retry(
-        _jup_quote, SOL_MINT, mint, int(lamports_in),
+        _jup_quote, SOL_MINT, mint, lamports_in,
         tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-buy",
-        slippage_bps=sbps, swap_mode=swap_mode, only_direct=bool(only_direct_routes),
+        slippage_bps=slippage_bps,
     )
     out_raw = int(q.get("outAmount", "0") or 0)
     dec = await _get_decimals(mint)
     ui = out_raw / (10 ** dec) if (dec is not None and dec >= 0) else 0.0
-    return {
-        **q,
-        "lamports_in": int(lamports_in),
-        "out_amount_raw": out_raw,
-        "out_amount_ui": ui,
-        "decimals": dec,
-    }
+    return {**q, "lamports_in": lamports_in, "out_amount_raw": out_raw, "out_amount_ui": ui, "decimals": dec}
+
+async def get_price_ui(mint: str) -> float:
+    """
+    Return the SOL price per 1 token (UI units).
+    Accepts Pump/BONK ids or real mints. Never raises; returns 0.0 on failure.
+    """
+    raw = (mint or "").strip()
+    if not raw:
+        return 0.0
+    if _bl_get(raw):
+        return 0.0
+
+    # Normalize to a real mint (quietly blacklist bad ids)
+    try:
+        norm = _sanitize_mint(raw)
+    except Exception:
+        _bl_set(raw)
+        log.every("price.bad", n=20, msg="PRICE_BAD_ID", raw=raw)
+        return 0.0
+
+    # Decimals (with RPC + token-list fallback)
+    dec = await _get_decimals(norm)
+    if dec is None or dec < 0 or dec > 18:
+        _bl_set(raw)
+        log.every("price.nodec", n=20, msg="PRICE_NO_DECIMALS", raw=raw, norm=norm)
+        return 0.0
+
+    # Serve from cache if fresh
+    if PRICE_TTL_SEC > 0:
+        rec = _PRICE_CACHE.get(norm)
+        if rec and rec[0] >= time.time():
+            return float(rec[1])
+
+    # Robust tiny-amount probe with auto-escalation
+    try:
+        probe = await _safe_price_probe(norm, dec)
+        if not probe:
+            _bl_set(raw)
+            return 0.0
+        q, raw_in = probe
+        lamports = int(q.get("outAmount", "0") or 0)
+        if lamports <= 0:
+            _bl_set(raw)
+            return 0.0
+
+        sol_out = lamports / LAMPORTS_PER_SOL
+        tokens_ui = raw_in / (10 ** dec)
+        px = sol_out / tokens_ui if tokens_ui > 0 else 0.0
+
+        if PRICE_TTL_SEC > 0:
+            _PRICE_CACHE[norm] = (time.time() + PRICE_TTL_SEC, px)
+        return px
+    except Exception:
+        _bl_set(raw)
+        return 0.0
+
+# Compat aliases
+async def price_of_ui(mint: str) -> float:
+    return await get_price_ui(mint)
+
+async def price_of(mint: str) -> float:
+    return await get_price_ui(mint)
+
+# Minimal public helper (used by main.py to log decimals cleanly)
+async def mint_decimals(mint: str) -> Optional[int]:
+    mint = _sanitize_mint(mint)
+    _assert_pubkey(mint, "mint")
+    return await _get_decimals(mint)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Price helper: adaptive tiny-quote ladder (token → SOL)
