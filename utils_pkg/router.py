@@ -509,21 +509,50 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
 # ──────────────────────────────────────────────────────────────────────────────
 # Simple RPC helpers (for decimals & sig status)
 # ──────────────────────────────────────────────────────────────────────────────
-_DECIMALS: Dict[str, int] = {}
+
+# Cached decimals and token metadata
+_DECIMALS: Dict[str, int] = {}           # mint -> decimals
+_TOK_META: Dict[str, Dict[str, Any]] = _TOK_META if "_TOK_META" in globals() else {}  # keep any prior state
+
+# Known-good overrides (avoid ever being wrong for the basics)
+_KNOWN_DECIMALS: Dict[str, int] = {
+    SOL_MINT: 9,  # SOL (wSOL mint)
+    # USDC classic
+    "EPjFWdd5AufqSSqeMzQ1NzxypaC8G4weEGKzwyTDt1v": 6,
+    # USDC (CCTP)
+    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": 6,
+    # USDT
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": 6,
+}
 
 def _rpc_post(method: str, params: list) -> dict:
+    """
+    Minimal JSON-RPC POST with budget hooks and strict HTTP handling.
+    Returns parsed JSON (dict). Raises for non-2xx.
+    """
     if not TX_RPC_URL:
         return {}
+
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+
     if not budget.before_rpc(method):
         return {}
-    r = requests.post(TX_RPC_URL, json=payload, timeout=RPC_TIMEOUT_SEC, headers=_UA)
-    budget.after_rpc(method)
-    r.raise_for_status()
-    return r.json()
+
+    try:
+        r = requests.post(TX_RPC_URL, json=payload, timeout=RPC_TIMEOUT_SEC, headers=_UA)
+        r.raise_for_status()
+        return r.json()
+    finally:
+        try:
+            budget.after_rpc(method)
+        except Exception:
+            pass
 
 def _mint_decimals_from_data(b: bytes) -> Optional[int]:
-    # SPL Mint layout: decimals at byte offset 44
+    """
+    SPL Mint layout (Token-2022 and Token-2020 compatible for decimals):
+    - decimals is at byte offset 44 (u8)
+    """
     try:
         if len(b) >= 45:
             return int(b[44])
@@ -531,12 +560,68 @@ def _mint_decimals_from_data(b: bytes) -> Optional[int]:
         pass
     return None
 
+async def _decimals_from_tokens_api(mint: str) -> Optional[int]:
+    """
+    Fallback: pull decimals from Jupiter's token list once and cache it.
+    Uses the same base + headers as our quote/swap calls, and the Worker
+    rewrites /v6/tokens -> /swap/v1/tokens.
+    """
+    # If already indexed, read from cache
+    if _TOK_META:
+        meta = _TOK_META.get(mint)
+        if not meta:
+            return None
+        try:
+            d = int(meta.get("decimals"))
+            return d if 0 <= d <= 18 else None
+        except Exception:
+            return None
+
+    # Fetch & index once
+    try:
+        js = await _get_json(_build_jup_endpoint("tokens"), headers=_jup_headers(), timeout=HTTP_TIMEOUT_GET)
+        if isinstance(js, list):
+            for t in js:
+                try:
+                    maddr = (t.get("address") or "").strip()
+                    if maddr:
+                        _TOK_META[maddr] = t
+                except Exception:
+                    continue
+    except Exception:
+        return None
+
+    meta = _TOK_META.get(mint)
+    if not meta:
+        return None
+    try:
+        d = int(meta.get("decimals"))
+        return d if 0 <= d <= 18 else None
+    except Exception:
+        return None
+
 async def _get_decimals(mint: str) -> Optional[int]:
+    """
+    Return SPL token decimals for a mint, with:
+      1) Known-override table (SOL/USDC/USDT)
+      2) Local cache
+      3) RPC getAccountInfo (read decimals @ offset 44)
+      4) Jupiter tokens fallback (one-shot index)
+    Caches valid results.
+    """
+    # 1) Known overrides
+    k = _KNOWN_DECIMALS.get(mint)
+    if k is not None:
+        _DECIMALS[mint] = k
+        return k
+
+    # 2) Cache
     d = _DECIMALS.get(mint)
     if d is not None:
         return d
 
-    def _call() -> Optional[int]:
+    # 3) RPC probe in a thread
+    def _rpc_probe() -> Optional[int]:
         try:
             js = _rpc_post("getAccountInfo", [mint, {"encoding": "base64"}])
             val = js.get("result", {}).get("value", {})
@@ -551,19 +636,36 @@ async def _get_decimals(mint: str) -> Optional[int]:
             return None
         return None
 
-    dec = await asyncio.to_thread(_call)
-    if dec is not None:
-        _DECIMALS[mint] = int(dec)
-    return dec
+    dec = await asyncio.to_thread(_rpc_probe)
 
-# public exports (used by main.py)
+    # Validate; if odd or missing -> 4) Jupiter tokens fallback
+    if dec is None or dec < 0 or dec > 18:
+        try:
+            dec = await _decimals_from_tokens_api(mint)
+            if dec is not None:
+                log.every("dec.fallback", n=20, msg="DEC_FALLBACK_TOKENS", mint=mint, decimals=dec)
+        except Exception:
+            dec = None
+
+    # Cache only sane values
+    if dec is not None and 0 <= dec <= 18:
+        _DECIMALS[mint] = int(dec)
+        return int(dec)
+
+    # Give the caller a chance to handle “unknown”
+    return None
+
+# Public export (used by main.py and others)
 async def get_decimals(mint: str) -> Optional[int]:
-    """Return SPL token decimals for a mint (cached)."""
+    """Return SPL token decimals for a mint (cached, with fallbacks)."""
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
     return await _get_decimals(mint)
 
 async def _get_signature_status(sig: str) -> Optional[dict]:
+    """
+    Lightweight signature status lookup (no history scan).
+    """
     def _call() -> Optional[dict]:
         try:
             js = _rpc_post("getSignatureStatuses", [[sig], {"searchTransactionHistory": False}])
@@ -573,6 +675,7 @@ async def _get_signature_status(sig: str) -> Optional[dict]:
         except Exception:
             pass
         return None
+
     return await asyncio.to_thread(_call)
 
 # ──────────────────────────────────────────────────────────────────────────────
