@@ -29,6 +29,20 @@ if not hasattr(log, "every"):
         return log.event(msg or _key, **kw)
     setattr(log, "every", _every)  # type: ignore[attr-defined]
 
+ALLOWED_MINTS = {
+    # Always allowed
+    "So11111111111111111111111111111111111111112",  # SOL
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # USDC (CCTP)
+}
+
+def _assert_allowed(m: str):
+    if m not in ALLOWED_MINTS:
+        # permit other valid 32-byte tokens that your strategy trades,
+        # but block the classic USDC explicitly
+        if m == "EPjFWdd5AufqSSqeMzQ1NzxypaC8G4weEGKzwyTDt1v":
+            raise ValueError("USDC classic is not tradable on swap/v1; use USDC CCTP (DezX...)")
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Chain / RPC config (with safe fallbacks)
 # ──────────────────────────────────────────────────────────────────────────────
