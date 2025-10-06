@@ -840,21 +840,52 @@ async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optiona
     return tx_b64
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public quote & price helpers
+# Public quote & price helpers (robust, API-compatible)
 # ──────────────────────────────────────────────────────────────────────────────
-async def get_sell_quote(*, mint: str, amount_raw: int, slippage_bps: Optional[int] = None) -> Dict[str, Any]:
-    if amount_raw <= 0:
+
+def _clamp_slippage_bps(v: Optional[int]) -> int:
+    """Clamp/resolve slippage to a sane default using env -> _slippage_bps()."""
+    try:
+        if v is None:
+            return int(_slippage_bps())
+        v = int(v)
+        # hard guardrails: [1 bps, 5000 bps]
+        return max(1, min(5000, v))
+    except Exception:
+        return int(_slippage_bps())
+
+async def get_sell_quote(
+    *,
+    mint: str,
+    amount_raw: int,
+    slippage_bps: Optional[int] = None,
+    only_direct_routes: bool = False,
+    swap_mode: str = "ExactIn",
+) -> Dict[str, Any]:
+    """
+    Quote selling <amount_raw> of token 'mint' into SOL.
+
+    Returns Jupiter's quote JSON plus convenience fields:
+      - lamports_out: int
+      - out_amount_sol: float
+    """
+    if amount_raw is None or int(amount_raw) <= 0:
         raise ValueError("amount_raw must be > 0")
 
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
 
+    if mint == SOL_MINT:
+        raise ValueError("Refusing to 'sell' SOL into SOL (input == output).")
+
+    sbps = _clamp_slippage_bps(slippage_bps)
+
     quote = await _retry(
-        _jup_quote, mint, SOL_MINT, amount_raw,
+        _jup_quote, mint, SOL_MINT, int(amount_raw),
         tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-sell",
-        slippage_bps=slippage_bps,
+        slippage_bps=sbps, swap_mode=swap_mode, only_direct=bool(only_direct_routes),
     )
-    lamports_out = int(quote.get("outAmount", "0"))
+    lamports_out = int(quote.get("outAmount", "0") or 0)
     return {
         **quote,
         "lamports_out": lamports_out,
@@ -867,34 +898,81 @@ async def get_buy_quote(
     lamports_in: Optional[int] = None,
     amount_sol: Optional[float] = None,
     slippage_bps: Optional[int] = None,
+    only_direct_routes: bool = False,
+    swap_mode: str = "ExactIn",
 ) -> Dict[str, Any]:
+    """
+    Quote buying 'mint' with SOL (exact-in in lamports or SOL amount).
+    If neither 'lamports_in' nor 'amount_sol' provided, will read PF_TRADE_SOL.
+
+    Returns Jupiter's quote JSON plus:
+      - lamports_in: int
+      - out_amount_raw: int
+      - out_amount_ui: float
+      - decimals: Optional[int]
+    """
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
 
     if lamports_in is None and amount_sol is None:
-        pf = os.getenv("PF_TRADE_SOL")
-        if pf:
+        if os.getenv("PF_TRADE_SOL"):
             amount_sol = _envf("PF_TRADE_SOL", 0.0)
         else:
-            raise ValueError("Provide lamports_in or amount_sol")
+            raise ValueError("Provide lamports_in or amount_sol (or set PF_TRADE_SOL).")
 
     if lamports_in is None:
-        lamports_in = int((amount_sol or 0.0) * LAMPORTS_PER_SOL)
+        lamports_in = int(max(0.0, float(amount_sol or 0.0)) * LAMPORTS_PER_SOL)
+
+    if lamports_in <= 0:
+        raise ValueError("lamports_in must be > 0")
+
+    if mint == SOL_MINT:
+        raise ValueError("Refusing to 'buy' SOL with SOL (input == output).")
+
+    sbps = _clamp_slippage_bps(slippage_bps)
 
     q = await _retry(
-        _jup_quote, SOL_MINT, mint, lamports_in,
+        _jup_quote, SOL_MINT, mint, int(lamports_in),
         tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-buy",
-        slippage_bps=slippage_bps,
+        slippage_bps=sbps, swap_mode=swap_mode, only_direct=bool(only_direct_routes),
     )
-    out_raw = int(q.get("outAmount", "0"))
+    out_raw = int(q.get("outAmount", "0") or 0)
     dec = await _get_decimals(mint)
     ui = out_raw / (10 ** dec) if (dec is not None and dec >= 0) else 0.0
-    return {**q, "lamports_in": lamports_in, "out_amount_raw": out_raw, "out_amount_ui": ui, "decimals": dec}
+    return {
+        **q,
+        "lamports_in": int(lamports_in),
+        "out_amount_raw": out_raw,
+        "out_amount_ui": ui,
+        "decimals": dec,
+    }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Price helper: adaptive tiny-quote ladder (token → SOL)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _price_probe_amounts(dec: int) -> list[int]:
+    """
+    Return a descending ladder of raw token amounts corresponding to roughly:
+      [1.0, 0.1, 0.01, 0.001] UI units, clamped to >= 1.
+    This avoids 400s on too-small probes for some pools.
+    """
+    steps_ui = [1.0, 0.1, 0.01, 0.001]
+    vals = []
+    for ui in steps_ui:
+        raw = int(round(ui * (10 ** max(0, dec))))
+        if raw >= 1:
+            vals.append(raw)
+    vals = sorted(set(vals), reverse=True)
+    return vals or [1]
 
 async def get_price_ui(mint: str) -> float:
     """
-    Returns the SOL price per 1 token (UI units).
-    Accepts raw Pump/BONK ids or real mints. Never raises; returns 0.0 on failure.
+    Return the SOL price per 1.0 UI token of 'mint'.
+    - Accepts Pump/BONK ids or real mints (uses normalize_mint).
+    - Never raises; returns 0.0 on failure.
+    - Uses adaptive tiny-quote ladder to handle pools that reject ultra-tiny quotes.
+    - Caches successful prices per PRICE_TTL_SEC.
     """
     raw = (mint or "").strip()
     if not raw:
@@ -902,7 +980,7 @@ async def get_price_ui(mint: str) -> float:
     if _bl_get(raw):
         return 0.0
 
-    # Normalize to a real mint, or bail quietly
+    # Normalize to a real mint or bail quietly
     try:
         norm = _sanitize_mint(raw)
     except Exception:
@@ -917,32 +995,34 @@ async def get_price_ui(mint: str) -> float:
         log.every("price.nodec", n=20, msg="PRICE_NO_DECIMALS", raw=raw, norm=norm)
         return 0.0
 
-    # Serve from cache if fresh
+    # Cache hit?
     if PRICE_TTL_SEC > 0:
         rec = _PRICE_CACHE.get(norm)
         if rec and rec[0] >= time.time():
             return float(rec[1])
 
-    # Tiny exact-in quote for pricing
-    tiny_raw = max(1, 10 ** max(0, dec - 3))
-    try:
-        q = await _retry(
-            _jup_quote, norm, SOL_MINT, tiny_raw,
-            tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-price",
-        )
-        lamports = int(q.get("outAmount", "0"))
-        if lamports <= 0:
-            _bl_set(raw)
-            return 0.0
-        sol_out = lamports / LAMPORTS_PER_SOL
-        tokens_ui = tiny_raw / (10 ** dec)
-        px = sol_out / tokens_ui if tokens_ui > 0 else 0.0
-        if PRICE_TTL_SEC > 0:
-            _PRICE_CACHE[norm] = (time.time() + PRICE_TTL_SEC, px)
-        return px
-    except Exception:
-        _bl_set(raw)  # e.g., Jupiter 400 due to non-mint address
-        return 0.0
+    # Try a ladder of small exact-in quotes: token -> SOL
+    for amt_raw in _price_probe_amounts(dec):
+        try:
+            q = await _retry(
+                _jup_quote, norm, SOL_MINT, int(amt_raw),
+                tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-price",
+            )
+            lamports = int(q.get("outAmount", "0") or 0)
+            if lamports <= 0:
+                continue
+            sol_out = lamports / LAMPORTS_PER_SOL
+            tokens_ui = amt_raw / (10 ** dec)
+            px = sol_out / tokens_ui if tokens_ui > 0 else 0.0
+            if px > 0 and PRICE_TTL_SEC > 0:
+                _PRICE_CACHE[norm] = (time.time() + PRICE_TTL_SEC, px)
+            return px
+        except Exception:
+            # Keep trying smaller probes; if all fail we’ll blacklist below.
+            continue
+
+    _bl_set(raw)  # all probes failed
+    return 0.0
 
 # Compat aliases
 async def price_of_ui(mint: str) -> float:
