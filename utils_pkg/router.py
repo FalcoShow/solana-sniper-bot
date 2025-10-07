@@ -1090,7 +1090,7 @@ async def get_price_ui(mint: str) -> float:
         pass  # Fall through to B
 
     # --- B) Fallback: tiny token -> SOL (your previous logic) ---
-    tiny_raw = max(1, 10 ** max(0, dec - 3))
+    tiny_raw = max(10 ** max(0, dec - 2), 50_000)
     try:
         q = await _retry(
             _jup_quote, norm, SOL_MINT, tiny_raw,
