@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Iterable
 
 from logging_setup import get_logger
 from utils_pkg.router import (
@@ -44,6 +44,33 @@ def _envf(k: str, d: float) -> float:
     except Exception:
         return float(d)
 
+def _envs(k: str, d: str) -> str:
+    return os.getenv(k, d)
+
+# -----------------------------------------------------------------------------
+# Parse a ladder like "50k,200k,1m" → [50000, 200000, 1000000]
+# -----------------------------------------------------------------------------
+def _parse_raw_ladder(v: str) -> list[int]:
+    out: list[int] = []
+    for part in (v or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        mult = 1
+        p = part.lower()
+        if p.endswith("k"):
+            mult = 1_000
+            p = p[:-1]
+        elif p.endswith("m"):
+            mult = 1_000_000
+            p = p[:-1]
+        try:
+            n = int(float(p) * mult)
+        except Exception:
+            continue
+        if n > 0:
+            out.append(n)
+    return out
+
 # -----------------------------------------------------------------------------
 # Policy / knobs (aligned with trader & router defaults)
 # -----------------------------------------------------------------------------
@@ -56,11 +83,16 @@ QUOTE_TTL_SEC        = max(1, _envi("ROUTER_QUOTE_TTL_SEC", _envi("PF_PRICE_TTL_
 # Guard: block extreme price impact (bps). 0 disables.
 MAX_IMPACT_BPS       = max(0, _envi("ROUTEGUARD_MAX_IMPACT_BPS", 1500))
 
-# Require a tiny sell route (raw token units)
-SELL_PROBE_RAW       = max(1_000, _envi("ROUTEGUARD_SELL_PROBE_RAW", 1_000))
+# Sell-probe ladder (raw token units). Tries in order until one works.
+# Defaults are robust for 6–9 decimals without being dust.
+_SELL_LADDER_ENV     = _envs("ROUTEGUARD_SELL_PROBE_LADDER", "50k,500k,5m")
+SELL_PROBE_LADDER    = _parse_raw_ladder(_SELL_LADDER_ENV) or [50_000, 500_000, 5_000_000]
+
+# Hard floor for any single probe (just in case custom ladder is too tiny)
+SELL_PROBE_FLOOR_RAW = max(50_000, _envi("ROUTEGUARD_SELL_PROBE_FLOOR_RAW", 50_000))
 
 # Per-mint cooldown when no Jupiter route is available
-NOROUTE_COOLDOWN_SEC = max(60, _envi("ROUTEGUARD_NOROUTE_COOLDOWN_SEC", 600))
+NOROUTE_COOLDOWN_SEC = max(60, _envi("NOROUTE_COOLDOWN_SEC", _envi("ROUTEGUARD_NOROUTE_COOLDOWN_SEC", 600)))
 
 # (Optional) cap for in-memory caches to avoid unlimited growth
 CACHE_MAX_KEYS       = max(100, _envi("ROUTEGUARD_CACHE_MAX_KEYS", 2000))
@@ -115,6 +147,10 @@ def _impact_bps(q: Dict[str, Any]) -> int:
         return int(abs(pip) * 10_000)
     except Exception:
         return 0
+
+def _ladder_with_floor(raws: Iterable[int]) -> list[int]:
+    # ensure we never probe below the floor
+    return [max(int(x), SELL_PROBE_FLOOR_RAW) for x in raws if int(x) > 0]
 
 # -----------------------------------------------------------------------------
 # Public API
@@ -203,27 +239,37 @@ async def preflight(*, mint: str, lamports_in: int) -> Tuple[bool, Optional[Dict
         log.event("RG_BLOCK_IMPACT", mint=norm, impact_bps=ibps, max_bps=MAX_IMPACT_BPS)
         return False, None
 
-    # Require a tiny sell path?
+    # 5) Require a tiny sell path? Use a probe ladder to avoid 400s on dust.
     if REQUIRE_SELL_ROUTE:
-        try:
-            q_sell = await get_sell_quote(mint=norm, amount_raw=int(SELL_PROBE_RAW))
-            lam = int(q_sell.get("outAmount", 0) or q_sell.get("lamports_out", 0))
-            if lam <= 0:
-                _note_no_route(norm)
-                log.event("RG_SELL_ROUTE_FAIL", mint=norm)
-                return False, None
-            log.every("rg.sell", n=20, msg="RG_SELL_ROUTE_OK", mint=norm, lamports_out=lam)
-        except Exception as e:
+        ladder = _ladder_with_floor(SELL_PROBE_LADDER)
+        sell_ok = False
+        sell_err: Optional[str] = None
+        for probe_raw in ladder:
+            try:
+                q_sell = await get_sell_quote(mint=norm, amount_raw=int(probe_raw))
+                lam = int(q_sell.get("outAmount", 0) or q_sell.get("lamports_out", 0))
+                if lam > 0:
+                    log.every("rg.sell", n=20, msg="RG_SELL_ROUTE_OK",
+                              mint=norm, probe_raw=int(probe_raw), lamports_out=lam)
+                    sell_ok = True
+                    break
+                else:
+                    sell_err = f"zero_out (probe_raw={probe_raw})"
+                    # try next size
+            except Exception as e:
+                sell_err = str(e)
+                # try next size in ladder
+        if not sell_ok:
             _note_no_route(norm)
-            log.event("RG_SELL_QUOTE_ERR", mint=norm, err=str(e))
+            log.event("RG_SELL_ROUTE_FAIL", mint=norm, err=sell_err, ladder=ladder)
             return False, None
 
-    # 5) If we need to force fallback because the raw id isn't a mint, do it now.
+    # 6) If we need to force fallback because the raw id isn't a mint, do it now.
     if force_fallback_only:
         log.event("RG_FORCE_FALLBACK_RAW_NOT_MINT", raw=mint, norm=norm)
         return True, None
 
-    # 6) Otherwise we’re good to use Jupiter directly with this buy quote
+    # 7) Otherwise we’re good to use Jupiter directly with this buy quote
     return True, q_buy
 
 
