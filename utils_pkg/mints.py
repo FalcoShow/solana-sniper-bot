@@ -5,39 +5,41 @@ import re
 from typing import Optional
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Canonical mints (Solana / Jupiter)
+# Canonical mints (Solana)
 # ──────────────────────────────────────────────────────────────────────────────
-SOL_MINT        = "So11111111111111111111111111111111111111112"  # wSOL "pseudo-mint"
-USDT_MINT       = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-USDC_CLASSIC    = "EPjFWdd5AufqSSqeMzQ1NzxypaC8G4weEGKzwyTDt1v"  # NOT tradable on /swap/v1
-USDC_CCTP       = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"  # Tradable USDC on /swap/v1
+SOL_MINT   = "So11111111111111111111111111111111111111112"  # wSOL "pseudo-mint"
+USDT_MINT  = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"  # USDT
+USDC_MINT  = "EPjFWdd5AufqSSqeMzQ1NzxypaC8G4weEGKzwyTDt1v"  # USDC (native/CCTP)
+BONK_MINT  = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"  # BONK (common gotcha)
 
-# Common symbol aliases (case-insensitive). We resolve "USDC" to CCTP by default.
+# Common symbol aliases (case-insensitive). We resolve "USDC" to native/CCTP.
 _SYM_TO_MINT = {
     "SOL": SOL_MINT,
     "WSOL": SOL_MINT,
     "USDT": USDT_MINT,
-    "USDC": USDC_CCTP,
-    "USDC.CCTP": USDC_CCTP,
-    "USDC.EPJ": USDC_CLASSIC,  # will be remapped to CCTP later anyway
+    "TETHER": USDT_MINT,
+    "USDC": USDC_MINT,
+    "USDC.SOL": USDC_MINT,
+    "USDC.CCTP": USDC_MINT,
+    "BONK": BONK_MINT,
 }
 
-# Base58 alphabet (Bitcoin style; excludes 0,O,I,l)
-_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-_B58_IDX = {c: i for i, c in enumerate(_B58_ALPHABET)}
+# Base58 (Bitcoin alphabet; excludes 0,O,I,l)
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_IDX = {c: i for i, c in enumerate(_B58)}
 
-# Up to 44 base58 chars for 32 bytes (depends on leading zeroes)
-_MAX_MINT_LEN = 44
+# Up to 44 base58 chars for a 32-byte key (depending on leading zeros)
+_MAX_B58_LEN = 44
 
-# When streams append base58-looking salts/words ('pump','bonk', etc.)
+# Some feeds append suffix-y words
 _SUS_SUFFIXES = ("pump", "bonk", "raydium", "rayd", "dex", "sol", "solana")
 
-# Regex to pull base58 substrings out of URLs/text blobs
-_B58_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{20,90}")  # 20..90 to avoid tiny noise
+# Broad base58-looking finder for URLs/blobs
+_B58_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{20,90}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Minimal base58 decode (no checksum) so we can verify 32-byte keys
+# Minimal base58 decode (no checksum); used only to verify 32-byte length
 # ──────────────────────────────────────────────────────────────────────────────
 def _b58decode(s: str) -> bytes:
     s = (s or "").strip()
@@ -49,10 +51,10 @@ def _b58decode(s: str) -> bytes:
         if i is None:
             raise ValueError("invalid base58 character")
         n = n * 58 + i
-    # Convert to bytes, preserving leading '1' -> zero prefix
-    full = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    # preserve leading '1' => zero bytes
     pad = len(s) - len(s.lstrip("1"))
-    return (b"\x00" * pad) + full
+    return (b"\x00" * pad) + raw
 
 
 def _is_base58_32(s: str) -> bool:
@@ -62,8 +64,8 @@ def _is_base58_32(s: str) -> bool:
         return False
 
 
-def _strip_suspicious_suffixes(s: str) -> str:
-    """Remove known 'salt' words some feeds append, then hard-cap length."""
+def _strip_suffixes_and_clip(s: str) -> str:
+    """Remove known suffix words; then hard-cap to 44 chars."""
     low = s.lower()
     changed = True
     while changed:
@@ -74,29 +76,27 @@ def _strip_suspicious_suffixes(s: str) -> str:
                 low = s.lower()
                 changed = True
                 break
-    if len(s) > _MAX_MINT_LEN:
-        s = s[:_MAX_MINT_LEN]
+    if len(s) > _MAX_B58_LEN:
+        s = s[:_MAX_B58_LEN]
     return s
 
 
 def _extract_base58_32(blob: str) -> Optional[str]:
     """
-    Find a 32-byte base58 key inside arbitrary text/URL.
+    Recover a 32-byte base58 key from arbitrary text/URL.
     Strategy:
-      1) Pull candidate base58 substrings.
-      2) For each: strip suspicious suffixes, cap to 44, validate length=32 bytes.
-      3) Fallback: if raw candidate > 44, try first 44 chars.
+      - Direct exact check
+      - Try last path segment from URL-ish strings
+      - Scan for base58-looking chunks; strip salts; validate; or try first 44
     """
     if not blob:
         return None
 
-    # Direct hit first (fast path)
     t = blob.strip()
     if _is_base58_32(t):
         return t
 
-    # URLs like https://pump.fun/coin/<mint>, https://dexscreener.com/solana/<mint>, etc.
-    # Try the last path segment first.
+    # Try last path segment for URLs like .../coin/<mint>
     try:
         parts = re.split(r"[/?#]", t)
         if parts:
@@ -106,14 +106,12 @@ def _extract_base58_32(blob: str) -> Optional[str]:
     except Exception:
         pass
 
-    # Scan for base58-like chunks
     for cand in _B58_RE.findall(t):
-        clean = _strip_suspicious_suffixes(cand)
+        clean = _strip_suffixes_and_clip(cand)
         if _is_base58_32(clean):
             return clean
-        # If trimming didn’t work but chunk is long, try the first 44 chars
-        if len(cand) > _MAX_MINT_LEN and _is_base58_32(cand[:_MAX_MINT_LEN]):
-            return cand[:_MAX_MINT_LEN]
+        if len(cand) > _MAX_B58_LEN and _is_base58_32(cand[:_MAX_B58_LEN]):
+            return cand[:_MAX_B58_LEN]
 
     return None
 
@@ -126,46 +124,39 @@ def normalize_mint(m: str) -> str:
     Return a canonical, 32-byte base58 mint address.
 
     Accepts:
-      - Exact base58 mint (any case/whitespace tolerated).
-      - Common symbols: SOL, WSOL, USDT, USDC (maps to **USDC CCTP**).
-      - URLs or salted IDs that contain a mint (we extract it).
-      - USDC classic (EPjF…) is **auto-remapped** to USDC CCTP (DezX…).
+      - Symbols: SOL, WSOL, USDT, USDC (maps to **EPjF…**).
+      - Exact base58 address.
+      - Pump.fun / dexscreener-style URLs or strings with a mint inside.
+      - Salted IDs where someone tacked on words like '...bonk'/'...pump'.
 
     Raises:
-      ValueError if no valid 32-byte base58 key can be recovered.
+      ValueError if a valid 32-byte base58 key cannot be recovered.
     """
     if not m or not str(m).strip():
         raise ValueError("empty mint")
 
     s = str(m).strip()
 
-    # Symbol aliases (case-insensitive)
+    # Symbol?
     sym = s.upper()
     if sym in _SYM_TO_MINT:
         s = _SYM_TO_MINT[sym]
     else:
-        # Try to recover a proper 32-byte base58 key from the string/URL
+        # Extract from URL/blob/salted string
         cand = _extract_base58_32(s)
         if not cand:
             raise ValueError(f"cannot normalize mint from input: {s!r}")
         s = cand
 
-    # Final sanity: must be a 32-byte base58 key
+    # Final sanity: must decode to 32 bytes
     if not _is_base58_32(s):
         raise ValueError(f"not a 32-byte base58 mint: {s!r}")
-
-    # USDC classic is not tradable on /swap/v1; map to CCTP
-    if s == USDC_CLASSIC:
-        return USDC_CCTP
 
     return s
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional helpers (exported)
-# ──────────────────────────────────────────────────────────────────────────────
 def is_base58_mint(s: str) -> bool:
-    """Public helper used by callers that want to preflight inputs."""
+    """Public helper for quick validation."""
     return _is_base58_32((s or "").strip())
 
 
@@ -174,6 +165,6 @@ __all__ = [
     "is_base58_mint",
     "SOL_MINT",
     "USDT_MINT",
-    "USDC_CLASSIC",
-    "USDC_CCTP",
+    "USDC_MINT",
+    "BONK_MINT",
 ]
