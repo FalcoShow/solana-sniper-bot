@@ -1034,10 +1034,15 @@ async def get_buy_quote(
     ui = out_raw / (10 ** dec) if (dec is not None and dec >= 0) else 0.0
     return {**q, "lamports_in": lamports_in, "out_amount_raw": out_raw, "out_amount_ui": ui, "decimals": dec}
 
+# In utils_pkg/router.py (replace your current get_price_ui)
 async def get_price_ui(mint: str) -> float:
     """
-    Return the SOL price per 1 token (UI units).
-    Accepts Pump/BONK ids or real mints. Never raises; returns 0.0 on failure.
+    Price of 1 token (UI units) in SOL.
+    Strategy:
+      A) Primary: quote SOL -> token with a small, non-dust SOL amount (e.g., 0.01 SOL),
+         then invert: px = (SOL_in_UI / token_out_UI).
+      B) Fallback: tiny token -> SOL quote (your existing path) only if A fails.
+    Never raises; returns 0.0 on failure.
     """
     raw = (mint or "").strip()
     if not raw:
@@ -1045,7 +1050,7 @@ async def get_price_ui(mint: str) -> float:
     if _bl_get(raw):
         return 0.0
 
-    # Normalize to a real mint (quietly blacklist bad ids)
+    # Normalize & decimals
     try:
         norm = _sanitize_mint(raw)
     except Exception:
@@ -1053,35 +1058,51 @@ async def get_price_ui(mint: str) -> float:
         log.every("price.bad", n=20, msg="PRICE_BAD_ID", raw=raw)
         return 0.0
 
-    # Decimals (with RPC + token-list fallback)
     dec = await _get_decimals(norm)
     if dec is None or dec < 0 or dec > 18:
         _bl_set(raw)
         log.every("price.nodec", n=20, msg="PRICE_NO_DECIMALS", raw=raw, norm=norm)
         return 0.0
 
-    # Serve from cache if fresh
+    # Cache hit?
     if PRICE_TTL_SEC > 0:
         rec = _PRICE_CACHE.get(norm)
         if rec and rec[0] >= time.time():
             return float(rec[1])
 
-    # Robust tiny-amount probe with auto-escalation
+    # --- A) Primary: SOL -> token, invert ---
     try:
-        probe = await _safe_price_probe(norm, dec)
-        if not probe:
-            _bl_set(raw)
-            return 0.0
-        q, raw_in = probe
-        lamports = int(q.get("outAmount", "0") or 0)
+        # 0.01 SOL (adjustable via env if you want)
+        sol_in_lamports = int(0.01 * LAMPORTS_PER_SOL)
+        q = await _retry(
+            _jup_quote, SOL_MINT, norm, sol_in_lamports,
+            tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="price-sol2tok",
+        )
+        out_raw = int(q.get("outAmount") or "0")
+        if out_raw > 0:
+            out_ui = out_raw / (10 ** dec)
+            if out_ui > 0:
+                px = (sol_in_lamports / LAMPORTS_PER_SOL) / out_ui  # SOL per 1 token
+                if PRICE_TTL_SEC > 0:
+                    _PRICE_CACHE[norm] = (time.time() + PRICE_TTL_SEC, px)
+                return px
+    except Exception:
+        pass  # Fall through to B
+
+    # --- B) Fallback: tiny token -> SOL (your previous logic) ---
+    tiny_raw = max(1, 10 ** max(0, dec - 3))
+    try:
+        q = await _retry(
+            _jup_quote, norm, SOL_MINT, tiny_raw,
+            tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="price-tok2sol",
+        )
+        lamports = int(q.get("outAmount") or "0")
         if lamports <= 0:
             _bl_set(raw)
             return 0.0
-
         sol_out = lamports / LAMPORTS_PER_SOL
-        tokens_ui = raw_in / (10 ** dec)
+        tokens_ui = tiny_raw / (10 ** dec)
         px = sol_out / tokens_ui if tokens_ui > 0 else 0.0
-
         if PRICE_TTL_SEC > 0:
             _PRICE_CACHE[norm] = (time.time() + PRICE_TTL_SEC, px)
         return px
