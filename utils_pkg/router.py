@@ -6,10 +6,12 @@ import base64
 import json
 import os
 import random
+import re
 import time
-from typing import Any, Dict, Optional, Tuple, Callable
+from typing import Any, Dict, Optional, Tuple, Callable, Sequence
 
 import requests
+from requests.exceptions import RequestException
 
 from logging_setup import get_logger
 from utils_pkg.mints import normalize_mint  # single source of truth
@@ -28,35 +30,6 @@ if not hasattr(log, "every"):
     def _every(_key: str, n: int = 10, msg: str | None = None, **kw):
         return log.event(msg or _key, **kw)
     setattr(log, "every", _every)  # type: ignore[attr-defined]
-
-ALLOWED_MINTS = {
-    # Always allowed
-    "So11111111111111111111111111111111111111112",  # SOL
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
-    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # USDC (CCTP)
-}
-
-def _assert_allowed(m: str):
-    if m not in ALLOWED_MINTS:
-        # permit other valid 32-byte tokens that your strategy trades,
-        # but block the classic USDC explicitly
-        if m == "EPjFWdd5AufqSSqeMzQ1NzxypaC8G4weEGKzwyTDt1v":
-            raise ValueError("USDC classic is not tradable on swap/v1; use USDC CCTP (DezX...)")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Chain / RPC config (with safe fallbacks)
-# ──────────────────────────────────────────────────────────────────────────────
-try:
-    from utils_pkg.txlearn import RPC_URL as _TX_RPC_URL, TX_COMMITMENT as _TX_COMMITMENT  # type: ignore
-except Exception:
-    _TX_RPC_URL = os.getenv("SOL_RPC_URL") or "https://api.mainnet-beta.solana.com"
-    _TX_COMMITMENT = "confirmed"
-
-TX_RPC_URL = _TX_RPC_URL
-TX_COMMITMENT = _TX_COMMITMENT
-
-SOL_MINT = "So11111111111111111111111111111111111111112"
-LAMPORTS_PER_SOL = 1_000_000_000
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Env helpers
@@ -80,119 +53,49 @@ def _envi(k: str, d: int) -> int:
         return int(d)
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Chain / RPC config (with safe fallbacks)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from utils_pkg.txlearn import RPC_URL as _TX_RPC_URL, TX_COMMITMENT as _TX_COMMITMENT  # type: ignore
+except Exception:
+    _TX_RPC_URL = os.getenv("SOL_RPC_URL") or "https://api.mainnet-beta.solana.com"
+    _TX_COMMITMENT = "confirmed"
+
+TX_RPC_URL = _TX_RPC_URL
+TX_COMMITMENT = _TX_COMMITMENT
+
+SOL_MINT = "So11111111111111111111111111111111111111112"
+LAMPORTS_PER_SOL = 1_000_000_000
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Feature toggles / HTTP knobs
 # ──────────────────────────────────────────────────────────────────────────────
-DRY_RUN = _envb("DRY_RUN", False)
+DRY_RUN = _envb("IS_DRYRUN", False) or _envb("DRY_RUN", False)
 
 HTTP_TIMEOUT_GET  = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
 HTTP_TIMEOUT_POST = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_POST_SEC", 25.0))
 RPC_TIMEOUT_SEC   = max(3.0, _envf("ROUTER_RPC_TIMEOUT_SEC", 10.0))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Jupiter base/headers (supports QuickNode Function proxy)
-# ──────────────────────────────────────────────────────────────────────────────
-def _is_qn_call_url(u: str) -> bool:
-    u = (u or "").rstrip("/")
-    return "/functions/" in u and u.endswith("/call")
-
-def _jup_base() -> str:
-    base = (os.getenv("JUP_BASE_URL") or "").strip()
-    return (base or "https://quote-api.jup.ag").rstrip("/")
-
-JUP_BASE = _jup_base()
-JUP_IS_QN_CALL = _is_qn_call_url(JUP_BASE)
-
-def _build_jup_endpoint(kind: str) -> str:
-    """
-    - For QuickNode /call, build:  <base>?mode=RAW&path=/v6/<kind>
-      (router passes actual Jupiter params separately)
-    - Otherwise: <base>/v6/<kind>
-    """
-    base = (os.getenv("JUP_BASE_URL") or "https://quote-api.jup.ag").rstrip("/")
-    if "/functions/rest/" in base and base.endswith("/call"):
-        sep = "&" if "?" in base else "?"
-        # order of path & mode does not matter, keep deterministic
-        return f"{base}{sep}path=/v6/{kind}&mode=RAW"
-    return f"{base}/v6/{kind}"
-
-def _jup_headers() -> Dict[str, str]:
-    """
-    Build headers for Jupiter/Proxy calls.
-
-    Always:
-      - Send browser-ish UA + JSON accept
-      - If QUICKNODE_FUNCTION_KEY or JUP_API_KEY are present, attach x-api-key
-      - If JUP_PRO_KEY is present, attach x-jup-auth: Bearer <key>  (PRO MODE)
-
-    NOTE: We never hardcode auth into the Worker. The bot sends it; the Worker just forwards.
-    """
-    h: Dict[str, str] = {
-        "user-agent": "pnlsniper/1.0 (+router)",
-        "accept": "application/json",
-        "content-type": "application/json",
-        # These two help some edges/CDNs; harmless elsewhere
-        "origin": "https://jup.ag",
-        "referer": "https://jup.ag/",
-    }
-
-    # QuickNode function / optional upstream API keys
-    x_api = (os.getenv("JUP_API_KEY") or os.getenv("QUICKNODE_FUNCTION_KEY") or "").strip()
-    if x_api:
-        h["x-api-key"] = x_api
-        # helps QN interpret pass-through RAW mode (harmless elsewhere)
-        h.setdefault("x-quicknode-mode", "RAW")
-
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # Jupiter PRO auth (from Render env). This is the important bit:
-    pro_key = (os.getenv("JUP_PRO_KEY") or "").strip()
-    if pro_key:
-        h["x-jup-auth"] = f"Bearer {pro_key}"
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
-    return h
-
-JUP_QUOTE_URL = _build_jup_endpoint("quote")
-JUP_SWAP_URL  = _build_jup_endpoint("swap")
-
-def _slippage_bps() -> int:
-    """
-    Slippage priority: PF_SLIPPAGE_BPS (int bps) >
-                       JUPITER_MAX_SLIPPAGE (fraction) >
-                       default 0.0125 (125 bps)
-    """
-    v = os.getenv("PF_SLIPPAGE_BPS")
-    if v:
-        try:
-            return max(1, int(v))
-        except Exception:
-            pass
-    s = _envf("JUPITER_MAX_SLIPPAGE", 0.0125)  # fraction -> bps
-    return max(1, int(round(s * 10_000)))
-
-def _as_legacy() -> bool:
-    return (os.getenv("JUP_AS_LEGACY", "1") or "1").strip().lower() in {"1", "true", "yes", "y"}
-
-# Retries / pacing
-QUOTE_RETRIES = max(1, _envi("ROUTER_QUOTE_RETRIES", 1))
+QUOTE_RETRIES = max(1, _envi("ROUTER_QUOTE_RETRIES", 3))
 SWAP_RETRIES  = max(1, _envi("ROUTER_SWAP_RETRIES", 3))
 RETRY_BACKOFF = max(0.05, _envf("ROUTER_RETRY_BACKOFF_SEC", 0.35))
 
-JUP_MAX_QPS       = max(1, _envi("JUP_MAX_QPS", 2))
+JUP_MAX_QPS       = max(1, _envi("JUP_MAX_QPS", 3))
 _JUP_MIN_INTERVAL = 1.0 / float(JUP_MAX_QPS)
 _JUP_RATE_LOCK    = asyncio.Lock()
 _JUP_LAST_TS: float = 0.0
 
-# Cache / single-flight
-QUOTE_TTL_SEC = max(0.0, _envf("ROUTER_QUOTE_TTL_SEC", 2.0))
-PRICE_TTL_SEC = max(0.0, _envf("PF_PRICE_TTL_SEC", 5.0))
+QUOTE_TTL_SEC = max(0.0, _envf("ROUTER_QUOTE_TTL_SEC", 10.0))
+PRICE_TTL_SEC = max(0.0, _envf("PF_PRICE_TTL_SEC", 6.0))
 _QUOTE_CACHE: Dict[str, Tuple[float, dict]] = {}
 _PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
 _QUOTE_FLIGHT: Dict[str, asyncio.Future[Any]] = {}
 _quote_lock = asyncio.Lock()
 
-# Bad ID blacklist for price calls (avoid repeated 400s/429s)
+# Bad ID blacklist for price calls (avoid repeated 400/429 hammers)
 BAD_ID_TTL_SEC = max(10, _envi("ROUTER_BAD_ID_TTL_SEC", 60))
 _BAD_PRICE_BLACKLIST: Dict[str, float] = {}
+
 def _bl_get(raw: str) -> bool:
     exp = _BAD_PRICE_BLACKLIST.get(raw)
     if exp and exp >= time.time():
@@ -200,6 +103,7 @@ def _bl_get(raw: str) -> bool:
     if exp:
         _BAD_PRICE_BLACKLIST.pop(raw, None)
     return False
+
 def _bl_set(raw: str) -> None:
     _BAD_PRICE_BLACKLIST[raw] = time.time() + BAD_ID_TTL_SEC
 
@@ -214,17 +118,16 @@ except Exception:  # pragma: no cover
         def after_rpc(self, method: str, *, weight: Optional[int] = None) -> None:  return None
     budget = _BudgetNoop()  # type: ignore
 
-# Default UA for RPC; Jupiter headers are built by _jup_headers()
-_UA = {"user-agent": "pnlsniper/1.0 (+router)", "accept": "application/json"}
+# Default UA
+_UA = {"user-agent": "pnlsniper/1.0 (+router)", "accept": "application/json", "content-type": "application/json"}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Base58 helpers (no external deps)
+# Base58 helpers and mint sanitation
 # ──────────────────────────────────────────────────────────────────────────────
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58_IDX = {c: i for i, c in enumerate(_B58_ALPHABET)}
 
 def _b58decode(s: str) -> bytes:
-    """Minimal base58 decode (no checksum)."""
     s = (s or "").strip()
     if not s:
         return b""
@@ -239,17 +142,19 @@ def _b58decode(s: str) -> bytes:
     return b"\x00" * pad + full
 
 def _is_valid_pubkey_str(s: str) -> bool:
-    """True iff base58 string decodes to exactly 32 bytes."""
     try:
         return len(_b58decode(s)) == 32
     except Exception:
         return False
 
-# Public-friendly alias (kept for compatibility)
+# Public alias
 def is_valid_pubkey_str(s: str) -> bool:
     return _is_valid_pubkey_str(s)
 
-# Router-local sanitizer that delegates to our single source of truth.
+def _assert_pubkey(s: str, name: str) -> None:
+    if not _is_valid_pubkey_str(s):
+        raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
+
 def _sanitize_mint(m: str) -> str:
     m = (m or "").strip()
     if not m:
@@ -257,25 +162,151 @@ def _sanitize_mint(m: str) -> str:
     try:
         return normalize_mint(m)
     except Exception:
-        # last-chance: accept any 32-byte base58 to avoid false negatives
         if _is_valid_pubkey_str(m):
             return m
         raise
 
-# Back-compat export name (used elsewhere)
+# Back-compat export used elsewhere
 def normalize_pump_id_to_mint(raw: str) -> str:
     return normalize_mint(raw)
 
-def _assert_pubkey(s: str, name: str) -> None:
-    if not _is_valid_pubkey_str(s):
-        raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
+# ──────────────────────────────────────────────────────────────────────────────
+# Jupiter base URL(s), headers, and multi-endpoint fallback
+# ──────────────────────────────────────────────────────────────────────────────
+def _alt_bases() -> Sequence[str]:
+    """
+    Primary from JUP_BASE_URL, fallbacks from JUP_ALT_BASE_URLS (comma-separated).
+    Example:
+      JUP_BASE_URL=https://quote-api.jup.ag
+      JUP_ALT_BASE_URLS=https://cryptobot.example.workers.dev
+    """
+    bases: list[str] = []
+    primary = (os.getenv("JUP_BASE_URL") or "https://quote-api.jup.ag").strip().rstrip("/")
+    if primary:
+        bases.append(primary)
+    alts = (os.getenv("JUP_ALT_BASE_URLS") or "").strip()
+    if alts:
+        for a in alts.split(","):
+            a = a.strip().rstrip("/")
+            if a and a not in bases:
+                bases.append(a)
+    # dedupe
+    deduped: list[str] = []
+    for b in bases:
+        if b and b not in deduped:
+            deduped.append(b)
+    return deduped
+
+def _is_qn_call_url(u: str) -> bool:
+    u = (u or "").rstrip("/")
+    # recognises QuickNode Functions /call endpoints, or workers that mirror same pattern
+    return "/functions/" in u and u.endswith("/call")
+
+def _compose_endpoint(base: str, kind: str) -> tuple[str, bool]:
+    """
+    For QuickNode /call: <base>?path=/v6/<kind>&mode=RAW
+    Otherwise:           <base>/v6/<kind>
+    Returns (url, use_post_for_qn_call)
+    """
+    b = base.rstrip("/")
+    if _is_qn_call_url(b):
+        sep = "&" if "?" in b else "?"
+        return f"{b}{sep}path=/v6/{kind}&mode=RAW", True
+    return f"{b}/v6/{kind}", False
+
+def _jup_headers() -> Dict[str, str]:
+    h: Dict[str, str] = {
+        **_UA,
+        "origin": "https://jup.ag",
+        "referer": "https://jup.ag/",
+    }
+    # Optional upstream API keys (QuickNode function key, or custom)
+    x_api = (os.getenv("JUP_API_KEY") or os.getenv("QUICKNODE_FUNCTION_KEY") or "").strip()
+    if x_api:
+        h["x-api-key"] = x_api
+        h.setdefault("x-quicknode-mode", "RAW")
+    # Jupiter PRO
+    pro_key = (os.getenv("JUP_PRO_KEY") or "").strip()
+    if pro_key:
+        # Jupiter’s current PRO header
+        h["x-jup-auth"] = f"Bearer {pro_key}"
+    return h
+
+async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) -> dict:
+    """
+    Tries each base (primary + fallbacks) for GET /v6/<kind> (or QN /call).
+    Returns JSON or raises the last error.
+    """
+    headers = _jup_headers()
+    last_err: Optional[Exception] = None
+    for idx, base in enumerate(_alt_bases()):
+        url, is_qn = _compose_endpoint(base, kind)
+        try:
+            if is_qn:
+                # QN functions prefer POST with params in query string; empty JSON body.
+                r = requests.post(url, json=None, params=params, timeout=timeout, headers=headers)
+            else:
+                r = requests.get(url, params=params, timeout=timeout, headers=headers)
+
+            # Parse JSON first; unwrap envelopes even on non-2xx for better errors
+            try:
+                js = r.json()
+            except Exception:
+                r.raise_for_status()
+                raise
+            js = _unwrap_qn_action(r, js)
+
+            if r.status_code in (200, 201):
+                return js
+
+            # Keep trying next base on 4xx/5xx
+            last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
+        except RequestException as e:
+            last_err = e
+        except Exception as e:
+            last_err = e
+        # tiny backoff before next base
+        await asyncio.sleep(0.05 if idx == 0 else 0.1)
+    # bubble the last thing we saw
+    raise last_err or RuntimeError("all quote endpoints failed")
+
+async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], params: Optional[dict], timeout: float) -> dict:
+    """
+    Tries each base (primary + fallbacks) for POST /v6/<kind> (or QN /call).
+    Used for /swap (and any future POST).
+    """
+    headers = _jup_headers()
+    last_err: Optional[Exception] = None
+    for idx, base in enumerate(_alt_bases()):
+        url, is_qn = _compose_endpoint(base, kind)
+        try:
+            if is_qn:
+                # QN /call: keep params in query string; JSON body goes through as-is.
+                r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=headers)
+            else:
+                r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=headers)
+
+            try:
+                js = r.json()
+            except Exception:
+                r.raise_for_status()
+                raise
+            js = _unwrap_qn_action(r, js)
+
+            if r.status_code in (200, 201):
+                return js
+
+            last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
+        except RequestException as e:
+            last_err = e
+        except Exception as e:
+            last_err = e
+        await asyncio.sleep(0.05 if idx == 0 else 0.1)
+    raise last_err or RuntimeError("all swap endpoints failed")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# QN envelopes → ultra-robust unwrap + tiny debug when payload missing
+# QN/Jupiter envelope unwrapping
 # ──────────────────────────────────────────────────────────────────────────────
-import json, base64, re
-from typing import Any
-
 def _jtry(s: str):
     try:
         return json.loads(s)
@@ -289,11 +320,7 @@ def _b64txt(s: str):
     except Exception:
         return None
 
-# Jupiter “looks like” tests
-_JUP_POS_KEYS = {
-    "outAmount", "routePlan", "swapTransaction",
-    "otherAmountThreshold", "priceImpactPct", "expiration",
-}
+_JUP_POS_KEYS = {"outAmount", "routePlan", "swapTransaction", "otherAmountThreshold", "priceImpactPct", "expiration"}
 _JUP_ERR_KEYS = {"errorCode", "errorMessage", "error", "statusCode", "message"}
 
 def _looks_jup(d: dict) -> bool:
@@ -302,13 +329,12 @@ def _looks_jup(d: dict) -> bool:
     sub = d.get("data") or d.get("result")
     return isinstance(sub, dict) and _looks_jup(sub)
 
-# Extract JSON from common QN places
+_JSON_IN_LOGS = re.compile(r"\{.*\}")
+
 def _from_result_container(obj: Any) -> Any:
     if not isinstance(obj, dict): return None
     res = obj.get("result")
     if res is None: return None
-
-    # direct dict with body/text/json/data/result
     if isinstance(res, dict):
         for k in ("json", "body", "text", "data", "result", "rawBody"):
             if k in res:
@@ -317,7 +343,6 @@ def _from_result_container(obj: Any) -> Any:
                 if isinstance(v, str):
                     j = _jtry(v) or _jtry(_b64txt(v) or "")
                     if j is not None: return j
-    # string → try json / base64→json
     if isinstance(res, str):
         j = _jtry(res) or _jtry(_b64txt(res) or "")
         if j is not None: return j
@@ -325,13 +350,11 @@ def _from_result_container(obj: Any) -> Any:
 
 def _from_action_envelope(obj: Any) -> Any:
     if not isinstance(obj, dict): return None
-    # user_data
     ud = obj.get("user_data")
     if isinstance(ud, dict): return ud
     if isinstance(ud, str):
         j = _jtry(ud) or _jtry(_b64txt(ud) or "")
         if j is not None: return j
-    # execution.response.body
     resp = obj.get("execution", {}).get("response", {})
     body = resp.get("body")
     if isinstance(body, dict): return body
@@ -339,9 +362,6 @@ def _from_action_envelope(obj: Any) -> Any:
         j = _jtry(body) or _jtry(_b64txt(body) or "")
         if j is not None: return j
     return None
-
-# sometimes the real JSON is printed into logs
-_JSON_IN_LOGS = re.compile(r"\{.*\}")
 
 def _from_logs(obj: Any) -> Any:
     if not isinstance(obj, dict): return None
@@ -357,30 +377,19 @@ def _from_logs(obj: Any) -> Any:
     return None
 
 def _dfs_extract(node: Any) -> Any:
-    # direct hit
-    if isinstance(node, dict) and _looks_jup(node):
-        return node
-
-    # known wrappers
+    if isinstance(node, dict) and _looks_jup(node): return node
     got = _from_result_container(node) or _from_action_envelope(node) or _from_logs(node)
-    if isinstance(got, dict) and _looks_jup(got):
-        return got
-
-    # recurse dict
+    if isinstance(got, dict) and _looks_jup(got): return got
     if isinstance(node, dict):
         for v in node.values():
             g = _dfs_extract(v)
             if isinstance(g, dict) and _looks_jup(g): return g
         return None
-
-    # recurse list
     if isinstance(node, list):
         for it in node:
             g = _dfs_extract(it)
             if isinstance(g, dict) and _looks_jup(g): return g
         return None
-
-    # strings: JSON / base64→JSON
     if isinstance(node, str):
         j = _jtry(node) or _jtry(_b64txt(node) or "")
         if j is not None: return _dfs_extract(j)
@@ -396,16 +405,12 @@ def _unwrap_qn_action(response: requests.Response, parsed: Any) -> Any:
         st = int(getattr(response, "status_code", 0) or 0)
     except Exception:
         st = 0
-
-    # Only attempt on 200/201 responses
     if st not in (200, 201):
         return parsed
-
     try:
         inner = _dfs_extract(parsed)
         if isinstance(inner, dict) and _looks_jup(inner):
             return inner
-        # one-time micro log so we can see the actual wrapper shape at runtime
         try:
             log.every("qn.unwrap.miss", n=30, msg="QN_UNWRAP_MISS",
                       status=st,
@@ -421,69 +426,16 @@ def _unwrap_qn_action(response: requests.Response, parsed: Any) -> Any:
         return parsed
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Non-blocking HTTP (requests in worker threads)
+# Jupiter pacing + retry
 # ──────────────────────────────────────────────────────────────────────────────
-async def _get_json(
-    url: str,
-    *,
-    params: Optional[dict] = None,
-    timeout: float | int = HTTP_TIMEOUT_GET,
-    headers: Optional[Dict[str, str]] = None,
-) -> dict:
-    def _req():
-        # Merge order: base UA → Jupiter headers (includes PRO) → caller overrides
-        merged_headers: Dict[str, str] = {**_UA, **_jup_headers(), **(headers or {})}
-        r = requests.get(url, params=params, timeout=timeout, headers=merged_headers)
-
-        # Parse first; then unwrap any QN envelope regardless of status code.
-        try:
-            js = r.json()
-        except Exception:
-            # If it's not JSON at all, now we can raise.
-            r.raise_for_status()
-            raise
-        js = _unwrap_qn_action(r, js)
-
-        # Only now enforce HTTP errors.
-        if r.status_code not in (200, 201):
-            # Helpful one-time log on auth failures
-            if r.status_code == 401:
-                log.every("jup.pro.401", n=10, msg="JUP_PRO_401",
-                          url=url, has_pro=bool(os.getenv("JUP_PRO_KEY")))
-            r.raise_for_status()
-
-        return js
-
-    return await asyncio.to_thread(_req)
-
-async def _post_json(
-    url: str,
-    *,
-    json_body: Optional[dict] = None,
-    params: Optional[dict] = None,
-    timeout: float | int = HTTP_TIMEOUT_POST,
-    headers: Optional[Dict[str, str]] = None,
-) -> dict:
-    def _req():
-        merged_headers: Dict[str, str] = {**_UA, **_jup_headers(), **(headers or {})}
-        r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=merged_headers)
-
-        try:
-            js = r.json()
-        except Exception:
-            r.raise_for_status()
-            raise
-        js = _unwrap_qn_action(r, js)
-
-        if r.status_code not in (200, 201):
-            if r.status_code == 401:
-                log.every("jup.pro.401", n=10, msg="JUP_PRO_401",
-                          url=url, has_pro=bool(os.getenv("JUP_PRO_KEY")))
-            r.raise_for_status()
-
-        return js
-
-    return await asyncio.to_thread(_req)
+async def _jup_gate() -> None:
+    global _JUP_LAST_TS
+    async with _JUP_RATE_LOCK:
+        now = time.time()
+        wait_for = _JUP_MIN_INTERVAL - (now - _JUP_LAST_TS)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        _JUP_LAST_TS = time.time()
 
 async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: str, **kwargs) -> Any:
     last_err: Optional[Exception] = None
@@ -493,7 +445,6 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
         except Exception as e:
             last_err = e
             status = getattr(getattr(e, "response", None), "status_code", None)
-            # 400/404 are almost always invalid inputs; don't spin
             if status in (400, 404):
                 log.event("ROUTER_RETRY_FAIL", label=label, err=str(e))
                 raise
@@ -507,37 +458,24 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
     raise last_err if last_err else RuntimeError(f"{label} failed")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Simple RPC helpers (for decimals & sig status)
+# Minimal RPC helpers (decimals & sig status)
 # ──────────────────────────────────────────────────────────────────────────────
+_DECIMALS: Dict[str, int] = {}
+_TOK_META: Dict[str, Dict[str, Any]] = _TOK_META if "_TOK_META" in globals() else {}
 
-# Cached decimals and token metadata
-_DECIMALS: Dict[str, int] = {}           # mint -> decimals
-_TOK_META: Dict[str, Dict[str, Any]] = _TOK_META if "_TOK_META" in globals() else {}  # keep any prior state
-
-# Known-good overrides (avoid ever being wrong for the basics)
 _KNOWN_DECIMALS: Dict[str, int] = {
-    SOL_MINT: 9,  # SOL (wSOL mint)
-    # USDC classic
-    "EPjFWdd5AufqSSqeMzQ1NzxypaC8G4weEGKzwyTDt1v": 6,
-    # USDC (CCTP)
-    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": 6,
-    # USDT
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": 6,
+    SOL_MINT: 9,
+    "EPjFWdd5AufqSSqeMzQ1NzxypaC8G4weEGKzwyTDt1v": 6,  # USDC classic
+    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": 6,  # USDC (CCTP)
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": 6,  # USDT
 }
 
 def _rpc_post(method: str, params: list) -> dict:
-    """
-    Minimal JSON-RPC POST with budget hooks and strict HTTP handling.
-    Returns parsed JSON (dict). Raises for non-2xx.
-    """
     if not TX_RPC_URL:
         return {}
-
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-
     if not budget.before_rpc(method):
         return {}
-
     try:
         r = requests.post(TX_RPC_URL, json=payload, timeout=RPC_TIMEOUT_SEC, headers=_UA)
         r.raise_for_status()
@@ -549,10 +487,6 @@ def _rpc_post(method: str, params: list) -> dict:
             pass
 
 def _mint_decimals_from_data(b: bytes) -> Optional[int]:
-    """
-    SPL Mint layout (Token-2022 and Token-2020 compatible for decimals):
-    - decimals is at byte offset 44 (u8)
-    """
     try:
         if len(b) >= 45:
             return int(b[44])
@@ -561,25 +495,9 @@ def _mint_decimals_from_data(b: bytes) -> Optional[int]:
     return None
 
 async def _decimals_from_tokens_api(mint: str) -> Optional[int]:
-    """
-    Fallback: pull decimals from Jupiter's token list once and cache it.
-    Uses the same base + headers as our quote/swap calls, and the Worker
-    rewrites /v6/tokens -> /swap/v1/tokens.
-    """
-    # If already indexed, read from cache
-    if _TOK_META:
-        meta = _TOK_META.get(mint)
-        if not meta:
-            return None
-        try:
-            d = int(meta.get("decimals"))
-            return d if 0 <= d <= 18 else None
-        except Exception:
-            return None
-
-    # Fetch & index once
+    # Fetch Jupiter token list via fallback bases (GET /v6/tokens)
     try:
-        js = await _get_json(_build_jup_endpoint("tokens"), headers=_jup_headers(), timeout=HTTP_TIMEOUT_GET)
+        js = await _http_get_with_fallback("tokens", params={}, timeout=HTTP_TIMEOUT_GET)
         if isinstance(js, list):
             for t in js:
                 try:
@@ -590,7 +508,6 @@ async def _decimals_from_tokens_api(mint: str) -> Optional[int]:
                     continue
     except Exception:
         return None
-
     meta = _TOK_META.get(mint)
     if not meta:
         return None
@@ -601,26 +518,14 @@ async def _decimals_from_tokens_api(mint: str) -> Optional[int]:
         return None
 
 async def _get_decimals(mint: str) -> Optional[int]:
-    """
-    Return SPL token decimals for a mint, with:
-      1) Known-override table (SOL/USDC/USDT)
-      2) Local cache
-      3) RPC getAccountInfo (read decimals @ offset 44)
-      4) Jupiter tokens fallback (one-shot index)
-    Caches valid results.
-    """
-    # 1) Known overrides
     k = _KNOWN_DECIMALS.get(mint)
     if k is not None:
         _DECIMALS[mint] = k
         return k
-
-    # 2) Cache
     d = _DECIMALS.get(mint)
     if d is not None:
         return d
 
-    # 3) RPC probe in a thread
     def _rpc_probe() -> Optional[int]:
         try:
             js = _rpc_post("getAccountInfo", [mint, {"encoding": "base64"}])
@@ -637,8 +542,6 @@ async def _get_decimals(mint: str) -> Optional[int]:
         return None
 
     dec = await asyncio.to_thread(_rpc_probe)
-
-    # Validate; if odd or missing -> 4) Jupiter tokens fallback
     if dec is None or dec < 0 or dec > 18:
         try:
             dec = await _decimals_from_tokens_api(mint)
@@ -646,26 +549,17 @@ async def _get_decimals(mint: str) -> Optional[int]:
                 log.every("dec.fallback", n=20, msg="DEC_FALLBACK_TOKENS", mint=mint, decimals=dec)
         except Exception:
             dec = None
-
-    # Cache only sane values
     if dec is not None and 0 <= dec <= 18:
         _DECIMALS[mint] = int(dec)
         return int(dec)
-
-    # Give the caller a chance to handle “unknown”
     return None
 
-# Public export (used by main.py and others)
 async def get_decimals(mint: str) -> Optional[int]:
-    """Return SPL token decimals for a mint (cached, with fallbacks)."""
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
     return await _get_decimals(mint)
 
 async def _get_signature_status(sig: str) -> Optional[dict]:
-    """
-    Lightweight signature status lookup (no history scan).
-    """
     def _call() -> Optional[dict]:
         try:
             js = _rpc_post("getSignatureStatuses", [[sig], {"searchTransactionHistory": False}])
@@ -675,16 +569,15 @@ async def _get_signature_status(sig: str) -> Optional[dict]:
         except Exception:
             pass
         return None
-
     return await asyncio.to_thread(_call)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Dynamic priority fee controller (optional QuickNode hints)
+# Priority fee controller
 # ──────────────────────────────────────────────────────────────────────────────
 def _to_sol_from_lamports_like(x: float) -> float:
     lamports = float(x)
     if lamports >= 1e9:
-        lamports = lamports / 1e6  # micro-lamports -> lamports
+        lamports = lamports / 1e6  # micro-lamports → lamports
     return lamports / 1e9
 
 QN_PRIORITY_HINT   = _envb("QN_PRIORITY_HINT", False)
@@ -725,15 +618,15 @@ def _qn_priority_seed_blocking() -> Optional[float]:
 
 class DynPriority:
     def __init__(self) -> None:
-        base = _envf("PF_PRIORITY_SOL", 0.002)
+        base = _envf("PF_PRIORITY_SOL", 0.0015)
         self.enabled        = _envb("PF_PRIORITY_DYNAMIC", True)
-        self.target_sec     = _envf("PF_PRIORITY_TARGET_SEC", 2.0)
+        self.target_sec     = _envf("PF_PRIORITY_TARGET_SEC", 1.2)
         self.step_up        = _envf("PF_PRIORITY_STEP_UP", 1.50)
         self.step_down      = _envf("PF_PRIORITY_STEP_DOWN", 0.85)
         self.min_sol        = _envf("PF_PRIORITY_MIN_SOL", max(0.0, base * 0.5))
-        self.max_sol        = _envf("PF_PRIORITY_MAX_SOL", max(self.min_sol, base * 5))
+        self.max_sol        = _envf("PF_PRIORITY_MAX_SOL", max(self.min_sol, 0.04))
         self.current_sol    = max(self.min_sol, min(self.max_sol, base))
-        self._pending: Dict[str, float] = {}  # sig -> t0
+        self._pending: Dict[str, float] = {}
         self._seed_task: Optional[asyncio.Task[None]] = None
 
     async def start(self) -> None:
@@ -780,6 +673,7 @@ class DynPriority:
 
     async def _watch(self, sig: str) -> None:
         deadline = time.time() + 45
+        poll = max(0.2, _envf("PF_STATUS_POLL_SEC", 0.6))
         while time.time() < deadline:
             try:
                 st = await _get_signature_status(sig)
@@ -794,7 +688,7 @@ class DynPriority:
                     return
             except Exception:
                 pass
-            await asyncio.sleep(max(0.2, _envf("PF_STATUS_POLL_SEC", 0.9)))
+            await asyncio.sleep(poll)
         self._pending.pop(sig, None)
         self._tune(self.target_sec * 2.0, had_error=False)
 
@@ -813,28 +707,27 @@ class DynPriority:
 _PRIO = DynPriority()
 
 async def start() -> None:
-    """Optional background seeding (idempotent)."""
     await _PRIO.start()
 
 async def shutdown() -> None:
-    """No-op for compatibility (no aiohttp session to close)."""
     return None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Jupiter pacing
+# Low-level Jupiter helpers (with fallback)
 # ──────────────────────────────────────────────────────────────────────────────
-async def _jup_gate() -> None:
-    global _JUP_LAST_TS
-    async with _JUP_RATE_LOCK:
-        now = time.time()
-        wait_for = _JUP_MIN_INTERVAL - (now - _JUP_LAST_TS)
-        if wait_for > 0:
-            await asyncio.sleep(wait_for)
-        _JUP_LAST_TS = time.time()
+def _slippage_bps() -> int:
+    v = os.getenv("PF_SLIPPAGE_BPS")
+    if v:
+        try:
+            return max(1, int(v))
+        except Exception:
+            pass
+    s = _envf("JUPITER_MAX_SLIPPAGE", 0.006)  # fraction -> default 0.6% (60 bps) if env matches your PF
+    return max(1, int(round(s * 10_000)))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Quote cache / single-flight
-# ──────────────────────────────────────────────────────────────────────────────
+def _as_legacy() -> bool:
+    return (os.getenv("JUP_AS_LEGACY", "0") or "0").strip().lower() in {"1", "true", "yes", "y"}
+
 def _qkey(input_mint: str, output_mint: str, amount_iu: int, slippage_bps: int, swap_mode: str, direct: bool, legacy: bool) -> str:
     return f"{input_mint}:{output_mint}:{amount_iu}:{slippage_bps}:{swap_mode}:{int(direct)}:{int(legacy)}"
 
@@ -858,7 +751,7 @@ async def _singleflight_quote(key: str, maker: Callable[[], Any]) -> dict:
     async with _quote_lock:
         fut = _QUOTE_FLIGHT.get(key)
         if fut is None:
-            fut = asyncio.ensure_future(maker())  # maker returns a coroutine
+            fut = asyncio.ensure_future(maker())
             _QUOTE_FLIGHT[key] = fut
     try:
         return await fut
@@ -866,9 +759,6 @@ async def _singleflight_quote(key: str, maker: Callable[[], Any]) -> dict:
         async with _quote_lock:
             _QUOTE_FLIGHT.pop(key, None)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Low-level Jupiter helpers (with proxy + API key)
-# ──────────────────────────────────────────────────────────────────────────────
 async def _jup_quote(
     input_mint: str,
     output_mint: str,
@@ -880,7 +770,6 @@ async def _jup_quote(
 ) -> dict:
     if amount_iu <= 0:
         raise ValueError("amount_iu must be > 0")
-
     _assert_pubkey(input_mint, "inputMint")
     _assert_pubkey(output_mint, "outputMint")
 
@@ -905,14 +794,7 @@ async def _jup_quote(
                 "swapMode": swap_mode,
                 "onlyDirectRoutes": "true" if only_direct else "false",
             }
-            headers = _jup_headers()
-
-            if JUP_IS_QN_CALL:
-                # QuickNode /call prefers POST; carry params in query string.
-                js = await _post_json(JUP_QUOTE_URL, json_body=None, params=params, timeout=HTTP_TIMEOUT_POST, headers=headers)
-            else:
-                js = await _get_json(JUP_QUOTE_URL, params=params, timeout=HTTP_TIMEOUT_GET, headers=headers)
-
+            js = await _http_get_with_fallback("quote", params=params, timeout=HTTP_TIMEOUT_GET)
             await _set_cached_quote(key, js, QUOTE_TTL_SEC)
             return js
         finally:
@@ -925,7 +807,6 @@ async def _jup_quote(
 
 async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optional[int]) -> str:
     await _jup_gate()
-
     body = {
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": True,
@@ -936,59 +817,18 @@ async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optiona
     if priority_lamports is not None:
         body["prioritizationFeeLamports"] = int(priority_lamports)
 
-    js = await _post_json(JUP_SWAP_URL, json_body=body, timeout=HTTP_TIMEOUT_POST, headers=_jup_headers())
+    js = await _http_post_with_fallback("swap", json_body=body, params=None, timeout=HTTP_TIMEOUT_POST)
     tx_b64 = js.get("swapTransaction")
     if not tx_b64:
         raise RuntimeError(f"Jupiter returned no swapTransaction: {js}")
     return tx_b64
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public quote & price helpers (hardened tiny-amount handling)
+# Public quote & price helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _min_probe_raw(dec: int) -> int:
-    """
-    Use a safe tiny ExactIn size that DEXes accept.
-    For 6-decimal tokens (USDC), 0.01 UI = 10^(6-2) = 10_000.
-    """
-    if dec is None or dec < 0:
-        return 1
-    return max(1, 10 ** max(0, dec - 2))
-
-async def _safe_price_probe(norm_mint: str, dec: int) -> Optional[tuple[dict, int]]:
-    """
-    Try up to 3 sizes to avoid 400s on dust amounts:
-      - 0.01 UI
-      - 0.10 UI
-      - 1.00 UI
-    Returns (quote_json, raw_in) or None.
-    """
-    candidates = [
-        _min_probe_raw(dec),                      # ~0.01 UI
-        max(1, 10 ** max(0, dec - 1)),           # ~0.10 UI
-        max(1, 10 ** max(0, dec)),               # 1.00 UI
-    ]
-    last_err = None
-    for raw_in in candidates:
-        try:
-            q = await _retry(
-                _jup_quote, norm_mint, SOL_MINT, raw_in,
-                tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-price",
-            )
-            return q, raw_in
-        except Exception as e:
-            last_err = e
-            # keep trying larger sizes
-            continue
-    # all failed
-    if last_err:
-        log.every("price.probe.err", n=20, msg="PRICE_PROBE_FAIL", mint=norm_mint, err=str(last_err))
-    return None
-
 async def get_sell_quote(*, mint: str, amount_raw: int, slippage_bps: Optional[int] = None) -> Dict[str, Any]:
     if amount_raw <= 0:
         raise ValueError("amount_raw must be > 0")
-
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
 
@@ -1034,105 +874,7 @@ async def get_buy_quote(
     ui = out_raw / (10 ** dec) if (dec is not None and dec >= 0) else 0.0
     return {**q, "lamports_in": lamports_in, "out_amount_raw": out_raw, "out_amount_ui": ui, "decimals": dec}
 
-# In utils_pkg/router.py (replace your current get_price_ui)
-async def get_price_ui(mint: str) -> float:
-    """
-    Price of 1 token (UI units) in SOL.
-    Strategy:
-      A) Primary: quote SOL -> token with a small, non-dust SOL amount (e.g., 0.01 SOL),
-         then invert: px = (SOL_in_UI / token_out_UI).
-      B) Fallback: tiny token -> SOL quote (your existing path) only if A fails.
-    Never raises; returns 0.0 on failure.
-    """
-    raw = (mint or "").strip()
-    if not raw:
-        return 0.0
-    if _bl_get(raw):
-        return 0.0
-
-    # Normalize & decimals
-    try:
-        norm = _sanitize_mint(raw)
-    except Exception:
-        _bl_set(raw)
-        log.every("price.bad", n=20, msg="PRICE_BAD_ID", raw=raw)
-        return 0.0
-
-    dec = await _get_decimals(norm)
-    if dec is None or dec < 0 or dec > 18:
-        _bl_set(raw)
-        log.every("price.nodec", n=20, msg="PRICE_NO_DECIMALS", raw=raw, norm=norm)
-        return 0.0
-
-    # Cache hit?
-    if PRICE_TTL_SEC > 0:
-        rec = _PRICE_CACHE.get(norm)
-        if rec and rec[0] >= time.time():
-            return float(rec[1])
-
-    # --- A) Primary: SOL -> token, invert ---
-    try:
-        # 0.01 SOL (adjustable via env if you want)
-        sol_in_lamports = int(0.01 * LAMPORTS_PER_SOL)
-        q = await _retry(
-            _jup_quote, SOL_MINT, norm, sol_in_lamports,
-            tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="price-sol2tok",
-        )
-        out_raw = int(q.get("outAmount") or "0")
-        if out_raw > 0:
-            out_ui = out_raw / (10 ** dec)
-            if out_ui > 0:
-                px = (sol_in_lamports / LAMPORTS_PER_SOL) / out_ui  # SOL per 1 token
-                if PRICE_TTL_SEC > 0:
-                    _PRICE_CACHE[norm] = (time.time() + PRICE_TTL_SEC, px)
-                return px
-    except Exception:
-        pass  # Fall through to B
-
-    # --- B) Fallback: tiny token -> SOL (your previous logic) ---
-    tiny_raw = max(10 ** max(0, dec - 2), 50_000)
-    try:
-        q = await _retry(
-            _jup_quote, norm, SOL_MINT, tiny_raw,
-            tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="price-tok2sol",
-        )
-        lamports = int(q.get("outAmount") or "0")
-        if lamports <= 0:
-            _bl_set(raw)
-            return 0.0
-        sol_out = lamports / LAMPORTS_PER_SOL
-        tokens_ui = tiny_raw / (10 ** dec)
-        px = sol_out / tokens_ui if tokens_ui > 0 else 0.0
-        if PRICE_TTL_SEC > 0:
-            _PRICE_CACHE[norm] = (time.time() + PRICE_TTL_SEC, px)
-        return px
-    except Exception:
-        _bl_set(raw)
-        return 0.0
-
-# Compat aliases
-async def price_of_ui(mint: str) -> float:
-    return await get_price_ui(mint)
-
-async def price_of(mint: str) -> float:
-    return await get_price_ui(mint)
-
-# Minimal public helper (used by main.py to log decimals cleanly)
-async def mint_decimals(mint: str) -> Optional[int]:
-    mint = _sanitize_mint(mint)
-    _assert_pubkey(mint, "mint")
-    return await _get_decimals(mint)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Price helper: adaptive tiny-quote ladder (token → SOL)
-# ──────────────────────────────────────────────────────────────────────────────
-
 def _price_probe_amounts(dec: int) -> list[int]:
-    """
-    Return a descending ladder of raw token amounts corresponding to roughly:
-      [1.0, 0.1, 0.01, 0.001] UI units, clamped to >= 1.
-    This avoids 400s on too-small probes for some pools.
-    """
     steps_ui = [1.0, 0.1, 0.01, 0.001]
     vals = []
     for ui in steps_ui:
@@ -1144,11 +886,8 @@ def _price_probe_amounts(dec: int) -> list[int]:
 
 async def get_price_ui(mint: str) -> float:
     """
-    Return the SOL price per 1.0 UI token of 'mint'.
-    - Accepts Pump/BONK ids or real mints (uses normalize_mint).
-    - Never raises; returns 0.0 on failure.
-    - Uses adaptive tiny-quote ladder to handle pools that reject ultra-tiny quotes.
-    - Caches successful prices per PRICE_TTL_SEC.
+    SOL per 1 token UI. Never raises; 0.0 on failure.
+    Uses adaptive tiny-quote ladder token->SOL with fallback bases.
     """
     raw = (mint or "").strip()
     if not raw:
@@ -1156,7 +895,6 @@ async def get_price_ui(mint: str) -> float:
     if _bl_get(raw):
         return 0.0
 
-    # Normalize to a real mint or bail quietly
     try:
         norm = _sanitize_mint(raw)
     except Exception:
@@ -1164,20 +902,17 @@ async def get_price_ui(mint: str) -> float:
         log.every("price.bad", n=20, msg="PRICE_BAD_ID", raw=raw)
         return 0.0
 
-    # decimals
     dec = await _get_decimals(norm)
     if dec is None or dec < 0 or dec > 18:
         _bl_set(raw)
         log.every("price.nodec", n=20, msg="PRICE_NO_DECIMALS", raw=raw, norm=norm)
         return 0.0
 
-    # Cache hit?
     if PRICE_TTL_SEC > 0:
         rec = _PRICE_CACHE.get(norm)
         if rec and rec[0] >= time.time():
             return float(rec[1])
 
-    # Try a ladder of small exact-in quotes: token -> SOL
     for amt_raw in _price_probe_amounts(dec):
         try:
             q = await _retry(
@@ -1194,10 +929,9 @@ async def get_price_ui(mint: str) -> float:
                 _PRICE_CACHE[norm] = (time.time() + PRICE_TTL_SEC, px)
             return px
         except Exception:
-            # Keep trying smaller probes; if all fail we’ll blacklist below.
             continue
 
-    _bl_set(raw)  # all probes failed
+    _bl_set(raw)
     return 0.0
 
 # Compat aliases
@@ -1207,7 +941,6 @@ async def price_of_ui(mint: str) -> float:
 async def price_of(mint: str) -> float:
     return await get_price_ui(mint)
 
-# Minimal public helper (used by main.py to log decimals cleanly)
 async def mint_decimals(mint: str) -> Optional[int]:
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
@@ -1278,7 +1011,7 @@ async def sell_via_lightning(
     slippage_bps: Optional[int] = None,
     priority_sol: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
-    del token_program  # Jupiter doesn't need this here
+    del token_program  # Jupiter doesn't need this
 
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
@@ -1329,6 +1062,6 @@ __all__ = [
     # mint helpers
     "normalize_pump_id_to_mint", "_is_valid_pubkey_str", "is_valid_pubkey_str",
     "mint_decimals", "get_decimals",
-    # exposed RPC config for legacy callers
+    # exposed RPC config
     "TX_RPC_URL", "TX_COMMITMENT",
 ]
