@@ -885,6 +885,12 @@ def _price_probe_amounts(dec: int) -> list[int]:
     return vals or [1]
 
 async def get_price_ui(mint: str) -> float:
+       # Special-case: 1 SOL = 1 SOL
+    try:
+        if normalize_mint(mint) == SOL_MINT:
+            return 1.0
+    except Exception:
+        pass
     """
     SOL per 1 token UI. Never raises; 0.0 on failure.
     Uses adaptive tiny-quote ladder token->SOL with fallback bases.
