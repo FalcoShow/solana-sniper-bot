@@ -6,6 +6,7 @@ redis>=5,<6
 requests==2.32.3
 python-dotenv==1.0.1
 websockets>=11,<12
+asyncpg==0.29.0
 
 # Solana stack
 solana==0.36.9
