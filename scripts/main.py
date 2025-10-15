@@ -49,12 +49,17 @@ KEYPAIR_JSON=[...] or SOLANA_KEYPAIR_JSON=[...]
 
 # Raydium scanner
 # ENABLE_RAYDIUM_SCANNER (config.py) and PF_POOLS contains "raydium"
+RAYDIUM_SCAN_INTERVAL_SEC=30      # throttle successful scan cycles (adds small jitter)
 
 # Daily PnL rollup
 DAILY_PNL_ENABLED=1
 DAILY_PNL_HOUR_UTC=23
 DAILY_PNL_TEST_NOW=0|1            # 1 = run once right after boot for testing
-# Uses TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID + DATABASE_URL that you already have.
+DAILY_PNL_DEBOUNCE_MIN=10         # never send 2 snapshots within N minutes
+
+# Dedupe TTLs
+PF_GATE_TTL_SEC=60                # default is max(ENTRY_MOMO_WINDOW_SEC*2, 60)
+PF_BUY_TTL_SEC=600                # default buy claim TTL
 """
 
 import asyncio
@@ -238,6 +243,9 @@ def _as_int(val: Any, default: int) -> int:
     except Exception:
         return default
 
+def _env_bool(name: str, default: bool) -> bool:
+    return _as_bool(os.getenv(name, "1" if default else "0"), default)
+
 # ---------------------------
 # Config (env)
 # ---------------------------
@@ -275,9 +283,6 @@ DEBUG_TX          = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
 _POOLS_ENV  = [p.strip().lower() for p in (os.getenv("PF_POOLS") or "").split(",") if p.strip()]
 POOLS_FILTER: set[str] = set(_POOLS_ENV)
 
-# PumpPortal control
-PUMP_SUBSCRIBE_TRADES = _as_bool(os.getenv("PUMP_SUBSCRIBE_TRADES", "1"), True)
-
 # Daily PnL env
 DAILY_PNL_ENABLED   = _as_bool(os.getenv("DAILY_PNL_ENABLED", "1"), True)
 DAILY_PNL_HOUR_UTC  = _as_int(os.getenv("DAILY_PNL_HOUR_UTC", "23"), 23)
@@ -285,6 +290,12 @@ DAILY_PNL_TEST_NOW  = _as_bool(os.getenv("DAILY_PNL_TEST_NOW", "0"), False)
 DAILY_PNL_CHAT_ID   = (os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 DAILY_PNL_BOT       = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 PG_DSN              = os.getenv("DATABASE_URL", "")
+
+# Scanner + dedupe tuning
+RAYDIUM_SCAN_INTERVAL_SEC = _as_float(os.getenv("RAYDIUM_SCAN_INTERVAL_SEC", "30"), 30.0)
+PF_GATE_TTL_SEC     = _as_int(os.getenv("PF_GATE_TTL_SEC", str(max(_as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC","10"),10)*2, 60))), max(ENTRY_MOMO_WINDOW_SEC*2, 60))
+PF_BUY_TTL_SEC      = _as_int(os.getenv("PF_BUY_TTL_SEC", "600"), 600)
+DAILY_PNL_DEBOUNCE_MIN = _as_int(os.getenv("DAILY_PNL_DEBOUNCE_MIN", "10"), 10)
 
 # ---------------------------
 # Small helpers
@@ -518,24 +529,22 @@ class Strategy:
             except Exception:
                 if DEBUG_TX:
                     traceback.print_exc()
-        m_raw = str(_get_first(raw_event, "mint", "mintAddress", "mint_address", "id", default="")).strip()
-        if not m_raw:
+        m = str(_get_first(raw_event, "mint", "mintAddress", "mint_address", "id", default="")).strip()
+        if not m:
             return
-        m_norm = _normalize_from_source(m_raw)
-        # increment momentum trade counter using the normalized gate key
-        st = self._gate_state.get(m_norm) or self._gate_state.get(m_raw)
+        st = self._gate_state.get(m)
         if st is not None:
             st["trades"] = int(st.get("trades", 0)) + 1
 
     async def _gate_candidate(self, ui: Dict[str, Any], mint_raw: str, mint_norm: str) -> None:
-        gate_key = mint_norm  # use normalized mint for all gate state + dedupe keys
+        gate_key = mint_norm  # use normalized mint for gate and dedupe keys
         async with self._gate_sema:
             if DEDUPE_ENABLED:
-                if not claim_once(f"gate:{gate_key}", ttl=int(max(ENTRY_MOMO_WINDOW_SEC * 2, 60))):
+                if not claim_once(f"gate:{gate_key}", ttl=int(PF_GATE_TTL_SEC)):
                     if DEBUG_TX:
                         print(f".[dedupe] gate already running for {gate_key} — skip", flush=True)
                     return
-            self._gate_state[gate_key] = {"trades": 0, "price0": 0.0}
+            self._gate_state[mint_raw] = {"trades": 0, "price0": 0.0}
             price0 = 0.0
             if _is_probable_mint(mint_norm):
                 for _ in range(max(1, ENTRY_MOMO_PRICE_TRIES)):
@@ -546,9 +555,9 @@ class Strategy:
                     if price0 > 0:
                         break
                     await asyncio.sleep(ENTRY_MOMO_PRICE_DELAY_S)
-            self._gate_state[gate_key]["price0"] = price0
+            self._gate_state[mint_raw]["price0"] = price0
             await asyncio.sleep(max(1, ENTRY_MOMO_WINDOW_SEC))
-            st = self._gate_state.get(gate_key, {})
+            st = self._gate_state.get(mint_raw, {})
             trades = int(st.get("trades", 0))
             price1 = 0.0
             if _is_probable_mint(mint_norm):
@@ -563,7 +572,7 @@ class Strategy:
             trades_ok = trades >= ENTRY_MOMO_MIN_TRADES
             log.event(
                 "MOMO_EVAL",
-                mint=mint_norm,
+                mint=mint_raw,
                 trades=trades,
                 price0=price0,
                 price1=price1,
@@ -572,7 +581,7 @@ class Strategy:
                 up_ok=int(up_ok),
                 trades_ok=int(trades_ok),
             )
-            self._gate_state.pop(gate_key, None)
+            self._gate_state.pop(mint_raw, None)
 
             # guardrails before buy
             if not buys_allowed() or PAUSE_TRADING:
@@ -592,8 +601,7 @@ class Strategy:
                     pass
 
             if trades_ok and up_ok:
-                # dedupe buy on normalized mint
-                if DEDUPE_ENABLED and not claim_once(f"buy:{mint_norm}", ttl=600):
+                if DEDUPE_ENABLED and not claim_once(f"buy:{mint_norm}", ttl=int(PF_BUY_TTL_SEC)):
                     if DEBUG_TX:
                         print(f".[dedupe] buy already claimed for {mint_norm} — skip", flush=True)
                     record_buy_result(ok=False, reason="buy_claimed_elsewhere")
@@ -687,9 +695,10 @@ class Strategy:
         symbol = ui.get("symbol", "") or "?"
         print(f"[trade] pool={pool} symbol={symbol} mint={mint_norm}", flush=True)
 
+        # momentum or direct buy
         if DEDUPE_ENABLED and ENTRY_MOMENTUM_ENABLED:
-            # dedupe gate proposal on normalized mint to avoid suffix/alias collisions
-            if not claim_once(f"gate-propose:{mint_norm}", ttl=int(max(ENTRY_MOMO_WINDOW_SEC * 2, 90))):
+            # use normalized key and new TTL for “gate-propose” too
+            if not claim_once(f"gate-propose:{mint_norm}", ttl=int(PF_GATE_TTL_SEC)):
                 if DEBUG_TX:
                     print(f".[dedupe] gate-propose taken for {mint_norm} — skip", flush=True)
                 return
@@ -697,8 +706,7 @@ class Strategy:
         if ENTRY_MOMENTUM_ENABLED:
             asyncio.create_task(self._gate_candidate(ui, mint_source, mint_norm))
         else:
-            # no momentum path: dedupe buy on normalized mint
-            if DEDUPE_ENABLED and not claim_once(f"buy:{mint_norm}", ttl=600):
+            if DEDUPE_ENABLED and not claim_once(f"buy:{mint_norm}", ttl=int(PF_BUY_TTL_SEC)):
                 if DEBUG_TX:
                     print(f".[dedupe] buy already claimed for {mint_norm} — skip", flush=True)
                 return
@@ -934,7 +942,15 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
 
     await _pnl_pg_ensure_table()
 
+    _last_sent_ts: Optional[float] = None
+
     async def _once():
+        nonlocal _last_sent_ts
+        now_ts = _dt.datetime.now(_dt.timezone.utc).timestamp()
+        if _last_sent_ts and (now_ts - _last_sent_ts) < (DAILY_PNL_DEBOUNCE_MIN * 60):
+            log.event("DAILY_PNL_DEBOUNCE_SKIP", since_sec=int(now_ts - _last_sent_ts))
+            return
+
         unrl_sol, open_n, unrl_details = await _estimate_unrealized_from_positions()
         realized_sol, r_meta = await _estimate_realized_today()
         wallet_sol = await _get_wallet_sol_balance()
@@ -958,6 +974,7 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
             wallet_sol=wallet_sol,
             notes=notes,
         )
+        _last_sent_ts = now_ts
         await _telegram_send(hdr + body + footer)
 
         log.event(
@@ -1008,7 +1025,7 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
         except Exception:
             return "<uri?>"
 
-    subscribe_trades_flag = PUMP_SUBSCRIBE_TRADES
+    subscribe_trades_flag = _env_bool("PUMP_SUBSCRIBE_TRADES", True)
 
     if hasattr(PumpPortalClient, "__aenter__"):
         # context-managed path
@@ -1107,6 +1124,11 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                 first_log = False
             await scan_raydium()  # reads env itself
             log.event("SCAN_RAYDIUM_RETURNED")
+            # Throttle successful runs to avoid hammering the upstream
+            if RAYDIUM_SCAN_INTERVAL_SEC > 0:
+                # add 0–15% jitter, mildly process-differentiated
+                jitter = 0.15 * RAYDIUM_SCAN_INTERVAL_SEC * (os.getpid() % 7) / 6.0
+                await asyncio.sleep(RAYDIUM_SCAN_INTERVAL_SEC + jitter)
             backoff = 2.0
         except asyncio.CancelledError:
             log.event("SCAN_RAYDIUM_CANCELLED")
@@ -1157,6 +1179,7 @@ async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asynci
 def _boot_banner() -> None:
     pools = ",".join(sorted(POOLS_FILTER)) if POOLS_FILTER else "<all>"
     effective_dryrun = _dryrun_env_on() or bool(_pkg_is_dryrun)
+    pump_trades = _env_bool("PUMP_SUBSCRIBE_TRADES", True)
     print(
         "\n=== 🟢 sniper main boot ===\n"
         f"DRYRUN={effective_dryrun}\n"
@@ -1164,7 +1187,7 @@ def _boot_banner() -> None:
         f"MOMO: on={int(ENTRY_MOMENTUM_ENABLED)} window={ENTRY_MOMO_WINDOW_SEC}s "
         f"min_trades={ENTRY_MOMO_MIN_TRADES} min_up={ENTRY_MOMO_MIN_UP_PCT}%\n"
         f"LIQ_FILTER={int(LIQ_FILTER_ENABLED)} | EXIT_ENGINE={int(EXIT_ENGINE_ENABLED)} | MAX_TRADEABLE={MAX_TRADEABLE}\n"
-        f"POOLS={pools} | PUMP_TRADES={int(PUMP_SUBSCRIBE_TRADES)}\n"
+        f"POOLS={pools} | PUMP_TRADES={int(pump_trades)}\n"
         "===========================\n",
         flush=True,
     )
