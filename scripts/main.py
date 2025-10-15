@@ -773,18 +773,22 @@ def _fmt_sol(x: Optional[float]) -> str:
 
 async def _telegram_send(text: str) -> None:
     if not DAILY_PNL_BOT or not DAILY_PNL_CHAT_ID or not httpx:
+        log.event("DAILY_PNL_TG_SKIP", reason="missing_cfg_or_httpx")
         return
     try:
         url = f"https://api.telegram.org/bot{DAILY_PNL_BOT}/sendMessage"
         payload = {"chat_id": DAILY_PNL_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
         async with httpx.AsyncClient(timeout=15) as cli:
-            await cli.post(url, json=payload)
-    except Exception:
+            r = await cli.post(url, json=payload)
+            log.event("DAILY_PNL_TG_SENT", http_status=getattr(r, "status_code", None))
+    except Exception as e:
         if DEBUG_TX:
             traceback.print_exc()
+        log.event("DAILY_PNL_TG_ERROR", error=str(e))
 
 async def _pnl_pg_ensure_table() -> None:
     if not asyncpg or not PG_DSN:
+        log.event("DAILY_PNL_PG_SKIP", reason="no_asyncpg_or_dsn")
         return
     try:
         conn = await asyncpg.connect(PG_DSN)
@@ -801,16 +805,19 @@ async def _pnl_pg_ensure_table() -> None:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
             """)
+            log.event("DAILY_PNL_PG_READY")
         finally:
             await conn.close()
-    except Exception:
+    except Exception as e:
         if DEBUG_TX:
             traceback.print_exc()
+        log.event("DAILY_PNL_PG_ERROR", when="ensure_table", error=str(e))
 
 async def _pnl_pg_insert_row(*, realized_sol: float, unrealized_sol: float,
                              open_positions: int, wallet_sol: Optional[float],
                              notes: Dict[str, Any]) -> None:
     if not asyncpg or not PG_DSN:
+        log.event("DAILY_PNL_PG_SKIP", reason="no_asyncpg_or_dsn")
         return
     try:
         conn = await asyncpg.connect(PG_DSN)
@@ -819,11 +826,15 @@ async def _pnl_pg_insert_row(*, realized_sol: float, unrealized_sol: float,
                 INSERT INTO daily_pnl (at_utc, realized_sol, unrealized_sol, open_positions, wallet_sol, notes)
                 VALUES (NOW() AT TIME ZONE 'UTC', $1, $2, $3, $4, $5::jsonb)
             """, realized_sol, unrealized_sol, open_positions, wallet_sol, json.dumps(notes))
+            log.event("DAILY_PNL_PG_INSERTED",
+                      realized_sol=realized_sol, unrealized_sol=unrealized_sol,
+                      open_positions=open_positions)
         finally:
             await conn.close()
-    except Exception:
+    except Exception as e:
         if DEBUG_TX:
             traceback.print_exc()
+        log.event("DAILY_PNL_PG_ERROR", when="insert_row", error=str(e))
 
 async def _get_wallet_sol_balance() -> Optional[float]:
     # Best-effort — if you have a wallet util, we use it; otherwise None.
@@ -919,7 +930,7 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
         realized_sol, r_meta = await _estimate_realized_today()
         wallet_sol = await _get_wallet_sol_balance()
 
-        now = _dt.datetime.utcnow().replace(tzinfo=_dt.timezone.utc)
+        now = _dt.datetime.now(_dt.timezone.utc)
         hdr = f"📊 <b>Daily PnL</b> — {now.strftime('%Y-%m-%d')} (UTC)"
         body = (
             f"\nRealized: <b>{_fmt_sol(realized_sol)}</b>"
@@ -955,7 +966,7 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
 
     # schedule daily at the requested UTC hour
     while not stop_evt.is_set():
-        now = _dt.datetime.utcnow()
+        now = _dt.datetime.now(_dt.timezone.utc)
         run_at = now.replace(hour=DAILY_PNL_HOUR_UTC, minute=0, second=0, microsecond=0)
         if run_at <= now:
             run_at = run_at + _dt.timedelta(days=1)
@@ -988,26 +999,53 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
         except Exception:
             return "<uri?>"
 
+    subscribe_trades_flag = _as_bool(os.getenv("PUMP_SUBSCRIBE_TRADES", "1"), True)
+
     if hasattr(PumpPortalClient, "__aenter__"):
-        async with PumpPortalClient() as client:  # type: ignore[misc]
-            print("[main] Connecting:", _mask_uri(client), flush=True)
-            async for ev in client.events():
-                if stop_evt and stop_evt.is_set():
-                    break
-                try:
-                    kind = ev.get("kind")
-                    raw = ev.get("raw", {}) or {}
-                    if kind == "new_token":
-                        await strat.on_new_token(raw)
-                    elif kind == "trade":
-                        await strat.on_trade(raw)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    print("[main] event handling error:", flush=True)
-                    traceback.print_exc()
+        # context-managed path
+        try:
+            async with PumpPortalClient(subscribe_trades=subscribe_trades_flag) as client:  # type: ignore[misc]
+                print("[main] Connecting:", _mask_uri(client), flush=True)
+                async for ev in client.events():
+                    if stop_evt and stop_evt.is_set():
+                        break
+                    try:
+                        kind = ev.get("kind")
+                        raw = ev.get("raw", {}) or {}
+                        if kind == "new_token":
+                            await strat.on_new_token(raw)
+                        elif kind == "trade":
+                            await strat.on_trade(raw)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        print("[main] event handling error:", flush=True)
+                        traceback.print_exc()
+        except TypeError:
+            # Older client without the kwarg; fall back
+            async with PumpPortalClient() as client:  # type: ignore[misc]
+                print("[main] Connecting:", _mask_uri(client), flush=True)
+                async for ev in client.events():
+                    if stop_evt and stop_evt.is_set():
+                        break
+                    try:
+                        kind = ev.get("kind")
+                        raw = ev.get("raw", {}) or {}
+                        if kind == "new_token":
+                            await strat.on_new_token(raw)
+                        elif kind == "trade":
+                            await strat.on_trade(raw)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        print("[main] event handling error:", flush=True)
+                        traceback.print_exc()
     else:
-        client = PumpPortalClient()  # may raise if not available
+        # non-context path
+        try:
+            client = PumpPortalClient(subscribe_trades=subscribe_trades_flag)  # may raise if unsupported
+        except TypeError:
+            client = PumpPortalClient()
         print("[main] Connecting:", _mask_uri(client), flush=True)
         try:
             async for ev in client.events():
