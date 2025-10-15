@@ -276,12 +276,17 @@ def _approx_minutes_since(ts_any: Any) -> Optional[float]:
     return None
 
 def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
+    pool = str((_get_first(msg, "pool", default="") or "")).strip().lower()
+    is_raydium = (pool == "raydium")
+
     typ = str(_get_first(msg, "txType", "type", default="")).strip().lower()
-    if typ != "create":
+    # Pump has txType=create; Raydium feed usually doesn't—so only enforce for non-Raydium.
+    if not is_raydium and typ != "create":
         return False
 
     init_buy = _as_float(_get_first(msg, "initialBuy", "initial_buy", default=0.0), 0.0)
-    if init_buy < MIN_INITIAL_BUY_SOL:
+    # Raydium entries won't have initialBuy—only enforce this for non-Raydium.
+    if not is_raydium and init_buy < MIN_INITIAL_BUY_SOL:
         if DEBUG_TX:
             print(f".[filter] initialBuy {init_buy} < min {MIN_INITIAL_BUY_SOL} — skip", flush=True)
         return False
