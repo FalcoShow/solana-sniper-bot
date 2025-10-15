@@ -97,6 +97,19 @@ except Exception:  # pragma: no cover
     _mg_normalize = None  # type: ignore
     _mg_prob = None  # type: ignore
 
+def _dryrun_env_on() -> bool:
+    v = (os.getenv("IS_DRYRUN") or os.getenv("DRYRUN") or "").strip().lower()
+    return v in {"1", "true", "yes", "on"}
+
+# then in Strategy._gate_candidate() where we would buy:
+if _dryrun_env_on():
+    log.event("BUY_SKIPPED_DRYRUN", mint=mint_norm)
+    record_buy_result(ok=False, reason="dryrun_skip")
+else:
+    async with self._sema:
+        tx_sig = await maybe_buy(mint=mint_norm, ui=ui)
+    ...
+# and in the non-momentum path before maybe_buy(...), same guard
 # ---------------------------
 # Event source + trading hooks
 # ---------------------------
