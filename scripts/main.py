@@ -275,6 +275,9 @@ DEBUG_TX          = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
 _POOLS_ENV  = [p.strip().lower() for p in (os.getenv("PF_POOLS") or "").split(",") if p.strip()]
 POOLS_FILTER: set[str] = set(_POOLS_ENV)
 
+# PumpPortal control
+PUMP_SUBSCRIBE_TRADES = _as_bool(os.getenv("PUMP_SUBSCRIBE_TRADES", "1"), True)
+
 # Daily PnL env
 DAILY_PNL_ENABLED   = _as_bool(os.getenv("DAILY_PNL_ENABLED", "1"), True)
 DAILY_PNL_HOUR_UTC  = _as_int(os.getenv("DAILY_PNL_HOUR_UTC", "23"), 23)
@@ -515,21 +518,24 @@ class Strategy:
             except Exception:
                 if DEBUG_TX:
                     traceback.print_exc()
-        m = str(_get_first(raw_event, "mint", "mintAddress", "mint_address", "id", default="")).strip()
-        if not m:
+        m_raw = str(_get_first(raw_event, "mint", "mintAddress", "mint_address", "id", default="")).strip()
+        if not m_raw:
             return
-        st = self._gate_state.get(m)
+        m_norm = _normalize_from_source(m_raw)
+        # increment momentum trade counter using the normalized gate key
+        st = self._gate_state.get(m_norm) or self._gate_state.get(m_raw)
         if st is not None:
             st["trades"] = int(st.get("trades", 0)) + 1
 
     async def _gate_candidate(self, ui: Dict[str, Any], mint_raw: str, mint_norm: str) -> None:
+        gate_key = mint_norm  # use normalized mint for all gate state + dedupe keys
         async with self._gate_sema:
             if DEDUPE_ENABLED:
-                if not claim_once(f"gate:{mint_raw}", ttl=int(max(ENTRY_MOMO_WINDOW_SEC * 2, 60))):
+                if not claim_once(f"gate:{gate_key}", ttl=int(max(ENTRY_MOMO_WINDOW_SEC * 2, 60))):
                     if DEBUG_TX:
-                        print(f".[dedupe] gate already running for {mint_raw} — skip", flush=True)
+                        print(f".[dedupe] gate already running for {gate_key} — skip", flush=True)
                     return
-            self._gate_state[mint_raw] = {"trades": 0, "price0": 0.0}
+            self._gate_state[gate_key] = {"trades": 0, "price0": 0.0}
             price0 = 0.0
             if _is_probable_mint(mint_norm):
                 for _ in range(max(1, ENTRY_MOMO_PRICE_TRIES)):
@@ -540,9 +546,9 @@ class Strategy:
                     if price0 > 0:
                         break
                     await asyncio.sleep(ENTRY_MOMO_PRICE_DELAY_S)
-            self._gate_state[mint_raw]["price0"] = price0
+            self._gate_state[gate_key]["price0"] = price0
             await asyncio.sleep(max(1, ENTRY_MOMO_WINDOW_SEC))
-            st = self._gate_state.get(mint_raw, {})
+            st = self._gate_state.get(gate_key, {})
             trades = int(st.get("trades", 0))
             price1 = 0.0
             if _is_probable_mint(mint_norm):
@@ -557,7 +563,7 @@ class Strategy:
             trades_ok = trades >= ENTRY_MOMO_MIN_TRADES
             log.event(
                 "MOMO_EVAL",
-                mint=mint_raw,
+                mint=mint_norm,
                 trades=trades,
                 price0=price0,
                 price1=price1,
@@ -566,7 +572,7 @@ class Strategy:
                 up_ok=int(up_ok),
                 trades_ok=int(trades_ok),
             )
-            self._gate_state.pop(mint_raw, None)
+            self._gate_state.pop(gate_key, None)
 
             # guardrails before buy
             if not buys_allowed() or PAUSE_TRADING:
@@ -586,9 +592,10 @@ class Strategy:
                     pass
 
             if trades_ok and up_ok:
-                if DEDUPE_ENABLED and not claim_once(f"buy:{mint_raw}", ttl=600):
+                # dedupe buy on normalized mint
+                if DEDUPE_ENABLED and not claim_once(f"buy:{mint_norm}", ttl=600):
                     if DEBUG_TX:
-                        print(f".[dedupe] buy already claimed for {mint_raw} — skip", flush=True)
+                        print(f".[dedupe] buy already claimed for {mint_norm} — skip", flush=True)
                     record_buy_result(ok=False, reason="buy_claimed_elsewhere")
                     return
 
@@ -681,17 +688,19 @@ class Strategy:
         print(f"[trade] pool={pool} symbol={symbol} mint={mint_norm}", flush=True)
 
         if DEDUPE_ENABLED and ENTRY_MOMENTUM_ENABLED:
-            if not claim_once(f"gate-propose:{mint_source}", ttl=int(max(ENTRY_MOMO_WINDOW_SEC * 2, 90))):
+            # dedupe gate proposal on normalized mint to avoid suffix/alias collisions
+            if not claim_once(f"gate-propose:{mint_norm}", ttl=int(max(ENTRY_MOMO_WINDOW_SEC * 2, 90))):
                 if DEBUG_TX:
-                    print(f".[dedupe] gate-propose taken for {mint_source} — skip", flush=True)
+                    print(f".[dedupe] gate-propose taken for {mint_norm} — skip", flush=True)
                 return
 
         if ENTRY_MOMENTUM_ENABLED:
             asyncio.create_task(self._gate_candidate(ui, mint_source, mint_norm))
         else:
-            if DEDUPE_ENABLED and not claim_once(f"buy:{mint_source}", ttl=600):
+            # no momentum path: dedupe buy on normalized mint
+            if DEDUPE_ENABLED and not claim_once(f"buy:{mint_norm}", ttl=600):
                 if DEBUG_TX:
-                    print(f".[dedupe] buy already claimed for {mint_source} — skip", flush=True)
+                    print(f".[dedupe] buy already claimed for {mint_norm} — skip", flush=True)
                 return
 
             if _dryrun_env_on() or _pkg_is_dryrun:
@@ -999,7 +1008,7 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
         except Exception:
             return "<uri?>"
 
-    subscribe_trades_flag = _as_bool(os.getenv("PUMP_SUBSCRIBE_TRADES", "1"), True)
+    subscribe_trades_flag = PUMP_SUBSCRIBE_TRADES
 
     if hasattr(PumpPortalClient, "__aenter__"):
         # context-managed path
@@ -1155,7 +1164,7 @@ def _boot_banner() -> None:
         f"MOMO: on={int(ENTRY_MOMENTUM_ENABLED)} window={ENTRY_MOMO_WINDOW_SEC}s "
         f"min_trades={ENTRY_MOMO_MIN_TRADES} min_up={ENTRY_MOMO_MIN_UP_PCT}%\n"
         f"LIQ_FILTER={int(LIQ_FILTER_ENABLED)} | EXIT_ENGINE={int(EXIT_ENGINE_ENABLED)} | MAX_TRADEABLE={MAX_TRADEABLE}\n"
-        f"POOLS={pools}\n"
+        f"POOLS={pools} | PUMP_TRADES={int(PUMP_SUBSCRIBE_TRADES)}\n"
         "===========================\n",
         flush=True,
     )
