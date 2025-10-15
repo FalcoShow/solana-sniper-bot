@@ -9,13 +9,22 @@ import sys
 import traceback
 from typing import Any, Dict, Optional
 
+import importlib
+
+# ---- Config (for feature flags like ENABLE_RAYDIUM_SCANNER) ----
+try:
+    C = importlib.import_module("config")
+except Exception:  # pragma: no cover
+    class _C:  # ultra-minimal fallback
+        ENABLE_RAYDIUM_SCANNER = True
+    C = _C()  # type: ignore
+
 from logging_setup import get_logger, bump, start_global_heartbeat
 
 # ---- Normalization helper (our local util) ----
 from scripts.pp_utils import normalize_mint as _pp_normalize
 
-# Optional: if the shared mint_guard package exists, we’ll use it as a
-# second opinion (not required for this file to run).
+# Optional: if the shared mint_guard package exists, use it
 try:
     from utils_pkg.mint_guard import (
         normalize_from_any as _mg_normalize,
@@ -66,7 +75,6 @@ try:
 except Exception:  # pragma: no cover
     def buys_allowed() -> bool:  # type: ignore
         return True
-
     def record_buy_result(*_args, **_kwargs):  # type: ignore
         return None
 
@@ -94,10 +102,8 @@ try:
         _route_get_decimals = None  # type: ignore
 except Exception:  # pragma: no cover
     router = None  # type: ignore
-
     async def _route_price_ui(_mint: str) -> float:  # type: ignore
         return 0.0
-
     _route_get_decimals = None  # type: ignore
 
 # Liquidity screen (fallback provided)
@@ -114,17 +120,23 @@ except Exception:  # pragma: no cover
     async def pricefeed_close():  # type: ignore
         return None
 
+# ----- NEW: Raydium scanner import (lazy in a function) -----
+def _get_raydium_scanner():
+    """
+    Import scan_raydium lazily; some builds may omit the scanner module.
+    """
+    try:
+        from scanner.raydium_scanner import scan_raydium  # type: ignore
+        return scan_raydium
+    except Exception:
+        return None
+
 log = get_logger()
 
 # -------------------------
 # Mint normalization / validation
 # -------------------------
 def _normalize_from_source(raw: str) -> str:
-    """
-    First try our local PP normalizer (strips pump/bonk & validates base58 length).
-    If that returns None and mint_guard is available, try that. As a last resort,
-    return a trimmed string so downstream filters can still reject safely.
-    """
     if raw is None:
         return ""
     raw = str(raw).strip()
@@ -140,7 +152,6 @@ def _normalize_from_source(raw: str) -> str:
             pass
     return raw  # permissive fallback — later checks will drop it
 
-
 def _is_probable_mint(s: str) -> bool:
     if not s:
         return False
@@ -149,9 +160,7 @@ def _is_probable_mint(s: str) -> bool:
             return bool(_mg_prob(s))
         except Exception:
             return False
-    # Cheap local check if mint_guard is absent: rely on our normalizer shape.
     return bool(_pp_normalize(s))
-
 
 # -------------------------
 # ENV helpers
@@ -161,20 +170,17 @@ def _as_bool(val: Optional[str], default: bool = False) -> bool:
         return default
     return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-
 def _as_float(val: Any, default: float) -> float:
     try:
         return float(val)
     except Exception:
         return default
 
-
 def _as_int(val: Any, default: int) -> int:
     try:
         return int(val)
     except Exception:
         return default
-
 
 # -------------------------
 # Config (same defaults / flags as your original)
@@ -218,17 +224,13 @@ def _get_first(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
             return d[k]
     return default
 
-
 def _extract_symbol(msg: Dict[str, Any]) -> str:
     return str(_get_first(msg, "symbol", "ticker", default="")).strip()
-
 
 def _extract_name(msg: Dict[str, Any]) -> str:
     return str(_get_first(msg, "name", default="")).strip()
 
-
 def _extract_raw_mint(msg: Dict[str, Any]) -> str:
-    # PP likes putting the id under several names. Grab anything plausible.
     raw = _get_first(
         msg,
         "mint",
@@ -242,11 +244,10 @@ def _extract_raw_mint(msg: Dict[str, Any]) -> str:
     )
     return ("" if raw is None else str(raw)).strip()
 
-
 def _approx_minutes_since(ts_any: Any) -> Optional[float]:
     try:
         import datetime as _dt
-        now = _dt.datetime.now(_dt.timezone.utc).timestamp()  # timezone-aware (no deprecation)
+        now = _dt.datetime.now(_dt.timezone.utc).timestamp()
         if ts_any is None:
             return None
         if isinstance(ts_any, (int, float)):
@@ -274,7 +275,6 @@ def _approx_minutes_since(ts_any: Any) -> Optional[float]:
         return None
     return None
 
-
 def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
     typ = str(_get_first(msg, "txType", "type", default="")).strip().lower()
     if typ != "create":
@@ -283,62 +283,38 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
     init_buy = _as_float(_get_first(msg, "initialBuy", "initial_buy", default=0.0), 0.0)
     if init_buy < MIN_INITIAL_BUY_SOL:
         if DEBUG_TX:
-            print(
-                f".[filter] initialBuy {init_buy} < min {MIN_INITIAL_BUY_SOL} — skip",
-                flush=True,
-            )
+            print(f".[filter] initialBuy {init_buy} < min {MIN_INITIAL_BUY_SOL} — skip", flush=True)
         return False
 
     sym = _extract_symbol(msg).upper()
     if any(bad and bad in sym for bad in SYMBOL_BLACKLIST):
         if DEBUG_TX:
-            print(
-                f".[filter] symbol '{sym}' hits blacklist {SYMBOL_BLACKLIST} — skip",
-                flush=True,
-            )
+            print(f".[filter] symbol '{sym}' hits blacklist {SYMBOL_BLACKLIST} — skip", flush=True)
         return False
 
     nm = _extract_name(msg)
     if MAX_NAME_LEN > 0 and len(nm) > MAX_NAME_LEN:
         if DEBUG_TX:
-            print(
-                f".[filter] name too long ({len(nm)} > {MAX_NAME_LEN}) — skip",
-                flush=True,
-            )
+            print(f".[filter] name too long ({len(nm)} > {MAX_NAME_LEN}) — skip", flush=True)
         return False
 
     mins_since_token = _approx_minutes_since(
         _get_first(msg, "created_at", "createdAt", "timestamp", "ts", default=None)
     )
-    if (
-        mins_since_token is not None
-        and ENTRY_MAX_AGE_MIN > 0
-        and mins_since_token > ENTRY_MAX_AGE_MIN
-    ):
+    if mins_since_token is not None and ENTRY_MAX_AGE_MIN > 0 and mins_since_token > ENTRY_MAX_AGE_MIN:
         if DEBUG_TX:
-            print(
-                f".[filter] token age {mins_since_token:.1f}m > max {ENTRY_MAX_AGE_MIN}m — skip",
-                flush=True,
-            )
+            print(f".[filter] token age {mins_since_token:.1f}m > max {ENTRY_MAX_AGE_MIN}m — skip", flush=True)
         return False
 
     mins_since_pool = _approx_minutes_since(
         _get_first(msg, "poolCreatedAt", "pool_created_at", default=None)
     )
-    if (
-        mins_since_pool is not None
-        and MIN_POOL_AGE_MIN > 0
-        and mins_since_pool < MIN_POOL_AGE_MIN
-    ):
+    if mins_since_pool is not None and MIN_POOL_AGE_MIN > 0 and mins_since_pool < MIN_POOL_AGE_MIN:
         if DEBUG_TX:
-            print(
-                f".[filter] pool age {mins_since_pool:.1f}m < min {MIN_POOL_AGE_MIN}m — skip",
-                flush=True,
-            )
+            print(f".[filter] pool age {mins_since_pool:.1f}m < min {MIN_POOL_AGE_MIN}m — skip", flush=True)
         return False
 
     return True
-
 
 # Optional immediate sell test after buy
 async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
@@ -351,13 +327,8 @@ async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
         if DEBUG_TX:
             traceback.print_exc()
 
-
 # -------- Soft retry helpers for 'no_account' (liquidity) --------
 async def _screen_with_retry(mint: str, tries: int = 3, first_wait: float = 0.8):
-    """
-    Retry screen_token a few times if it returns {'ok': False, 'reason': 'no_account'}.
-    This works even when router.get_decimals is unavailable.
-    """
     wait = first_wait
     last = None
     for i in range(tries):
@@ -374,19 +345,13 @@ async def _screen_with_retry(mint: str, tries: int = 3, first_wait: float = 0.8)
             wait *= 1.6
     return False, last
 
-
 async def _await_mint_ready(
     mint_norm: str,
     max_wait_s: int = 45,
     step_s: float = 3.0,
 ) -> Optional[int]:
-    """
-    Poll for the mint's decimals (as a proxy that the mint account exists).
-    Uses router.get_decimals if available. Returns decimals or None.
-    """
     if _route_get_decimals is None:
         return None
-
     waited = 0.0
     while waited < max_wait_s:
         try:
@@ -399,49 +364,33 @@ async def _await_mint_ready(
         waited += step_s
     return None
 
-
 # -------- Step A: ensure wallet file exists on boot --------
 def _ensure_keypair_file() -> None:
-    """
-    Ensure ~/.config/solana/id.json exists. If the env KEYPAIR_JSON or
-    SOLANA_KEYPAIR_JSON is set (JSON array of 64 integers), write it with proper perms.
-    This makes the wallet resilient to pod restarts / ephemeral filesystems.
-    """
     import json, pathlib, stat
-
     try:
         home = os.path.expanduser("~")
         cfg_dir = pathlib.Path(home) / ".config" / "solana"
         key_path = cfg_dir / "id.json"
-
         if key_path.exists():
             return
-
         raw = os.getenv("KEYPAIR_JSON") or os.getenv("SOLANA_KEYPAIR_JSON")
         if not raw:
-            # Nothing to write; buy paths will throw if a keypair is required.
             log.event("KEYPAIR_ENV_MISSING", hint="set KEYPAIR_JSON to auto-create wallet")
             return
-
         kp = json.loads(raw)
         if not (isinstance(kp, list) and len(kp) == 64 and all(isinstance(x, int) for x in kp)):
             raise ValueError("KEYPAIR_JSON must be a JSON array of 64 integers")
-
         cfg_dir.mkdir(parents=True, exist_ok=True)
         key_path.write_text(json.dumps(kp), encoding="utf-8")
-
-        # chmod 600 for file, 700 for dir
         key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
         with contextlib.suppress(Exception):
             cfg_dir.chmod(stat.S_IRWXU)
-
         log.event("KEYPAIR_FILE_WRITTEN", path=str(key_path))
     except Exception as e:
         try:
             log.event("KEYPAIR_FILE_WRITE_FAIL", error=str(e))
         except Exception:
             print(f"[boot] could not write wallet: {e}", flush=True)
-
 
 # -------------------------
 # Strategy implementation
@@ -459,8 +408,6 @@ class Strategy:
             except Exception:
                 if DEBUG_TX:
                     traceback.print_exc()
-
-        # Track trades for momentum window keyed by *raw* id
         m = str(_get_first(raw_event, "mint", "mintAddress", "mint_address", "id", default="")).strip()
         if not m:
             return
@@ -475,10 +422,7 @@ class Strategy:
                     if DEBUG_TX:
                         print(f".[dedupe] gate already running for {mint_raw} — skip", flush=True)
                     return
-
             self._gate_state[mint_raw] = {"trades": 0, "price0": 0.0}
-
-            # price sample at t0 (with retries)
             price0 = 0.0
             if _is_probable_mint(mint_norm):
                 for _ in range(max(1, ENTRY_MOMO_PRICE_TRIES)):
@@ -490,25 +434,20 @@ class Strategy:
                         break
                     await asyncio.sleep(ENTRY_MOMO_PRICE_DELAY_S)
             self._gate_state[mint_raw]["price0"] = price0
-
             await asyncio.sleep(max(1, ENTRY_MOMO_WINDOW_SEC))
-
             st = self._gate_state.get(mint_raw, {})
             trades = int(st.get("trades", 0))
-
             price1 = 0.0
             if _is_probable_mint(mint_norm):
                 try:
                     price1 = await _route_price_ui(mint_norm)
                 except Exception:
                     price1 = 0.0
-
             up_ok = True
             if price0 > 0 and price1 > 0:
                 up_pct = ((price1 / price0) - 1.0) * 100.0
                 up_ok = up_pct >= ENTRY_MOMO_MIN_UP_PCT
             trades_ok = trades >= ENTRY_MOMO_MIN_TRADES
-
             log.event(
                 "MOMO_EVAL",
                 mint=mint_raw,
@@ -520,15 +459,12 @@ class Strategy:
                 up_ok=int(up_ok),
                 trades_ok=int(trades_ok),
             )
-
             self._gate_state.pop(mint_raw, None)
-
             if not buys_allowed() or PAUSE_TRADING:
                 if DEBUG_TX:
                     print("[guardrails] buys not allowed at gate decision — skip", flush=True)
                 record_buy_result(ok=False, reason="guardrails_halt")
                 return
-
             if MAX_TRADEABLE > 0:
                 try:
                     if len(list(all_positions())) >= MAX_TRADEABLE:
@@ -537,14 +473,12 @@ class Strategy:
                         return
                 except Exception:
                     pass
-
             if trades_ok and up_ok:
                 if DEDUPE_ENABLED and not claim_once(f"buy:{mint_raw}", ttl=600):
                     if DEBUG_TX:
                         print(f".[dedupe] buy already claimed for {mint_raw} — skip", flush=True)
                     record_buy_result(ok=False, reason="buy_claimed_elsewhere")
                     return
-
                 try:
                     async with self._sema:
                         tx_sig = await maybe_buy(mint=mint_norm, ui=ui)
@@ -566,7 +500,6 @@ class Strategy:
             if DEBUG_TX:
                 print("[guardrails] buys not allowed now — skip", flush=True)
             return
-
         if MAX_TRADEABLE > 0:
             try:
                 if len(list(all_positions())) >= MAX_TRADEABLE:
@@ -574,29 +507,22 @@ class Strategy:
                     return
             except Exception:
                 pass
-
-        # 1) Parse and normalize immediately (drop if not plausible)
         mint_source = _extract_raw_mint(raw_event)
         if not mint_source:
             if DEBUG_TX:
                 print("[strategy] missing mint — skip", flush=True)
             return
-
         mint_norm = _normalize_from_source(mint_source)
         if not _is_probable_mint(mint_norm):
             if DEBUG_TX:
                 print(f"[strategy] implausible mint after normalize => skip ({mint_source})", flush=True)
             return
-
         if not _passes_basic_filters(raw_event):
             return
-
-        # 2) Liquidity screen (optional, adds decimals if available) with soft retry
         dec_from_liq: Optional[int] = None
         if LIQ_FILTER_ENABLED:
             ok, rep = await _screen_with_retry(mint_norm, tries=3, first_wait=0.8)
             if not ok and str((rep or {}).get("reason")) == "no_account":
-                # As a last resort, if router.get_decimals is available, wait for it
                 dec_from_liq = await _await_mint_ready(mint_norm, max_wait_s=45, step_s=3.0)
                 if dec_from_liq is not None:
                     ok = True
@@ -613,8 +539,6 @@ class Strategy:
                 priceImpactPct=(rep or {}).get("priceImpactPct"),
                 dec=dec_from_liq,
             )
-
-        # 3) Prepare UI payload for buy path
         ui: Dict[str, Any] = dict(raw_event)
         ui.setdefault("pool", "pump")
         ui.setdefault("symbol", _extract_symbol(raw_event))
@@ -624,17 +548,13 @@ class Strategy:
         ui["normalized"] = (mint_norm != mint_source)
         if dec_from_liq is not None:
             ui["decimals"] = dec_from_liq
-
         symbol = ui.get("symbol", "") or "?"
         print(f"[trade] pool=pump symbol={symbol} mint={mint_norm} curve=-", flush=True)
-
-        # 4) Momentum gate (or direct buy)
         if DEDUPE_ENABLED and ENTRY_MOMENTUM_ENABLED:
             if not claim_once(f"gate-propose:{mint_source}", ttl=int(max(ENTRY_MOMO_WINDOW_SEC * 2, 90))):
                 if DEBUG_TX:
                     print(f".[dedupe] gate-propose taken for {mint_source} — skip", flush=True)
                 return
-
         if ENTRY_MOMENTUM_ENABLED:
             asyncio.create_task(self._gate_candidate(ui, mint_source, mint_norm))
         else:
@@ -655,13 +575,11 @@ class Strategy:
                                 return
                         except Exception:
                             pass
-
                     tx_sig = await maybe_buy(mint=mint_norm, ui=ui)
                     if not tx_sig:
                         record_buy_result(ok=False, reason="no_tx_sig")
                         return
                     record_buy_result(ok=True, reason="executed", sig=tx_sig)
-
                     if EXIT_ENGINE_ENABLED and not IS_DRYRUN:
                         asyncio.create_task(exit_engine.on_buy_filled(raw_id_or_mint=mint_norm, tx_sig=tx_sig))
                     asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
@@ -669,17 +587,13 @@ class Strategy:
                     print("[strategy] maybe_buy exception:", flush=True)
                     traceback.print_exc()
                     record_buy_result(ok=False, reason="exception")
-
         await asyncio.sleep(LOOP_COOLDOWN_SEC)
-
 
 # -------------------------
 # Streaming loop / main
 # -------------------------
 async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
     strat = Strategy()
-
-    # Prefer async context manager if available
     if hasattr(PumpPortalClient, "__aenter__"):
         async with PumpPortalClient() as client:  # type: ignore[misc]
             print("[main] Connecting:", getattr(client, "masked_uri", lambda: "<uri?>")(), flush=True)
@@ -724,9 +638,65 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
                     if asyncio.iscoroutine(maybe_awaitable):
                         await maybe_awaitable  # type: ignore
 
+# ---------- NEW: Scanner supervisor & boot wiring ----------
+async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
+    """
+    Runs scan_raydium(), restarts with backoff if it returns/crashes.
+    Emits clear logs and a task name so tails can detect it:
+      grep -aE '"taskName":"scan\.raydium"|raydium_scanner|RAYDIUM'
+    """
+    scan_raydium = _get_raydium_scanner()
+    if scan_raydium is None:
+        log.event("SCAN_RAYDIUM_UNAVAILABLE")
+        return
 
-async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asyncio.Task]) -> None:
+    backoff = 2.0
+    first_log = True
+    while not stop_evt.is_set():
+        try:
+            if first_log:
+                log.event("SCAN_RAYDIUM_STARTING", task="scan.raydium",
+                          limit=os.getenv("RAYDIUM_LIMIT"),
+                          min_liq=os.getenv("RAYDIUM_MIN_LIQ_USD"))
+                first_log = False
+            # Important: no kwargs — the function reads env for knobs.
+            await scan_raydium()
+            log.event("SCAN_RAYDIUM_RETURNED")  # if it ever returns normally
+            backoff = 2.0
+        except asyncio.CancelledError:
+            log.event("SCAN_RAYDIUM_CANCELLED")
+            raise
+        except Exception as e:
+            log.event("SCAN_RAYDIUM_CRASH", error=str(e))
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.7, 30.0)
+
+async def _start_background_tasks(stop_evt: asyncio.Event) -> Dict[str, asyncio.Task]:
+    """
+    Create long-running background tasks (scanner, etc.).
+    Returns a dict of task name -> task for coordinated shutdown.
+    """
+    tasks: Dict[str, asyncio.Task] = {}
+
+    # Raydium scanner only when enabled (and PF_POOLS allows raydium, if set)
+    want_raydium = C.ENABLE_RAYDIUM_SCANNER
+    pools_env = (os.getenv("PF_POOLS") or "").lower().split(",")
+    pools_ok = (not pools_env) or ("raydium" in {p.strip() for p in pools_env if p.strip()})
+
+    if want_raydium and pools_ok:
+        t = asyncio.create_task(_run_raydium_scanner_forever(stop_evt), name="scan.raydium")
+        tasks["scan.raydium"] = t
+        log.event("SCAN_RAYDIUM_SCHEDULED", name="scan.raydium")
+
+    return tasks
+
+async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asyncio.Task],
+                             bg_tasks: Dict[str, asyncio.Task]) -> None:
     stop_evt.set()
+    # Cancel background tasks first
+    for name, t in list(bg_tasks.items()):
+        with contextlib.suppress(Exception):
+            t.cancel()
     with contextlib.suppress(Exception):
         if sell_task:
             sell_task.cancel()
@@ -736,7 +706,6 @@ async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asynci
             await router.shutdown()
     with contextlib.suppress(Exception):
         await pricefeed_close()
-
 
 async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     with contextlib.suppress(Exception):
@@ -766,10 +735,14 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
         log.event("BOOT_SELL_LOOP_START_FAIL", error=str(e))
 
     local_stop = stop_evt or asyncio.Event()
+
+    # NEW: start scanners/background tasks
+    bg_tasks = await _start_background_tasks(local_stop)
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(_graceful_shutdown(local_stop, sell_task)))
+            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(_graceful_shutdown(local_stop, sell_task, bg_tasks)))
         except NotImplementedError:
             pass  # Windows
 
@@ -796,8 +769,7 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
                     await asyncio.wait_for(sell_task, timeout=2.5)
         except Exception:
             pass
-        await _graceful_shutdown(local_stop, sell_task)
-
+        await _graceful_shutdown(local_stop, sell_task, bg_tasks)
 
 if __name__ == "__main__":
     try:
