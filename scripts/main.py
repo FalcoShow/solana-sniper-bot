@@ -4,25 +4,24 @@ from __future__ import annotations
 scripts/main.py (vNext, hardened)
 
 - Hardens startup, logging, and shutdown.
-- Adds event-rate diagnostics + periodic guardrail/momentum summaries.
-- Enforces PF_POOLS filter and supervises Raydium scanner with backoff.
-- Improves dedupe, liquidity retry, momentum gate, and buy orchestration.
-- Prints a clear boot banner of key env/flags so tailing is easier.
-- **Enforces DRY RUN** from env (IS_DRYRUN/DRYRUN) before any buy.
+- Adds event-rate diagnostics + momentum gate + guardrails.
+- Enforces PF_POOLS filter and supervises the Raydium scanner with backoff.
+- **Daily PnL rollup**: once/day Telegram message + row in PG table `daily_pnl`.
+- **DRYRUN enforcement** before any buy (env-based: IS_DRYRUN/DRYRUN).
+- Degrades gracefully if optional dependencies are missing.
 
 ENV knobs (most are optional / already in your .env)
 ---------------------------------------------------
-# General
 PF_DEBUG_TX=0|1
 PF_COOLDOWN_SEC=15
 PF_MAX_CONCURRENT=2
 PF_DEDUPE_ENABLED=1
 PF_DEDUPE_TTL_SEC=3600
-PF_POOLS=pump,raydium             # which pools we consume from (case-insensitive)
+PF_POOLS=pump,raydium
 PAUSE_TRADING=0
-MAX_TRADEABLE=0                   # 0 = unlimited
+MAX_TRADEABLE=0                    # 0 = unlimited
 EXIT_ENGINE_ENABLED=1
-PF_HEARTBEAT_SEC=45               # global heartbeat (logging_setup.start_global_heartbeat)
+PF_HEARTBEAT_SEC=45
 
 # Entry filters
 ENTRY_MIN_BUY_SOL=0.0
@@ -36,32 +35,51 @@ ENTRY_LIQ_FILTER=1
 ENTRY_MOMENTUM_ENABLED=1
 ENTRY_MOMO_WINDOW_SEC=10
 ENTRY_MOMO_MIN_TRADES=6
-ENTRY_MOMO_MIN_UP_PCT=5           # % up from price0->price1 in window
+ENTRY_MOMO_MIN_UP_PCT=5
 ENTRY_MOMO_PRICE_TRIES=4
 ENTRY_MOMO_PRICE_DELAY_S=0.7
 ENTRY_MOMO_MAX_PARALLEL=6
 
-# Post-buy smoke test (optional)
-POSTBUY_MODE=immediate_sell_test  # exactly this string triggers a post-buy sell test
+# Optional post-buy smoke test
+POSTBUY_MODE=immediate_sell_test   # run a quick sell after a buy (for smoke test)
 
-# Wallet helper (optional). If ~/.config/solana/id.json doesn't exist, we'll write it.
+# Wallet helper: if ~/.config/solana/id.json doesn't exist, we'll write it.
 # Must be a JSON array of 64 integers.
-KEYPAIR_JSON=[...]
-SOLANA_KEYPAIR_JSON=[...]         # alias (either works)
+KEYPAIR_JSON=[...] or SOLANA_KEYPAIR_JSON=[...]
 
-# Raydium scanner (enabled by config.ENABLE_RAYDIUM_SCANNER and PF_POOLS contains raydium)
-RAYDIUM_LIMIT=200
-RAYDIUM_MIN_LIQ_USD=1500
+# Raydium scanner
+# ENABLE_RAYDIUM_SCANNER (config.py) and PF_POOLS contains "raydium"
+
+# Daily PnL rollup
+DAILY_PNL_ENABLED=1
+DAILY_PNL_HOUR_UTC=23
+DAILY_PNL_TEST_NOW=0|1            # 1 = run once right after boot for testing
+# Uses TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID + DATABASE_URL that you already have.
 """
 
 import asyncio
 import contextlib
+import datetime as _dt
 import importlib
+import json
 import os
 import signal
 import sys
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+
+# ---------------------------
+# Optional deps (Telegram / PG)
+# ---------------------------
+try:
+    import httpx
+except Exception:
+    httpx = None  # type: ignore
+
+try:
+    import asyncpg
+except Exception:
+    asyncpg = None  # type: ignore
 
 # ---------------------------
 # Config module (feature flags)
@@ -76,13 +94,25 @@ except Exception:  # pragma: no cover
 # ---------------------------
 # Logging
 # ---------------------------
-from logging_setup import get_logger, bump, start_global_heartbeat
-log = get_logger()
+try:
+    from logging_setup import get_logger, bump, start_global_heartbeat
+    log = get_logger()
+except Exception:  # pragma: no cover
+    class _Dummy:
+        def event(self, *a, **k): print("[log]", a, k, flush=True)
+    def bump(_): pass
+    def start_global_heartbeat(*_a, **_k): pass
+    log = _Dummy()  # type: ignore
 
 # ---------------------------
 # Normalization helpers
 # ---------------------------
-from scripts.pp_utils import normalize_mint as _pp_normalize
+try:
+    from scripts.pp_utils import normalize_mint as _pp_normalize
+except Exception:
+    def _pp_normalize(s: str) -> str:  # type: ignore
+        return s.strip()
+
 try:
     from utils_pkg.mint_guard import (
         normalize_from_any as _mg_normalize,
@@ -93,10 +123,7 @@ except Exception:  # pragma: no cover
     _mg_prob = None  # type: ignore
 
 def _dryrun_env_on() -> bool:
-    """
-    Effective dry-run flag sourced from env (overrides downstream modules).
-    Returns True if either IS_DRYRUN or DRYRUN env is a truthy value.
-    """
+    """True if either IS_DRYRUN or DRYRUN env is truthy."""
     v = (os.getenv("IS_DRYRUN") or os.getenv("DRYRUN") or "").strip().lower()
     return v in {"1", "true", "yes", "on"}
 
@@ -214,23 +241,23 @@ def _as_int(val: Any, default: int) -> int:
 # ---------------------------
 # Config (env)
 # ---------------------------
-EXIT_ENGINE_ENABLED = _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True)
-DEDUPE_ENABLED = _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True)
-DEDUPE_TTL_SEC = _as_int(os.getenv("PF_DEDUPE_TTL_SEC", "3600"), 3600)
-LIQ_FILTER_ENABLED = _as_bool(os.getenv("ENTRY_LIQ_FILTER", "1"), True)
+EXIT_ENGINE_ENABLED   = _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True)
+DEDUPE_ENABLED        = _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True)
+DEDUPE_TTL_SEC        = _as_int(os.getenv("PF_DEDUPE_TTL_SEC", "3600"), 3600)
+LIQ_FILTER_ENABLED    = _as_bool(os.getenv("ENTRY_LIQ_FILTER", "1"), True)
 
-ENTRY_MOMENTUM_ENABLED = _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True)
-ENTRY_MOMO_WINDOW_SEC = _as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10)
-ENTRY_MOMO_MIN_TRADES = _as_int(os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6)
-ENTRY_MOMO_MIN_UP_PCT = _as_float(os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0)
-ENTRY_MOMO_PRICE_TRIES = _as_int(os.getenv("ENTRY_MOMO_PRICE_TRIES", "4"), 4)
+ENTRY_MOMENTUM_ENABLED   = _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True)
+ENTRY_MOMO_WINDOW_SEC    = _as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10)
+ENTRY_MOMO_MIN_TRADES    = _as_int(os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6)
+ENTRY_MOMO_MIN_UP_PCT    = _as_float(os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0)
+ENTRY_MOMO_PRICE_TRIES   = _as_int(os.getenv("ENTRY_MOMO_PRICE_TRIES", "4"), 4)
 ENTRY_MOMO_PRICE_DELAY_S = _as_float(os.getenv("ENTRY_MOMO_PRICE_DELAY_S", "0.7"), 0.7)
-ENTRY_MOMO_MAX_PARALLEL = max(1, _as_int(os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"), 6))
+ENTRY_MOMO_MAX_PARALLEL  = max(1, _as_int(os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"), 6))
 
-MIN_INITIAL_BUY_SOL = _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
-MAX_NAME_LEN = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
-ENTRY_MAX_AGE_MIN = _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20)
-MIN_POOL_AGE_MIN = _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3)
+MIN_INITIAL_BUY_SOL   = _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
+MAX_NAME_LEN          = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
+ENTRY_MAX_AGE_MIN     = _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20)
+MIN_POOL_AGE_MIN      = _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3)
 
 SYMBOL_BLACKLIST = {
     s.strip().upper()
@@ -238,15 +265,23 @@ SYMBOL_BLACKLIST = {
     if s.strip()
 }
 
-MAX_CONCURRENCY = max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2))
+MAX_CONCURRENCY   = max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2))
 LOOP_COOLDOWN_SEC = _as_float(os.getenv("PF_COOLDOWN_SEC", "15"), 15.0)
-MAX_TRADEABLE = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)  # 0 = unlimited
-PAUSE_TRADING = _as_bool(os.getenv("PAUSE_TRADING", "0"), False)
-DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
+MAX_TRADEABLE     = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)  # 0 = unlimited
+PAUSE_TRADING     = _as_bool(os.getenv("PAUSE_TRADING", "0"), False)
+DEBUG_TX          = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
 
 # Pools filter (affects printing and Raydium scanner scheduling)
-_POOLS_ENV = [p.strip().lower() for p in (os.getenv("PF_POOLS") or "").split(",") if p.strip()]
+_POOLS_ENV  = [p.strip().lower() for p in (os.getenv("PF_POOLS") or "").split(",") if p.strip()]
 POOLS_FILTER: set[str] = set(_POOLS_ENV)
+
+# Daily PnL env
+DAILY_PNL_ENABLED   = _as_bool(os.getenv("DAILY_PNL_ENABLED", "1"), True)
+DAILY_PNL_HOUR_UTC  = _as_int(os.getenv("DAILY_PNL_HOUR_UTC", "23"), 23)
+DAILY_PNL_TEST_NOW  = _as_bool(os.getenv("DAILY_PNL_TEST_NOW", "0"), False)
+DAILY_PNL_CHAT_ID   = (os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+DAILY_PNL_BOT       = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+PG_DSN              = os.getenv("DATABASE_URL", "")
 
 # ---------------------------
 # Small helpers
@@ -266,26 +301,19 @@ def _extract_name(msg: Dict[str, Any]) -> str:
 def _extract_raw_mint(msg: Dict[str, Any]) -> str:
     raw = _get_first(
         msg,
-        "mint",
-        "mintAddress",
-        "mint_address",
-        "bondingCurve",
-        "bonding_curve",
-        "address",
-        "id",
+        "mint","mintAddress","mint_address","bondingCurve","bonding_curve","address","id",
         default="",
     )
     return ("" if raw is None else str(raw)).strip()
 
 def _approx_minutes_since(ts_any: Any) -> Optional[float]:
     try:
-        import datetime as _dt
         now = _dt.datetime.now(_dt.timezone.utc).timestamp()
         if ts_any is None:
             return None
         if isinstance(ts_any, (int, float)):
             t = float(ts_any)
-            if t > 10_000_000_000:
+            if t > 10_000_000_000:  # ms → s
                 t /= 1000.0
             return max(0.0, (now - t) / 60.0)
         if isinstance(ts_any, str):
@@ -326,7 +354,6 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
         return False
 
     init_buy = _as_float(_get_first(msg, "initialBuy", "initial_buy", default=0.0), 0.0)
-    # Raydium entries won't have initialBuy—only enforce this for non-Raydium.
     if not is_raydium and init_buy < MIN_INITIAL_BUY_SOL:
         if DEBUG_TX:
             print(f".[filter] initialBuy {init_buy} < min {MIN_INITIAL_BUY_SOL} — skip", flush=True)
@@ -352,9 +379,7 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
             print(f".[filter] token age {mins_since_token:.1f}m > max {ENTRY_MAX_AGE_MIN}m — skip", flush=True)
         return False
 
-    mins_since_pool = _approx_minutes_since(
-        _get_first(msg, "poolCreatedAt", "pool_created_at", default=None)
-    )
+    mins_since_pool = _approx_minutes_since(_get_first(msg, "poolCreatedAt","pool_created_at", default=None))
     if mins_since_pool is not None and MIN_POOL_AGE_MIN > 0 and mins_since_pool < MIN_POOL_AGE_MIN:
         if DEBUG_TX:
             print(f".[filter] pool age {mins_since_pool:.1f}m < min {MIN_POOL_AGE_MIN}m — skip", flush=True)
@@ -414,7 +439,7 @@ async def _await_mint_ready(mint_norm: str, max_wait_s: int = 45, step_s: float 
 # Boot: ensure keypair file
 # ---------------------------
 def _ensure_keypair_file() -> None:
-    import json, pathlib, stat
+    import pathlib, stat
     try:
         home = os.path.expanduser("~")
         cfg_dir = pathlib.Path(home) / ".config" / "solana"
@@ -567,8 +592,8 @@ class Strategy:
                     record_buy_result(ok=False, reason="buy_claimed_elsewhere")
                     return
 
-                # 🔒 enforce dry-run from env BEFORE any buy
-                if _dryrun_env_on():
+                # 🔒 enforce DRYRUN BEFORE any buy
+                if _dryrun_env_on() or _pkg_is_dryrun:
                     log.event("BUY_SKIPPED_DRYRUN", mint=mint_norm)
                     record_buy_result(ok=False, reason="dryrun_skip")
                     return
@@ -639,12 +664,7 @@ class Strategy:
                 return
             if dec_from_liq is None:
                 dec_from_liq = (rep or {}).get("decimals")
-            log.event(
-                "ENTRY_LIQ_OK",
-                mint=mint_norm,
-                priceImpactPct=(rep or {}).get("priceImpactPct"),
-                dec=dec_from_liq,
-            )
+            log.event("ENTRY_LIQ_OK", mint=mint_norm, priceImpactPct=(rep or {}).get("priceImpactPct"), dec=dec_from_liq)
 
         ui: Dict[str, Any] = dict(raw_event)
         ui.setdefault("pool", (raw_event.get("pool") or "pump").lower())
@@ -674,8 +694,7 @@ class Strategy:
                     print(f".[dedupe] buy already claimed for {mint_source} — skip", flush=True)
                 return
 
-            # 🔒 enforce dry-run from env BEFORE any buy
-            if _dryrun_env_on():
+            if _dryrun_env_on() or _pkg_is_dryrun:
                 log.event("BUY_SKIPPED_DRYRUN", mint=mint_norm)
                 record_buy_result(ok=False, reason="dryrun_skip")
                 return
@@ -740,6 +759,217 @@ def _is_probable_mint(s: str) -> bool:
         except Exception:
             return False
     return bool(_pp_normalize(s))
+
+# ---------------------------
+# Daily PnL helpers
+# ---------------------------
+def _fmt_sol(x: Optional[float]) -> str:
+    if x is None:
+        return "—"
+    try:
+        return f"{x:.4f} SOL"
+    except Exception:
+        return str(x)
+
+async def _telegram_send(text: str) -> None:
+    if not DAILY_PNL_BOT or not DAILY_PNL_CHAT_ID or not httpx:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{DAILY_PNL_BOT}/sendMessage"
+        payload = {"chat_id": DAILY_PNL_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        async with httpx.AsyncClient(timeout=15) as cli:
+            await cli.post(url, json=payload)
+    except Exception:
+        if DEBUG_TX:
+            traceback.print_exc()
+
+async def _pnl_pg_ensure_table() -> None:
+    if not asyncpg or not PG_DSN:
+        return
+    try:
+        conn = await asyncpg.connect(PG_DSN)
+        try:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS daily_pnl (
+                    id BIGSERIAL PRIMARY KEY,
+                    at_utc TIMESTAMPTZ NOT NULL,
+                    realized_sol NUMERIC,
+                    unrealized_sol NUMERIC,
+                    open_positions INT,
+                    wallet_sol NUMERIC,
+                    notes JSONB,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+        finally:
+            await conn.close()
+    except Exception:
+        if DEBUG_TX:
+            traceback.print_exc()
+
+async def _pnl_pg_insert_row(*, realized_sol: float, unrealized_sol: float,
+                             open_positions: int, wallet_sol: Optional[float],
+                             notes: Dict[str, Any]) -> None:
+    if not asyncpg or not PG_DSN:
+        return
+    try:
+        conn = await asyncpg.connect(PG_DSN)
+        try:
+            await conn.execute("""
+                INSERT INTO daily_pnl (at_utc, realized_sol, unrealized_sol, open_positions, wallet_sol, notes)
+                VALUES (NOW() AT TIME ZONE 'UTC', $1, $2, $3, $4, $5::jsonb)
+            """, realized_sol, unrealized_sol, open_positions, wallet_sol, json.dumps(notes))
+        finally:
+            await conn.close()
+    except Exception:
+        if DEBUG_TX:
+            traceback.print_exc()
+
+async def _get_wallet_sol_balance() -> Optional[float]:
+    # Best-effort — if you have a wallet util, we use it; otherwise None.
+    try:
+        from utils_pkg.wallet import get_sol_balance  # type: ignore
+        bal = await get_sol_balance()
+        return float(bal)
+    except Exception:
+        return None
+
+async def _estimate_unrealized_from_positions() -> Tuple[float, int, Dict[str, Any]]:
+    """
+    Conservative unrealized = sum(current_value - cost_basis) over open positions.
+    We try multiple field names and swallow errors per-position.
+    """
+    total_unrl = 0.0
+    open_n = 0
+    details: Dict[str, Any] = {"legs": []}
+
+    try:
+        poss = list(all_positions())
+    except Exception:
+        poss = []
+
+    for p in poss:
+        try:
+            mint = str(p.get("mint") or p.get("token") or "")
+            if not mint:
+                continue
+            qty = p.get("amount") or p.get("qty") or p.get("size") or 0
+            qty = float(qty or 0)
+            if qty <= 0:
+                continue
+            # entry cost (in SOL); try multiple keys
+            cost = p.get("entry_total_sol") or p.get("cost_basis_sol") or p.get("cost") or 0.0
+            cost = float(cost or 0.0)
+
+            price = 0.0
+            try:
+                price = float(await _route_price_ui(mint))
+            except Exception:
+                price = 0.0
+
+            cur_val = price * qty if price > 0 else 0.0
+            unrl = cur_val - cost
+            total_unrl += unrl
+            open_n += 1
+            details["legs"].append({
+                "mint": mint,
+                "qty": qty,
+                "entry_cost_sol": cost,
+                "mark_price_sol": price,
+                "cur_val_sol": cur_val,
+                "unrealized_sol": unrl,
+            })
+        except Exception:
+            if DEBUG_TX:
+                traceback.print_exc()
+            continue
+
+    return total_unrl, open_n, details
+
+async def _estimate_realized_today() -> Tuple[float, Dict[str, Any]]:
+    """
+    Realized for the last UTC day. Prefer project-provided helpers; else 0.0 with a source note.
+    """
+    try:
+        from utils_pkg.realized import realized_today_sol  # type: ignore
+        v = await realized_today_sol()
+        return float(v or 0.0), {"source": "utils_pkg.realized.realized_today_sol"}
+    except Exception:
+        pass
+    try:
+        from positions_pg import realized_today_sol as pg_realized_today_sol  # type: ignore
+        v = await pg_realized_today_sol()
+        return float(v or 0.0), {"source": "positions_pg.realized_today_sol"}
+    except Exception:
+        pass
+    return 0.0, {"source": "fallback_zero"}
+
+async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
+    """
+    At DAILY_PNL_HOUR_UTC each day (or immediately if DAILY_PNL_TEST_NOW=1 at boot),
+    compute realized/unrealized/wallet SOL and post to Telegram + insert into PG.
+    """
+    if not DAILY_PNL_ENABLED:
+        return
+
+    await _pnl_pg_ensure_table()
+
+    async def _once():
+        unrl_sol, open_n, unrl_details = await _estimate_unrealized_from_positions()
+        realized_sol, r_meta = await _estimate_realized_today()
+        wallet_sol = await _get_wallet_sol_balance()
+
+        now = _dt.datetime.utcnow().replace(tzinfo=_dt.timezone.utc)
+        hdr = f"📊 <b>Daily PnL</b> — {now.strftime('%Y-%m-%d')} (UTC)"
+        body = (
+            f"\nRealized: <b>{_fmt_sol(realized_sol)}</b>"
+            f"\nUnrealized: <b>{_fmt_sol(unrl_sol)}</b>"
+            f"\nOpen positions: <b>{open_n}</b>"
+            f"\nWallet: <b>{_fmt_sol(wallet_sol)}</b>"
+        )
+        footer = "\n\n<code>src=daily_pnl_loop</code>"
+
+        notes = {"realized_meta": r_meta, "unrealized_details": unrl_details}
+
+        await _pnl_pg_insert_row(
+            realized_sol=realized_sol,
+            unrealized_sol=unrl_sol,
+            open_positions=open_n,
+            wallet_sol=wallet_sol,
+            notes=notes,
+        )
+        await _telegram_send(hdr + body + footer)
+
+        log.event(
+            "DAILY_PNL_SNAPSHOT",
+            realized_sol=realized_sol,
+            unrealized_sol=unrl_sol,
+            open_positions=open_n,
+            wallet_sol=wallet_sol,
+        )
+
+    # optional immediate test on boot
+    if DAILY_PNL_TEST_NOW and not stop_evt.is_set():
+        with contextlib.suppress(Exception):
+            await _once()
+
+    # schedule daily at the requested UTC hour
+    while not stop_evt.is_set():
+        now = _dt.datetime.utcnow()
+        run_at = now.replace(hour=DAILY_PNL_HOUR_UTC, minute=0, second=0, microsecond=0)
+        if run_at <= now:
+            run_at = run_at + _dt.timedelta(days=1)
+        wait_s = (run_at - now).total_seconds()
+        # chunk the sleep so we can stop promptly
+        chunk = 5.0
+        while wait_s > 0 and not stop_evt.is_set():
+            sl = min(chunk, wait_s)
+            await asyncio.sleep(sl)
+            wait_s -= sl
+        if stop_evt.is_set():
+            break
+        with contextlib.suppress(Exception):
+            await _once()
 
 # ---------------------------
 # Streaming loop
@@ -841,12 +1071,21 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
 
 async def _start_background_tasks(stop_evt: asyncio.Event) -> Dict[str, asyncio.Task]:
     tasks: Dict[str, asyncio.Task] = {}
+
+    # Raydium scanner
     want_raydium = getattr(C, "ENABLE_RAYDIUM_SCANNER", True)
     pools_ok = (not POOLS_FILTER) or ("raydium" in POOLS_FILTER)
     if want_raydium and pools_ok:
         t = asyncio.create_task(_run_raydium_scanner_forever(stop_evt), name="scan.raydium")
         tasks["scan.raydium"] = t
         log.event("SCAN_RAYDIUM_SCHEDULED", task="scan.raydium")
+
+    # Daily PnL rollup
+    if DAILY_PNL_ENABLED:
+        t = asyncio.create_task(_run_daily_pnl_loop(stop_evt), name="telemetry.daily_pnl")
+        tasks["telemetry.daily_pnl"] = t
+        log.event("DAILY_PNL_SCHEDULED", hour_utc=DAILY_PNL_HOUR_UTC)
+
     return tasks
 
 async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asyncio.Task], bg_tasks: Dict[str, asyncio.Task]) -> None:
@@ -870,7 +1109,6 @@ async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asynci
 # ---------------------------
 def _boot_banner() -> None:
     pools = ",".join(sorted(POOLS_FILTER)) if POOLS_FILTER else "<all>"
-    # effective dry-run: env OR downstream lib flag
     effective_dryrun = _dryrun_env_on() or bool(_pkg_is_dryrun)
     print(
         "\n=== 🟢 sniper main boot ===\n"
