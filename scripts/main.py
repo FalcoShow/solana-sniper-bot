@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 """
-Fully‑rewritten scripts/main.py (vNext)
+scripts/main.py (vNext, hardened)
+
 - Hardens startup, logging, and shutdown.
-- Adds event‑rate diagnostics + periodic guardrail/momentum summaries.
-- Adds PF_POOLS filter + Raydium scanner supervisor with backoff.
+- Adds event-rate diagnostics + periodic guardrail/momentum summaries.
+- Enforces PF_POOLS filter and supervises Raydium scanner with backoff.
 - Improves dedupe, liquidity retry, momentum gate, and buy orchestration.
 - Prints a clear boot banner of key env/flags so tailing is easier.
+- **Enforces DRY RUN** from env (IS_DRYRUN/DRYRUN) before any buy.
 
 ENV knobs (most are optional / already in your .env)
 ---------------------------------------------------
@@ -16,7 +18,7 @@ PF_COOLDOWN_SEC=15
 PF_MAX_CONCURRENT=2
 PF_DEDUPE_ENABLED=1
 PF_DEDUPE_TTL_SEC=3600
-PF_POOLS=pump,raydium             # which pools we consume from (case‑insensitive)
+PF_POOLS=pump,raydium             # which pools we consume from (case-insensitive)
 PAUSE_TRADING=0
 MAX_TRADEABLE=0                   # 0 = unlimited
 EXIT_ENGINE_ENABLED=1
@@ -39,8 +41,8 @@ ENTRY_MOMO_PRICE_TRIES=4
 ENTRY_MOMO_PRICE_DELAY_S=0.7
 ENTRY_MOMO_MAX_PARALLEL=6
 
-# Post‑buy smoke test (optional)
-POSTBUY_MODE=immediate_sell_test  # exactly this string triggers a post‑buy sell test
+# Post-buy smoke test (optional)
+POSTBUY_MODE=immediate_sell_test  # exactly this string triggers a post-buy sell test
 
 # Wallet helper (optional). If ~/.config/solana/id.json doesn't exist, we'll write it.
 # Must be a JSON array of 64 integers.
@@ -50,13 +52,6 @@ SOLANA_KEYPAIR_JSON=[...]         # alias (either works)
 # Raydium scanner (enabled by config.ENABLE_RAYDIUM_SCANNER and PF_POOLS contains raydium)
 RAYDIUM_LIMIT=200
 RAYDIUM_MIN_LIQ_USD=1500
-
-Notes
------
-- This file assumes your utility modules exist in utils_pkg/* and scanner/* as in your project.
-- The script is chatty when PF_DEBUG_TX=1; otherwise it keeps logs compact.
-- If you "+Now tail only buy/guardrail signals" and see nothing, you'll at least see periodic
-  DIAG_* counters printed every 60s with an event rate and filter reasons.
 """
 
 import asyncio
@@ -98,18 +93,13 @@ except Exception:  # pragma: no cover
     _mg_prob = None  # type: ignore
 
 def _dryrun_env_on() -> bool:
+    """
+    Effective dry-run flag sourced from env (overrides downstream modules).
+    Returns True if either IS_DRYRUN or DRYRUN env is a truthy value.
+    """
     v = (os.getenv("IS_DRYRUN") or os.getenv("DRYRUN") or "").strip().lower()
     return v in {"1", "true", "yes", "on"}
 
-# then in Strategy._gate_candidate() where we would buy:
-if _dryrun_env_on():
-    log.event("BUY_SKIPPED_DRYRUN", mint=mint_norm)
-    record_buy_result(ok=False, reason="dryrun_skip")
-else:
-    async with self._sema:
-        tx_sig = await maybe_buy(mint=mint_norm, ui=ui)
-    ...
-# and in the non-momentum path before maybe_buy(...), same guard
 # ---------------------------
 # Event source + trading hooks
 # ---------------------------
@@ -127,7 +117,7 @@ except Exception:  # pragma: no cover
         raise RuntimeError("maybe_buy not available")
 
 try:
-    from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN
+    from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN as _pkg_is_dryrun
 except Exception:  # pragma: no cover
     async def sell_on_jupiter(*_a, **_kw):  # type: ignore
         raise RuntimeError("sell_on_jupiter not available")
@@ -135,7 +125,7 @@ except Exception:  # pragma: no cover
         async def on_trade_tick(self, *_a, **_kw): ...
         async def on_buy_filled(self, *_a, **_kw): ...
     exit_engine = _NoopExit()  # type: ignore
-    IS_DRYRUN = True
+    _pkg_is_dryrun = True
 
 # Optional utils
 try:
@@ -194,7 +184,6 @@ except Exception:  # pragma: no cover
         return None
 
 # Raydium scanner (lazy import)
-
 def _get_raydium_scanner():
     try:
         from scanner.raydium_scanner import scan_raydium  # type: ignore
@@ -205,7 +194,6 @@ def _get_raydium_scanner():
 # ---------------------------
 # ENV helpers
 # ---------------------------
-
 def _as_bool(val: Optional[str], default: bool = False) -> bool:
     if val is None:
         return default
@@ -226,7 +214,6 @@ def _as_int(val: Any, default: int) -> int:
 # ---------------------------
 # Config (env)
 # ---------------------------
-
 EXIT_ENGINE_ENABLED = _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True)
 DEDUPE_ENABLED = _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True)
 DEDUPE_TTL_SEC = _as_int(os.getenv("PF_DEDUPE_TTL_SEC", "3600"), 3600)
@@ -264,7 +251,6 @@ POOLS_FILTER: set[str] = set(_POOLS_ENV)
 # ---------------------------
 # Small helpers
 # ---------------------------
-
 def _get_first(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
     for k in keys:
         if k in d and d[k] is not None:
@@ -325,7 +311,6 @@ def _approx_minutes_since(ts_any: Any) -> Optional[float]:
 # ---------------------------
 # Basic filters
 # ---------------------------
-
 def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
     pool = str((_get_first(msg, "pool", default="") or "")).strip().lower()
     is_raydium = (pool == "raydium")
@@ -336,10 +321,12 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
         return False
 
     typ = str(_get_first(msg, "txType", "type", default="")).strip().lower()
+    # Pump has txType=create; Raydium feed usually doesn't—so only enforce for non-Raydium.
     if not is_raydium and typ != "create":
         return False
 
     init_buy = _as_float(_get_first(msg, "initialBuy", "initial_buy", default=0.0), 0.0)
+    # Raydium entries won't have initialBuy—only enforce this for non-Raydium.
     if not is_raydium and init_buy < MIN_INITIAL_BUY_SOL:
         if DEBUG_TX:
             print(f".[filter] initialBuy {init_buy} < min {MIN_INITIAL_BUY_SOL} — skip", flush=True)
@@ -376,7 +363,7 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
     return True
 
 # ---------------------------
-# Post‑buy optional immediate sell test
+# Post-buy optional immediate sell test
 # ---------------------------
 async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
     if str(os.getenv("POSTBUY_MODE", "")).strip().lower() != "immediate_sell_test":
@@ -426,7 +413,6 @@ async def _await_mint_ready(mint_norm: str, max_wait_s: int = 45, step_s: float 
 # ---------------------------
 # Boot: ensure keypair file
 # ---------------------------
-
 def _ensure_keypair_file() -> None:
     import json, pathlib, stat
     try:
@@ -457,7 +443,6 @@ def _ensure_keypair_file() -> None:
 # ---------------------------
 # Strategy
 # ---------------------------
-
 class Strategy:
     def __init__(self) -> None:
         self._sema = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -557,6 +542,8 @@ class Strategy:
                 trades_ok=int(trades_ok),
             )
             self._gate_state.pop(mint_raw, None)
+
+            # guardrails before buy
             if not buys_allowed() or PAUSE_TRADING:
                 if DEBUG_TX:
                     print("[guardrails] buys not allowed at gate decision — skip", flush=True)
@@ -572,12 +559,20 @@ class Strategy:
                         return
                 except Exception:
                     pass
+
             if trades_ok and up_ok:
                 if DEDUPE_ENABLED and not claim_once(f"buy:{mint_raw}", ttl=600):
                     if DEBUG_TX:
                         print(f".[dedupe] buy already claimed for {mint_raw} — skip", flush=True)
                     record_buy_result(ok=False, reason="buy_claimed_elsewhere")
                     return
+
+                # 🔒 enforce dry-run from env BEFORE any buy
+                if _dryrun_env_on():
+                    log.event("BUY_SKIPPED_DRYRUN", mint=mint_norm)
+                    record_buy_result(ok=False, reason="dryrun_skip")
+                    return
+
                 try:
                     async with self._sema:
                         tx_sig = await maybe_buy(mint=mint_norm, ui=ui)
@@ -585,7 +580,7 @@ class Strategy:
                     if tx_sig:
                         record_buy_result(ok=True, reason="executed", sig=tx_sig)
                         self._diag["buys_filled"] += 1
-                        if EXIT_ENGINE_ENABLED and not IS_DRYRUN:
+                        if EXIT_ENGINE_ENABLED and not _dryrun_env_on():
                             asyncio.create_task(exit_engine.on_buy_filled(raw_id_or_mint=mint_norm, tx_sig=tx_sig))
                         asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
                     else:
@@ -600,6 +595,7 @@ class Strategy:
     async def on_new_token(self, raw_event: Dict[str, Any]) -> None:
         self._diag["events_total"] += 1
         self._diag["events_new_token"] += 1
+
         if PAUSE_TRADING or not buys_allowed():
             if DEBUG_TX:
                 print("[guardrails] buys not allowed now — skip", flush=True)
@@ -613,6 +609,7 @@ class Strategy:
                     return
             except Exception:
                 pass
+
         mint_source = _extract_raw_mint(raw_event)
         if not mint_source:
             if DEBUG_TX:
@@ -626,6 +623,7 @@ class Strategy:
         if not _passes_basic_filters(raw_event):
             self._diag["rejected_filters"] += 1
             return
+
         dec_from_liq: Optional[int] = None
         if LIQ_FILTER_ENABLED:
             ok, rep = await _screen_with_retry(mint_norm, tries=3, first_wait=0.8)
@@ -647,6 +645,7 @@ class Strategy:
                 priceImpactPct=(rep or {}).get("priceImpactPct"),
                 dec=dec_from_liq,
             )
+
         ui: Dict[str, Any] = dict(raw_event)
         ui.setdefault("pool", (raw_event.get("pool") or "pump").lower())
         ui.setdefault("symbol", _extract_symbol(raw_event))
@@ -656,14 +655,17 @@ class Strategy:
         ui["normalized"] = (mint_norm != mint_source)
         if dec_from_liq is not None:
             ui["decimals"] = dec_from_liq
+
         pool = ui.get("pool", "?")
         symbol = ui.get("symbol", "") or "?"
         print(f"[trade] pool={pool} symbol={symbol} mint={mint_norm}", flush=True)
+
         if DEDUPE_ENABLED and ENTRY_MOMENTUM_ENABLED:
             if not claim_once(f"gate-propose:{mint_source}", ttl=int(max(ENTRY_MOMO_WINDOW_SEC * 2, 90))):
                 if DEBUG_TX:
                     print(f".[dedupe] gate-propose taken for {mint_source} — skip", flush=True)
                 return
+
         if ENTRY_MOMENTUM_ENABLED:
             asyncio.create_task(self._gate_candidate(ui, mint_source, mint_norm))
         else:
@@ -671,6 +673,13 @@ class Strategy:
                 if DEBUG_TX:
                     print(f".[dedupe] buy already claimed for {mint_source} — skip", flush=True)
                 return
+
+            # 🔒 enforce dry-run from env BEFORE any buy
+            if _dryrun_env_on():
+                log.event("BUY_SKIPPED_DRYRUN", mint=mint_norm)
+                record_buy_result(ok=False, reason="dryrun_skip")
+                return
+
             async with self._sema:
                 try:
                     if PAUSE_TRADING or not buys_allowed():
@@ -693,19 +702,19 @@ class Strategy:
                         return
                     record_buy_result(ok=True, reason="executed", sig=tx_sig)
                     self._diag["buys_filled"] += 1
-                    if EXIT_ENGINE_ENABLED and not IS_DRYRUN:
+                    if EXIT_ENGINE_ENABLED and not _dryrun_env_on():
                         asyncio.create_task(exit_engine.on_buy_filled(raw_id_or_mint=mint_norm, tx_sig=tx_sig))
                     asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
                 except Exception:
                     print("[strategy] maybe_buy exception:", flush=True)
                     traceback.print_exc()
                     record_buy_result(ok=False, reason="exception")
+
         await asyncio.sleep(LOOP_COOLDOWN_SEC)
 
 # ---------------------------
 # Mint normalization wrappers
 # ---------------------------
-
 def _normalize_from_source(raw: str) -> str:
     if raw is None:
         return ""
@@ -735,7 +744,6 @@ def _is_probable_mint(s: str) -> bool:
 # ---------------------------
 # Streaming loop
 # ---------------------------
-
 async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
     strat = Strategy()
 
@@ -802,7 +810,6 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
 # ---------------------------
 # Raydium scanner supervisor
 # ---------------------------
-
 async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
     scan_raydium = _get_raydium_scanner()
     if scan_raydium is None:
@@ -861,15 +868,16 @@ async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asynci
 # ---------------------------
 # Main
 # ---------------------------
-
 def _boot_banner() -> None:
-    # Print once so tails show config quickly
     pools = ",".join(sorted(POOLS_FILTER)) if POOLS_FILTER else "<all>"
+    # effective dry-run: env OR downstream lib flag
+    effective_dryrun = _dryrun_env_on() or bool(_pkg_is_dryrun)
     print(
         "\n=== 🟢 sniper main boot ===\n"
-        f"DRYRUN={getattr(sys.modules.get('utils_pkg.trader',''), 'IS_DRYRUN', 'unknown')}\n"
+        f"DRYRUN={effective_dryrun}\n"
         f"PF_DEBUG_TX={int(DEBUG_TX)} | PF_MAX_CONCURRENT={MAX_CONCURRENCY} | PF_COOLDOWN_SEC={LOOP_COOLDOWN_SEC}\n"
-        f"MOMO: on={int(ENTRY_MOMENTUM_ENABLED)} window={ENTRY_MOMO_WINDOW_SEC}s min_trades={ENTRY_MOMO_MIN_TRADES} min_up={ENTRY_MOMO_MIN_UP_PCT}%\n"
+        f"MOMO: on={int(ENTRY_MOMENTUM_ENABLED)} window={ENTRY_MOMO_WINDOW_SEC}s "
+        f"min_trades={ENTRY_MOMO_MIN_TRADES} min_up={ENTRY_MOMO_MIN_UP_PCT}%\n"
         f"LIQ_FILTER={int(LIQ_FILTER_ENABLED)} | EXIT_ENGINE={int(EXIT_ENGINE_ENABLED)} | MAX_TRADEABLE={MAX_TRADEABLE}\n"
         f"POOLS={pools}\n"
         "===========================\n",
@@ -883,10 +891,10 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
 
     _boot_banner()
 
-    # Ensure wallet file exists (no‑op if already present)
+    # Ensure wallet file exists (no-op if already present)
     _ensure_keypair_file()
 
-    # Router initialization (best‑effort)
+    # Router initialization (best-effort)
     try:
         if router and hasattr(router, "start"):
             await router.start()
@@ -910,7 +918,7 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     # Start scanners/background tasks
     bg_tasks = await _start_background_tasks(local_stop)
 
-    # Signal handlers (best‑effort; Windows may not support add_signal_handler)
+    # Signal handlers (best-effort; Windows may not support add_signal_handler)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -942,7 +950,6 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
         except Exception:
             pass
         await _graceful_shutdown(local_stop, sell_task, bg_tasks)
-
 
 if __name__ == "__main__":
     try:
