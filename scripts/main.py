@@ -686,7 +686,7 @@ async def _start_background_tasks(stop_evt: asyncio.Event) -> Dict[str, asyncio.
     if want_raydium and pools_ok:
         t = asyncio.create_task(_run_raydium_scanner_forever(stop_evt), name="scan.raydium")
         tasks["scan.raydium"] = t
-        log.event("SCAN_RAYDIUM_SCHEDULED", name="scan.raydium")
+        log.event("SCAN_RAYDIUM_SCHEDULED", task="scan.raydium")
 
     return tasks
 
