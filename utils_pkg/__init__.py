@@ -1,7 +1,3 @@
 # utils_pkg/__init__.py
-from .core_utils import (
-    init_resources,
-    close_resources,
-    get_sol_usd,
-)
- 
+# Re-export everything from core_utils so main.py can "from utils_pkg import …"
+from .core_utils import *  # noqa: F401,F403

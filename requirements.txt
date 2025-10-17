@@ -15,4 +15,3 @@ base58==2.1.1
 
 # Optional DBs (safe even if PG_ENABLED=false)
 SQLAlchemy>=2.0,<2.1
-psycopg2-binary==2.9.9
