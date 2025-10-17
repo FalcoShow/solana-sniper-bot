@@ -92,6 +92,12 @@ log "DB(SQLA): ${DATABASE_URL%%\?*}?…"
 log "DB(asyncpg): ${PNL_DSN%%\?*}?…"
 log "JUP_BASE_URL: ${JUP_BASE_URL}"
 
+# --- Positions storage guard ---
+if [[ "${PF_POSITIONS_BACKEND:-sqlite}" == "sqlite" ]]; then
+  export POSITIONS_PG_ENABLED=0
+  export POSITIONS_PG_DSN=""
+fi
+
 # ---------- Final launch ----------
 # Run the app module
 exec "${PYTHON}" -m scripts.main
