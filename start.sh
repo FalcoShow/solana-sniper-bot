@@ -43,4 +43,4 @@ if [ "$relay_ok" -ne 1 ]; then
 fi
 
 # --- Run app ---
-exec python main.py
+exec python -m scripts.main
