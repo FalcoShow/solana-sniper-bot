@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import os, socket, ssl
 from urllib.parse import urlparse
-from aiohttp import web, ClientSession, TCPConnector, ClientTimeout, AsyncResolver
+from aiohttp import web, ClientSession, TCPConnector, ClientTimeout
+from aiohttp.resolver import ThreadedResolver
 
 BIND = os.getenv("RELAY_BIND", "127.0.0.1")
 PORT = int(os.getenv("RELAY_PORT", "18080"))
@@ -23,16 +24,10 @@ DEFAULT_HEADERS = {
     "Accept-Encoding": "gzip, deflate, br, zstd",
     "Origin": "https://quote-api.jup.ag",
     "Referer": "https://quote-api.jup.ag/",
-    "Sec-Fetch-Site": "same-site",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Not.A/Brand";v="24"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Linux"',
 }
 
-class StaticIPResolver(AsyncResolver):
-    """Resolve the upstream hostname to pinned IPs if provided."""
+class PinnedResolver(ThreadedResolver):
+    """Pin hostname to provided IPs without extra deps."""
     def __init__(self, hostname: str, ips: list[str]):
         super().__init__()
         self.hostname = hostname
@@ -43,15 +38,15 @@ class StaticIPResolver(AsyncResolver):
             return [{"hostname": host, "host": ip, "port": port,
                      "family": family, "proto": 0, "flags": 0}
                     for ip in self.ips]
-        # fall back to normal DNS
         return await super().resolve(host, port, family)
 
 async def make_session(upstream: str) -> ClientSession:
     parsed = urlparse(upstream)
     hostname = parsed.hostname or "quote-api.jup.ag"
 
-    resolver = StaticIPResolver(hostname, RESOLVE_IPS) if RESOLVE_IPS else AsyncResolver()
-    # keep SNI as the hostname (aiohttp uses the request URL host for SNI)
+    resolver = PinnedResolver(hostname, RESOLVE_IPS) if RESOLVE_IPS else ThreadedResolver()
+
+    # Keep SNI as the hostname; aiohttp uses the URL's host for SNI
     ssl_ctx = ssl.create_default_context()
     connector = TCPConnector(limit=100, ttl_dns_cache=300, resolver=resolver, ssl=ssl_ctx)
     timeout = ClientTimeout(total=20)
@@ -74,13 +69,12 @@ async def debug_handler(_: web.Request):
 
 def _forward_headers(req: web.Request):
     fwd = {k: v for k, v in req.headers.items() if k.lower() not in HOP_BY_HOP}
-    # enforce browser-ish defaults if caller didn’t send them
     for k, v in DEFAULT_HEADERS.items():
         fwd.setdefault(k, v)
-    # always ensure correct Host for WAF + SNI expectations
+
     host = urlparse(UPSTREAM).hostname or "quote-api.jup.ag"
     fwd["Host"] = host
-    # inject Jupiter API key if available
+
     if API_KEY and "x-api-key" not in {k.lower(): v for k, v in fwd.items()}:
         fwd["x-api-key"] = API_KEY
     return fwd
