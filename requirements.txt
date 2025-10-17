@@ -1,19 +1,27 @@
-# Runtime
-aiohttp>=3.9,<3.10
-aiosqlite>=0.19
-certifi==2024.2.2
-redis>=5,<6
-requests==2.32.3
-python-dotenv==1.0.1
-websockets>=11,<12
-asyncpg==0.29.0
+# --- Core async HTTP / DNS-safe relay ---
+aiohttp==3.9.5
+brotli>=1.1.0            # needed to decode Cloudflare br responses
 
-# Solana stack
+# --- Async DB stack ---
+SQLAlchemy==2.0.44       # matches your runtime logs
+asyncpg==0.29.0
+psycopg2-binary==2.9.9   # only used by your sell loop / any sync PG paths
+
+# --- Storage / cache / config ---
+aiosqlite==0.21.0
+redis==5.3.1
+python-dotenv==1.0.1
+
+# --- HTTP clients / websockets ---
+httpx==0.28.1            # you use httpx directly; pin to what your logs showed
+requests==2.32.3
+websockets==11.0.3
+
+# --- Solana toolchain ---
 solana==0.36.9
 solders==0.26.0
 base58==2.1.1
 
-# Optional DBs (safe even if PG_ENABLED=false)
-SQLAlchemy>=2.0,<2.1
-psycopg2-binary==2.9.9
-brotli>=1.1.0
+# --- Compatibility helpers (safe on 3.12) ---
+typing-extensions==4.15.0
+certifi==2024.2.2
