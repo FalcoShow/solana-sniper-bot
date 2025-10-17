@@ -10,7 +10,7 @@ if [[ -n "${WALLET_JSON:-}" && ! -f /opt/render/.secrets/wallet.json ]]; then
   chmod 600 /opt/render/.secrets/wallet.json
 fi
 
-# Point app at the secret file (your code already knows how to read this)
+# Point app at the secret file
 export WALLET_PRIVATE_KEY=/opt/render/.secrets/wallet.json
 
 # 2) Start local Jupiter relay in the background
@@ -19,5 +19,5 @@ nohup ./jup_relay.py >/tmp/jup_relay.log 2>&1 &
 echo $! >/tmp/jup_relay.pid
 sleep 1
 
-# 3) Run the long-lived worker (Render watches this process)
+# 3) Run the long-lived worker (change if your entrypoint differs)
 exec python -m scripts.main
