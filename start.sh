@@ -47,7 +47,7 @@ export JUP_IPS="${JUP_IPS:-104.18.24.229,104.18.25.229}"
 
 # clean previous relay if present
 pkill -f '[j]up_relay.py' || true
-nohup ./jup_relay.py >/tmp/jup_relay.log 2>&1 & echo $! >/tmp/jup_relay.pid || true
+nohup python jup_relay.py >/tmp/jup_relay.log 2>&1 & echo $! >/tmp/jup_relay.pid
 sleep 1
 
 # soft check (don’t fail app if relay isn’t ready yet)
