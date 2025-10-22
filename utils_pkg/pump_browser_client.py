@@ -4,8 +4,9 @@
 # - Optional executable override via PUMP_BROWSER_EXECUTABLE_PATH
 # - Proper warm-up (visit site + /cdn-cgi/trace) before API POST
 # - Reuses persistent context to keep CF cookies
-# - Retries with backoff on 530/5xx
-# - Honors common Render envs: PLAYWRIGHT_* , CHROMIUM_FLAGS, PF_* etc.
+# - Retries with backoff + jitter
+# - Circuit breaker on repeated 530s (CF Origin DNS error)
+# - Honors common Render/env knobs: PLAYWRIGHT_*, CHROMIUM_FLAGS, PF_*, PUMPFUN_*
 
 from __future__ import annotations
 
@@ -13,8 +14,7 @@ import asyncio
 import json
 import os
 import random
-import time
-from typing import Iterable, Tuple
+from typing import Tuple
 
 from playwright.async_api import async_playwright, BrowserContext, Playwright
 
@@ -40,6 +40,13 @@ def _int_env(name: str, default: int) -> int:
     except Exception:
         return default
 
+def _float_env(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    try:
+        return float(v) if v is not None and str(v).strip() != "" else default
+    except Exception:
+        return default
+
 def _list_env(name: str, default_csv: str) -> list[str]:
     raw = _str_env(name, default_csv)
     return [s.strip() for s in raw.split(",") if s.strip()]
@@ -51,27 +58,31 @@ def _list_env(name: str, default_csv: str) -> list[str]:
 
 # Browser selection
 _DEFAULT_CHANNEL = "chromium"  # critical: NOT "chrome" (avoids system Chrome)
-# where to persist cookies, keeps CF session alive across calls (works on Render)
-_DEFAULT_USER_DATA = _str_env("PUMP_USER_DATA_DIR", "/opt/render/.cache/pumpctx")
+# persistent profile keeps CF cookies/session alive across calls
+_DEFAULT_USER_DATA = _str_env("PF_CHROME_PROFILE", _str_env("PUMP_USER_DATA_DIR", "/opt/render/project/src/.pw-profile"))
 
-# Default UA (will fall back to navigator.userAgent after warm-up)
+# Default UA (we’ll try to read navigator.userAgent after warm-up)
 _DEFAULT_UA = _str_env(
     "PUMPFUN_UA",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
 # API bases
 _DEFAULT_API_BASES = "https://frontend-api.pump.fun"
 
 # Warm-up timing
-_WARM_API_SEC = float(_str_env("PF_WARM_API_SEC", "8") or "8")
-_WARM_SITE_SEC = float(_str_env("PF_WARM_SITE_SEC", "2") or "2")
+_WARM_API_SEC  = _float_env("PF_WARM_API_SEC", 8.0)
+_WARM_SITE_SEC = _float_env("PF_WARM_SITE_SEC", 2.0)
 
-# Retry policy
-_MAX_RETRIES = _int_env("PUMP_HTTP_RETRIES", 4)
-_RETRY_BASE_SLEEP = float(_str_env("PUMP_HTTP_RETRY_BASE_SEC", "1.0"))
+# Retry + circuit breaker policy (can be overridden by env)
+_RETRY_MAX           = _int_env("PUMPFUN_RETRY_MAX", 4)
+_RETRY_BASE_MS       = _int_env("PUMPFUN_RETRY_BASE_MS", 800)
+_BREAKER_FAILS       = _int_env("PUMPFUN_BREAKER_FAILS", 6)          # trip after N consecutive 530s
+_BREAKER_COOL_MS     = _int_env("PUMPFUN_BREAKER_COOL_MS", 120_000)  # 2 minutes cooldown (open state)
+
+# Hard caps
+_MAX_SLEEP_S = 8.0
 
 
 # --------------------------
@@ -86,11 +97,12 @@ async def _new_context(pw: Playwright) -> Tuple[BrowserContext, str]:
       - PUMP_BROWSER_EXECUTABLE_PATH (optional)
       - PF_HEADLESS / PLAYWRIGHT_HEADLESS
       - CHROMIUM_FLAGS
+      - PF_CHROME_PROFILE / PUMP_USER_DATA_DIR (profile dir)
     Performs Cloudflare warm-up on both site and API.
     """
-    profile = _DEFAULT_USER_DATA
-    headless = _bool_env("PLAYWRIGHT_HEADLESS", _bool_env("PF_HEADLESS", True))
-    channel = _str_env("PUMP_BROWSER_CHANNEL", _DEFAULT_CHANNEL) or _DEFAULT_CHANNEL
+    profile    = _DEFAULT_USER_DATA
+    headless   = _bool_env("PLAYWRIGHT_HEADLESS", _bool_env("PF_HEADLESS", True))
+    channel    = _str_env("PUMP_BROWSER_CHANNEL", _DEFAULT_CHANNEL) or _DEFAULT_CHANNEL
     executable = _str_env("PUMP_BROWSER_EXECUTABLE_PATH", "").strip() or None
 
     # Extra Chromium args (Render-safe flags)
@@ -100,19 +112,14 @@ async def _new_context(pw: Playwright) -> Tuple[BrowserContext, str]:
         user_data_dir=profile,
         headless=headless,
         args=chromium_args,
+        user_agent=_DEFAULT_UA,  # initial UA; we’ll resolve to navigator.userAgent after warm-up
     )
 
-    # Prefer explicit executable when provided (takes precedence over channel)
-    # Note: Playwright disallows mixing both; we choose one.
+    # Prefer explicit executable when provided; otherwise use channel (chromium)
     if executable:
         launch_kwargs["executable_path"] = executable
     else:
-        # Use "chromium" channel by default; NEVER hardcode "chrome"
-        # (system Chrome path may not exist on Render)
         launch_kwargs["channel"] = channel
-
-    # Set an initial UA; we may refine after warm-up
-    launch_kwargs["user_agent"] = _DEFAULT_UA
 
     ctx = await pw.chromium.launch_persistent_context(**launch_kwargs)
     page = await ctx.new_page()
@@ -127,7 +134,7 @@ async def _new_context(pw: Playwright) -> Tuple[BrowserContext, str]:
         except Exception:
             pass
     except Exception:
-        # non-fatal; continue
+        # non-fatal
         pass
 
     # 2) Hit API base (first base) to pre-establish cookies at the API origin
@@ -150,6 +157,11 @@ async def _new_context(pw: Playwright) -> Tuple[BrowserContext, str]:
     except Exception:
         ua = _DEFAULT_UA
 
+    try:
+        await page.close()
+    except Exception:
+        pass
+
     return ctx, ua
 
 
@@ -167,6 +179,7 @@ async def _post_via_request_ctx(
     """
     POST via BrowserContext's request client. Reuses cookies from the context,
     avoids CORS, and looks like it originated from the warm browser session.
+    Raises RuntimeError with rich message on non-200 (includes cf-ray and status).
     """
     resp = await ctx.request.post(
         full_url,
@@ -199,24 +212,33 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
     Robust tRPC POST helper that:
       - Creates a Chromium persistent context
       - Warms up CF on site + API
-      - Tries each API base with retries/backoff
+      - Tries each API base with retries/backoff (+ jitter)
+      - Circuit-breaks on repeated 530s
       - Closes context on exit
 
-    Env of interest:
-      PUMPFUN_API_BASES                  CSV list of bases (default https://frontend-api.pump.fun)
-      PUMP_BROWSER_CHANNEL               Default "chromium"
-      PUMP_BROWSER_EXECUTABLE_PATH       Override executable path
-      PLAYWRIGHT_HEADLESS / PF_HEADLESS  Headless toggle
-      CHROMIUM_FLAGS                     Extra chromium flags
-      PUMPFUN_UA                         Override UA
-      PUMP_HTTP_RETRIES                  Retry count (default 4)
-      PUMP_HTTP_RETRY_BASE_SEC           Backoff base seconds (default 1.0)
+    Relevant env:
+      PUMPFUN_API_BASES            CSV list of bases (default https://frontend-api.pump.fun)
+      PUMP_BROWSER_CHANNEL         Default "chromium"
+      PUMP_BROWSER_EXECUTABLE_PATH Override executable path
+      PLAYWRIGHT_HEADLESS/PF_HEADLESS
+      CHROMIUM_FLAGS
+      PUMPFUN_UA
+      PUMPFUN_RETRY_MAX            (default 4)
+      PUMPFUN_RETRY_BASE_MS        (default 800)
+      PUMPFUN_BREAKER_FAILS        (default 6)
+      PUMPFUN_BREAKER_COOL_MS      (default 120000)
+      PF_WARM_API_SEC              (default 8)
+      PF_WARM_SITE_SEC             (default 2)
     """
     if not path.startswith("/"):
         path = "/" + path
 
     bases = [b.rstrip("/") for b in _list_env("PUMPFUN_API_BASES", _DEFAULT_API_BASES)]
+    if not bases:
+        raise RuntimeError("No PUMPFUN_API_BASES configured")
+
     last_err: Exception | None = None
+    consecutive_530 = 0
 
     async with async_playwright() as pw:
         ctx: BrowserContext | None = None
@@ -224,26 +246,47 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
         try:
             ctx, ua_resolved = await _new_context(pw)
 
-            # Try each base with per-base retries
-            for base in bases:
-                full = f"{base}{path}"
-                for attempt in range(_MAX_RETRIES + 1):
+            # Try bases with retries
+            for attempt in range(_RETRY_MAX + 1):
+                for base in bases:
+                    full = f"{base}{path}"
                     try:
-                        return await _post_via_request_ctx(ctx, full, json_body, timeout_ms, ua_resolved)
-                    except Exception as e:
+                        txt = await _post_via_request_ctx(ctx, full, json_body, timeout_ms, ua_resolved)
+                        consecutive_530 = 0
+                        return txt
+                    except RuntimeError as e:
+                        msg = str(e)
                         last_err = e
-                        # Backoff for CF hiccups (530/5xx). Random jitter helps.
-                        sleep_s = _RETRY_BASE_SLEEP * (2 ** attempt) * (1.0 + random.random() * 0.25)
-                        # On the first failure against a base, try a quick re-warm of that origin:
+
+                        # Fast fail on 404 (wrong path/host)
+                        if "-> 404" in msg:
+                            raise
+
+                        # Track 530s for breaker logic
+                        if "-> 530" in msg or "Origin DNS error" in msg:
+                            consecutive_530 += 1
+
+                        # Quick re-warm this base after first failure
                         if attempt == 0:
                             try:
-                                page = await ctx.new_page()
-                                await page.goto(base, wait_until="domcontentloaded", timeout=60_000)
-                                await page.wait_for_timeout(int(750))
-                                await page.close()
+                                pg = await ctx.new_page()
+                                await pg.goto(base, wait_until="domcontentloaded", timeout=60_000)
+                                await pg.wait_for_timeout(600)
+                                await pg.close()
                             except Exception:
                                 pass
-                        await asyncio.sleep(min(sleep_s, 8.0))
+
+                # exponential backoff with jitter between attempts
+                sleep_ms = int(_RETRY_BASE_MS * (2 ** attempt) * (1.0 + random.random() * 0.25))
+                await asyncio.sleep(min(float(sleep_ms) / 1000.0, _MAX_SLEEP_S))
+
+                # circuit breaker: too many 530s in a row -> cool down
+                if consecutive_530 >= _BREAKER_FAILS:
+                    cool_ms = max(_BREAKER_COOL_MS, _RETRY_BASE_MS * 4)
+                    # simple log line (stderr captured by your logger)
+                    print(f"[pump] circuit-breaker open after {consecutive_530}x 530; cooling {cool_ms}ms", flush=True)
+                    await asyncio.sleep(float(cool_ms) / 1000.0)
+                    consecutive_530 = 0  # half-open afterwards
         finally:
             if ctx is not None:
                 try:
