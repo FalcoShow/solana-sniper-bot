@@ -15,6 +15,9 @@ import json
 import os
 import random
 from typing import Tuple
+import pathlib
+import shutil
+import uuid
 
 from playwright.async_api import async_playwright, BrowserContext, Playwright
 
@@ -92,40 +95,58 @@ _MAX_SLEEP_S = 8.0
 async def _new_context(pw: Playwright) -> Tuple[BrowserContext, str]:
     """
     Create a persistent Chromium context and return (ctx, resolved_user_agent).
-    Honors:
-      - PUMP_BROWSER_CHANNEL (default chromium)
-      - PUMP_BROWSER_EXECUTABLE_PATH (optional)
-      - PF_HEADLESS / PLAYWRIGHT_HEADLESS
-      - CHROMIUM_FLAGS
-      - PF_CHROME_PROFILE / PUMP_USER_DATA_DIR (profile dir)
-    Performs Cloudflare warm-up on both site and API.
+    Falls back to a fresh subdir if the configured profile is locked.
     """
-    profile    = _DEFAULT_USER_DATA
-    headless   = _bool_env("PLAYWRIGHT_HEADLESS", _bool_env("PF_HEADLESS", True))
-    channel    = _str_env("PUMP_BROWSER_CHANNEL", _DEFAULT_CHANNEL) or _DEFAULT_CHANNEL
+    base_profile = pathlib.Path(_DEFAULT_USER_DATA)
+    headless = _bool_env("PLAYWRIGHT_HEADLESS", _bool_env("PF_HEADLESS", True))
+    channel = _str_env("PUMP_BROWSER_CHANNEL", _DEFAULT_CHANNEL) or _DEFAULT_CHANNEL
     executable = _str_env("PUMP_BROWSER_EXECUTABLE_PATH", "").strip() or None
+    chromium_args = _str_env(
+        "CHROMIUM_FLAGS", "--no-sandbox --disable-dev-shm-usage"
+    ).split()
 
-    # Extra Chromium args (Render-safe flags)
-    chromium_args = _str_env("CHROMIUM_FLAGS", "--no-sandbox --disable-dev-shm-usage").split()
+    def launch_kwargs_for(user_data_dir: pathlib.Path) -> dict:
+        kw = dict(
+            user_data_dir=str(user_data_dir),
+            headless=headless,
+            args=chromium_args,
+            user_agent=_DEFAULT_UA,
+        )
+        if executable:
+            kw["executable_path"] = executable
+        else:
+            kw["channel"] = channel
+        return kw
 
-    launch_kwargs = dict(
-        user_data_dir=profile,
-        headless=headless,
-        args=chromium_args,
-        user_agent=_DEFAULT_UA,  # initial UA; we’ll resolve to navigator.userAgent after warm-up
-    )
+    # Helper: does this profile look locked?
+    def profile_locked(p: pathlib.Path) -> bool:
+        return any((p / name).exists() for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"))
 
-    # Prefer explicit executable when provided; otherwise use channel (chromium)
-    if executable:
-        launch_kwargs["executable_path"] = executable
-    else:
-        launch_kwargs["channel"] = channel
+    # Decide which profile dir to use
+    profile_to_use = base_profile
+    base_profile.mkdir(parents=True, exist_ok=True)
 
-    ctx = await pw.chromium.launch_persistent_context(**launch_kwargs)
+    # If a lock is present, fall back to a unique subdir under the same root
+    if profile_locked(base_profile):
+        profile_to_use = base_profile / f"run-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        profile_to_use.mkdir(parents=True, exist_ok=True)
+
+    # Try launch; if we still hit ProcessSingleton, fallback once more to a fresh subdir
+    try:
+        ctx = await pw.chromium.launch_persistent_context(**launch_kwargs_for(profile_to_use))
+    except Exception as e:
+        msg = str(e)
+        if "ProcessSingleton" in msg or "SingletonLock" in msg:
+            # final fallback
+            alt = base_profile / f"run-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+            alt.mkdir(parents=True, exist_ok=True)
+            ctx = await pw.chromium.launch_persistent_context(**launch_kwargs_for(alt))
+        else:
+            raise
+
     page = await ctx.new_page()
 
     # --- Cloudflare warm-up ---
-    # 1) Hit pump.fun to let CF set challenge cookies
     try:
         await page.goto("https://pump.fun/", wait_until="domcontentloaded", timeout=120_000)
         await page.wait_for_timeout(int(_WARM_SITE_SEC * 1000))
@@ -134,10 +155,8 @@ async def _new_context(pw: Playwright) -> Tuple[BrowserContext, str]:
         except Exception:
             pass
     except Exception:
-        # non-fatal
         pass
 
-    # 2) Hit API base (first base) to pre-establish cookies at the API origin
     bases = _list_env("PUMPFUN_API_BASES", _DEFAULT_API_BASES)
     api_origin = bases[0].rstrip("/")
     try:
@@ -151,16 +170,10 @@ async def _new_context(pw: Playwright) -> Tuple[BrowserContext, str]:
 
     await page.wait_for_timeout(int(_WARM_API_SEC * 1000))
 
-    # Resolve final UA from the live page (more realistic)
     try:
         ua = await page.evaluate("() => navigator.userAgent")
     except Exception:
         ua = _DEFAULT_UA
-
-    try:
-        await page.close()
-    except Exception:
-        pass
 
     return ctx, ua
 
