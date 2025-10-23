@@ -18,6 +18,7 @@ from typing import Tuple
 import pathlib
 import shutil
 import uuid
+import time
 
 from playwright.async_api import async_playwright, BrowserContext, Playwright
 
