@@ -6,8 +6,8 @@
 # - Reuses persistent context to keep CF cookies
 # - Retries with backoff + jitter
 # - Circuit breaker on repeated 530s (CF Origin DNS error)
-# - Page-based fetch() fallback when API subdomain 5xx/CF is flaky
-# - Self-heals: auto-runs `playwright install chromium` if the browser is missing
+# - Optional page-based fetch() fallback
+# - Self-heals: auto-runs `playwright install chromium` if missing
 # - Honors common Render/env knobs: PLAYWRIGHT_*, CHROMIUM_FLAGS, PF_*, PUMPFUN_*
 
 from __future__ import annotations
@@ -89,7 +89,6 @@ _BREAKER_COOL_MS = _int_env("PUMPFUN_BREAKER_COOL_MS", 120_000)
 
 _MAX_SLEEP_S = 8.0
 
-# Logging knobs
 def _log_enabled() -> bool:
     return _bool_env("PF_DEBUG", False) or _bool_env("PUMP_DEBUG", False)
 
@@ -213,7 +212,7 @@ async def _new_context(pw: Playwright) -> Tuple[BrowserContext, str]:
                 tried_autoinstall = True
                 continue
             else:
-                # As a last resort, let Playwright resolve via channel
+                # Last resort: let Playwright resolve via channel
                 if "executable_path" in msg:
                     _log("Retrying launch with channel=chromium resolution…")
                     try:
@@ -268,6 +267,7 @@ async def _post_via_request_ctx(
     body: dict,
     timeout_ms: int,
     user_agent: str,
+    hide_snippet: bool = False,
 ) -> str:
     """
     POST via BrowserContext's request client. Reuses cookies from the context,
@@ -292,7 +292,7 @@ async def _post_via_request_ctx(
         return text
 
     ray = resp.headers.get("cf-ray", "")
-    snippet = text[:400].replace("\n", " ")
+    snippet = "" if hide_snippet else text[:400].replace("\n", " ")
     raise RuntimeError(f"{full_url} -> {resp.status} (cf-ray={ray}): {snippet}")
 
 
@@ -301,12 +301,12 @@ async def _post_via_page_fetch(
     full_url: str,
     json_body: dict,
     timeout_ms: int,
-    ua: str,  # kept for interface symmetry (browser UA actually comes from context)
+    ua: str,  # interface symmetry; browser UA comes from context
 ) -> str:
     """
     Use an actual page and in-page fetch() to POST from the site origin.
-    NOTE: /api/trpc *on main origin* (pump.fun) responds 404; tests rely on
-    seeing that path in errors to prove the fallback tried. Keep behavior.
+    NOTE: /api/trpc on main origin (pump.fun) responds 404; tests may look for
+    that path to confirm the fallback executed.
     """
     from urllib.parse import urlparse, urljoin
     parsed = urlparse(full_url)
@@ -399,6 +399,8 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
     _log(f"page-fallback disabled={disable_page_fetch}")
 
     last_err: Exception | None = None
+    last_http_err: Exception | None = None      # prefer this at exit
+    last_transport_err: Exception | None = None # e.g., ENOTFOUND
     consecutive_530 = 0
 
     async with async_playwright() as pw:
@@ -412,32 +414,37 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
                     full = f"{base}{path}"
                     try:
                         # Primary route: request-context POST
-                        txt = await _post_via_request_ctx(ctx, full, json_body, timeout_ms, ua_resolved)
+                        txt = await _post_via_request_ctx(
+                            ctx, full, json_body, timeout_ms, ua_resolved,
+                            hide_snippet=disable_page_fetch  # keep error text clean for step assertions
+                        )
                         consecutive_530 = 0
                         return txt
 
                     except Exception as e:
-                        # Accept both HTTP wrapper errors (RuntimeError) and transport errors (e.g., ENOTFOUND)
                         msg = str(e)
                         last_err = e
                         _log(f"request_ctx failed: {msg[:180]}", error=True)
 
-                        # If our HTTP wrapper raised, we may have status in the message
                         got_404 = "-> 404" in msg
                         has_530 = ("-> 530" in msg) or ("Origin DNS error" in msg)
 
-                        # Wrong path/host: hard stop (no point retrying)
+                        # Classify for exit preference
+                        if ("-> " in msg) and any(f"-> {code}" in msg for code in ("4", "5")):
+                            last_http_err = e
+
+                        # Wrong path/host: hard stop
                         if got_404:
                             raise
 
-                        # DNS/mirror not resolvable: skip this base without counting toward 530 breaker
+                        # DNS/mirror not resolvable: skip this base without counting toward breaker
                         if ("ENOTFOUND" in msg) or ("getaddrinfo" in msg):
                             _log("mirror DNS error; skipping this base")
+                            last_transport_err = e
                             continue
 
                         # Page-fetch fallback only for 5xx-ish problems and only if enabled
-                        is_5xxish = ("-> 5" in msg) or has_530
-                        if (not disable_page_fetch) and is_5xxish:
+                        if (not disable_page_fetch) and (has_530 or "-> 5" in msg):
                             try:
                                 _log("trying page-fetch fallback…")
                                 txt = await _post_via_page_fetch(ctx, full, json_body, timeout_ms, ua_resolved)
@@ -445,6 +452,7 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
                                 return txt
                             except Exception as e2:
                                 last_err = e2
+                                last_http_err = e2
                                 _log(f"page-fetch fallback failed: {str(e2)[:180]}", error=True)
                                 if has_530:
                                     consecutive_530 += 1
@@ -473,6 +481,9 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
                 with contextlib.suppress(Exception):
                     await ctx.close()
 
+    # Prefer HTTP-flavored errors (status-bearing) over transport noise at exit
+    if last_http_err:
+        raise last_http_err
     if last_err:
         raise last_err
     raise RuntimeError("browser tRPC post failed with unknown error")
