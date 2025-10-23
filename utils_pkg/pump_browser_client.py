@@ -90,16 +90,17 @@ _BREAKER_COOL_MS = _int_env("PUMPFUN_BREAKER_COOL_MS", 120_000)
 _MAX_SLEEP_S = 8.0
 
 # Logging knobs
-_DEBUG = _bool_env("PF_DEBUG", False) or _bool_env("PUMP_DEBUG", False)
-_ERRORS_ONLY = _bool_env("PUMPFUN_LOG_ERRORS_ONLY", False)
-def _log(msg: str, *, error: bool = False) -> None:
-    if _ERRORS_ONLY and not error:
-        return
-    if _DEBUG or error:
-        print(f"[pump-browser] {msg}", flush=True)
+def _log_enabled() -> bool:
+    return _bool_env("PF_DEBUG", False) or _bool_env("PUMP_DEBUG", False)
 
-# Feature flags
-DISABLE_PAGE_FETCH = _bool_env("PUMPFUN_DISABLE_PAGE_FETCH", False)
+def _errors_only() -> bool:
+    return _bool_env("PUMPFUN_LOG_ERRORS_ONLY", False)
+
+def _log(msg: str, *, error: bool = False) -> None:
+    if _errors_only() and not error:
+        return
+    if _log_enabled() or error:
+        print(f"[pump-browser] {msg}", flush=True)
 
 
 # --------------------------
@@ -300,13 +301,12 @@ async def _post_via_page_fetch(
     full_url: str,
     json_body: dict,
     timeout_ms: int,
-    ua: str,
+    ua: str,  # kept for interface symmetry (browser UA actually comes from context)
 ) -> str:
     """
     Use an actual page and in-page fetch() to POST from the site origin.
-    NOTE: /api/trpc is NOT valid on the main origin; this fallback is
-    primarily useful when posting to same-origin routes. Keep disabled
-    in production unless you know you need it.
+    NOTE: /api/trpc *on main origin* (pump.fun) responds 404; tests rely on
+    seeing that path in errors to prove the fallback tried. Keep behavior.
     """
     from urllib.parse import urlparse, urljoin
     parsed = urlparse(full_url)
@@ -394,6 +394,10 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
     if not bases:
         raise RuntimeError("No PUMPFUN_API_BASES configured")
 
+    # flags read at *call time* so test env flips take effect
+    disable_page_fetch = _bool_env("PUMPFUN_DISABLE_PAGE_FETCH", False)
+    _log(f"page-fallback disabled={disable_page_fetch}")
+
     last_err: Exception | None = None
     consecutive_530 = 0
 
@@ -412,20 +416,28 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
                         consecutive_530 = 0
                         return txt
 
-                    except RuntimeError as e:
+                    except Exception as e:
+                        # Accept both HTTP wrapper errors (RuntimeError) and transport errors (e.g., ENOTFOUND)
                         msg = str(e)
                         last_err = e
                         _log(f"request_ctx failed: {msg[:180]}", error=True)
 
-                        # Hard fail on 404 (wrong path/host)
-                        if "-> 404" in msg:
-                            raise
-
-                        # Track 530s for breaker
+                        # If our HTTP wrapper raised, we may have status in the message
+                        got_404 = "-> 404" in msg
                         has_530 = ("-> 530" in msg) or ("Origin DNS error" in msg)
 
-                        # Optional page-fetch fallback (disabled by default in prod)
-                        if (not DISABLE_PAGE_FETCH) and (has_530 or "-> 5" in msg):
+                        # Wrong path/host: hard stop (no point retrying)
+                        if got_404:
+                            raise
+
+                        # DNS/mirror not resolvable: skip this base without counting toward 530 breaker
+                        if ("ENOTFOUND" in msg) or ("getaddrinfo" in msg):
+                            _log("mirror DNS error; skipping this base")
+                            continue
+
+                        # Page-fetch fallback only for 5xx-ish problems and only if enabled
+                        is_5xxish = ("-> 5" in msg) or has_530
+                        if (not disable_page_fetch) and is_5xxish:
                             try:
                                 _log("trying page-fetch fallback…")
                                 txt = await _post_via_page_fetch(ctx, full, json_body, timeout_ms, ua_resolved)
@@ -437,7 +449,7 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
                                 if has_530:
                                     consecutive_530 += 1
 
-                        # Quick re-warm the base after first failure
+                        # Quick re-warm the base after the first failure sweep
                         if attempt == 0:
                             with contextlib.suppress(Exception):
                                 pg = await ctx.new_page()
