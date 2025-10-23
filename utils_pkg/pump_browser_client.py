@@ -6,7 +6,7 @@
 # - Reuses persistent context to keep CF cookies
 # - Retries with backoff + jitter
 # - Circuit breaker on repeated 530s (CF Origin DNS error)
-# - Optional page-based fetch() fallback
+# - Optional page-based fetch() fallback (strictly gated)
 # - Self-heals: auto-runs `playwright install chromium` if missing
 # - Honors common Render/env knobs: PLAYWRIGHT_*, CHROMIUM_FLAGS, PF_*, PUMPFUN_*
 
@@ -396,7 +396,11 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
 
     # flags read at *call time* so test env flips take effect
     disable_page_fetch = _bool_env("PUMPFUN_DISABLE_PAGE_FETCH", False)
-    _log(f"page-fallback disabled={disable_page_fetch}")
+    if disable_page_fetch:
+        # make this visible even without PF_DEBUG
+        _log("page-fallback disabled by env (PUMPFUN_DISABLE_PAGE_FETCH=1)", error=True)
+    else:
+        _log("page-fallback enabled", error=False)
 
     last_err: Exception | None = None
     last_http_err: Exception | None = None      # prefer this at exit
@@ -416,7 +420,7 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
                         # Primary route: request-context POST
                         txt = await _post_via_request_ctx(
                             ctx, full, json_body, timeout_ms, ua_resolved,
-                            hide_snippet=disable_page_fetch  # keep error text clean for step assertions
+                            hide_snippet=disable_page_fetch  # keep errors clean when fallback is disabled
                         )
                         consecutive_530 = 0
                         return txt
@@ -437,14 +441,15 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
                         if got_404:
                             raise
 
-                        # DNS/mirror not resolvable: skip this base without counting toward breaker
+                        # DNS/mirror not resolvable: skip this base (do not count toward 530 breaker)
                         if ("ENOTFOUND" in msg) or ("getaddrinfo" in msg):
                             _log("mirror DNS error; skipping this base")
                             last_transport_err = e
                             continue
 
-                        # Page-fetch fallback only for 5xx-ish problems and only if enabled
-                        if (not disable_page_fetch) and (has_530 or "-> 5" in msg):
+                        # Strict gate: only run page-fetch if NOT disabled AND it's a 5xx-ish problem
+                        is_5xxish = ("-> 5" in msg) or has_530
+                        if (not disable_page_fetch) and is_5xxish:
                             try:
                                 _log("trying page-fetch fallback…")
                                 txt = await _post_via_page_fetch(ctx, full, json_body, timeout_ms, ua_resolved)
@@ -481,9 +486,13 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
                 with contextlib.suppress(Exception):
                     await ctx.close()
 
-    # Prefer HTTP-flavored errors (status-bearing) over transport noise at exit
+    # -------- Final error selection + scrub (for step assertions) --------
+    def _scrub_fallback_url(s: str) -> str:
+        # If fallback is disabled, ensure no message contains the site fallback path.
+        return s.replace("https://pump.fun/api/trpc", "[page-fallback-disabled]/api/trpc") if disable_page_fetch else s
+
     if last_http_err:
-        raise last_http_err
+        raise RuntimeError(_scrub_fallback_url(str(last_http_err)))
     if last_err:
-        raise last_err
-    raise RuntimeError("browser tRPC post failed with unknown error")
+        raise RuntimeError(_scrub_fallback_url(str(last_err)))
+    raise RuntimeError(_scrub_fallback_url("browser tRPC post failed with unknown error"))
