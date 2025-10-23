@@ -297,7 +297,8 @@ async def _post_via_page_fetch(
         await page.goto(site_origin, wait_until="domcontentloaded", timeout=min(timeout_ms, 120_000))
 
         js = """
-          async (path, body, timeoutMs, ua) => {
+          async (input) => {
+            const { path, body, timeoutMs, ua } = input;
             const ctrl = new AbortController();
             const t = setTimeout(() => ctrl.abort(), timeoutMs);
             try {
@@ -306,8 +307,9 @@ async def _post_via_page_fetch(
                 headers: {
                   "content-type": "application/json",
                   "accept": "*/*",
-                  "x-trpc-source": "web",
-                  "user-agent": ua
+                  "x-trpc-source": "web"
+                  // Note: setting 'user-agent' here doesn't override browser UA,
+                  // but it's harmless; real UA comes from the browser context.
                 },
                 body: JSON.stringify(body),
                 signal: ctrl.signal,
@@ -320,7 +322,8 @@ async def _post_via_page_fetch(
             }
           }
         """
-        out = await page.evaluate(js, rel_path, json_body, timeout_ms, ua)
+        payload = {"path": rel_path, "body": json_body, "timeoutMs": timeout_ms, "ua": ua}
+        out = await page.evaluate(js, payload)
     finally:
         with contextlib.suppress(Exception):
             await page.close()
@@ -331,7 +334,8 @@ async def _post_via_page_fetch(
 
     cf_ray = out.get("cfRay", "")
     snippet = (out.get("text") or "")[:400].replace("\n", " ")
-    raise RuntimeError(f"{urljoin(site_origin, rel_path)} -> {status} (cf-ray={cf_ray}): {snippet}")
+    return_url = urljoin(site_origin, rel_path)
+    raise RuntimeError(f"{return_url} -> {status} (cf-ray={cf_ray}): {snippet}")
 
 
 # --------------------------
