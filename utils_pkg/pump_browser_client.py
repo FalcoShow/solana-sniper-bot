@@ -7,21 +7,23 @@
 # - Retries with backoff + jitter
 # - Circuit breaker on repeated 530s (CF Origin DNS error)
 # - Page-based fetch() fallback when API subdomain 5xx/CF is flaky
+# - Self-heals: auto-runs `playwright install chromium` if the browser is missing
 # - Honors common Render/env knobs: PLAYWRIGHT_*, CHROMIUM_FLAGS, PF_*, PUMPFUN_*
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
-import random
-from typing import Tuple
 import pathlib
-import uuid
+import random
+import subprocess
+import sys
 import time
-import contextlib
+import uuid
+from typing import Tuple
 
-# We import lazily inside functions when possible, but having this here is fine
 from playwright.async_api import async_playwright, BrowserContext, Playwright
 
 
@@ -64,7 +66,7 @@ def _list_env(name: str, default_csv: str) -> list[str]:
 
 # Browser selection
 _DEFAULT_CHANNEL = "chromium"  # critical: NOT "chrome" (avoids system Chrome)
-# persistent profile keeps CF cookies/session alive across calls
+# Persistent profile keeps CF cookies/session alive across calls
 _DEFAULT_USER_DATA = _str_env("PF_CHROME_PROFILE", _str_env("PUMP_USER_DATA_DIR", "/opt/render/project/src/.pw-profile"))
 
 # Default UA (we’ll try to read navigator.userAgent after warm-up)
@@ -93,10 +95,36 @@ _MAX_SLEEP_S = 8.0
 # Optional noisy logs
 _LOG = _bool_env("PF_DEBUG", False) or _bool_env("PUMP_DEBUG", False)
 
-
 def _log(msg: str) -> None:
     if _LOG:
         print(f"[pump-browser] {msg}", flush=True)
+
+
+# --------------------------
+# Self-heal: ensure Chromium is installed
+# --------------------------
+
+def _install_chromium_sync() -> None:
+    """
+    Runs `python -m playwright install chromium` once, honoring PLAYWRIGHT_BROWSERS_PATH.
+    Uses a local cache path by default so downloads persist across pod restarts (when possible).
+    """
+    # Prefer a project-local cache unless user explicitly sets something else.
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/project/src/.cache/ms-playwright")
+    cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+    _log(f"Installing Chromium via: {' '.join(cmd)} (PLAYWRIGHT_BROWSERS_PATH={os.environ.get('PLAYWRIGHT_BROWSERS_PATH')})")
+    subprocess.run(cmd, check=True)
+
+
+def _error_suggests_missing_browser(msg: str) -> bool:
+    needles = (
+        "Executable doesn't exist",
+        "playwright install",                   # generic hint string from Playwright
+        "Host system is missing dependencies",  # some images
+        "Failed to launch browser",             # catch-all we guard with retry
+    )
+    m = msg.lower()
+    return any(s.lower() in m for s in needles)
 
 
 # --------------------------
@@ -107,6 +135,7 @@ async def _new_context(pw: Playwright) -> Tuple[BrowserContext, str]:
     """
     Create a persistent Chromium context and return (ctx, resolved_user_agent).
     Falls back to a fresh subdir if the configured profile is locked.
+    Self-heals by installing Chromium if the executable is missing.
     """
     base_profile = pathlib.Path(_DEFAULT_USER_DATA)
     headless = _bool_env("PLAYWRIGHT_HEADLESS", _bool_env("PF_HEADLESS", True))
@@ -143,15 +172,32 @@ async def _new_context(pw: Playwright) -> Tuple[BrowserContext, str]:
         profile_to_use.mkdir(parents=True, exist_ok=True)
         _log(f"profile locked; using temp profile: {profile_to_use}")
 
-    # Try launch; if we still hit ProcessSingleton, fallback once more to a fresh subdir
+    # ---------- launch with autoinstall fallback ----------
+    # First attempt
     try:
         ctx = await pw.chromium.launch_persistent_context(**launch_kwargs_for(profile_to_use))
     except Exception as e:
         msg = str(e)
-        if "ProcessSingleton" in msg or "SingletonLock" in msg:
+        # If the browser isn't installed on this pod, fetch it and retry once.
+        if _error_suggests_missing_browser(msg):
+            _log("Chromium missing; attempting autoinstall…")
+            _install_chromium_sync()
+            try:
+                ctx = await pw.chromium.launch_persistent_context(**launch_kwargs_for(profile_to_use))
+            except Exception as e2:
+                msg2 = str(e2)
+                # If second attempt hits ProcessSingleton, fall back to a fresh profile
+                if "ProcessSingleton" in msg2 or "SingletonLock" in msg2:
+                    alt = base_profile / f"run-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+                    alt.mkdir(parents=True, exist_ok=True)
+                    _log(f"ProcessSingleton after install; retrying with new profile: {alt}")
+                    ctx = await pw.chromium.launch_persistent_context(**launch_kwargs_for(alt))
+                else:
+                    raise
+        elif "ProcessSingleton" in msg or "SingletonLock" in msg:
             alt = base_profile / f"run-{int(time.time())}-{uuid.uuid4().hex[:8]}"
             alt.mkdir(parents=True, exist_ok=True)
-            _log(f"ProcessSingleton again; retrying with new profile: {alt}")
+            _log(f"ProcessSingleton; retrying with new profile: {alt}")
             ctx = await pw.chromium.launch_persistent_context(**launch_kwargs_for(alt))
         else:
             raise
@@ -355,7 +401,7 @@ async def pump_post_via_browser(path: str, json_body: dict, timeout_ms: int = 90
                         has_530 = ("-> 530" in msg) or ("Origin DNS error" in msg)
 
                         # --- Page fetch fallback for 5xx/DNS-ish problems ---
-                        if has_530 or "-> 5" in msg:
+                        if has_530 or "-> 5" in msg:  # catch generic 5xx too
                             try:
                                 _log("trying page-fetch fallback…")
                                 txt = await _post_via_page_fetch(ctx, full, json_body, timeout_ms, ua_resolved)
