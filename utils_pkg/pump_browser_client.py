@@ -11,7 +11,9 @@
 # - Honors common Render/env knobs: PLAYWRIGHT_*, CHROMIUM_FLAGS, PF_*, PUMPFUN_*
 
 from __future__ import annotations
-
+import sys
+import glob
+import subprocess
 import asyncio
 import contextlib
 import json
@@ -131,31 +133,86 @@ def _error_suggests_missing_browser(msg: str) -> bool:
 # Browser/context creation
 # --------------------------
 
+def _candidate_browsers_roots() -> list[str]:
+    # Prefer app-local cache, then Render global cache, then HOME cache
+    roots = []
+    env_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env_root:
+        roots.append(env_root)
+    roots.extend([
+        "/opt/render/project/src/.cache/ms-playwright",
+        "/opt/render/.cache/ms-playwright",
+        os.path.expanduser("~/.cache/ms-playwright"),
+    ])
+    # de-dupe while preserving order
+    seen, out = set(), []
+    for r in roots:
+        if r and r not in seen:
+            seen.add(r); out.append(r)
+    return out
+
+def _find_chromium_exe() -> str | None:
+    """
+    Look for a Chromium binary under common Playwright cache paths.
+    Returns absolute path or None.
+    """
+    patterns = [
+        "chromium-*/chrome-linux/chrome",
+        "chromium-*/chromium-linux/chrome",
+        "chromium-*/chrome-linux/headless_shell",  # last resort
+    ]
+    for root in _candidate_browsers_roots():
+        for pat in patterns:
+            for p in glob.glob(os.path.join(root, pat)):
+                if os.path.isfile(p) and os.access(p, os.X_OK):
+                    return p
+    return None
+
+def _autoinstall_browsers() -> None:
+    """
+    Synchronously run `playwright install chromium` into our preferred app cache.
+    Safe to call even if browsers already exist.
+    """
+    target_root = "/opt/render/project/src/.cache/ms-playwright"
+    env = dict(os.environ)
+    env.setdefault("PLAYWRIGHT_BROWSERS_PATH", target_root)
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except Exception as e:
+        # Bubble up – caller will handle
+        raise RuntimeError(f"playwright autoinstall failed: {e}") from e
+
 async def _new_context(pw: Playwright) -> Tuple[BrowserContext, str]:
     """
     Create a persistent Chromium context and return (ctx, resolved_user_agent).
     Falls back to a fresh subdir if the configured profile is locked.
-    Self-heals by installing Chromium if the executable is missing.
+    Also self-heals by auto-installing Chromium if the binary is missing.
     """
     base_profile = pathlib.Path(_DEFAULT_USER_DATA)
     headless = _bool_env("PLAYWRIGHT_HEADLESS", _bool_env("PF_HEADLESS", True))
     channel = _str_env("PUMP_BROWSER_CHANNEL", _DEFAULT_CHANNEL) or _DEFAULT_CHANNEL
-    executable = _str_env("PUMP_BROWSER_EXECUTABLE_PATH", "").strip() or None
-    chromium_args = _str_env(
-        "CHROMIUM_FLAGS", "--no-sandbox --disable-dev-shm-usage"
-    ).split()
+    explicit_exe = _str_env("PUMP_BROWSER_EXECUTABLE_PATH", "").strip() or None
+    chromium_args = _str_env("CHROMIUM_FLAGS", "--no-sandbox --disable-dev-shm-usage").split()
 
-    def launch_kwargs_for(user_data_dir: pathlib.Path) -> dict:
+    # Build launch kwargs, preferring an executable_path when available.
+    def launch_kwargs_for(user_data_dir: pathlib.Path, prefer_exe: bool = True) -> dict:
         kw = dict(
             user_data_dir=str(user_data_dir),
             headless=headless,
             args=chromium_args,
             user_agent=_DEFAULT_UA,
         )
-        if executable:
-            kw["executable_path"] = executable
+        exe = explicit_exe or _find_chromium_exe()
+        if prefer_exe and exe:
+            kw["executable_path"] = exe
         else:
-            kw["channel"] = channel
+            kw["channel"] = channel  # will use Playwright cache resolution
         return kw
 
     # Helper: does this profile look locked?
@@ -166,41 +223,42 @@ async def _new_context(pw: Playwright) -> Tuple[BrowserContext, str]:
     profile_to_use = base_profile
     base_profile.mkdir(parents=True, exist_ok=True)
 
-    # If a lock is present, fall back to a unique subdir under the same root
     if profile_locked(base_profile):
         profile_to_use = base_profile / f"run-{int(time.time())}-{uuid.uuid4().hex[:8]}"
         profile_to_use.mkdir(parents=True, exist_ok=True)
         _log(f"profile locked; using temp profile: {profile_to_use}")
 
-    # ---------- launch with autoinstall fallback ----------
-    # First attempt
-    try:
-        ctx = await pw.chromium.launch_persistent_context(**launch_kwargs_for(profile_to_use))
-    except Exception as e:
-        msg = str(e)
-        # If the browser isn't installed on this pod, fetch it and retry once.
-        if _error_suggests_missing_browser(msg):
-            _log("Chromium missing; attempting autoinstall…")
-            _install_chromium_sync()
-            try:
-                ctx = await pw.chromium.launch_persistent_context(**launch_kwargs_for(profile_to_use))
-            except Exception as e2:
-                msg2 = str(e2)
-                # If second attempt hits ProcessSingleton, fall back to a fresh profile
-                if "ProcessSingleton" in msg2 or "SingletonLock" in msg2:
-                    alt = base_profile / f"run-{int(time.time())}-{uuid.uuid4().hex[:8]}"
-                    alt.mkdir(parents=True, exist_ok=True)
-                    _log(f"ProcessSingleton after install; retrying with new profile: {alt}")
-                    ctx = await pw.chromium.launch_persistent_context(**launch_kwargs_for(alt))
+    # Try launch; on missing-executable error, autoinstall then retry ONCE
+    tried_autoinstall = False
+    while True:
+        try:
+            ctx = await pw.chromium.launch_persistent_context(**launch_kwargs_for(profile_to_use, prefer_exe=True))
+        except Exception as e:
+            msg = str(e)
+            # ProcessSingleton => try new profile once
+            if ("ProcessSingleton" in msg or "SingletonLock" in msg):
+                alt = base_profile / f"run-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+                alt.mkdir(parents=True, exist_ok=True)
+                _log(f"ProcessSingleton again; retrying with new profile: {alt}")
+                ctx = await pw.chromium.launch_persistent_context(**launch_kwargs_for(alt, prefer_exe=True))
+            # Executable missing => autoinstall + retry one time
+            elif ("Executable doesn't exist" in msg or "executable_path" in msg) and not tried_autoinstall:
+                _log("Chromium executable missing – running autoinstall…")
+                _autoinstall_browsers()
+                tried_autoinstall = True
+                # Loop and retry; launch_kwargs will now find the exe
+                continue
+            else:
+                # If we tried with executable_path and still failed, try with channel once
+                if "executable_path" in msg:
+                    _log("Retrying launch with channel=chromium resolution…")
+                    try:
+                        ctx = await pw.chromium.launch_persistent_context(**launch_kwargs_for(profile_to_use, prefer_exe=False))
+                    except Exception:
+                        raise
                 else:
                     raise
-        elif "ProcessSingleton" in msg or "SingletonLock" in msg:
-            alt = base_profile / f"run-{int(time.time())}-{uuid.uuid4().hex[:8]}"
-            alt.mkdir(parents=True, exist_ok=True)
-            _log(f"ProcessSingleton; retrying with new profile: {alt}")
-            ctx = await pw.chromium.launch_persistent_context(**launch_kwargs_for(alt))
-        else:
-            raise
+        break  # got ctx
 
     page = await ctx.new_page()
 
