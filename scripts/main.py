@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 """
-scripts/main.py (vNext + DSN-normalizer)
+scripts/main.py (vNext + DSN-normalizer + full buy hooks + healthcheck + sentry)
 
 - Hardens startup, logging, and shutdown.
 - Adds event-rate diagnostics + momentum gate + guardrails.
-- Enforces PF_POOLS filter and supervises the Raydium scanner with backoff.
+- Enforces PF_POOLS filter and supervises the Raydium scanner with backoff+jitter.
 - Local Jupiter relay compatible (removes Brotli decode issues upstream).
 - **Daily PnL rollup**: once/day Telegram message + row in PG table `daily_pnl`.
-- **DRYRUN enforcement** before any buy (IS_DRYRUN/DRYRUN).
+- **DRYRUN enforcement** before any buy (IS_DRYRUN/DRYRUN + package flag).
 - **DSN normalizer** so asyncpg always gets postgresql:// (never postgresql+asyncpg://).
+- **BUY HOOKS**: passes coroutines to utils_pkg.pump_trader.maybe_buy:
+      - on_buy_submitted   (fires when swap submitted)
+      - on_buy_filled      (fires when swap confirmed)  -> forwards to exit engine
+      - on_buy_failed      (fires when swap fails)
+- Optional **/health** endpoint (aiohttp present + HEALTH_PORT set).
+- Optional **Sentry** init (SENTRY_DSN).
 - Degrades gracefully if optional dependencies are missing.
 """
 
@@ -25,7 +31,7 @@ import traceback
 from typing import Any, Dict, Optional, Tuple
 
 # ---------------------------
-# Optional deps (Telegram / PG)
+# Optional deps (Telegram / PG / Sentry / Health)
 # ---------------------------
 try:
     import httpx
@@ -37,13 +43,23 @@ try:
 except Exception:
     asyncpg = None  # type: ignore
 
+try:
+    import sentry_sdk  # type: ignore
+except Exception:
+    sentry_sdk = None  # type: ignore
+
+try:
+    from aiohttp import web  # type: ignore
+except Exception:
+    web = None  # type: ignore
+
 # ---------------------------
 # Config module (feature flags)
 # ---------------------------
 try:
     C = importlib.import_module("config")
 except Exception:  # pragma: no cover
-    class _C:  # minimal fallback
+    class _C:
         ENABLE_RAYDIUM_SCANNER = True
     C = _C()  # type: ignore
 
@@ -56,6 +72,7 @@ try:
 except Exception:  # pragma: no cover
     class _Dummy:
         def event(self, *a, **k): print("[log]", a, k, flush=True)
+        def warning(self, *a, **k): print("[warn]", a, k, flush=True)
     def bump(_): pass
     def start_global_heartbeat(*_a, **_k): pass
     log = _Dummy()  # type: ignore
@@ -92,10 +109,14 @@ except Exception:  # pragma: no cover
         def __init__(self, *a, **kw):
             raise RuntimeError("PumpPortalClient not available")
 
+# >>> USE THE UTILS VERSION (no local shadow) <<<
 try:
     from utils_pkg.pump_trader import maybe_buy
 except Exception:  # pragma: no cover
-    async def maybe_buy(*, mint: str, ui: Dict[str, Any]) -> Optional[str]:  # type: ignore
+    async def maybe_buy(
+        *, mint: str, ui: Dict[str, Any],
+        on_buy_submitted=None, on_buy_filled=None, on_buy_failed=None
+    ) -> Optional[str]:  # type: ignore
         raise RuntimeError("maybe_buy not available")
 
 try:
@@ -165,6 +186,12 @@ except Exception:  # pragma: no cover
     async def pricefeed_close():
         return None
 
+# Optional Telegram text sender (for buy hooks)
+try:
+    from utils_pkg.telegram_utils import send_text as _tg_send_text  # type: ignore
+except Exception:  # pragma: no cover
+    _tg_send_text = None  # type: ignore
+
 # Raydium scanner (lazy import)
 def _get_raydium_scanner():
     try:
@@ -197,40 +224,23 @@ def _env_bool(name: str, default: bool) -> bool:
     return _as_bool(os.getenv(name, "1" if default else "0"), default)
 
 # ---------------------------
-# DSN normalizer (NEW)
+# DSN normalizer
 # ---------------------------
 def _dsn_to_asyncpg(dsn: str | None) -> str:
-    """
-    Make sure DSN is usable by asyncpg:
-      - Force scheme to postgresql:// (asyncpg rejects postgresql+asyncpg://)
-      - Leave query string (e.g., sslmode=require) intact
-    """
     if not dsn:
         return ""
     s = dsn.strip()
     if not s:
         return ""
-    # Common variants we may see
     s = s.replace("postgres+asyncpg://", "postgres://")
     s = s.replace("postgresql+asyncpg://", "postgresql://")
-    # Some providers emit uppercase scheme
     if s.lower().startswith("postgresql+asyncpg://"):
         s = "postgresql://" + s.split("://", 1)[1]
     if s.lower().startswith("postgres+asyncpg://"):
         s = "postgres://" + s.split("://", 1)[1]
-    # Ensure we end up with either postgresql:// or postgres://
-    if not (s.lower().startswith("postgresql://") or s.lower().startswith("postgres://")):
-        # DATABASE_URL could come as e.g. "postgres://"; that is fine
-        pass
     return s
 
 def _pick_env_dsn() -> tuple[str, str, str]:
-    """
-    Choose DSNs from environment and return a tuple:
-      (PNL_DSN_ASYNC, PG_DSN_ASYNC, INFO_MASK)
-    INFO_MASK is a short masked string for logging/diagnostics.
-    """
-    # Prefer explicit PNL first, then general PG
     raw_candidates = [
         os.getenv("PNL_DSN"),
         os.getenv("TELEMETRY_PG_DSN"),
@@ -240,7 +250,6 @@ def _pick_env_dsn() -> tuple[str, str, str]:
         os.getenv("PG_DSN_INTERNAL"),
         os.getenv("PG_DSN_EXTERNAL"),
     ]
-    # The first non-empty wins for PnL
     pnl_raw = next((x for x in raw_candidates if x and x.strip()), "") or ""
     pg_raw  = (os.getenv("PG_DSN") or os.getenv("DATABASE_URL") or os.getenv("PG_DSN_INTERNAL")
                or os.getenv("PG_DSN_EXTERNAL") or os.getenv("POSITIONS_PG_DSN") or "").strip()
@@ -248,13 +257,11 @@ def _pick_env_dsn() -> tuple[str, str, str]:
     pnl_async = _dsn_to_asyncpg(pnl_raw)
     pg_async  = _dsn_to_asyncpg(pg_raw)
 
-    # Mask host/db while keeping useful bits for logs
     def _mask(s: str) -> str:
         if not s:
             return ""
         try:
             body = s.split("://", 1)[1]
-            # ...user:pass@host/db?params -> keep host/db only
             after_at = body.split("@", 1)[-1]
             host_db  = after_at.split("?", 1)[0]
             return host_db
@@ -263,7 +270,6 @@ def _pick_env_dsn() -> tuple[str, str, str]:
 
     return pnl_async, pg_async, (_mask(pnl_async) or _mask(pg_async) or "")
 
-# Resolve DSNs once at import
 _PNL_DSN_ASYNC, _PG_DSN_ASYNC, _PG_DSN_MASK = _pick_env_dsn()
 
 # ---------------------------
@@ -315,6 +321,15 @@ RAYDIUM_SCAN_INTERVAL_SEC = _as_float(os.getenv("RAYDIUM_SCAN_INTERVAL_SEC", "30
 PF_GATE_TTL_SEC     = _as_int(os.getenv("PF_GATE_TTL_SEC", str(max(_as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC","10"),10)*2, 60))), max(ENTRY_MOMO_WINDOW_SEC*2, 60))
 PF_BUY_TTL_SEC      = _as_int(os.getenv("PF_BUY_TTL_SEC", "600"), 600)
 DAILY_PNL_DEBOUNCE_MIN = _as_int(os.getenv("DAILY_PNL_DEBOUNCE_MIN", "10"), 10)
+
+# Buy-hook Telegram toggles (optional)
+NOTIFY_BUY_SUBMITTED = _as_bool(os.getenv("TELEGRAM_NOTIFY_SUBMITTED", "0"), False)
+NOTIFY_BUY_FAILED    = _as_bool(os.getenv("TELEGRAM_NOTIFY_FAILED", "0"), False)
+NOTIFY_BUY_FILLED    = _as_bool(os.getenv("TELEGRAM_NOTIFY_FILLED", "0"), False)
+
+# Health / Sentry
+HEALTH_PORT = _as_int(os.getenv("HEALTH_PORT", "0"), 0)
+SENTRY_DSN  = (os.getenv("SENTRY_DSN") or "").strip()
 
 # ---------------------------
 # Small helpers
@@ -504,12 +519,104 @@ def _ensure_keypair_file() -> None:
             print(f"[boot] could not write wallet: {e}", flush=True)
 
 # ---------------------------
+# BUY HOOKS (submitted / filled / failed)
+# ---------------------------
+async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
+    """
+    payload: {mint, pool, symbol, spend_sol, route, hint}
+    """
+    try:
+        bump("buys_submitted")
+    except Exception:
+        pass
+    try:
+        log.event("BUY_SUBMITTED",
+                  mint=payload.get("mint"),
+                  symbol=payload.get("symbol"),
+                  pool=payload.get("pool"),
+                  route=payload.get("route"),
+                  spend_sol=payload.get("spend_sol"),
+                  hint=payload.get("hint"))
+    except Exception:
+        pass
+    if NOTIFY_BUY_SUBMITTED and _tg_send_text:
+        txt = f"🟡 Submitted BUY {payload.get('symbol') or ''}\n" \
+              f"mint={payload.get('mint')}  route={payload.get('route')}  size={payload.get('spend_sol')} SOL"
+        with contextlib.suppress(Exception):
+            await _tg_send_text(txt)
+
+async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
+    """
+    ev: { mint, signature, symbol, spend_sol, pool }
+    """
+    if _dryrun_env_on():
+        return
+    try:
+        bump("buys_filled")
+    except Exception:
+        pass
+    try:
+        log.event("BUY_FILLED",
+                  mint=ev.get("mint"),
+                  symbol=ev.get("symbol"),
+                  pool=ev.get("pool"),
+                  spend_sol=ev.get("spend_sol"),
+                  sig=ev.get("signature"))
+    except Exception:
+        pass
+    # Telegram (optional)
+    if NOTIFY_BUY_FILLED and _tg_send_text:
+        txt = f"🟢 BUY FILLED {ev.get('symbol') or ''}\n" \
+              f"mint={ev.get('mint')}  size={ev.get('spend_sol')} SOL\nsig={ev.get('signature')}"
+        with contextlib.suppress(Exception):
+            await _tg_send_text(txt)
+    # Forward to exit engine (supports both new and legacy signatures)
+    if not EXIT_ENGINE_ENABLED:
+        return
+    try:
+        await exit_engine.on_buy_filled(ev)  # type: ignore[arg-type]
+        return
+    except TypeError:
+        with contextlib.suppress(Exception):
+            await exit_engine.on_buy_filled(raw_id_or_mint=ev.get("mint"), tx_sig=ev.get("signature"))  # type: ignore[misc]
+    except Exception as e:
+        log.warning("EXIT_ENGINE_FILL_HOOK_FAIL %s", e)
+
+async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
+    """
+    payload: {mint, pool, symbol, spend_sol, route, hint, reason, error}
+    """
+    try:
+        log.event("BUY_FAILED",
+                  mint=payload.get("mint"),
+                  symbol=payload.get("symbol"),
+                  pool=payload.get("pool"),
+                  route=payload.get("route"),
+                  spend_sol=payload.get("spend_sol"),
+                  reason=payload.get("reason"),
+                  error=payload.get("error"))
+    except Exception:
+        pass
+    # Optional Telegram
+    if NOTIFY_BUY_FAILED and _tg_send_text:
+        txt = f"🔴 BUY FAILED {payload.get('symbol') or ''}\n" \
+              f"mint={payload.get('mint')}  route={payload.get('route')}\n" \
+              f"reason={payload.get('reason')}  err={payload.get('error') or '—'}"
+        with contextlib.suppress(Exception):
+            await _tg_send_text(txt)
+    # Optional telemetry
+    try:
+        record_buy_result(ok=False, reason=str(payload.get("reason") or "failed"), error=payload.get("error"))
+    except Exception:
+        pass
+
+# ---------------------------
 # Strategy
 # ---------------------------
 class Strategy:
     def __init__(self) -> None:
         self._sema = asyncio.Semaphore(max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2)))
-        self._gate_sema = asyncio.Semaphore(max(1, _as_int(os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"), 6)))
+        self._gate_sema = asyncio.Semaphore(max(1, _as_int(os.getenv("ENTRY_MOMENTUM_MAX_PARALLEL", os.getenv("ENTRY_MOMO_MAX_PARALLEL","6")), 6)))
         self._gate_state: Dict[str, Dict[str, Any]] = {}
         self._diag = {
             "events_total": 0,
@@ -645,13 +752,17 @@ class Strategy:
 
                 try:
                     async with self._sema:
-                        tx_sig = await maybe_buy(mint=mint_norm, ui=ui)
+                        tx_sig = await maybe_buy(
+                            mint=mint_norm,
+                            ui=ui,
+                            on_buy_submitted=_buy_hook_submitted,
+                            on_buy_filled=_buy_hook_filled,
+                            on_buy_failed=_buy_hook_failed,
+                        )
                     self._diag["buys_submitted"] += 1
                     if tx_sig:
                         record_buy_result(ok=True, reason="executed", sig=tx_sig)
                         self._diag["buys_filled"] += 1
-                        if _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True) and not _dryrun_env_on():
-                            asyncio.create_task(exit_engine.on_buy_filled(raw_id_or_mint=mint_norm, tx_sig=tx_sig))
                         asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
                     else:
                         record_buy_result(ok=False, reason="no_tx_sig")
@@ -760,15 +871,19 @@ class Strategy:
                                 return
                         except Exception:
                             pass
-                    tx_sig = await maybe_buy(mint=mint_norm, ui=ui)
+                    tx_sig = await maybe_buy(
+                        mint=mint_norm,
+                        ui=ui,
+                        on_buy_submitted=_buy_hook_submitted,
+                        on_buy_filled=_buy_hook_filled,
+                        on_buy_failed=_buy_hook_failed,
+                    )
                     self._diag["buys_submitted"] += 1
                     if not tx_sig:
                         record_buy_result(ok=False, reason="no_tx_sig")
                         return
                     record_buy_result(ok=True, reason="executed", sig=tx_sig)
                     self._diag["buys_filled"] += 1
-                    if _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True) and not _dryrun_env_on():
-                        asyncio.create_task(exit_engine.on_buy_filled(raw_id_or_mint=mint_norm, tx_sig=tx_sig))
                     asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
                 except Exception:
                     print("[strategy] maybe_buy exception:", flush=True)
@@ -1013,6 +1128,39 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
             await _once()
 
 # ---------------------------
+# Health server (optional)
+# ---------------------------
+async def _maybe_start_health_server(stop_evt: asyncio.Event) -> Optional[asyncio.Task]:
+    if not (web and HEALTH_PORT > 0):
+        return None
+    app = web.Application()
+
+    async def _health(_request):
+        return web.json_response({
+            "ok": True,
+            "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "dryrun": _dryrun_env_on() or bool(_pkg_is_dryrun),
+            "pools": sorted(POOLS_FILTER) if POOLS_FILTER else ["<all>"],
+        })
+
+    app.router.add_get("/health", _health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
+    await site.start()
+    log.event("HEALTH_LISTENING", port=HEALTH_PORT)
+
+    async def _waiter():
+        try:
+            while not stop_evt.is_set():
+                await asyncio.sleep(0.5)
+        finally:
+            with contextlib.suppress(Exception):
+                await runner.cleanup()
+
+    return asyncio.create_task(_waiter(), name="health.server")
+
+# ---------------------------
 # Streaming loop
 # ---------------------------
 async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
@@ -1148,6 +1296,10 @@ async def _start_background_tasks(stop_evt: asyncio.Event) -> Dict[str, asyncio.
         t = asyncio.create_task(_run_daily_pnl_loop(stop_evt), name="telemetry.daily_pnl")
         tasks["telemetry.daily_pnl"] = t
         log.event("DAILY_PNL_SCHEDULED", hour_utc=_as_int(os.getenv("DAILY_PNL_HOUR_UTC", "23"), 23))
+    # Optional health server
+    ht = await _maybe_start_health_server(stop_evt)
+    if ht:
+        tasks["health.server"] = ht
     return tasks
 
 async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asyncio.Task], bg_tasks: Dict[str, asyncio.Task]) -> None:
@@ -1166,6 +1318,21 @@ async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asynci
         await pricefeed_close()
 
 # ---------------------------
+# Sentry (optional)
+# ---------------------------
+def _maybe_init_sentry() -> None:
+    if not (SENTRY_DSN and sentry_sdk):
+        return
+    try:
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0")),
+        )
+        log.event("SENTRY_INIT_OK")
+    except Exception as e:
+        log.event("SENTRY_INIT_FAIL", error=str(e))
+
+# ---------------------------
 # Main
 # ---------------------------
 def _boot_banner() -> None:
@@ -1179,24 +1346,35 @@ def _boot_banner() -> None:
         f"PF_MAX_CONCURRENT={_as_int(os.getenv('PF_MAX_CONCURRENT','2'), 2)} | "
         f"PF_COOLDOWN_SEC={_as_float(os.getenv('PF_COOLDOWN_SEC','15'), 15.0)}\n"
         f"MOMO: on={int(_as_bool(os.getenv('ENTRY_MOMENTUM_ENABLED','1'), True))} "
-        f"window={_as_int(os.getenv('ENTRY_MOMO_WINDOW_SEC','10'),10)}s "
-        f"min_trades={_as_int(os.getenv('ENTRY_MOMO_MIN_TRADES','6'),6)} "
-        f"min_up={_as_float(os.getenv('ENTRY_MOMO_MIN_UP_PCT','5'),5.0)}%\n"
+        f"window={_as_int(os.getenv('ENTRY_MOMENTUM_WINDOW_SEC', os.getenv('ENTRY_MOMO_WINDOW_SEC','10')),10)}s "
+        f"min_trades={_as_int(os.getenv('ENTRY_MOMENTUM_MIN_TRADES', os.getenv('ENTRY_MOMO_MIN_TRADES','6')),6)} "
+        f"min_up={_as_float(os.getenv('ENTRY_MOMENTUM_MIN_UP_PCT', os.getenv('ENTRY_MOMO_MIN_UP_PCT','5')),5.0)}%\n"
         f"LIQ_FILTER={int(_as_bool(os.getenv('ENTRY_LIQ_FILTER','1'), True))} | "
         f"EXIT_ENGINE={int(_as_bool(os.getenv('EXIT_ENGINE_ENABLED','1'), True))} | "
         f"MAX_TRADEABLE={_as_int(os.getenv('MAX_TRADEABLE','0'),0)}\n"
         f"POOLS={pools} | PUMP_TRADES={int(pump_trades)}\n"
-        f"PG(asyncpg) DSN={_PG_DSN_MASK or '<none>'}\n"
+        f"PG(asyncpg) DSN={_PG_DSN_MASK or '<none>'} | HEALTH_PORT={HEALTH_PORT or 'off'}\n"
         "===========================\n",
         flush=True,
     )
+
+def _env_hints() -> None:
+    # Non-fatal “helpful” hints for common misconfigs
+    if not (os.getenv("KEYPAIR_JSON") or os.getenv("SOLANA_KEYPAIR_JSON")):
+        log.event("HINT_KEYPAIR_JSON_MISSING", note="wallet auto-create disabled (ok if mounted)")
+    if not (os.getenv("TELEGRAM_BOT_TOKEN") and (os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID"))):
+        log.event("HINT_TELEGRAM_MISSING", note="daily pnl / buy notifications off")
+    if not (_PNL_DSN_ASYNC or _PG_DSN_ASYNC):
+        log.event("HINT_PG_DSN_MISSING", note="daily pnl persistence disabled")
 
 async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     with contextlib.suppress(Exception):
         start_global_heartbeat(log, interval=float(os.getenv("PF_HEARTBEAT_SEC", "45")))
         bump("boot")
 
+    _maybe_init_sentry()
     _boot_banner()
+    _env_hints()
     _ensure_keypair_file()
 
     try:

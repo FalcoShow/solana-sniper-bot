@@ -8,7 +8,7 @@ import os
 import random
 import re
 import time
-from typing import Any, Dict, Optional, Tuple, Callable, Sequence
+from typing import Any, Dict, Optional, Tuple, Callable, Sequence, List
 
 import requests
 from requests.exceptions import RequestException
@@ -59,7 +59,7 @@ try:
     from utils_pkg.txlearn import RPC_URL as _TX_RPC_URL, TX_COMMITMENT as _TX_COMMITMENT  # type: ignore
 except Exception:
     _TX_RPC_URL = os.getenv("SOL_RPC_URL") or "https://api.mainnet-beta.solana.com"
-    _TX_COMMITMENT = "confirmed"
+    _TX_COMMITMENT = (os.getenv("CONFIRM_COMMITMENT") or "confirmed").strip().lower()
 
 TX_RPC_URL = _TX_RPC_URL
 TX_COMMITMENT = _TX_COMMITMENT
@@ -70,7 +70,8 @@ LAMPORTS_PER_SOL = 1_000_000_000
 # ──────────────────────────────────────────────────────────────────────────────
 # Feature toggles / HTTP knobs
 # ──────────────────────────────────────────────────────────────────────────────
-DRY_RUN = _envb("IS_DRYRUN", False) or _envb("DRY_RUN", False)
+# Accept any of these for dryrun
+DRY_RUN = _envb("DRYRUN", False) or _envb("IS_DRYRUN", False) or _envb("DRY_RUN", False)
 
 HTTP_TIMEOUT_GET  = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
 HTTP_TIMEOUT_POST = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_POST_SEC", 25.0))
@@ -87,8 +88,11 @@ _JUP_LAST_TS: float = 0.0
 
 QUOTE_TTL_SEC = max(0.0, _envf("ROUTER_QUOTE_TTL_SEC", 10.0))
 PRICE_TTL_SEC = max(0.0, _envf("PF_PRICE_TTL_SEC", 6.0))
+TOKENS_TTL_SEC = max(30.0, _envf("ROUTER_TOKENS_TTL_SEC", 900.0))
+
 _QUOTE_CACHE: Dict[str, Tuple[float, dict]] = {}
 _PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
+_TOKENS_CACHE: Tuple[float, List[dict]] | None = None
 _QUOTE_FLIGHT: Dict[str, asyncio.Future[Any]] = {}
 _quote_lock = asyncio.Lock()
 
@@ -225,10 +229,9 @@ def _jup_headers() -> Dict[str, str]:
     if x_api:
         h["x-api-key"] = x_api
         h.setdefault("x-quicknode-mode", "RAW")
-    # Jupiter PRO
+    # Jupiter PRO token
     pro_key = (os.getenv("JUP_PRO_KEY") or "").strip()
     if pro_key:
-        # Jupiter’s current PRO header
         h["x-jup-auth"] = f"Bearer {pro_key}"
     return h
 
@@ -494,19 +497,40 @@ def _mint_decimals_from_data(b: bytes) -> Optional[int]:
         pass
     return None
 
-async def _decimals_from_tokens_api(mint: str) -> Optional[int]:
-    # Fetch Jupiter token list via fallback bases (GET /v6/tokens)
+async def _tokens_catalog() -> List[dict]:
+    """Fetch & cache Jupiter token list via /v6/tokens."""
+    global _TOKENS_CACHE
+    now = time.time()
+    if _TOKENS_CACHE and _TOKENS_CACHE[0] >= now:
+        return _TOKENS_CACHE[1]
     try:
         js = await _http_get_with_fallback("tokens", params={}, timeout=HTTP_TIMEOUT_GET)
-        if isinstance(js, list):
-            for t in js:
+        arr: List[dict] = js if isinstance(js, list) else []
+        if arr:
+            # refresh symbol/decimals map
+            for t in arr:
                 try:
                     maddr = (t.get("address") or "").strip()
                     if maddr:
                         _TOK_META[maddr] = t
                 except Exception:
                     continue
+            _TOKENS_CACHE = (now + TOKENS_TTL_SEC, arr)
+            return arr
     except Exception:
+        pass
+    # on failure, keep old cache (if any)
+    return _TOKENS_CACHE[1] if _TOKENS_CACHE else []
+
+def _tok_symbol(mint: str) -> Optional[str]:
+    meta = _TOK_META.get(mint)
+    s = (meta or {}).get("symbol")
+    return str(s).strip() if s else None
+
+async def _decimals_from_tokens_api(mint: str) -> Optional[int]:
+    # ensure token catalog is warmed
+    arr = await _tokens_catalog()
+    if not arr:
         return None
     meta = _TOK_META.get(mint)
     if not meta:
@@ -652,6 +676,7 @@ class DynPriority:
             pass
 
     def choose_lamports(self, override_sol: Optional[float]) -> Optional[int]:
+        # honor explicit override first (PF_JITO_TIP_SOL in caller)
         if override_sol is not None:
             try:
                 return int(max(0, override_sol) * LAMPORTS_PER_SOL)
@@ -722,7 +747,7 @@ def _slippage_bps() -> int:
             return max(1, int(v))
         except Exception:
             pass
-    s = _envf("JUPITER_MAX_SLIPPAGE", 0.006)  # fraction -> default 0.6% (60 bps) if env matches your PF
+    s = _envf("JUPITER_MAX_SLIPPAGE", 0.006)  # fraction -> default 0.6% if using that env
     return max(1, int(round(s * 10_000)))
 
 def _as_legacy() -> bool:
@@ -805,17 +830,26 @@ async def _jup_quote(
 
     return await _singleflight_quote(key, _fetch)
 
-async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optional[int]) -> str:
+async def _jup_swap(
+    user_pubkey: str,
+    quote: dict,
+    *,
+    priority_lamports: Optional[int],
+    compute_units: Optional[int],
+) -> str:
     await _jup_gate()
     body = {
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": True,
-        "dynamicComputeUnitLimit": True,
+        # If compute_units is provided, disable dynamic CU limit and set a fixed one
+        "dynamicComputeUnitLimit": False if (compute_units and compute_units > 0) else True,
         "quoteResponse": quote,
         "asLegacyTransaction": True if _as_legacy() else False,
     }
     if priority_lamports is not None:
         body["prioritizationFeeLamports"] = int(priority_lamports)
+    if compute_units and compute_units > 0:
+        body["computeUnitLimit"] = int(compute_units)
 
     js = await _http_post_with_fallback("swap", json_body=body, params=None, timeout=HTTP_TIMEOUT_POST)
     tx_b64 = js.get("swapTransaction")
@@ -872,7 +906,14 @@ async def get_buy_quote(
     out_raw = int(q.get("outAmount", "0") or 0)
     dec = await _get_decimals(mint)
     ui = out_raw / (10 ** dec) if (dec is not None and dec >= 0) else 0.0
-    return {**q, "lamports_in": lamports_in, "out_amount_raw": out_raw, "out_amount_ui": ui, "decimals": dec}
+    return {
+        **q,
+        "lamports_in": lamports_in,
+        "out_amount_raw": out_raw,
+        "out_amount_ui": ui,
+        "decimals": dec,
+        "symbol": _tok_symbol(mint),
+    }
 
 def _price_probe_amounts(dec: int) -> list[int]:
     steps_ui = [1.0, 0.1, 0.01, 0.001]
@@ -885,16 +926,17 @@ def _price_probe_amounts(dec: int) -> list[int]:
     return vals or [1]
 
 async def get_price_ui(mint: str) -> float:
-       # Special-case: 1 SOL = 1 SOL
+    """
+    SOL per 1 token UI. Never raises; 0.0 on failure.
+    Uses adaptive tiny-quote ladder token->SOL with fallback bases.
+    """
+    # Special-case: 1 SOL = 1 SOL
     try:
         if normalize_mint(mint) == SOL_MINT:
             return 1.0
     except Exception:
         pass
-    """
-    SOL per 1 token UI. Never raises; 0.0 on failure.
-    Uses adaptive tiny-quote ladder token->SOL with fallback bases.
-    """
+
     raw = (mint or "").strip()
     if not raw:
         return 0.0
@@ -962,7 +1004,13 @@ async def buy_via_lightning(
     lamports_in: Optional[int] = None,
     slippage_bps: Optional[int] = None,
     priority_sol: Optional[float] = None,
+    compute_units: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
+    """
+    Execute SOL->token swap via Jupiter.
+    - priority_sol: explicit tip (SOL); if None, dynamic controller decides.
+    - compute_units: fixed CU limit; if None/<=0 uses dynamic CU limit.
+    """
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
 
@@ -998,7 +1046,7 @@ async def buy_via_lightning(
     for attempt in range(1, SWAP_RETRIES + 1):
         try:
             prio = _PRIO.choose_lamports(priority_sol)
-            tx_b64 = await _jup_swap(owner, quote, priority_lamports=prio)
+            tx_b64 = await _jup_swap(owner, quote, priority_lamports=prio, compute_units=compute_units)
             sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
             _PRIO.observe(sig, t0)
             return True, sig
@@ -1016,7 +1064,12 @@ async def sell_via_lightning(
     amount_raw: int,
     slippage_bps: Optional[int] = None,
     priority_sol: Optional[float] = None,
+    compute_units: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
+    """
+    Execute token->SOL swap via Jupiter.
+    token_program is ignored (Jupiter infers it).
+    """
     del token_program  # Jupiter doesn't need this
 
     mint = _sanitize_mint(mint)
@@ -1047,7 +1100,7 @@ async def sell_via_lightning(
     for attempt in range(1, SWAP_RETRIES + 1):
         try:
             prio = _PRIO.choose_lamports(priority_sol)
-            tx_b64 = await _jup_swap(owner, quote, priority_lamports=prio)
+            tx_b64 = await _jup_swap(owner, quote, priority_lamports=prio, compute_units=compute_units)
             sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
             _PRIO.observe(sig, t0)
             return True, sig
@@ -1058,11 +1111,26 @@ async def sell_via_lightning(
             _PRIO._tune(_PRIO.target_sec * 1.6, had_error=True)
             await asyncio.sleep(RETRY_BACKOFF * max(1, attempt))
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Convenience: token metadata accessors
+# ──────────────────────────────────────────────────────────────────────────────
+async def get_tokens() -> List[dict]:
+    """Return cached Jupiter tokens array (refreshes per TOKENS_TTL_SEC)."""
+    return await _tokens_catalog()
+
+def get_token_symbol(mint: str) -> Optional[str]:
+    try:
+        m = _sanitize_mint(mint)
+    except Exception:
+        return None
+    return _tok_symbol(m)
+
 __all__ = [
     # lifecycle
     "start", "shutdown",
-    # quotes / price
+    # quotes / price / tokens
     "get_sell_quote", "get_buy_quote", "get_price_ui", "price_of_ui", "price_of",
+    "get_tokens", "get_token_symbol",
     # swaps
     "buy_via_lightning", "sell_via_lightning",
     # mint helpers
