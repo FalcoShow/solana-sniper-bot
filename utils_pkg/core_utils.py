@@ -29,6 +29,7 @@ import redis.asyncio as aioredis
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 from sqlalchemy import MetaData, Table, Column, BigInteger, String, Float, DateTime, text
+from typing import Any, Callable, Optional
 
 import certifi
 
@@ -391,21 +392,23 @@ async def get_sol_usd() -> float:
         pass
     return 0.0
 
-def convert_sol_to_usd(price_provider):
+async def convert_sol_to_usd(price_provider: Any) -> float:
     """
-    Robust SOL→USD conversion.
+    Robust SOL→USD conversion, async-safe.
 
     Accepts either:
-      - a callable: price_provider(key) -> float|None
-      - a numeric (float/int/str) meaning already-known SOL price in USD
+      - a callable: price_provider(key) -> float|None (sync) OR awaitable
+      - a numeric (float/int/str): already-known SOL price in USD
 
-    Tries:
-      1) Birdeye wSOL (SOL price)
-      2) SOL/USDC pool price (if supported by provider)
+    Tries (in order):
+      1) Direct wSOL (Birdeye) via SOL_PRICE_MINT
+      2) SOL/USDC pool price (provider may support "mintA:mintB")
       3) Cached "SOL_USD_LAST"
-      4) If a numeric provider was passed, return it directly (if > 0)
     """
-    # If they passed a numeric instead of a callable, just return it safely
+    wsol_mint = os.getenv("SOL_PRICE_MINT", "So11111111111111111111111111111111111111112")
+    usdc_mint = os.getenv("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+
+    # If a numeric value was passed instead of a callable, just return it
     if not callable(price_provider):
         try:
             val = float(price_provider)
@@ -415,35 +418,27 @@ def convert_sol_to_usd(price_provider):
             pass
         raise RuntimeError("convert_sol_to_usd failed: non-callable provider not a valid price")
 
-    def gp(key: str):
+    async def gp(key: str) -> Optional[float]:
         try:
-            v = price_provider(key)
-            return float(v) if v is not None else None
-        except TypeError:
-            # In case upstream mistakenly passed a float and we try to call it
-            try:
-                v = float(price_provider)
-                return v
-            except Exception:
-                return None
+            res = price_provider(key)
+            if inspect.isawaitable(res):
+                res = await res
+            return float(res) if res is not None else None
         except Exception:
             return None
 
-    wsol_mint = os.getenv("SOL_PRICE_MINT", "So11111111111111111111111111111111111111112")
-    usdc_mint = os.getenv("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
-
-    # 1) Direct wSOL price
-    p = gp(wsol_mint)
+    # 1) Direct wSOL
+    p = await gp(wsol_mint)
     if p and p > 0:
         return p
 
-    # 2) Try SOL/USDC pool (if your provider supports "mintA:mintB")
-    p = gp(f"{wsol_mint}:{usdc_mint}")
+    # 2) SOL/USDC pool
+    p = await gp(f"{wsol_mint}:{usdc_mint}")
     if p and p > 0:
         return p
 
-    # 3) Try cached last price
-    p = gp("SOL_USD_LAST")
+    # 3) Cached last price
+    p = await gp("SOL_USD_LAST")
     if p and p > 0:
         return p
 
