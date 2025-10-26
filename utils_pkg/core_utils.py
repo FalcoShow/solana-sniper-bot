@@ -391,31 +391,61 @@ async def get_sol_usd() -> float:
         pass
     return 0.0
 
-def convert_sol_to_usd(get_price):
+def convert_sol_to_usd(price_provider):
     """
     Robust SOL→USD conversion.
-    1. Try Birdeye wSOL (primary source).
-    2. Try SOL/USDC pool pair.
-    3. Try cached SOL price.
-    Raises RuntimeError if all fail.
+
+    Accepts either:
+      - a callable: price_provider(key) -> float|None
+      - a numeric (float/int/str) meaning already-known SOL price in USD
+
+    Tries:
+      1) Birdeye wSOL (SOL price)
+      2) SOL/USDC pool price (if supported by provider)
+      3) Cached "SOL_USD_LAST"
+      4) If a numeric provider was passed, return it directly (if > 0)
     """
+    # If they passed a numeric instead of a callable, just return it safely
+    if not callable(price_provider):
+        try:
+            val = float(price_provider)
+            if val > 0:
+                return val
+        except Exception:
+            pass
+        raise RuntimeError("convert_sol_to_usd failed: non-callable provider not a valid price")
+
+    def gp(key: str):
+        try:
+            v = price_provider(key)
+            return float(v) if v is not None else None
+        except TypeError:
+            # In case upstream mistakenly passed a float and we try to call it
+            try:
+                v = float(price_provider)
+                return v
+            except Exception:
+                return None
+        except Exception:
+            return None
+
     wsol_mint = os.getenv("SOL_PRICE_MINT", "So11111111111111111111111111111111111111112")
     usdc_mint = os.getenv("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 
-    # 1) Direct wSOL from Birdeye
-    p = get_price(wsol_mint)
+    # 1) Direct wSOL price
+    p = gp(wsol_mint)
     if p and p > 0:
-        return float(p)
+        return p
 
-    # 2) Try SOL/USDC pool if supported by price provider
-    p = get_price(f"{wsol_mint}:{usdc_mint}")
+    # 2) Try SOL/USDC pool (if your provider supports "mintA:mintB")
+    p = gp(f"{wsol_mint}:{usdc_mint}")
     if p and p > 0:
-        return float(p)
+        return p
 
-    # 3) Cached value fallback (if your system caches prices)
-    cached = get_price("SOL_USD_LAST")
-    if cached and cached > 0:
-        return float(cached)
+    # 3) Try cached last price
+    p = gp("SOL_USD_LAST")
+    if p and p > 0:
+        return p
 
     raise RuntimeError("convert_sol_to_usd failed")
 
