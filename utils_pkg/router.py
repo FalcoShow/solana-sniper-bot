@@ -1120,25 +1120,42 @@ async def mint_decimals(mint: str) -> Optional[int]:
     return await _get_decimals(mint)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Swaps (public) — return (ok, signature|None)
+# Telegram helpers (never raise)
 # ──────────────────────────────────────────────────────────────────────────────
 async def _send_safe(msg: str, *, src: str) -> None:
-    """Fire-and-forget Telegram send that never raises."""
+    """Fire-and-forget Telegram send that never bubbles errors."""
     try:
         await _tg_send(msg, src=src)
     except Exception:
-        pass
+        # Log locally but do not break trading flow.
+        try:
+            log.event("TG_SEND_FAIL", src=src)
+        except Exception:
+            pass
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Small utilities
+# ──────────────────────────────────────────────────────────────────────────────
 def _fmt_sym(mint: str) -> str:
     return _tok_symbol(mint) or mint[:6]
 
 def _slip_pct(slippage_bps: Optional[int]) -> float:
-    sbps = slippage_bps if slippage_bps is not None else _slippage_bps()
+    """
+    Convert slippage BPS → percent with sane clamping.
+    If None, pull from env via _slippage_bps().
+    """
     try:
+        sbps = slippage_bps if slippage_bps is not None else _slippage_bps()
+        sbps = max(0, min(int(sbps), 5000))  # clamp 0%..50%
         return float(sbps) / 100.0
     except Exception:
         return 0.0
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Swaps (public) — return (ok, signature|None)
+# ──────────────────────────────────────────────────────────────────────────────
 async def buy_via_lightning(
     *,
     mint: str,
@@ -1148,21 +1165,30 @@ async def buy_via_lightning(
     priority_sol: Optional[float] = None,
     compute_units: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
-    mint = _sanitize_mint(mint)
-    _assert_pubkey(mint, "mint")
+    """Buy `mint` using SOL. If DRY_RUN is set, only simulate + notify."""
 
+    # Validate / normalize mint up-front and report nicely if bad
+    try:
+        mint = _sanitize_mint(mint)
+        _assert_pubkey(mint, "mint")
+    except Exception as e:
+        await _send_safe(f"BUY ERROR (mint)\nMint: {mint}\nErr: {str(e)[:180]}", src="router.buy.error.mint")
+        return False, None
+
+    # Wallet / owner
     kp = load_keypair()
     owner = get_pubkey_str(kp)
 
-    # choose funding amount
+    # Funding amount (lamports)
     if lamports_in is None:
         if amount_sol is None:
             amount_sol = _envf("PF_TRADE_SOL", 0.0)
-        lamports_in = int(amount_sol * LAMPORTS_PER_SOL)
+        lamports_in = int(max(0.0, float(amount_sol)) * LAMPORTS_PER_SOL)
     if lamports_in <= 0:
+        await _send_safe(f"BUY ERROR (size)\nMint: {mint}\nErr: zero-size trade", src="router.buy.error.size")
         return False, None
 
-    # quote
+    # Get quote
     try:
         quote = await _retry(
             _jup_quote, SOL_MINT, mint, lamports_in,
@@ -1174,32 +1200,30 @@ async def buy_via_lightning(
         await _send_safe(f"BUY ERROR (quote)\nMint: {mint}\nErr: {str(e)[:180]}", src="router.buy.error.quote")
         return False, None
 
-    # shared fields for notifications
-    out_raw = int(quote.get("outAmount", "0") or 0)
+    # Shared fields for notifications / pricing
+    try:
+        out_raw = int(quote.get("outAmount", "0") or 0)
+    except Exception:
+        out_raw = 0
     dec = await _get_decimals(mint) or 6
     out_ui = out_raw / (10 ** dec)
     size_sol = lamports_in / LAMPORTS_PER_SOL
     slip_pct = _slip_pct(slippage_bps)
     sym = _fmt_sym(mint)
-    ts = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
+    # DRY-RUN path
     if DRY_RUN:
-        # DRY-RUN notifs
         await _send_safe(
             "BUY SIGNAL (dry-run)\n"
-            f"Token: {sym}\n"
-            f"Mint: {mint}\n"
-            f"Size: {size_sol:.4f} SOL\n"
-            f"Slippage: {slip_pct:.2f}%\n"
-            f"UTC: {ts}",
+            f"Token: {sym}\nMint: {mint}\n"
+            f"Size: {size_sol:.4f} SOL\nSlippage: {slip_pct:.2f}%\nUTC: {ts}",
             src="router.buy.signal.dry",
         )
         px = (size_sol / max(out_ui, 1e-9))
         await _send_safe(
             "BUY FILLED (dry-run)\n"
-            f"Token: {sym}\n"
-            f"Qty: {out_ui:,.6f}\n"
-            f"Price: {px:.9f} SOL\n"
+            f"Token: {sym}\nQty: {out_ui:,.6f}\nPrice: {px:.9f} SOL\n"
             "Tx: https://solscan.io/tx/FAKE",
             src="router.buy.filled.dry",
         )
@@ -1209,37 +1233,32 @@ async def buy_via_lightning(
     # LIVE: pre-trade “signal”
     await _send_safe(
         "BUY SIGNAL\n"
-        f"Token: {sym}\n"
-        f"Mint: {mint}\n"
-        f"Size: {size_sol:.4f} SOL\n"
-        f"Slippage: {slip_pct:.2f}%\n"
-        f"UTC: {ts}",
+        f"Token: {sym}\nMint: {mint}\n"
+        f"Size: {size_sol:.4f} SOL\nSlippage: {slip_pct:.2f}%\nUTC: {ts}",
         src="router.buy.signal.live",
     )
 
-    # perform swap with retries
+    # Perform swap with retries + adaptive priority
     t0 = time.time()
     for attempt in range(1, SWAP_RETRIES + 1):
         try:
             prio = _PRIO.choose_lamports(priority_sol)
-            tx_b64 = await _jup_swap(owner, quote, priority_lamports=prio, compute_units=compute_units)
+            tx_b64 = await _jup_swap(
+                owner, quote, priority_lamports=prio, compute_units=compute_units
+            )
             sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
             _PRIO.observe(sig, t0)
 
-            # live filled
-            try:
-                px = (lamports_in / LAMPORTS_PER_SOL) / max(out_ui, 1e-9)
-                await _send_safe(
-                    "BUY FILLED\n"
-                    f"Token: {sym}\n"
-                    f"Qty: {out_ui:,.6f}\n"
-                    f"Price: {px:.9f} SOL\n"
-                    f"Tx: https://solscan.io/tx/{sig}",
-                    src="router.buy.filled.live",
-                )
-            finally:
-                pass
+            # Live filled note
+            px = (lamports_in / LAMPORTS_PER_SOL) / max(out_ui, 1e-9)
+            await _send_safe(
+                "BUY FILLED\n"
+                f"Token: {sym}\nQty: {out_ui:,.6f}\nPrice: {px:.9f} SOL\n"
+                f"Tx: https://solscan.io/tx/{sig}",
+                src="router.buy.filled.live",
+            )
             return True, sig
+
         except Exception as e:
             if attempt >= SWAP_RETRIES:
                 log.event("ROUTER_BUY_SWAP_FAIL", mint=mint, err=str(e))
@@ -1248,8 +1267,10 @@ async def buy_via_lightning(
                     src="router.buy.error.live",
                 )
                 return False, None
+            # backoff + increase priority target a bit after failure
             _PRIO._tune(_PRIO.target_sec * 1.6, had_error=True)
             await asyncio.sleep(RETRY_BACKOFF * max(1, attempt))
+
 
 async def sell_via_lightning(
     *,
@@ -1260,17 +1281,26 @@ async def sell_via_lightning(
     priority_sol: Optional[float] = None,
     compute_units: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
+    """Sell `amount_raw` of `mint` for SOL. If DRY_RUN is set, only simulate + notify."""
     del token_program  # Jupiter infers it
 
-    mint = _sanitize_mint(mint)
-    _assert_pubkey(mint, "mint")
-    if amount_raw <= 0:
+    # Validate / normalize mint up-front
+    try:
+        mint = _sanitize_mint(mint)
+        _assert_pubkey(mint, "mint")
+    except Exception as e:
+        await _send_safe(f"SELL ERROR (mint)\nMint: {mint}\nErr: {str(e)[:180]}", src="router.sell.error.mint")
         return False, None
 
+    if amount_raw <= 0:
+        await _send_safe(f"SELL ERROR (size)\nMint: {mint}\nErr: zero-size trade", src="router.sell.error.size")
+        return False, None
+
+    # Wallet / owner
     kp = load_keypair()
     owner = get_pubkey_str(kp)
 
-    # quote
+    # Quote
     try:
         quote = await _retry(
             _jup_quote, mint, SOL_MINT, amount_raw,
@@ -1285,19 +1315,20 @@ async def sell_via_lightning(
     lamports = int(quote.get("outAmount", "0") or 0)
     sol_out = lamports / LAMPORTS_PER_SOL
     sym = _fmt_sym(mint)
+    slip_pct = _slip_pct(slippage_bps)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
+    # DRY-RUN
     if DRY_RUN:
         await _send_safe(
             "SELL SIGNAL (dry-run)\n"
-            f"Token: {sym}\n"
-            f"Amount raw: {amount_raw}\n"
-            f"Proceeds: {sol_out:.6f} SOL",
+            f"Token: {sym}\nAmount raw: {amount_raw}\n"
+            f"Proceeds: {sol_out:.6f} SOL\nSlippage: {slip_pct:.2f}%\nUTC: {ts}",
             src="router.sell.signal.dry",
         )
         await _send_safe(
             "SELL FILLED (dry-run)\n"
-            f"Token: {sym}\n"
-            f"Realized: {sol_out:.6f} SOL\n"
+            f"Token: {sym}\nRealized: {sol_out:.6f} SOL\n"
             "Tx: https://solscan.io/tx/FAKE",
             src="router.sell.filled.dry",
         )
@@ -1307,30 +1338,30 @@ async def sell_via_lightning(
     # LIVE: pre-trade “signal”
     await _send_safe(
         "SELL SIGNAL\n"
-        f"Token: {sym}\n"
-        f"Amount raw: {amount_raw}\n"
-        f"Proceeds est: {sol_out:.6f} SOL",
+        f"Token: {sym}\nAmount raw: {amount_raw}\n"
+        f"Proceeds est: {sol_out:.6f} SOL\nSlippage: {slip_pct:.2f}%\nUTC: {ts}",
         src="router.sell.signal.live",
     )
 
-    # perform swap with retries
+    # Swap with retries
     t0 = time.time()
     for attempt in range(1, SWAP_RETRIES + 1):
         try:
             prio = _PRIO.choose_lamports(priority_sol)
-            tx_b64 = await _jup_swap(owner, quote, priority_lamports=prio, compute_units=compute_units)
+            tx_b64 = await _jup_swap(
+                owner, quote, priority_lamports=prio, compute_units=compute_units
+            )
             sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
             _PRIO.observe(sig, t0)
 
-            # live filled
             await _send_safe(
                 "SELL FILLED\n"
-                f"Token: {sym}\n"
-                f"Realized: {sol_out:.6f} SOL\n"
+                f"Token: {sym}\nRealized: {sol_out:.6f} SOL\n"
                 f"Tx: https://solscan.io/tx/{sig}",
                 src="router.sell.filled.live",
             )
             return True, sig
+
         except Exception as e:
             if attempt >= SWAP_RETRIES:
                 log.event("ROUTER_SELL_SWAP_FAIL", mint=mint, err=str(e))
