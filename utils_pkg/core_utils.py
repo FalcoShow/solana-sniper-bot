@@ -391,9 +391,33 @@ async def get_sol_usd() -> float:
         pass
     return 0.0
 
-async def convert_sol_to_usd(sol_amount: float) -> float:
-    px = await get_sol_usd()
-    return round(sol_amount * px, 2) if px > 0 else 0.0
+def convert_sol_to_usd(get_price):
+    """
+    Robust SOL→USD conversion.
+    1. Try Birdeye wSOL (primary source).
+    2. Try SOL/USDC pool pair.
+    3. Try cached SOL price.
+    Raises RuntimeError if all fail.
+    """
+    wsol_mint = os.getenv("SOL_PRICE_MINT", "So11111111111111111111111111111111111111112")
+    usdc_mint = os.getenv("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+
+    # 1) Direct wSOL from Birdeye
+    p = get_price(wsol_mint)
+    if p and p > 0:
+        return float(p)
+
+    # 2) Try SOL/USDC pool if supported by price provider
+    p = get_price(f"{wsol_mint}:{usdc_mint}")
+    if p and p > 0:
+        return float(p)
+
+    # 3) Cached value fallback (if your system caches prices)
+    cached = get_price("SOL_USD_LAST")
+    if cached and cached > 0:
+        return float(cached)
+
+    raise RuntimeError("convert_sol_to_usd failed")
 
 async def convert_usd_to_sol(usd_amount: float) -> float:
     px = await get_sol_usd()
