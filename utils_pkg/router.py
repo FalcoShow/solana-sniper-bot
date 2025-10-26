@@ -321,50 +321,85 @@ async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) ->
         await asyncio.sleep(0.05 if idx == 0 else 0.1)
     raise last_err or RuntimeError("all quote endpoints failed")
 
-async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], params: Optional[dict], timeout: float) -> dict:
+async def _http_post_with_fallback(
+    kind: str,
+    *,
+    json_body: Optional[dict],
+    params: Optional[dict],
+    timeout: float
+) -> dict:
+    """
+    POST to Jupiter (or relay) with smart endpoint selection + fallbacks.
+    - swap:
+        * api.jup.ag         -> /swap/v1/tx
+        * quote-api.jup.ag   -> /v6/swap
+        * lite-api.jup.ag    -> SKIPPED (no swap support)
+        * QuickNode /call    -> ?path=/v6/swap&mode=RAW
+    - other kinds (e.g., tokens, quote): default to /v6/<kind> (with /call mapping)
+    """
     last_err: Optional[Exception] = None
-    for idx, base in enumerate(_alt_bases()):
-        b = base.rstrip("/")
 
-        # ── choose correct swap path for each base (hostname-aware) ───────────
+    for idx, base in enumerate(_alt_bases()):
+        b = (base or "").strip().rstrip("/")
+        if not b:
+            continue
+
+        host = urlparse(b).netloc.lower() or b.lower()
+        is_qn = _is_qn_call_url(b)
+
+        # Build endpoint URL
         if kind == "swap":
-            if _is_qn_call_url(b):
-                # QuickNode /call relay passes through v6
+            # lite-api has no swap endpoint — skip it entirely
+            if host.startswith("lite-api.jup.ag"):
+                continue
+
+            if is_qn:
+                # QuickNode Functions relay; pass the v6 path explicitly
                 url = f"{b}?path=/v6/swap&mode=RAW"
-                is_qn = True
+            elif host == "api.jup.ag":
+                # PRO uses v1/tx for swap-building
+                url = f"{b}/swap/v1/tx"
             else:
-                host = urlparse(b).netloc.lower() or b.lower()
-                if host == "api.jup.ag":
-                    # Jupiter PRO uses the v1 tx endpoint
-                    url = f"{b}/swap/v1/tx"
-                else:
-                    # quote-api.jup.ag (and most mirrors) support v6
-                    url = f"{b}/v6/swap"
-                is_qn = False
+                # quote-api.jup.ag (and similar mirrors) expose v6/swap
+                url = f"{b}/v6/swap"
         else:
-            url, is_qn = _compose_endpoint(base, kind)
-        # ──────────────────────────────────────────────────────────────────────
+            # Non-swap calls: use the generic composer (handles QN /call too)
+            url, is_qn = _compose_endpoint(b, kind)
 
         try:
-            if is_qn:
-                r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=_jup_headers_for(base))
-            else:
-                r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=_jup_headers_for(base))
+            r = requests.post(
+                url,
+                json=json_body,
+                params=params,
+                timeout=timeout,
+                headers=_jup_headers_for(base),
+            )
+
+            # Try to parse JSON; if not JSON and not 2xx, raise for the loop to catch
             try:
                 js = r.json()
             except Exception:
                 r.raise_for_status()
                 raise
+
+            # If this came via QN /call, unwrap any envelopes
             js = _unwrap_qn_action(r, js)
+
             if r.status_code in (200, 201):
                 return js
+
+            # Remember the HTTP error payload for the final raise
             last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
+
         except RequestException as e:
             last_err = e
         except Exception as e:
             last_err = e
+
+        # Small backoff between fallbacks
         await asyncio.sleep(0.05 if idx == 0 else 0.1)
-    raise last_err or RuntimeError("all swap endpoints failed")
+
+    raise last_err or RuntimeError(f"all {kind} endpoints failed")
 
 # Ordered bases for QUOTES: RELAY -> PRO -> LITE -> V6
 def _quote_bases_order() -> List[tuple[str, str]]:
