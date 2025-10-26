@@ -134,7 +134,7 @@ _UA = {"user-agent": "pnlsniper/1.0 (+router)", "accept": "application/json", "c
 # ──────────────────────────────────────────────────────────────────────────────
 # Telegram helpers (robust; always logs why it skipped)
 # ──────────────────────────────────────────────────────────────────────────────
-def _tg_ready() -> Tuple[bool, str]:
+def _tg_ready() -> tuple[bool, str]:
     if not _envb("TELEGRAM_ENABLED", False):
         return False, "TELEGRAM_ENABLED=0"
     tok = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
@@ -145,14 +145,20 @@ def _tg_ready() -> Tuple[bool, str]:
         return False, "no TELEGRAM_CHAT_ID"
     return True, "ok"
 
+# Strip characters that explode under MarkdownV2; send plain text
+_MARKDOWNV2_SPECIALS = r"_*[]()~`>#+-=|{}.!\\"
+def _tg_plain(msg: str) -> str:
+    # safest: just remove specials instead of escaping (works with any parse_mode)
+    return "".join(ch for ch in msg if ch not in _MARKDOWNV2_SPECIALS)
+
 async def _tg_send(msg: str, *, src: str) -> None:
     ok, why = _tg_ready()
     if not ok:
         log.every("tg.skip", n=15, msg="TG_SKIP", why=why, src=src)
         return
     try:
-        await _core_send_telegram(msg)
-        log.every("tg.sent", n=30, msg="TG_SENT", bytes=len(msg.encode("utf-8")), src=src)
+        await _core_send_telegram(_tg_plain(msg))
+        log.every("tg.sent", n=1, msg="TG_SENT_ONCE", src=src)  # n=1 so you see it at least once
     except Exception as e:
         log.event("TG_SEND_ERROR", src=src, err=str(e))
 
@@ -1075,19 +1081,29 @@ async def buy_via_lightning(
         slip_pct = float(slippage_bps if slippage_bps is not None else _slippage_bps()) / 100.0
         sym = _tok_symbol(mint) or mint[:6]
         ts = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
-        await _tg_send(
-            f"🟢 *BUY SIGNAL* (dry-run)\n"
-            f"Token: {sym}\nMint: `{mint}`\n"
-            f"Size: {size_sol:.4f} SOL\nSlippage: {slip_pct:.2f}%\n{ts} UTC",
-            src="router.buy.signal",
-        )
-        px = (size_sol / max(out_ui, 1e-9))
-        await _tg_send(
-            f"✅ *BUY FILLED* (dry-run)\n"
-            f"Token: {sym}\nQty: {out_ui:,.6f}\n"
-            f"Price: {px:.9f} SOL\nTx: https://solscan.io/tx/FAKE",
-            src="router.buy.filled",
-        )
+        # BUY (dry-run)
+await _tg_send(
+    (
+        "BUY SIGNAL (dry-run)\n"
+        f"Token: {sym}\n"
+        f"Mint: {mint}\n"
+        f"Size: {size_sol:.4f} SOL\n"
+        f"Slippage: {slip_pct:.2f}%\n"
+        f"UTC: {ts}"
+    ),
+    src="router.buy.signal",
+)
+px = (size_sol / max(out_ui, 1e-9))
+await _tg_send(
+    (
+        "BUY FILLED (dry-run)\n"
+        f"Token: {sym}\n"
+        f"Qty: {out_ui:,.6f}\n"
+        f"Price: {px:.9f} SOL\n"
+        "Tx: https://solscan.io/tx/FAKE"
+    ),
+    src="router.buy.filled",
+)
         log.event("DRYRUN_BUY", mint=mint, lamports_in=lamports_in, out_ui=out_ui)
         return True, None
 
@@ -1140,16 +1156,25 @@ async def sell_via_lightning(
         lamports = int(quote.get("outAmount", "0") or 0)
         sol_out = lamports / LAMPORTS_PER_SOL
         sym = _tok_symbol(mint) or mint[:6]
-        await _tg_send(
-            f"📉 *SELL SIGNAL* (dry-run)\n"
-            f"Token: {sym}\nAmount(raw): {amount_raw}\nProceeds: {sol_out:.6f} SOL",
-            src="router.sell.signal",
-        )
-        await _tg_send(
-            f"✅ *SELL FILLED* (dry-run)\n"
-            f"Token: {sym}\nRealized: {sol_out:.6f} SOL\nTx: https://solscan.io/tx/FAKE",
-            src="router.sell.filled",
-        )
+        # SELL (dry-run)
+await _tg_send(
+    (
+        "SELL SIGNAL (dry-run)\n"
+        f"Token: {sym}\n"
+        f"Amount raw: {amount_raw}\n"
+        f"Proceeds: {sol_out:.6f} SOL"
+    ),
+    src="router.sell.signal",
+)
+await _tg_send(
+    (
+        "SELL FILLED (dry-run)\n"
+        f"Token: {sym}\n"
+        f"Realized: {sol_out:.6f} SOL\n"
+        "Tx: https://solscan.io/tx/FAKE"
+    ),
+    src="router.sell.filled",
+)
         log.event("DRYRUN_SELL", mint=mint, amount_raw=amount_raw, out_sol=sol_out)
         return True, None
 
