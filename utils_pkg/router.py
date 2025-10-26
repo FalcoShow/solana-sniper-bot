@@ -321,85 +321,79 @@ async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) ->
         await asyncio.sleep(0.05 if idx == 0 else 0.1)
     raise last_err or RuntimeError("all quote endpoints failed")
 
-async def _http_post_with_fallback(
-    kind: str,
-    *,
-    json_body: Optional[dict],
-    params: Optional[dict],
-    timeout: float
-) -> dict:
+async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], params: Optional[dict], timeout: float) -> dict:
     """
-    POST to Jupiter (or relay) with smart endpoint selection + fallbacks.
-    - swap:
-        * api.jup.ag         -> /swap/v1/tx
-        * quote-api.jup.ag   -> /v6/swap
-        * lite-api.jup.ag    -> SKIPPED (no swap support)
-        * QuickNode /call    -> ?path=/v6/swap&mode=RAW
-    - other kinds (e.g., tokens, quote): default to /v6/<kind> (with /call mapping)
+    POST with robust swap path probing.
+    For swap:
+      1) /v6/swap
+      2) /swap/v1/swap
+      3) /swap/v1/tx
+    Also supports QuickNode /call relays.
     """
     last_err: Optional[Exception] = None
 
-    for idx, base in enumerate(_alt_bases()):
-        b = (base or "").strip().rstrip("/")
-        if not b:
-            continue
+    def _swap_candidates(base: str) -> list[tuple[str, bool]]:
+        b = base.rstrip("/")
+        # QN /call relay: always v6 via path query param
+        if _is_qn_call_url(b):
+            return [(f"{b}?path=/v6/swap&mode=RAW", True)]
+        # Try the modern v6 first, then the two v1 variants
+        return [
+            (f"{b}/v6/swap", False),
+            (f"{b}/swap/v1/swap", False),
+            (f"{b}/swap/v1/tx", False),
+        ]
 
-        host = urlparse(b).netloc.lower() or b.lower()
-        is_qn = _is_qn_call_url(b)
-
-        # Build endpoint URL
+    for bidx, base in enumerate(_alt_bases()):
+        try_paths: list[tuple[str, bool]]
         if kind == "swap":
-            # lite-api has no swap endpoint — skip it entirely
-            if host.startswith("lite-api.jup.ag"):
-                continue
-
-            if is_qn:
-                # QuickNode Functions relay; pass the v6 path explicitly
-                url = f"{b}?path=/v6/swap&mode=RAW"
-            elif host == "api.jup.ag":
-                # PRO uses v1/tx for swap-building
-                url = f"{b}/swap/v1/tx"
-            else:
-                # quote-api.jup.ag (and similar mirrors) expose v6/swap
-                url = f"{b}/v6/swap"
+            try_paths = _swap_candidates(base)
         else:
-            # Non-swap calls: use the generic composer (handles QN /call too)
-            url, is_qn = _compose_endpoint(b, kind)
+            try_paths = [_compose_endpoint(base, kind)]
 
-        try:
-            r = requests.post(
-                url,
-                json=json_body,
-                params=params,
-                timeout=timeout,
-                headers=_jup_headers_for(base),
-            )
-
-            # Try to parse JSON; if not JSON and not 2xx, raise for the loop to catch
+        for pidx, (url, is_qn) in enumerate(try_paths):
             try:
-                js = r.json()
-            except Exception:
-                r.raise_for_status()
-                raise
+                # Optional: one-time visibility (won’t spam because n=1)
+                try:
+                    log.every("swap.try", n=1, msg="SWAP_TRY", url=url)
+                except Exception:
+                    pass
 
-            # If this came via QN /call, unwrap any envelopes
-            js = _unwrap_qn_action(r, js)
+                r = requests.post(
+                    url,
+                    json=json_body,
+                    params=params,
+                    timeout=timeout,
+                    headers=_jup_headers_for(base),
+                )
 
-            if r.status_code in (200, 201):
-                return js
+                # If JSON parse fails but HTTP is not OK, raise to try next path
+                try:
+                    js = r.json()
+                except Exception:
+                    r.raise_for_status()
+                    raise
 
-            # Remember the HTTP error payload for the final raise
-            last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
+                js = _unwrap_qn_action(r, js)
 
-        except RequestException as e:
-            last_err = e
-        except Exception as e:
-            last_err = e
+                if r.status_code in (200, 201):
+                    return js
 
-        # Small backoff between fallbacks
-        await asyncio.sleep(0.05 if idx == 0 else 0.1)
+                # Non-OK: try next candidate path (or next base)
+                last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
 
-    raise last_err or RuntimeError(f"all {kind} endpoints failed")
+            except RequestException as e:
+                last_err = e
+            except Exception as e:
+                last_err = e
+
+            # small stagger between path probes under same base
+            await asyncio.sleep(0.03)
+
+        # small stagger between bases
+        await asyncio.sleep(0.08 if bidx == 0 else 0.12)
+
+    raise last_err or RuntimeError("all swap endpoints failed")
 
 # Ordered bases for QUOTES: RELAY -> PRO -> LITE -> V6
 def _quote_bases_order() -> List[tuple[str, str]]:
