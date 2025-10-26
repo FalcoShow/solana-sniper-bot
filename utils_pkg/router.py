@@ -20,8 +20,7 @@ from utils_pkg.solana_wallet import (
     get_pubkey_str,
     sign_and_send_b64_tx,
 )
-# NEW: DRYRUN notifications
-from utils_pkg.core_utils import send_telegram
+from utils_pkg.core_utils import send_telegram  # Telegram pings
 
 log = get_logger()
 
@@ -128,6 +127,26 @@ except Exception:  # pragma: no cover
 _UA = {"user-agent": "pnlsniper/1.0 (+router)", "accept": "application/json", "content-type": "application/json"}
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Telegram toggles (respect your existing env scheme)
+# ──────────────────────────────────────────────────────────────────────────────
+TELEGRAM_ENABLED       = _envb("TELEGRAM_ENABLED", True)
+TELEGRAM_NOTIFY_TRADES = _envb("TELEGRAM_NOTIFY_TRADES", True)
+TELEGRAM_NOTIFY_BUY    = _envb("TELEGRAM_NOTIFY_BUY", True)
+TELEGRAM_NOTIFY_SELLS  = _envb("TELEGRAM_NOTIFY_SELLS", True)
+TELEGRAM_NOTIFY_FILLED = _envb("TELEGRAM_NOTIFY_FILLED", True)
+
+def _tg_on() -> bool:
+    return TELEGRAM_ENABLED and TELEGRAM_NOTIFY_TRADES
+
+async def _tg(msg: str) -> None:
+    if not _tg_on():
+        return
+    try:
+        await send_telegram(msg, disable_web_page_preview=True)
+    except Exception as e:
+        log.every("tg.err", n=50, msg="TELEGRAM_SEND_ERR", err=str(e))
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Base58 helpers and mint sanitation
 # ──────────────────────────────────────────────────────────────────────────────
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -177,15 +196,14 @@ def normalize_pump_id_to_mint(raw: str) -> str:
     return normalize_mint(raw)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Jupiter base URL(s) & multi-endpoint fallback (NEW order for quotes)
+# Jupiter base URL(s) & multi-endpoint fallback
+#   - keep v6 /tokens and /swap helpers as-is (with QN /call support)
+#   - add strict quote order: RELAY → PRO → LITE → V6 (v1 params; v6 as fallback)
 # ──────────────────────────────────────────────────────────────────────────────
-# Keep existing v6 helpers (_alt_bases, _compose_endpoint, _http_*_with_fallback) for tokens & swap.
 def _alt_bases() -> Sequence[str]:
     """
+    For /v6 endpoints (tokens/swap):
     Primary from JUP_BASE_URL, fallbacks from JUP_ALT_BASE_URLS (comma-separated).
-    Example:
-      JUP_BASE_URL=https://quote-api.jup.ag
-      JUP_ALT_BASE_URLS=https://cryptobot.example.workers.dev
     """
     bases: list[str] = []
     primary = (os.getenv("JUP_BASE_URL") or "https://quote-api.jup.ag").strip().rstrip("/")
@@ -197,7 +215,7 @@ def _alt_bases() -> Sequence[str]:
             a = a.strip().rstrip("/")
             if a and a not in bases:
                 bases.append(a)
-    # dedupe
+    # dedupe, keep order
     deduped: list[str] = []
     for b in bases:
         if b and b not in deduped:
@@ -206,7 +224,6 @@ def _alt_bases() -> Sequence[str]:
 
 def _is_qn_call_url(u: str) -> bool:
     u = (u or "").rstrip("/")
-    # recognises QuickNode Functions /call endpoints, or workers that mirror same pattern
     return "/functions/" in u and u.endswith("/call")
 
 def _compose_endpoint(base: str, kind: str) -> tuple[str, bool]:
@@ -232,80 +249,59 @@ def _jup_headers_for(base: str) -> Dict[str, str]:
     if x_api:
         h["x-api-key"] = x_api
         h.setdefault("x-quicknode-mode", "RAW")
-    # Jupiter PRO API key (for api.jup.ag)
+    # Jupiter PRO key (some relays/proxy read this as x-api-key)
     pro_key = (os.getenv("JUP_PRO_KEY") or "").strip()
-    if pro_key and ("api.jup.ag" in base or "127.0.0.1" in base or "localhost" in base):
-        # many relays forward x-api-key
+    if pro_key and ("api.jup.ag" in base or "localhost" in base or "127.0.0.1" in base):
         h["x-api-key"] = pro_key
-    # Jupiter bearer (kept for compatibility)
+    # Bearer (legacy)
     jup_bearer = (os.getenv("JUP_BEARER") or "").strip()
     if jup_bearer:
         h["x-jup-auth"] = f"Bearer {jup_bearer}"
     return h
 
 async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) -> dict:
-    """
-    Tries each base (primary + fallbacks) for GET /v6/<kind> (or QN /call).
-    Returns JSON or raises the last error.
-    """
     headers = _jup_headers_for(_alt_bases()[0] if _alt_bases() else "")
     last_err: Optional[Exception] = None
     for idx, base in enumerate(_alt_bases()):
         url, is_qn = _compose_endpoint(base, kind)
         try:
             if is_qn:
-                # QN functions prefer POST with params in query string; empty JSON body.
                 r = requests.post(url, json=None, params=params, timeout=timeout, headers=_jup_headers_for(base))
             else:
                 r = requests.get(url, params=params, timeout=timeout, headers=_jup_headers_for(base))
-
-            # Parse JSON first; unwrap envelopes even on non-2xx for better errors
             try:
                 js = r.json()
             except Exception:
                 r.raise_for_status()
                 raise
             js = _unwrap_qn_action(r, js)
-
             if r.status_code in (200, 201):
                 return js
-
-            # Keep trying next base on 4xx/5xx
             last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
         except RequestException as e:
             last_err = e
         except Exception as e:
             last_err = e
-        # tiny backoff before next base
         await asyncio.sleep(0.05 if idx == 0 else 0.1)
-    # bubble the last thing we saw
     raise last_err or RuntimeError("all quote endpoints failed")
 
 async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], params: Optional[dict], timeout: float) -> dict:
-    """
-    Tries each base (primary + fallbacks) for POST /v6/<kind> (or QN /call).
-    Used for /swap (and any future POST).
-    """
     last_err: Optional[Exception] = None
     for idx, base in enumerate(_alt_bases()):
         url, is_qn = _compose_endpoint(base, kind)
         try:
             if is_qn:
-                # QN /call: keep params in query string; JSON body goes through as-is.
                 r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=_jup_headers_for(base))
             else:
                 r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=_jup_headers_for(base))
-
             try:
                 js = r.json()
             except Exception:
                 r.raise_for_status()
                 raise
             js = _unwrap_qn_action(r, js)
-
             if r.status_code in (200, 201):
                 return js
-
             last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
         except RequestException as e:
             last_err = e
@@ -314,14 +310,14 @@ async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], para
         await asyncio.sleep(0.05 if idx == 0 else 0.1)
     raise last_err or RuntimeError("all swap endpoints failed")
 
-# NEW: explicit ordered bases just for QUOTES (v1→v6)
+# Ordered bases specifically for quoting (v1 first, v6 as last fallback)
 def _quote_bases_order() -> List[tuple[str, str]]:
     """
     Returns list of (base, kind) where kind is 'v1' or 'v6' in the required order:
     RELAY(if set) → PRO(api.jup.ag) → LITE → V6(quote-api.jup.ag)
     """
     order: List[tuple[str, str]] = []
-    relay = (os.getenv("JUP_BASE_URL") or "").strip().rstrip("/")
+    relay = (os.getenv("JUP_RELAY") or os.getenv("RELAY_URL") or os.getenv("JUP_BASE_URL") or "").strip().rstrip("/")
     if relay:
         order.append((relay, "v1"))
     pro  = (os.getenv("JUP_UPSTREAM") or "https://api.jup.ag").strip().rstrip("/")
@@ -331,7 +327,7 @@ def _quote_bases_order() -> List[tuple[str, str]]:
     order.append((lite, "v1"))
     order.append((v6, "v6"))
     # dedupe while preserving order
-    seen = set()
+    seen: set[tuple[str, str]] = set()
     out: List[tuple[str, str]] = []
     for b, k in order:
         if b and (b, k) not in seen:
@@ -340,10 +336,6 @@ def _quote_bases_order() -> List[tuple[str, str]]:
     return out
 
 async def _http_get_quote_any(*, params_v1: dict, params_v6: dict) -> dict:
-    """
-    Try in strict order:
-      (RELAY v1) → (PRO v1) → (LITE v1) → (V6 legacy)
-    """
     last_err: Optional[Exception] = None
     for base, kind in _quote_bases_order():
         try:
@@ -574,7 +566,6 @@ async def _tokens_catalog() -> List[dict]:
             return arr
     except Exception:
         pass
-    # on failure, keep old cache (if any)
     return _TOKENS_CACHE[1] if _TOKENS_CACHE else []
 
 def _tok_symbol(mint: str) -> Optional[str]:
@@ -583,7 +574,6 @@ def _tok_symbol(mint: str) -> Optional[str]:
     return str(s).strip() if s else None
 
 async def _decimals_from_tokens_api(mint: str) -> Optional[int]:
-    # ensure token catalog is warmed
     arr = await _tokens_catalog()
     if not arr:
         return None
@@ -651,7 +641,7 @@ async def _get_signature_status(sig: str) -> Optional[dict]:
     return await asyncio.to_thread(_call)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Priority fee controller (unchanged)
+# Priority fee controller
 # ──────────────────────────────────────────────────────────────────────────────
 def _to_sol_from_lamports_like(x: float) -> float:
     lamports = float(x)
@@ -731,7 +721,6 @@ class DynPriority:
             pass
 
     def choose_lamports(self, override_sol: Optional[float]) -> Optional[int]:
-        # honor explicit override first (PF_JITO_TIP_SOL in caller)
         if override_sol is not None:
             try:
                 return int(max(0, override_sol) * LAMPORTS_PER_SOL)
@@ -866,13 +855,13 @@ async def _jup_quote(
             raise RuntimeError("quote blocked by budget")
         try:
             await _jup_gate()
-            # v1 params (string booleans, swapMode required); v6 params (same but no swapMode)
+            # v1 style params (string booleans) + v6 params
             params_v1 = {
                 "inputMint": input_mint,
                 "outputMint": output_mint,
                 "amount": str(amount_iu),
                 "slippageBps": sbps,
-                "swapMode": swap_mode,
+                "swapMode": swap_mode,  # ExactIn
                 "onlyDirectRoutes": "true" if only_direct else "false",
                 "asLegacyTransaction": "true" if legacy else "false",
             }
@@ -906,7 +895,6 @@ async def _jup_swap(
     body = {
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": True,
-        # If compute_units is provided, disable dynamic CU limit and set a fixed one
         "dynamicComputeUnitLimit": False if (compute_units and compute_units > 0) else True,
         "quoteResponse": quote,
         "asLegacyTransaction": True if _as_legacy() else False,
@@ -995,7 +983,6 @@ async def get_price_ui(mint: str) -> float:
     SOL per 1 token UI. Never raises; 0.0 on failure.
     Uses adaptive tiny-quote ladder token->SOL with fallback bases.
     """
-    # Special-case: 1 SOL = 1 SOL
     try:
         if normalize_mint(mint) == SOL_MINT:
             return 1.0
@@ -1100,7 +1087,6 @@ async def buy_via_lightning(
         log.event("ROUTER_BUY_QUOTE_FAIL", mint=mint, err=str(e))
         return False, None
 
-    # NEW: Telegram alerts even in DRYRUN
     if DRY_RUN:
         out_raw = int(quote.get("outAmount", "0") or 0)
         dec = await _get_decimals(mint) or 6
@@ -1109,20 +1095,19 @@ async def buy_via_lightning(
         slip_pct = float(slippage_bps if slippage_bps is not None else _slippage_bps()) / 100.0
         sym = _tok_symbol(mint) or mint[:6]
         ts = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
-        try:
-            await send_telegram(
+        if TELEGRAM_NOTIFY_BUY:
+            await _tg(
                 f"🟢 *BUY SIGNAL* (dry-run)\n"
-                f"Token: {sym}\nMint: `{mint[:12]}...`\n"
+                f"Token: {sym}\nMint: `{mint}`\n"
                 f"Size: {size_sol:.4f} SOL\nSlippage: {slip_pct:.2f}%\n{ts} UTC"
             )
+        if TELEGRAM_NOTIFY_FILLED:
             px = (size_sol / max(out_ui, 1e-9))
-            await send_telegram(
-                f"✅ *BUY FILLED* (dry-run)\n"
+            await _tg(
+                "✅ *BUY FILLED* (dry-run)\n"
                 f"Token: {sym}\nQty: {out_ui:,.6f}\n"
-                f"Price: {px:.9f} SOL\nTx: https://solscan.io/tx/FAKE"
+                f"Price: {px:.9f} SOL"
             )
-        except Exception:
-            pass
         log.event("DRYRUN_BUY", mint=mint, lamports_in=lamports_in, out_ui=out_ui)
         return True, None
 
@@ -1133,6 +1118,18 @@ async def buy_via_lightning(
             tx_b64 = await _jup_swap(owner, quote, priority_lamports=prio, compute_units=compute_units)
             sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
             _PRIO.observe(sig, t0)
+            if TELEGRAM_NOTIFY_FILLED and _tg_on():
+                out_raw = int(quote.get("outAmount", "0") or 0)
+                dec = await _get_decimals(mint) or 0
+                out_ui = out_raw / (10 ** max(0, dec)) if dec >= 0 else 0.0
+                px = (lamports_in / LAMPORTS_PER_SOL) / max(out_ui, 1e-9)
+                await _tg(
+                    "✅ *BUY FILLED*\n"
+                    f"Token: {_tok_symbol(mint) or mint[:6]}\n"
+                    f"Qty: {out_ui:,.6f}\n"
+                    f"Price: {px:.9f} SOL\n"
+                    f"Tx: https://solscan.io/tx/{sig}"
+                )
             return True, sig
         except Exception as e:
             if attempt >= SWAP_RETRIES:
@@ -1175,22 +1172,21 @@ async def sell_via_lightning(
         log.event("ROUTER_SELL_QUOTE_FAIL", mint=mint, err=str(e))
         return False, None
 
-    # NEW: Telegram alerts even in DRYRUN
     if DRY_RUN:
         lamports = int(quote.get("outAmount", "0") or 0)
         sol_out = lamports / LAMPORTS_PER_SOL
         sym = _tok_symbol(mint) or mint[:6]
-        try:
-            await send_telegram(
-                f"📉 *SELL SIGNAL* (dry-run)\n"
-                f"Token: {sym}\nAmount(raw): {amount_raw}\nProceeds: {sol_out:.6f} SOL"
+        if TELEGRAM_NOTIFY_SELLS:
+            dec = await _get_decimals(mint) or 0
+            qty_ui = amount_raw / (10 ** max(0, dec))
+            px = (sol_out) / max(qty_ui, 1e-9)
+            await _tg(
+                "🔴 *SELL FILLED* (dry-run)\n"
+                f"Token: {sym}\n"
+                f"Qty: {qty_ui:,.6f}\n"
+                f"Proceeds: {sol_out:.6f} SOL\n"
+                f"Price: {px:.9f} SOL"
             )
-            await send_telegram(
-                f"✅ *SELL FILLED* (dry-run)\n"
-                f"Token: {sym}\nRealized: {sol_out:.6f} SOL\nTx: https://solscan.io/tx/FAKE"
-            )
-        except Exception:
-            pass
         log.event("DRYRUN_SELL", mint=mint, amount_raw=amount_raw, out_sol=sol_out)
         return True, None
 
@@ -1201,6 +1197,19 @@ async def sell_via_lightning(
             tx_b64 = await _jup_swap(owner, quote, priority_lamports=prio, compute_units=compute_units)
             sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
             _PRIO.observe(sig, t0)
+            if TELEGRAM_NOTIFY_SELLS and _tg_on():
+                lamports = int(quote.get("outAmount", "0") or 0)
+                dec = await _get_decimals(mint) or 0
+                qty_ui = amount_raw / (10 ** max(0, dec))
+                px = (lamports / LAMPORTS_PER_SOL) / max(qty_ui, 1e-9)
+                await _tg(
+                    "🔴 *SELL FILLED*\n"
+                    f"Token: {_tok_symbol(mint) or mint[:6]}\n"
+                    f"Qty: {qty_ui:,.6f}\n"
+                    f"Proceeds: {lamports / LAMPORTS_PER_SOL:.6f} SOL\n"
+                    f"Price: {px:.9f} SOL\n"
+                    f"Tx: https://solscan.io/tx/{sig}"
+                )
             return True, sig
         except Exception as e:
             if attempt >= SWAP_RETRIES:
