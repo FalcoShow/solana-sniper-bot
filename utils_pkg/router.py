@@ -135,14 +135,30 @@ TELEGRAM_NOTIFY_BUY    = _envb("TELEGRAM_NOTIFY_BUY", True)
 TELEGRAM_NOTIFY_SELLS  = _envb("TELEGRAM_NOTIFY_SELLS", True)
 TELEGRAM_NOTIFY_FILLED = _envb("TELEGRAM_NOTIFY_FILLED", True)
 
+_TG_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+_TG_CHAT  = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+if TELEGRAM_ENABLED and (not _TG_TOKEN or not _TG_CHAT):
+    # Make it obvious in logs if creds aren't present in this process env
+    log.every("tg.missing.creds", n=1, msg="TELEGRAM_CREDS_MISSING",
+              has_token=bool(_TG_TOKEN), has_chat=bool(_TG_CHAT))
+
 def _tg_on() -> bool:
-    return TELEGRAM_ENABLED and TELEGRAM_NOTIFY_TRADES
+    return TELEGRAM_ENABLED and TELEGRAM_NOTIFY_TRADES and bool(_TG_TOKEN and _TG_CHAT)
+
+def _plain(msg: str) -> str:
+    # Keep emojis but strip characters that can break MarkdownV2 if the helper forces it
+    return msg.replace("*", "").replace("_", "").replace("`", "")
 
 async def _tg(msg: str) -> None:
     if not _tg_on():
         return
     try:
-        await send_telegram(msg, disable_web_page_preview=True)
+        # many internal helpers accept src/force; if not, this still no-ops safely via **kwargs try
+        kwargs = dict(disable_web_page_preview=True)
+        try:
+            await send_telegram(_plain(msg), src="router", force=True, **kwargs)  # preferred
+        except TypeError:
+            await send_telegram(_plain(msg), **kwargs)  # fallback if helper has no src/force
     except Exception as e:
         log.every("tg.err", n=50, msg="TELEGRAM_SEND_ERR", err=str(e))
 
@@ -1087,29 +1103,27 @@ async def buy_via_lightning(
         log.event("ROUTER_BUY_QUOTE_FAIL", mint=mint, err=str(e))
         return False, None
 
-    if DRY_RUN:
-        out_raw = int(quote.get("outAmount", "0") or 0)
-        dec = await _get_decimals(mint) or 6
-        out_ui = out_raw / (10 ** dec)
-        size_sol = lamports_in / LAMPORTS_PER_SOL
-        slip_pct = float(slippage_bps if slippage_bps is not None else _slippage_bps()) / 100.0
-        sym = _tok_symbol(mint) or mint[:6]
-        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
-        if TELEGRAM_NOTIFY_BUY:
-            await _tg(
-                f"🟢 *BUY SIGNAL* (dry-run)\n"
-                f"Token: {sym}\nMint: `{mint}`\n"
-                f"Size: {size_sol:.4f} SOL\nSlippage: {slip_pct:.2f}%\n{ts} UTC"
-            )
-        if TELEGRAM_NOTIFY_FILLED:
-            px = (size_sol / max(out_ui, 1e-9))
-            await _tg(
-                "✅ *BUY FILLED* (dry-run)\n"
-                f"Token: {sym}\nQty: {out_ui:,.6f}\n"
-                f"Price: {px:.9f} SOL"
-            )
-        log.event("DRYRUN_BUY", mint=mint, lamports_in=lamports_in, out_ui=out_ui)
-        return True, None
+# BUY (DRYRUN) message block
+if DRY_RUN:
+    out_raw = int(quote.get("outAmount", "0") or 0)
+    dec = await _get_decimals(mint) or 6
+    out_ui = out_raw / (10 ** dec)
+    size_sol = lamports_in / LAMPORTS_PER_SOL
+    slip_pct = float(slippage_bps if slippage_bps is not None else _slippage_bps()) / 100.0
+    sym = _tok_symbol(mint) or mint[:6]
+    ts = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
+    if TELEGRAM_NOTIFY_BUY:
+        await _tg(
+            f"🟢 BUY SIGNAL (dry-run)\nToken: {sym}\nMint: {mint}\n"
+            f"Size: {size_sol:.4f} SOL\nSlippage: {slip_pct:.2f}%\n{ts} UTC"
+        )
+    if TELEGRAM_NOTIFY_FILLED:
+        px = (size_sol / max(out_ui, 1e-9))
+        await _tg(
+            f"✅ BUY FILLED (dry-run)\nToken: {sym}\nQty: {out_ui:,.6f}\nPrice: {px:.9f} SOL"
+        )
+    log.event("DRYRUN_BUY", mint=mint, lamports_in=lamports_in, out_ui=out_ui)
+    return True, None
 
     t0 = time.time()
     for attempt in range(1, SWAP_RETRIES + 1):
@@ -1118,18 +1132,16 @@ async def buy_via_lightning(
             tx_b64 = await _jup_swap(owner, quote, priority_lamports=prio, compute_units=compute_units)
             sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
             _PRIO.observe(sig, t0)
-            if TELEGRAM_NOTIFY_FILLED and _tg_on():
-                out_raw = int(quote.get("outAmount", "0") or 0)
-                dec = await _get_decimals(mint) or 0
-                out_ui = out_raw / (10 ** max(0, dec)) if dec >= 0 else 0.0
-                px = (lamports_in / LAMPORTS_PER_SOL) / max(out_ui, 1e-9)
-                await _tg(
-                    "✅ *BUY FILLED*\n"
-                    f"Token: {_tok_symbol(mint) or mint[:6]}\n"
-                    f"Qty: {out_ui:,.6f}\n"
-                    f"Price: {px:.9f} SOL\n"
-                    f"Tx: https://solscan.io/tx/{sig}"
-                )
+# BUY (live) filled ping just before return True, sig
+if TELEGRAM_NOTIFY_FILLED and _tg_on():
+    out_raw = int(quote.get("outAmount", "0") or 0)
+    dec = await _get_decimals(mint) or 0
+    out_ui = out_raw / (10 ** max(0, dec)) if dec >= 0 else 0.0
+    px = (lamports_in / LAMPORTS_PER_SOL) / max(out_ui, 1e-9)
+    await _tg(
+        f"✅ BUY FILLED\nToken: {_tok_symbol(mint) or mint[:6]}\n"
+        f"Qty: {out_ui:,.6f}\nPrice: {px:.9f} SOL\nTx: https://solscan.io/tx/{sig}"
+    )
             return True, sig
         except Exception as e:
             if attempt >= SWAP_RETRIES:
@@ -1172,23 +1184,21 @@ async def sell_via_lightning(
         log.event("ROUTER_SELL_QUOTE_FAIL", mint=mint, err=str(e))
         return False, None
 
-    if DRY_RUN:
-        lamports = int(quote.get("outAmount", "0") or 0)
-        sol_out = lamports / LAMPORTS_PER_SOL
-        sym = _tok_symbol(mint) or mint[:6]
-        if TELEGRAM_NOTIFY_SELLS:
-            dec = await _get_decimals(mint) or 0
-            qty_ui = amount_raw / (10 ** max(0, dec))
-            px = (sol_out) / max(qty_ui, 1e-9)
-            await _tg(
-                "🔴 *SELL FILLED* (dry-run)\n"
-                f"Token: {sym}\n"
-                f"Qty: {qty_ui:,.6f}\n"
-                f"Proceeds: {sol_out:.6f} SOL\n"
-                f"Price: {px:.9f} SOL"
-            )
-        log.event("DRYRUN_SELL", mint=mint, amount_raw=amount_raw, out_sol=sol_out)
-        return True, None
+# SELL (DRYRUN) message block
+if DRY_RUN:
+    lamports = int(quote.get("outAmount", "0") or 0)
+    sol_out = lamports / LAMPORTS_PER_SOL
+    sym = _tok_symbol(mint) or mint[:6]
+    if TELEGRAM_NOTIFY_SELLS:
+        dec = await _get_decimals(mint) or 0
+        qty_ui = amount_raw / (10 ** max(0, dec))
+        px = (sol_out) / max(qty_ui, 1e-9)
+        await _tg(
+            f"🔴 SELL FILLED (dry-run)\nToken: {sym}\nQty: {qty_ui:,.6f}\n"
+            f"Proceeds: {sol_out:.6f} SOL\nPrice: {px:.9f} SOL"
+        )
+    log.event("DRYRUN_SELL", mint=mint, amount_raw=amount_raw, out_sol=sol_out)
+    return True, None
 
     t0 = time.time()
     for attempt in range(1, SWAP_RETRIES + 1):
@@ -1197,19 +1207,17 @@ async def sell_via_lightning(
             tx_b64 = await _jup_swap(owner, quote, priority_lamports=prio, compute_units=compute_units)
             sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
             _PRIO.observe(sig, t0)
-            if TELEGRAM_NOTIFY_SELLS and _tg_on():
-                lamports = int(quote.get("outAmount", "0") or 0)
-                dec = await _get_decimals(mint) or 0
-                qty_ui = amount_raw / (10 ** max(0, dec))
-                px = (lamports / LAMPORTS_PER_SOL) / max(qty_ui, 1e-9)
-                await _tg(
-                    "🔴 *SELL FILLED*\n"
-                    f"Token: {_tok_symbol(mint) or mint[:6]}\n"
-                    f"Qty: {qty_ui:,.6f}\n"
-                    f"Proceeds: {lamports / LAMPORTS_PER_SOL:.6f} SOL\n"
-                    f"Price: {px:.9f} SOL\n"
-                    f"Tx: https://solscan.io/tx/{sig}"
-                )
+# SELL (live) filled ping just before return True, sig
+if TELEGRAM_NOTIFY_SELLS and _tg_on():
+    lamports = int(quote.get("outAmount", "0") or 0)
+    dec = await _get_decimals(mint) or 0
+    qty_ui = amount_raw / (10 ** max(0, dec))
+    px = (lamports / LAMPORTS_PER_SOL) / max(qty_ui, 1e-9)
+    await _tg(
+        f"🔴 SELL FILLED\nToken: {_tok_symbol(mint) or mint[:6]}\n"
+        f"Qty: {qty_ui:,.6f}\nProceeds: {lamports / LAMPORTS_PER_SOL:.6f} SOL\n"
+        f"Price: {px:.9f} SOL\nTx: https://solscan.io/tx/{sig}"
+    )
             return True, sig
         except Exception as e:
             if attempt >= SWAP_RETRIES:
