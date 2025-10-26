@@ -151,14 +151,46 @@ def _tg_plain(msg: str) -> str:
     # safest: remove specials (works regardless of parse_mode)
     return "".join(ch for ch in msg if ch not in _MARKDOWNV2_SPECIALS)
 
+# replace your existing _tg_send with this version
+
 async def _tg_send(msg: str, *, src: str) -> None:
     ok, why = _tg_ready()
     if not ok:
         log.every("tg.skip", n=15, msg="TG_SKIP", why=why, src=src)
         return
+
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": _tg_plain(msg),  # plain text (no parse_mode) to avoid 400s
+        # no parse_mode → safe for any characters
+        "disable_web_page_preview": True,
+    }
+
     try:
-        await _core_send_telegram(_tg_plain(msg))
-        log.every("tg.sent", n=1, msg="TG_SENT_ONCE", src=src)  # n=1 so you see it at least once
+        # use a background thread so we don't block the event loop
+        def _post():
+            return requests.post(url, json=payload, timeout=8)
+
+        resp = await asyncio.to_thread(_post)
+        ok_json = {}
+        try:
+            ok_json = resp.json()
+        except Exception:
+            pass
+
+        if resp.status_code != 200 or not ok_json.get("ok", False):
+            log.event(
+                "TG_SEND_ERROR",
+                src=src,
+                http=resp.status_code,
+                body=str(ok_json)[:200] or (resp.text[:200] if hasattr(resp, "text") else "no-body"),
+            )
+            return
+
+        log.every("tg.sent", n=1, msg="TG_SENT_ONCE", src=src)
     except Exception as e:
         log.event("TG_SEND_ERROR", src=src, err=str(e))
 
