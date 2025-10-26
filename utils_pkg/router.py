@@ -20,6 +20,8 @@ from utils_pkg.solana_wallet import (
     get_pubkey_str,
     sign_and_send_b64_tx,
 )
+# NEW: DRYRUN notifications
+from utils_pkg.core_utils import send_telegram
 
 log = get_logger()
 
@@ -175,8 +177,9 @@ def normalize_pump_id_to_mint(raw: str) -> str:
     return normalize_mint(raw)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Jupiter base URL(s), headers, and multi-endpoint fallback
+# Jupiter base URL(s) & multi-endpoint fallback (NEW order for quotes)
 # ──────────────────────────────────────────────────────────────────────────────
+# Keep existing v6 helpers (_alt_bases, _compose_endpoint, _http_*_with_fallback) for tokens & swap.
 def _alt_bases() -> Sequence[str]:
     """
     Primary from JUP_BASE_URL, fallbacks from JUP_ALT_BASE_URLS (comma-separated).
@@ -218,7 +221,7 @@ def _compose_endpoint(base: str, kind: str) -> tuple[str, bool]:
         return f"{b}{sep}path=/v6/{kind}&mode=RAW", True
     return f"{b}/v6/{kind}", False
 
-def _jup_headers() -> Dict[str, str]:
+def _jup_headers_for(base: str) -> Dict[str, str]:
     h: Dict[str, str] = {
         **_UA,
         "origin": "https://jup.ag",
@@ -229,10 +232,15 @@ def _jup_headers() -> Dict[str, str]:
     if x_api:
         h["x-api-key"] = x_api
         h.setdefault("x-quicknode-mode", "RAW")
-    # Jupiter PRO token
+    # Jupiter PRO API key (for api.jup.ag)
     pro_key = (os.getenv("JUP_PRO_KEY") or "").strip()
-    if pro_key:
-        h["x-jup-auth"] = f"Bearer {pro_key}"
+    if pro_key and ("api.jup.ag" in base or "127.0.0.1" in base or "localhost" in base):
+        # many relays forward x-api-key
+        h["x-api-key"] = pro_key
+    # Jupiter bearer (kept for compatibility)
+    jup_bearer = (os.getenv("JUP_BEARER") or "").strip()
+    if jup_bearer:
+        h["x-jup-auth"] = f"Bearer {jup_bearer}"
     return h
 
 async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) -> dict:
@@ -240,16 +248,16 @@ async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) ->
     Tries each base (primary + fallbacks) for GET /v6/<kind> (or QN /call).
     Returns JSON or raises the last error.
     """
-    headers = _jup_headers()
+    headers = _jup_headers_for(_alt_bases()[0] if _alt_bases() else "")
     last_err: Optional[Exception] = None
     for idx, base in enumerate(_alt_bases()):
         url, is_qn = _compose_endpoint(base, kind)
         try:
             if is_qn:
                 # QN functions prefer POST with params in query string; empty JSON body.
-                r = requests.post(url, json=None, params=params, timeout=timeout, headers=headers)
+                r = requests.post(url, json=None, params=params, timeout=timeout, headers=_jup_headers_for(base))
             else:
-                r = requests.get(url, params=params, timeout=timeout, headers=headers)
+                r = requests.get(url, params=params, timeout=timeout, headers=_jup_headers_for(base))
 
             # Parse JSON first; unwrap envelopes even on non-2xx for better errors
             try:
@@ -278,16 +286,15 @@ async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], para
     Tries each base (primary + fallbacks) for POST /v6/<kind> (or QN /call).
     Used for /swap (and any future POST).
     """
-    headers = _jup_headers()
     last_err: Optional[Exception] = None
     for idx, base in enumerate(_alt_bases()):
         url, is_qn = _compose_endpoint(base, kind)
         try:
             if is_qn:
                 # QN /call: keep params in query string; JSON body goes through as-is.
-                r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=headers)
+                r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=_jup_headers_for(base))
             else:
-                r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=headers)
+                r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=_jup_headers_for(base))
 
             try:
                 js = r.json()
@@ -306,6 +313,54 @@ async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], para
             last_err = e
         await asyncio.sleep(0.05 if idx == 0 else 0.1)
     raise last_err or RuntimeError("all swap endpoints failed")
+
+# NEW: explicit ordered bases just for QUOTES (v1→v6)
+def _quote_bases_order() -> List[tuple[str, str]]:
+    """
+    Returns list of (base, kind) where kind is 'v1' or 'v6' in the required order:
+    RELAY(if set) → PRO(api.jup.ag) → LITE → V6(quote-api.jup.ag)
+    """
+    order: List[tuple[str, str]] = []
+    relay = (os.getenv("JUP_BASE_URL") or "").strip().rstrip("/")
+    if relay:
+        order.append((relay, "v1"))
+    pro  = (os.getenv("JUP_UPSTREAM") or "https://api.jup.ag").strip().rstrip("/")
+    lite = (os.getenv("JUP_LITE")     or "https://lite-api.jup.ag").strip().rstrip("/")
+    v6   = (os.getenv("JUP_LEGACY")   or "https://quote-api.jup.ag").strip().rstrip("/")
+    order.append((pro, "v1"))
+    order.append((lite, "v1"))
+    order.append((v6, "v6"))
+    # dedupe while preserving order
+    seen = set()
+    out: List[tuple[str, str]] = []
+    for b, k in order:
+        if b and (b, k) not in seen:
+            seen.add((b, k))
+            out.append((b, k))
+    return out
+
+async def _http_get_quote_any(*, params_v1: dict, params_v6: dict) -> dict:
+    """
+    Try in strict order:
+      (RELAY v1) → (PRO v1) → (LITE v1) → (V6 legacy)
+    """
+    last_err: Optional[Exception] = None
+    for base, kind in _quote_bases_order():
+        try:
+            await _jup_gate()
+            if kind == "v1":
+                url = f"{base}/swap/v1/quote"
+                r = requests.get(url, params=params_v1, timeout=HTTP_TIMEOUT_GET, headers=_jup_headers_for(base))
+            else:
+                url = f"{base}/v6/quote"
+                r = requests.get(url, params=params_v6, timeout=HTTP_TIMEOUT_GET, headers=_jup_headers_for(base))
+            if r.status_code >= 400:
+                raise RuntimeError(f"{kind}@{base} -> {r.status_code} {r.text[:400]}")
+            return r.json()
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err or RuntimeError("all quote endpoints failed")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # QN/Jupiter envelope unwrapping
@@ -596,7 +651,7 @@ async def _get_signature_status(sig: str) -> Optional[dict]:
     return await asyncio.to_thread(_call)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Priority fee controller
+# Priority fee controller (unchanged)
 # ──────────────────────────────────────────────────────────────────────────────
 def _to_sol_from_lamports_like(x: float) -> float:
     lamports = float(x)
@@ -811,15 +866,25 @@ async def _jup_quote(
             raise RuntimeError("quote blocked by budget")
         try:
             await _jup_gate()
-            params = {
+            # v1 params (string booleans, swapMode required); v6 params (same but no swapMode)
+            params_v1 = {
                 "inputMint": input_mint,
                 "outputMint": output_mint,
                 "amount": str(amount_iu),
                 "slippageBps": sbps,
                 "swapMode": swap_mode,
                 "onlyDirectRoutes": "true" if only_direct else "false",
+                "asLegacyTransaction": "true" if legacy else "false",
             }
-            js = await _http_get_with_fallback("quote", params=params, timeout=HTTP_TIMEOUT_GET)
+            params_v6 = {
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(amount_iu),
+                "slippageBps": sbps,
+                "onlyDirectRoutes": "true" if only_direct else "false",
+                "asLegacyTransaction": "true" if legacy else "false",
+            }
+            js = await _http_get_quote_any(params_v1=params_v1, params_v6=params_v6)
             await _set_cached_quote(key, js, QUOTE_TTL_SEC)
             return js
         finally:
@@ -1035,10 +1100,29 @@ async def buy_via_lightning(
         log.event("ROUTER_BUY_QUOTE_FAIL", mint=mint, err=str(e))
         return False, None
 
+    # NEW: Telegram alerts even in DRYRUN
     if DRY_RUN:
-        out_raw = int(quote.get("outAmount", "0"))
-        dec = await _get_decimals(mint)
-        out_ui = out_raw / (10 ** dec) if (dec is not None and dec >= 0) else 0.0
+        out_raw = int(quote.get("outAmount", "0") or 0)
+        dec = await _get_decimals(mint) or 6
+        out_ui = out_raw / (10 ** dec)
+        size_sol = lamports_in / LAMPORTS_PER_SOL
+        slip_pct = float(slippage_bps if slippage_bps is not None else _slippage_bps()) / 100.0
+        sym = _tok_symbol(mint) or mint[:6]
+        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
+        try:
+            await send_telegram(
+                f"🟢 *BUY SIGNAL* (dry-run)\n"
+                f"Token: {sym}\nMint: `{mint[:12]}...`\n"
+                f"Size: {size_sol:.4f} SOL\nSlippage: {slip_pct:.2f}%\n{ts} UTC"
+            )
+            px = (size_sol / max(out_ui, 1e-9))
+            await send_telegram(
+                f"✅ *BUY FILLED* (dry-run)\n"
+                f"Token: {sym}\nQty: {out_ui:,.6f}\n"
+                f"Price: {px:.9f} SOL\nTx: https://solscan.io/tx/FAKE"
+            )
+        except Exception:
+            pass
         log.event("DRYRUN_BUY", mint=mint, lamports_in=lamports_in, out_ui=out_ui)
         return True, None
 
@@ -1091,9 +1175,23 @@ async def sell_via_lightning(
         log.event("ROUTER_SELL_QUOTE_FAIL", mint=mint, err=str(e))
         return False, None
 
+    # NEW: Telegram alerts even in DRYRUN
     if DRY_RUN:
-        lamports = int(quote.get("outAmount", "0"))
-        log.event("DRYRUN_SELL", mint=mint, amount_raw=amount_raw, out_sol=lamports / LAMPORTS_PER_SOL)
+        lamports = int(quote.get("outAmount", "0") or 0)
+        sol_out = lamports / LAMPORTS_PER_SOL
+        sym = _tok_symbol(mint) or mint[:6]
+        try:
+            await send_telegram(
+                f"📉 *SELL SIGNAL* (dry-run)\n"
+                f"Token: {sym}\nAmount(raw): {amount_raw}\nProceeds: {sol_out:.6f} SOL"
+            )
+            await send_telegram(
+                f"✅ *SELL FILLED* (dry-run)\n"
+                f"Token: {sym}\nRealized: {sol_out:.6f} SOL\nTx: https://solscan.io/tx/FAKE"
+            )
+        except Exception:
+            pass
+        log.event("DRYRUN_SELL", mint=mint, amount_raw=amount_raw, out_sol=sol_out)
         return True, None
 
     t0 = time.time()
