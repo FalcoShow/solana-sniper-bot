@@ -323,7 +323,25 @@ async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) ->
 async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], params: Optional[dict], timeout: float) -> dict:
     last_err: Optional[Exception] = None
     for idx, base in enumerate(_alt_bases()):
-        url, is_qn = _compose_endpoint(base, kind)
+        b = base.rstrip("/")
+        # ── choose correct swap path for each base ─────────────────────────────
+        if kind == "swap":
+            if _is_qn_call_url(b):
+                # QuickNode /call relay passes through v6
+                url = f"{b}?path=/v6/swap&mode=RAW"
+                is_qn = True
+            elif "api.jup.ag" in b:
+                # Jupiter PRO prefers the v1 tx endpoint for swaps
+                url = f"{b}/swap/v1/tx"
+                is_qn = False
+            else:
+                # Legacy quote-api (and most mirrors) support v6
+                url = f"{b}/v6/swap"
+                is_qn = False
+        else:
+            url, is_qn = _compose_endpoint(base, kind)
+        # ──────────────────────────────────────────────────────────────────────
+
         try:
             if is_qn:
                 r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=_jup_headers_for(base))
