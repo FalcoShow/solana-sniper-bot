@@ -21,7 +21,7 @@ from utils_pkg.solana_wallet import (
     sign_and_send_b64_tx,
 )
 
-# Telegram helper (safe import + noisy diagnostics)
+# Telegram helper (safe import)
 try:
     from utils_pkg.core_utils import send_telegram as _core_send_telegram  # async
 except Exception:  # pragma: no cover
@@ -148,7 +148,7 @@ def _tg_ready() -> tuple[bool, str]:
 # Strip characters that explode under MarkdownV2; send plain text
 _MARKDOWNV2_SPECIALS = r"_*[]()~`>#+-=|{}.!\\"
 def _tg_plain(msg: str) -> str:
-    # safest: just remove specials instead of escaping (works with any parse_mode)
+    # safest: remove specials (works regardless of parse_mode)
     return "".join(ch for ch in msg if ch not in _MARKDOWNV2_SPECIALS)
 
 async def _tg_send(msg: str, *, src: str) -> None:
@@ -508,7 +508,7 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
 # Minimal RPC helpers (decimals & sig status)
 # ──────────────────────────────────────────────────────────────────────────────
 _DECIMALS: Dict[str, int] = {}
-_TOK_META: Dict[str, Dict[str, Any]] = _TOK_META if "_TOK_META" in globals() else {}
+_TOK_META: Dict[str, Dict[str, Any]] = {}  # FIX: initialize cleanly
 
 _KNOWN_DECIMALS: Dict[str, int] = {
     SOL_MINT: 9,
@@ -1081,29 +1081,31 @@ async def buy_via_lightning(
         slip_pct = float(slippage_bps if slippage_bps is not None else _slippage_bps()) / 100.0
         sym = _tok_symbol(mint) or mint[:6]
         ts = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
-        # BUY (dry-run)
-await _tg_send(
-    (
-        "BUY SIGNAL (dry-run)\n"
-        f"Token: {sym}\n"
-        f"Mint: {mint}\n"
-        f"Size: {size_sol:.4f} SOL\n"
-        f"Slippage: {slip_pct:.2f}%\n"
-        f"UTC: {ts}"
-    ),
-    src="router.buy.signal",
-)
-px = (size_sol / max(out_ui, 1e-9))
-await _tg_send(
-    (
-        "BUY FILLED (dry-run)\n"
-        f"Token: {sym}\n"
-        f"Qty: {out_ui:,.6f}\n"
-        f"Price: {px:.9f} SOL\n"
-        "Tx: https://solscan.io/tx/FAKE"
-    ),
-    src="router.buy.filled",
-)
+
+        # BUY (dry-run) Telegram pings
+        await _tg_send(
+            (
+                "BUY SIGNAL (dry-run)\n"
+                f"Token: {sym}\n"
+                f"Mint: {mint}\n"
+                f"Size: {size_sol:.4f} SOL\n"
+                f"Slippage: {slip_pct:.2f}%\n"
+                f"UTC: {ts}"
+            ),
+            src="router.buy.signal",
+        )
+        px = (size_sol / max(out_ui, 1e-9))
+        await _tg_send(
+            (
+                "BUY FILLED (dry-run)\n"
+                f"Token: {sym}\n"
+                f"Qty: {out_ui:,.6f}\n"
+                f"Price: {px:.9f} SOL\n"
+                "Tx: https://solscan.io/tx/FAKE"
+            ),
+            src="router.buy.filled",
+        )
+
         log.event("DRYRUN_BUY", mint=mint, lamports_in=lamports_in, out_ui=out_ui)
         return True, None
 
@@ -1156,25 +1158,27 @@ async def sell_via_lightning(
         lamports = int(quote.get("outAmount", "0") or 0)
         sol_out = lamports / LAMPORTS_PER_SOL
         sym = _tok_symbol(mint) or mint[:6]
-        # SELL (dry-run)
-await _tg_send(
-    (
-        "SELL SIGNAL (dry-run)\n"
-        f"Token: {sym}\n"
-        f"Amount raw: {amount_raw}\n"
-        f"Proceeds: {sol_out:.6f} SOL"
-    ),
-    src="router.sell.signal",
-)
-await _tg_send(
-    (
-        "SELL FILLED (dry-run)\n"
-        f"Token: {sym}\n"
-        f"Realized: {sol_out:.6f} SOL\n"
-        "Tx: https://solscan.io/tx/FAKE"
-    ),
-    src="router.sell.filled",
-)
+
+        # SELL (dry-run) Telegram pings
+        await _tg_send(
+            (
+                "SELL SIGNAL (dry-run)\n"
+                f"Token: {sym}\n"
+                f"Amount raw: {amount_raw}\n"
+                f"Proceeds: {sol_out:.6f} SOL"
+            ),
+            src="router.sell.signal",
+        )
+        await _tg_send(
+            (
+                "SELL FILLED (dry-run)\n"
+                f"Token: {sym}\n"
+                f"Realized: {sol_out:.6f} SOL\n"
+                "Tx: https://solscan.io/tx/FAKE"
+            ),
+            src="router.sell.filled",
+        )
+
         log.event("DRYRUN_SELL", mint=mint, amount_raw=amount_raw, out_sol=sol_out)
         return True, None
 
