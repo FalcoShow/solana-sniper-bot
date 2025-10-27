@@ -1004,8 +1004,44 @@ async def _jup_swap(
     return tx_b64
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public quote & price helpers (host-aware, decimals-safe, cache-aware)
+# Public quote & price helpers (hardened)
+# - Never pass None into _jup_quote/_qkey
+# - Clamp/normalize slippage + flags
+# - Consistent output fields for callers/tests/telemetry
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _clamp_slippage_bps(v: Optional[int]) -> int:
+    """Return a sane slippage in bps (1..5000). Falls back to _slippage_bps()."""
+    try:
+        sv = int(v if v is not None else _slippage_bps())
+    except Exception:
+        sv = _slippage_bps()
+    # guard rails; Jupiter generally happy in low hundreds; keep upper cap wide
+    if sv < 1:
+        sv = 1
+    if sv > 5000:
+        sv = 5000
+    return sv
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    """Boolean env reader consistent with the rest of the codebase."""
+    try:
+        return bool(int(_envi(name, "1" if default else "0")))
+    except Exception:
+        return bool(default)
+
+
+async def _safe_decimals(mint: str, fallback: int = 6) -> int:
+    """Get decimals for a mint; never returns None. Falls back to 6 on weird tokens."""
+    try:
+        dec = await _get_decimals(mint)
+        if isinstance(dec, int) and 0 <= dec <= 18:
+            return dec
+    except Exception:
+        pass
+    return fallback
+
 
 async def get_sell_quote(
     *,
@@ -1014,28 +1050,32 @@ async def get_sell_quote(
     slippage_bps: Optional[int] = None,
     only_direct: Optional[bool] = None,
 ) -> Dict[str, Any]:
+    """
+    Quote selling <amount_raw> of <mint> into SOL.
+    Returns Jupiter quote payload plus convenience fields:
+      - amount_in_raw
+      - out_amount_lamports
+      - out_amount_sol
+      - decimals, symbol
+    """
     if not isinstance(amount_raw, int) or amount_raw <= 0:
         raise ValueError("amount_raw must be a positive integer")
 
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
 
-    # ### NEW: normalize flags/bps so _jup_quote/_qkey never see None
-    if slippage_bps is None:
-        slippage_bps = _slippage_bps()
-    if only_direct is None:
-        only_direct = bool(_envint("JUP_ONLY_DIRECT", 0))
+    # Normalize inputs so _jup_quote/_qkey never see None
+    sbps = _clamp_slippage_bps(slippage_bps)
+    direct = only_direct if isinstance(only_direct, bool) else _bool_env("JUP_ONLY_DIRECT", False)
 
     q = await _retry(
         _jup_quote, mint, SOL_MINT, amount_raw,
         tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-sell",
-        slippage_bps=slippage_bps, only_direct=only_direct,
+        slippage_bps=sbps, only_direct=direct,
     )
-    lamports_out = int(q.get("outAmount") or 0)
 
-    dec = await _get_decimals(mint)
-    if not isinstance(dec, int) or dec <= 0 or dec > 18:
-        dec = 6
+    lamports_out = int(q.get("outAmount") or 0)
+    dec = await _safe_decimals(mint)
 
     return {
         **q,
@@ -1055,34 +1095,44 @@ async def get_buy_quote(
     slippage_bps: Optional[int] = None,
     only_direct: Optional[bool] = None,
 ) -> Dict[str, Any]:
+    """
+    Quote buying <mint> using SOL (ExactIn).
+    Accepts lamports_in or amount_sol; if neither provided, uses PF_TRADE_SOL.
+    Returns Jupiter quote payload plus convenience fields:
+      - lamports_in
+      - out_amount_raw, out_amount_ui
+      - decimals, symbol
+    """
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
 
-    # Input size
+    # Determine input size in lamports
     if lamports_in is None and amount_sol is None:
+        # follow existing convention: let PF_TRADE_SOL supply the size
         amount_sol = _envf("PF_TRADE_SOL", 0.0)
-    if lamports_in is None:
-        lamports_in = int(round((amount_sol or 0.0) * LAMPORTS_PER_SOL))
-    if lamports_in <= 0:
-        raise ValueError("Provide a positive lamports_in or amount_sol")
 
-    # ### NEW: normalize flags/bps so _jup_quote/_qkey never see None
-    if slippage_bps is None:
-        slippage_bps = _slippage_bps()
-    if only_direct is None:
-        only_direct = bool(_envint("JUP_ONLY_DIRECT", 0))
+    if lamports_in is None:
+        try:
+            lamports_in = int(round(float(amount_sol or 0.0) * LAMPORTS_PER_SOL))
+        except Exception:
+            lamports_in = 0
+
+    if lamports_in <= 0:
+        raise ValueError("Provide a positive lamports_in or amount_sol > 0")
+
+    # Normalize inputs so _jup_quote/_qkey never see None
+    sbps = _clamp_slippage_bps(slippage_bps)
+    direct = only_direct if isinstance(only_direct, bool) else _bool_env("JUP_ONLY_DIRECT", False)
 
     q = await _retry(
         _jup_quote, SOL_MINT, mint, lamports_in,
         tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-buy",
-        slippage_bps=slippage_bps, only_direct=only_direct,
+        slippage_bps=sbps, only_direct=direct,
     )
 
     out_raw = int(q.get("outAmount") or 0)
-    dec = await _get_decimals(mint)
-    if not isinstance(dec, int) or dec <= 0 or dec > 18:
-        dec = 6
-    out_ui = out_raw / (10 ** dec)
+    dec = await _safe_decimals(mint)
+    out_ui = out_raw / (10 ** dec) if out_raw > 0 else 0.0
 
     return {
         **q,
@@ -1093,6 +1143,7 @@ async def get_buy_quote(
         "symbol": _tok_symbol(mint),
     }
 
+
 # Internal: choose sensible probe sizes for pricing given decimals
 def _price_probe_amounts(dec: int) -> list[int]:
     """
@@ -1100,8 +1151,7 @@ def _price_probe_amounts(dec: int) -> list[int]:
     We try larger -> smaller until we get a stable quote.
     """
     dec = max(0, min(int(dec or 0), 18))
-    # Aim for ~1.0, 0.1, 0.01, 0.001 tokens where representable
-    steps_ui = (1.0, 0.1, 0.01, 0.001)
+    steps_ui = (1.0, 0.1, 0.01, 0.001)  # ~1, 0.1, 0.01, 0.001 tokens
     raw = sorted(
         {int(round(ui * (10 ** dec))) for ui in steps_ui if (ui * (10 ** dec)) >= 1},
         reverse=True,
@@ -1145,10 +1195,7 @@ async def get_price_ui(mint: str) -> float:
             except Exception:
                 pass
 
-    # decimals for normalization; fall back to 6 to avoid 0 UI math
-    dec = await _get_decimals(norm)
-    if not isinstance(dec, int) or dec < 0 or dec > 18:
-        dec = 6
+    dec = await _safe_decimals(norm)
 
     for amt_raw in _price_probe_amounts(dec):
         try:
