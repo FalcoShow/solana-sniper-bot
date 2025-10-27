@@ -19,7 +19,7 @@ from utils_pkg.mints import normalize_mint  # single source of truth
 from utils_pkg.solana_wallet import (
     load_keypair,
     get_pubkey_str,
-    sign_and_send_b64_tx,
+    sign_and_send_b64_tx,   # kept for compatibility; we now wrap with diagnostics
 )
 
 # Telegram helper (safe import)
@@ -84,17 +84,17 @@ HTTP_TIMEOUT_GET  = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
 HTTP_TIMEOUT_POST = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_POST_SEC", 25.0))
 RPC_TIMEOUT_SEC   = max(3.0, _envf("ROUTER_RPC_TIMEOUT_SEC", 10.0))
 
-QUOTE_RETRIES = max(1, _envi("ROUTER_QUOTE_RETRIES", 3))
-SWAP_RETRIES  = max(1, _envi("ROUTER_SWAP_RETRIES", 3))
-RETRY_BACKOFF = max(0.05, _envf("ROUTER_RETRY_BACKOFF_SEC", 0.35))
+QUOTE_RETRIES = max(1, _envi("ROUTER_QUOTE_RETRIES", 6))
+SWAP_RETRIES  = max(1, _envi("ROUTER_SWAP_RETRIES", 9))
+RETRY_BACKOFF = max(0.05, _envf("ROUTER_RETRY_BACKOFF_SEC", 1.2))
 
-JUP_MAX_QPS       = max(1, _envi("JUP_MAX_QPS", 3))
+JUP_MAX_QPS       = max(1, _envi("JUP_MAX_QPS", 2))
 _JUP_MIN_INTERVAL = 1.0 / float(JUP_MAX_QPS)
 _JUP_RATE_LOCK    = asyncio.Lock()
 _JUP_LAST_TS: float = 0.0
 
-QUOTE_TTL_SEC = max(0.0, _envf("ROUTER_QUOTE_TTL_SEC", 10.0))
-PRICE_TTL_SEC = max(0.0, _envf("PF_PRICE_TTL_SEC", 6.0))
+QUOTE_TTL_SEC  = max(0.0, _envf("ROUTER_QUOTE_TTL_SEC", 8.0))
+PRICE_TTL_SEC  = max(0.0, _envf("PF_PRICE_TTL_SEC", 6.0))
 TOKENS_TTL_SEC = max(30.0, _envf("ROUTER_TOKENS_TTL_SEC", 900.0))
 
 _QUOTE_CACHE: Dict[str, Tuple[float, dict]] = {}
@@ -149,10 +149,7 @@ def _tg_ready() -> tuple[bool, str]:
 # Strip characters that explode under MarkdownV2; send plain text
 _MARKDOWNV2_SPECIALS = r"_*[]()~`>#+-=|{}.!\\"
 def _tg_plain(msg: str) -> str:
-    # safest: remove specials (works regardless of parse_mode)
     return "".join(ch for ch in msg if ch not in _MARKDOWNV2_SPECIALS)
-
-# replace your existing _tg_send with this version
 
 async def _tg_send(msg: str, *, src: str) -> None:
     ok, why = _tg_ready()
@@ -165,32 +162,22 @@ async def _tg_send(msg: str, *, src: str) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
-        "text": _tg_plain(msg),  # plain text (no parse_mode) to avoid 400s
-        # no parse_mode → safe for any characters
+        "text": _tg_plain(msg),
         "disable_web_page_preview": True,
     }
 
     try:
-        # use a background thread so we don't block the event loop
         def _post():
             return requests.post(url, json=payload, timeout=8)
-
         resp = await asyncio.to_thread(_post)
         ok_json = {}
-        try:
-            ok_json = resp.json()
-        except Exception:
-            pass
+        try: ok_json = resp.json()
+        except Exception: pass
 
         if resp.status_code != 200 or not ok_json.get("ok", False):
-            log.event(
-                "TG_SEND_ERROR",
-                src=src,
-                http=resp.status_code,
-                body=str(ok_json)[:200] or (resp.text[:200] if hasattr(resp, "text") else "no-body"),
-            )
+            log.event("TG_SEND_ERROR", src=src, http=resp.status_code,
+                      body=str(ok_json)[:200] or (resp.text[:200] if hasattr(resp, "text") else "no-body"))
             return
-
         log.every("tg.sent", n=1, msg="TG_SENT_ONCE", src=src)
     except Exception as e:
         log.event("TG_SEND_ERROR", src=src, err=str(e))
@@ -258,7 +245,6 @@ def _alt_bases() -> Sequence[str]:
             a = a.strip().rstrip("/")
             if a and a not in bases:
                 bases.append(a)
-    # dedupe
     deduped: list[str] = []
     for b in bases:
         if b and b not in deduped:
@@ -286,11 +272,9 @@ def _jup_headers_for(base: str) -> Dict[str, str]:
     if x_api:
         h["x-api-key"] = x_api
         h.setdefault("x-quicknode-mode", "RAW")
-    # Allow PRO (api.jup.ag) via x-api-key if provided
     pro_key = (os.getenv("JUP_PRO_KEY") or "").strip()
     if pro_key and ("api.jup.ag" in base):
         h["x-api-key"] = pro_key
-    # Old bearer (still accepted by some relays)
     jup_bearer = (os.getenv("JUP_BEARER") or "").strip()
     if jup_bearer:
         h["x-jup-auth"] = f"Bearer {jup_bearer}"
@@ -334,10 +318,8 @@ async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], para
 
     def _swap_candidates(base: str) -> list[tuple[str, bool]]:
         b = base.rstrip("/")
-        # QN /call relay: always v6 via path query param
         if _is_qn_call_url(b):
             return [(f"{b}?path=/v6/swap&mode=RAW", True)]
-        # Try the modern v6 first, then the two v1 variants
         return [
             (f"{b}/v6/swap", False),
             (f"{b}/swap/v1/swap", False),
@@ -351,9 +333,8 @@ async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], para
         else:
             try_paths = [_compose_endpoint(base, kind)]
 
-        for pidx, (url, is_qn) in enumerate(try_paths):
+        for _pidx, (url, _is_qn) in enumerate(try_paths):
             try:
-                # Optional: one-time visibility (won’t spam because n=1)
                 try:
                     log.every("swap.try", n=1, msg="SWAP_TRY", url=url)
                 except Exception:
@@ -366,8 +347,6 @@ async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], para
                     timeout=timeout,
                     headers=_jup_headers_for(base),
                 )
-
-                # If JSON parse fails but HTTP is not OK, raise to try next path
                 try:
                     js = r.json()
                 except Exception:
@@ -379,7 +358,6 @@ async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], para
                 if r.status_code in (200, 201):
                     return js
 
-                # Non-OK: try next candidate path (or next base)
                 last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
 
             except RequestException as e:
@@ -387,10 +365,8 @@ async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], para
             except Exception as e:
                 last_err = e
 
-            # small stagger between path probes under same base
             await asyncio.sleep(0.03)
 
-        # small stagger between bases
         await asyncio.sleep(0.08 if bidx == 0 else 0.12)
 
     raise last_err or RuntimeError("all swap endpoints failed")
@@ -405,7 +381,6 @@ def _quote_bases_order() -> List[tuple[str, str]]:
     lite = (os.getenv("JUP_LITE")     or "https://lite-api.jup.ag").strip().rstrip("/")
     v6   = (os.getenv("JUP_LEGACY")   or "https://quote-api.jup.ag").strip().rstrip("/")
     out += [(pro, "v1"), (lite, "v1"), (v6, "v6")]
-    # de-dupe preserve order
     seen = set()
     final: List[tuple[str, str]] = []
     for b, k in out:
@@ -587,14 +562,14 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
     raise last_err if last_err else RuntimeError(f"{label} failed")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Minimal RPC helpers (decimals & sig status)
+# Minimal RPC helpers (decimals & sig status) + robust sender with diagnostics
 # ──────────────────────────────────────────────────────────────────────────────
 _DECIMALS: Dict[str, int] = {}
-_TOK_META: Dict[str, Dict[str, Any]] = {}  # FIX: initialize cleanly
+_TOK_META: Dict[str, Dict[str, Any]] = {}
 
 _KNOWN_DECIMALS: Dict[str, int] = {
     SOL_MINT: 9,
-    "EPjFWdd5AufqSSqeMzQ1NzxypaC8G4weEGKzwyTDt1v": 6,  # USDC classic
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": 6,  # USDC
     "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": 6,  # USDC (CCTP)
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": 6,  # USDT
 }
@@ -614,6 +589,82 @@ def _rpc_post(method: str, params: list) -> dict:
             budget.after_rpc(method)
         except Exception:
             pass
+
+async def _send_b64_with_diag(tx_b64: str, *, skip_preflight: bool = True) -> str:
+    """
+    Sends base64 tx via RPC. On error, runs simulateTransaction with logs and
+    raises a descriptive RuntimeError that includes the RPC err and program logs.
+    """
+    rpc = os.getenv("TX_RPC_URL") or os.getenv("RPC_URL") or TX_RPC_URL
+    if not rpc:
+        raise RuntimeError("RPC_URL/TX_RPC_URL not set")
+
+    send_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            tx_b64,
+            {
+                "encoding": "base64",
+                "skipPreflight": bool(skip_preflight),
+                "preflightCommitment": "confirmed",
+            },
+        ],
+    }
+    async with asyncio.timeout(25):
+        async def _post(j):
+            return requests.post(rpc, json=j, timeout=20, headers=_UA)
+        r = await asyncio.to_thread(_post, send_payload)
+
+    jr: Dict[str, Any]
+    try:
+        jr = r.json()
+    except Exception:
+        jr = {"error": {"message": f"Non-JSON response: {r.text[:1200]}"}}
+
+    if "result" in jr and isinstance(jr["result"], str):
+        return jr["result"]
+
+    # simulate for logs
+    sim_payload = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "simulateTransaction",
+        "params": [tx_b64, {"encoding": "base64", "sigVerify": True}],
+    }
+    try:
+        simr = await asyncio.to_thread(requests.post, rpc, None, sim_payload, 20, _UA)  # type: ignore
+    except TypeError:
+        # requests.post signature helper for readability above
+        simr = await asyncio.to_thread(
+            requests.post, rpc, json=sim_payload, timeout=20, headers=_UA
+        )
+    sim_body = {}
+    try:
+        sim_body = simr.json()
+    except Exception:
+        pass
+
+    err_msg = None
+    logs = None
+    if isinstance(jr.get("error"), dict):
+        err_msg = jr["error"].get("message") or json.dumps(jr["error"])[:500]
+    if isinstance(sim_body.get("result"), dict):
+        val = sim_body["result"].get("value") or {}
+        if "err" in val and val["err"] is not None:
+            err_msg = f"{err_msg or ''} | sim.err={val['err']}"
+        logs = val.get("logs")
+
+    try:
+        log.event("RPC_SEND_FAIL",
+                  http_status=r.status_code,
+                  err=err_msg or "unknown",
+                  sim_logs="\n".join(logs or [])[:1800])
+    except Exception:
+        pass
+
+    raise RuntimeError(err_msg or "sendTransaction failed; see sim logs")
 
 def _mint_decimals_from_data(b: bytes) -> Optional[int]:
     try:
@@ -766,11 +817,11 @@ class DynPriority:
     def __init__(self) -> None:
         base = _envf("PF_PRIORITY_SOL", 0.0015)
         self.enabled        = _envb("PF_PRIORITY_DYNAMIC", True)
-        self.target_sec     = _envf("PF_PRIORITY_TARGET_SEC", 1.2)
-        self.step_up        = _envf("PF_PRIORITY_STEP_UP", 1.50)
-        self.step_down      = _envf("PF_PRIORITY_STEP_DOWN", 0.85)
+        self.target_sec     = _envf("PF_PRIORITY_TARGET_SEC", 0.6)
+        self.step_up        = _envf("PF_PRIORITY_STEP_UP", 1.6)
+        self.step_down      = _envf("PF_PRIORITY_STEP_DOWN", 0.8)
         self.min_sol        = _envf("PF_PRIORITY_MIN_SOL", max(0.0, base * 0.5))
-        self.max_sol        = _envf("PF_PRIORITY_MAX_SOL", max(self.min_sol, 0.04))
+        self.max_sol        = _envf("PF_PRIORITY_MAX_SOL", max(self.min_sol, 0.12))
         self.current_sol    = max(self.min_sol, min(self.max_sol, base))
         self._pending: Dict[str, float] = {}
         self._seed_task: Optional[asyncio.Task[None]] = None
@@ -819,7 +870,7 @@ class DynPriority:
 
     async def _watch(self, sig: str) -> None:
         deadline = time.time() + 45
-        poll = max(0.2, _envf("PF_STATUS_POLL_SEC", 0.6))
+        poll = max(0.2, _envf("PF_STATUS_POLL_SEC", 0.7))
         while time.time() < deadline:
             try:
                 st = await _get_signature_status(sig)
@@ -862,7 +913,6 @@ async def shutdown() -> None:
 # Low-level Jupiter helpers (with fallback)
 # ──────────────────────────────────────────────────────────────────────────────
 def _bool01(x: Optional[bool]) -> int:
-    """Return 1 for truthy, else 0. None becomes 0."""
     return 1 if bool(x) else 0
 
 def _slippage_bps() -> int:
@@ -872,7 +922,7 @@ def _slippage_bps() -> int:
             return max(1, int(v))
         except Exception:
             pass
-    s = _envf("JUPITER_MAX_SLIPPAGE", 0.006)  # fraction -> default 0.6%
+    s = _envf("JUPITER_MAX_SLIPPAGE", 0.006)  # fraction → default 0.6%
     return max(1, int(round(s * 10_000)))
 
 def _as_legacy() -> bool:
@@ -887,7 +937,6 @@ def _qkey(
     direct: Optional[bool],
     legacy: Optional[bool],
 ) -> str:
-    # Normalize potentially None values so the key is always stable
     sbps = "" if slippage_bps is None else str(slippage_bps)
     d = _bool01(direct)
     l = _bool01(legacy)
@@ -948,7 +997,6 @@ async def _jup_quote(
             raise RuntimeError("quote blocked by budget")
         try:
             await _jup_gate()
-            # v1 params use string booleans + swapMode=ExactIn; v6 similar minus swapMode
             params_v1 = {
                 "inputMint": input_mint,
                 "outputMint": output_mint,
@@ -1005,35 +1053,29 @@ async def _jup_swap(
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public quote & price helpers (hardened)
-# - Never pass None into _jup_quote/_qkey
-# - Clamp/normalize slippage + flags
-# - Consistent output fields for callers/tests/telemetry
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _clamp_slippage_bps(v: Optional[int]) -> int:
-    """Return a sane slippage in bps (1..5000). Falls back to _slippage_bps()."""
     try:
         sv = int(v if v is not None else _slippage_bps())
     except Exception:
         sv = _slippage_bps()
-    # guard rails; Jupiter generally happy in low hundreds; keep upper cap wide
-    if sv < 1:
-        sv = 1
-    if sv > 5000:
-        sv = 5000
+    if sv < 1: sv = 1
+    if sv > 5000: sv = 5000
     return sv
 
-
 def _bool_env(name: str, default: bool = False) -> bool:
-    """Boolean env reader consistent with the rest of the codebase."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    s = raw.strip().lower()
+    if s in {"1","true","yes","y","on"}:  return True
+    if s in {"0","false","no","n","off"}: return False
     try:
-        return bool(int(_envi(name, "1" if default else "0")))
+        return bool(int(s))
     except Exception:
-        return bool(default)
-
+        return default
 
 async def _safe_decimals(mint: str, fallback: int = 6) -> int:
-    """Get decimals for a mint; never returns None. Falls back to 6 on weird tokens."""
     try:
         dec = await _get_decimals(mint)
         if isinstance(dec, int) and 0 <= dec <= 18:
@@ -1042,7 +1084,6 @@ async def _safe_decimals(mint: str, fallback: int = 6) -> int:
         pass
     return fallback
 
-
 async def get_sell_quote(
     *,
     mint: str,
@@ -1050,21 +1091,12 @@ async def get_sell_quote(
     slippage_bps: Optional[int] = None,
     only_direct: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """
-    Quote selling <amount_raw> of <mint> into SOL.
-    Returns Jupiter quote payload plus convenience fields:
-      - amount_in_raw
-      - out_amount_lamports
-      - out_amount_sol
-      - decimals, symbol
-    """
     if not isinstance(amount_raw, int) or amount_raw <= 0:
         raise ValueError("amount_raw must be a positive integer")
 
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
 
-    # Normalize inputs so _jup_quote/_qkey never see None
     sbps = _clamp_slippage_bps(slippage_bps)
     direct = only_direct if isinstance(only_direct, bool) else _bool_env("JUP_ONLY_DIRECT", False)
 
@@ -1073,7 +1105,6 @@ async def get_sell_quote(
         tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-sell",
         slippage_bps=sbps, only_direct=direct,
     )
-
     lamports_out = int(q.get("outAmount") or 0)
     dec = await _safe_decimals(mint)
 
@@ -1086,7 +1117,6 @@ async def get_sell_quote(
         "symbol": _tok_symbol(mint),
     }
 
-
 async def get_buy_quote(
     *,
     mint: str,
@@ -1095,20 +1125,10 @@ async def get_buy_quote(
     slippage_bps: Optional[int] = None,
     only_direct: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """
-    Quote buying <mint> using SOL (ExactIn).
-    Accepts lamports_in or amount_sol; if neither provided, uses PF_TRADE_SOL.
-    Returns Jupiter quote payload plus convenience fields:
-      - lamports_in
-      - out_amount_raw, out_amount_ui
-      - decimals, symbol
-    """
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
 
-    # Determine input size in lamports
     if lamports_in is None and amount_sol is None:
-        # follow existing convention: let PF_TRADE_SOL supply the size
         amount_sol = _envf("PF_TRADE_SOL", 0.0)
 
     if lamports_in is None:
@@ -1120,7 +1140,6 @@ async def get_buy_quote(
     if lamports_in <= 0:
         raise ValueError("Provide a positive lamports_in or amount_sol > 0")
 
-    # Normalize inputs so _jup_quote/_qkey never see None
     sbps = _clamp_slippage_bps(slippage_bps)
     direct = only_direct if isinstance(only_direct, bool) else _bool_env("JUP_ONLY_DIRECT", False)
 
@@ -1143,28 +1162,17 @@ async def get_buy_quote(
         "symbol": _tok_symbol(mint),
     }
 
-
 # Internal: choose sensible probe sizes for pricing given decimals
 def _price_probe_amounts(dec: int) -> list[int]:
-    """
-    Produce descending raw token amounts for price probing.
-    We try larger -> smaller until we get a stable quote.
-    """
     dec = max(0, min(int(dec or 0), 18))
-    steps_ui = (1.0, 0.1, 0.01, 0.001)  # ~1, 0.1, 0.01, 0.001 tokens
+    steps_ui = (1.0, 0.1, 0.01, 0.001)
     raw = sorted(
         {int(round(ui * (10 ** dec))) for ui in steps_ui if (ui * (10 ** dec)) >= 1},
         reverse=True,
     )
     return raw or [1]
 
-
 async def get_price_ui(mint: str) -> float:
-    """
-    Best-effort price of 1 token in SOL (ExactIn mint->SOL, normalized per 1 token).
-    Caches successful results for PRICE_TTL_SEC.
-    """
-    # SOL is 1.0 by definition
     try:
         if normalize_mint(mint) == SOL_MINT:
             return 1.0
@@ -1175,7 +1183,6 @@ async def get_price_ui(mint: str) -> float:
     if not raw:
         return 0.0
 
-    # simple blacklist (avoid hammering bad ids)
     if _bl_get(raw):
         return 0.0
 
@@ -1186,7 +1193,6 @@ async def get_price_ui(mint: str) -> float:
         log.every("price.bad", n=20, msg="PRICE_BAD_ID", raw=raw)
         return 0.0
 
-    # cache hit
     if PRICE_TTL_SEC > 0:
         rec = _PRICE_CACHE.get(norm)
         if rec and rec[0] >= time.time():
@@ -1215,12 +1221,10 @@ async def get_price_ui(mint: str) -> float:
                     _PRICE_CACHE[norm] = (time.time() + PRICE_TTL_SEC, px)
                 return px
         except Exception:
-            # try next, smaller probe
             continue
 
     _bl_set(raw)
     return 0.0
-
 
 # Compat aliases
 async def price_of_ui(mint: str) -> float:
@@ -1238,16 +1242,13 @@ async def mint_decimals(mint: str) -> Optional[int]:
 # Telegram helpers (never raise)
 # ──────────────────────────────────────────────────────────────────────────────
 async def _send_safe(msg: str, *, src: str) -> None:
-    """Fire-and-forget Telegram send that never bubbles errors."""
     try:
         await _tg_send(msg, src=src)
     except Exception:
-        # Log locally but do not break trading flow.
         try:
             log.event("TG_SEND_FAIL", src=src)
         except Exception:
             pass
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Small utilities
@@ -1256,17 +1257,12 @@ def _fmt_sym(mint: str) -> str:
     return _tok_symbol(mint) or mint[:6]
 
 def _slip_pct(slippage_bps: Optional[int]) -> float:
-    """
-    Convert slippage BPS → percent with sane clamping.
-    If None, pull from env via _slippage_bps().
-    """
     try:
         sbps = slippage_bps if slippage_bps is not None else _slippage_bps()
-        sbps = max(0, min(int(sbps), 5000))  # clamp 0%..50%
+        sbps = max(0, min(int(sbps), 5000))
         return float(sbps) / 100.0
     except Exception:
         return 0.0
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Swaps (public) — return (ok, signature|None)
@@ -1280,9 +1276,8 @@ async def buy_via_lightning(
     priority_sol: Optional[float] = None,
     compute_units: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
-    """Buy `mint` using SOL. If DRY_RUN is set, only simulate + notify."""
 
-    # Validate / normalize mint up-front and report nicely if bad
+    # Validate mint
     try:
         mint = _sanitize_mint(mint)
         _assert_pubkey(mint, "mint")
@@ -1290,11 +1285,10 @@ async def buy_via_lightning(
         await _send_safe(f"BUY ERROR (mint)\nMint: {mint}\nErr: {str(e)[:180]}", src="router.buy.error.mint")
         return False, None
 
-    # Wallet / owner
     kp = load_keypair()
     owner = get_pubkey_str(kp)
 
-    # Funding amount (lamports)
+    # Funding
     if lamports_in is None:
         if amount_sol is None:
             amount_sol = _envf("PF_TRADE_SOL", 0.0)
@@ -1303,19 +1297,21 @@ async def buy_via_lightning(
         await _send_safe(f"BUY ERROR (size)\nMint: {mint}\nErr: zero-size trade", src="router.buy.error.size")
         return False, None
 
-    # Get quote
+    # Quote
     try:
+        sbps = _clamp_slippage_bps(slippage_bps)
+        direct = _bool_env("JUP_ONLY_DIRECT", False)
         quote = await _retry(
             _jup_quote, SOL_MINT, mint, lamports_in,
             tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-buy",
-            slippage_bps=slippage_bps,
+            slippage_bps=sbps, only_direct=direct,
         )
     except Exception as e:
         log.event("ROUTER_BUY_QUOTE_FAIL", mint=mint, err=str(e))
         await _send_safe(f"BUY ERROR (quote)\nMint: {mint}\nErr: {str(e)[:180]}", src="router.buy.error.quote")
         return False, None
 
-    # Shared fields for notifications / pricing
+    # Fields for notifications
     try:
         out_raw = int(quote.get("outAmount", "0") or 0)
     except Exception:
@@ -1327,7 +1323,7 @@ async def buy_via_lightning(
     sym = _fmt_sym(mint)
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
-    # DRY-RUN path
+    # DRY-RUN
     if DRY_RUN:
         await _send_safe(
             "BUY SIGNAL (dry-run)\n"
@@ -1345,7 +1341,7 @@ async def buy_via_lightning(
         log.event("DRYRUN_BUY", mint=mint, lamports_in=lamports_in, out_ui=out_ui)
         return True, None
 
-    # LIVE: pre-trade “signal”
+    # LIVE signal
     await _send_safe(
         "BUY SIGNAL\n"
         f"Token: {sym}\nMint: {mint}\n"
@@ -1353,7 +1349,7 @@ async def buy_via_lightning(
         src="router.buy.signal.live",
     )
 
-    # Perform swap with retries + adaptive priority
+    # Swap with retries (diagnostic sender)
     t0 = time.time()
     for attempt in range(1, SWAP_RETRIES + 1):
         try:
@@ -1361,10 +1357,15 @@ async def buy_via_lightning(
             tx_b64 = await _jup_swap(
                 owner, quote, priority_lamports=prio, compute_units=compute_units
             )
-            sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
+            # Use robust sender with auto-sim logs:
+            try:
+                sig = await _send_b64_with_diag(tx_b64, skip_preflight=True)
+            except Exception:
+                # Compatibility fallback if RPC forbids log-sim during load
+                sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
+
             _PRIO.observe(sig, t0)
 
-            # Live filled note
             px = (lamports_in / LAMPORTS_PER_SOL) / max(out_ui, 1e-9)
             await _send_safe(
                 "BUY FILLED\n"
@@ -1382,10 +1383,8 @@ async def buy_via_lightning(
                     src="router.buy.error.live",
                 )
                 return False, None
-            # backoff + increase priority target a bit after failure
             _PRIO._tune(_PRIO.target_sec * 1.6, had_error=True)
             await asyncio.sleep(RETRY_BACKOFF * max(1, attempt))
-
 
 async def sell_via_lightning(
     *,
@@ -1396,10 +1395,8 @@ async def sell_via_lightning(
     priority_sol: Optional[float] = None,
     compute_units: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
-    """Sell `amount_raw` of `mint` for SOL. If DRY_RUN is set, only simulate + notify."""
     del token_program  # Jupiter infers it
 
-    # Validate / normalize mint up-front
     try:
         mint = _sanitize_mint(mint)
         _assert_pubkey(mint, "mint")
@@ -1411,16 +1408,16 @@ async def sell_via_lightning(
         await _send_safe(f"SELL ERROR (size)\nMint: {mint}\nErr: zero-size trade", src="router.sell.error.size")
         return False, None
 
-    # Wallet / owner
     kp = load_keypair()
     owner = get_pubkey_str(kp)
 
-    # Quote
     try:
+        sbps = _clamp_slippage_bps(slippage_bps)
+        direct = _bool_env("JUP_ONLY_DIRECT", False)
         quote = await _retry(
             _jup_quote, mint, SOL_MINT, amount_raw,
             tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-sell",
-            slippage_bps=slippage_bps,
+            slippage_bps=sbps, only_direct=direct,
         )
     except Exception as e:
         log.event("ROUTER_SELL_QUOTE_FAIL", mint=mint, err=str(e))
@@ -1433,7 +1430,6 @@ async def sell_via_lightning(
     slip_pct = _slip_pct(slippage_bps)
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
-    # DRY-RUN
     if DRY_RUN:
         await _send_safe(
             "SELL SIGNAL (dry-run)\n"
@@ -1450,7 +1446,6 @@ async def sell_via_lightning(
         log.event("DRYRUN_SELL", mint=mint, amount_raw=amount_raw, out_sol=sol_out)
         return True, None
 
-    # LIVE: pre-trade “signal”
     await _send_safe(
         "SELL SIGNAL\n"
         f"Token: {sym}\nAmount raw: {amount_raw}\n"
@@ -1458,7 +1453,6 @@ async def sell_via_lightning(
         src="router.sell.signal.live",
     )
 
-    # Swap with retries
     t0 = time.time()
     for attempt in range(1, SWAP_RETRIES + 1):
         try:
@@ -1466,7 +1460,11 @@ async def sell_via_lightning(
             tx_b64 = await _jup_swap(
                 owner, quote, priority_lamports=prio, compute_units=compute_units
             )
-            sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
+            try:
+                sig = await _send_b64_with_diag(tx_b64, skip_preflight=True)
+            except Exception:
+                sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
+
             _PRIO.observe(sig, t0)
 
             await _send_safe(
