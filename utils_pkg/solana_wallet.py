@@ -43,24 +43,45 @@ from solders.signature import Signature
 from solders.pubkey import Pubkey
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Small helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _sanitize_url(u: Optional[str]) -> str:
+    """
+    Treat literal placeholders like ${RPC_URL} as unset.
+    Return a trimmed string or empty string.
+    """
+    s = (u or "").strip()
+    if s.startswith("${") and s.endswith("}"):
+        return ""
+    return s
+
+_UA = {
+    "user-agent": "pnlsniper/1.0 (+wallet)",
+    "accept": "application/json",
+    "content-type": "application/json",
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # RPC endpoints & knobs
 # ──────────────────────────────────────────────────────────────────────────────
-# Primary TX RPC (do NOT use ${RPC_URL} literal inside others)
+# Primary TX RPC (prefer explicit TX var; fall back to generic; avoid ${...})
 _SEND_RPC_URL = (
-    os.getenv("TX_RPC_URL")
-    or os.getenv("SOL_RPC_TX_URL")
-    or os.getenv("SOL_RPC_URL")
-    or os.getenv("SOLANA_RPC_URL")
+    _sanitize_url(os.getenv("TX_RPC_URL"))
+    or _sanitize_url(os.getenv("SOL_RPC_TX_URL"))
+    or _sanitize_url(os.getenv("SOL_RPC_URL"))
+    or _sanitize_url(os.getenv("SOLANA_RPC_URL"))
     or "https://api.mainnet-beta.solana.com"
-).strip()
-RPC_URL = _SEND_RPC_URL  # public alias
+)
 
-# read RPC for balance (prefer SOL_RPC_URL)
+# Public alias used elsewhere
+RPC_URL = _SEND_RPC_URL
+
+# Read RPC for balance (prefer read endpoint, fall back to TX)
 _READ_RPC_URL = (
-    os.getenv("SOL_RPC_URL")
-    or os.getenv("SOLANA_RPC_URL")
+    _sanitize_url(os.getenv("SOL_RPC_URL"))
+    or _sanitize_url(os.getenv("SOLANA_RPC_URL"))
     or _SEND_RPC_URL
-).strip()
+)
 
 _RPC_TIMEOUT_SEC = float(os.getenv("ROUTER_RPC_TIMEOUT_SEC", "10") or 10.0)
 
@@ -71,11 +92,8 @@ _TX_COMMITMENT_RAW = (
     or "confirmed"
 ).strip()
 
-_UA = {"user-agent": "pnlsniper/1.0 (+wallet)", "accept": "application/json"}
-
 # cached keypair
 _KP: Optional[Keypair] = None
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Commitment normalization
@@ -91,15 +109,14 @@ def _norm_commitment(c: object) -> Commitment:
     mapping = {"processed": Processed, "confirmed": Confirmed, "finalized": Finalized, "finalised": Finalized}
     return mapping.get(s, Confirmed)
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Keypair loading (many sources)
 # ──────────────────────────────────────────────────────────────────────────────
 def _load_keypair_from_env_or_file() -> Keypair:
     """
     Load a keypair from:
-      - WALLET_PRIVKEY_B58              : base58-encoded 64-byte secret (secret||pub)
-      - WALLET_PRIVKEY_JSON             : JSON array of 64 ints
+      - WALLET_PRIVKEY_B58                       : base58-encoded 64-byte secret (secret||pub)
+      - WALLET_PRIVKEY_JSON                      : JSON array of 64 ints
       - WALLET_KEYPAIR_JSON / KEYPAIR_JSON / WALLET_JSON : JSON array of 64 ints
       - WALLET_PRIVATE_KEY / WALLET_KEYPAIR_PATH / KEYPAIR_PATH : path to JSON array (64 ints)
       - default ~/.config/solana/id.json
@@ -136,7 +153,6 @@ def _load_keypair_from_env_or_file() -> Keypair:
         raise RuntimeError(f"Keypair at {path} must contain a JSON array of 64 bytes")
     return Keypair.from_bytes(sk_bytes)
 
-
 def load_keypair() -> Keypair:
     """Return the cached trading keypair (lazy-loaded)."""
     global _KP
@@ -144,17 +160,14 @@ def load_keypair() -> Keypair:
         _KP = _load_keypair_from_env_or_file()
     return _KP
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Pubkey helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def get_pubkey(kp: Keypair) -> Pubkey:
     return kp.pubkey()
 
-
 def get_pubkey_str(kp: Keypair) -> str:
     return str(kp.pubkey())
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Balance helper (used by autosizer)
@@ -189,7 +202,6 @@ async def get_balance_sol(owner: Optional[str] = None) -> float:
     except Exception:
         return 0.0
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Legacy tx helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -199,7 +211,6 @@ def _is_legacy_tx_bytes(raw: bytes) -> bool:
     Versioned (v0) sets MSB=1 in first byte (versioned prefix).
     """
     return (raw[0] & 0x80) == 0
-
 
 def _read_shortvec(data: bytes, offset: int = 0) -> Tuple[int, int]:
     """Decode Solana shortvec at data[offset:]. Returns (value, next_index)."""
@@ -215,7 +226,6 @@ def _read_shortvec(data: bytes, offset: int = 0) -> Tuple[int, int]:
         shift += 7
     return value, i
 
-
 def _encode_shortvec(n: int) -> bytes:
     """Encode an integer to Solana shortvec bytes."""
     out = bytearray()
@@ -229,7 +239,6 @@ def _encode_shortvec(n: int) -> bytes:
             break
     return bytes(out)
 
-
 def _unwrap_send_resp(resp: Any) -> str:
     """
     Normalize solana-py's send_raw_transaction response to a base58 signature string.
@@ -238,15 +247,12 @@ def _unwrap_send_resp(resp: Any) -> str:
     # 1) Already a string
     if isinstance(resp, str):
         return resp
-
-    # 2) Newer solana-py typed responses (SendTransactionResp)
+    # 2) Newer solana-py typed responses (SendTransactionResp-like)
     if hasattr(resp, "value"):
         try:
-            v = getattr(resp, "value")
-            return str(v)
+            return str(getattr(resp, "value"))
         except Exception:
             pass
-
     # 3) Dict-ish RPC responses
     if isinstance(resp, dict):
         if isinstance(resp.get("result"), str):
@@ -256,21 +262,18 @@ def _unwrap_send_resp(resp: Any) -> str:
             return str(r["value"])
         if resp.get("value"):
             return str(resp["value"])
-
     # Fallback
     return str(resp)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Low-level RPC helper (used by diagnostics)
 # ──────────────────────────────────────────────────────────────────────────────
 def _rpc_post(method: str, params: list, *, url: Optional[str] = None) -> Dict[str, Any]:
-    u = (url or _SEND_RPC_URL).strip()
+    u = _sanitize_url(url) or _SEND_RPC_URL
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     r = requests.post(u, json=payload, timeout=_RPC_TIMEOUT_SEC, headers=_UA)
     r.raise_for_status()
     return r.json()
-
 
 async def _send_b64_with_diag(tx_b64: str, *, skip_preflight: bool = True) -> str:
     """
@@ -280,7 +283,6 @@ async def _send_b64_with_diag(tx_b64: str, *, skip_preflight: bool = True) -> st
     kp = load_keypair()
     sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=skip_preflight)
     return sig
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Signing & sending Jupiter swap transactions (LEGACY ONLY)
@@ -361,7 +363,6 @@ async def sign_and_send_b64_tx(
             raise RuntimeError(msg)
         except Exception as e2:
             raise RuntimeError(f"send_raw_transaction failed: {e!r}; simulate secondary error: {e2!r}") from e
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public API
