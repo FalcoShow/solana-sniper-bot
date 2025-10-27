@@ -179,7 +179,7 @@ async def get_balance_sol(owner: Optional[str] = None) -> float:
                 "method": "getBalance",
                 "params": [owner, {"commitment": _TX_COMMITMENT_RAW}],
             }
-            r = requests.post(url, json=payload, timeout=_RPC_TIMEOUT_SEC, headers=_U A)
+            r = requests.post(url, json=payload, timeout=_RPC_TIMEOUT_SEC, headers=_UA)
             r.raise_for_status()
             js = r.json()
             lamports = int((js.get("result") or {}).get("value", 0))
@@ -262,7 +262,7 @@ def _unwrap_send_resp(resp: Any) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Low-level RPC helpers for diagnostics
+# Low-level RPC helper (used by diagnostics)
 # ──────────────────────────────────────────────────────────────────────────────
 def _rpc_post(method: str, params: list, *, url: Optional[str] = None) -> Dict[str, Any]:
     u = (url or _SEND_RPC_URL).strip()
@@ -353,7 +353,6 @@ async def sign_and_send_b64_tx(
                 "simulateTransaction",
                 [tx_b64, {"encoding": "base64", "sigVerify": True, "commitment": _TX_COMMITMENT_RAW}],
             )
-            # Extract anything useful
             res = sim.get("result") or {}
             err = res.get("err")
             logs = res.get("logs")
