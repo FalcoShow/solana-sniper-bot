@@ -78,7 +78,8 @@ LAMPORTS_PER_SOL = 1_000_000_000
 # ──────────────────────────────────────────────────────────────────────────────
 # Feature toggles / HTTP knobs
 # ──────────────────────────────────────────────────────────────────────────────
-DRY_RUN = _envb("DRYRUN", False) or _envb("IS_DRYRUN", False) or _envb("DRY_RUN", False)
+DRY_RUN = os.getenv("DRYRUN") or os.getenv("DRY_RUN") or os.getenv("IS_DRYRUN")
+DRY_RUN = DRY_RUN not in (None, "", "0", "false", "False")
 
 HTTP_TIMEOUT_GET  = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
 HTTP_TIMEOUT_POST = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_POST_SEC", 25.0))
@@ -1262,7 +1263,7 @@ async def buy_via_lightning(
             "Tx: https://solscan.io/tx/FAKE",
             src="router.buy.filled.dry",
         )
-        log.event("DRYRUN_BUY", mint=mint, lamports_in=lamports_in, out_ui=out_ui)
+        log.info("DRYRUN_BUY", extra={"mint": mint, "lamports_in": lamports_in, "out_ui": out_ui})
         return True, None
 
     # LIVE signal
