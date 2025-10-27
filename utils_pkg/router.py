@@ -612,6 +612,72 @@ async def _send_b64_with_diag(tx_b64: str, *, skip_preflight: bool = True) -> st
             },
         ],
     }
+
+    # ---- sendTransaction (in thread) ----
+    def _post_send():
+        return requests.post(rpc, json=send_payload, timeout=20, headers=_UA)
+
+    r = await asyncio.to_thread(_post_send)
+
+    try:
+        jr: Dict[str, Any] = r.json()
+    except Exception:
+        jr = {"error": {"message": f"Non-JSON response: {r.text[:1200]}"}}
+
+    # Success path
+    if isinstance(jr.get("result"), str):
+        return jr["result"]
+
+    # ---- simulateTransaction for diagnostics ----
+    sim_payload = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "simulateTransaction",
+        "params": [
+            tx_b64,
+            {
+                "encoding": "base64",
+                # NOTE: do NOT set replaceRecentBlockhash with sigVerify on some RPCs
+                "sigVerify": True,
+                "commitment": "processed",
+            },
+        ],
+    }
+
+    def _post_sim():
+        return requests.post(rpc, json=sim_payload, timeout=20, headers=_UA)
+
+    simr = await asyncio.to_thread(_post_sim)
+
+    sim_body: Dict[str, Any] = {}
+    try:
+        sim_body = simr.json()
+    except Exception:
+        pass
+
+    err_msg = None
+    if isinstance(jr.get("error"), dict):
+        err_msg = jr["error"].get("message") or json.dumps(jr["error"])[:500]
+
+    logs = []
+    val = (sim_body.get("result") or {}).get("value") or {}
+    if "err" in val and val["err"] is not None:
+        err_msg = f"{err_msg or ''} | sim.err={val['err']}"
+    if isinstance(val.get("logs"), list):
+        logs = val["logs"]
+
+    try:
+        log.event(
+            "RPC_SEND_FAIL",
+            http_status=r.status_code,
+            err=err_msg or "unknown",
+            sim_logs="\n".join(logs)[:1800],
+        )
+    except Exception:
+        pass
+
+    raise RuntimeError(err_msg or "sendTransaction failed; see sim logs")
+
     async with asyncio.timeout(25):
         async def _post(j):
             return requests.post(rpc, json=j, timeout=20, headers=_UA)
