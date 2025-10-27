@@ -9,7 +9,6 @@ import random
 import re
 import time
 from typing import Any, Dict, Optional, Tuple, Callable, Sequence, List
-from urllib.parse import urlparse
 
 import requests
 from requests.exceptions import RequestException
@@ -19,10 +18,11 @@ from utils_pkg.mints import normalize_mint  # single source of truth
 from utils_pkg.solana_wallet import (
     load_keypair,
     get_pubkey_str,
-    sign_and_send_b64_tx,   # kept for compatibility; we now wrap with diagnostics
+    sign_and_send_b64_tx,     # fallback
+    _send_b64_with_diag,      # primary, with simulation diagnostics
 )
 
-# Telegram helper (safe import)
+# Telegram helper (safe import of core util)
 try:
     from utils_pkg.core_utils import send_telegram as _core_send_telegram  # async
 except Exception:  # pragma: no cover
@@ -562,7 +562,7 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
     raise last_err if last_err else RuntimeError(f"{label} failed")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Minimal RPC helpers (decimals & sig status) + robust sender with diagnostics
+# Minimal RPC helpers (decimals & sig status)
 # ──────────────────────────────────────────────────────────────────────────────
 _DECIMALS: Dict[str, int] = {}
 _TOK_META: Dict[str, Dict[str, Any]] = {}
@@ -589,148 +589,6 @@ def _rpc_post(method: str, params: list) -> dict:
             budget.after_rpc(method)
         except Exception:
             pass
-
-async def _send_b64_with_diag(tx_b64: str, *, skip_preflight: bool = True) -> str:
-    """
-    Sends base64 tx via RPC. On error, runs simulateTransaction with logs and
-    raises a descriptive RuntimeError that includes the RPC err and program logs.
-    """
-    rpc = os.getenv("TX_RPC_URL") or os.getenv("RPC_URL") or TX_RPC_URL
-    if not rpc:
-        raise RuntimeError("RPC_URL/TX_RPC_URL not set")
-
-    send_payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "sendTransaction",
-        "params": [
-            tx_b64,
-            {
-                "encoding": "base64",
-                "skipPreflight": bool(skip_preflight),
-                "preflightCommitment": "confirmed",
-            },
-        ],
-    }
-
-    # ---- sendTransaction (in thread) ----
-    def _post_send():
-        return requests.post(rpc, json=send_payload, timeout=20, headers=_UA)
-
-    r = await asyncio.to_thread(_post_send)
-
-    try:
-        jr: Dict[str, Any] = r.json()
-    except Exception:
-        jr = {"error": {"message": f"Non-JSON response: {r.text[:1200]}"}}
-
-    # Success path
-    if isinstance(jr.get("result"), str):
-        return jr["result"]
-
-    # ---- simulateTransaction for diagnostics ----
-    sim_payload = {
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "simulateTransaction",
-        "params": [
-            tx_b64,
-            {
-                "encoding": "base64",
-                # NOTE: do NOT set replaceRecentBlockhash with sigVerify on some RPCs
-                "sigVerify": True,
-                "commitment": "processed",
-            },
-        ],
-    }
-
-    def _post_sim():
-        return requests.post(rpc, json=sim_payload, timeout=20, headers=_UA)
-
-    simr = await asyncio.to_thread(_post_sim)
-
-    sim_body: Dict[str, Any] = {}
-    try:
-        sim_body = simr.json()
-    except Exception:
-        pass
-
-    err_msg = None
-    if isinstance(jr.get("error"), dict):
-        err_msg = jr["error"].get("message") or json.dumps(jr["error"])[:500]
-
-    logs = []
-    val = (sim_body.get("result") or {}).get("value") or {}
-    if "err" in val and val["err"] is not None:
-        err_msg = f"{err_msg or ''} | sim.err={val['err']}"
-    if isinstance(val.get("logs"), list):
-        logs = val["logs"]
-
-    try:
-        log.event(
-            "RPC_SEND_FAIL",
-            http_status=r.status_code,
-            err=err_msg or "unknown",
-            sim_logs="\n".join(logs)[:1800],
-        )
-    except Exception:
-        pass
-
-    raise RuntimeError(err_msg or "sendTransaction failed; see sim logs")
-
-    async with asyncio.timeout(25):
-        async def _post(j):
-            return requests.post(rpc, json=j, timeout=20, headers=_UA)
-        r = await asyncio.to_thread(_post, send_payload)
-
-    jr: Dict[str, Any]
-    try:
-        jr = r.json()
-    except Exception:
-        jr = {"error": {"message": f"Non-JSON response: {r.text[:1200]}"}}
-
-    if "result" in jr and isinstance(jr["result"], str):
-        return jr["result"]
-
-    # simulate for logs
-    sim_payload = {
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "simulateTransaction",
-        "params": [tx_b64, {"encoding": "base64", "sigVerify": True}],
-    }
-    try:
-        simr = await asyncio.to_thread(requests.post, rpc, None, sim_payload, 20, _UA)  # type: ignore
-    except TypeError:
-        # requests.post signature helper for readability above
-        simr = await asyncio.to_thread(
-            requests.post, rpc, json=sim_payload, timeout=20, headers=_UA
-        )
-    sim_body = {}
-    try:
-        sim_body = simr.json()
-    except Exception:
-        pass
-
-    err_msg = None
-    logs = None
-    if isinstance(jr.get("error"), dict):
-        err_msg = jr["error"].get("message") or json.dumps(jr["error"])[:500]
-    if isinstance(sim_body.get("result"), dict):
-        val = sim_body["result"].get("value") or {}
-        if "err" in val and val["err"] is not None:
-            err_msg = f"{err_msg or ''} | sim.err={val['err']}"
-        logs = val.get("logs")
-
-    try:
-        log.event("RPC_SEND_FAIL",
-                  http_status=r.status_code,
-                  err=err_msg or "unknown",
-                  sim_logs="\n".join(logs or [])[:1800])
-    except Exception:
-        pass
-
-    raise RuntimeError(err_msg or "sendTransaction failed; see sim logs")
 
 def _mint_decimals_from_data(b: bytes) -> Optional[int]:
     try:
@@ -1331,7 +1189,7 @@ def _slip_pct(slippage_bps: Optional[int]) -> float:
         return 0.0
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Swaps (public) — return (ok, signature|None)
+# Swaps (public) — return (ok, signature|None) — NO PLACEHOLDERS EVER
 # ──────────────────────────────────────────────────────────────────────────────
 async def buy_via_lightning(
     *,
@@ -1423,11 +1281,10 @@ async def buy_via_lightning(
             tx_b64 = await _jup_swap(
                 owner, quote, priority_lamports=prio, compute_units=compute_units
             )
-            # Use robust sender with auto-sim logs:
+            # Use robust sender with auto-sim logs, fallback to signed send
             try:
                 sig = await _send_b64_with_diag(tx_b64, skip_preflight=True)
             except Exception:
-                # Compatibility fallback if RPC forbids log-sim during load
                 sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
 
             _PRIO.observe(sig, t0)
@@ -1568,6 +1425,8 @@ def get_token_symbol(mint: str) -> Optional[str]:
 __all__ = [
     # lifecycle
     "start", "shutdown",
+    # constants
+    "SOL_MINT", "LAMPORTS_PER_SOL",
     # quotes / price / tokens
     "get_sell_quote", "get_buy_quote", "get_price_ui", "price_of_ui", "price_of",
     "get_tokens", "get_token_symbol",
@@ -1578,4 +1437,6 @@ __all__ = [
     "mint_decimals", "get_decimals",
     # exposed RPC config
     "TX_RPC_URL", "TX_COMMITMENT",
+    # diagnostics/helpers you call in tests
+    "_get_signature_status", "_tg_send",
 ]
