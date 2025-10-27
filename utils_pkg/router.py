@@ -861,6 +861,10 @@ async def shutdown() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Low-level Jupiter helpers (with fallback)
 # ──────────────────────────────────────────────────────────────────────────────
+def _bool01(x: Optional[bool]) -> int:
+    """Return 1 for truthy, else 0. None becomes 0."""
+    return 1 if bool(x) else 0
+
 def _slippage_bps() -> int:
     v = os.getenv("PF_SLIPPAGE_BPS")
     if v:
@@ -874,8 +878,20 @@ def _slippage_bps() -> int:
 def _as_legacy() -> bool:
     return (os.getenv("JUP_AS_LEGACY", "0") or "0").strip().lower() in {"1", "true", "yes", "y"}
 
-def _qkey(input_mint: str, output_mint: str, amount_iu: int, slippage_bps: int, swap_mode: str, direct: bool, legacy: bool) -> str:
-    return f"{input_mint}:{output_mint}:{amount_iu}:{slippage_bps}:{swap_mode}:{int(direct)}:{int(legacy)}"
+def _qkey(
+    input_mint: str,
+    output_mint: str,
+    amount_iu: int,
+    slippage_bps: Optional[int],
+    swap_mode: str,
+    direct: Optional[bool],
+    legacy: Optional[bool],
+) -> str:
+    # Normalize potentially None values so the key is always stable
+    sbps = "" if slippage_bps is None else str(slippage_bps)
+    d = _bool01(direct)
+    l = _bool01(legacy)
+    return f"{input_mint}:{output_mint}:{amount_iu}:{sbps}:{swap_mode}:{d}:{l}"
 
 async def _get_cached_quote(key: str) -> Optional[dict]:
     if QUOTE_TTL_SEC <= 0:
@@ -998,42 +1014,37 @@ async def get_sell_quote(
     slippage_bps: Optional[int] = None,
     only_direct: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """
-    Quote mint -> SOL.
-    Returns Jupiter fields plus:
-      - amount_in_raw (int)
-      - out_amount_lamports (int)
-      - out_amount_sol (float)
-      - decimals (int)
-      - symbol (str|None)
-    """
     if not isinstance(amount_raw, int) or amount_raw <= 0:
         raise ValueError("amount_raw must be a positive integer")
 
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
 
+    # ### NEW: normalize flags/bps so _jup_quote/_qkey never see None
+    if slippage_bps is None:
+        slippage_bps = _slippage_bps()
+    if only_direct is None:
+        only_direct = bool(_envint("JUP_ONLY_DIRECT", 0))
+
     q = await _retry(
         _jup_quote, mint, SOL_MINT, amount_raw,
         tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-sell",
         slippage_bps=slippage_bps, only_direct=only_direct,
     )
-
     lamports_out = int(q.get("outAmount") or 0)
+
     dec = await _get_decimals(mint)
-    # Always provide a sane decimals so downstream math never returns 0 due to None.
     if not isinstance(dec, int) or dec <= 0 or dec > 18:
         dec = 6
 
-    enriched = dict(q)
-    enriched.update({
+    return {
+        **q,
         "amount_in_raw": amount_raw,
         "out_amount_lamports": lamports_out,
         "out_amount_sol": lamports_out / LAMPORTS_PER_SOL,
         "decimals": dec,
         "symbol": _tok_symbol(mint),
-    })
-    return enriched
+    }
 
 
 async def get_buy_quote(
@@ -1044,28 +1055,22 @@ async def get_buy_quote(
     slippage_bps: Optional[int] = None,
     only_direct: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """
-    Quote SOL -> mint.
-    Returns Jupiter fields plus:
-      - lamports_in (int)
-      - out_amount_raw (int)
-      - out_amount_ui (float)    # decimals-safe; never 0.0 due to missing decimals
-      - decimals (int)
-      - symbol (str|None)
-    """
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
 
-    # Determine input size
+    # Input size
     if lamports_in is None and amount_sol is None:
-        # Fall back to configured PF_TRADE_SOL if present
         amount_sol = _envf("PF_TRADE_SOL", 0.0)
-
     if lamports_in is None:
         lamports_in = int(round((amount_sol or 0.0) * LAMPORTS_PER_SOL))
-
     if lamports_in <= 0:
         raise ValueError("Provide a positive lamports_in or amount_sol")
+
+    # ### NEW: normalize flags/bps so _jup_quote/_qkey never see None
+    if slippage_bps is None:
+        slippage_bps = _slippage_bps()
+    if only_direct is None:
+        only_direct = bool(_envint("JUP_ONLY_DIRECT", 0))
 
     q = await _retry(
         _jup_quote, SOL_MINT, mint, lamports_in,
@@ -1074,22 +1079,19 @@ async def get_buy_quote(
     )
 
     out_raw = int(q.get("outAmount") or 0)
-
     dec = await _get_decimals(mint)
     if not isinstance(dec, int) or dec <= 0 or dec > 18:
         dec = 6
     out_ui = out_raw / (10 ** dec)
 
-    enriched = dict(q)
-    enriched.update({
+    return {
+        **q,
         "lamports_in": lamports_in,
         "out_amount_raw": out_raw,
         "out_amount_ui": out_ui,
         "decimals": dec,
         "symbol": _tok_symbol(mint),
-    })
-    return enriched
-
+    }
 
 # Internal: choose sensible probe sizes for pricing given decimals
 def _price_probe_amounts(dec: int) -> list[int]:
