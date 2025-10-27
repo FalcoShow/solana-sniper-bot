@@ -1164,6 +1164,13 @@ async def _maybe_start_health_server(stop_evt: asyncio.Event) -> Optional[asynci
 # Streaming loop
 # ---------------------------
 async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
+    """
+    Robust, version-proof PumpPortal streaming loop:
+      - Works with both newer and older PumpPortalClient signatures
+      - Subscribes to trades if possible (by kwarg or method)
+      - Gracefully handles reconnects and shutdown
+      - Shields Strategy handlers from crashing the stream
+    """
     strat = Strategy()
     local_stop = stop_evt or asyncio.Event()
     diag_task = asyncio.create_task(strat.diag_loop(local_stop), name="diag.minute")
@@ -1175,78 +1182,84 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
         except Exception:
             return "<uri?>"
 
+    async def _handle_event(ev: dict) -> None:
+        kind = (ev or {}).get("kind")
+        raw = (ev or {}).get("raw", {}) or {}
+        if kind == "new_token":
+            await strat.on_new_token(raw)
+        elif kind == "trade":
+            await strat.on_trade(raw)
+
     subscribe_trades_flag = _env_bool("PUMP_SUBSCRIBE_TRADES", True)
 
+    async def _subscribe_if_needed(client: Any) -> None:
+        """
+        Some client versions support subscribe at __init__, others expose a method.
+        Try a few common method names; never raise if missing.
+        """
+        if not subscribe_trades_flag:
+            return
+        for name in ("subscribe_trades", "enable_trades", "enable_trade_stream"):
+            fn = getattr(client, name, None)
+            if callable(fn):
+                try:
+                    res = fn()
+                    if asyncio.iscoroutine(res):
+                        await res
+                    log.every("pump.subscribe", n=30, msg="PUMP_SUBSCRIBED", via=name)
+                    return
+                except Exception as e:
+                    log.every("pump.subscribe.err", n=5, msg="PUMP_SUBSCRIBE_FAIL", via=name, err=str(e))
+
+    async def _run_with_client_obj(client: Any) -> None:
+        print("[main] Connecting:", _mask_uri(client), flush=True)
+        await _subscribe_if_needed(client)
+        async for ev in client.events():
+            if local_stop.is_set():
+                break
+            try:
+                await _handle_event(ev)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                print("[main] event handling error:", flush=True)
+                traceback.print_exc()
+
+    # Path A: client is an async context manager (preferred)
     if hasattr(PumpPortalClient, "__aenter__"):
         try:
-            async with PumpPortalClient(subscribe_trades=subscribe_trades_flag) as client:  # type: ignore[misc]
-                print("[main] Connecting:", _mask_uri(client), flush=True)
-                async for ev in client.events():
-                    if stop_evt and stop_evt.is_set():
-                        break
-                    try:
-                        kind = ev.get("kind")
-                        raw = ev.get("raw", {}) or {}
-                        if kind == "new_token":
-                            await strat.on_new_token(raw)
-                        elif kind == "trade":
-                            await strat.on_trade(raw)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        print("[main] event handling error:", flush=True)
-                        traceback.print_exc()
-        except TypeError:
-            async with PumpPortalClient() as client:  # type: ignore[misc]
-                print("[main] Connecting:", _mask_uri(client), flush=True)
-                async for ev in client.events():
-                    if stop_evt and stop_evt.is_set():
-                        break
-                    try:
-                        kind = ev.get("kind")
-                        raw = ev.get("raw", {}) or {}
-                        if kind == "new_token":
-                            await strat.on_new_token(raw)
-                        elif kind == "trade":
-                            await strat.on_trade(raw)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        print("[main] event handling error:", flush=True)
-                        traceback.print_exc()
-    else:
+            try:
+                async with PumpPortalClient(subscribe_trades=subscribe_trades_flag) as client:  # type: ignore[misc]
+                    await _run_with_client_obj(client)
+            except TypeError:
+                # Older client; no subscribe_trades kwarg
+                async with PumpPortalClient() as client:  # type: ignore[misc]
+                    await _run_with_client_obj(client)
+        finally:
+            with contextlib.suppress(Exception):
+                local_stop.set()
+                diag_task.cancel()
+                await asyncio.wait_for(diag_task, timeout=1.5)
+        return
+
+    # Path B: legacy style (manual open/close)
+    try:
         try:
-            client = PumpPortalClient(subscribe_trades=subscribe_trades_flag)  # may raise if unsupported
+            client = PumpPortalClient(subscribe_trades=subscribe_trades_flag)  # type: ignore[misc]
         except TypeError:
             client = PumpPortalClient()
-        print("[main] Connecting:", _mask_uri(client), flush=True)
-        try:
-            async for ev in client.events():
-                if stop_evt and stop_evt.is_set():
-                    break
-                try:
-                    kind = ev.get("kind")
-                    raw = ev.get("raw", {}) or {}
-                    if kind == "new_token":
-                        await strat.on_new_token(raw)
-                    elif kind == "trade":
-                        await strat.on_trade(raw)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    print("[main] event handling error:", flush=True)
-                    traceback.print_exc()
-        finally:
+        await _run_with_client_obj(client)
+    finally:
+        # Try to close gracefully across versions
+        with contextlib.suppress(Exception):
             if hasattr(client, "close"):
-                with contextlib.suppress(Exception):
-                    maybe_awaitable = client.close()
-                    if asyncio.iscoroutine(maybe_awaitable):
-                        await maybe_awaitable  # type: ignore
-
-    with contextlib.suppress(Exception):
-        local_stop.set()
-        diag_task.cancel()
-        await asyncio.wait_for(diag_task, timeout=1.5)
+                maybe_awaitable = client.close()
+                if asyncio.iscoroutine(maybe_awaitable):
+                    await maybe_awaitable  # type: ignore
+        with contextlib.suppress(Exception):
+            local_stop.set()
+            diag_task.cancel()
+            await asyncio.wait_for(diag_task, timeout=1.5)
 
 # ---------------------------
 # Raydium scanner supervisor
@@ -1257,8 +1270,11 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
         log.event("SCAN_RAYDIUM_UNAVAILABLE")
         return
 
+    base_interval = _as_float(os.getenv("RAYDIUM_SCAN_INTERVAL_SEC", "30"), 30.0)
+    jitter_seed = (os.getpid() % 7) / 6.0
     backoff = 2.0
     first_log = True
+
     while not stop_evt.is_set():
         try:
             if first_log:
@@ -1269,12 +1285,15 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                     min_liq=os.getenv("RAYDIUM_MIN_LIQ_USD"),
                 )
                 first_log = False
-            await scan_raydium()  # reads env itself
+
+            await scan_raydium()  # scanner reads env itself
             log.event("SCAN_RAYDIUM_RETURNED")
-            if _as_float(os.getenv("RAYDIUM_SCAN_INTERVAL_SEC", "30"), 30.0) > 0:
-                base = _as_float(os.getenv("RAYDIUM_SCAN_INTERVAL_SEC", "30"), 30.0)
-                jitter = 0.15 * base * (os.getpid() % 7) / 6.0
-                await asyncio.sleep(base + jitter)
+
+            if base_interval > 0:
+                # slight deterministic jitter per instance
+                jitter = 0.15 * base_interval * jitter_seed
+                await asyncio.sleep(base_interval + jitter)
+
             backoff = 2.0
         except asyncio.CancelledError:
             log.event("SCAN_RAYDIUM_CANCELLED")
@@ -1286,34 +1305,50 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
 
 async def _start_background_tasks(stop_evt: asyncio.Event) -> Dict[str, asyncio.Task]:
     tasks: Dict[str, asyncio.Task] = {}
+
     want_raydium = getattr(C, "ENABLE_RAYDIUM_SCANNER", True)
     pools_ok = (not POOLS_FILTER) or ("raydium" in POOLS_FILTER)
     if want_raydium and pools_ok:
         t = asyncio.create_task(_run_raydium_scanner_forever(stop_evt), name="scan.raydium")
         tasks["scan.raydium"] = t
         log.event("SCAN_RAYDIUM_SCHEDULED", task="scan.raydium")
+
     if _as_bool(os.getenv("DAILY_PNL_ENABLED", "1"), True):
         t = asyncio.create_task(_run_daily_pnl_loop(stop_evt), name="telemetry.daily_pnl")
         tasks["telemetry.daily_pnl"] = t
         log.event("DAILY_PNL_SCHEDULED", hour_utc=_as_int(os.getenv("DAILY_PNL_HOUR_UTC", "23"), 23))
+
     # Optional health server
     ht = await _maybe_start_health_server(stop_evt)
     if ht:
         tasks["health.server"] = ht
+
     return tasks
 
-async def _graceful_shutdown(stop_evt: asyncio.Event, sell_task: Optional[asyncio.Task], bg_tasks: Dict[str, asyncio.Task]) -> None:
+async def _graceful_shutdown(
+    stop_evt: asyncio.Event,
+    sell_task: Optional[asyncio.Task],
+    bg_tasks: Dict[str, asyncio.Task],
+) -> None:
     stop_evt.set()
+
+    # Cancel BG tasks
     for _name, t in list(bg_tasks.items()):
         with contextlib.suppress(Exception):
             t.cancel()
+
+    # Stop sell loop
     with contextlib.suppress(Exception):
         if sell_task:
             sell_task.cancel()
             await asyncio.wait_for(sell_task, timeout=3.0)
+
+    # Router shutdown
     with contextlib.suppress(Exception):
         if router and hasattr(router, "shutdown"):
             await router.shutdown()
+
+    # Pricefeed shutdown
     with contextlib.suppress(Exception):
         await pricefeed_close()
 
@@ -1377,6 +1412,7 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     _env_hints()
     _ensure_keypair_file()
 
+    # Initialize router (priority fee control, etc.)
     try:
         if router and hasattr(router, "start"):
             await router.start()
@@ -1384,6 +1420,7 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     except Exception as e:
         log.event("ROUTER_PRIO_INIT_FAIL", error=str(e))
 
+    # Resume sell loop if positions exist
     sell_stop_evt: Optional[asyncio.Event] = None
     sell_task: Optional[asyncio.Task] = None
     try:
@@ -1394,9 +1431,11 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     except Exception as e:
         log.event("BOOT_SELL_LOOP_START_FAIL", error=str(e))
 
+    # Background tasks (Raydium, PnL, health)
     local_stop = stop_evt or asyncio.Event()
     bg_tasks = await _start_background_tasks(local_stop)
 
+    # OS signals for graceful shutdown
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -1404,21 +1443,23 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
         except NotImplementedError:
             pass
 
-    backoff = 3
+    # Reconnect loop for Pump portal
+    backoff = 3.0
     try:
         while not local_stop.is_set():
             try:
                 await stream_loop(local_stop)
                 print("[main] stream ended (remote closed). Reconnecting...", flush=True)
-                backoff = 3
+                backoff = 3.0
             except asyncio.CancelledError:
                 raise
             except Exception:
                 print("[main] stream_loop crashed:", flush=True)
                 traceback.print_exc()
-                backoff = min(backoff * 2, 30)
+                backoff = min(backoff * 2.0, 30.0)
             await asyncio.sleep(backoff)
     finally:
+        # Stop sell loop first to avoid double work
         try:
             if sell_stop_evt is not None:
                 sell_stop_evt.set()
