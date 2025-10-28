@@ -132,7 +132,7 @@ _UA = {"user-agent": "pnlsniper/1.0 (+router)", "accept": "application/json", "c
 # -------------------------
 # Telegram helpers
 # -------------------------
-_MARKDOWNV2_SPECIALS = r"_*[]()~`>#+-=|{}.!\\"  # sanitized characters for Telegram plain messages
+_MARKDOWNV2_SPECIALS = r"_*[]()~`>#+-=|{}.!\\"
 def _tg_plain(msg: str) -> str:
     return "".join(ch for ch in msg if ch not in _MARKDOWNV2_SPECIALS)
 
@@ -230,7 +230,11 @@ def normalize_pump_id_to_mint(raw: str) -> str:
 # -------------------------
 # Jupiter HTTP helpers + fallback
 # -------------------------
+
 def _alt_bases() -> Sequence[str]:
+    """
+    Ordered list of base URLs to try. Primary env first, then alts.
+    """
     bases: list[str] = []
     primary = (os.getenv("JUP_BASE_URL") or "https://quote-api.jup.ag").strip().rstrip("/")
     if primary:
@@ -252,12 +256,40 @@ def _is_qn_call_url(u: str) -> bool:
     u = (u or "").rstrip("/")
     return "/functions/" in u and u.endswith("/call")
 
+# ── NEW: choose correct paths by base ─────────────────────────────────────────
+def _paths_for_base(base: str) -> tuple[str, str, str, str]:
+    """
+    Returns (quote_path, swap_path, alt_swap_path, tokens_path) for a given base.
+    - api.jup.ag/public.jupiterapi.com → v1-style paths
+    - quote-api.jup.ag or anything else → v6-style paths
+    """
+    b = (base or "").lower()
+    if "api.jup.ag" in b or "public.jupiterapi.com" in b:
+        return "/swap/v1/quote", "/swap/v1/swap", "/swap/v1/tx", "/swap/v1/tokens"
+    # default to legacy quote host (v6)
+    return "/v6/quote", "/v6/swap", "/v6/swap", "/v6/tokens"
+
 def _compose_endpoint(base: str, kind: str) -> tuple[str, bool]:
+    """
+    Compose a URL for GET-style Jupiter endpoints (quote/tokens/etc.),
+    honoring QuickNode /functions/call as well as base-specific paths.
+    """
     b = base.rstrip("/")
+    q_path, s_path, _alt_swap, t_path = _paths_for_base(b)
+
+    # Map logical 'kind' -> real path
+    if kind == "quote":
+        path = q_path
+    elif kind == "tokens":
+        path = t_path
+    else:
+        # fall back to v6-style for unknown kinds (maintains previous behavior)
+        path = f"/v6/{kind}"
+
     if _is_qn_call_url(b):
         sep = "&" if "?" in b else "?"
-        return f"{b}{sep}path=/v6/{kind}&mode=RAW", True
-    return f"{b}/v6/{kind}", False
+        return f"{b}{sep}path={path}&mode=RAW", True
+    return f"{b}{path}", False
 
 def _jup_headers_for(base: str) -> Dict[str, str]:
     h: Dict[str, str] = {**_UA, "origin": "https://jup.ag", "referer": "https://jup.ag/"}
@@ -274,6 +306,9 @@ def _jup_headers_for(base: str) -> Dict[str, str]:
     return h
 
 async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) -> dict:
+    """
+    Generic GET with base fallback. Now base-aware for paths.
+    """
     last_err: Optional[Exception] = None
     for idx, base in enumerate(_alt_bases()):
         url, is_qn = _compose_endpoint(base, kind)
@@ -282,6 +317,7 @@ async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) ->
                 r = requests.post(url, json=None, params=params, timeout=timeout, headers=_jup_headers_for(base))
             else:
                 r = requests.get(url, params=params, timeout=timeout, headers=_jup_headers_for(base))
+
             try:
                 js = r.json()
             except Exception:
@@ -296,16 +332,29 @@ async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) ->
         except Exception as e:
             last_err = e
         await asyncio.sleep(0.05 if idx == 0 else 0.1)
-    raise last_err or RuntimeError("all quote endpoints failed")
+    raise last_err or RuntimeError("all GET endpoints failed")
 
 async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], params: Optional[dict], timeout: float) -> dict:
+    """
+    POST with base fallback. For kind == 'swap' we try both v6 and v1 paths
+    depending on base; for other kinds we defer to _compose_endpoint.
+    """
     last_err: Optional[Exception] = None
 
     def _swap_candidates(base: str) -> list[tuple[str, bool]]:
         b = base.rstrip("/")
+        q_path, s_path, alt_swap, _t_path = _paths_for_base(b)
         if _is_qn_call_url(b):
-            return [(f"{b}?path=/v6/swap&mode=RAW", True)]
-        return [(f"{b}/v6/swap", False), (f"{b}/swap/v1/swap", False), (f"{b}/swap/v1/tx", False)]
+            # QuickNode functions need the target path as ?path=...
+            return [(f"{b}?path={s_path}&mode=RAW", True)]
+        # Try primary swap path first, then an alternative if present
+        out = [(f"{b}{s_path}", False)]
+        if alt_swap and alt_swap != s_path:
+            out.append((f"{b}{alt_swap}", False))
+        # keep legacy/v6 as a final fallback in case base detection was odd
+        if s_path != "/v6/swap":
+            out.append((f"{b}/v6/swap", False))
+        return out
 
     for bidx, base in enumerate(_alt_bases()):
         try_paths = _swap_candidates(base) if kind == "swap" else [_compose_endpoint(base, kind)]
@@ -373,7 +422,6 @@ async def _http_get_quote_any(*, params_v1: dict, params_v6: dict) -> dict:
 
 # -------------------------
 # QuickNode / action unwrap helpers
-# (these try to extract Jupiter envelope from various wrapper formats)
 # -------------------------
 def _jtry(s: str):
     try:
@@ -413,7 +461,7 @@ def _from_result_container(obj: Any) -> Any:
                     if j is not None: return j
     if isinstance(res, str):
         j = _jtry(res) or _jtry(_b64txt(res) or "")
-        if j is not None: return j
+        if j is not None: return _dfs_extract(j)
     return None
 
 def _from_action_envelope(obj: Any) -> Any:
