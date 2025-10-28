@@ -227,27 +227,38 @@ def _sanitize_mint(m: str) -> str:
 def normalize_pump_id_to_mint(raw: str) -> str:
     return normalize_mint(raw)
 
-# -------------------------
-# Jupiter HTTP helpers + fallback
-# -------------------------
-def _alt_bases() -> Sequence[str]:
-    bases: list[str] = []
-    primary = (os.getenv("JUP_BASE_URL") or "https://quote-api.jup.ag").strip().rstrip("/")
-    if primary:
-        bases.append(primary)
-    alts = (os.getenv("JUP_ALT_BASE_URLS") or "").strip()
-    if alts:
-        for a in alts.split(","):
-            a = a.strip().rstrip("/")
-            if a and a not in bases:
-                bases.append(a)
-    # dedupe keep order
-    final: list[str] = []
-    for b in bases:
-        if b and b not in final:
-            final.append(b)
-    return final
+# =======================================================
+# Jupiter: Circuit breaker, base prioritization & helpers
+# =======================================================
 
+# --- Circuit breaker state ---
+_JUP_FAIL_COUNT = 0
+_JUP_FAIL_LIMIT = _envi("JUP_FAIL_LIMIT", 8)
+_JUP_BREAKER_COOLDOWN = _envf("JUP_BREAKER_COOLDOWN_SEC", 30.0)
+_JUP_BREAKER_UNTIL: float = 0.0
+_JUP_LAST_GOOD_BASE: Optional[str] = None
+
+def _jup_breaker_check() -> None:
+    if time.time() < _JUP_BREAKER_UNTIL:
+        raise RuntimeError(f"JUP_CIRCUIT_BREAKER active for {round(_JUP_BREAKER_UNTIL - time.time(), 1)}s")
+
+def _jup_record_success(base: str):
+    global _JUP_FAIL_COUNT, _JUP_BREAKER_UNTIL, _JUP_LAST_GOOD_BASE
+    if _JUP_FAIL_COUNT > 0:
+        log.event("JUP_BREAKER_RESET", fails=_JUP_FAIL_COUNT)
+    _JUP_FAIL_COUNT = 0
+    _JUP_BREAKER_UNTIL = 0
+    _JUP_LAST_GOOD_BASE = (base or "").strip().rstrip("/")
+
+def _jup_record_failure():
+    global _JUP_FAIL_COUNT, _JUP_BREAKER_UNTIL
+    _JUP_FAIL_COUNT += 1
+    log.every("jup.fail", n=1, msg="JUP_FAIL_COUNT", count=_JUP_FAIL_COUNT)
+    if _JUP_FAIL_COUNT >= _JUP_FAIL_LIMIT:
+        _JUP_BREAKER_UNTIL = time.time() + _JUP_BREAKER_COOLDOWN
+        log.event("JUP_BREAKER_TRIPPED", until=_JUP_BREAKER_UNTIL)
+
+# --- Base selection & headers ---
 def _is_qn_call_url(u: str) -> bool:
     u = (u or "").rstrip("/")
     return "/functions/" in u and u.endswith("/call")
@@ -258,6 +269,26 @@ def _compose_endpoint(base: str, kind: str) -> tuple[str, bool]:
         sep = "&" if "?" in b else "?"
         return f"{b}{sep}path=/v6/{kind}&mode=RAW", True
     return f"{b}/v6/{kind}", False
+
+def _paths_for_base(base: str) -> Tuple[str, str, bool]:
+    """
+    Return (quote_path, swap_path, is_qn_call) for the base.
+    """
+    b = (base or "").strip().rstrip("/")
+    if not b:
+        return ("/v6/quote", "/v6/swap", False)
+
+    if _is_qn_call_url(b):
+        sep = "&" if "?" in b else "?"
+        return (f"{b}{sep}path=/v6/quote&mode=RAW", f"{b}{sep}path=/v6/swap&mode=RAW", True)
+
+    if "api.jup.ag" in b or "lite-api.jup.ag" in b:
+        return ("/swap/v1/quote", "/swap/v1/swap", False)
+
+    if "quote-api.jup.ag" in b or "public.jupiterapi.com" in b:
+        return ("/v6/quote", "/v6/swap", False)
+
+    return ("/v6/quote", "/v6/swap", False)
 
 def _jup_headers_for(base: str) -> Dict[str, str]:
     h: Dict[str, str] = {**_UA, "origin": "https://jup.ag", "referer": "https://jup.ag/"}
@@ -273,112 +304,30 @@ def _jup_headers_for(base: str) -> Dict[str, str]:
         h["x-jup-auth"] = f"Bearer {jup_bearer}"
     return h
 
-# ---------- NEW: choose path pair for a given base ----------
-def _paths_for_base(base: str) -> Tuple[str, str, bool]:
+def _alt_bases() -> Sequence[str]:
     """
-    Return (quote_path, swap_path, is_qn_call) for the base.
-    quote_path/swap_path may be either an absolute path (starting with /)
-    which should be concatenated with base.rstrip("/"), OR a fully-built
-    URL (for QuickNode-style function URLs) which should be used directly.
+    Prioritize the last good base first, then user-provided bases.
+    Env:
+      - JUP_BASE_URL primary (can be custom relay/proxy)
+      - JUP_ALT_BASE_URLS comma-separated fallbacks
+      - JUP_UPSTREAM / JUP_LITE / JUP_LEGACY used by _quote_bases_order()
     """
-    b = (base or "").strip().rstrip("/")
-    if not b:
-        return ("/v6/quote", "/v6/swap", False)
-
-    # QuickNode / function wrapper
-    if _is_qn_call_url(b):
-        sep = "&" if "?" in b else "?"
-        return (f"{b}{sep}path=/v6/quote&mode=RAW", f"{b}{sep}path=/v6/swap&mode=RAW", True)
-
-    # api.jup.ag (the main "pro" API) exposes swap/v1 and v6 formats; prefer swap/v1 for quote endpoints
-    if "api.jup.ag" in b or "lite-api.jup.ag" in b:
-        # main API prefers /swap/v1/quote and /swap/v1/swap for v1-style.
-        return ("/swap/v1/quote", "/swap/v1/swap", False)
-
-    # public / quote endpoints sometimes expose v6
-    if "quote-api.jup.ag" in b or "public.jupiterapi.com" in b:
-        return ("/v6/quote", "/v6/swap", False)
-
-    # default fallback to v6 paths
-    return ("/v6/quote", "/v6/swap", False)
-
-# ---------- end new helper ----------
-
-async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) -> dict:
-    last_err: Optional[Exception] = None
-    for idx, base in enumerate(_alt_bases()):
-        quote_path, swap_path, is_qn = _paths_for_base(base)
-        # choose path based on kind (quote/tokens/etc). For non-quote kinds use compose endpoint as before.
-        try:
-            if is_qn:
-                # QuickNode-style function URL: call via POST to the function URL
-                url = quote_path if kind == "quote" else (quote_path if kind == "tokens" else f"{base.rstrip('/')}/v6/{kind}")
-                r = requests.post(url, json=None, params=params, timeout=timeout, headers=_jup_headers_for(base))
-            else:
-                # standard GET endpoints (quote/v6 or swap/v1/quote)
-                if kind == "quote":
-                    url = base.rstrip("/") + quote_path
-                else:
-                    # use compose_endpoint fallback for other kinds (tokens, etc)
-                    url, _ = _compose_endpoint(base, kind)
-                r = requests.get(url, params=params, timeout=timeout, headers=_jup_headers_for(base))
-            try:
-                js = r.json()
-            except Exception:
-                r.raise_for_status()
-                raise
-            js = _unwrap_qn_action(r, js)
-            if r.status_code in (200, 201):
-                return js
-            last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
-        except RequestException as e:
-            last_err = e
-        except Exception as e:
-            last_err = e
-        await asyncio.sleep(0.05 if idx == 0 else 0.1)
-    raise last_err or RuntimeError("all quote endpoints failed")
-
-async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], params: Optional[dict], timeout: float) -> dict:
-    last_err: Optional[Exception] = None
-
-    def _swap_candidates(base: str) -> list[tuple[str, bool]]:
-        # produce candidate (url, is_qn) tuples for swap post endpoints
-        quote_path, swap_path, is_qn = _paths_for_base(base)
-        b = base.rstrip("/")
-        if is_qn:
-            # already a fully built QN URL in swap_path
-            return [(swap_path, True)]
-        # prefer the swap_path returned by helper, then fallback to older endpoints
-        candidates = [(b + swap_path, False)]
-        candidates.append((f"{b}/swap/v1/swap", False))
-        candidates.append((f"{b}/swap/v1/tx", False))
-        return candidates
-
-    for bidx, base in enumerate(_alt_bases()):
-        try_paths = _swap_candidates(base) if kind == "swap" else [_compose_endpoint(base, kind)]
-        for _pidx, (url, _is_qn) in enumerate(try_paths):
-            try:
-                log.every("swap.try", n=1, msg="SWAP_TRY", url=url)
-            except Exception:
-                pass
-            try:
-                r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=_jup_headers_for(base))
-                try:
-                    js = r.json()
-                except Exception:
-                    r.raise_for_status()
-                    raise
-                js = _unwrap_qn_action(r, js)
-                if r.status_code in (200, 201):
-                    return js
-                last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
-            except RequestException as e:
-                last_err = e
-            except Exception as e:
-                last_err = e
-            await asyncio.sleep(0.03)
-        await asyncio.sleep(0.08 if bidx == 0 else 0.12)
-    raise last_err or RuntimeError("all swap endpoints failed")
+    bases: list[str] = []
+    primary = (_JUP_LAST_GOOD_BASE or (os.getenv("JUP_BASE_URL") or "https://quote-api.jup.ag")).strip().rstrip("/")
+    if primary:
+        bases.append(primary)
+    alts = (os.getenv("JUP_ALT_BASE_URLS") or "").strip()
+    if alts:
+        for a in alts.split(","):
+            a = a.strip().rstrip("/")
+            if a and a not in bases:
+                bases.append(a)
+    # Dedup keeping order
+    final: list[str] = []
+    for b in bases:
+        if b and b not in final:
+            final.append(b)
+    return final
 
 # helper to choose quote bases order (relay -> pro -> lite -> v6)
 def _quote_bases_order() -> List[tuple[str, str]]:
@@ -396,37 +345,15 @@ def _quote_bases_order() -> List[tuple[str, str]]:
         if b and (b, k) not in seen:
             seen.add((b, k))
             final.append((b, k))
+    # Prefer last known good base if present
+    if _JUP_LAST_GOOD_BASE:
+        lg = _JUP_LAST_GOOD_BASE
+        prioritized = [(lg, "v1")] + [p for p in final if p[0] != lg]
+        return prioritized
     return final
-
-async def _http_get_quote_any(*, params_v1: dict, params_v6: dict) -> dict:
-    last_err: Optional[Exception] = None
-    for base, kind in _quote_bases_order():
-        try:
-            await _jup_gate()
-            quote_path, swap_path, is_qn = _paths_for_base(base)
-            if is_qn:
-                # QuickNode-style function: POST to the function url
-                url = quote_path if kind == "v1" else quote_path
-                r = requests.post(url, json=None, params=(params_v1 if kind == "v1" else params_v6), timeout=HTTP_TIMEOUT_GET, headers=_jup_headers_for(base))
-            else:
-                if kind == "v1":
-                    url = base.rstrip("/") + quote_path
-                    r = requests.get(url, params=params_v1, timeout=HTTP_TIMEOUT_GET, headers=_jup_headers_for(base))
-                else:
-                    url = base.rstrip("/") + quote_path
-                    r = requests.get(url, params=params_v6, timeout=HTTP_TIMEOUT_GET, headers=_jup_headers_for(base))
-            if r.status_code >= 400:
-                raise RuntimeError(f"{kind}@{base} -> {r.status_code} {r.text[:300]}")
-            return r.json()
-        except Exception as e:
-            last_err = e
-            log.every("quote.fallback", n=10, msg="QUOTE_FALLBACK", base=base, kind=kind, err=str(e))
-            continue
-    raise last_err or RuntimeError("all quote endpoints failed")
 
 # -------------------------
 # QuickNode / action unwrap helpers
-# (these try to extract Jupiter envelope from various wrapper formats)
 # -------------------------
 def _jtry(s: str):
     try:
@@ -578,7 +505,169 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
     raise last_err if last_err else RuntimeError(f"{label} failed")
 
 # -------------------------
-# minimal RPC helpers: decimals, signature status
+# HTTP helpers with fallback + breaker + timing
+# -------------------------
+async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) -> dict:
+    """
+    GET calls to Jupiter-style endpoints with:
+      - multiple base fallbacks (incl. QuickNode / functions)
+      - circuit breaker
+      - latency logs
+      - action unwrap support
+    """
+    _jup_breaker_check()
+    last_err: Optional[Exception] = None
+    for idx, base in enumerate(_alt_bases()):
+        quote_path, swap_path, is_qn = _paths_for_base(base)
+        t0 = time.time()
+        try:
+            if is_qn:
+                url = quote_path if kind == "quote" else (quote_path if kind == "tokens" else f"{base.rstrip('/')}/v6/{kind}")
+                r = requests.post(url, json=None, params=params, timeout=timeout, headers=_jup_headers_for(base))
+            else:
+                if kind == "quote":
+                    url = base.rstrip("/") + quote_path
+                else:
+                    url, _ = _compose_endpoint(base, kind)
+                r = requests.get(url, params=params, timeout=timeout, headers=_jup_headers_for(base))
+            try:
+                js = r.json()
+            except Exception:
+                r.raise_for_status()
+                raise
+            js = _unwrap_qn_action(r, js)
+            if r.status_code in (200, 201):
+                _jup_record_success(base)
+                try:
+                    log.every("jup.quote.latency", n=1, msg="JUP_QUOTE_TIME",
+                              dur_ms=int((time.time() - t0) * 1000), base=base, kind=kind)
+                except Exception:
+                    pass
+                return js
+            last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
+            log.every("jup.http.err", n=5, msg="JUP_HTTP_ERR", base=base, kind=kind, code=r.status_code)
+        except RequestException as e:
+            last_err = e
+            log.every("jup.req.err", n=5, msg="JUP_REQ_ERR", base=base, kind=kind, err=str(e))
+        except Exception as e:
+            last_err = e
+            log.every("jup.unknown.err", n=5, msg="JUP_UNKNOWN_ERR", base=base, kind=kind, err=str(e))
+        await asyncio.sleep(0.05 if idx == 0 else 0.1)
+    _jup_record_failure()
+    raise last_err or RuntimeError("all quote endpoints failed")
+
+async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], params: Optional[dict], timeout: float) -> dict:
+    """
+    POST calls (swap) with:
+      - multiple candidate endpoints per base
+      - circuit breaker
+      - action unwrap support
+    """
+    _jup_breaker_check()
+    last_err: Optional[Exception] = None
+
+    def _swap_candidates(base: str) -> list[tuple[str, bool]]:
+        quote_path, swap_path, is_qn = _paths_for_base(base)
+        b = base.rstrip("/")
+        if is_qn:
+            return [(swap_path, True)]
+        candidates = [(b + swap_path, False)]
+        candidates.append((f"{b}/swap/v1/swap", False))
+        candidates.append((f"{b}/swap/v1/tx", False))
+        return candidates
+
+    for bidx, base in enumerate(_alt_bases()):
+        try_paths = _swap_candidates(base) if kind == "swap" else [_compose_endpoint(base, kind)]
+        for _pidx, (url, _is_qn) in enumerate(try_paths):
+            try:
+                log.every("swap.try", n=1, msg="SWAP_TRY", url=url)
+            except Exception:
+                pass
+            try:
+                r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=_jup_headers_for(base))
+                try:
+                    js = r.json()
+                except Exception:
+                    r.raise_for_status()
+                    raise
+                js = _unwrap_qn_action(r, js)
+                if r.status_code in (200, 201):
+                    _jup_record_success(base)
+                    return js
+                last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
+                log.every("jup.swap.err", n=5, msg="JUP_SWAP_HTTP_ERR", base=base, code=r.status_code)
+            except RequestException as e:
+                last_err = e
+                log.every("jup.swap.req", n=5, msg="JUP_SWAP_REQ_ERR", base=base, err=str(e))
+            except Exception as e:
+                last_err = e
+                log.every("jup.swap.unknown", n=5, msg="JUP_SWAP_UNKNOWN_ERR", base=base, err=str(e))
+            await asyncio.sleep(0.03)
+        await asyncio.sleep(0.08 if bidx == 0 else 0.12)
+    _jup_record_failure()
+    raise last_err or RuntimeError("all swap endpoints failed")
+
+# -------------------------
+# jupiter multi-path quote helper
+# -------------------------
+async def _http_get_quote_any(*, params_v1: dict, params_v6: dict) -> dict:
+    last_err: Optional[Exception] = None
+    for base, kind in _quote_bases_order():
+        try:
+            await _jup_gate()
+            t0 = time.time()
+            quote_path, swap_path, is_qn = _paths_for_base(base)
+            if is_qn:
+                url = quote_path
+                r = requests.post(url, json=None, params=(params_v1 if kind == "v1" else params_v6), timeout=HTTP_TIMEOUT_GET, headers=_jup_headers_for(base))
+            else:
+                url = base.rstrip("/") + quote_path
+                r = requests.get(url, params=(params_v1 if kind == "v1" else params_v6), timeout=HTTP_TIMEOUT_GET, headers=_jup_headers_for(base))
+            if r.status_code >= 400:
+                raise RuntimeError(f"{kind}@{base} -> {r.status_code} {r.text[:300]}")
+            _jup_record_success(base)
+            try:
+                log.every("quote.fallback", n=10, msg="QUOTE_PATH_USED", base=base, kind=kind, dur_ms=int((time.time()-t0)*1000))
+            except Exception:
+                pass
+            return r.json()
+        except Exception as e:
+            last_err = e
+            _jup_record_failure()
+            log.every("quote.fallback", n=10, msg="QUOTE_FALLBACK", base=base, kind=kind, err=str(e))
+            continue
+    raise last_err or RuntimeError("all quote endpoints failed")
+
+# =======================================================
+# FILTER HELPER for scanners (clear reason logging)
+# =======================================================
+def run_filters(token: dict, filters: List[Callable[[dict], Tuple[bool, str]]]) -> tuple[bool, str]:
+    """
+    Run a list of filter functions against a token dict.
+    Each filter returns (ok: bool, reason: str).
+    """
+    for f in filters:
+        try:
+            ok, reason = f(token)
+        except Exception as e:
+            ok, reason = False, f"Exception: {e}"
+        if not ok:
+            # compact, machine-parseable log
+            try:
+                log.info("TOKEN_REJECTED", extra={
+                    "mint": token.get("mint"),
+                    "symbol": token.get("symbol"),
+                    "filter": getattr(f, "__name__", "filter"),
+                    "reason": reason
+                })
+            except Exception:
+                log.event("TOKEN_REJECTED", mint=token.get("mint"), symbol=token.get("symbol"),
+                          filter=getattr(f, "__name__", "filter"), reason=reason)
+            return False, reason
+    return True, "ok"
+
+# -------------------------
+# token decimals lookup
 # -------------------------
 _DECIMALS: Dict[str, int] = {}
 _TOK_META: Dict[str, Dict[str, Any]] = {}
@@ -618,9 +707,6 @@ async def _get_signature_status(sig: str) -> Optional[dict]:
         return None
     return await asyncio.to_thread(_call)
 
-# -------------------------
-# token decimals lookup
-# -------------------------
 def _mint_decimals_from_data(b: bytes) -> Optional[int]:
     try:
         if len(b) >= 45:
@@ -939,7 +1025,10 @@ async def _jup_quote(input_mint: str, output_mint: str, amount_iu: int, *, slipp
                 "onlyDirectRoutes": "true" if only_direct else "false",
                 "asLegacyTransaction": "true" if legacy else "false",
             }
+            t0 = time.time()
             js = await _http_get_quote_any(params_v1=params_v1, params_v6=params_v6)
+            dur_ms = int((time.time() - t0) * 1000)
+            log.every("quote.ms", n=5, msg="QUOTE_DURATION_MS", ms=dur_ms)
             await _set_cached_quote(key, js, QUOTE_TTL_SEC)
             return js
         finally:
@@ -1279,4 +1368,5 @@ __all__ = [
     "normalize_pump_id_to_mint", "_is_valid_pubkey_str", "is_valid_pubkey_str",
     "mint_decimals", "get_decimals",
     "TX_RPC_URL", "TX_COMMITMENT",
+    "run_filters",
 ]
