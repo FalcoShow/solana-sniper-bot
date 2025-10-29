@@ -552,33 +552,47 @@ async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
         with contextlib.suppress(Exception):
             await _tg_send_text(txt)
 
-async def _notion_intraday_snapshot_push(debounce_sec: float = None) -> None:
-    """
-    Build a fresh snapshot and push to Notion, debounced.
-    """
+async def _notion_intraday_snapshot_push(note: str = "") -> None:
+    """Lightweight intraday push to Notion after a buy fill (debounced)."""
+    import time as _time
     global _LAST_NOTION_PUSH_TS
-    debounce_sec = float(debounce_sec if debounce_sec is not None else (DAILY_PNL_DEBOUNCE_MIN * 60))
-    now = _dt.datetime.now(_dt.timezone.utc).timestamp()
-    if (now - _LAST_NOTION_PUSH_TS) < debounce_sec:
-        return
     try:
-        unrl_sol, open_n, _ = await _estimate_unrealized_from_positions()
-        realized_sol, _rmeta = await _estimate_realized_today()
-        wallet_sol = await _get_wallet_sol_balance()
-        page_id = push_daily_pnl({
-            "date": utc_today_iso(),
-            "realized_sol": realized_sol,
-            "unrealized_sol": unrl_sol,
+        if os.getenv("NOTION_ENABLED", "0") != "1":
+            return
+        debounce_sec = int(os.getenv("DAILY_PNL_DEBOUNCE_MIN", "10")) * 60
+        now = _time.time()
+        if (now - _LAST_NOTION_PUSH_TS) < debounce_sec:
+            return
+
+        # very small snapshot (no price walk); safe + fast
+        unrl, open_n, _ = await _estimate_unrealized_from_positions()
+        realized, _ = await _estimate_realized_today()
+        wallet = await _get_wallet_sol_balance()
+
+        from datetime import date as _date
+        sn = {
+            "date": _date.today().isoformat(),
+            "realized_sol": realized,
+            "unrealized_sol": unrl,
             "open_positions": open_n,
-            "wallet_sol": wallet_sol,
-            # trades/realized_usd/unrealized_usd optional; client tolerates None
-            "note": "Intraday autosync",
-        })
-        if page_id:
-            log.event("NOTION_INTRADAY_PNL_UPSERTED", page_id=page_id)
+            "wallet_sol": wallet,
+            "note": note or "auto intraday snapshot",
+        }
+        with contextlib.suppress(Exception):
+            push_daily_pnl(sn)
         _LAST_NOTION_PUSH_TS = now
     except Exception as e:
-        log.warning("NOTION_INTRADAY_PNL_FAILED %s", e)
+        log.event("NOTION_INTRADAY_PUSH_FAIL", err=str(e))
+
+# --- Notion (optional daily PnL sync) ---
+try:
+    from utils_pkg.notion_pnl import push_daily_pnl  # safe no-op if NOTION_ENABLED!=1
+except Exception:  # pragma: no cover
+    def push_daily_pnl(_snapshot):  # fallback no-op
+        return None
+
+# Debounce for intraday push after fills (seconds granularity)
+_LAST_NOTION_PUSH_TS: float = 0.0
 
 async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
     """
