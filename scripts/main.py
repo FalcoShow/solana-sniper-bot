@@ -996,6 +996,24 @@ async def _pnl_pg_insert_row(*, realized_sol: float, unrealized_sol: float,
             traceback.print_exc()
         log.event("DAILY_PNL_PG_ERROR", when="insert_row", error=str(e))
 
+# main.py (telemetry.daily_pnl task)
+try:
+    from utils_pkg.notion_pnl import push_daily_pnl
+    pushed = push_daily_pnl({
+        "date": snapshot_date_iso,          # or however you name it
+        "realized_sol": realized_sol,
+        "unrealized_sol": unrealized_sol,
+        "open_positions": open_positions,
+        "wallet_sol": wallet_sol,           # optional if you have it
+        "trades": trades_count,             # if tracked
+        "price_usd": price_usd,             # if you already fetch SOL price
+        "note": "",                         # optional
+    })
+    if pushed:
+        log.info("NOTION_PNL_UPSERTED", extra={"page_id": pushed})
+except Exception as e:
+    log.warning("NOTION_PNL_FAILED", extra={"error": str(e)})
+
 async def _get_wallet_sol_balance() -> Optional[float]:
     try:
         from utils_pkg.wallet import get_sol_balance  # type: ignore
