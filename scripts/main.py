@@ -204,15 +204,6 @@ def _get_raydium_scanner():
     except Exception:
         return None
 
-# --- Notion (optional daily PnL sync) ---
-try:
-    from utils_pkg.notion_pnl import push_daily_pnl  # safe no-op if NOTION_ENABLED!=1
-except Exception:  # pragma: no cover
-    def push_daily_pnl(_snapshot):  # fallback no-op
-        return None
-
-_LAST_NOTION_PUSH_TS = 0.0  # debounce for intraday pushes
-
 # ---------------------------
 # ENV helpers
 # ---------------------------
@@ -1093,7 +1084,7 @@ async def _estimate_unrealized_from_positions() -> Tuple[float, int, Dict[str, A
             continue
     return total_unrl, open_n, details
 
-async def _estimate_realized_today() -> Tuple[float, Dict[str, Any]]]:
+async def _estimate_realized_today() -> Tuple[float, Dict[str, Any]]:
     try:
         from utils_pkg.realized import realized_today_sol  # type: ignore
         v = await realized_today_sol()
