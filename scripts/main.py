@@ -17,6 +17,10 @@ scripts/main.py (vNext + DSN-normalizer + full buy hooks + healthcheck + sentry)
 - Optional **/health** endpoint (aiohttp present + HEALTH_PORT set).
 - Optional **Sentry** init (SENTRY_DSN).
 - Degrades gracefully if optional dependencies are missing.
+
+NEW in this edition:
+- Notion daily sync integrated into daily-PnL loop
+- Debounced intraday Notion sync on BUY_FILLED (default 10 min)
 """
 
 import asyncio
@@ -200,6 +204,15 @@ def _get_raydium_scanner():
     except Exception:
         return None
 
+# --- Notion (optional daily PnL sync) ---
+try:
+    from utils_pkg.notion_pnl import push_daily_pnl  # safe no-op if NOTION_ENABLED!=1
+except Exception:  # pragma: no cover
+    def push_daily_pnl(_snapshot):  # fallback no-op
+        return None
+
+_LAST_NOTION_PUSH_TS = 0.0  # debounce for intraday pushes
+
 # ---------------------------
 # ENV helpers
 # ---------------------------
@@ -315,12 +328,12 @@ DAILY_PNL_HOUR_UTC  = _as_int(os.getenv("DAILY_PNL_HOUR_UTC", "23"), 23)
 DAILY_PNL_TEST_NOW  = _as_bool(os.getenv("DAILY_PNL_TEST_NOW", "0"), False)
 DAILY_PNL_CHAT_ID   = (os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 DAILY_PNL_BOT       = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+DAILY_PNL_DEBOUNCE_MIN = _as_int(os.getenv("DAILY_PNL_DEBOUNCE_MIN", "10"), 10)
 
 # Scanner + dedupe tuning
 RAYDIUM_SCAN_INTERVAL_SEC = _as_float(os.getenv("RAYDIUM_SCAN_INTERVAL_SEC", "30"), 30.0)
 PF_GATE_TTL_SEC     = _as_int(os.getenv("PF_GATE_TTL_SEC", str(max(_as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC","10"),10)*2, 60))), max(ENTRY_MOMO_WINDOW_SEC*2, 60))
 PF_BUY_TTL_SEC      = _as_int(os.getenv("PF_BUY_TTL_SEC", "600"), 600)
-DAILY_PNL_DEBOUNCE_MIN = _as_int(os.getenv("DAILY_PNL_DEBOUNCE_MIN", "10"), 10)
 
 # Buy-hook Telegram toggles (optional)
 NOTIFY_BUY_SUBMITTED = _as_bool(os.getenv("TELEGRAM_NOTIFY_SUBMITTED", "0"), False)
@@ -383,6 +396,9 @@ def _approx_minutes_since(ts_any: Any) -> Optional[float]:
     except Exception:
         return None
     return None
+
+def utc_today_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).date().isoformat()
 
 # ---------------------------
 # Basic filters
@@ -545,6 +561,34 @@ async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
         with contextlib.suppress(Exception):
             await _tg_send_text(txt)
 
+async def _notion_intraday_snapshot_push(debounce_sec: float = None) -> None:
+    """
+    Build a fresh snapshot and push to Notion, debounced.
+    """
+    global _LAST_NOTION_PUSH_TS
+    debounce_sec = float(debounce_sec if debounce_sec is not None else (DAILY_PNL_DEBOUNCE_MIN * 60))
+    now = _dt.datetime.now(_dt.timezone.utc).timestamp()
+    if (now - _LAST_NOTION_PUSH_TS) < debounce_sec:
+        return
+    try:
+        unrl_sol, open_n, _ = await _estimate_unrealized_from_positions()
+        realized_sol, _rmeta = await _estimate_realized_today()
+        wallet_sol = await _get_wallet_sol_balance()
+        page_id = push_daily_pnl({
+            "date": utc_today_iso(),
+            "realized_sol": realized_sol,
+            "unrealized_sol": unrl_sol,
+            "open_positions": open_n,
+            "wallet_sol": wallet_sol,
+            # trades/realized_usd/unrealized_usd optional; client tolerates None
+            "note": "Intraday autosync",
+        })
+        if page_id:
+            log.event("NOTION_INTRADAY_PNL_UPSERTED", page_id=page_id)
+        _LAST_NOTION_PUSH_TS = now
+    except Exception as e:
+        log.warning("NOTION_INTRADAY_PNL_FAILED %s", e)
+
 async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
     """
     ev: { mint, signature, symbol, spend_sol, pool }
@@ -570,6 +614,10 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
               f"mint={ev.get('mint')}  size={ev.get('spend_sol')} SOL\nsig={ev.get('signature')}"
         with contextlib.suppress(Exception):
             await _tg_send_text(txt)
+
+    # Kick an intraday Notion push (debounced)
+    asyncio.create_task(_notion_intraday_snapshot_push())
+
     # Forward to exit engine (supports both new and legacy signatures)
     if not EXIT_ENGINE_ENABLED:
         return
@@ -863,6 +911,7 @@ class Strategy:
                             print("[guardrails] buys not allowed at execution — skip", flush=True)
                         self._diag["rejected_guardrails"] += 1
                         return
+                    max_tradeable = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)
                     if max_tradeable > 0:
                         try:
                             if len(list(all_positions())) >= max_tradeable:
@@ -996,24 +1045,6 @@ async def _pnl_pg_insert_row(*, realized_sol: float, unrealized_sol: float,
             traceback.print_exc()
         log.event("DAILY_PNL_PG_ERROR", when="insert_row", error=str(e))
 
-# main.py (telemetry.daily_pnl task)
-try:
-    from utils_pkg.notion_pnl import push_daily_pnl
-    pushed = push_daily_pnl({
-        "date": snapshot_date_iso,          # or however you name it
-        "realized_sol": realized_sol,
-        "unrealized_sol": unrealized_sol,
-        "open_positions": open_positions,
-        "wallet_sol": wallet_sol,           # optional if you have it
-        "trades": trades_count,             # if tracked
-        "price_usd": price_usd,             # if you already fetch SOL price
-        "note": "",                         # optional
-    })
-    if pushed:
-        log.info("NOTION_PNL_UPSERTED", extra={"page_id": pushed})
-except Exception as e:
-    log.warning("NOTION_PNL_FAILED", extra={"error": str(e)})
-
 async def _get_wallet_sol_balance() -> Optional[float]:
     try:
         from utils_pkg.wallet import get_sol_balance  # type: ignore
@@ -1062,7 +1093,7 @@ async def _estimate_unrealized_from_positions() -> Tuple[float, int, Dict[str, A
             continue
     return total_unrl, open_n, details
 
-async def _estimate_realized_today() -> Tuple[float, Dict[str, Any]]:
+async def _estimate_realized_today() -> Tuple[float, Dict[str, Any]]]:
     try:
         from utils_pkg.realized import realized_today_sol  # type: ignore
         v = await realized_today_sol()
@@ -1087,13 +1118,33 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
     async def _once():
         nonlocal _last_sent_ts
         now_ts = _dt.datetime.now(_dt.timezone.utc).timestamp()
-        if _last_sent_ts and (now_ts - _last_sent_ts) < (_as_int(os.getenv("DAILY_PNL_DEBOUNCE_MIN","10"),10) * 60):
+        if _last_sent_ts and (now_ts - _last_sent_ts) < (DAILY_PNL_DEBOUNCE_MIN * 60):
             log.event("DAILY_PNL_DEBOUNCE_SKIP", since_sec=int(now_ts - _last_sent_ts))
             return
 
         unrl_sol, open_n, unrl_details = await _estimate_unrealized_from_positions()
         realized_sol, r_meta = await _estimate_realized_today()
         wallet_sol = await _get_wallet_sol_balance()
+
+        # --- Notion: push daily snapshot (safe no-op if NOTION_ENABLED != 1)
+        try:
+            _page = push_daily_pnl({
+                "date": utc_today_iso(),
+                "realized_sol": realized_sol,
+                "unrealized_sol": unrl_sol,
+                "open_positions": open_n,
+                "wallet_sol": wallet_sol,
+                # Optional fields if you later add them:
+                # "trades": ...,
+                # "realized_usd": ...,
+                # "unrealized_usd": ...,
+                "net_sol": (realized_sol + unrl_sol),
+                "note": "Auto-daily sync",
+            })
+            if _page:
+                log.event("NOTION_DAILY_PNL_UPSERTED", page_id=_page)
+        except Exception as e:
+            log.warning("NOTION_DAILY_PNL_FAILED %s", e)
 
         now = _dt.datetime.now(_dt.timezone.utc)
         hdr = f"📊 <b>Daily PnL</b> — {now.strftime('%Y-%m-%d')} (UTC)"
@@ -1131,7 +1182,7 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
 
     while not stop_evt.is_set():
         now = _dt.datetime.now(_dt.timezone.utc)
-        run_at = now.replace(hour=_as_int(os.getenv("DAILY_PNL_HOUR_UTC", "23"), 23), minute=0, second=0, microsecond=0)
+        run_at = now.replace(hour=DAILY_PNL_HOUR_UTC, minute=0, second=0, microsecond=0)
         if run_at <= now:
             run_at = run_at + _dt.timedelta(days=1)
         wait_s = (run_at - now).total_seconds()
