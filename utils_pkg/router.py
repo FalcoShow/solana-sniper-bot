@@ -77,6 +77,7 @@ LAMPORTS_PER_SOL = 1_000_000_000
 # toggles / timeouts / retries
 # -------------------------
 DRY_RUN = _envb("DRYRUN", False) or _envb("DRY_RUN", False) or _envb("IS_DRYRUN", False)
+MIN_SOL_BALANCE = _envf("MIN_SOL_BALANCE", 3.0)  # you set 5.0 in env; this just exports it
 
 HTTP_TIMEOUT_GET  = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
 HTTP_TIMEOUT_POST = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_POST_SEC", 25.0))
