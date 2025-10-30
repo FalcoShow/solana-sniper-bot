@@ -20,6 +20,7 @@ from utils_pkg.solana_wallet import (
     get_pubkey_str,
     sign_and_send_b64_tx,   # fallback signer+sender (legacy)
     _send_b64_with_diag,    # robust RPC sender with simulate diagnostics
+    get_balance_lamports,   # ← ADDED: fast sync balance helper
 )
 
 # optional telegram helper (async)
@@ -77,7 +78,7 @@ LAMPORTS_PER_SOL = 1_000_000_000
 # toggles / timeouts / retries
 # -------------------------
 DRY_RUN = _envb("DRYRUN", False) or _envb("DRY_RUN", False) or _envb("IS_DRYRUN", False)
-MIN_SOL_BALANCE = _envf("MIN_SOL_BALANCE", 3.0)  # you set 5.0 in env; this just exports it
+MIN_SOL_BALANCE = _envf("MIN_SOL_BALANCE", 3.0)  # uses your env (e.g., 5.0)
 
 HTTP_TIMEOUT_GET  = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
 HTTP_TIMEOUT_POST = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_POST_SEC", 25.0))
@@ -179,6 +180,7 @@ def _jup_headers() -> Dict[str, str]:
         h["x-jup-auth"] = f"Bearer {bearer}"
     return h
 
+_JUP_LAST_GOOD_BASE: Optional[str] = None
 def _bases() -> List[str]:
     # Strict order: last good (if any) -> JUP_UPSTREAM -> JUP_ALT_BASE_URLS
     out: List[str] = []
@@ -198,7 +200,6 @@ _JUP_FAIL_COUNT = 0
 _JUP_FAIL_LIMIT = _envi("JUP_FAIL_LIMIT", 8)
 _JUP_BREAKER_COOLDOWN = _envf("JUP_BREAKER_COOLDOWN_SEC", 30.0)
 _JUP_BREAKER_UNTIL: float = 0.0
-_JUP_LAST_GOOD_BASE: Optional[str] = None
 
 def _jup_breaker_check() -> None:
     if time.time() < _JUP_BREAKER_UNTIL:
@@ -359,7 +360,7 @@ def _from_result_container(obj: Any) -> Any:
                     if j is not None: return j
     if isinstance(res, str):
         j = _jtry(res) or _jtry(_b64txt(res) or "")
-        if j is not None: return j
+        if j is not None: return _dfs_extract(j)
     return None
 
 def _from_action_envelope(obj: Any) -> Any:
@@ -570,7 +571,7 @@ _TOK_META: Dict[str, Dict[str, Any]] = {}
 _KNOWN_DECIMALS: Dict[str, int] = {
     SOL_MINT: 9,
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": 6,  # USDC
-    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": 6,  # alt usdc
+    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": 6,  # BONK (example, safe as 6)
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": 6,  # USDT
 }
 
@@ -666,7 +667,7 @@ async def get_decimals(mint: str) -> Optional[int]:
     return await _get_decimals(mint)
 
 # =======================================================
-# Priority fee / dynamic tuning (unchanged logic)
+# Priority fee / dynamic tuning
 # =======================================================
 def _to_sol_from_lamports_like(x: float) -> float:
     lamports = float(x)
@@ -805,6 +806,46 @@ async def start() -> None:
 
 async def shutdown() -> None:
     return None
+
+# =======================================================
+# Reserve guard (NEW)
+# =======================================================
+async def _enforce_min_sol(required_spend_lamports: int = 0) -> bool:
+    """
+    Block trades if (balance - required_spend) < MIN_SOL_BALANCE.
+    Sends a Telegram note when blocked.
+    """
+    try:
+        min_sol_env = os.getenv("MIN_SOL_BALANCE", "").strip()
+        min_sol = float(min_sol_env) if min_sol_env else float(MIN_SOL_BALANCE)
+    except Exception:
+        min_sol = float(MIN_SOL_BALANCE)
+
+    if min_sol <= 0:
+        return True  # no reserve configured
+
+    try:
+        bal_lamports = int(get_balance_lamports())
+    except Exception:
+        bal_lamports = 0
+
+    reserve = int(min_sol * LAMPORTS_PER_SOL)
+    spend = int(required_spend_lamports or 0)
+    if bal_lamports - spend < reserve:
+        try:
+            need_ui = max(0.0, (reserve + spend - bal_lamports) / LAMPORTS_PER_SOL)
+            await _send_safe(
+                "TRADE BLOCKED (SOL reserve)\n"
+                f"Balance: {bal_lamports/1e9:.4f} SOL\n"
+                f"Reserve: {min_sol:.4f} SOL\n"
+                f"Spend est: {spend/1e9:.4f} SOL\n"
+                f"Top up needed: {need_ui:.4f} SOL",
+                src="router.guard.sol",
+            )
+        except Exception:
+            pass
+        return False
+    return True
 
 # =======================================================
 # internal Jupiter helpers
@@ -1089,6 +1130,14 @@ async def buy_via_lightning(*, mint: str, amount_sol: Optional[float] = None, la
         await _send_safe(f"BUY ERROR (size)\nMint: {mint}\nErr: zero-size trade", src="router.buy.error.size")
         return False, None
 
+    # --------- RESERVE GUARD (NEW): before quoting ---------
+    prio_est = _PRIO.choose_lamports(priority_sol)
+    required = lamports_in + (int(prio_est) if prio_est else 0)
+    ok_reserve = await _enforce_min_sol(required_spend_lamports=required)
+    if not ok_reserve:
+        return False, None
+    # --------------------------------------------------------
+
     # quote
     try:
         sbps = _clamp_slippage_bps(slippage_bps)
@@ -1166,6 +1215,14 @@ async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_
 
     kp = load_keypair()
     owner = get_pubkey_str(kp)
+
+    # --------- RESERVE GUARD (NEW): ensure fee headroom before quoting ---------
+    prio_est = _PRIO.choose_lamports(priority_sol)
+    required = int(prio_est) if prio_est else 0
+    ok_reserve = await _enforce_min_sol(required_spend_lamports=required)
+    if not ok_reserve:
+        return False, None
+    # ---------------------------------------------------------------------------
 
     try:
         sbps = _clamp_slippage_bps(slippage_bps)
