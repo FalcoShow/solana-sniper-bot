@@ -38,7 +38,7 @@ if not hasattr(log, "every"):
     setattr(log, "every", _every)  # type: ignore[attr-defined]
 
 # -------------------------
-# small env helpers
+# env helpers
 # -------------------------
 def _envb(k: str, default: bool = False) -> bool:
     v = (os.getenv(k, "") or "").strip().lower()
@@ -59,7 +59,7 @@ def _envi(k: str, d: int) -> int:
         return int(d)
 
 # -------------------------
-# basic chain / rpc config
+# chain / rpc config
 # -------------------------
 try:
     from utils_pkg.txlearn import RPC_URL as _TX_RPC_URL, TX_COMMITMENT as _TX_COMMITMENT  # type: ignore
@@ -129,9 +129,99 @@ except Exception:
 
 _UA = {"user-agent": "pnlsniper/1.0 (+router)", "accept": "application/json", "content-type": "application/json"}
 
-# -------------------------
+# =======================================================
+# Jupiter upstream: HONOR ENV + MODERN PATHS
+# =======================================================
+def _env_bool(name: str, default: str = "0") -> bool:
+    return (os.getenv(name, default) or "").lower() in ("1", "true", "yes", "on")
+
+# Primary base and alternates (no trailing slash)
+# >>> NEVER default to quote-api.jup.ag here <<<
+JUP_UPSTREAM: str = (
+    os.getenv("JUP_UPSTREAM")
+    or os.getenv("JUP_BASE_URL")
+    or "https://public.jupiterapi.com"
+).rstrip("/")
+JUP_ALT_BASE_URLS: List[str] = [
+    u.strip().rstrip("/")
+    for u in (os.getenv("JUP_ALT_BASE_URLS") or "").split(",")
+    if u.strip()
+]
+AS_LEGACY = _env_bool("JUP_AS_LEGACY", "0")
+ONLY_DIRECT_DEFAULT = _env_bool("JUP_ONLY_DIRECT", "0")
+
+def _quote_url(base: str) -> str:
+    # Modern public endpoint uses /quote; legacy microservice used /swap/v1/quote
+    return f"{base.rstrip('/')}/swap/v1/quote" if AS_LEGACY else f"{base.rstrip('/')}/quote"
+
+def _swap_url(base: str) -> str:
+    # Modern public endpoint uses /swap; legacy used /swap/v1/swap
+    return f"{base.rstrip('/')}/swap/v1/swap" if AS_LEGACY else f"{base.rstrip('/')}/swap"
+
+def _is_qn_call_url(u: str) -> bool:
+    u = (u or "").rstrip("/")
+    return "/functions/" in u and u.endswith("/call")
+
+def _qn_path(base: str, path: str) -> str:
+    # QuickNode functions passthrough (RAW mode)
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}path={path}&mode=RAW"
+
+def _jup_headers() -> Dict[str, str]:
+    h = {"accept": "application/json", "content-type": "application/json", "origin": "https://jup.ag", "referer": "https://jup.ag/"}
+    key = (os.getenv("JUP_API_KEY") or os.getenv("JUP_PRO_KEY") or os.getenv("QUICKNODE_FUNCTION_KEY") or "").strip()
+    if key:
+        h["x-api-key"] = key
+        h.setdefault("x-quicknode-mode", "RAW")
+    bearer = (os.getenv("JUP_BEARER") or "").strip()
+    if bearer:
+        h["x-jup-auth"] = f"Bearer {bearer}"
+    return h
+
+def _bases() -> List[str]:
+    # Strict order: last good (if any) -> JUP_UPSTREAM -> JUP_ALT_BASE_URLS
+    out: List[str] = []
+    if _JUP_LAST_GOOD_BASE:
+        out.append(_JUP_LAST_GOOD_BASE)
+    if JUP_UPSTREAM and JUP_UPSTREAM not in out:
+        out.append(JUP_UPSTREAM)
+    for a in JUP_ALT_BASE_URLS:
+        if a and a not in out:
+            out.append(a)
+    return out
+
+# =======================================================
+# Circuit breaker
+# =======================================================
+_JUP_FAIL_COUNT = 0
+_JUP_FAIL_LIMIT = _envi("JUP_FAIL_LIMIT", 8)
+_JUP_BREAKER_COOLDOWN = _envf("JUP_BREAKER_COOLDOWN_SEC", 30.0)
+_JUP_BREAKER_UNTIL: float = 0.0
+_JUP_LAST_GOOD_BASE: Optional[str] = None
+
+def _jup_breaker_check() -> None:
+    if time.time() < _JUP_BREAKER_UNTIL:
+        raise RuntimeError(f"JUP_CIRCUIT_BREAKER active for {round(_JUP_BREAKER_UNTIL - time.time(), 1)}s")
+
+def _jup_record_success(base: str):
+    global _JUP_FAIL_COUNT, _JUP_BREAKER_UNTIL, _JUP_LAST_GOOD_BASE
+    if _JUP_FAIL_COUNT > 0:
+        log.event("JUP_BREAKER_RESET", fails=_JUP_FAIL_COUNT)
+    _JUP_FAIL_COUNT = 0
+    _JUP_BREAKER_UNTIL = 0
+    _JUP_LAST_GOOD_BASE = (base or "").strip().rstrip("/")
+
+def _jup_record_failure():
+    global _JUP_FAIL_COUNT, _JUP_BREAKER_UNTIL
+    _JUP_FAIL_COUNT += 1
+    log.every("jup.fail", n=1, msg="JUP_FAIL_COUNT", count=_JUP_FAIL_COUNT)
+    if _JUP_FAIL_COUNT >= _JUP_FAIL_LIMIT:
+        _JUP_BREAKER_UNTIL = time.time() + _JUP_BREAKER_COOLDOWN
+        log.event("JUP_BREAKER_TRIPPED", until=_JUP_BREAKER_UNTIL)
+
+# =======================================================
 # Telegram helpers
-# -------------------------
+# =======================================================
 _MARKDOWNV2_SPECIALS = r"_*[]()~`>#+-=|{}.!\\"  # sanitized characters for Telegram plain messages
 def _tg_plain(msg: str) -> str:
     return "".join(ch for ch in msg if ch not in _MARKDOWNV2_SPECIALS)
@@ -180,9 +270,9 @@ async def _send_safe(msg: str, *, src: str) -> None:
         except Exception:
             pass
 
-# -------------------------
+# =======================================================
 # base58 helpers & mint sanitation
-# -------------------------
+# =======================================================
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58_IDX = {c: i for i, c in enumerate(_B58_ALPHABET)}
 
@@ -228,133 +318,8 @@ def normalize_pump_id_to_mint(raw: str) -> str:
     return normalize_mint(raw)
 
 # =======================================================
-# Jupiter: Circuit breaker, base prioritization & helpers
+# QuickNode & unwrap helpers (for /functions/.../call)
 # =======================================================
-
-# --- Circuit breaker state ---
-_JUP_FAIL_COUNT = 0
-_JUP_FAIL_LIMIT = _envi("JUP_FAIL_LIMIT", 8)
-_JUP_BREAKER_COOLDOWN = _envf("JUP_BREAKER_COOLDOWN_SEC", 30.0)
-_JUP_BREAKER_UNTIL: float = 0.0
-_JUP_LAST_GOOD_BASE: Optional[str] = None
-
-def _jup_breaker_check() -> None:
-    if time.time() < _JUP_BREAKER_UNTIL:
-        raise RuntimeError(f"JUP_CIRCUIT_BREAKER active for {round(_JUP_BREAKER_UNTIL - time.time(), 1)}s")
-
-def _jup_record_success(base: str):
-    global _JUP_FAIL_COUNT, _JUP_BREAKER_UNTIL, _JUP_LAST_GOOD_BASE
-    if _JUP_FAIL_COUNT > 0:
-        log.event("JUP_BREAKER_RESET", fails=_JUP_FAIL_COUNT)
-    _JUP_FAIL_COUNT = 0
-    _JUP_BREAKER_UNTIL = 0
-    _JUP_LAST_GOOD_BASE = (base or "").strip().rstrip("/")
-
-def _jup_record_failure():
-    global _JUP_FAIL_COUNT, _JUP_BREAKER_UNTIL
-    _JUP_FAIL_COUNT += 1
-    log.every("jup.fail", n=1, msg="JUP_FAIL_COUNT", count=_JUP_FAIL_COUNT)
-    if _JUP_FAIL_COUNT >= _JUP_FAIL_LIMIT:
-        _JUP_BREAKER_UNTIL = time.time() + _JUP_BREAKER_COOLDOWN
-        log.event("JUP_BREAKER_TRIPPED", until=_JUP_BREAKER_UNTIL)
-
-# --- Base selection & headers ---
-def _is_qn_call_url(u: str) -> bool:
-    u = (u or "").rstrip("/")
-    return "/functions/" in u and u.endswith("/call")
-
-def _compose_endpoint(base: str, kind: str) -> tuple[str, bool]:
-    b = base.rstrip("/")
-    if _is_qn_call_url(b):
-        sep = "&" if "?" in b else "?"
-        return f"{b}{sep}path=/v6/{kind}&mode=RAW", True
-    return f"{b}/v6/{kind}", False
-
-def _paths_for_base(base: str) -> Tuple[str, str, bool]:
-    """
-    Return (quote_path, swap_path, is_qn_call) for the base.
-    """
-    b = (base or "").strip().rstrip("/")
-    if not b:
-        return ("/v6/quote", "/v6/swap", False)
-
-    if _is_qn_call_url(b):
-        sep = "&" if "?" in b else "?"
-        return (f"{b}{sep}path=/v6/quote&mode=RAW", f"{b}{sep}path=/v6/swap&mode=RAW", True)
-
-    if "api.jup.ag" in b or "lite-api.jup.ag" in b:
-        return ("/swap/v1/quote", "/swap/v1/swap", False)
-
-    if "quote-api.jup.ag" in b or "public.jupiterapi.com" in b:
-        return ("/v6/quote", "/v6/swap", False)
-
-    return ("/v6/quote", "/v6/swap", False)
-
-def _jup_headers_for(base: str) -> Dict[str, str]:
-    h: Dict[str, str] = {**_UA, "origin": "https://jup.ag", "referer": "https://jup.ag/"}
-    x_api = (os.getenv("JUP_API_KEY") or os.getenv("QUICKNODE_FUNCTION_KEY") or "").strip()
-    if x_api:
-        h["x-api-key"] = x_api
-        h.setdefault("x-quicknode-mode", "RAW")
-    pro_key = (os.getenv("JUP_PRO_KEY") or "").strip()
-    if pro_key and ("api.jup.ag" in base):
-        h["x-api-key"] = pro_key
-    jup_bearer = (os.getenv("JUP_BEARER") or "").strip()
-    if jup_bearer:
-        h["x-jup-auth"] = f"Bearer {jup_bearer}"
-    return h
-
-def _alt_bases() -> Sequence[str]:
-    """
-    Prioritize the last good base first, then user-provided bases.
-    Env:
-      - JUP_BASE_URL primary (can be custom relay/proxy)
-      - JUP_ALT_BASE_URLS comma-separated fallbacks
-      - JUP_UPSTREAM / JUP_LITE / JUP_LEGACY used by _quote_bases_order()
-    """
-    bases: list[str] = []
-    primary = (_JUP_LAST_GOOD_BASE or (os.getenv("JUP_BASE_URL") or "https://quote-api.jup.ag")).strip().rstrip("/")
-    if primary:
-        bases.append(primary)
-    alts = (os.getenv("JUP_ALT_BASE_URLS") or "").strip()
-    if alts:
-        for a in alts.split(","):
-            a = a.strip().rstrip("/")
-            if a and a not in bases:
-                bases.append(a)
-    # Dedup keeping order
-    final: list[str] = []
-    for b in bases:
-        if b and b not in final:
-            final.append(b)
-    return final
-
-# helper to choose quote bases order (relay -> pro -> lite -> v6)
-def _quote_bases_order() -> List[tuple[str, str]]:
-    out: List[tuple[str, str]] = []
-    relay = (os.getenv("JUP_BASE_URL") or "").strip().rstrip("/")
-    if relay:
-        out.append((relay, "v1"))
-    pro  = (os.getenv("JUP_UPSTREAM") or "https://api.jup.ag").strip().rstrip("/")
-    lite = (os.getenv("JUP_LITE")     or "https://lite-api.jup.ag").strip().rstrip("/")
-    v6   = (os.getenv("JUP_LEGACY")   or "https://quote-api.jup.ag").strip().rstrip("/")
-    out += [(pro, "v1"), (lite, "v1"), (v6, "v6")]
-    seen = set()
-    final: List[tuple[str, str]] = []
-    for b, k in out:
-        if b and (b, k) not in seen:
-            seen.add((b, k))
-            final.append((b, k))
-    # Prefer last known good base if present
-    if _JUP_LAST_GOOD_BASE:
-        lg = _JUP_LAST_GOOD_BASE
-        prioritized = [(lg, "v1")] + [p for p in final if p[0] != lg]
-        return prioritized
-    return final
-
-# -------------------------
-# QuickNode / action unwrap helpers
-# -------------------------
 def _jtry(s: str):
     try:
         return json.loads(s)
@@ -443,11 +408,6 @@ def _dfs_extract(node: Any) -> Any:
         if j is not None: return _dfs_extract(j)
     return None
 
-def _tiny_shape(o: Any) -> str:
-    if isinstance(o, dict): return "dict:" + ",".join(list(o.keys())[:6])
-    if isinstance(o, list): return f"list:{len(o)}"
-    return type(o).__name__
-
 def _unwrap_qn_action(response: requests.Response, parsed: Any) -> Any:
     try:
         st = int(getattr(response, "status_code", 0) or 0)
@@ -459,22 +419,13 @@ def _unwrap_qn_action(response: requests.Response, parsed: Any) -> Any:
         inner = _dfs_extract(parsed)
         if isinstance(inner, dict) and _looks_jup(inner):
             return inner
-        try:
-            log.every("qn.unwrap.miss", n=30, msg="QN_UNWRAP_MISS",
-                      status=st, top=_tiny_shape(parsed),
-                      hint=("result" if isinstance(parsed, dict) and "result" in parsed else
-                            "execution" if isinstance(parsed, dict) and "execution" in parsed else
-                            "logs" if isinstance(parsed, dict) and "logs" in parsed else
-                            "no-hint"))
-        except Exception:
-            pass
         return parsed
     except Exception:
         return parsed
 
-# -------------------------
-# jupiter pacing + retry helper
-# -------------------------
+# =======================================================
+# pacing & retry
+# =======================================================
 async def _jup_gate() -> None:
     global _JUP_LAST_TS
     async with _JUP_RATE_LOCK:
@@ -504,32 +455,26 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
                 raise
     raise last_err if last_err else RuntimeError(f"{label} failed")
 
-# -------------------------
-# HTTP helpers with fallback + breaker + timing
-# -------------------------
-async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) -> dict:
+# =======================================================
+# HTTP helpers (STRICT bases -> paths from env)
+# =======================================================
+async def _http_get(kind: str, *, params: dict, timeout: float) -> dict:
     """
-    GET calls to Jupiter-style endpoints with:
-      - multiple base fallbacks (incl. QuickNode / functions)
-      - circuit breaker
-      - latency logs
-      - action unwrap support
+    GET to /quote (or legacy /swap/v1/quote) with fallbacks across your env bases.
+    Also supports QuickNode /functions/.../call passthrough.
     """
     _jup_breaker_check()
     last_err: Optional[Exception] = None
-    for idx, base in enumerate(_alt_bases()):
-        quote_path, swap_path, is_qn = _paths_for_base(base)
+    for idx, base in enumerate(_bases()):
         t0 = time.time()
         try:
-            if is_qn:
-                url = quote_path if kind == "quote" else (quote_path if kind == "tokens" else f"{base.rstrip('/')}/v6/{kind}")
-                r = requests.post(url, json=None, params=params, timeout=timeout, headers=_jup_headers_for(base))
+            if _is_qn_call_url(base):
+                path = "/swap/v1/quote" if AS_LEGACY else "/quote"
+                url = _qn_path(base, path if kind == "quote" else f"/{kind}")
+                r = requests.post(url, json=None, params=params, timeout=timeout, headers=_jup_headers())
             else:
-                if kind == "quote":
-                    url = base.rstrip("/") + quote_path
-                else:
-                    url, _ = _compose_endpoint(base, kind)
-                r = requests.get(url, params=params, timeout=timeout, headers=_jup_headers_for(base))
+                url = _quote_url(base) if kind == "quote" else f"{base.rstrip('/')}/{kind}"
+                r = requests.get(url, params=params, timeout=timeout, headers=_jup_headers())
             try:
                 js = r.json()
             except Exception:
@@ -538,11 +483,8 @@ async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) ->
             js = _unwrap_qn_action(r, js)
             if r.status_code in (200, 201):
                 _jup_record_success(base)
-                try:
-                    log.every("jup.quote.latency", n=1, msg="JUP_QUOTE_TIME",
-                              dur_ms=int((time.time() - t0) * 1000), base=base, kind=kind)
-                except Exception:
-                    pass
+                log.every("jup.quote.latency", n=1, msg="JUP_QUOTE_TIME",
+                          dur_ms=int((time.time() - t0) * 1000), base=base, kind=kind)
                 return js
             last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
             log.every("jup.http.err", n=5, msg="JUP_HTTP_ERR", base=base, kind=kind, code=r.status_code)
@@ -552,123 +494,75 @@ async def _http_get_with_fallback(kind: str, *, params: dict, timeout: float) ->
         except Exception as e:
             last_err = e
             log.every("jup.unknown.err", n=5, msg="JUP_UNKNOWN_ERR", base=base, kind=kind, err=str(e))
-        await asyncio.sleep(0.05 if idx == 0 else 0.1)
+        await asyncio.sleep(0.06 if idx == 0 else 0.12)
     _jup_record_failure()
-    raise last_err or RuntimeError("all quote endpoints failed")
+    raise last_err or RuntimeError(f"all {kind} endpoints failed")
 
-async def _http_post_with_fallback(kind: str, *, json_body: Optional[dict], params: Optional[dict], timeout: float) -> dict:
+async def _http_post_swap(*, json_body: Optional[dict], params: Optional[dict], timeout: float) -> dict:
     """
-    POST calls (swap) with:
-      - multiple candidate endpoints per base
-      - circuit breaker
-      - action unwrap support
+    POST to /swap (or legacy /swap/v1/swap) with fallbacks across your env bases.
     """
     _jup_breaker_check()
     last_err: Optional[Exception] = None
-
-    def _swap_candidates(base: str) -> list[tuple[str, bool]]:
-        quote_path, swap_path, is_qn = _paths_for_base(base)
-        b = base.rstrip("/")
-        if is_qn:
-            return [(swap_path, True)]
-        candidates = [(b + swap_path, False)]
-        candidates.append((f"{b}/swap/v1/swap", False))
-        candidates.append((f"{b}/swap/v1/tx", False))
-        return candidates
-
-    for bidx, base in enumerate(_alt_bases()):
-        try_paths = _swap_candidates(base) if kind == "swap" else [_compose_endpoint(base, kind)]
-        for _pidx, (url, _is_qn) in enumerate(try_paths):
+    for idx, base in enumerate(_bases()):
+        try:
+            if _is_qn_call_url(base):
+                path = "/swap/v1/swap" if AS_LEGACY else "/swap"
+                url = _qn_path(base, path)
+                r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=_jup_headers())
+            else:
+                url = _swap_url(base)
+                r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=_jup_headers())
             try:
-                log.every("swap.try", n=1, msg="SWAP_TRY", url=url)
+                js = r.json()
             except Exception:
-                pass
-            try:
-                r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=_jup_headers_for(base))
-                try:
-                    js = r.json()
-                except Exception:
-                    r.raise_for_status()
-                    raise
-                js = _unwrap_qn_action(r, js)
-                if r.status_code in (200, 201):
-                    _jup_record_success(base)
-                    return js
-                last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
-                log.every("jup.swap.err", n=5, msg="JUP_SWAP_HTTP_ERR", base=base, code=r.status_code)
-            except RequestException as e:
-                last_err = e
-                log.every("jup.swap.req", n=5, msg="JUP_SWAP_REQ_ERR", base=base, err=str(e))
-            except Exception as e:
-                last_err = e
-                log.every("jup.swap.unknown", n=5, msg="JUP_SWAP_UNKNOWN_ERR", base=base, err=str(e))
-            await asyncio.sleep(0.03)
-        await asyncio.sleep(0.08 if bidx == 0 else 0.12)
+                r.raise_for_status()
+                raise
+            js = _unwrap_qn_action(r, js)
+            if r.status_code in (200, 201):
+                _jup_record_success(base)
+                return js
+            last_err = RuntimeError(f"{url} -> HTTP {r.status_code} ({str(js)[:200]})")
+            log.every("jup.swap.err", n=5, msg="JUP_SWAP_HTTP_ERR", base=base, code=r.status_code)
+        except RequestException as e:
+            last_err = e
+            log.every("jup.swap.req", n=5, msg="JUP_SWAP_REQ_ERR", base=base, err=str(e))
+        except Exception as e:
+            last_err = e
+            log.every("jup.swap.unknown", n=5, msg="JUP_SWAP_UNKNOWN_ERR", base=base, err=str(e))
+        await asyncio.sleep(0.08 if idx == 0 else 0.15)
     _jup_record_failure()
     raise last_err or RuntimeError("all swap endpoints failed")
 
-# -------------------------
-# jupiter multi-path quote helper
-# -------------------------
-async def _http_get_quote_any(*, params_v1: dict, params_v6: dict) -> dict:
-    last_err: Optional[Exception] = None
-    for base, kind in _quote_bases_order():
-        try:
-            await _jup_gate()
-            t0 = time.time()
-            quote_path, swap_path, is_qn = _paths_for_base(base)
-            if is_qn:
-                url = quote_path
-                r = requests.post(url, json=None, params=(params_v1 if kind == "v1" else params_v6), timeout=HTTP_TIMEOUT_GET, headers=_jup_headers_for(base))
-            else:
-                url = base.rstrip("/") + quote_path
-                r = requests.get(url, params=(params_v1 if kind == "v1" else params_v6), timeout=HTTP_TIMEOUT_GET, headers=_jup_headers_for(base))
-            if r.status_code >= 400:
-                raise RuntimeError(f"{kind}@{base} -> {r.status_code} {r.text[:300]}")
-            _jup_record_success(base)
-            try:
-                log.every("quote.fallback", n=10, msg="QUOTE_PATH_USED", base=base, kind=kind, dur_ms=int((time.time()-t0)*1000))
-            except Exception:
-                pass
-            return r.json()
-        except Exception as e:
-            last_err = e
-            _jup_record_failure()
-            log.every("quote.fallback", n=10, msg="QUOTE_FALLBACK", base=base, kind=kind, err=str(e))
-            continue
-    raise last_err or RuntimeError("all quote endpoints failed")
+# =======================================================
+# Tokens catalog (optional; best-effort)
+# =======================================================
+async def _tokens_catalog() -> List[dict]:
+    global _TOKENS_CACHE
+    now = time.time()
+    if _TOKENS_CACHE and _TOKENS_CACHE[0] >= now:
+        return _TOKENS_CACHE[1]
+    try:
+        # Many public relays host /tokens; if not, this silently no-ops.
+        js = await _http_get("tokens", params={}, timeout=HTTP_TIMEOUT_GET)
+        arr: List[dict] = js if isinstance(js, list) else []
+        if arr:
+            for t in arr:
+                try:
+                    maddr = (t.get("address") or "").strip()
+                    if maddr:
+                        _TOK_META[maddr] = t
+                except Exception:
+                    continue
+            _TOKENS_CACHE = (now + TOKENS_TTL_SEC, arr)
+            return arr
+    except Exception:
+        pass
+    return _TOKENS_CACHE[1] if _TOKENS_CACHE else []
 
 # =======================================================
-# FILTER HELPER for scanners (clear reason logging)
+# token decimals & RPC helpers
 # =======================================================
-def run_filters(token: dict, filters: List[Callable[[dict], Tuple[bool, str]]]) -> tuple[bool, str]:
-    """
-    Run a list of filter functions against a token dict.
-    Each filter returns (ok: bool, reason: str).
-    """
-    for f in filters:
-        try:
-            ok, reason = f(token)
-        except Exception as e:
-            ok, reason = False, f"Exception: {e}"
-        if not ok:
-            # compact, machine-parseable log
-            try:
-                log.info("TOKEN_REJECTED", extra={
-                    "mint": token.get("mint"),
-                    "symbol": token.get("symbol"),
-                    "filter": getattr(f, "__name__", "filter"),
-                    "reason": reason
-                })
-            except Exception:
-                log.event("TOKEN_REJECTED", mint=token.get("mint"), symbol=token.get("symbol"),
-                          filter=getattr(f, "__name__", "filter"), reason=reason)
-            return False, reason
-    return True, "ok"
-
-# -------------------------
-# token decimals lookup
-# -------------------------
 _DECIMALS: Dict[str, int] = {}
 _TOK_META: Dict[str, Dict[str, Any]] = {}
 
@@ -714,33 +608,6 @@ def _mint_decimals_from_data(b: bytes) -> Optional[int]:
     except Exception:
         pass
     return None
-
-async def _tokens_catalog() -> List[dict]:
-    global _TOKENS_CACHE
-    now = time.time()
-    if _TOKENS_CACHE and _TOKENS_CACHE[0] >= now:
-        return _TOKENS_CACHE[1]
-    try:
-        js = await _http_get_with_fallback("tokens", params={}, timeout=HTTP_TIMEOUT_GET)
-        arr: List[dict] = js if isinstance(js, list) else []
-        if arr:
-            for t in arr:
-                try:
-                    maddr = (t.get("address") or "").strip()
-                    if maddr:
-                        _TOK_META[maddr] = t
-                except Exception:
-                    continue
-            _TOKENS_CACHE = (now + TOKENS_TTL_SEC, arr)
-            return arr
-    except Exception:
-        pass
-    return _TOKENS_CACHE[1] if _TOKENS_CACHE else []
-
-def _tok_symbol(mint: str) -> Optional[str]:
-    meta = _TOK_META.get(mint)
-    s = (meta or {}).get("symbol")
-    return str(s).strip() if s else None
 
 async def _decimals_from_tokens_api(mint: str) -> Optional[int]:
     arr = await _tokens_catalog()
@@ -797,9 +664,9 @@ async def get_decimals(mint: str) -> Optional[int]:
     _assert_pubkey(mint, "mint")
     return await _get_decimals(mint)
 
-# -------------------------
-# priority fee / dynamic tuning
-# -------------------------
+# =======================================================
+# Priority fee / dynamic tuning (unchanged logic)
+# =======================================================
 def _to_sol_from_lamports_like(x: float) -> float:
     lamports = float(x)
     if lamports >= 1e9:
@@ -938,9 +805,9 @@ async def start() -> None:
 async def shutdown() -> None:
     return None
 
-# -------------------------
+# =======================================================
 # internal Jupiter helpers
-# -------------------------
+# =======================================================
 def _bool01(x: Optional[bool]) -> int:
     return 1 if bool(x) else 0
 
@@ -955,7 +822,7 @@ def _slippage_bps() -> int:
     return max(1, int(round(s * 10_000)))
 
 def _as_legacy() -> bool:
-    return (os.getenv("JUP_AS_LEGACY", "0") or "0").strip().lower() in {"1", "true", "yes", "y"}
+    return AS_LEGACY
 
 def _qkey(input_mint: str, output_mint: str, amount_iu: int, slippage_bps: Optional[int], swap_mode: str, direct: Optional[bool], legacy: Optional[bool]) -> str:
     sbps = "" if slippage_bps is None else str(slippage_bps)
@@ -1008,16 +875,8 @@ async def _jup_quote(input_mint: str, output_mint: str, amount_iu: int, *, slipp
             raise RuntimeError("quote blocked by budget")
         try:
             await _jup_gate()
-            params_v1 = {
-                "inputMint": input_mint,
-                "outputMint": output_mint,
-                "amount": str(amount_iu),
-                "slippageBps": sbps,
-                "swapMode": swap_mode,
-                "onlyDirectRoutes": "true" if only_direct else "false",
-                "asLegacyTransaction": "true" if legacy else "false",
-            }
-            params_v6 = {
+            # modern params (public /quote)
+            params = {
                 "inputMint": input_mint,
                 "outputMint": output_mint,
                 "amount": str(amount_iu),
@@ -1025,8 +884,10 @@ async def _jup_quote(input_mint: str, output_mint: str, amount_iu: int, *, slipp
                 "onlyDirectRoutes": "true" if only_direct else "false",
                 "asLegacyTransaction": "true" if legacy else "false",
             }
+            # legacy adds swapMode; modern ignores it safely
+            params["swapMode"] = swap_mode
             t0 = time.time()
-            js = await _http_get_quote_any(params_v1=params_v1, params_v6=params_v6)
+            js = await _http_get("quote", params=params, timeout=HTTP_TIMEOUT_GET)
             dur_ms = int((time.time() - t0) * 1000)
             log.every("quote.ms", n=5, msg="QUOTE_DURATION_MS", ms=dur_ms)
             await _set_cached_quote(key, js, QUOTE_TTL_SEC)
@@ -1052,15 +913,15 @@ async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optiona
         body["prioritizationFeeLamports"] = int(priority_lamports)
     if compute_units and compute_units > 0:
         body["computeUnitLimit"] = int(compute_units)
-    js = await _http_post_with_fallback("swap", json_body=body, params=None, timeout=HTTP_TIMEOUT_POST)
+    js = await _http_post_swap(json_body=body, params=None, timeout=HTTP_TIMEOUT_POST)
     tx_b64 = js.get("swapTransaction")
     if not tx_b64:
         raise RuntimeError(f"Jupiter returned no swapTransaction: {js}")
     return tx_b64
 
-# -------------------------
+# =======================================================
 # public quote & price helpers
-# -------------------------
+# =======================================================
 def _clamp_slippage_bps(v: Optional[int]) -> int:
     try:
         sv = int(v if v is not None else _slippage_bps())
@@ -1097,7 +958,7 @@ async def get_sell_quote(*, mint: str, amount_raw: int, slippage_bps: Optional[i
     mint = _sanitize_mint(mint)
     _assert_pubkey(mint, "mint")
     sbps = _clamp_slippage_bps(slippage_bps)
-    direct = only_direct if isinstance(only_direct, bool) else _bool_env("JUP_ONLY_DIRECT", False)
+    direct = only_direct if isinstance(only_direct, bool) else ONLY_DIRECT_DEFAULT
     q = await _retry(_jup_quote, mint, SOL_MINT, amount_raw, tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-sell", slippage_bps=sbps, only_direct=direct)
     lamports_out = int(q.get("outAmount") or 0)
     dec = await _safe_decimals(mint)
@@ -1116,7 +977,7 @@ async def get_buy_quote(*, mint: str, lamports_in: Optional[int] = None, amount_
     if lamports_in <= 0:
         raise ValueError("Provide a positive lamports_in or amount_sol > 0")
     sbps = _clamp_slippage_bps(slippage_bps)
-    direct = only_direct if isinstance(only_direct, bool) else _bool_env("JUP_ONLY_DIRECT", False)
+    direct = only_direct if isinstance(only_direct, bool) else ONLY_DIRECT_DEFAULT
     q = await _retry(_jup_quote, SOL_MINT, mint, lamports_in, tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-buy", slippage_bps=sbps, only_direct=direct)
     out_raw = int(q.get("outAmount") or 0)
     dec = await _safe_decimals(mint)
@@ -1184,9 +1045,14 @@ async def mint_decimals(mint: str) -> Optional[int]:
     _assert_pubkey(mint, "mint")
     return await _get_decimals(mint)
 
-# -------------------------
+# =======================================================
 # small formatting utilities
-# -------------------------
+# =======================================================
+def _tok_symbol(mint: str) -> Optional[str]:
+    meta = _TOK_META.get(mint)
+    s = (meta or {}).get("symbol")
+    return str(s).strip() if s else None
+
 def _fmt_sym(mint: str) -> str:
     return _tok_symbol(mint) or mint[:6]
 
@@ -1198,9 +1064,9 @@ def _slip_pct(slippage_bps: Optional[int]) -> float:
     except Exception:
         return 0.0
 
-# -------------------------
+# =======================================================
 # swaps (public) — return (ok, signature|None)
-# -------------------------
+# =======================================================
 async def buy_via_lightning(*, mint: str, amount_sol: Optional[float] = None, lamports_in: Optional[int] = None, slippage_bps: Optional[int] = None, priority_sol: Optional[float] = None, compute_units: Optional[int] = None) -> Tuple[bool, Optional[str]]:
     # validate mint
     try:
@@ -1225,7 +1091,7 @@ async def buy_via_lightning(*, mint: str, amount_sol: Optional[float] = None, la
     # quote
     try:
         sbps = _clamp_slippage_bps(slippage_bps)
-        direct = _bool_env("JUP_ONLY_DIRECT", False)
+        direct = ONLY_DIRECT_DEFAULT
         quote = await _retry(_jup_quote, SOL_MINT, mint, lamports_in, tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-buy", slippage_bps=sbps, only_direct=direct)
     except Exception as e:
         log.event("ROUTER_BUY_QUOTE_FAIL", mint=mint, err=str(e))
@@ -1302,7 +1168,7 @@ async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_
 
     try:
         sbps = _clamp_slippage_bps(slippage_bps)
-        direct = _bool_env("JUP_ONLY_DIRECT", False)
+        direct = ONLY_DIRECT_DEFAULT
         quote = await _retry(_jup_quote, mint, SOL_MINT, amount_raw, tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-sell", slippage_bps=sbps, only_direct=direct)
     except Exception as e:
         log.event("ROUTER_SELL_QUOTE_FAIL", mint=mint, err=str(e))
@@ -1349,7 +1215,9 @@ async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_
             _PRIO._tune(_PRIO.target_sec * 1.6, had_error=True)
             await asyncio.sleep(RETRY_BACKOFF * max(1, attempt))
 
+# =======================================================
 # token metadata helpers
+# =======================================================
 async def get_tokens() -> List[dict]:
     return await _tokens_catalog()
 
@@ -1368,5 +1236,4 @@ __all__ = [
     "normalize_pump_id_to_mint", "_is_valid_pubkey_str", "is_valid_pubkey_str",
     "mint_decimals", "get_decimals",
     "TX_RPC_URL", "TX_COMMITMENT",
-    "run_filters",
 ]
