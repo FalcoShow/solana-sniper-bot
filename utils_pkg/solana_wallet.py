@@ -61,6 +61,8 @@ _UA = {
     "content-type": "application/json",
 }
 
+LAMPORTS_PER_SOL = 1_000_000_000
+
 # ──────────────────────────────────────────────────────────────────────────────
 # RPC endpoints & knobs
 # ──────────────────────────────────────────────────────────────────────────────
@@ -170,12 +172,12 @@ def get_pubkey_str(kp: Keypair) -> str:
     return str(kp.pubkey())
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Balance helper (used by autosizer)
+# Balance helpers (sync + async)
 # ──────────────────────────────────────────────────────────────────────────────
-async def get_balance_sol(owner: Optional[str] = None) -> float:
+def get_balance_lamports(owner: Optional[str] = None) -> int:
     """
-    Async helper: returns SOL balance for `owner` (or current wallet if None).
-    Uses a lightweight JSON-RPC POST via requests in a worker thread.
+    Synchronous: returns lamports for `owner` (or current wallet if None).
+    Lightweight JSON-RPC POST via requests.
     """
     try:
         if not owner:
@@ -183,27 +185,35 @@ async def get_balance_sol(owner: Optional[str] = None) -> float:
             owner = get_pubkey_str(kp)
         url = _READ_RPC_URL
         if not (url and owner):
-            return 0.0
+            return 0
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [owner, {"commitment": _TX_COMMITMENT_RAW}],
+        }
+        r = requests.post(url, json=payload, timeout=_RPC_TIMEOUT_SEC, headers=_UA)
+        r.raise_for_status()
+        js = r.json()
+        return int((js.get("result") or {}).get("value", 0) or 0)
+    except Exception:
+        return 0
 
-        def _call() -> float:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getBalance",
-                "params": [owner, {"commitment": _TX_COMMITMENT_RAW}],
-            }
-            r = requests.post(url, json=payload, timeout=_RPC_TIMEOUT_SEC, headers=_UA)
-            r.raise_for_status()
-            js = r.json()
-            lamports = int((js.get("result") or {}).get("value", 0))
-            return lamports / 1_000_000_000.0
-
+async def get_balance_sol(owner: Optional[str] = None) -> float:
+    """
+    Async helper: returns SOL balance for `owner` (or current wallet if None).
+    Uses a requests call in a worker thread.
+    """
+    def _call() -> float:
+        lamports = get_balance_lamports(owner)
+        return float(lamports) / LAMPORTS_PER_SOL
+    try:
         return await asyncio.to_thread(_call)
     except Exception:
         return 0.0
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Legacy tx helpers
+# Legacy tx format helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _is_legacy_tx_bytes(raw: bytes) -> bool:
     """
@@ -274,15 +284,6 @@ def _rpc_post(method: str, params: list, *, url: Optional[str] = None) -> Dict[s
     r = requests.post(u, json=payload, timeout=_RPC_TIMEOUT_SEC, headers=_UA)
     r.raise_for_status()
     return r.json()
-
-async def _send_b64_with_diag(tx_b64: str, *, skip_preflight: bool = True) -> str:
-    """
-    Send a base64 legacy tx; on failure, run simulateTransaction (encoding=base64, sigVerify=True)
-    and raise a detailed RuntimeError. Useful for step-by-step diagnostics.
-    """
-    kp = load_keypair()
-    sig = await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=skip_preflight)
-    return sig
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Signing & sending Jupiter swap transactions (LEGACY ONLY)
@@ -365,14 +366,27 @@ async def sign_and_send_b64_tx(
             raise RuntimeError(f"send_raw_transaction failed: {e!r}; simulate secondary error: {e2!r}") from e
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Robust sender with diagnostics (used by router first; falls back to legacy)
+# ──────────────────────────────────────────────────────────────────────────────
+async def _send_b64_with_diag(tx_b64: str, *, skip_preflight: bool = True) -> str:
+    """
+    Preferred sender: attempts send; on failure runs simulate for detailed logs.
+    Exactly the behavior your router expects.
+    """
+    kp = load_keypair()
+    return await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=skip_preflight)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────────────────────────────────────
 __all__ = [
     "RPC_URL",
+    "LAMPORTS_PER_SOL",
     "load_keypair",
     "get_pubkey",
     "get_pubkey_str",
+    "get_balance_lamports",
     "get_balance_sol",
     "sign_and_send_b64_tx",
-    "_send_b64_with_diag",  # handy for tests/diagnostics
+    "_send_b64_with_diag",  # robust sender w/ simulate on failure
 ]
