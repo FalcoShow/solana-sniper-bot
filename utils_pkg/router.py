@@ -181,6 +181,7 @@ def _jup_headers() -> Dict[str, str]:
     return h
 
 _JUP_LAST_GOOD_BASE: Optional[str] = None
+
 def _bases() -> List[str]:
     # Strict order: last good (if any) -> JUP_UPSTREAM -> JUP_ALT_BASE_URLS
     out: List[str] = []
@@ -225,6 +226,7 @@ def _jup_record_failure():
 # Telegram helpers
 # =======================================================
 _MARKDOWNV2_SPECIALS = r"_*[]()~`>#+-=|{}.!\\"  # sanitized characters for Telegram plain messages
+
 def _tg_plain(msg: str) -> str:
     return "".join(ch for ch in msg if ch not in _MARKDOWNV2_SPECIALS)
 
@@ -322,6 +324,7 @@ def normalize_pump_id_to_mint(raw: str) -> str:
 # =======================================================
 # QuickNode & unwrap helpers (for /functions/.../call)
 # =======================================================
+
 def _jtry(s: str):
     try:
         return json.loads(s)
@@ -669,6 +672,7 @@ async def get_decimals(mint: str) -> Optional[int]:
 # =======================================================
 # Priority fee / dynamic tuning
 # =======================================================
+
 def _to_sol_from_lamports_like(x: float) -> float:
     lamports = float(x)
     if lamports >= 1e9:
@@ -850,6 +854,7 @@ async def _enforce_min_sol(required_spend_lamports: int = 0) -> bool:
 # =======================================================
 # internal Jupiter helpers
 # =======================================================
+
 def _bool01(x: Optional[bool]) -> int:
     return 1 if bool(x) else 0
 
@@ -964,6 +969,7 @@ async def _jup_swap(user_pubkey: str, quote: dict, *, priority_lamports: Optiona
 # =======================================================
 # public quote & price helpers
 # =======================================================
+
 def _clamp_slippage_bps(v: Optional[int]) -> int:
     try:
         sv = int(v if v is not None else _slippage_bps())
@@ -1090,6 +1096,7 @@ async def mint_decimals(mint: str) -> Optional[int]:
 # =======================================================
 # small formatting utilities
 # =======================================================
+
 def _tok_symbol(mint: str) -> Optional[str]:
     meta = _TOK_META.get(mint)
     s = (meta or {}).get("symbol")
