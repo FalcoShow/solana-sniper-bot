@@ -308,17 +308,29 @@ def _assert_pubkey(s: str, name: str) -> None:
         raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
 
 def _sanitize_mint(m: str) -> str:
-    m = (m or "").strip()
+    """Strict validator — NEVER alters the provided base58 string.
+    We only strip surrounding whitespace then assert it decodes to 32 bytes.
+    """
+    if m is None:
+        raise ValueError("empty mint")
+    m = str(m).strip()
     if not m:
         raise ValueError("empty mint")
-    try:
-        return normalize_mint(m)
-    except Exception:
-        if _is_valid_pubkey_str(m):
-            return m
-        raise
+    # Validate exact base58 form and 32-byte payload.
+    if not _is_valid_pubkey_str(m):
+        raise ValueError(f"Invalid mint (must be 32-byte base58): {m}")
+    return m
 
 def normalize_pump_id_to_mint(raw: str) -> str:
+    # For external callers expecting this conversion, keep using your canonical util,
+    # but router internals will NOT re-normalize/trim mints.
+    try:
+        return normalize_mint(raw)
+    except Exception:
+        # If caller already passed a mint, accept it as-is when valid.
+        if _is_valid_pubkey_str(raw):
+            return raw.strip()
+        raise(raw: str) -> str:
     return normalize_mint(raw)
 
 # =======================================================
