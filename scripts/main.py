@@ -21,6 +21,9 @@ scripts/main.py (vNext + DSN-normalizer + full buy hooks + healthcheck + sentry)
 NEW in this edition:
 - Notion daily sync integrated into daily-PnL loop
 - Debounced intraday Notion sync on BUY_FILLED (default 10 min)
+
+HOTFIX:
+- Force-wire maybe_buy() to the router’s implementation used in shell tests.
 """
 
 import asyncio
@@ -77,6 +80,7 @@ except Exception:  # pragma: no cover
     class _Dummy:
         def event(self, *a, **k): print("[log]", a, k, flush=True)
         def warning(self, *a, **k): print("[warn]", a, k, flush=True)
+        def every(self, *a, **k): print("[every]", a, k, flush=True)
     def bump(_): pass
     def start_global_heartbeat(*_a, **_k): pass
     log = _Dummy()  # type: ignore
@@ -113,15 +117,9 @@ except Exception:  # pragma: no cover
         def __init__(self, *a, **kw):
             raise RuntimeError("PumpPortalClient not available")
 
-# >>> USE THE UTILS VERSION (no local shadow) <<<
-try:
-    from utils_pkg.pump_trader import maybe_buy
-except Exception:  # pragma: no cover
-    async def maybe_buy(
-        *, mint: str, ui: Dict[str, Any],
-        on_buy_submitted=None, on_buy_filled=None, on_buy_failed=None
-    ) -> Optional[str]:  # type: ignore
-        raise RuntimeError("maybe_buy not available")
+# NOTE: We intentionally DO NOT import maybe_buy from pump_trader here.
+# The hotfix below wires maybe_buy() directly to the router so it always works
+# (even if pump_trader is missing or outdated).
 
 try:
     from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN as _pkg_is_dryrun
@@ -164,7 +162,7 @@ except Exception:  # pragma: no cover
 
 # Router + price helpers
 try:
-    from utils_pkg import router  # provides start()/shutdown()
+    from utils_pkg import router  # provides start()/shutdown() and buy function(s)
     from utils_pkg.router import get_price_ui as _route_price_ui
     try:
         from utils_pkg.router import get_decimals as _route_get_decimals
@@ -175,6 +173,78 @@ except Exception:  # pragma: no cover
     async def _route_price_ui(_mint: str) -> float:  # type: ignore
         return 0.0
     _route_get_decimals = None  # type: ignore
+
+# ---------- HOTFIX: wire maybe_buy to router ----------
+import inspect
+
+def _pick_router_buy_callable() -> Optional[Any]:
+    """
+    Try a few common entrypoints that exist in utils_pkg/router.py.
+    """
+    if router is None:
+        return None
+    for name in (
+        "maybe_buy",           # preferred
+        "buy",                 # common
+        "route_and_buy",       # descriptive
+        "buy_on_jupiter",      # explicit
+        "buy_token",           # fallback naming
+        "execute_buy", "exec_buy"
+    ):
+        fn = getattr(router, name, None)
+        if callable(fn):
+            return fn
+    return None
+
+async def maybe_buy(
+    *, mint: str, ui: Dict[str, Any],
+    on_buy_submitted=None, on_buy_filled=None, on_buy_failed=None
+) -> Optional[str]:
+    """
+    Router-wired maybe_buy:
+      - Locates router's buy-callable dynamically
+      - Passes hooks if the target supports them
+      - Normalizes output to a tx signature string (or None)
+    """
+    if router is None:
+        raise RuntimeError("router unavailable")
+    fn = _pick_router_buy_callable()
+    if not fn:
+        raise RuntimeError("router has no buy-capable function")
+
+    kwargs = {"mint": mint, "ui": ui}
+    try:
+        sig = inspect.signature(fn)
+        if "on_buy_submitted" in sig.parameters:
+            kwargs["on_buy_submitted"] = on_buy_submitted
+        if "on_buy_filled" in sig.parameters:
+            kwargs["on_buy_filled"] = on_buy_filled
+        if "on_buy_failed" in sig.parameters:
+            kwargs["on_buy_failed"] = on_buy_failed
+    except Exception:
+        # Best-effort: some legacy functions won't expose signatures reliably
+        pass
+
+    try:
+        res = fn(**kwargs)
+        if asyncio.iscoroutine(res):
+            res = await res
+    except TypeError:
+        # Retry without hooks in case the target doesn't accept them
+        res = fn(mint=mint, ui=ui)
+        if asyncio.iscoroutine(res):
+            res = await res
+
+    # Normalize return → signature string or None
+    if isinstance(res, str):
+        return res
+    if isinstance(res, dict):
+        for k in ("signature", "sig", "tx_sig", "tx"):
+            v = res.get(k)
+            if isinstance(v, str) and v:
+                return v
+    return None
+# ---------- /HOTFIX ----------
 
 # Liquidity screen (optional fallback)
 try:
@@ -1139,10 +1209,6 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
                 "unrealized_sol": unrl_sol,
                 "open_positions": open_n,
                 "wallet_sol": wallet_sol,
-                # Optional fields if you later add them:
-                # "trades": ...,
-                # "realized_usd": ...,
-                # "unrealized_usd": ...,
                 "net_sol": (realized_sol + unrl_sol),
                 "note": "Auto-daily sync",
             })
