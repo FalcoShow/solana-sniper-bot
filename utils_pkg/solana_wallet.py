@@ -43,30 +43,23 @@ from solders.signature import Signature
 from solders.pubkey import Pubkey
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Small helpers
+# Small helpers / constants
 # ──────────────────────────────────────────────────────────────────────────────
 def _sanitize_url(u: Optional[str]) -> str:
-    """
-    Treat literal placeholders like ${RPC_URL} as unset.
-    Return a trimmed string or empty string.
-    """
     s = (u or "").strip()
-    if s.startswith("${") and s.endswith("}"):
+    if s.startswith("${") and s.endswith("}"):  # treat literal placeholders as unset
         return ""
     return s
 
 _UA = {
-    "user-agent": "pnlsniper/1.0 (+wallet)",
+    "user-agent": "sniper.wallet/1.0",
     "accept": "application/json",
     "content-type": "application/json",
 }
 
 LAMPORTS_PER_SOL = 1_000_000_000
 
-# ──────────────────────────────────────────────────────────────────────────────
-# RPC endpoints & knobs
-# ──────────────────────────────────────────────────────────────────────────────
-# Primary TX RPC (prefer explicit TX var; fall back to generic; avoid ${...})
+# RPC selection
 _SEND_RPC_URL = (
     _sanitize_url(os.getenv("TX_RPC_URL"))
     or _sanitize_url(os.getenv("SOL_RPC_TX_URL"))
@@ -74,11 +67,8 @@ _SEND_RPC_URL = (
     or _sanitize_url(os.getenv("SOLANA_RPC_URL"))
     or "https://api.mainnet-beta.solana.com"
 )
+RPC_URL = _SEND_RPC_URL  # public alias used by other modules
 
-# Public alias used elsewhere
-RPC_URL = _SEND_RPC_URL
-
-# Read RPC for balance (prefer read endpoint, fall back to TX)
 _READ_RPC_URL = (
     _sanitize_url(os.getenv("SOL_RPC_URL"))
     or _sanitize_url(os.getenv("SOLANA_RPC_URL"))
@@ -101,10 +91,6 @@ _KP: Optional[Keypair] = None
 # Commitment normalization
 # ──────────────────────────────────────────────────────────────────────────────
 def _norm_commitment(c: object) -> Commitment:
-    """
-    Accept a Commitment instance or string ('processed'|'confirmed'|'finalized')
-    and return a proper Commitment enum instance. Defaults to Confirmed.
-    """
     if hasattr(c, "value"):
         return c  # type: ignore[return-value]
     s = str(c or "").strip().lower()
@@ -116,14 +102,13 @@ def _norm_commitment(c: object) -> Commitment:
 # ──────────────────────────────────────────────────────────────────────────────
 def _load_keypair_from_env_or_file() -> Keypair:
     """
-    Load a keypair from:
-      - WALLET_PRIVKEY_B58                       : base58-encoded 64-byte secret (secret||pub)
-      - WALLET_PRIVKEY_JSON                      : JSON array of 64 ints
-      - WALLET_KEYPAIR_JSON / KEYPAIR_JSON / WALLET_JSON : JSON array of 64 ints
-      - WALLET_PRIVATE_KEY / WALLET_KEYPAIR_PATH / KEYPAIR_PATH : path to JSON array (64 ints)
-      - default ~/.config/solana/id.json
+    Load a keypair from (first match wins):
+      - WALLET_PRIVKEY_B58                  (base58 64-byte secret)
+      - WALLET_PRIVKEY_JSON                 (JSON array of 64 ints)
+      - WALLET_KEYPAIR_JSON / KEYPAIR_JSON / WALLET_JSON  (JSON array of 64 ints)
+      - WALLET_PRIVATE_KEY / WALLET_KEYPAIR_PATH / KEYPAIR_PATH (file path)
+      - default: ~/.config/solana/id.json
     """
-    # 1) base58 secret (64 bytes)
     b58 = (os.getenv("WALLET_PRIVKEY_B58") or "").strip()
     if b58:
         sk = _b58decode(b58)
@@ -131,7 +116,6 @@ def _load_keypair_from_env_or_file() -> Keypair:
             raise RuntimeError("WALLET_PRIVKEY_B58 must be base58 of a 64-byte secret key")
         return Keypair.from_bytes(sk)
 
-    # 2) inline JSON array in env
     for key in ("WALLET_PRIVKEY_JSON", "WALLET_KEYPAIR_JSON", "KEYPAIR_JSON", "WALLET_JSON"):
         js = (os.getenv(key) or "").strip()
         if js:
@@ -141,7 +125,6 @@ def _load_keypair_from_env_or_file() -> Keypair:
                 raise RuntimeError(f"{key} must be a JSON array of 64 bytes")
             return Keypair.from_bytes(sk_bytes)
 
-    # 3) file path(s)
     path = (
         os.getenv("WALLET_PRIVATE_KEY")
         or os.getenv("WALLET_KEYPAIR_PATH")
@@ -156,7 +139,6 @@ def _load_keypair_from_env_or_file() -> Keypair:
     return Keypair.from_bytes(sk_bytes)
 
 def load_keypair() -> Keypair:
-    """Return the cached trading keypair (lazy-loaded)."""
     global _KP
     if _KP is None:
         _KP = _load_keypair_from_env_or_file()
@@ -172,38 +154,33 @@ def get_pubkey_str(kp: Keypair) -> str:
     return str(kp.pubkey())
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Generic RPC POST (used below)
+# ──────────────────────────────────────────────────────────────────────────────
+def _rpc_post(method: str, params: list, *, url: Optional[str] = None) -> Dict[str, Any]:
+    u = _sanitize_url(url) or _SEND_RPC_URL
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    r = requests.post(u, json=payload, timeout=_RPC_TIMEOUT_SEC, headers=_UA)
+    r.raise_for_status()
+    return r.json()
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Balance helpers (sync + async)
 # ──────────────────────────────────────────────────────────────────────────────
 def get_balance_lamports(owner: Optional[str] = None) -> int:
-    """
-    Synchronous: returns lamports for `owner` (or current wallet if None).
-    Lightweight JSON-RPC POST via requests.
-    """
     try:
         if not owner:
             kp = load_keypair()
             owner = get_pubkey_str(kp)
-        url = _READ_RPC_URL
-        if not (url and owner):
-            return 0
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getBalance",
-            "params": [owner, {"commitment": _TX_COMMITMENT_RAW}],
-        }
-        r = requests.post(url, json=payload, timeout=_RPC_TIMEOUT_SEC, headers=_UA)
-        r.raise_for_status()
-        js = r.json()
+        js = _rpc_post(
+            "getBalance",
+            [owner, {"commitment": _TX_COMMITMENT_RAW}],
+            url=_READ_RPC_URL,
+        )
         return int((js.get("result") or {}).get("value", 0) or 0)
     except Exception:
         return 0
 
 async def get_balance_sol(owner: Optional[str] = None) -> float:
-    """
-    Async helper: returns SOL balance for `owner` (or current wallet if None).
-    Uses a requests call in a worker thread.
-    """
     def _call() -> float:
         lamports = get_balance_lamports(owner)
         return float(lamports) / LAMPORTS_PER_SOL
@@ -212,18 +189,16 @@ async def get_balance_sol(owner: Optional[str] = None) -> float:
     except Exception:
         return 0.0
 
+# Back-compat alias some code expects
+get_sol_balance = get_balance_sol
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Legacy tx format helpers
+# Legacy tx parsing helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _is_legacy_tx_bytes(raw: bytes) -> bool:
-    """
-    Legacy wire format begins with shortvec-encoded signature count.
-    Versioned (v0) sets MSB=1 in first byte (versioned prefix).
-    """
-    return (raw[0] & 0x80) == 0
+    return (raw[0] & 0x80) == 0  # v0 sets MSB=1 in first byte
 
 def _read_shortvec(data: bytes, offset: int = 0) -> Tuple[int, int]:
-    """Decode Solana shortvec at data[offset:]. Returns (value, next_index)."""
     value = 0
     shift = 0
     i = offset
@@ -237,7 +212,6 @@ def _read_shortvec(data: bytes, offset: int = 0) -> Tuple[int, int]:
     return value, i
 
 def _encode_shortvec(n: int) -> bytes:
-    """Encode an integer to Solana shortvec bytes."""
     out = bytearray()
     while True:
         b = n & 0x7F
@@ -250,20 +224,13 @@ def _encode_shortvec(n: int) -> bytes:
     return bytes(out)
 
 def _unwrap_send_resp(resp: Any) -> str:
-    """
-    Normalize solana-py's send_raw_transaction response to a base58 signature string.
-    Handles: plain str, dicts, and SendTransactionResp / RPCResponse objects with .value.
-    """
-    # 1) Already a string
     if isinstance(resp, str):
         return resp
-    # 2) Newer solana-py typed responses (SendTransactionResp-like)
     if hasattr(resp, "value"):
         try:
             return str(getattr(resp, "value"))
         except Exception:
             pass
-    # 3) Dict-ish RPC responses
     if isinstance(resp, dict):
         if isinstance(resp.get("result"), str):
             return str(resp["result"])
@@ -272,21 +239,10 @@ def _unwrap_send_resp(resp: Any) -> str:
             return str(r["value"])
         if resp.get("value"):
             return str(resp["value"])
-    # Fallback
     return str(resp)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Low-level RPC helper (used by diagnostics)
-# ──────────────────────────────────────────────────────────────────────────────
-def _rpc_post(method: str, params: list, *, url: Optional[str] = None) -> Dict[str, Any]:
-    u = _sanitize_url(url) or _SEND_RPC_URL
-    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    r = requests.post(u, json=payload, timeout=_RPC_TIMEOUT_SEC, headers=_UA)
-    r.raise_for_status()
-    return r.json()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Signing & sending Jupiter swap transactions (LEGACY ONLY)
+# Send + confirm helpers
 # ──────────────────────────────────────────────────────────────────────────────
 async def sign_and_send_b64_tx(
     tx_b64: str,
@@ -296,37 +252,25 @@ async def sign_and_send_b64_tx(
 ) -> str:
     """
     Decode base64 swap transaction from Jupiter, sign (LEGACY ONLY), and submit.
-
-    The router requests `asLegacyTransaction=True`, so we expect legacy bytes.
-    If a versioned (v0) tx is ever received, fail fast with a clear message.
-
-    Returns:
-        str: transaction signature (base58 string)
-
-    Raises:
-        Exception on any send failure (NO fake signatures are ever returned).
+    The router requests asLegacyTransaction=True, so versioned v0 bytes are rejected.
+    Returns base58 signature (never fakes success).
     """
     raw = b64decode(tx_b64)
 
-    # Guard: must be legacy
     if not _is_legacy_tx_bytes(raw):
         raise RuntimeError(
             "Received a versioned (v0) transaction but legacy is expected. "
             "Ensure Jupiter requests use asLegacyTransaction=True."
         )
 
-    # Parse existing signatures + extract message bytes
     sig_count, pos = _read_shortvec(raw, 0)
-    pos += 64 * sig_count  # skip any present (often 0 or a placeholder)
+    pos += 64 * sig_count
     msg_bytes = raw[pos:]
 
-    # Sign canonical message bytes
     sig_obj: Signature = kp.sign_message(msg_bytes)
 
-    # Rebuild wire: [shortvec(1)][signature][message_bytes]
     wire = _encode_shortvec(1) + bytes(sig_obj) + msg_bytes
 
-    # Tx options
     commitment = _norm_commitment(_TX_COMMITMENT_RAW)
     max_retries_env = os.getenv("PF_TX_SEND_MAX_RETRIES", "")
     try:
@@ -346,11 +290,10 @@ async def sign_and_send_b64_tx(
         )
         return _unwrap_send_resp(resp)
 
-    # Try send; if it fails, run simulateTransaction for a clear error and re-raise
     try:
         return await asyncio.to_thread(_send_sync)
     except Exception as e:
-        # Simulate with encoding=base64, sigVerify=True (NO replaceRecentBlockhash)
+        # Try to simulate for clearer errors
         try:
             sim = _rpc_post(
                 "simulateTransaction",
@@ -365,16 +308,66 @@ async def sign_and_send_b64_tx(
         except Exception as e2:
             raise RuntimeError(f"send_raw_transaction failed: {e!r}; simulate secondary error: {e2!r}") from e
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Robust sender with diagnostics (used by router first; falls back to legacy)
-# ──────────────────────────────────────────────────────────────────────────────
 async def _send_b64_with_diag(tx_b64: str, *, skip_preflight: bool = True) -> str:
-    """
-    Preferred sender: attempts send; on failure runs simulate for detailed logs.
-    Exactly the behavior your router expects.
-    """
     kp = load_keypair()
     return await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=skip_preflight)
+
+def _status_from_sig(sig: str) -> Dict[str, Any]:
+    """
+    Calls getSignatureStatuses. Tries with and without searchTransactionHistory
+    for maximum node compatibility.
+    """
+    try:
+        js = _rpc_post("getSignatureStatuses", [[sig], {"searchTransactionHistory": True}], url=_READ_RPC_URL)
+    except Exception:
+        js = _rpc_post("getSignatureStatuses", [[sig]], url=_READ_RPC_URL)
+    res = (js.get("result") or {}).get("value") or []
+    return res[0] if res else {}
+
+def _is_confirmed_ok(status: Dict[str, Any], want: str) -> bool:
+    # want in {"processed","confirmed","finalized"}
+    if not status:
+        return False
+    if status.get("err"):
+        return False
+    conf = int(status.get("confirmations") or 0) if status.get("confirmations") is not None else None
+    # Solana RPC may return confirmationStatus: "processed"/"confirmed"/"finalized"
+    lvl = (status.get("confirmationStatus") or "").lower()
+    if lvl in ("confirmed", "finalized"):
+        # good for confirmed+
+        return want in ("processed", "confirmed") or lvl == "finalized"
+    if lvl == "processed":
+        return want == "processed"
+    # Fallback: if confirmations is None => finalized on some nodes
+    if conf is None:
+        return want in ("processed", "confirmed", "finalized")
+    # If we only got a number, consider >=1 as processed; >=2 as confirmed-ish
+    return (want == "processed" and conf >= 1) or (want != "processed" and conf >= 2)
+
+async def confirm_signature(
+    signature: str,
+    *,
+    commitment: str = "confirmed",
+    timeout_s: float = 60.0,
+    poll_interval_s: float = 0.8,
+) -> bool:
+    """
+    Polls getSignatureStatuses until the tx is confirmed at the requested level
+    or the timeout elapses. Returns True on success, False otherwise.
+    """
+    want = str(commitment).strip().lower()
+    deadline = asyncio.get_event_loop().time() + float(timeout_s)
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            st = _status_from_sig(signature)
+            if st and st.get("err"):
+                return False
+            if _is_confirmed_ok(st, want):
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(poll_interval_s)
+    return False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public API
@@ -387,6 +380,8 @@ __all__ = [
     "get_pubkey_str",
     "get_balance_lamports",
     "get_balance_sol",
+    "get_sol_balance",          # alias used elsewhere
     "sign_and_send_b64_tx",
-    "_send_b64_with_diag",  # robust sender w/ simulate on failure
+    "_send_b64_with_diag",
+    "confirm_signature",        # ★ required by pump_trader
 ]
