@@ -1,36 +1,79 @@
-# utils_pkg/lightning_impl.py
 from __future__ import annotations
 
+"""
+utils_pkg/lightning_impl.py — Jupiter v6 swapper (stable)
+
+Design goals
+- Target Jupiter v6 at https://public.jupiterapi.com (no legacy by default)
+- Do NOT send platform fees unless fully configured (prevents 422)
+- Clean headers (origin/referer) and optional API key/bearer
+- Quote → Swap with quoteResponse passthrough (no payload re-shaping)
+- Optional priority fee (lamports) & compute unit limit
+- DRY_RUN support for safe testing
+- Friendly logs on non-200 responses (emit JSON body when possible)
+
+Environment knobs (recommended)
+- JUP_UPSTREAM (default: https://public.jupiterapi.com)
+- JUP_API_KEY / JUP_PRO_KEY (optional), JUP_BEARER (optional)
+- JUP_AS_LEGACY=false (v6)
+- JUP_ONLY_DIRECT=false
+- JUP_PLATFORM_FEE_BPS (default: 0 → disabled)
+- JUP_PLATFORM_FEE_ACCOUNT (fee account; required if fee enabled)
+- PF_SLIPPAGE_BPS (default: 30)
+- PF_PRIORITY_LAMPORTS (optional) or PF_PRIORITY_SOL (optional)
+- PF_COMPUTE_UNIT_LIMIT (optional)
+- PF_WRAP_UNWRAP_SOL=true
+- DRYRUN / DRY_RUN / IS_DRYRUN (optional)
+
+Public API
+- buy_via_lightning(mint: str, amount_sol: float, slippage_bps: int = ...)
+- sell_via_lightning(mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int = ...)
+"""
+
 import os
-import base64
+import json
 from typing import Optional, Tuple, Dict, Any
 
 import httpx
 
-# Local deps already in your repo
 from logging_setup import get_logger
 from utils_pkg.mints import normalize_mint
 from utils_pkg.solana_wallet import (
-    load_keypair,         # loads keypair (Render id.json or env)
-    get_pubkey_str,       # returns base58 pubkey string
-    sign_and_send_b64_tx, # signs & sends a base64 transaction, returns signature
+    load_keypair,
+    get_pubkey_str,
+    sign_and_send_b64_tx,
 )
+
+# Try to import the robust sender with simulation diagnostics if available
+try:  # pragma: no cover
+    from utils_pkg.solana_wallet import _send_b64_with_diag  # type: ignore
+except Exception:  # pragma: no cover
+    _send_b64_with_diag = None  # type: ignore
 
 log = get_logger()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Env / constants
+# Env helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return default if v is None else v.strip()
 
+
 def _env_int(name: str, default: int) -> int:
     try:
-        return int(os.getenv(name, str(default)).strip())
+        return int((os.getenv(name, str(default)) or str(default)).strip())
     except Exception:
         return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float((os.getenv(name, str(default)) or str(default)).strip())
+    except Exception:
+        return default
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
@@ -38,161 +81,194 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return default
     return v.strip().lower() in ("1", "true", "yes", "on")
 
-# Jupiter upstream(s)
-JUP_BASE = _env_str("JUP_BASE_URL", "https://public.jupiterapi.com")
-JUP_ALT  = _env_str("JUP_ALT_BASE_URLS", "https://api.jup.ag")
-JUP_API_KEY = _env_str("JUP_API_KEY", "")
 
-# Trading knobs (align with your .env/dashboard)
-DEFAULT_SLIPPAGE_BPS = _env_int("PF_SLIPPAGE_BPS", 30)          # 0.30%
-PLATFORM_FEE_BPS     = _env_int("PF_FEE_BPS", 20)               # 0.20% (optional)
-WRAP_UNWRAP_SOL      = _env_bool("PF_WRAP_UNWRAP_SOL", True)
-LEGACY_TX            = _env_bool("PF_USE_LEGACY_TX", False)
+# ──────────────────────────────────────────────────────────────────────────────
+# Config (Jupiter + trade knobs)
+# ──────────────────────────────────────────────────────────────────────────────
 
-# Optional priority fees & CU limit (Jito / CU tweak handled in your signer)
-JITO_TIP_LAMPORTS    = _env_int("PF_JITO_TIP_LAMPORTS", 0)      # 0 = let RPC decide
-COMPUTE_UNIT_LIMIT   = _env_int("PF_COMPUTE_UNIT_LIMIT", 0)     # 0 = default
+BASE: str = (_env_str("JUP_UPSTREAM") or _env_str("JUP_BASE_URL") or "https://public.jupiterapi.com").rstrip("/")
+AS_LEGACY: bool = _env_bool("JUP_AS_LEGACY", False)
+ONLY_DIRECT: bool = _env_bool("JUP_ONLY_DIRECT", False)
 
+# v6: avoid alt bases like https://api.jup.ag which return 404 on /quote
+ALT_BASES: list[str] = []
+
+# Auth/headers
+JUP_API_KEY: str = _env_str("JUP_API_KEY", _env_str("JUP_PRO_KEY", ""))
+JUP_BEARER: str = _env_str("JUP_BEARER", "")
+
+# Fees — DISABLED by default to avoid 422s unless fully configured
+PLATFORM_FEE_BPS: int = _env_int("JUP_PLATFORM_FEE_BPS", 0)
+PLATFORM_FEE_ACCOUNT: str = _env_str("JUP_PLATFORM_FEE_ACCOUNT", "")
+USE_PLATFORM_FEE: bool = PLATFORM_FEE_BPS > 0 and bool(PLATFORM_FEE_ACCOUNT)
+
+# Slippage / CU / priority fee
+DEFAULT_SLIPPAGE_BPS: int = _env_int("PF_SLIPPAGE_BPS", 30)
+COMPUTE_UNIT_LIMIT: int = _env_int("PF_COMPUTE_UNIT_LIMIT", 0)  # 0 = dynamic by Jupiter
+PF_PRIORITY_LAMPORTS: int = _env_int("PF_PRIORITY_LAMPORTS", 0)
+PF_PRIORITY_SOL: float = _env_float("PF_PRIORITY_SOL", 0.0)
+WRAP_UNWRAP_SOL: bool = _env_bool("PF_WRAP_UNWRAP_SOL", True)
+
+# Dry-run toggle
+DRY_RUN: bool = _env_bool("DRYRUN", False) or _env_bool("DRY_RUN", False) or _env_bool("IS_DRYRUN", False)
+
+# Chain constants
 SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# HTTP helpers
+# HTTP helpers (headers + get/post with friendly error logs)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _headers() -> Dict[str, str]:
-    h = {"content-type": "application/json"}
+def _jup_headers() -> Dict[str, str]:
+    h = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "origin": "https://jup.ag",
+        "referer": "https://jup.ag/",
+    }
     if JUP_API_KEY:
         h["x-api-key"] = JUP_API_KEY
+    if JUP_BEARER:
+        h["x-jup-auth"] = f"Bearer {JUP_BEARER}"
     return h
 
-def _pick_base() -> str:
-    # prefer public endpoint; fall back to alt if needed
-    return JUP_BASE or "https://public.jupiterapi.com"
 
-def _merge_platform_fee(params: Dict[str, Any]) -> Dict[str, Any]:
-    if PLATFORM_FEE_BPS > 0:
-        params["platformFeeBps"] = PLATFORM_FEE_BPS
-    return params
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Core Jupiter flows (quote → swap tx → sign & send)
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def _jup_quote(
-    *,
-    input_mint: str,
-    output_mint: str,
-    amount: int,
-    slippage_bps: int,
-) -> Dict[str, Any]:
-    """
-    Calls /quote and returns parsed JSON (raises on non-2xx).
-    """
-    base = _pick_base()
-    params = {
-        "inputMint":  input_mint,
-        "outputMint": output_mint,
-        "amount":     str(amount),
-        "slippageBps": int(slippage_bps),
-        "swapMode":   "ExactIn",
-        "onlyDirectRoutes": "false",
-        "asLegacyTransaction": "true" if LEGACY_TX else "false",
-    }
-    _merge_platform_fee(params)
-
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(f"{base}/quote", params=params, headers=_headers())
-        r.raise_for_status()
+async def _http_get(url: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(url, params=params, headers=_jup_headers())
+        if r.status_code != 200:
+            body: Any
+            try:
+                body = r.json()
+            except Exception:
+                body = {"text": r.text}
+            log.warning("JUP_GET_NON200", extra={"url": url, "status": r.status_code, "body": body})
+            r.raise_for_status()
         return r.json()
 
-async def _jup_swap_tx(
-    *,
-    user_pubkey: str,
-    input_mint: str,
-    output_mint: str,
-    amount: int,
-    slippage_bps: int,
-) -> str:
-    """
-    Calls /swap to build a swap transaction. Returns base64-encoded tx.
-    """
-    base = _pick_base()
+
+async def _http_post(url: str, *, json_body: Dict[str, Any]) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=25) as c:
+        r = await c.post(url, json=json_body, headers=_jup_headers())
+        if r.status_code != 200:
+            body: Any
+            try:
+                body = r.json()
+            except Exception:
+                body = {"text": r.text}
+            log.warning("JUP_POST_NON200", extra={"url": url, "status": r.status_code, "body": body})
+            r.raise_for_status()
+        return r.json()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Jupiter v6 flows (quote → swap)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _get_quote(*, input_mint: str, output_mint: str, amount: int, slippage_bps: int) -> Dict[str, Any]:
+    params: Dict[str, Any] = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount),
+        "slippageBps": int(slippage_bps),
+        "swapMode": "ExactIn",
+        "onlyDirectRoutes": str(ONLY_DIRECT).lower(),
+        "asLegacyTransaction": str(AS_LEGACY).lower(),
+    }
+    # Include fee only when properly configured
+    if USE_PLATFORM_FEE:
+        params["platformFeeBps"] = int(PLATFORM_FEE_BPS)
+
+    url = f"{BASE}/quote" if not AS_LEGACY else f"{BASE}/swap/v1/quote"
+    js = await _http_get(url, params=params)
+    # trace for debugging/telemetry
+    log.info("quote", extra={
+        "label": "quote",
+        "input": input_mint,
+        "output": output_mint,
+        "in": str(amount),
+        "out": js.get("outAmount"),
+        "priceImpactPct": js.get("priceImpactPct"),
+    })
+    return js
+
+
+def _choose_priority_lamports() -> Optional[int]:
+    if PF_PRIORITY_LAMPORTS > 0:
+        return int(PF_PRIORITY_LAMPORTS)
+    if PF_PRIORITY_SOL > 0:
+        try:
+            return int(PF_PRIORITY_SOL * LAMPORTS_PER_SOL)
+        except Exception:
+            return None
+    return None
+
+
+async def _build_swap_tx(*, user_pubkey: str, quote: Dict[str, Any]) -> str:
     body: Dict[str, Any] = {
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": WRAP_UNWRAP_SOL,
-        "asLegacyTransaction": LEGACY_TX,
-        "payload": {
-            "inputMint":  input_mint,
-            "outputMint": output_mint,
-            "amount":     str(amount),
-            "slippageBps": int(slippage_bps),
-            "swapMode":   "ExactIn",
-        },
-        # Jupiter v6 supports priority fee knobs; they're optional.
-        "prioritizationFeeLamports": JITO_TIP_LAMPORTS if JITO_TIP_LAMPORTS > 0 else None,
-        "computeUnitLimit": COMPUTE_UNIT_LIMIT if COMPUTE_UNIT_LIMIT > 0 else None,
+        "dynamicComputeUnitLimit": False if (COMPUTE_UNIT_LIMIT and COMPUTE_UNIT_LIMIT > 0) else True,
+        "quoteResponse": quote,
+        "asLegacyTransaction": bool(AS_LEGACY),
     }
-    _merge_platform_fee(body["payload"])
 
-    async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.post(f"{base}/swap", json=body, headers=_headers())
-        r.raise_for_status()
-        data = r.json()
-        # Jupiter returns {"swapTransaction": "<base64>"} on success
-        tx_b64 = data.get("swapTransaction")
-        if not tx_b64:
-            raise RuntimeError(f"Jupiter /swap did not return swapTransaction: {data}")
-        return tx_b64
+    prio = _choose_priority_lamports()
+    if prio is not None and prio > 0:
+        body["prioritizationFeeLamports"] = int(prio)
+    if COMPUTE_UNIT_LIMIT and COMPUTE_UNIT_LIMIT > 0:
+        body["computeUnitLimit"] = int(COMPUTE_UNIT_LIMIT)
+
+    if USE_PLATFORM_FEE:
+        body["platformFee"] = {
+            "feeBps": int(PLATFORM_FEE_BPS),
+            "platform": "sniper",
+            "feeAccount": PLATFORM_FEE_ACCOUNT,
+        }
+
+    url = f"{BASE}/swap" if not AS_LEGACY else f"{BASE}/swap/v1/swap"
+    js = await _http_post(url, json_body=body)
+    tx_b64 = js.get("swapTransaction")
+    if not tx_b64:
+        raise RuntimeError(f"Jupiter /swap missing swapTransaction: {js}")
+    return tx_b64
+
+
+async def _send_tx_b64(tx_b64: str) -> str:
+    # Prefer the diagnostic sender when available
+    if _send_b64_with_diag is not None:
+        try:
+            return await _send_b64_with_diag(tx_b64, skip_preflight=True)  # type: ignore[arg-type]
+        except Exception as e:
+            log.warning("SEND_WITH_DIAG_FAIL", extra={"err": str(e)[:200]})
+    # Fallback to simple signer
+    kp = load_keypair()
+    return await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public API (used by router)
+# Public API (called by router)
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def buy_via_lightning(
-    *,
-    mint: str,
-    amount_sol: float,
-    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
-) -> Tuple[bool, Optional[str]]:
-    """
-    Buy `mint` using SOL via Jupiter. Returns (ok, signature_or_error).
-    """
+async def buy_via_lightning(*, mint: str, amount_sol: float, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Tuple[bool, Optional[str]]:
+    """Buy `mint` spending SOL. Returns (ok, signature|error)."""
     try:
-        mint = normalize_mint(mint)
-        kp = load_keypair()
-        user_pk = get_pubkey_str(kp)
+        m = normalize_mint(mint)
+        lamports_in = max(1, int(float(amount_sol) * LAMPORTS_PER_SOL))
 
-        lamports_in = max(1, int(amount_sol * LAMPORTS_PER_SOL))
+        # Pre-quote (for telemetry & swap input)
+        quote = await _get_quote(input_mint=SOL_MINT, output_mint=m, amount=lamports_in, slippage_bps=slippage_bps)
 
-        # (Optional, but good for logs/guardrail): get a quote first
-        quote = await _jup_quote(
-            input_mint=SOL_MINT,
-            output_mint=mint,
-            amount=lamports_in,
-            slippage_bps=slippage_bps,
-        )
-        log.info(
-            "quote-buy",
-            extra={
-                "label": "quote-buy",
-                "in_lamports": lamports_in,
-                "out_amount": quote.get("outAmount"),
-                "priceImpactPct": quote.get("priceImpactPct"),
-            },
-        )
+        if DRY_RUN:
+            log.info("ENTRY_TX_DRYRUN", extra={"mint": m, "lamports_in": lamports_in, "slippage_bps": slippage_bps})
+            return True, None
 
-        # Build tx
-        tx_b64 = await _jup_swap_tx(
-            user_pubkey=user_pk,
-            input_mint=SOL_MINT,
-            output_mint=mint,
-            amount=lamports_in,
-            slippage_bps=slippage_bps,
-        )
-
-        # Sign + send
-        sig = await sign_and_send_b64_tx(tx_b64)
+        # Build and send
+        user_pk = get_pubkey_str(load_keypair())
+        tx_b64 = await _build_swap_tx(user_pubkey=user_pk, quote=quote)
+        sig = await _send_tx_b64(tx_b64)
         log.info("ENTRY_TX_OK", extra={"sig": sig})
         return True, sig
 
@@ -206,49 +282,21 @@ async def buy_via_lightning(
         return False, msg
 
 
-async def sell_via_lightning(
-    *,
-    mint: str,
-    token_program: Optional[str],
-    amount_raw: int,
-    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
-) -> Tuple[bool, Optional[str]]:
-    """
-    Sell `mint` back to SOL via Jupiter. `amount_raw` is in mint's base units.
-    `token_program` is optional; Jupiter resolves it if omitted.
-    """
+async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Tuple[bool, Optional[str]]:
+    """Sell `amount_raw` units of `mint` back to SOL. token_program is ignored (Jupiter resolves)."""
+    del token_program
     try:
-        mint = normalize_mint(mint)
-        kp = load_keypair()
-        user_pk = get_pubkey_str(kp)
+        m = normalize_mint(mint)
 
-        # Quote for logs / sanity
-        quote = await _jup_quote(
-            input_mint=mint,
-            output_mint=SOL_MINT,
-            amount=amount_raw,
-            slippage_bps=slippage_bps,
-        )
-        log.info(
-            "quote-sell",
-            extra={
-                "label": "quote-sell",
-                "in_raw": amount_raw,
-                "out_amount": quote.get("outAmount"),
-                "priceImpactPct": quote.get("priceImpactPct"),
-            },
-        )
+        quote = await _get_quote(input_mint=m, output_mint=SOL_MINT, amount=amount_raw, slippage_bps=slippage_bps)
 
-        # Build tx (Jupiter will include the correct token program in the tx)
-        tx_b64 = await _jup_swap_tx(
-            user_pubkey=user_pk,
-            input_mint=mint,
-            output_mint=SOL_MINT,
-            amount=amount_raw,
-            slippage_bps=slippage_bps,
-        )
+        if DRY_RUN:
+            log.info("EXIT_TX_DRYRUN", extra={"mint": m, "amount_raw": amount_raw, "slippage_bps": slippage_bps})
+            return True, None
 
-        sig = await sign_and_send_b64_tx(tx_b64)
+        user_pk = get_pubkey_str(load_keypair())
+        tx_b64 = await _build_swap_tx(user_pubkey=user_pk, quote=quote)
+        sig = await _send_tx_b64(tx_b64)
         log.info("EXIT_TX_OK", extra={"sig": sig})
         return True, sig
 
