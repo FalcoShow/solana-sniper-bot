@@ -110,6 +110,48 @@ def _envi(k: str, d: int) -> int:
     except Exception:
         return int(d)
 
+# --- Router registration shim (safe default to lightning) ---
+def _env_bool(name, default=False):
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1","true","yes","on")
+
+ALLOW_PUMP    = _env_bool("ROUTER_ALLOW_PUMP", True)
+ALLOW_RAYDIUM = _env_bool("ROUTER_ALLOW_RAYDIUM", True)
+
+BUY_IMPL  = os.getenv("ROUTER_BUY_IMPL", "lightning").strip().lower()
+SELL_IMPL = os.getenv("ROUTER_SELL_IMPL", "lightning").strip().lower()
+
+# Global registries the main loop uses
+BUY_IMPLS  = {}
+SELL_IMPLS = {}
+
+# Import the lightning impls once
+from utils_pkg.router import buy_via_lightning as _buy_lightning, sell_via_lightning as _sell_lightning  # adjust import if your paths differ
+
+def _register_lightning():
+    if ALLOW_PUMP:
+        BUY_IMPLS["pump"]  = _buy_lightning
+        SELL_IMPLS["pump"] = _sell_lightning
+    if ALLOW_RAYDIUM:
+        BUY_IMPLS["raydium"]  = _buy_lightning
+        SELL_IMPLS["raydium"] = _sell_lightning
+
+if BUY_IMPL == "lightning":
+    _register_lightning()
+# (add other branches if you support different impls)
+
+# Helpful startup log
+try:
+    from logging_setup import get_logger
+    log = get_logger()
+    log.info({"event":"ROUTER_IMPLS",
+              "buy_keys": list(BUY_IMPLS.keys()),
+              "sell_keys": list(SELL_IMPLS.keys())})
+except Exception:
+    pass
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Chain / RPC config
 # ──────────────────────────────────────────────────────────────────────────────
