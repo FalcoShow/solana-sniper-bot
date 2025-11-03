@@ -123,9 +123,8 @@ except Exception:  # pragma: no cover
         def __init__(self, *a, **kw):
             raise RuntimeError("PumpPortalClient not available")
 
-# NOTE: we intentionally DO NOT import maybe_buy from pump_trader.
-# We wire maybe_buy() directly to the router so it always works even
-# if pump_trader is missing or out of date.
+# NOTE: We intentionally DO NOT import maybe_buy from pump_trader here.
+# We wire maybe_buy() directly to the router so it always matches whatever impls exist.
 
 try:
     from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN as _pkg_is_dryrun
@@ -180,29 +179,104 @@ except Exception:  # pragma: no cover
         return 0.0
     _route_get_decimals = None  # type: ignore
 
-# ---------- HOTFIX: wire maybe_buy to router (safe logging) ----------
+# ---------- HOTFIX: wire maybe_buy to router ----------
 import inspect
+from typing import Any, Dict, Optional
 
-def _pick_router_buy_callable() -> Optional[Any]:
+def _safe_log_router_state(event: str, **fields: Any) -> None:
+    try:
+        # our logger has .event() for structured payloads; avoid kwargs to .error()
+        log.event(event, **fields)
+    except Exception:
+        # fall back noiselessly
+        pass
+
+def _candidate_buy_names() -> list[str]:
+    # Most common names first
+    return [
+        "maybe_buy",
+        "buy",
+        "route_and_buy",
+        "buy_on_jupiter",
+        "buy_token",
+        "execute_buy",
+        "exec_buy",
+        # lightning / router variants seen in your logs:
+        "buy_via_lightning",
+        "_buy_lightning",
+        "buy_lightning",
+        "buy_direct",
+        "buy_pump",
+    ]
+
+def _pick_router_buy_callable() -> Optional[tuple[str, Any]]:
     """
-    Try common entrypoints that may exist in utils_pkg/router.py.
-    Add more names here if your router exposes a different symbol.
+    1) Try known names in order.
+    2) If none, fall back to any callable whose name contains 'buy'
+       but does NOT contain 'sell' or 'quote'.
     """
     if router is None:
         return None
-    for name in (
-        "maybe_buy",           # preferred
-        "buy",                 # common
-        "route_and_buy",       # descriptive
-        "buy_on_jupiter",      # explicit
-        "buy_token",           # fallback naming
-        "execute_buy", "exec_buy",
-        # lightning-flavored aliases some routers use:
-        "lightning_buy", "buy_lightning", "route_buy", "lightning_route",
-    ):
+
+    for name in _candidate_buy_names():
         fn = getattr(router, name, None)
         if callable(fn):
-            return fn
+            return name, fn
+
+    # Fallback: scan for any 'buy*' function that isn't a quote/sell
+    try:
+        names = [n for n in dir(router) if "buy" in n.lower()]
+        for n in names:
+            if any(bad in n.lower() for bad in ("sell", "quote")):
+                continue
+            fn = getattr(router, n, None)
+            if callable(fn):
+                return n, fn
+    except Exception:
+        pass
+    return None
+
+async def _call_with_variants(fn: Any, *, mint: str, ui: Dict[str, Any],
+                              on_buy_submitted, on_buy_filled, on_buy_failed):
+    """
+    Try a few signatures to be version-proof:
+    (mint, ui, hooks?) → (mint, ui) → (ui,) → (mint,) → (mint, ui) positional
+    """
+    # Discover parameters to decide if hooks are acceptable
+    kwargs_full = {"mint": mint, "ui": ui}
+    try:
+        sig = inspect.signature(fn)
+        if "on_buy_submitted" in sig.parameters:
+            kwargs_full["on_buy_submitted"] = on_buy_submitted
+        if "on_buy_filled" in sig.parameters:
+            kwargs_full["on_buy_filled"] = on_buy_filled
+        if "on_buy_failed" in sig.parameters:
+            kwargs_full["on_buy_failed"] = on_buy_failed
+    except Exception:
+        pass
+
+    attempts = [
+        ("kw_full", lambda: fn(**kwargs_full)),
+        ("kw_nohooks", lambda: fn(mint=mint, ui=ui)),
+        ("kw_ui_only", lambda: fn(ui=ui)),
+        ("kw_mint_only", lambda: fn(mint=mint)),
+        ("pos_mint_ui", lambda: fn(mint, ui)),
+        ("pos_ui_only", lambda: fn(ui)),
+    ]
+    last_err = None
+    for label, inv in attempts:
+        try:
+            res = inv()
+            if inspect.isawaitable(res):
+                res = await res
+            _safe_log_router_state("ROUTER_BUY_CALL", variant=label)
+            return res
+        except TypeError as e:
+            # wrong signature → try next shape
+            last_err = str(e)
+            continue
+    if last_err:
+        _safe_log_router_state("ROUTER_BUY_ALL_VARIANTS_FAILED", error=last_err)
     return None
 
 async def maybe_buy(
@@ -211,76 +285,46 @@ async def maybe_buy(
 ) -> Optional[str]:
     """
     Router-wired maybe_buy:
-      - Locates router's buy-callable dynamically
-      - Passes hooks if the target supports them
-      - Normalizes output to a tx signature string (or None)
+      - Locates router's buy-callable dynamically (handles lightning names)
+      - Passes hooks if supported; gracefully retries without hooks
+      - Normalizes return to a tx signature string (or None)
     """
     if router is None:
-        # structured logging must use log.event (kwargs-safe)
-        try:
-            if hasattr(log, "event"):
-                log.event("ROUTER_UNAVAILABLE_FOR_BUY")
-        except Exception:
-            pass
+        _safe_log_router_state("ROUTER_UNAVAILABLE_FOR_BUY")
         raise RuntimeError("router unavailable")
 
-    fn = _pick_router_buy_callable()
-    if not fn:
-        # better context without breaking logging (no kwargs to log.error!)
-        try:
-            if hasattr(log, "event"):
-                log.event(
-                    "ROUTER_NO_BUY_CAPABLE",
-                    buy_keys=getattr(router, "buy_keys", None),
-                    sell_keys=getattr(router, "sell_keys", None),
-                    impls=os.getenv("ROUTER_IMPLS"),
-                )
-            else:
-                print(
-                    f"[router] no buy-capable function; "
-                    f"buy={getattr(router, 'buy_keys', None)} "
-                    f"sell={getattr(router, 'sell_keys', None)}",
-                    flush=True,
-                )
-        except Exception:
-            pass
+    choice = _pick_router_buy_callable()
+    if not choice:
+        _safe_log_router_state(
+            "ROUTER_NO_BUY_CAPABLE",
+            impls=os.getenv("ROUTER_IMPLS"),
+            buy_keys=getattr(router, "buy_keys", None),
+            sell_keys=getattr(router, "sell_keys", None),
+            file=getattr(router, "__file__", "<router?>"),
+        )
         raise RuntimeError("router has no buy-capable function")
 
-    # optional: emit which router fn we picked (safe kwargs)
-    try:
-        if hasattr(log, "event"):
-            log.event("ROUTER_BUY_FN", name=getattr(fn, "__name__", "<callable>"))
-    except Exception:
-        pass
+    fn_name, fn = choice
+    _safe_log_router_state(
+        "ROUTER_BUY_FN",
+        fn=fn_name,
+        impls=os.getenv("ROUTER_IMPLS"),
+        file=getattr(router, "__file__", "<router?>"),
+    )
 
-    kwargs = {"mint": mint, "ui": ui}
-    try:
-        sig = inspect.signature(fn)
-        if "on_buy_submitted" in sig.parameters:
-            kwargs["on_buy_submitted"] = on_buy_submitted
-        if "on_buy_filled" in sig.parameters:
-            kwargs["on_buy_filled"] = on_buy_filled
-        if "on_buy_failed" in sig.parameters:
-            kwargs["on_buy_failed"] = on_buy_failed
-    except Exception:
-        # Some legacy callables won't expose signatures reliably
-        pass
-
-    try:
-        res = fn(**kwargs)
-        if asyncio.iscoroutine(res):
-            res = await res
-    except TypeError:
-        # Retry without hooks in case the target doesn't accept them
-        res = fn(mint=mint, ui=ui)
-        if asyncio.iscoroutine(res):
-            res = await res
+    # Call with robust signature handling
+    res = await _call_with_variants(
+        fn, mint=mint, ui=ui,
+        on_buy_submitted=on_buy_submitted,
+        on_buy_filled=on_buy_filled,
+        on_buy_failed=on_buy_failed,
+    )
 
     # Normalize return → signature string or None
     if isinstance(res, str):
         return res
     if isinstance(res, dict):
-        for k in ("signature", "sig", "tx_sig", "tx"):
+        for k in ("signature", "sig", "tx_sig", "tx", "id"):
             v = res.get(k)
             if isinstance(v, str) and v:
                 return v
