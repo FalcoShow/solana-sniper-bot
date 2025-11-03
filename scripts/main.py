@@ -24,6 +24,11 @@ NEW in this edition:
 
 HOTFIX:
 - Force-wire maybe_buy() to the router’s implementation used in shell tests.
+
+PATCHES IN THIS BUILD:
+- PumpPortalClient no longer called with `subscribe_trades=` (version-safe).
+  We subscribe via `client._subscribe("trades")` or other public methods if available.
+- When router has no buy-capable function, we log `ROUTER_NO_BUY_CAPABLE` with context.
 """
 
 import asyncio
@@ -81,6 +86,7 @@ except Exception:  # pragma: no cover
         def event(self, *a, **k): print("[log]", a, k, flush=True)
         def warning(self, *a, **k): print("[warn]", a, k, flush=True)
         def every(self, *a, **k): print("[every]", a, k, flush=True)
+        def error(self, *a, **k): print("[error]", a, k, flush=True)
     def bump(_): pass
     def start_global_heartbeat(*_a, **_k): pass
     log = _Dummy()  # type: ignore
@@ -207,9 +213,18 @@ async def maybe_buy(
       - Normalizes output to a tx signature string (or None)
     """
     if router is None:
+        log.error("ROUTER_UNAVAILABLE_FOR_BUY")
         raise RuntimeError("router unavailable")
+
     fn = _pick_router_buy_callable()
     if not fn:
+        # ---- PATCH #2: better error context ----
+        log.error(
+            "ROUTER_NO_BUY_CAPABLE",
+            buy_keys=getattr(router, "buy_keys", None),
+            sell_keys=getattr(router, "sell_keys", None),
+            impls=os.getenv("ROUTER_IMPLS"),
+        )
         raise RuntimeError("router has no buy-capable function")
 
     kwargs = {"mint": mint, "ui": ui}
@@ -1306,8 +1321,8 @@ async def _maybe_start_health_server(stop_evt: asyncio.Event) -> Optional[asynci
 async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
     """
     Robust, version-proof PumpPortal streaming loop:
-      - Works with both newer and older PumpPortalClient signatures
-      - Subscribes to trades if possible (by kwarg or method)
+      - Works with older PumpPortalClient signatures (no subscribe_trades kwarg)
+      - Subscribes to trades via client methods if present, or internal helper
       - Gracefully handles reconnects and shutdown
       - Shields Strategy handlers from crashing the stream
     """
@@ -1332,13 +1347,15 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
 
     subscribe_trades_flag = _env_bool("PUMP_SUBSCRIBE_TRADES", True)
 
-    async def _subscribe_if_needed(client: Any) -> None:
+    async def _subscribe_if_possible(client: Any) -> None:
         """
-        Some client versions support subscribe at __init__, others expose a method.
-        Try a few common method names; never raise if missing.
+        Version-safe subscription:
+          1) Try public methods if they exist
+          2) Fallback to internal `_subscribe("trades")`
         """
         if not subscribe_trades_flag:
             return
+        # Public styles we know about
         for name in ("subscribe_trades", "enable_trades", "enable_trade_stream"):
             fn = getattr(client, name, None)
             if callable(fn):
@@ -1350,10 +1367,20 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
                     return
                 except Exception as e:
                     log.every("pump.subscribe.err", n=5, msg="PUMP_SUBSCRIBE_FAIL", via=name, err=str(e))
+        # Internal helper seen in your class
+        try:
+            sub = getattr(client, "_subscribe", None)
+            if callable(sub):
+                res = sub("trades")
+                if asyncio.iscoroutine(res):
+                    await res
+                log.every("pump.subscribe", n=30, msg="PUMP_SUBSCRIBED", via="_subscribe")
+        except Exception as e:
+            log.every("pump.subscribe.err", n=5, msg="PUMP_SUBSCRIBE_FAIL", via="_subscribe", err=str(e))
 
     async def _run_with_client_obj(client: Any) -> None:
         print("[main] Connecting:", _mask_uri(client), flush=True)
-        await _subscribe_if_needed(client)
+        await _subscribe_if_possible(client)
         async for ev in client.events():
             if local_stop.is_set():
                 break
@@ -1365,37 +1392,29 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
                 print("[main] event handling error:", flush=True)
                 traceback.print_exc()
 
-    # Path A: client is an async context manager (preferred)
-    if hasattr(PumpPortalClient, "__aenter__"):
-        try:
-            try:
-                async with PumpPortalClient(subscribe_trades=subscribe_trades_flag) as client:  # type: ignore[misc]
-                    await _run_with_client_obj(client)
-            except TypeError:
-                # Older client; no subscribe_trades kwarg
-                async with PumpPortalClient() as client:  # type: ignore[misc]
-                    await _run_with_client_obj(client)
-        finally:
-            with contextlib.suppress(Exception):
-                local_stop.set()
-                diag_task.cancel()
-                await asyncio.wait_for(diag_task, timeout=1.5)
-        return
+    # Build kwargs safely for current client signature
+    pp_kwargs: Dict[str, Any] = {}
+    if os.getenv("PF_PP_KEY"):
+        pp_kwargs["api_key"] = os.getenv("PF_PP_KEY")
+    if os.getenv("OWNER"):
+        pp_kwargs["account"] = os.getenv("OWNER")
 
-    # Path B: legacy style (manual open/close)
+    # Prefer async context manager if available
     try:
-        try:
-            client = PumpPortalClient(subscribe_trades=subscribe_trades_flag)  # type: ignore[misc]
-        except TypeError:
-            client = PumpPortalClient()
-        await _run_with_client_obj(client)
+        if hasattr(PumpPortalClient, "__aenter__"):
+            async with PumpPortalClient(**pp_kwargs) as client:  # no subscribe_trades kwarg
+                await _run_with_client_obj(client)
+        else:
+            client = PumpPortalClient(**pp_kwargs)  # legacy style
+            try:
+                await _run_with_client_obj(client)
+            finally:
+                with contextlib.suppress(Exception):
+                    if hasattr(client, "close"):
+                        maybe_awaitable = client.close()
+                        if asyncio.iscoroutine(maybe_awaitable):
+                            await maybe_awaitable  # type: ignore
     finally:
-        # Try to close gracefully across versions
-        with contextlib.suppress(Exception):
-            if hasattr(client, "close"):
-                maybe_awaitable = client.close()
-                if asyncio.iscoroutine(maybe_awaitable):
-                    await maybe_awaitable  # type: ignore
         with contextlib.suppress(Exception):
             local_stop.set()
             diag_task.cancel()
