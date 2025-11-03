@@ -329,6 +329,125 @@ async def maybe_buy(
             if isinstance(v, str) and v:
                 return v
     return None
+
+# --- add these helpers near the router hotfix section ---
+
+def _compute_spend_sol(ui: Dict[str, Any]) -> float:
+    """
+    Pick a buy size (in SOL) for routers that require amount_sol or lamports.
+    Priority: ui['spend_sol'] -> ENV -> default 0.02 SOL
+    ENV keys supported: ENTRY_BUY_SOL, ENTRY_SPEND_SOL, INITIAL_BUY_SOL
+    """
+    for k in ("spend_sol", "buy_size_sol", "amount_sol"):
+        try:
+            v = float(ui.get(k)) if ui.get(k) is not None else None
+            if v and v > 0:
+                return v
+        except Exception:
+            pass
+    for envk in ("ENTRY_BUY_SOL", "ENTRY_SPEND_SOL", "INITIAL_BUY_SOL"):
+        try:
+            v = float(os.getenv(envk, "0"))
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    return 0.02  # sane default
+
+def _env_slippage_bps() -> int:
+    try:
+        return int(os.getenv("SLIPPAGE_BPS", os.getenv("ENTRY_SLIPPAGE_BPS", "50")))
+    except Exception:
+        return 50
+
+def _build_kwargs_for_router(fn: Any, mint: str, ui: Dict[str, Any],
+                             on_buy_submitted, on_buy_filled, on_buy_failed) -> Dict[str, Any]:
+    """
+    Inspect the router fn and supply exactly the kwargs it understands.
+    Handles keyword-only signatures like buy_via_lightning.
+    """
+    kwargs: Dict[str, Any] = {}
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        names = set(params.keys())
+
+        # Common requireds
+        if "mint" in names:
+            kwargs["mint"] = mint
+        if "ui" in names:
+            kwargs["ui"] = ui
+
+        # Amount/lamports shapes
+        spend = _compute_spend_sol(ui)
+        if "amount_sol" in names:
+            kwargs["amount_sol"] = float(spend)
+        if "lamports_in" in names:
+            kwargs["lamports_in"] = int(round(spend * 1_000_000_000))
+
+        # Slippage
+        if "slippage_bps" in names:
+            kwargs["slippage_bps"] = _env_slippage_bps()
+
+        # “Direct only” toggle (optional)
+        if "only_direct" in names:
+            kwargs["only_direct"] = bool(os.getenv("ONLY_DIRECT", "0") in {"1","true","yes","on"})
+
+        # Hooks (only if accepted)
+        if "on_buy_submitted" in names:
+            kwargs["on_buy_submitted"] = on_buy_submitted
+        if "on_buy_filled" in names:
+            kwargs["on_buy_filled"] = on_buy_filled
+        if "on_buy_failed" in names:
+            kwargs["on_buy_failed"] = on_buy_failed
+    except Exception:
+        # If we can’t introspect, fall back to a safe minimal set
+        kwargs = {"mint": mint, "ui": ui}
+    return kwargs
+
+async def _call_with_variants(fn: Any, *, mint: str, ui: Dict[str, Any],
+                              on_buy_submitted, on_buy_filled, on_buy_failed):
+    """
+    Prefer an introspected **kwargs call that exactly matches the signature.
+    Only if that fails, try a couple of generic fallbacks (still kwargs).
+    We avoid positional calls to support keyword-only functions like buy_via_lightning.
+    """
+    # 1) Best-effort signature-aware kwargs
+    try:
+        kw_sig = _build_kwargs_for_router(fn, mint, ui, on_buy_submitted, on_buy_filled, on_buy_failed)
+        res = fn(**kw_sig)
+        if inspect.isawaitable(res):
+            res = await res
+        _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_sig", sent_keys=sorted(kw_sig.keys()))
+        return res
+    except TypeError as e:
+        _safe_log_router_state("ROUTER_BUY_CALL_TYPERR", where="kw_sig", err=str(e))
+    except Exception as e:
+        _safe_log_router_state("ROUTER_BUY_CALL_ERR", where="kw_sig", err=str(e))
+
+    # 2) Minimal kwargs: {mint, ui}
+    try:
+        res = fn(mint=mint, ui=ui)
+        if inspect.isawaitable(res):
+            res = await res
+        _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_min_mint_ui")
+        return res
+    except Exception as e:
+        _safe_log_router_state("ROUTER_BUY_CALL_ERR", where="kw_min_mint_ui", err=str(e))
+
+    # 3) Last resort: {mint} only
+    try:
+        res = fn(mint=mint)
+        if inspect.isawaitable(res):
+            res = await res
+        _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_mint_only")
+        return res
+    except Exception as e:
+        _safe_log_router_state("ROUTER_BUY_CALL_ERR", where="kw_mint_only", err=str(e))
+
+    _safe_log_router_state("ROUTER_BUY_ALL_VARIANTS_FAILED", error="no compatible kwargs")
+    return None
+
 # ---------- /HOTFIX ----------
 
 # Liquidity screen (optional fallback)
