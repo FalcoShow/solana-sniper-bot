@@ -123,9 +123,9 @@ except Exception:  # pragma: no cover
         def __init__(self, *a, **kw):
             raise RuntimeError("PumpPortalClient not available")
 
-# NOTE: We intentionally DO NOT import maybe_buy from pump_trader here.
-# The hotfix below wires maybe_buy() directly to the router so it always works
-# (even if pump_trader is missing or outdated).
+# NOTE: we intentionally DO NOT import maybe_buy from pump_trader.
+# We wire maybe_buy() directly to the router so it always works even
+# if pump_trader is missing or out of date.
 
 try:
     from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN as _pkg_is_dryrun
@@ -180,12 +180,13 @@ except Exception:  # pragma: no cover
         return 0.0
     _route_get_decimals = None  # type: ignore
 
-# ---------- HOTFIX: wire maybe_buy to router ----------
+# ---------- HOTFIX: wire maybe_buy to router (safe logging) ----------
 import inspect
 
 def _pick_router_buy_callable() -> Optional[Any]:
     """
-    Try a few common entrypoints that exist in utils_pkg/router.py.
+    Try common entrypoints that may exist in utils_pkg/router.py.
+    Add more names here if your router exposes a different symbol.
     """
     if router is None:
         return None
@@ -195,7 +196,9 @@ def _pick_router_buy_callable() -> Optional[Any]:
         "route_and_buy",       # descriptive
         "buy_on_jupiter",      # explicit
         "buy_token",           # fallback naming
-        "execute_buy", "exec_buy"
+        "execute_buy", "exec_buy",
+        # lightning-flavored aliases some routers use:
+        "lightning_buy", "buy_lightning", "route_buy", "lightning_route",
     ):
         fn = getattr(router, name, None)
         if callable(fn):
@@ -213,19 +216,42 @@ async def maybe_buy(
       - Normalizes output to a tx signature string (or None)
     """
     if router is None:
-        log.error("ROUTER_UNAVAILABLE_FOR_BUY")
+        # structured logging must use log.event (kwargs-safe)
+        try:
+            if hasattr(log, "event"):
+                log.event("ROUTER_UNAVAILABLE_FOR_BUY")
+        except Exception:
+            pass
         raise RuntimeError("router unavailable")
 
     fn = _pick_router_buy_callable()
     if not fn:
-        # ---- PATCH #2: better error context ----
-        log.error(
-            "ROUTER_NO_BUY_CAPABLE",
-            buy_keys=getattr(router, "buy_keys", None),
-            sell_keys=getattr(router, "sell_keys", None),
-            impls=os.getenv("ROUTER_IMPLS"),
-        )
+        # better context without breaking logging (no kwargs to log.error!)
+        try:
+            if hasattr(log, "event"):
+                log.event(
+                    "ROUTER_NO_BUY_CAPABLE",
+                    buy_keys=getattr(router, "buy_keys", None),
+                    sell_keys=getattr(router, "sell_keys", None),
+                    impls=os.getenv("ROUTER_IMPLS"),
+                )
+            else:
+                print(
+                    f"[router] no buy-capable function; "
+                    f"buy={getattr(router, 'buy_keys', None)} "
+                    f"sell={getattr(router, 'sell_keys', None)}",
+                    flush=True,
+                )
+        except Exception:
+            pass
         raise RuntimeError("router has no buy-capable function")
+
+    # optional: emit which router fn we picked (safe kwargs)
+    try:
+        if hasattr(log, "event"):
+            log.event("ROUTER_BUY_FN", name=getattr(fn, "__name__", "<callable>"))
+    except Exception:
+        pass
 
     kwargs = {"mint": mint, "ui": ui}
     try:
@@ -237,7 +263,7 @@ async def maybe_buy(
         if "on_buy_failed" in sig.parameters:
             kwargs["on_buy_failed"] = on_buy_failed
     except Exception:
-        # Best-effort: some legacy functions won't expose signatures reliably
+        # Some legacy callables won't expose signatures reliably
         pass
 
     try:
