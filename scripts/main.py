@@ -478,6 +478,65 @@ def _get_raydium_scanner():
     except Exception:
         return None
 
+# --- Solana tx confirmation helpers (keyword-only friendly) ---
+import json as _json
+import httpx as _httpx
+
+def _rpc_url() -> str:
+    return os.getenv("SOLANA_RPC_URL") or os.getenv("RPC_URL") or "https://api.mainnet-beta.solana.com"
+
+def _confirm_commitment() -> str:
+    # "confirmed" is faster; switch to "finalized" if you prefer.
+    return os.getenv("CONFIRM_COMMITMENT", "confirmed")
+
+def _confirm_timeout_sec() -> float:
+    try:
+        return float(os.getenv("CONFIRM_TIMEOUT_SEC", "25"))
+    except Exception:
+        return 25.0
+
+async def _get_sig_status(sig: str) -> Optional[dict]:
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSignatureStatuses",
+        "params": [[sig], {"searchTransactionHistory": True}],
+    }
+    async with _httpx.AsyncClient(timeout=10) as c:
+        r = await c.post(_rpc_url(), json=body)
+        r.raise_for_status()
+        j = r.json()
+        val = (j.get("result") or {}).get("value") or []
+        return (val[0] if val else None)
+
+async def _confirm_sig(sig: str) -> tuple[bool, Optional[str]]:
+    """
+    Poll getSignatureStatuses until:
+      - status.confirmationStatus in {'confirmed','finalized'} and err is None -> (True, slot)
+      - err not None or timeout -> (False, reason)
+    """
+    import time as _time
+    deadline = _time.monotonic() + _confirm_timeout_sec()
+    want = _confirm_commitment()
+    ok_states = {"confirmed", "finalized"}
+
+    while _time.monotonic() < deadline:
+        st = await _get_sig_status(sig)
+        if st:
+            err = st.get("err")
+            conf = (st.get("confirmationStatus") or "").lower()
+            slot = st.get("slot")
+            if err is None and conf in ok_states:
+                if want == "finalized" and conf != "finalized":
+                    await asyncio.sleep(0.35)
+                    continue
+                return True, str(slot)
+            if err is not None:
+                return False, f"rpc_error:{err}"
+        await asyncio.sleep(0.35)
+
+    return False, "timeout"
+
 # ---------------------------
 # ENV helpers
 # ---------------------------
@@ -1008,6 +1067,7 @@ class Strategy:
                     if DEBUG_TX:
                         print(f".[dedupe] gate already running for {mint_norm} — skip", flush=True)
                     return
+
             self._gate_state[mint_raw] = {"trades": 0, "price0": 0.0}
             price0 = 0.0
             if _is_probable_mint(mint_norm):
@@ -1019,6 +1079,7 @@ class Strategy:
                     if price0 > 0:
                         break
                     await asyncio.sleep(ENTRY_MOMO_PRICE_DELAY_S)
+
             self._gate_state[mint_raw]["price0"] = price0
             await asyncio.sleep(max(1, ENTRY_MOMO_WINDOW_SEC))
             st = self._gate_state.get(mint_raw, {})
@@ -1029,11 +1090,13 @@ class Strategy:
                     price1 = await _route_price_ui(mint_norm)
                 except Exception:
                     price1 = 0.0
+
             up_ok = True
             if price0 > 0 and price1 > 0:
                 up_pct = ((price1 / price0) - 1.0) * 100.0
                 up_ok = up_pct >= ENTRY_MOMO_MIN_UP_PCT
             trades_ok = trades >= ENTRY_MOMO_MIN_TRADES
+
             log.event(
                 "MOMO_EVAL",
                 mint=mint_raw,
@@ -1047,6 +1110,7 @@ class Strategy:
             )
             self._gate_state.pop(mint_raw, None)
 
+            # Guardrails
             if not buys_allowed() or _as_bool(os.getenv("PAUSE_TRADING", "0"), False):
                 if DEBUG_TX:
                     print("[guardrails] buys not allowed at gate decision — skip", flush=True)
@@ -1087,18 +1151,41 @@ class Strategy:
                             on_buy_failed=_buy_hook_failed,
                         )
                     self._diag["buys_submitted"] += 1
+
                     if tx_sig:
-                        record_buy_result(ok=True, reason="executed", sig=tx_sig)
-                        self._diag["buys_filled"] += 1
-                        asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
+                        try:
+                            await _buy_hook_submitted({"mint": mint_norm, **ui})
+                        except Exception:
+                            pass
+
+                        ok, info = await _confirm_sig(tx_sig)
+                        if ok:
+                            log.info("BUY_FILLED", extra={"mint": mint_norm, "tx_sig": tx_sig, "slot": info})
+                            try:
+                                await exit_engine.on_buy_filled(mint=mint_norm, ui=ui, tx_sig=tx_sig)
+                            except Exception:
+                                pass
+                            self._diag["buys_filled"] += 1
+                            record_buy_result(ok=True, reason="executed", sig=tx_sig)
+                            asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
+                        else:
+                            log.error("BUY_FAILED", extra={"mint": mint_norm, "tx_sig": tx_sig, "reason": info})
+                            try:
+                                await _buy_hook_failed({"mint": mint_norm, "reason": info, **ui})
+                            except Exception:
+                                pass
+                            record_buy_result(ok=False, reason=info)
                     else:
                         record_buy_result(ok=False, reason="no_tx_sig")
+
                 except Exception:
                     traceback.print_exc()
                     record_buy_result(ok=False, reason="exception")
+
             else:
                 record_buy_result(ok=False, reason="momo_reject")
                 self._diag["rejected_momo"] += 1
+
 
     async def on_new_token(self, raw_event: Dict[str, Any]) -> None:
         DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
@@ -1126,11 +1213,13 @@ class Strategy:
             if DEBUG_TX:
                 print("[strategy] missing mint — skip", flush=True)
             return
+
         mint_norm = _normalize_from_source(mint_source)
         if not _is_probable_mint(mint_norm):
             if DEBUG_TX:
                 print(f"[strategy] implausible mint after normalize => skip ({mint_source})", flush=True)
             return
+
         if not _passes_basic_filters(raw_event):
             self._diag["rejected_filters"] += 1
             return
@@ -1190,6 +1279,7 @@ class Strategy:
                             print("[guardrails] buys not allowed at execution — skip", flush=True)
                         self._diag["rejected_guardrails"] += 1
                         return
+
                     max_tradeable = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)
                     if max_tradeable > 0:
                         try:
@@ -1199,6 +1289,7 @@ class Strategy:
                                 return
                         except Exception:
                             pass
+
                     tx_sig = await maybe_buy(
                         mint=mint_norm,
                         ui=ui,
@@ -1207,12 +1298,32 @@ class Strategy:
                         on_buy_failed=_buy_hook_failed,
                     )
                     self._diag["buys_submitted"] += 1
-                    if not tx_sig:
+
+                    if tx_sig:
+                        try:
+                            await _buy_hook_submitted({"mint": mint_norm, **ui})
+                        except Exception:
+                            pass
+
+                        ok, info = await _confirm_sig(tx_sig)
+                        if ok:
+                            log.info("BUY_FILLED", extra={"mint": mint_norm, "tx_sig": tx_sig, "slot": info})
+                            try:
+                                await exit_engine.on_buy_filled(mint=mint_norm, ui=ui, tx_sig=tx_sig)
+                            except Exception:
+                                pass
+                            self._diag["buys_filled"] += 1
+                            record_buy_result(ok=True, reason="executed", sig=tx_sig)
+                            asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
+                        else:
+                            log.error("BUY_FAILED", extra={"mint": mint_norm, "tx_sig": tx_sig, "reason": info})
+                            try:
+                                await _buy_hook_failed({"mint": mint_norm, "reason": info, **ui})
+                            except Exception:
+                                pass
+                            record_buy_result(ok=False, reason=info)
+                    else:
                         record_buy_result(ok=False, reason="no_tx_sig")
-                        return
-                    record_buy_result(ok=True, reason="executed", sig=tx_sig)
-                    self._diag["buys_filled"] += 1
-                    asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
                 except Exception:
                     print("[strategy] maybe_buy exception:", flush=True)
                     traceback.print_exc()
