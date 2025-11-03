@@ -28,12 +28,14 @@ Environment knobs (recommended)
 
 Public API
 - buy_via_lightning(mint: str, amount_sol: float, slippage_bps: int = ...)
+    -> Optional[str]  # tx signature or None
 - sell_via_lightning(mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int = ...)
+    -> Optional[str]  # tx signature or None
 """
 
 import os
 import json
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Dict, Any
 
 import httpx
 
@@ -179,8 +181,8 @@ async def _get_quote(*, input_mint: str, output_mint: str, amount: int, slippage
         "amount": str(amount),
         "slippageBps": int(slippage_bps),
         "swapMode": "ExactIn",
-        "onlyDirectRoutes": str(ONLY_DIRECT).lower(),
-        "asLegacyTransaction": str(AS_LEGACY).lower(),
+        "onlyDirectRoutes": ONLY_DIRECT,
+        "asLegacyTransaction": AS_LEGACY,
     }
     # Include fee only when properly configured
     if USE_PLATFORM_FEE:
@@ -212,9 +214,11 @@ async def _build_swap_tx(*, user_pubkey: str, quote: Dict[str, Any]) -> str:
     body: Dict[str, Any] = {
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": WRAP_UNWRAP_SOL,
-        "dynamicComputeUnitLimit": False if (COMPUTE_UNIT_LIMIT and COMPUTE_UNIT_LIMIT > 0) else True,
+        "dynamicComputeUnitLimit": not (COMPUTE_UNIT_LIMIT and COMPUTE_UNIT_LIMIT > 0),
         "quoteResponse": quote,
         "asLegacyTransaction": bool(AS_LEGACY),
+        # 🔧 Critical fix for Jupiter 400 ("useSharedAccounts"):
+        "useSharedAccounts": False,
     }
 
     prio = _choose_priority_lamports()
@@ -252,8 +256,8 @@ async def _send_tx_b64(tx_b64: str) -> str:
 # Public API (called by router)
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def buy_via_lightning(*, mint: str, amount_sol: float, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Tuple[bool, Optional[str]]:
-    """Buy `mint` spending SOL. Returns (ok, signature|error)."""
+async def buy_via_lightning(*, mint: str, amount_sol: float, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Optional[str]:
+    """Buy `mint` spending SOL. Returns tx signature on success, else None."""
     try:
         m = normalize_mint(mint)
         lamports_in = max(1, int(float(amount_sol) * LAMPORTS_PER_SOL))
@@ -262,25 +266,25 @@ async def buy_via_lightning(*, mint: str, amount_sol: float, slippage_bps: int =
 
         if DRY_RUN:
             log.info("ENTRY_TX_DRYRUN", extra={"mint": m, "lamports_in": lamports_in, "slippage_bps": slippage_bps})
-            return True, None
+            return None
 
         user_pk = get_pubkey_str(load_keypair())
         tx_b64 = await _build_swap_tx(user_pubkey=user_pk, quote=quote)
         sig = await _send_tx_b64(tx_b64)
         log.info("ENTRY_TX_OK", extra={"sig": sig})
-        return True, sig
+        return sig
 
     except httpx.HTTPError as e:
         msg = f"HTTPError during buy: {e}"
         log.warning("ENTRY_TX_HTTP_ERROR", extra={"err": msg})
-        return False, msg
+        return None
     except Exception as e:
         msg = f"buy exception: {e}"
         log.warning("ENTRY_TX_FAIL", extra={"err": msg})
-        return False, msg
+        return None
 
-async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Tuple[bool, Optional[str]]:
-    """Sell `amount_raw` units of `mint` back to SOL. token_program is ignored (Jupiter resolves)."""
+async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Optional[str]:
+    """Sell `amount_raw` units of `mint` back to SOL. Returns tx signature on success, else None."""
     del token_program
     try:
         m = normalize_mint(mint)
@@ -289,19 +293,19 @@ async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_
 
         if DRY_RUN:
             log.info("EXIT_TX_DRYRUN", extra={"mint": m, "amount_raw": amount_raw, "slippage_bps": slippage_bps})
-            return True, None
+            return None
 
         user_pk = get_pubkey_str(load_keypair())
         tx_b64 = await _build_swap_tx(user_pubkey=user_pk, quote=quote)
         sig = await _send_tx_b64(tx_b64)
         log.info("EXIT_TX_OK", extra={"sig": sig})
-        return True, sig
+        return sig
 
     except httpx.HTTPError as e:
         msg = f"HTTPError during sell: {e}"
         log.warning("EXIT_TX_HTTP_ERROR", extra={"err": msg})
-        return False, msg
+        return None
     except Exception as e:
         msg = f"sell exception: {e}"
         log.warning("EXIT_TX_FAIL", extra={"err": msg})
-        return False, msg
+        return None
