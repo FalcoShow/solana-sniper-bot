@@ -162,12 +162,16 @@ SELL_IMPLS = {}
 from utils_pkg.lightning_impl import buy_via_lightning as _buy_lightning, sell_via_lightning as _sell_lightning
 
 def _register_lightning():
+    # Register under pool names the app expects, so routing works without further changes.
     if ALLOW_PUMP:
         BUY_IMPLS["pump"]  = _buy_lightning
         SELL_IMPLS["pump"] = _sell_lightning
     if ALLOW_RAYDIUM:
         BUY_IMPLS["raydium"]  = _buy_lightning
         SELL_IMPLS["raydium"] = _sell_lightning
+    # Also provide a generic "lightning" key for direct calls, if any.
+    BUY_IMPLS.setdefault("lightning", _buy_lightning)
+    SELL_IMPLS.setdefault("lightning", _sell_lightning)
 
 if BUY_IMPL == "lightning":
     _register_lightning()
@@ -176,7 +180,7 @@ if BUY_IMPL == "lightning":
 buy_via_lightning = _buy_lightning
 sell_via_lightning = _sell_lightning
 
-# Helpful startup log
+# Helpful startup log (confirms registration happened)
 try:
     from logging_setup import get_logger
     log = get_logger()
@@ -204,6 +208,9 @@ LAMPORTS_PER_SOL = 1_000_000_000
 # ──────────────────────────────────────────────────────────────────────────────
 # Toggles / timeouts / retries
 # ──────────────────────────────────────────────────────────────────────────────
+# NOTE: The router DOES NOT short-circuit on DRYRUN; it allows the call to
+# reach lightning_impl where DRYRUN only skips the *send*. This is required
+# so you can see quote + ENTRY_TX_DRYRUN from the main loop.
 DRY_RUN = _envb("DRYRUN", False) or _envb("DRY_RUN", False) or _envb("IS_DRYRUN", False)
 MIN_SOL_BALANCE = _envf("MIN_SOL_BALANCE", 3.0)
 
