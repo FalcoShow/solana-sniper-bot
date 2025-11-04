@@ -33,6 +33,40 @@ from typing import Any, Dict, Optional, Tuple, Callable, List
 import requests
 from requests.exceptions import RequestException
 
+# ----- BEGIN: ENV-DRIVEN HARD JUPITER DISABLE GUARD -----
+import os, logging
+
+log = logging.getLogger(__name__) if 'log' not in globals() else log
+
+def _env_false(val: str) -> bool:
+    return str(val).strip().lower() in ("0", "false", "no", "")
+
+JUPIER_DISABLED_BY_ENV = (
+    _env_false(os.getenv("ROUTER_ALLOW_JUPITER", "0"))  # prefer explicit allow flag
+    or _env_false(os.getenv("JUP_ENABLED", "0"))
+)
+
+# Explicitly blank out any base urls we may have inherited
+if JUPIER_DISABLED_BY_ENV:
+    # Defensive: make sure the rest of the code sees these as empty strings
+    os.environ["JUP_BASE_URL"] = ""
+    os.environ["JUP_ALT_BASE_URLS"] = ""
+    log.info({"event": "JUP_DISABLED_BY_ENV", "msg": "Jupiter calls disabled by env"})
+
+    # Provide a safe stub for the common Jupiter call sites used by router
+    def _jupiter_quote_stub(*args, **kwargs):
+        raise RuntimeError("Jupiter disabled by environment - quote requested but blocked")
+
+    # Try to patch common function names used in this codebase. If these names don't exist,
+    # the try/except simply continues (non-invasive).
+    try:
+        # if functions are defined later in this module, this will be overwritten; therefore also
+        # patch the router's public API points if they import a helper name.
+        globals()["quote_price_via_jupiter"] = _jupiter_quote_stub
+    except Exception:
+        pass
+# ----- END: ENV-DRIVEN HARD JUPITER DISABLE GUARD -----
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────────────────────────────────────
