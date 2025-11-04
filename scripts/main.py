@@ -1060,6 +1060,7 @@ class Strategy:
         ENTRY_MOMO_PRICE_DELAY_S = _as_float(os.getenv("ENTRY_MOMO_PRICE_DELAY_S", "0.7"), 0.7)
         ENTRY_MOMO_MIN_TRADES = _as_int(os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6)
         ENTRY_MOMO_MIN_UP_PCT = _as_float(os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0)
+        IS_DRYRUN = (_dryrun_env_on() or _pkg_is_dryrun)
 
         async with self._gate_sema:
             if _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True):
@@ -1136,16 +1137,12 @@ class Strategy:
                     record_buy_result(ok=False, reason="buy_claimed_elsewhere")
                     return
 
-                if _dryrun_env_on() or _pkg_is_dryrun:
-                    log.event("BUY_SKIPPED_DRYRUN", mint=mint_norm)
-                    record_buy_result(ok=False, reason="dryrun_skip")
-                    return
-
+                # *** KEY CHANGE: do NOT short-circuit for DRYRUN here. ***
                 try:
                     async with self._sema:
                         tx_sig = await maybe_buy(
                             mint=mint_norm,
-                            ui=ui,
+                            ui=ui | {"dryrun": IS_DRYRUN},
                             on_buy_submitted=_buy_hook_submitted,
                             on_buy_filled=_buy_hook_filled,
                             on_buy_failed=_buy_hook_failed,
@@ -1176,7 +1173,12 @@ class Strategy:
                                 pass
                             record_buy_result(ok=False, reason=info)
                     else:
-                        record_buy_result(ok=False, reason="no_tx_sig")
+                        # DRYRUN path naturally returns None from the impl — treat distinctly.
+                        if IS_DRYRUN:
+                            log.event("BUY_DRYRUN_EXIT", mint=mint_norm)
+                            record_buy_result(ok=False, reason="dryrun_exit")
+                        else:
+                            record_buy_result(ok=False, reason="no_tx_sig")
 
                 except Exception:
                     traceback.print_exc()
@@ -1186,9 +1188,10 @@ class Strategy:
                 record_buy_result(ok=False, reason="momo_reject")
                 self._diag["rejected_momo"] += 1
 
-
     async def on_new_token(self, raw_event: Dict[str, Any]) -> None:
         DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
+        IS_DRYRUN = (_dryrun_env_on() or _pkg_is_dryrun)
+
         self._diag["events_total"] += 1
         self._diag["events_new_token"] += 1
 
@@ -1267,11 +1270,7 @@ class Strategy:
                     print(f".[dedupe] buy already claimed for {mint_norm} — skip", flush=True)
                 return
 
-            if _dryrun_env_on() or _pkg_is_dryrun:
-                log.event("BUY_SKIPPED_DRYRUN", mint=mint_norm)
-                record_buy_result(ok=False, reason="dryrun_skip")
-                return
-
+            # *** KEY CHANGE: do NOT short-circuit for DRYRUN here. ***
             async with self._sema:
                 try:
                     if _as_bool(os.getenv("PAUSE_TRADING", "0"), False) or not buys_allowed():
@@ -1292,7 +1291,7 @@ class Strategy:
 
                     tx_sig = await maybe_buy(
                         mint=mint_norm,
-                        ui=ui,
+                        ui=ui | {"dryrun": IS_DRYRUN},
                         on_buy_submitted=_buy_hook_submitted,
                         on_buy_filled=_buy_hook_filled,
                         on_buy_failed=_buy_hook_failed,
@@ -1323,7 +1322,11 @@ class Strategy:
                                 pass
                             record_buy_result(ok=False, reason=info)
                     else:
-                        record_buy_result(ok=False, reason="no_tx_sig")
+                        if IS_DRYRUN:
+                            log.event("BUY_DRYRUN_EXIT", mint=mint_norm)
+                            record_buy_result(ok=False, reason="dryrun_exit")
+                        else:
+                            record_buy_result(ok=False, reason="no_tx_sig")
                 except Exception:
                     print("[strategy] maybe_buy exception:", flush=True)
                     traceback.print_exc()
