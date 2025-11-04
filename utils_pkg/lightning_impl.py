@@ -85,7 +85,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 # Config (Jupiter + trade knobs)
 # ──────────────────────────────────────────────────────────────────────────────
 
-BASE: str = (_env_str("JUP_UPSTREAM") or _env_str("JUP_BASE_URL") or "https://public.jupiterapi.com").rstrip("/")
+BASE: str = (_env_str("JUP_BASE_URL") or _env_str("JUP_UPSTREAM") or "https://api.jup.ag").rstrip("/")
 AS_LEGACY: bool = _env_bool("JUP_AS_LEGACY", False)  # keep False for v6
 ONLY_DIRECT: bool = _env_bool("JUP_ONLY_DIRECT", False)
 
@@ -194,6 +194,7 @@ async def _get_quote(*, input_mint: str, output_mint: str, amount: int, slippage
     if USE_PLATFORM_FEE:
         params["platformFeeBps"] = int(PLATFORM_FEE_BPS)
 
+    log.info("JUP runtime base=%s AS_LEGACY=%s", BASE, AS_LEGACY)
     url = f"{BASE}/quote" if not AS_LEGACY else f"{BASE}/swap/v1/quote"
     js = await _http_get(url, params=params)
 

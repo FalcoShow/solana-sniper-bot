@@ -249,13 +249,13 @@ _UA = {"user-agent": "pnlsniper/router", "accept": "application/json", "content-
 JUP_UPSTREAM: str = (
     os.getenv("JUP_UPSTREAM")
     or os.getenv("JUP_BASE_URL")
-    or "https://public.jupiterapi.com"
+    or "https://api.jup.ag"
 ).rstrip("/")
 JUP_ALT_BASE_URLS: List[str] = [u.strip().rstrip("/") for u in (os.getenv("JUP_ALT_BASE_URLS") or "").split(",") if u.strip()]
 AS_LEGACY = _envb("JUP_AS_LEGACY", False)
 ONLY_DIRECT_DEFAULT = _envb("JUP_ONLY_DIRECT", False)
 if not AS_LEGACY:
-    JUP_ALT_BASE_URLS = []  # v6: avoid api.jup.ag 404s
+    JUP_ALT_BASE_URLS = [os.getenv("JUP_BASE_URL", "https://api.jup.ag"), "https://quote-api.jup.ag"]
 _JUP_LAST_GOOD_BASE: Optional[str] = None
 
 def _quote_url(base: str) -> str:

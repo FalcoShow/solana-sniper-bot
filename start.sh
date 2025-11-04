@@ -149,19 +149,19 @@ if [[ "${RELAY_ENABLED}" = "1" ]]; then
       (head -n 80 /tmp/jup_relay.log || true) | sed 's/^/[relay] /'
       log "falling back to public Jupiter"
       : "${JUP_BASE_URL:=https://api.jup.ag}"
-      : "${JUP_ALT_BASE_URLS:=https://public.jupiterapi.com}"
+      : "${JUP_ALT_BASE_URLS:=https://api.jup.ag}"
       export JUP_BASE_URL JUP_ALT_BASE_URLS
     fi
   else
     log "RELAY_ENABLED=1 but jup_relay.py not found; using public Jupiter"
     : "${JUP_BASE_URL:=https://api.jup.ag}"
-    : "${JUP_ALT_BASE_URLS:=https://public.jupiterapi.com}"
+    : "${JUP_ALT_BASE_URLS:=https://api.jup.ag}"
     export JUP_BASE_URL JUP_ALT_BASE_URLS
   fi
 else
   log "skipping local Jupiter relay (RELAY_ENABLED!=1)"
   : "${JUP_BASE_URL:=https://api.jup.ag}"
-  : "${JUP_ALT_BASE_URLS:=https://public.jupiterapi.com}"
+  : "${JUP_ALT_BASE_URLS:=https://api.jup.ag}"
   export JUP_BASE_URL JUP_ALT_BASE_URLS
 fi
 
