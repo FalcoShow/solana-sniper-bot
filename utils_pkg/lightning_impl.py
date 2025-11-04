@@ -1,40 +1,40 @@
 from __future__ import annotations
 
 """
-utils_pkg/lightning_impl.py — Jupiter v6 swapper (stable)
+utils_pkg/lightning_impl.py — Jupiter v6 swapper (Shared Accounts / Token Ledger)
+
+What this version fixes
+- Uses Jupiter v6 /swap with one of the NEW required variants:
+  - useSharedAccounts (recommended)  ← set JUP_USE_SHARED_ACCOUNTS=1
+  - useTokenLedger                   ← set JUP_USE_TOKEN_LEDGER=1
+- If both are set, we PREFER Shared Accounts and log a warning.
+- Leaves legacy mode OFF by default (AS_LEGACY=False).
 
 Design goals
-- Target Jupiter v6 at https://public.jupiterapi.com (no legacy by default)
-- Do NOT send platform fees unless fully configured (prevents 422)
-- Clean headers (origin/referer) and optional API key/bearer
-- Quote → Swap with quoteResponse passthrough (no payload re-shaping)
-- Optional priority fee (lamports) & compute unit limit
-- DRY_RUN support for safe testing
-- Friendly logs on non-200 responses (emit JSON body when possible)
+- Target https://public.jupiterapi.com (v6) with clean headers
+- Quote → Swap using quoteResponse passthrough
+- DRY_RUN safe path
+- Optional platform fees (disabled unless fully configured)
+- Optional priority fee & compute unit limit (or dynamic CU)
+- Wrap/unwrap SOL by default
 
 Environment knobs (recommended)
 - JUP_UPSTREAM (default: https://public.jupiterapi.com)
 - JUP_API_KEY / JUP_PRO_KEY (optional), JUP_BEARER (optional)
 - JUP_AS_LEGACY=false (v6)
 - JUP_ONLY_DIRECT=false
-- JUP_PLATFORM_FEE_BPS (default: 0 → disabled)
-- JUP_PLATFORM_FEE_ACCOUNT (fee account; required if fee enabled)
-- PF_SLIPPAGE_BPS (default: 30)
-- PF_PRIORITY_LAMPORTS (optional) or PF_PRIORITY_SOL (optional)
-- PF_COMPUTE_UNIT_LIMIT (optional)
+- JUP_USE_SHARED_ACCOUNTS=1   ← you already set this
+- JUP_USE_TOKEN_LEDGER=0
+- JUP_PLATFORM_FEE_BPS=0      (and JUP_PLATFORM_FEE_ACCOUNT if >0)
+- PF_SLIPPAGE_BPS=30
+- PF_PRIORITY_LAMPORTS (or PF_PRIORITY_SOL)
+- PF_COMPUTE_UNIT_LIMIT (0 → let Jupiter pick dynamically)
 - PF_WRAP_UNWRAP_SOL=true
-- JITO_FEE_MICROLAMPORTS (optional; fallback → lamports)
-- DRYRUN / DRY_RUN / IS_DRYRUN (optional)
-
-Public API
-- buy_via_lightning(mint: str, amount_sol: float, slippage_bps: int = ...)
-    -> Optional[str]  # tx signature or None
-- sell_via_lightning(mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int = ...)
-    -> Optional[str]  # tx signature or None
+- JITO_FEE_MICROLAMPORTS (fallback → lamports)
+- DRYRUN / DRY_RUN / IS_DRYRUN
 """
 
 import os
-import json
 from typing import Optional, Dict, Any
 
 import httpx
@@ -47,7 +47,7 @@ from utils_pkg.solana_wallet import (
     sign_and_send_b64_tx,
 )
 
-# Prefer robust sender w/ simulate diagnostics if available
+# Prefer robust sender (if available)
 try:  # pragma: no cover
     from utils_pkg.solana_wallet import _send_b64_with_diag  # type: ignore
 except Exception:  # pragma: no cover
@@ -86,26 +86,30 @@ def _env_bool(name: str, default: bool = False) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 
 BASE: str = (_env_str("JUP_UPSTREAM") or _env_str("JUP_BASE_URL") or "https://public.jupiterapi.com").rstrip("/")
-AS_LEGACY: bool = _env_bool("JUP_AS_LEGACY", False)
+AS_LEGACY: bool = _env_bool("JUP_AS_LEGACY", False)  # keep False for v6
 ONLY_DIRECT: bool = _env_bool("JUP_ONLY_DIRECT", False)
 
-# v6: avoid alt bases (e.g., https://api.jup.ag 404s on /quote); keep empty
-ALT_BASES: list[str] = []
+# New variant toggles (prefer shared accounts if both true)
+USE_SHARED_ACCOUNTS: bool = _env_bool("JUP_USE_SHARED_ACCOUNTS", True)
+USE_TOKEN_LEDGER: bool = _env_bool("JUP_USE_TOKEN_LEDGER", False)
+if USE_SHARED_ACCOUNTS and USE_TOKEN_LEDGER:
+    log.warning("JUP_VARIANT_BOTH_SET", extra={"note": "Both SharedAccounts and TokenLedger set; preferring SharedAccounts"})
+    USE_TOKEN_LEDGER = False  # prefer shared
 
 # Auth/headers
 JUP_API_KEY: str = _env_str("JUP_API_KEY", _env_str("JUP_PRO_KEY", ""))
 JUP_BEARER: str   = _env_str("JUP_BEARER", "")
 
-# Fees — DISABLED by default to avoid 422s unless fully configured
+# Fees — DISABLED by default to avoid 422 unless fully configured
 PLATFORM_FEE_BPS: int      = _env_int("JUP_PLATFORM_FEE_BPS", 0)
 PLATFORM_FEE_ACCOUNT: str  = _env_str("JUP_PLATFORM_FEE_ACCOUNT", "")
 USE_PLATFORM_FEE: bool     = PLATFORM_FEE_BPS > 0 and bool(PLATFORM_FEE_ACCOUNT)
 
 # Slippage / CU / priority fee
 DEFAULT_SLIPPAGE_BPS: int = _env_int("PF_SLIPPAGE_BPS", 30)
-COMPUTE_UNIT_LIMIT: int   = _env_int("PF_COMPUTE_UNIT_LIMIT", 0)  # 0 = dynamic by Jupiter
+COMPUTE_UNIT_LIMIT: int   = _env_int("PF_COMPUTE_UNIT_LIMIT", 0)  # 0 → dynamic
 
-# --- JITO nicety: fallback from JITO_FEE_MICROLAMPORTS → lamports ---
+# Priority fee sources
 def _micro_to_lamports(micro: int) -> int:
     # 1 lamport = 1_000_000 microlamports
     try:
@@ -116,7 +120,6 @@ def _micro_to_lamports(micro: int) -> int:
 _fallback_micro = _env_int("JITO_FEE_MICROLAMPORTS", 0)
 _fallback_lamports = _micro_to_lamports(_fallback_micro)
 
-# If PF_PRIORITY_LAMPORTS is not set, auto-use JITO_FEE_MICROLAMPORTS (converted)
 PF_PRIORITY_LAMPORTS: int = _env_int("PF_PRIORITY_LAMPORTS", _fallback_lamports)
 PF_PRIORITY_SOL: float    = _env_float("PF_PRIORITY_SOL", 0.0)
 
@@ -175,6 +178,10 @@ async def _http_post(url: str, *, json_body: Dict[str, Any]) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def _get_quote(*, input_mint: str, output_mint: str, amount: int, slippage_bps: int) -> Dict[str, Any]:
+    """
+    Ask Jupiter for a v6 quote. We do not reshape the response; we pass it
+    straight into /swap in quoteResponse.
+    """
     params: Dict[str, Any] = {
         "inputMint": input_mint,
         "outputMint": output_mint,
@@ -182,14 +189,14 @@ async def _get_quote(*, input_mint: str, output_mint: str, amount: int, slippage
         "slippageBps": int(slippage_bps),
         "swapMode": "ExactIn",
         "onlyDirectRoutes": ONLY_DIRECT,
-        "asLegacyTransaction": AS_LEGACY,
+        "asLegacyTransaction": AS_LEGACY,  # keep False for v6
     }
-    # Include fee only when properly configured
     if USE_PLATFORM_FEE:
         params["platformFeeBps"] = int(PLATFORM_FEE_BPS)
 
     url = f"{BASE}/quote" if not AS_LEGACY else f"{BASE}/swap/v1/quote"
     js = await _http_get(url, params=params)
+
     log.info("quote", extra={
         "label": "quote",
         "input": input_mint,
@@ -197,6 +204,7 @@ async def _get_quote(*, input_mint: str, output_mint: str, amount: int, slippage
         "in": str(amount),
         "out": js.get("outAmount"),
         "priceImpactPct": js.get("priceImpactPct"),
+        "routes": len(js.get("routes", [])) if isinstance(js.get("routes"), list) else None,
     })
     return js
 
@@ -210,21 +218,38 @@ def _choose_priority_lamports() -> Optional[int]:
             return None
     return None
 
+def _variant_flags() -> Dict[str, bool]:
+    """
+    Decide which NEW Jupiter swap variant to request.
+    Prefers Shared Accounts when both toggles are true.
+    """
+    if USE_SHARED_ACCOUNTS:
+        return {"useSharedAccounts": True}
+    if USE_TOKEN_LEDGER:
+        return {"useTokenLedger": True}
+    # Default to Shared Accounts if neither is set to avoid old Route variant.
+    log.warning("JUP_VARIANT_DEFAULTED", extra={"note": "Neither variant env set; defaulting to useSharedAccounts"})
+    return {"useSharedAccounts": True}
+
 async def _build_swap_tx(*, user_pubkey: str, quote: Dict[str, Any]) -> str:
+    """
+    Build the v6 swap transaction using the selected variant.
+    """
+    dynamic_cu = not (COMPUTE_UNIT_LIMIT and COMPUTE_UNIT_LIMIT > 0)
+
     body: Dict[str, Any] = {
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": WRAP_UNWRAP_SOL,
-        "dynamicComputeUnitLimit": not (COMPUTE_UNIT_LIMIT and COMPUTE_UNIT_LIMIT > 0),
+        "dynamicComputeUnitLimit": dynamic_cu,
         "quoteResponse": quote,
         "asLegacyTransaction": bool(AS_LEGACY),
-        # 🔧 Critical fix for Jupiter 400 ("useSharedAccounts"):
-        "useSharedAccounts": False,
+        **_variant_flags(),  # ← NEW: Shared Accounts or Token Ledger
     }
 
     prio = _choose_priority_lamports()
     if prio is not None and prio > 0:
         body["prioritizationFeeLamports"] = int(prio)
-    if COMPUTE_UNIT_LIMIT and COMPUTE_UNIT_LIMIT > 0:
+    if not dynamic_cu:
         body["computeUnitLimit"] = int(COMPUTE_UNIT_LIMIT)
 
     if USE_PLATFORM_FEE:
@@ -239,6 +264,7 @@ async def _build_swap_tx(*, user_pubkey: str, quote: Dict[str, Any]) -> str:
     tx_b64 = js.get("swapTransaction")
     if not tx_b64:
         raise RuntimeError(f"Jupiter /swap missing swapTransaction: {js}")
+    log.info("swap_variant", extra={"variant": "SharedAccounts" if "useSharedAccounts" in body else "TokenLedger"})
     return tx_b64
 
 async def _send_tx_b64(tx_b64: str) -> str:
@@ -262,7 +288,12 @@ async def buy_via_lightning(*, mint: str, amount_sol: float, slippage_bps: int =
         m = normalize_mint(mint)
         lamports_in = max(1, int(float(amount_sol) * LAMPORTS_PER_SOL))
 
-        quote = await _get_quote(input_mint=SOL_MINT, output_mint=m, amount=lamports_in, slippage_bps=slippage_bps)
+        quote = await _get_quote(
+            input_mint=SOL_MINT,
+            output_mint=m,
+            amount=lamports_in,
+            slippage_bps=slippage_bps,
+        )
 
         if DRY_RUN:
             log.info("ENTRY_TX_DRYRUN", extra={"mint": m, "lamports_in": lamports_in, "slippage_bps": slippage_bps})
@@ -275,21 +306,24 @@ async def buy_via_lightning(*, mint: str, amount_sol: float, slippage_bps: int =
         return sig
 
     except httpx.HTTPError as e:
-        msg = f"HTTPError during buy: {e}"
-        log.warning("ENTRY_TX_HTTP_ERROR", extra={"err": msg})
+        log.warning("ENTRY_TX_HTTP_ERROR", extra={"err": f"{e}"})
         return None
     except Exception as e:
-        msg = f"buy exception: {e}"
-        log.warning("ENTRY_TX_FAIL", extra={"err": msg})
+        log.warning("ENTRY_TX_FAIL", extra={"err": f"{e}"})
         return None
 
 async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Optional[str]:
-    """Sell `amount_raw` units of `mint` back to SOL. Returns tx signature on success, else None."""
-    del token_program
+    """Sell `amount_raw` of `mint` to SOL. Returns tx signature on success, else None."""
+    del token_program  # Jupiter v6 doesn’t require us to choose token program here
     try:
         m = normalize_mint(mint)
 
-        quote = await _get_quote(input_mint=m, output_mint=SOL_MINT, amount=amount_raw, slippage_bps=slippage_bps)
+        quote = await _get_quote(
+            input_mint=m,
+            output_mint=SOL_MINT,
+            amount=amount_raw,
+            slippage_bps=slippage_bps,
+        )
 
         if DRY_RUN:
             log.info("EXIT_TX_DRYRUN", extra={"mint": m, "amount_raw": amount_raw, "slippage_bps": slippage_bps})
@@ -302,10 +336,8 @@ async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_
         return sig
 
     except httpx.HTTPError as e:
-        msg = f"HTTPError during sell: {e}"
-        log.warning("EXIT_TX_HTTP_ERROR", extra={"err": msg})
+        log.warning("EXIT_TX_HTTP_ERROR", extra={"err": f"{e}"})
         return None
     except Exception as e:
-        msg = f"sell exception: {e}"
-        log.warning("EXIT_TX_FAIL", extra={"err": msg})
+        log.warning("EXIT_TX_FAIL", extra={"err": f"{e}"})
         return None
