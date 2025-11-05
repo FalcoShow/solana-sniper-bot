@@ -1,3 +1,4 @@
+# src/utils_pkg/lightning_impl.py
 from __future__ import annotations
 
 """
@@ -80,7 +81,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
-    return v.strip().lower() in ("1", "true", "yes", "on")
+    return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config (Jupiter + trade knobs)
@@ -129,8 +130,12 @@ PF_PRIORITY_SOL: float = _env_float("PF_PRIORITY_SOL", 0.0)
 
 WRAP_UNWRAP_SOL: bool = _env_bool("PF_WRAP_UNWRAP_SOL", True)
 
-# Dry-run toggle
-DRY_RUN: bool = _env_bool("DRYRUN", False) or _env_bool("DRY_RUN", False) or _env_bool("IS_DRYRUN", False)
+# Dry-run toggle (robust; default False)
+DRY_RUN: bool = (
+    _env_bool("DRYRUN", False) or
+    _env_bool("DRY_RUN", False) or
+    _env_bool("IS_DRYRUN", False)
+)
 
 # Unroutable + bump knobs
 UNROUTABLE_TTL_SEC: int = max(30, _env_int("JUP_UNROUTABLE_TTL_SEC", 1800))
