@@ -4,12 +4,12 @@ from __future__ import annotations
 utils_pkg/lightning_impl.py — Jupiter v6/legacy swapper
 
 Fixes & features
-- Authenticated requests to https://api.jup.ag using x-api-key.
+- Authenticated requests to https://api.jup.ag using x-api-key (and optional bearer).
 - v6 (default) or legacy (/swap/v1/*) flow via JUP_AS_LEGACY.
 - v6 swap variants: useSharedAccounts / useTokenLedger (prefer Shared Accounts).
 - Stable headers to avoid CDN/WAF edge issues.
-- Unroutable-mint cache (TTL) to avoid hammering Jupiter.
-- One-shot (+5%) amount bump if "COULD_NOT_FIND_ANY_ROUTE".
+- Pair-scoped unroutable cache (TTL) to avoid hammering Jupiter.
+- One-shot (+JUP_REQUOTE_BUMP_PCT%) amount bump if "COULD_NOT_FIND_ANY_ROUTE".
 - Quote → Swap via quoteResponse passthrough.
 - Priority fee / compute-unit knobs, wrap/unwrap SOL, DRY-RUN safe.
 
@@ -29,7 +29,7 @@ Environment knobs
 - PF_WRAP_UNWRAP_SOL=1
 - JITO_FEE_MICROLAMPORTS                 (fallback → lamports)
 - DRYRUN / DRY_RUN / IS_DRYRUN
-- JUP_UNROUTABLE_TTL_SEC=1800            (unroutable mint cache TTL)
+- JUP_UNROUTABLE_TTL_SEC=1800            (unroutable PAIR cache TTL)
 - JUP_REQUOTE_BUMP_PCT=5                 (amount bump for 1 retry on no-route)
 """
 
@@ -38,6 +38,7 @@ import time
 from typing import Optional, Dict, Any
 
 import httpx
+from httpx import HTTPStatusError
 
 from logging_setup import get_logger
 from utils_pkg.mints import normalize_mint
@@ -140,18 +141,18 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Unroutable cache
+# Unroutable PAIR cache
 # ──────────────────────────────────────────────────────────────────────────────
 
-_UNROUTABLE: dict[str, float] = {}  # mint -> expires_ts
+# Cache is keyed by (inputMint, outputMint) → expiry_ts
+_UNROUTABLE_UNTIL: dict[tuple[str, str], float] = {}
 
-def _is_unroutable(mint: str) -> bool:
-    exp = _UNROUTABLE.get(mint)
+def _is_unroutable_pair(inp: str, out: str) -> bool:
+    exp = _UNROUTABLE_UNTIL.get((inp, out))
     return bool(exp and exp > time.time())
 
-def _mark_unroutable(mint: str, ttl: int | None = None) -> None:
-    ttl = int(ttl or UNROUTABLE_TTL_SEC)
-    _UNROUTABLE[mint] = time.time() + ttl
+def _mark_unroutable(inp: str, out: str, *, ttl: int | None = None) -> None:
+    _UNROUTABLE_UNTIL[(inp, out)] = time.time() + float(ttl or UNROUTABLE_TTL_SEC)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP helpers (headers + get/post with friendly error logs)
@@ -184,7 +185,14 @@ async def _http_get(url: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 body = {"text": r.text}
             log.warning("JUP_GET_NON200", extra={"url": url, "status": r.status_code, "body": body})
-            r.raise_for_status()
+            # Raise HTTPStatusError but include Jupiter errorCode/error in message; keep response attached
+            ec = (body or {}).get("errorCode")
+            em = (body or {}).get("error")
+            raise HTTPStatusError(
+                f"{r.status_code} {ec or ''} {em or ''}".strip(),
+                request=r.request,
+                response=r,
+            )
         return r.json()
 
 async def _http_post(url: str, *, json_body: Dict[str, Any]) -> Dict[str, Any]:
@@ -196,71 +204,105 @@ async def _http_post(url: str, *, json_body: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 body = {"text": r.text}
             log.warning("JUP_POST_NON200", extra={"url": url, "status": r.status_code, "body": body})
-            r.raise_for_status()
+            ec = (body or {}).get("errorCode")
+            em = (body or {}).get("error")
+            raise HTTPStatusError(
+                f"{r.status_code} {ec or ''} {em or ''}".strip(),
+                request=r.request,
+                response=r,
+            )
         return r.json()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Jupiter flows (quote → swap)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _quote_url() -> str:
+    return f"{BASE}/quote" if not AS_LEGACY else f"{BASE}/swap/v1/quote"
+
+def _swap_url() -> str:
+    return f"{BASE}/swap" if not AS_LEGACY else f"{BASE}/swap/v1/swap"
+
+def _quote_params(*, input_mint: str, output_mint: str, amount: int, slippage_bps: int) -> Dict[str, Any]:
+    p: Dict[str, Any] = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(int(amount)),          # as string for big ints
+        "slippageBps": int(slippage_bps),
+        "swapMode": "ExactIn",
+        "onlyDirectRoutes": ONLY_DIRECT,
+        "asLegacyTransaction": AS_LEGACY,    # ignored by v6; used by legacy
+    }
+    if USE_PLATFORM_FEE:
+        p["platformFeeBps"] = int(PLATFORM_FEE_BPS)
+    return p
+
 async def _get_quote(*, input_mint: str, output_mint: str, amount: int, slippage_bps: int) -> Dict[str, Any]:
     """
     Ask Jupiter for a quote (v6 by default; legacy if AS_LEGACY=1).
     Adds:
-      - unroutable mint cache check
+      - pair-scoped unroutable cache check
       - one-shot +REQUOTE_BUMP_PCT% amount bump if "COULD_NOT_FIND_ANY_ROUTE"
+      - robust handling of HTTPStatusError by inspecting response JSON for errorCode
     """
-    # Guard: unroutable cache
-    if _is_unroutable(output_mint):
-        log.info("JUP_NO_ROUTE_CACHED", extra={"mint": output_mint, "ttl": UNROUTABLE_TTL_SEC})
+    # Guard: unroutable pair cache
+    if _is_unroutable_pair(input_mint, output_mint):
+        log.info("JUP_NO_ROUTE_CACHED", extra={"pair": [input_mint, output_mint], "ttl": UNROUTABLE_TTL_SEC})
         raise RuntimeError("jup_no_route_cached")
 
-    def _params(amt: int) -> Dict[str, Any]:
-        p: Dict[str, Any] = {
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": str(int(amt)),          # str for big ints
-            "slippageBps": int(slippage_bps),
-            "swapMode": "ExactIn",
-            "onlyDirectRoutes": ONLY_DIRECT,
-            "asLegacyTransaction": AS_LEGACY,  # ignored by v6; kept for legacy
-        }
-        if USE_PLATFORM_FEE:
-            p["platformFeeBps"] = int(PLATFORM_FEE_BPS)
-        return p
+    url = _quote_url()
+    params = _quote_params(input_mint=input_mint, output_mint=output_mint, amount=amount, slippage_bps=slippage_bps)
 
-    url = f"{BASE}/quote" if not AS_LEGACY else f"{BASE}/swap/v1/quote"
-
-    # 1st attempt
+    # First attempt
     try:
-        js = await _http_get(url, params=_params(amount))
-    except httpx.HTTPStatusError as e:
-        # Inspect body for "no route"
-        err_code = None
-        try:
-            err_code = e.response.json().get("errorCode")
-        except Exception:
-            pass
-        if err_code == "COULD_NOT_FIND_ANY_ROUTE":
-            # Mark unroutable, but also try a tiny one-shot bump (+REQUOTE_BUMP_PCT%)
-            _mark_unroutable(output_mint)
-            bumped = max(int(amount * (100 + REQUOTE_BUMP_PCT) / 100), amount + 1)
-            log.info("JUP_REQUOTE_BUMP", extra={"mint": output_mint, "amount": amount, "bumped": bumped})
+        js = await _http_get(url, params=params)
+    except HTTPStatusError as e:
+        # Parse Jupiter errorCode reliably from the response body
+        err_code, err_text = "", ""
+        resp = getattr(e, "response", None)
+        if resp is not None:
             try:
-                js = await _http_get(url, params=_params(bumped))
-            except httpx.HTTPStatusError as e2:
-                # If the bump also fails, keep it cached and bubble up
-                err_code2 = None
+                body = resp.json()
+                err_code = (body or {}).get("errorCode") or ""
+                err_text = (body or {}).get("error") or ""
+            except Exception:
                 try:
-                    err_code2 = e2.response.json().get("errorCode")
+                    err_text = resp.text
                 except Exception:
                     pass
-                if err_code2 == "COULD_NOT_FIND_ANY_ROUTE":
-                    log.info("JUP_NO_ROUTE_FINAL", extra={"mint": output_mint})
+
+        msg = f"{err_code} {err_text}".strip()
+
+        if "COULD_NOT_FIND_ANY_ROUTE" in msg:
+            # mark unroutable then try a single bump
+            _mark_unroutable(input_mint, output_mint)
+            bumped = max(int(amount * (100 + REQUOTE_BUMP_PCT) / 100), amount + 1)
+            log.info("JUP_REQUOTE_BUMP", extra={"pair": [input_mint, output_mint], "amount": amount, "bumped": bumped})
+            try:
+                js = await _http_get(url, params=_quote_params(
+                    input_mint=input_mint, output_mint=output_mint, amount=bumped, slippage_bps=slippage_bps
+                ))
+            except HTTPStatusError as e2:
+                # If bump also fails on routing, finalize as no route
+                code2 = ""
+                r2 = getattr(e2, "response", None)
+                if r2 is not None:
+                    try:
+                        code2 = (r2.json() or {}).get("errorCode") or ""
+                    except Exception:
+                        pass
+                if code2 == "COULD_NOT_FIND_ANY_ROUTE":
+                    log.info("JUP_NO_ROUTE_FINAL", extra={"pair": [input_mint, output_mint]})
                     raise RuntimeError("jup_no_route")
+                # Other HTTP errors bubble up
                 raise
+        elif any(tag in msg for tag in ("TOKEN_NOT_TRADABLE", "MINT_NOT_FOUND", "POOL_NOT_FOUND", "COULD_NOT_FIND_ANY_ROUTE")):
+            _mark_unroutable(input_mint, output_mint)
+            raise RuntimeError("jup_no_route")
         else:
+            # Different HTTP error → bubble up (callers may soft-skip)
             raise
+
     # OK
     log.info(
         "QUOTE_OK",
@@ -289,13 +331,12 @@ def _choose_priority_lamports() -> Optional[int]:
 def _variant_flags() -> Dict[str, bool]:
     """
     Decide which NEW Jupiter swap variant to request.
-    Prefers Shared Accounts when both toggles are true.
+    Prefers Shared Accounts when both toggles are true or neither provided.
     """
     if USE_SHARED_ACCOUNTS:
         return {"useSharedAccounts": True}
     if USE_TOKEN_LEDGER:
         return {"useTokenLedger": True}
-    # Default to Shared Accounts if neither is set to avoid old Route variant.
     log.warning("JUP_VARIANT_DEFAULTED", extra={"note": "Neither variant env set; defaulting to useSharedAccounts"})
     return {"useSharedAccounts": True}
 
@@ -311,7 +352,7 @@ async def _build_swap_tx(*, user_pubkey: str, quote: Dict[str, Any]) -> str:
         "dynamicComputeUnitLimit": dynamic_cu,
         "quoteResponse": quote,
         "asLegacyTransaction": bool(AS_LEGACY),
-        **_variant_flags(),  # ← NEW: Shared Accounts or Token Ledger
+        **_variant_flags(),  # Shared Accounts or Token Ledger
     }
 
     prio = _choose_priority_lamports()
@@ -327,15 +368,11 @@ async def _build_swap_tx(*, user_pubkey: str, quote: Dict[str, Any]) -> str:
             "feeAccount": PLATFORM_FEE_ACCOUNT,
         }
 
-    url = f"{BASE}/swap" if not AS_LEGACY else f"{BASE}/swap/v1/swap"
-    js = await _http_post(url, json_body=body)
+    js = await _http_post(_swap_url(), json_body=body)
     tx_b64 = js.get("swapTransaction")
     if not tx_b64:
         raise RuntimeError(f"Jupiter /swap missing swapTransaction: {js}")
-    log.info(
-        "SWAP_BUILT",
-        extra={"variant": "SharedAccounts" if "useSharedAccounts" in body else "TokenLedger"},
-    )
+    log.info("SWAP_BUILT", extra={"variant": "SharedAccounts" if "useSharedAccounts" in body else "TokenLedger"})
     return tx_b64
 
 async def _send_tx_b64(tx_b64: str) -> str:
