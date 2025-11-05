@@ -87,6 +87,7 @@ except Exception:  # pragma: no cover
         def warning(self, *a, **k): print("[warn]", a, k, flush=True)
         def every(self, *a, **k): print("[every]", a, k, flush=True)
         def error(self, *a, **k): print("[error]", a, k, flush=True)
+        def info(self, *a, **k): print("[info]", a, k, flush=True)
     def bump(_): pass
     def start_global_heartbeat(*_a, **_k): pass
     log = _Dummy()  # type: ignore
@@ -109,9 +110,16 @@ except Exception:  # pragma: no cover
     _mg_normalize = None  # type: ignore
     _mg_prob = None  # type: ignore
 
+# --- Unified env-bool helper (same semantics as lightning_impl.env_bool) ---
+def _env_bool(key: str, default: bool=False) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1","true","t","yes","y","on")
+
 def _dryrun_env_on() -> bool:
-    v = (os.getenv("IS_DRYRUN") or os.getenv("DRYRUN") or "").strip().lower()
-    return v in {"1", "true", "yes", "on"}
+    # honor any of these
+    return _env_bool("DRYRUN") or _env_bool("DRY_RUN") or _env_bool("IS_DRYRUN")
 
 # ---------------------------
 # Event source + trading hooks
@@ -181,18 +189,14 @@ except Exception:  # pragma: no cover
 
 # ---------- HOTFIX: wire maybe_buy to router ----------
 import inspect
-from typing import Any, Dict, Optional
 
 def _safe_log_router_state(event: str, **fields: Any) -> None:
     try:
-        # our logger has .event() for structured payloads; avoid kwargs to .error()
         log.event(event, **fields)
     except Exception:
-        # fall back noiselessly
         pass
 
 def _candidate_buy_names() -> list[str]:
-    # Most common names first
     return [
         "maybe_buy",
         "buy",
@@ -201,7 +205,6 @@ def _candidate_buy_names() -> list[str]:
         "buy_token",
         "execute_buy",
         "exec_buy",
-        # lightning / router variants seen in your logs:
         "buy_via_lightning",
         "_buy_lightning",
         "buy_lightning",
@@ -210,20 +213,12 @@ def _candidate_buy_names() -> list[str]:
     ]
 
 def _pick_router_buy_callable() -> Optional[tuple[str, Any]]:
-    """
-    1) Try known names in order.
-    2) If none, fall back to any callable whose name contains 'buy'
-       but does NOT contain 'sell' or 'quote'.
-    """
     if router is None:
         return None
-
     for name in _candidate_buy_names():
         fn = getattr(router, name, None)
         if callable(fn):
             return name, fn
-
-    # Fallback: scan for any 'buy*' function that isn't a quote/sell
     try:
         names = [n for n in dir(router) if "buy" in n.lower()]
         for n in names:
@@ -236,59 +231,103 @@ def _pick_router_buy_callable() -> Optional[tuple[str, Any]]:
         pass
     return None
 
-async def _call_with_variants(fn: Any, *, mint: str, ui: Dict[str, Any],
-                              on_buy_submitted, on_buy_filled, on_buy_failed):
-    """
-    Try a few signatures to be version-proof:
-    (mint, ui, hooks?) → (mint, ui) → (ui,) → (mint,) → (mint, ui) positional
-    """
-    # Discover parameters to decide if hooks are acceptable
-    kwargs_full = {"mint": mint, "ui": ui}
+def _compute_spend_sol(ui: Dict[str, Any]) -> float:
+    for k in ("spend_sol", "buy_size_sol", "amount_sol"):
+        try:
+            v = float(ui.get(k)) if ui.get(k) is not None else None
+            if v and v > 0:
+                return v
+        except Exception:
+            pass
+    for envk in ("ENTRY_BUY_SOL", "ENTRY_SPEND_SOL", "INITIAL_BUY_SOL"):
+        try:
+            v = float(os.getenv(envk, "0"))
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    return 0.02
+
+def _env_slippage_bps() -> int:
+    try:
+        return int(os.getenv("SLIPPAGE_BPS", os.getenv("ENTRY_SLIPPAGE_BPS", "50")))
+    except Exception:
+        return 50
+
+def _build_kwargs_for_router(fn: Any, mint: str, ui: Dict[str, Any],
+                             on_buy_submitted, on_buy_filled, on_buy_failed) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {}
     try:
         sig = inspect.signature(fn)
-        if "on_buy_submitted" in sig.parameters:
-            kwargs_full["on_buy_submitted"] = on_buy_submitted
-        if "on_buy_filled" in sig.parameters:
-            kwargs_full["on_buy_filled"] = on_buy_filled
-        if "on_buy_failed" in sig.parameters:
-            kwargs_full["on_buy_failed"] = on_buy_failed
-    except Exception:
-        pass
+        params = sig.parameters
+        names = set(params.keys())
 
-    attempts = [
-        ("kw_full", lambda: fn(**kwargs_full)),
-        ("kw_nohooks", lambda: fn(mint=mint, ui=ui)),
-        ("kw_ui_only", lambda: fn(ui=ui)),
-        ("kw_mint_only", lambda: fn(mint=mint)),
-        ("pos_mint_ui", lambda: fn(mint, ui)),
-        ("pos_ui_only", lambda: fn(ui)),
-    ]
-    last_err = None
-    for label, inv in attempts:
-        try:
-            res = inv()
-            if inspect.isawaitable(res):
-                res = await res
-            _safe_log_router_state("ROUTER_BUY_CALL", variant=label)
-            return res
-        except TypeError as e:
-            # wrong signature → try next shape
-            last_err = str(e)
-            continue
-    if last_err:
-        _safe_log_router_state("ROUTER_BUY_ALL_VARIANTS_FAILED", error=last_err)
+        if "mint" in names:
+            kwargs["mint"] = mint
+        if "ui" in names:
+            kwargs["ui"] = ui
+
+        spend = _compute_spend_sol(ui)
+        if "amount_sol" in names:
+            kwargs["amount_sol"] = float(spend)
+        if "lamports_in" in names:
+            kwargs["lamports_in"] = int(round(spend * 1_000_000_000))
+
+        if "slippage_bps" in names:
+            kwargs["slippage_bps"] = _env_slippage_bps()
+
+        if "only_direct" in names:
+            kwargs["only_direct"] = bool(os.getenv("ONLY_DIRECT", "0") in {"1","true","yes","on"})
+
+        if "on_buy_submitted" in names:
+            kwargs["on_buy_submitted"] = on_buy_submitted
+        if "on_buy_filled" in names:
+            kwargs["on_buy_filled"] = on_buy_filled
+        if "on_buy_failed" in names:
+            kwargs["on_buy_failed"] = on_buy_failed
+    except Exception:
+        kwargs = {"mint": mint, "ui": ui}
+    return kwargs
+
+async def _call_with_variants(fn: Any, *, mint: str, ui: Dict[str, Any],
+                              on_buy_submitted, on_buy_filled, on_buy_failed):
+    try:
+        kw_sig = _build_kwargs_for_router(fn, mint, ui, on_buy_submitted, on_buy_filled, on_buy_failed)
+        res = fn(**kw_sig)
+        if inspect.isawaitable(res):
+            res = await res
+        _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_sig", sent_keys=sorted(kw_sig.keys()))
+        return res
+    except TypeError as e:
+        _safe_log_router_state("ROUTER_BUY_CALL_TYPERR", where="kw_sig", err=str(e))
+    except Exception as e:
+        _safe_log_router_state("ROUTER_BUY_CALL_ERR", where="kw_sig", err=str(e))
+
+    try:
+        res = fn(mint=mint, ui=ui)
+        if inspect.isawaitable(res):
+            res = await res
+        _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_min_mint_ui")
+        return res
+    except Exception as e:
+        _safe_log_router_state("ROUTER_BUY_CALL_ERR", where="kw_min_mint_ui", err=str(e))
+
+    try:
+        res = fn(mint=mint)
+        if inspect.isawaitable(res):
+            res = await res
+        _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_mint_only")
+        return res
+    except Exception as e:
+        _safe_log_router_state("ROUTER_BUY_CALL_ERR", where="kw_mint_only", err=str(e))
+
+    _safe_log_router_state("ROUTER_BUY_ALL_VARIANTS_FAILED", error="no compatible kwargs")
     return None
 
 async def maybe_buy(
     *, mint: str, ui: Dict[str, Any],
     on_buy_submitted=None, on_buy_filled=None, on_buy_failed=None
 ) -> Optional[str]:
-    """
-    Router-wired maybe_buy:
-      - Locates router's buy-callable dynamically (handles lightning names)
-      - Passes hooks if supported; gracefully retries without hooks
-      - Normalizes return to a tx signature string (or None)
-    """
     if router is None:
         _safe_log_router_state("ROUTER_UNAVAILABLE_FOR_BUY")
         raise RuntimeError("router unavailable")
@@ -312,7 +351,6 @@ async def maybe_buy(
         file=getattr(router, "__file__", "<router?>"),
     )
 
-    # Call with robust signature handling
     res = await _call_with_variants(
         fn, mint=mint, ui=ui,
         on_buy_submitted=on_buy_submitted,
@@ -320,7 +358,6 @@ async def maybe_buy(
         on_buy_failed=on_buy_failed,
     )
 
-    # Normalize return → signature string or None
     if isinstance(res, str):
         return res
     if isinstance(res, dict):
@@ -328,124 +365,6 @@ async def maybe_buy(
             v = res.get(k)
             if isinstance(v, str) and v:
                 return v
-    return None
-
-# --- add these helpers near the router hotfix section ---
-
-def _compute_spend_sol(ui: Dict[str, Any]) -> float:
-    """
-    Pick a buy size (in SOL) for routers that require amount_sol or lamports.
-    Priority: ui['spend_sol'] -> ENV -> default 0.02 SOL
-    ENV keys supported: ENTRY_BUY_SOL, ENTRY_SPEND_SOL, INITIAL_BUY_SOL
-    """
-    for k in ("spend_sol", "buy_size_sol", "amount_sol"):
-        try:
-            v = float(ui.get(k)) if ui.get(k) is not None else None
-            if v and v > 0:
-                return v
-        except Exception:
-            pass
-    for envk in ("ENTRY_BUY_SOL", "ENTRY_SPEND_SOL", "INITIAL_BUY_SOL"):
-        try:
-            v = float(os.getenv(envk, "0"))
-            if v > 0:
-                return v
-        except Exception:
-            pass
-    return 0.02  # sane default
-
-def _env_slippage_bps() -> int:
-    try:
-        return int(os.getenv("SLIPPAGE_BPS", os.getenv("ENTRY_SLIPPAGE_BPS", "50")))
-    except Exception:
-        return 50
-
-def _build_kwargs_for_router(fn: Any, mint: str, ui: Dict[str, Any],
-                             on_buy_submitted, on_buy_filled, on_buy_failed) -> Dict[str, Any]:
-    """
-    Inspect the router fn and supply exactly the kwargs it understands.
-    Handles keyword-only signatures like buy_via_lightning.
-    """
-    kwargs: Dict[str, Any] = {}
-    try:
-        sig = inspect.signature(fn)
-        params = sig.parameters
-        names = set(params.keys())
-
-        # Common requireds
-        if "mint" in names:
-            kwargs["mint"] = mint
-        if "ui" in names:
-            kwargs["ui"] = ui
-
-        # Amount/lamports shapes
-        spend = _compute_spend_sol(ui)
-        if "amount_sol" in names:
-            kwargs["amount_sol"] = float(spend)
-        if "lamports_in" in names:
-            kwargs["lamports_in"] = int(round(spend * 1_000_000_000))
-
-        # Slippage
-        if "slippage_bps" in names:
-            kwargs["slippage_bps"] = _env_slippage_bps()
-
-        # “Direct only” toggle (optional)
-        if "only_direct" in names:
-            kwargs["only_direct"] = bool(os.getenv("ONLY_DIRECT", "0") in {"1","true","yes","on"})
-
-        # Hooks (only if accepted)
-        if "on_buy_submitted" in names:
-            kwargs["on_buy_submitted"] = on_buy_submitted
-        if "on_buy_filled" in names:
-            kwargs["on_buy_filled"] = on_buy_filled
-        if "on_buy_failed" in names:
-            kwargs["on_buy_failed"] = on_buy_failed
-    except Exception:
-        # If we can’t introspect, fall back to a safe minimal set
-        kwargs = {"mint": mint, "ui": ui}
-    return kwargs
-
-async def _call_with_variants(fn: Any, *, mint: str, ui: Dict[str, Any],
-                              on_buy_submitted, on_buy_filled, on_buy_failed):
-    """
-    Prefer an introspected **kwargs call that exactly matches the signature.
-    Only if that fails, try a couple of generic fallbacks (still kwargs).
-    We avoid positional calls to support keyword-only functions like buy_via_lightning.
-    """
-    # 1) Best-effort signature-aware kwargs
-    try:
-        kw_sig = _build_kwargs_for_router(fn, mint, ui, on_buy_submitted, on_buy_filled, on_buy_failed)
-        res = fn(**kw_sig)
-        if inspect.isawaitable(res):
-            res = await res
-        _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_sig", sent_keys=sorted(kw_sig.keys()))
-        return res
-    except TypeError as e:
-        _safe_log_router_state("ROUTER_BUY_CALL_TYPERR", where="kw_sig", err=str(e))
-    except Exception as e:
-        _safe_log_router_state("ROUTER_BUY_CALL_ERR", where="kw_sig", err=str(e))
-
-    # 2) Minimal kwargs: {mint, ui}
-    try:
-        res = fn(mint=mint, ui=ui)
-        if inspect.isawaitable(res):
-            res = await res
-        _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_min_mint_ui")
-        return res
-    except Exception as e:
-        _safe_log_router_state("ROUTER_BUY_CALL_ERR", where="kw_min_mint_ui", err=str(e))
-
-    # 3) Last resort: {mint} only
-    try:
-        res = fn(mint=mint)
-        if inspect.isawaitable(res):
-            res = await res
-        _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_mint_only")
-        return res
-    except Exception as e:
-        _safe_log_router_state("ROUTER_BUY_CALL_ERR", where="kw_mint_only", err=str(e))
-
-    _safe_log_router_state("ROUTER_BUY_ALL_VARIANTS_FAILED", error="no compatible kwargs")
     return None
 
 # ---------- /HOTFIX ----------
@@ -486,7 +405,6 @@ def _rpc_url() -> str:
     return os.getenv("SOLANA_RPC_URL") or os.getenv("RPC_URL") or "https://api.mainnet-beta.solana.com"
 
 def _confirm_commitment() -> str:
-    # "confirmed" is faster; switch to "finalized" if you prefer.
     return os.getenv("CONFIRM_COMMITMENT", "confirmed")
 
 def _confirm_timeout_sec() -> float:
@@ -510,11 +428,6 @@ async def _get_sig_status(sig: str) -> Optional[dict]:
         return (val[0] if val else None)
 
 async def _confirm_sig(sig: str) -> tuple[bool, Optional[str]]:
-    """
-    Poll getSignatureStatuses until:
-      - status.confirmationStatus in {'confirmed','finalized'} and err is None -> (True, slot)
-      - err not None or timeout -> (False, reason)
-    """
     import time as _time
     deadline = _time.monotonic() + _confirm_timeout_sec()
     want = _confirm_commitment()
@@ -556,9 +469,6 @@ def _as_int(val: Any, default: int) -> int:
         return int(val)
     except Exception:
         return default
-
-def _env_bool(name: str, default: bool) -> bool:
-    return _as_bool(os.getenv(name, "1" if default else "0"), default)
 
 # ---------------------------
 # DSN normalizer
@@ -1658,7 +1568,6 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
         """
         if not subscribe_trades_flag:
             return
-        # Public styles we know about
         for name in ("subscribe_trades", "enable_trades", "enable_trade_stream"):
             fn = getattr(client, name, None)
             if callable(fn):
@@ -1670,7 +1579,6 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
                     return
                 except Exception as e:
                     log.every("pump.subscribe.err", n=5, msg="PUMP_SUBSCRIBE_FAIL", via=name, err=str(e))
-        # Internal helper seen in your class
         try:
             sub = getattr(client, "_subscribe", None)
             if callable(sub):
@@ -1695,20 +1603,18 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
                 print("[main] event handling error:", flush=True)
                 traceback.print_exc()
 
-    # Build kwargs safely for current client signature
     pp_kwargs: Dict[str, Any] = {}
     if os.getenv("PF_PP_KEY"):
         pp_kwargs["api_key"] = os.getenv("PF_PP_KEY")
     if os.getenv("OWNER"):
         pp_kwargs["account"] = os.getenv("OWNER")
 
-    # Prefer async context manager if available
     try:
         if hasattr(PumpPortalClient, "__aenter__"):
-            async with PumpPortalClient(**pp_kwargs) as client:  # no subscribe_trades kwarg
+            async with PumpPortalClient(**pp_kwargs) as client:
                 await _run_with_client_obj(client)
         else:
-            client = PumpPortalClient(**pp_kwargs)  # legacy style
+            client = PumpPortalClient(**pp_kwargs)
             try:
                 await _run_with_client_obj(client)
             finally:
@@ -1748,11 +1654,10 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                 )
                 first_log = False
 
-            await scan_raydium()  # scanner reads env itself
+            await scan_raydium()
             log.event("SCAN_RAYDIUM_RETURNED")
 
             if base_interval > 0:
-                # slight deterministic jitter per instance
                 jitter = 0.15 * base_interval * jitter_seed
                 await asyncio.sleep(base_interval + jitter)
 
@@ -1780,7 +1685,6 @@ async def _start_background_tasks(stop_evt: asyncio.Event) -> Dict[str, asyncio.
         tasks["telemetry.daily_pnl"] = t
         log.event("DAILY_PNL_SCHEDULED", hour_utc=_as_int(os.getenv("DAILY_PNL_HOUR_UTC", "23"), 23))
 
-    # Optional health server
     ht = await _maybe_start_health_server(stop_evt)
     if ht:
         tasks["health.server"] = ht
@@ -1794,23 +1698,19 @@ async def _graceful_shutdown(
 ) -> None:
     stop_evt.set()
 
-    # Cancel BG tasks
     for _name, t in list(bg_tasks.items()):
         with contextlib.suppress(Exception):
             t.cancel()
 
-    # Stop sell loop
     with contextlib.suppress(Exception):
         if sell_task:
             sell_task.cancel()
             await asyncio.wait_for(sell_task, timeout=3.0)
 
-    # Router shutdown
     with contextlib.suppress(Exception):
         if router and hasattr(router, "shutdown"):
             await router.shutdown()
 
-    # Pricefeed shutdown
     with contextlib.suppress(Exception):
         await pricefeed_close()
 
@@ -1856,7 +1756,6 @@ def _boot_banner() -> None:
     )
 
 def _env_hints() -> None:
-    # Non-fatal “helpful” hints for common misconfigs
     if not (os.getenv("KEYPAIR_JSON") or os.getenv("SOLANA_KEYPAIR_JSON")):
         log.event("HINT_KEYPAIR_JSON_MISSING", note="wallet auto-create disabled (ok if mounted)")
     if not (os.getenv("TELEGRAM_BOT_TOKEN") and (os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID"))):
@@ -1874,7 +1773,6 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     _env_hints()
     _ensure_keypair_file()
 
-    # Initialize router (priority fee control, etc.)
     try:
         if router and hasattr(router, "start"):
             await router.start()
@@ -1882,7 +1780,6 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     except Exception as e:
         log.event("ROUTER_PRIO_INIT_FAIL", error=str(e))
 
-    # Resume sell loop if positions exist
     sell_stop_evt: Optional[asyncio.Event] = None
     sell_task: Optional[asyncio.Task] = None
     try:
@@ -1893,11 +1790,9 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     except Exception as e:
         log.event("BOOT_SELL_LOOP_START_FAIL", error=str(e))
 
-    # Background tasks (Raydium, PnL, health)
     local_stop = stop_evt or asyncio.Event()
     bg_tasks = await _start_background_tasks(local_stop)
 
-    # OS signals for graceful shutdown
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -1905,7 +1800,6 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
         except NotImplementedError:
             pass
 
-    # Reconnect loop for Pump portal
     backoff = 3.0
     try:
         while not local_stop.is_set():
@@ -1921,7 +1815,6 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
                 backoff = min(backoff * 2.0, 30.0)
             await asyncio.sleep(backoff)
     finally:
-        # Stop sell loop first to avoid double work
         try:
             if sell_stop_evt is not None:
                 sell_stop_evt.set()
