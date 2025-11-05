@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 """
-utils_pkg/lightning_impl.py — Jupiter v6/legacy swapper
+utils_pkg/lightning_impl.py — Jupiter swapper (modern /swap/v1/* endpoints)
 
 Fixes & features
 - Authenticated requests to https://api.jup.ag using x-api-key (and optional bearer).
-- v6 (default) or legacy (/swap/v1/*) flow via JUP_AS_LEGACY.
-- v6 swap variants: useSharedAccounts / useTokenLedger (prefer Shared Accounts).
+- Uses /swap/v1/quote and /swap/v1/swap for both "v6" and legacy flagging.
+- v6 swap variants: useSharedAccounts / useTokenLedger (prefers Shared Accounts).
 - Stable headers to avoid CDN/WAF edge issues.
 - Pair-scoped unroutable cache (TTL) to avoid hammering Jupiter.
 - One-shot (+JUP_REQUOTE_BUMP_PCT%) amount bump if "COULD_NOT_FIND_ANY_ROUTE".
@@ -15,16 +15,16 @@ Fixes & features
 
 Environment knobs
 - JUP_BASE_URL=https://api.jup.ag        (default)
-- JUP_UPSTREAM                           (fallback if BASE unset)
+- JUP_UPSTREAM                           (ignored if BASE is set; safe to leave blank)
 - JUP_API_KEY / JUP_PRO_KEY              (either works)
 - JUP_BEARER                             (optional bearer)
-- JUP_AS_LEGACY=0                        (set 1 to force legacy)
+- JUP_AS_LEGACY=0                        (kept only as a signal in bodies/params)
 - JUP_ONLY_DIRECT=0
 - JUP_USE_SHARED_ACCOUNTS=1              (recommended)
 - JUP_USE_TOKEN_LEDGER=0
 - JUP_PLATFORM_FEE_BPS=0                 (and JUP_PLATFORM_FEE_ACCOUNT if >0)
 - PF_SLIPPAGE_BPS=30
-- PF_PRIORITY_LAMPORTS (or PF_PRIORITY_SOL)
+- PF_PRIORITY_LAMPORTS (or PF_PRIORITY_SOL)   # if PF_PRIORITY_DYNAMIC=0 in your app
 - PF_COMPUTE_UNIT_LIMIT=0                (0 → dynamic)
 - PF_WRAP_UNWRAP_SOL=1
 - JITO_FEE_MICROLAMPORTS                 (fallback → lamports)
@@ -87,7 +87,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 
 BASE: str = (_env_str("JUP_BASE_URL") or _env_str("JUP_UPSTREAM") or "https://api.jup.ag").rstrip("/")
-AS_LEGACY: bool = _env_bool("JUP_AS_LEGACY", False)  # v6 by default; legacy if True
+AS_LEGACY: bool = _env_bool("JUP_AS_LEGACY", False)  # kept only as a signal in request params/bodies
 ONLY_DIRECT: bool = _env_bool("JUP_ONLY_DIRECT", False)
 
 # New variant toggles (prefer shared accounts if both true)
@@ -214,14 +214,19 @@ async def _http_post(url: str, *, json_body: Dict[str, Any]) -> Dict[str, Any]:
         return r.json()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Jupiter flows (quote → swap)
+# Jupiter endpoints (modern paths used for both modes)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _quote_url() -> str:
-    return f"{BASE}/quote" if not AS_LEGACY else f"{BASE}/swap/v1/quote"
+    # Jupiter consolidated on /swap/v1/*; keep BASE configurable.
+    return f"{BASE}/swap/v1/quote"
 
 def _swap_url() -> str:
-    return f"{BASE}/swap" if not AS_LEGACY else f"{BASE}/swap/v1/swap"
+    return f"{BASE}/swap/v1/swap"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Jupiter flows (quote → swap)
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _quote_params(*, input_mint: str, output_mint: str, amount: int, slippage_bps: int) -> Dict[str, Any]:
     p: Dict[str, Any] = {
@@ -231,15 +236,15 @@ def _quote_params(*, input_mint: str, output_mint: str, amount: int, slippage_bp
         "slippageBps": int(slippage_bps),
         "swapMode": "ExactIn",
         "onlyDirectRoutes": ONLY_DIRECT,
-        "asLegacyTransaction": AS_LEGACY,    # ignored by v6; used by legacy
+        "asLegacyTransaction": AS_LEGACY,    # honored by Jupiter even on /swap/v1/*
     }
     if USE_PLATFORM_FEE:
         p["platformFeeBps"] = int(PLATFORM_FEE_BPS)
     return p
 
-async def _get_quote(*, input_mint: str, output_mint: str, amount: int, slippage_bps: int) -> Dict[str, Any]:
+async def _get_quote_kwonly(*, input_mint: str, output_mint: str, amount: int, slippage_bps: int) -> Dict[str, Any]:
     """
-    Ask Jupiter for a quote (v6 by default; legacy if AS_LEGACY=1).
+    Ask Jupiter for a quote using /swap/v1/quote.
     Adds:
       - pair-scoped unroutable cache check
       - one-shot +REQUOTE_BUMP_PCT% amount bump if "COULD_NOT_FIND_ANY_ROUTE"
@@ -318,7 +323,20 @@ async def _get_quote(*, input_mint: str, output_mint: str, amount: int, slippage
     )
     return js
 
+# Compatibility: accept both keyword-only and legacy positional calls.
+async def _get_quote(*args, **kwargs) -> Dict[str, Any]:  # type: ignore[override]
+    """
+    Public wrapper for _get_quote_kwonly that also accepts positional calls:
+      _get_quote(input_mint, output_mint, amount, slippage_bps)
+    """
+    if args and not kwargs and len(args) == 4:
+        return await _get_quote_kwonly(
+            input_mint=args[0], output_mint=args[1], amount=args[2], slippage_bps=args[3]
+        )
+    return await _get_quote_kwonly(**kwargs)
+
 def _choose_priority_lamports() -> Optional[int]:
+    # If your app runs with PF_PRIORITY_DYNAMIC=1, this value is usually 0
     if PF_PRIORITY_LAMPORTS > 0:
         return int(PF_PRIORITY_LAMPORTS)
     if PF_PRIORITY_SOL > 0:
@@ -454,7 +472,7 @@ async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_
         if str(e) in {"jup_no_route", "jup_no_route_cached"}:
             log.info("EXIT_SKIP_NO_ROUTE", extra={"mint": mint})
             return None
-        log.warning("EXIT_TX_RT_FAIL", extra={"err": f"{e}"})
+        log.warning("EXIT_TX_RT_FAIL", extra":{"err": f"{e}"})
         return None
     except httpx.HTTPError as e:
         log.warning("EXIT_TX_HTTP_ERROR", extra={"err": f"{e}"})
