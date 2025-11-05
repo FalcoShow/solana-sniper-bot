@@ -1,0 +1,22 @@
+diff --git a/deploy_tools/go_live.sh b/deploy_tools/go_live.sh
+old mode 100644
+new mode 100755
+diff --git a/deploy_tools/go_live_smoke.sh b/deploy_tools/go_live_smoke.sh
+old mode 100644
+new mode 100755
+diff --git a/deploy_tools/rollback.sh b/deploy_tools/rollback.sh
+old mode 100644
+new mode 100755
+diff --git a/utils_pkg/lightning_impl.py b/utils_pkg/lightning_impl.py
+index 6ab4b7d..5f4ddbc 100644
+--- a/utils_pkg/lightning_impl.py
++++ b/utils_pkg/lightning_impl.py
+@@ -472,7 +472,7 @@ async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_
+         if str(e) in {"jup_no_route", "jup_no_route_cached"}:
+             log.info("EXIT_SKIP_NO_ROUTE", extra={"mint": mint})
+             return None
+-        log.warning("EXIT_TX_RT_FAIL", extra":{"err": f"{e}"})
++        log.warning("EXIT_TX_RT_FAIL", extra={"err": f"{e}"})
+         return None
+     except httpx.HTTPError as e:
+         log.warning("EXIT_TX_HTTP_ERROR", extra={"err": f"{e}"})
