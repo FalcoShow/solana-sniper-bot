@@ -3,41 +3,38 @@ from __future__ import annotations
 """
 utils_pkg/lightning_impl.py — Jupiter v6/legacy swapper
 
-What this version fixes
-- Authenticated requests against https://api.jup.ag via x-api-key.
-- v6 flow (default) and legacy (/swap/v1/*) flow controlled by JUP_AS_LEGACY.
-- Supports new v6 swap variants:
-  - useSharedAccounts (recommend) ← JUP_USE_SHARED_ACCOUNTS=1
-  - useTokenLedger               ← JUP_USE_TOKEN_LEDGER=1
-  When both are set, prefer Shared Accounts.
-- Stable User-Agent to avoid odd edge gating.
-
-Design goals
-- Quote → Swap using quoteResponse passthrough.
-- DRY_RUN safe path.
-- Optional platform fees (disabled unless fully configured).
-- Optional priority fee & compute unit limit (or dynamic CU).
-- Wrap/unwrap SOL by default.
+Fixes & features
+- Authenticated requests to https://api.jup.ag using x-api-key.
+- v6 (default) or legacy (/swap/v1/*) flow via JUP_AS_LEGACY.
+- v6 swap variants: useSharedAccounts / useTokenLedger (prefer Shared Accounts).
+- Stable headers to avoid CDN/WAF edge issues.
+- Unroutable-mint cache (TTL) to avoid hammering Jupiter.
+- One-shot (+5%) amount bump if "COULD_NOT_FIND_ANY_ROUTE".
+- Quote → Swap via quoteResponse passthrough.
+- Priority fee / compute-unit knobs, wrap/unwrap SOL, DRY-RUN safe.
 
 Environment knobs
-- JUP_BASE_URL=https://api.jup.ag                (default)
-- JUP_UPSTREAM                                   (fallback if BASE unset)
-- JUP_API_KEY / JUP_PRO_KEY                      (API key; either works)
-- JUP_BEARER                                     (optional bearer)
-- JUP_AS_LEGACY=0                                (v6 default; set 1 for legacy)
+- JUP_BASE_URL=https://api.jup.ag        (default)
+- JUP_UPSTREAM                           (fallback if BASE unset)
+- JUP_API_KEY / JUP_PRO_KEY              (either works)
+- JUP_BEARER                             (optional bearer)
+- JUP_AS_LEGACY=0                        (set 1 to force legacy)
 - JUP_ONLY_DIRECT=0
-- JUP_USE_SHARED_ACCOUNTS=1                      (recommended)
+- JUP_USE_SHARED_ACCOUNTS=1              (recommended)
 - JUP_USE_TOKEN_LEDGER=0
-- JUP_PLATFORM_FEE_BPS=0                         (and JUP_PLATFORM_FEE_ACCOUNT if >0)
+- JUP_PLATFORM_FEE_BPS=0                 (and JUP_PLATFORM_FEE_ACCOUNT if >0)
 - PF_SLIPPAGE_BPS=30
 - PF_PRIORITY_LAMPORTS (or PF_PRIORITY_SOL)
-- PF_COMPUTE_UNIT_LIMIT=0                        (0 → dynamic CU)
+- PF_COMPUTE_UNIT_LIMIT=0                (0 → dynamic)
 - PF_WRAP_UNWRAP_SOL=1
-- JITO_FEE_MICROLAMPORTS                         (fallback → lamports)
+- JITO_FEE_MICROLAMPORTS                 (fallback → lamports)
 - DRYRUN / DRY_RUN / IS_DRYRUN
+- JUP_UNROUTABLE_TTL_SEC=1800            (unroutable mint cache TTL)
+- JUP_REQUOTE_BUMP_PCT=5                 (amount bump for 1 retry on no-route)
 """
 
 import os
+import time
 from typing import Optional, Dict, Any
 
 import httpx
@@ -134,9 +131,27 @@ WRAP_UNWRAP_SOL: bool = _env_bool("PF_WRAP_UNWRAP_SOL", True)
 # Dry-run toggle
 DRY_RUN: bool = _env_bool("DRYRUN", False) or _env_bool("DRY_RUN", False) or _env_bool("IS_DRYRUN", False)
 
+# Unroutable + bump knobs
+UNROUTABLE_TTL_SEC: int = max(30, _env_int("JUP_UNROUTABLE_TTL_SEC", 1800))
+REQUOTE_BUMP_PCT: int = max(1, _env_int("JUP_REQUOTE_BUMP_PCT", 5))
+
 # Chain constants
 SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Unroutable cache
+# ──────────────────────────────────────────────────────────────────────────────
+
+_UNROUTABLE: dict[str, float] = {}  # mint -> expires_ts
+
+def _is_unroutable(mint: str) -> bool:
+    exp = _UNROUTABLE.get(mint)
+    return bool(exp and exp > time.time())
+
+def _mark_unroutable(mint: str, ttl: int | None = None) -> None:
+    ttl = int(ttl or UNROUTABLE_TTL_SEC)
+    _UNROUTABLE[mint] = time.time() + ttl
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP helpers (headers + get/post with friendly error logs)
@@ -145,11 +160,13 @@ LAMPORTS_PER_SOL = 1_000_000_000
 def _jup_headers() -> Dict[str, str]:
     """
     Common headers for Jupiter. Must include x-api-key when present.
-    Keep a stable user-agent so CloudFront/WAF don't rate-limit strangely.
+    Keep a stable user-agent; include origin/referer as most clients do.
     """
     h = {
         "accept": "application/json",
         "content-type": "application/json",
+        "origin": "https://jup.ag",
+        "referer": "https://jup.ag/",
         "user-agent": "pnlsniper/router",
     }
     if JUP_API_KEY:
@@ -183,29 +200,68 @@ async def _http_post(url: str, *, json_body: Dict[str, Any]) -> Dict[str, Any]:
         return r.json()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Jupiter v6 flows (quote → swap)
+# Jupiter flows (quote → swap)
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def _get_quote(*, input_mint: str, output_mint: str, amount: int, slippage_bps: int) -> Dict[str, Any]:
     """
     Ask Jupiter for a quote (v6 by default; legacy if AS_LEGACY=1).
-    We pass the response straight into /swap via quoteResponse.
+    Adds:
+      - unroutable mint cache check
+      - one-shot +REQUOTE_BUMP_PCT% amount bump if "COULD_NOT_FIND_ANY_ROUTE"
     """
-    params: Dict[str, Any] = {
-        "inputMint": input_mint,
-        "outputMint": output_mint,
-        "amount": str(amount),               # Jupiter accepts str for large ints
-        "slippageBps": int(slippage_bps),
-        "swapMode": "ExactIn",
-        "onlyDirectRoutes": ONLY_DIRECT,
-        "asLegacyTransaction": AS_LEGACY,    # Jupiter ignores in v6 paths
-    }
-    if USE_PLATFORM_FEE:
-        params["platformFeeBps"] = int(PLATFORM_FEE_BPS)
+    # Guard: unroutable cache
+    if _is_unroutable(output_mint):
+        log.info("JUP_NO_ROUTE_CACHED", extra={"mint": output_mint, "ttl": UNROUTABLE_TTL_SEC})
+        raise RuntimeError("jup_no_route_cached")
+
+    def _params(amt: int) -> Dict[str, Any]:
+        p: Dict[str, Any] = {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(int(amt)),          # str for big ints
+            "slippageBps": int(slippage_bps),
+            "swapMode": "ExactIn",
+            "onlyDirectRoutes": ONLY_DIRECT,
+            "asLegacyTransaction": AS_LEGACY,  # ignored by v6; kept for legacy
+        }
+        if USE_PLATFORM_FEE:
+            p["platformFeeBps"] = int(PLATFORM_FEE_BPS)
+        return p
 
     url = f"{BASE}/quote" if not AS_LEGACY else f"{BASE}/swap/v1/quote"
-    js = await _http_get(url, params=params)
 
+    # 1st attempt
+    try:
+        js = await _http_get(url, params=_params(amount))
+    except httpx.HTTPStatusError as e:
+        # Inspect body for "no route"
+        err_code = None
+        try:
+            err_code = e.response.json().get("errorCode")
+        except Exception:
+            pass
+        if err_code == "COULD_NOT_FIND_ANY_ROUTE":
+            # Mark unroutable, but also try a tiny one-shot bump (+REQUOTE_BUMP_PCT%)
+            _mark_unroutable(output_mint)
+            bumped = max(int(amount * (100 + REQUOTE_BUMP_PCT) / 100), amount + 1)
+            log.info("JUP_REQUOTE_BUMP", extra={"mint": output_mint, "amount": amount, "bumped": bumped})
+            try:
+                js = await _http_get(url, params=_params(bumped))
+            except httpx.HTTPStatusError as e2:
+                # If the bump also fails, keep it cached and bubble up
+                err_code2 = None
+                try:
+                    err_code2 = e2.response.json().get("errorCode")
+                except Exception:
+                    pass
+                if err_code2 == "COULD_NOT_FIND_ANY_ROUTE":
+                    log.info("JUP_NO_ROUTE_FINAL", extra={"mint": output_mint})
+                    raise RuntimeError("jup_no_route")
+                raise
+        else:
+            raise
+    # OK
     log.info(
         "QUOTE_OK",
         extra={
@@ -320,6 +376,13 @@ async def buy_via_lightning(*, mint: str, amount_sol: float, slippage_bps: int =
         log.info("ENTRY_TX_OK", extra={"sig": sig})
         return sig
 
+    except RuntimeError as e:
+        # "jup_no_route" or "jup_no_route_cached" → clean skip
+        if str(e) in {"jup_no_route", "jup_no_route_cached"}:
+            log.info("ENTRY_SKIP_NO_ROUTE", extra={"mint": mint})
+            return None
+        log.warning("ENTRY_TX_RT_FAIL", extra={"err": f"{e}"})
+        return None
     except httpx.HTTPError as e:
         log.warning("ENTRY_TX_HTTP_ERROR", extra={"err": f"{e}"})
         return None
@@ -350,6 +413,12 @@ async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_
         log.info("EXIT_TX_OK", extra={"sig": sig})
         return sig
 
+    except RuntimeError as e:
+        if str(e) in {"jup_no_route", "jup_no_route_cached"}:
+            log.info("EXIT_SKIP_NO_ROUTE", extra={"mint": mint})
+            return None
+        log.warning("EXIT_TX_RT_FAIL", extra={"err": f"{e}"})
+        return None
     except httpx.HTTPError as e:
         log.warning("EXIT_TX_HTTP_ERROR", extra={"err": f"{e}"})
         return None

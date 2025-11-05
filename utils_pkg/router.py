@@ -3,8 +3,13 @@ from __future__ import annotations
 """
 utils_pkg/router.py — Clean, end-to-end rewrite (delegates swaps to lightning_impl)
 
-Key features
-- Jupiter v6-first (public/pro relays), with optional legacy (/swap/v1/*) toggle
+Additions in this rewrite
+- BUY/SELL wrappers that catch Jupiter "no route" and cleanly fall back to Raydium.
+- Keeps your existing API surface, registries, caching, pricing, Telegram helpers, etc.
+- Does NOT change call sites — BUY_IMPLS/SELL_IMPLS still expose "pump"/"raydium" keys.
+
+Key features (unchanged)
+- Jupiter v6-first (public/pro relays), optional legacy (/swap/v1/*) toggle
 - Strict 32-byte base58 validation (no auto-trimming/fixing)
 - Robust quote/swap HTTP helpers, basic rate limiting, circuit breaker
 - On-chain decimals probe (RPC getAccountInfo) with optional /tokens fallback cache
@@ -32,6 +37,8 @@ from typing import Any, Dict, Optional, Tuple, Callable, List
 
 import requests
 from requests.exceptions import RequestException
+from utils_pkg import lightning_impl as lightning
+from utils_pkg import raydium_impl as raydium
 
 # ----- BEGIN: ENV-DRIVEN HARD JUPITER DISABLE GUARD -----
 import os, logging
@@ -57,11 +64,7 @@ if JUPIER_DISABLED_BY_ENV:
     def _jupiter_quote_stub(*args, **kwargs):
         raise RuntimeError("Jupiter disabled by environment - quote requested but blocked")
 
-    # Try to patch common function names used in this codebase. If these names don't exist,
-    # the try/except simply continues (non-invasive).
     try:
-        # if functions are defined later in this module, this will be overwritten; therefore also
-        # patch the router's public API points if they import a helper name.
         globals()["quote_price_via_jupiter"] = _jupiter_quote_stub
     except Exception:
         pass
@@ -160,35 +163,6 @@ SELL_IMPLS = {}
 
 # Import the lightning impls once (source of truth for swaps)
 from utils_pkg.lightning_impl import buy_via_lightning as _buy_lightning, sell_via_lightning as _sell_lightning
-
-def _register_lightning():
-    # Register under pool names the app expects, so routing works without further changes.
-    if ALLOW_PUMP:
-        BUY_IMPLS["pump"]  = _buy_lightning
-        SELL_IMPLS["pump"] = _sell_lightning
-    if ALLOW_RAYDIUM:
-        BUY_IMPLS["raydium"]  = _buy_lightning
-        SELL_IMPLS["raydium"] = _sell_lightning
-    # Also provide a generic "lightning" key for direct calls, if any.
-    BUY_IMPLS.setdefault("lightning", _buy_lightning)
-    SELL_IMPLS.setdefault("lightning", _sell_lightning)
-
-if BUY_IMPL == "lightning":
-    _register_lightning()
-
-# Router-level symbols delegate to the impl to avoid code drift
-buy_via_lightning = _buy_lightning
-sell_via_lightning = _sell_lightning
-
-# Helpful startup log (confirms registration happened)
-try:
-    from logging_setup import get_logger
-    log = get_logger()
-    log.info({"event":"ROUTER_IMPLS",
-              "buy_keys": list(BUY_IMPLS.keys()),
-              "sell_keys": list(SELL_IMPLS.keys())})
-except Exception:
-    pass
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Chain / RPC config
@@ -793,6 +767,7 @@ async def mint_decimals(mint: str) -> Optional[int]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Priority fee tuner (scaffold) + status polling (usable by impl)
 # ──────────────────────────────────────────────────────────────────────────────
+
 def _to_sol_from_lamports_like(x: float) -> float:
     lamports = float(x)
     # Some providers return microlamports
@@ -946,6 +921,65 @@ async def _enforce_min_sol(required_spend_lamports: int = 0) -> bool:
     return True
 
 # ──────────────────────────────────────────────────────────────────────────────
+# BUY/SELL WRAPPERS with Jupiter→Raydium fallback
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Error markers thrown by utils_pkg/lightning_impl when Jupiter has no route
+_NO_ROUTE_ERRORS = {"jup_no_route", "jup_no_route_cached"}
+
+async def _fallback_buy_on_raydium(*, mint: str, amount_sol: float, slippage_bps: int) -> Optional[str]:
+    """Try Raydium path if available; tolerate absence gracefully."""
+    try:
+        if hasattr(raydium, "buy") and callable(getattr(raydium, "buy")):
+            return await raydium.buy(mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps)  # type: ignore
+        if hasattr(raydium, "buy_via_raydium") and callable(getattr(raydium, "buy_via_raydium")):
+            return await raydium.buy_via_raydium(mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps)  # type: ignore
+    except Exception as e:
+        log.event("ROUTER_RAYDIUM_BUY_FAIL", mint=mint, err=str(e)[:200])
+    return None
+
+async def _fallback_sell_on_raydium(*, mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int) -> Optional[str]:
+    try:
+        if hasattr(raydium, "sell") and callable(getattr(raydium, "sell")):
+            return await raydium.sell(mint=mint, token_program=token_program, amount_raw=amount_raw, slippage_bps=slippage_bps)  # type: ignore
+        if hasattr(raydium, "sell_via_raydium") and callable(getattr(raydium, "sell_via_raydium")):
+            return await raydium.sell_via_raydium(mint=mint, token_program=token_program, amount_raw=amount_raw, slippage_bps=slippage_bps)  # type: ignore
+    except Exception as e:
+        log.event("ROUTER_RAYDIUM_SELL_FAIL", mint=mint, err=str(e)[:200])
+    return None
+
+# Public wrappers that used to be aliases — now add fallback logic
+async def buy_via_lightning(*, mint: str, amount_sol: float, slippage_bps: int = None) -> Optional[str]:
+    """Primary BUY path: try Jupiter via lightning_impl, then fallback to Raydium on no-route."""
+    if slippage_bps is None:
+        slippage_bps = _clamp_slippage_bps(None)
+    try:
+        sig = await _buy_lightning(mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps)
+        if sig:
+            return sig
+        return None
+    except RuntimeError as e:
+        if str(e) in _NO_ROUTE_ERRORS:
+            log.info({"event": "ROUTER_FALLBACK_RAYDIUM", "mint": mint})
+            return await _fallback_buy_on_raydium(mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps)
+        raise
+
+async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int = None) -> Optional[str]:
+    """Primary SELL path: try Jupiter via lightning_impl, fallback to Raydium on no-route."""
+    if slippage_bps is None:
+        slippage_bps = _clamp_slippage_bps(None)
+    try:
+        sig = await _sell_lightning(mint=mint, token_program=token_program, amount_raw=amount_raw, slippage_bps=slippage_bps)
+        if sig:
+            return sig
+        return None
+    except RuntimeError as e:
+        if str(e) in _NO_ROUTE_ERRORS:
+            log.info({"event": "ROUTER_FALLBACK_RAYDIUM_SELL", "mint": mint})
+            return await _fallback_sell_on_raydium(mint=mint, token_program=token_program, amount_raw=amount_raw, slippage_bps=slippage_bps)
+        raise
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Token metadata helpers
 # ──────────────────────────────────────────────────────────────────────────────
 async def get_tokens() -> List[dict]:
@@ -961,6 +995,35 @@ def get_token_symbol(mint: str) -> Optional[str]:
     return str(s).strip() if s else None
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Registry wiring — register AFTER wrappers are defined so we point to them
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _register_lightning():
+    # Register under pool names the app expects, so routing works without further changes.
+    if ALLOW_PUMP:
+        BUY_IMPLS["pump"]  = buy_via_lightning
+        SELL_IMPLS["pump"] = sell_via_lightning
+    if ALLOW_RAYDIUM:
+        BUY_IMPLS["raydium"]  = buy_via_lightning
+        SELL_IMPLS["raydium"] = sell_via_lightning
+    # Also provide a generic "lightning" key for direct calls, if any.
+    BUY_IMPLS.setdefault("lightning", buy_via_lightning)
+    SELL_IMPLS.setdefault("lightning", sell_via_lightning)
+
+if BUY_IMPL == "lightning":
+    _register_lightning()
+
+# Helpful startup log (confirms registration happened)
+try:
+    from logging_setup import get_logger
+    log = get_logger()
+    log.info({"event":"ROUTER_IMPLS",
+              "buy_keys": list(BUY_IMPLS.keys()),
+              "sell_keys": list(SELL_IMPLS.keys())})
+except Exception:
+    pass
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Exports
 # ──────────────────────────────────────────────────────────────────────────────
 __all__ = [
@@ -970,7 +1033,7 @@ __all__ = [
     "get_sell_quote", "get_buy_quote", "get_price_ui", "price_of_ui", "price_of",
     # tokens/meta
     "get_tokens", "get_token_symbol", "mint_decimals", "get_decimals",
-    # swaps (delegated)
+    # swaps (delegated with fallback)
     "buy_via_lightning", "sell_via_lightning",
     # utils
     "normalize_pump_id_to_mint", "_is_valid_pubkey_str", "is_valid_pubkey_str",
