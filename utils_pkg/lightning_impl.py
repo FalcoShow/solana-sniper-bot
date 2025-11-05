@@ -472,7 +472,7 @@ async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_
         if str(e) in {"jup_no_route", "jup_no_route_cached"}:
             log.info("EXIT_SKIP_NO_ROUTE", extra={"mint": mint})
             return None
-        log.warning("EXIT_TX_RT_FAIL", extra":{"err": f"{e}"})
+        log.warning("EXIT_TX_RT_FAIL", extra={"err": f"{e}"})
         return None
     except httpx.HTTPError as e:
         log.warning("EXIT_TX_HTTP_ERROR", extra={"err": f"{e}"})
