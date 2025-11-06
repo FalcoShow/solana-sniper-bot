@@ -16,7 +16,7 @@ import socket
 import asyncio
 import logging
 from typing import List, Optional, Dict
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 from aiohttp import web, ClientSession, TCPConnector, ClientTimeout
 from aiohttp.client_exceptions import ClientConnectorError
@@ -44,16 +44,13 @@ if not UPSTREAM.endswith("/v6"):
     raise SystemExit(f"RELAY_UPSTREAM must end with /v6, got: {UPSTREAM}")
 
 def _alt_list() -> List[str]:
+    # Only honor explicit env; do NOT auto-add any host
     out: List[str] = []
     if JUP_ALT_BASE_URLS:
         for p in JUP_ALT_BASE_URLS.split(","):
             s = p.strip()
             if s:
                 out.append(s.rstrip("/"))
-    # Add canonical fallback from quote-api -> api if relevant
-    parsed = urlparse(UPSTREAM)
-    if "quote-api.jup.ag" in parsed.netloc and "https://api.jup.ag/v6" not in out:
-        out.append("https://api.jup.ag/v6")
     return out
 
 ALT_UPSTREAMS = _alt_list()
@@ -101,7 +98,6 @@ class HostMapResolver(AbstractResolver):
         }]
 
     async def close(self):
-        # nothing to close
         return
 
 # ---------- helpers ----------
@@ -171,7 +167,7 @@ async def _do_upstream_request(
 
 async def passthrough(request: web.Request):
     # Map "/quote" -> "{UPSTREAM}/quote", etc.
-    tail = request.path.lstrip("/")  # e.g. "quote" or "v6/quote" if client includes it
+    tail = request.path.lstrip("/")  # "quote", "price", or "v6/quote" if client includes it
     try_list = _build_try_list(UPSTREAM)
 
     # Build candidate URLs; if client sent /v6/quote we still append only once
@@ -183,7 +179,7 @@ async def passthrough(request: web.Request):
 
     headers = _sanitize_request_headers(dict(request.headers))
     # Inject API key if not present
-    if JUP_API_KEY and not any(h.lower() == "x-api-key" for h in headers.keys()):
+    if JUP_API_KEY and not any(k.lower() == "x-api-key" for k in headers.keys()):
         headers["x-api-key"] = JUP_API_KEY
 
     # Read body if present
@@ -199,7 +195,7 @@ async def passthrough(request: web.Request):
                 session, request.method, candidate, headers, data
             )
 
-            # If the current upstream returns 401/404, try the next candidate
+            # Fall through on 401/404 to next upstream if available
             if status in (401, 404) and idx < len(url_candidates) - 1:
                 LOG.warning("got %s from %s, trying next fallback", status, candidate)
                 continue
