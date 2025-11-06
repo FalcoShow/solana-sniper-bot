@@ -5,7 +5,7 @@
 # - Accepts local paths like /quote and forwards to {UPSTREAM}/quote
 # - Adds x-api-key if JUP_API_KEY is set
 # - Has /__debug and /ping health endpoints
-# - DNS fallback: if primary host fails to resolve we'll retry with fallbacks
+# - DNS fallback: if primary host fails to resolve, retry alternates
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ if not UPSTREAM.endswith("/v6"):
     raise SystemExit(f"RELAY_UPSTREAM must end with /v6, got: {UPSTREAM}")
 
 def _alt_list() -> List[str]:
-    out = []
+    out: List[str] = []
     if JUP_ALT_BASE_URLS:
         for p in JUP_ALT_BASE_URLS.split(","):
             s = p.strip()
@@ -76,7 +76,7 @@ def _build_try_list(primary: str) -> List[str]:
     out.extend(ALT_UPSTREAMS)
     # dedupe while preserving order
     seen = set()
-    dedup = []
+    dedup: List[str] = []
     for u in out:
         if u not in seen:
             seen.add(u)
@@ -97,9 +97,19 @@ async def debug(_req: web.Request):
         "force_ipv4": FORCE_IPV4,
     })
 
-async def _do_upstream_request(session: ClientSession, method: str, url: str, headers: dict, data: Optional[bytes], timeout_seconds: int = 12):
+async def _do_upstream_request(
+    session: ClientSession,
+    method: str,
+    url: str,
+    headers: dict,
+    data: Optional[bytes],
+    timeout_seconds: int = 12,
+):
     timeout = ClientTimeout(total=timeout_seconds)
-    async with session.request(method=method, url=url, headers=headers, data=data, allow_redirects=False, timeout=timeout) as resp:
+    async with session.request(
+        method=method, url=url, headers=headers, data=data,
+        allow_redirects=False, timeout=timeout
+    ) as resp:
         body = await resp.read()
         passthrough_headers = _safe_passthrough_headers(resp.headers)
         return resp.status, passthrough_headers, body
@@ -107,14 +117,10 @@ async def _do_upstream_request(session: ClientSession, method: str, url: str, he
 async def passthrough(request: web.Request):
     # Map "/quote" -> "{UPSTREAM}/quote", etc.
     tail = request.path.lstrip("/")  # e.g. "quote" or "v6/quote" if client includes it
-    # try the incoming path appended to the base upstream
     try_list = _build_try_list(UPSTREAM)
 
-    # If the client accidentally sent a full path like /v6/quote, we shouldn't end up with .../v6/v6/quote;
-    # keep the simple behavior of appending the tail to the upstream base.
-    url_candidates = []
-    for base in try_list:
-        url_candidates.append(urljoin(base + "/", tail))
+    # If client sent /v6/quote, still just append tail once to each base.
+    url_candidates = [urljoin(base + "/", tail) for base in try_list]
 
     # preserve original query string
     if request.query_string:
@@ -130,19 +136,23 @@ async def passthrough(request: web.Request):
 
     session: ClientSession = request.app["session"]
 
-    last_exc = None
+    last_exc: Optional[Exception] = None
     for candidate in url_candidates:
         LOG.info("proxy -> %s", candidate)
         try:
-            status, resp_headers, body = await _do_upstream_request(session, request.method, candidate, headers, data)
+            status, resp_headers, body = await _do_upstream_request(
+                session, request.method, candidate, headers, data
+            )
             return web.Response(status=status, headers=dict(resp_headers), body=body)
         except ClientConnectorError as e:
             # If underlying cause is a DNS getaddrinfo failure, try next fallback
             cause = getattr(e, "__cause__", None)
             is_gai = isinstance(cause, socket.gaierror)
-            LOG.warning("connect error to upstream %s: %s (gai=%s) — trying next fallback if available", candidate, e, is_gai)
+            LOG.warning(
+                "connect error to upstream %s: %s (gai=%s) — trying next fallback if available",
+                candidate, e, is_gai
+            )
             last_exc = e
-            # continue to next candidate
             continue
         except asyncio.TimeoutError as e:
             LOG.warning("timeout contacting upstream %s: %s", candidate, e)
@@ -155,7 +165,6 @@ async def passthrough(request: web.Request):
     # all attempts failed
     if last_exc is None:
         return await _json_error(502, "no upstream candidates available")
-    # If last_exc was DNS related, include that hint for faster debugging
     if isinstance(last_exc, ClientConnectorError) and isinstance(getattr(last_exc, "__cause__", None), socket.gaierror):
         return await _json_error(502, f"DNS resolution failed for upstream candidates; last: {last_exc}")
     return await _json_error(502, f"failed to contact upstreams; last: {last_exc}")
@@ -185,7 +194,10 @@ def make_app():
     family = socket.AF_INET if FORCE_IPV4 else 0
 
     async def on_startup(_app: web.Application):
-        LOG.info("starting relay; bind=%s:%s upstream=%s force_ipv4=%s alts=%s", RELAY_BIND, RELAY_PORT, UPSTREAM, FORCE_IPV4, ALT_UPSTREAMS)
+        LOG.info(
+            "starting relay; bind=%s:%s upstream=%s force_ipv4=%s alts=%s",
+            RELAY_BIND, RELAY_PORT, UPSTREAM, FORCE_IPV4, ALT_UPSTREAMS
+        )
         _app["session"] = ClientSession(connector=TCPConnector(family=family))
 
     async def on_cleanup(_app: web.Application):
