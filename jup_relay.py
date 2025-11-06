@@ -44,16 +44,13 @@ if not UPSTREAM.endswith("/v6"):
     raise SystemExit(f"RELAY_UPSTREAM must end with /v6, got: {UPSTREAM}")
 
 def _alt_list() -> List[str]:
+    # Only honor explicit env; do NOT auto-add api.jup.ag
     out: List[str] = []
     if JUP_ALT_BASE_URLS:
         for p in JUP_ALT_BASE_URLS.split(","):
             s = p.strip()
             if s:
                 out.append(s.rstrip("/"))
-    # Add canonical fallback from quote-api -> api if relevant
-    parsed = urlparse(UPSTREAM)
-    if "quote-api.jup.ag" in parsed.netloc and "https://api.jup.ag/v6" not in out:
-        out.append("https://api.jup.ag/v6")
     return out
 
 ALT_UPSTREAMS = _alt_list()
