@@ -229,7 +229,7 @@ JUP_ALT_BASE_URLS: List[str] = [u.strip().rstrip("/") for u in (os.getenv("JUP_A
 AS_LEGACY = _envb("JUP_AS_LEGACY", False)
 ONLY_DIRECT_DEFAULT = _envb("JUP_ONLY_DIRECT", False)
 if not AS_LEGACY:
-    JUP_ALT_BASE_URLS = [os.getenv("JUP_BASE_URL", "https://api.jup.ag"), "https://quote-api.jup.ag"]
+    JUP_ALT_BASE_URLS = [os.getenv("JUP_BASE_URL", "https://api.jup.ag")]
 _JUP_LAST_GOOD_BASE: Optional[str] = None
 
 def _quote_url(base: str) -> str:
