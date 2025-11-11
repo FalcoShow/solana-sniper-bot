@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-# jup_relay.py — robust IPv4-friendly relay for Jupiter v6
-# - Listens on RELAY_BIND:RELAY_PORT (defaults 127.0.0.1:8081)
-# - RELAY_UPSTREAM must end with /v6 (e.g. https://quote-api.jup.ag/v6)
-# - Accepts local paths like /quote and forwards to {UPSTREAM}/quote
-# - Adds x-api-key if JUP_API_KEY is set
-# - Has /__debug and /ping health endpoints
-# - DNS fallback: optional static host->IP resolver to bypass broken DNS
-# - Upstream fallbacks: tries JUP_ALT_BASE_URLS when the primary fails
-# - Falls through on HTTP 401/404 to the next upstream
+"""
+jup_relay.py — IPv4-friendly relay for Jupiter (Ultra/paid endpoints)
+
+- Listens on RELAY_BIND:RELAY_PORT (defaults 127.0.0.1:8081)
+- RELAY_UPSTREAM may be a bare base (https://api.jup.ag) or already /swap/v1
+- Rewrites local legacy paths:
+    /v6/*                -> /swap/v1/*
+    /quote               -> /swap/v1/quote
+    /swap                -> /swap/v1/swap
+    /swap-instructions   -> /swap/v1/swap-instructions
+  Also accepts direct /swap/v1/* and passes through unchanged.
+- Adds x-api-key if JUP_API_KEY is set (unless client already sent it)
+- Health: /__debug and /ping
+- Optional DNS bypass via RELAY_HOST_MAP ("host=ip,host2=ip2")
+- Optional fallbacks via JUP_ALT_BASE_URLS (comma-separated)
+"""
 
 from __future__ import annotations
 
@@ -22,29 +29,29 @@ from aiohttp import web, ClientSession, TCPConnector, ClientTimeout
 from aiohttp.client_exceptions import ClientConnectorError
 from aiohttp.abc import AbstractResolver
 
-# ---------- config ----------
+# ────────────────────────── logging / config ──────────────────────────
 LOG = logging.getLogger("jup_relay")
 logging.basicConfig(level=logging.INFO, format="[relay] %(asctime)s %(levelname)s %(message)s")
 
 RELAY_BIND = os.environ.get("RELAY_BIND", "127.0.0.1")
 RELAY_PORT = int(os.environ.get("RELAY_PORT", "8081"))
 
-UPSTREAM = os.environ.get("RELAY_UPSTREAM", "https://quote-api.jup.ag/v6").rstrip("/")
+UPSTREAM = os.environ.get("RELAY_UPSTREAM", "https://api.jup.ag").rstrip("/")
 JUP_API_KEY = os.environ.get("JUP_API_KEY", "")
 FORCE_IPV4 = os.environ.get("RELAY_FORCE_IPV4", "1") == "1"
 
-# optional comma separated additional base urls to try if primary fails
+# Optional comma-separated additional base URLs
 JUP_ALT_BASE_URLS = os.environ.get("JUP_ALT_BASE_URLS", "").strip()
 
-# RELAY_HOST_MAP: "host=ip,host2=ip2" (used to bypass DNS; SNI still uses host)
+# RELAY_HOST_MAP: "host=ip,host2=ip2" (curl --resolve style)
 RELAY_HOST_MAP = os.environ.get("RELAY_HOST_MAP", "").strip()
 
-# ---------- validation ----------
-if not UPSTREAM.endswith("/v6"):
-    raise SystemExit(f"RELAY_UPSTREAM must end with /v6, got: {UPSTREAM}")
+# Relaxed validation: allow either bare base or already /swap/v1
+if not (UPSTREAM.endswith("/swap/v1") or UPSTREAM.endswith("api.jup.ag")):
+    print(f"WARNING: unusual RELAY_UPSTREAM: {UPSTREAM}")
 
+# ────────────────────────── helpers / parsing ──────────────────────────
 def _alt_list() -> List[str]:
-    # Only honor explicit env; do NOT auto-add any host
     out: List[str] = []
     if JUP_ALT_BASE_URLS:
         for p in JUP_ALT_BASE_URLS.split(","):
@@ -53,7 +60,16 @@ def _alt_list() -> List[str]:
                 out.append(s.rstrip("/"))
     return out
 
-ALT_UPSTREAMS = _alt_list()
+ALT_UPSTREAMS_RAW = _alt_list()
+
+def _ensure_swap_v1(base: str) -> str:
+    """Normalize a base so it ends with /swap/v1 (no trailing slash)."""
+    base = base.rstrip("/")
+    return base if base.endswith("/swap/v1") else f"{base}/swap/v1"
+
+# The normalized list we actually try against:
+PRIMARY_NORM = _ensure_swap_v1(UPSTREAM)
+ALT_UPSTREAMS = [_ensure_swap_v1(u) for u in ALT_UPSTREAMS_RAW]
 
 def _parse_hostmap(raw: str) -> Dict[str, str]:
     hostmap: Dict[str, str] = {}
@@ -69,25 +85,21 @@ def _parse_hostmap(raw: str) -> Dict[str, str]:
 
 HOSTMAP = _parse_hostmap(RELAY_HOST_MAP)
 
-# ---------- resolver ----------
+# ────────────────────────── resolver (host pin) ──────────────────────────
 class HostMapResolver(AbstractResolver):
-    """Static host->IP resolver (curl --resolve equivalent).
-    When a host is present in HOSTMAP, connect to that IP but keep SNI as the original host.
-    """
+    """Static host->IP resolver (curl --resolve equivalent)."""
     def __init__(self, mapping: Dict[str, str]):
         self._map = {k.lower(): v for k, v in mapping.items() if k and v}
 
     async def resolve(self, host: str, port: int = 0, family: int = socket.AF_UNSPEC):
         ip = self._map.get(host.lower())
         if not ip:
-            # Use system DNS
             loop = asyncio.get_event_loop()
             infos = await loop.getaddrinfo(host, port, family=family, type=socket.SOCK_STREAM)
             return [
                 {"hostname": host, "host": a[4][0], "port": a[4][1], "family": a[0], "proto": a[2], "flags": 0}
                 for a in infos
             ]
-        # Force IPv4 for mapped hosts
         return [{
             "hostname": host,
             "host": ip,
@@ -100,15 +112,28 @@ class HostMapResolver(AbstractResolver):
     async def close(self):
         return
 
-# ---------- helpers ----------
+# ────────────────────────── request shaping ──────────────────────────
+def _rewrite_path_for_ultra(path: str) -> str:
+    """Return a path appropriate for the Ultra endpoints."""
+    p = path or "/"
+    if p.startswith("/swap/v1/"):
+        return p
+    if p.startswith("/v6/"):
+        return "/swap/v1/" + p[len("/v6/"):]
+    if p == "/quote":
+        return "/swap/v1/quote"
+    if p == "/swap":
+        return "/swap/v1/swap"
+    if p == "/swap-instructions":
+        return "/swap/v1/swap-instructions"
+    return p
+
 async def _json_error(status: int, message: str):
     return web.json_response({"ok": False, "error": message}, status=status)
 
 def _sanitize_request_headers(headers: dict) -> dict:
     h = dict(headers)
-    # remove hop-by-hop and host
-    h.pop("Host", None)
-    h.pop("host", None)
+    h.pop("Host", None); h.pop("host", None)
     for k in list(h.keys()):
         if k.lower() in ("content-length", "transfer-encoding", "connection"):
             h.pop(k, None)
@@ -121,19 +146,15 @@ def _safe_passthrough_headers(resp_headers: dict) -> List[tuple]:
         if k.lower() not in ("content-length", "content-encoding", "transfer-encoding", "connection")
     ]
 
-def _build_try_list(primary: str) -> List[str]:
-    out = [primary.rstrip("/")]
-    out.extend(ALT_UPSTREAMS)
-    # dedupe while preserving order
-    seen = set()
-    dedup: List[str] = []
+def _build_try_list() -> List[str]:
+    out = [PRIMARY_NORM]; out.extend(ALT_UPSTREAMS)
+    seen, dedup = set(), []
     for u in out:
         if u not in seen:
-            seen.add(u)
-            dedup.append(u)
+            seen.add(u); dedup.append(u)
     return dedup
 
-# ---------- handlers ----------
+# ────────────────────────── handlers ──────────────────────────
 async def ping(_req: web.Request):
     return web.json_response({"ok": True, "relay": "up"})
 
@@ -141,8 +162,10 @@ async def debug(_req: web.Request):
     return web.json_response({
         "bind": RELAY_BIND,
         "port": RELAY_PORT,
-        "upstream": UPSTREAM,
-        "alt_upstreams": ALT_UPSTREAMS,
+        "upstream_raw": UPSTREAM,
+        "primary_norm": PRIMARY_NORM,
+        "alt_upstreams_raw": ALT_UPSTREAMS_RAW,
+        "alt_upstreams_norm": ALT_UPSTREAMS,
         "api_key_present": bool(JUP_API_KEY),
         "force_ipv4": FORCE_IPV4,
         "hostmap": HOSTMAP,
@@ -166,25 +189,18 @@ async def _do_upstream_request(
         return resp.status, passthrough_headers, body
 
 async def passthrough(request: web.Request):
-    # Map "/quote" -> "{UPSTREAM}/quote", etc.
-    tail = request.path.lstrip("/")  # "quote", "price", or "v6/quote" if client includes it
-    try_list = _build_try_list(UPSTREAM)
+    path = _rewrite_path_for_ultra(request.path)
+    try_list = _build_try_list()
 
-    # Build candidate URLs; if client sent /v6/quote we still append only once
-    url_candidates = [urljoin(base + "/", tail) for base in try_list]
-
-    # Preserve original query string
+    url_candidates = [urljoin(base + "/", path.lstrip("/")) for base in try_list]
     if request.query_string:
         url_candidates = [f"{u}?{request.query_string}" for u in url_candidates]
 
     headers = _sanitize_request_headers(dict(request.headers))
-    # Inject API key if not present
     if JUP_API_KEY and not any(k.lower() == "x-api-key" for k in headers.keys()):
         headers["x-api-key"] = JUP_API_KEY
 
-    # Read body if present
     data = await request.read() if request.can_read_body else None
-
     session: ClientSession = request.app["session"]
 
     last_exc: Optional[Exception] = None
@@ -194,68 +210,57 @@ async def passthrough(request: web.Request):
             status, resp_headers, body = await _do_upstream_request(
                 session, request.method, candidate, headers, data
             )
-
-            # Fall through on 401/404 to next upstream if available
             if status in (401, 404) and idx < len(url_candidates) - 1:
                 LOG.warning("got %s from %s, trying next fallback", status, candidate)
                 continue
-
             return web.Response(status=status, headers=dict(resp_headers), body=body)
 
         except ClientConnectorError as e:
-            # If underlying cause is a DNS getaddrinfo failure, try next fallback
             cause = getattr(e, "__cause__", None)
             is_gai = isinstance(cause, socket.gaierror)
-            LOG.warning(
-                "connect error to upstream %s: %s (gai=%s) — trying next fallback if available",
-                candidate, e, is_gai
-            )
-            last_exc = e
-            continue
+            LOG.warning("connect error to %s: %s (gai=%s) — trying next", candidate, e, is_gai)
+            last_exc = e; continue
         except asyncio.TimeoutError as e:
-            LOG.warning("timeout contacting upstream %s: %s", candidate, e)
-            last_exc = e
-            continue
-        except Exception as e:  # unexpected, bubble as 502
-            LOG.exception("unexpected error when contacting upstream %s", candidate)
+            LOG.warning("timeout contacting %s: %s", candidate, e)
+            last_exc = e; continue
+        except Exception as e:
+            LOG.exception("unexpected upstream error for %s", candidate)
             return await _json_error(502, f"upstream error: {e}")
 
-    # All attempts failed
     if last_exc is None:
         return await _json_error(502, "no upstream candidates available")
     if isinstance(last_exc, ClientConnectorError) and isinstance(getattr(last_exc, "__cause__", None), socket.gaierror):
         return await _json_error(502, f"DNS resolution failed for upstream candidates; last: {last_exc}")
     return await _json_error(502, f"failed to contact upstreams; last: {last_exc}")
 
-# ---------- app factory ----------
+# ────────────────────────── app factory ──────────────────────────
 def make_app():
     app = web.Application()
 
-    # Health endpoints
     app.add_routes([
         web.get("/__debug", debug),
         web.get("/ping", ping),
     ])
 
-    # v6 endpoints we care about; include catch-all -> passthrough too
     app.add_routes([
+        # legacy short forms
         web.route("*", "/quote", passthrough),
         web.route("*", "/swap", passthrough),
         web.route("*", "/swap-instructions", passthrough),
-        web.route("*", "/price", passthrough),
-        web.route("*", "/tokens", passthrough),
-        web.route("*", "/routes", passthrough),
-        web.route("*", "/{tail:.*}", passthrough),  # catch-all
+        # legacy v6 and modern endpoints
+        web.route("*", "/v6/{tail:.*}", passthrough),
+        web.route("*", "/swap/v1/{tail:.*}", passthrough),
+        # catch-all
+        web.route("*", "/{tail:.*}", passthrough),
     ])
 
-    # Properly create/close the HTTP client inside the loop
     family = socket.AF_INET if FORCE_IPV4 else 0
     resolver = HostMapResolver(HOSTMAP) if HOSTMAP else None
 
     async def on_startup(_app: web.Application):
         LOG.info(
-            "starting relay; bind=%s:%s upstream=%s force_ipv4=%s alts=%s hostmap=%s",
-            RELAY_BIND, RELAY_PORT, UPSTREAM, FORCE_IPV4, ALT_UPSTREAMS, HOSTMAP
+            "starting relay; bind=%s:%s upstream=%s primary_norm=%s force_ipv4=%s alts=%s hostmap=%s",
+            RELAY_BIND, RELAY_PORT, UPSTREAM, PRIMARY_NORM, FORCE_IPV4, ALT_UPSTREAMS, HOSTMAP
         )
         _app["session"] = ClientSession(
             connector=TCPConnector(family=family, resolver=resolver)
@@ -269,6 +274,6 @@ def make_app():
     app.on_cleanup.append(on_cleanup)
     return app
 
-# ---------- run ----------
+# ────────────────────────── run ──────────────────────────
 if __name__ == "__main__":
     web.run_app(make_app(), host=RELAY_BIND, port=RELAY_PORT)

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # start.sh — Render entrypoint (end-to-end, hardened)
 # - Loads .env
-# - Pins quote-api.jup.ag to IPv4 (if DNS is broken)
-# - Boots optional local Jupiter relay (IPv4 only)
+# - Optional local Jupiter relay (IPv4 only)
 # - Normalizes DSNs, light health checks, verbose logging
 # - Starts main app
 
@@ -28,35 +27,21 @@ set +a
 log "booting…"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1) Force quote-api.jup.ag to resolve even if DNS is broken
-#    We pin it to the CloudFront IPv4 we can resolve from api.jup.ag
+# 1) Jupiter readiness (new endpoints)
+#    - No more /etc/hosts pinning or /v6/ping
+#    - Default base is https://api.jup.ag
 # ──────────────────────────────────────────────────────────────────────────────
-: "${RELAY_FORCE_IPV4:=1}"   # default: force IPv4 everywhere we can
-if [[ "${RELAY_FORCE_IPV4}" = "1" ]]; then
-  API4="$(getent ahostsv4 api.jup.ag | awk '/STREAM/ {print $1; exit}' || true)"
-  if [[ -n "${API4}" ]]; then
-    log "using api.jup.ag IPv4: ${API4} → pinning quote-api.jup.ag"
-    # Try to append to /etc/hosts (works on Render). Fall back to temp file if needed.
-    if grep -q 'quote-api.jup.ag' /etc/hosts 2>/dev/null; then
-      log "/etc/hosts already has quote-api.jup.ag"
-    else
-      if (echo "${API4} quote-api.jup.ag" | sudo tee -a /etc/hosts >/dev/null) || \
-         (echo "${API4} quote-api.jup.ag" | tee -a /etc/hosts >/dev/null); then
-        log "pinned quote-api.jup.ag → ${API4}"
-      else
-        log "WARN: couldn't write /etc/hosts; continuing (relay may still work if DNS is OK)"
-      fi
-    fi
-  else
-    log "WARN: couldn't resolve api.jup.ag to IPv4; skipping pin (relay may still work)"
-  fi
-fi
+: "${JUP_BASE_URL:=https://api.jup.ag}"
+: "${JUP_ALT_BASE_URLS:=https://api.jup.ag}"
+export JUP_BASE_URL JUP_ALT_BASE_URLS
 
-# Quick upstream ping (expect JSON or 401). Non-fatal.
 if command -v curl >/dev/null 2>&1; then
-  curl ${RELAY_FORCE_IPV4:+-4} -m 5 -sS -H "x-api-key: ${JUP_API_KEY:-}" \
-    "https://quote-api.jup.ag/v6/ping" >/dev/null || \
-  log "note: /v6/ping didn't return 200 (401 is also fine) — continuing"
+  log "checking Jupiter quote…"
+  # 200 is success; 401 is also acceptable if the header is missing/wrong.
+  curl -sS -m 6 -D - \
+    -H "x-api-key: ${JUP_PRO_KEY:-${JUP_API_KEY:-}}" \
+    "${JUP_BASE_URL%/}/swap/v1/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=10000000&slippageBps=200" \
+    -o /dev/null | head -c 0 || true
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -148,19 +133,19 @@ PY
 # ──────────────────────────────────────────────────────────────────────────────
 # 6) Local Jupiter relay (if enabled)
 #    - binds 127.0.0.1:8081
-#    - upstream: https://quote-api.jup.ag/v6  (correct host for /v6/quote)
+#    - upstream: https://api.jup.ag (relay will append /swap/v1)
 # ──────────────────────────────────────────────────────────────────────────────
 : "${RELAY_ENABLED:=0}"
 : "${RELAY_BIND:=127.0.0.1}"
 : "${RELAY_PORT:=8081}"
-: "${RELAY_UPSTREAM:=https://quote-api.jup.ag/v6}"
+: "${RELAY_UPSTREAM:=https://api.jup.ag}"
+: "${RELAY_FORCE_IPV4:=1}"
 
 if [[ "${RELAY_ENABLED}" = "1" ]]; then
   if [[ -f "./jup_relay.py" ]]; then
     log "starting local Jupiter relay (RELAY_ENABLED=1)…"
-    # pass hints to the relay through env
     export RELAY_BIND RELAY_PORT RELAY_UPSTREAM RELAY_FORCE_IPV4
-    export JUP_API_KEY="${JUP_API_KEY:-}"  # relay forwards this header
+    export JUP_API_KEY="${JUP_API_KEY:-${JUP_PRO_KEY:-}}"
 
     pkill -f '[j]up_relay.py' || true
     nohup "${PYTHON}" -u ./jup_relay.py > /tmp/jup_relay.log 2>&1 &
@@ -181,18 +166,18 @@ if [[ "${RELAY_ENABLED}" = "1" ]]; then
       log "relay failed to start; head log:"
       (head -n 120 /tmp/jup_relay.log || true) | sed 's/^/[relay] /'
       log "falling back to public Jupiter endpoints"
-      export JUP_BASE_URL="https://quote-api.jup.ag/v6"
-      export JUP_ALT_BASE_URLS="https://quote-api.jup.ag/v6"
+      export JUP_BASE_URL="https://api.jup.ag"
+      export JUP_ALT_BASE_URLS="https://api.jup.ag"
     fi
   else
     log "RELAY_ENABLED=1 but jup_relay.py not found; using public Jupiter"
-    export JUP_BASE_URL="https://quote-api.jup.ag/v6"
-    export JUP_ALT_BASE_URLS="https://quote-api.jup.ag/v6"
+    export JUP_BASE_URL="https://api.jup.ag"
+    export JUP_ALT_BASE_URLS="https://api.jup.ag"
   fi
 else
   log "skipping local Jupiter relay (RELAY_ENABLED!=1)"
-  : "${JUP_BASE_URL:=https://quote-api.jup.ag/v6}"
-  : "${JUP_ALT_BASE_URLS:=https://quote-api.jup.ag/v6}"
+  : "${JUP_BASE_URL:=https://api.jup.ag}"
+  : "${JUP_ALT_BASE_URLS:=https://api.jup.ag}"
   export JUP_BASE_URL JUP_ALT_BASE_URLS
 fi
 
