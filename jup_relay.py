@@ -87,9 +87,7 @@ HOSTMAP = _parse_hostmap(RELAY_HOST_MAP)
 
 # ────────────────────────── resolver (host pin) ──────────────────────────
 class HostMapResolver(AbstractResolver):
-    """Static host->IP resolver (curl --resolve equivalent).
-    When a host is present in HOSTMAP, connect to that IP but keep SNI as the original host.
-    """
+    """Static host->IP resolver (curl --resolve equivalent)."""
     def __init__(self, mapping: Dict[str, str]):
         self._map = {k.lower(): v for k, v in mapping.items() if k and v}
 
@@ -102,7 +100,6 @@ class HostMapResolver(AbstractResolver):
                 {"hostname": host, "host": a[4][0], "port": a[4][1], "family": a[0], "proto": a[2], "flags": 0}
                 for a in infos
             ]
-        # Force IPv4 for mapped hosts
         return [{
             "hostname": host,
             "host": ip,
@@ -120,17 +117,15 @@ def _rewrite_path_for_ultra(path: str) -> str:
     """Return a path appropriate for the Ultra endpoints."""
     p = path or "/"
     if p.startswith("/swap/v1/"):
-        return p  # already correct
+        return p
     if p.startswith("/v6/"):
         return "/swap/v1/" + p[len("/v6/"):]
-    # short legacy forms
     if p == "/quote":
         return "/swap/v1/quote"
     if p == "/swap":
         return "/swap/v1/swap"
     if p == "/swap-instructions":
         return "/swap/v1/swap-instructions"
-    # otherwise pass as-is (client might call newer paths in future)
     return p
 
 async def _json_error(status: int, message: str):
@@ -138,8 +133,7 @@ async def _json_error(status: int, message: str):
 
 def _sanitize_request_headers(headers: dict) -> dict:
     h = dict(headers)
-    h.pop("Host", None)
-    h.pop("host", None)
+    h.pop("Host", None); h.pop("host", None)
     for k in list(h.keys()):
         if k.lower() in ("content-length", "transfer-encoding", "connection"):
             h.pop(k, None)
@@ -153,14 +147,11 @@ def _safe_passthrough_headers(resp_headers: dict) -> List[tuple]:
     ]
 
 def _build_try_list() -> List[str]:
-    out = [PRIMARY_NORM]
-    out.extend(ALT_UPSTREAMS)
-    seen = set()
-    dedup: List[str] = []
+    out = [PRIMARY_NORM]; out.extend(ALT_UPSTREAMS)
+    seen, dedup = set(), []
     for u in out:
         if u not in seen:
-            seen.add(u)
-            dedup.append(u)
+            seen.add(u); dedup.append(u)
     return dedup
 
 # ────────────────────────── handlers ──────────────────────────
@@ -201,7 +192,6 @@ async def passthrough(request: web.Request):
     path = _rewrite_path_for_ultra(request.path)
     try_list = _build_try_list()
 
-    # Build candidate URLs
     url_candidates = [urljoin(base + "/", path.lstrip("/")) for base in try_list]
     if request.query_string:
         url_candidates = [f"{u}?{request.query_string}" for u in url_candidates]
@@ -220,29 +210,23 @@ async def passthrough(request: web.Request):
             status, resp_headers, body = await _do_upstream_request(
                 session, request.method, candidate, headers, data
             )
-
-            # fall through on 401/404 to next upstream if available
             if status in (401, 404) and idx < len(url_candidates) - 1:
                 LOG.warning("got %s from %s, trying next fallback", status, candidate)
                 continue
-
             return web.Response(status=status, headers=dict(resp_headers), body=body)
 
         except ClientConnectorError as e:
             cause = getattr(e, "__cause__", None)
             is_gai = isinstance(cause, socket.gaierror)
             LOG.warning("connect error to %s: %s (gai=%s) — trying next", candidate, e, is_gai)
-            last_exc = e
-            continue
+            last_exc = e; continue
         except asyncio.TimeoutError as e:
             LOG.warning("timeout contacting %s: %s", candidate, e)
-            last_exc = e
-            continue
+            last_exc = e; continue
         except Exception as e:
             LOG.exception("unexpected upstream error for %s", candidate)
             return await _json_error(502, f"upstream error: {e}")
 
-    # All attempts failed
     if last_exc is None:
         return await _json_error(502, "no upstream candidates available")
     if isinstance(last_exc, ClientConnectorError) and isinstance(getattr(last_exc, "__cause__", None), socket.gaierror):
@@ -253,19 +237,20 @@ async def passthrough(request: web.Request):
 def make_app():
     app = web.Application()
 
-    # Health
     app.add_routes([
         web.get("/__debug", debug),
         web.get("/ping", ping),
     ])
 
-    # Legacy short forms + legacy v6 + modern swap/v1 + catch-all
     app.add_routes([
+        # legacy short forms
         web.route("*", "/quote", passthrough),
         web.route("*", "/swap", passthrough),
         web.route("*", "/swap-instructions", passthrough),
+        # legacy v6 and modern endpoints
         web.route("*", "/v6/{tail:.*}", passthrough),
         web.route("*", "/swap/v1/{tail:.*}", passthrough),
+        # catch-all
         web.route("*", "/{tail:.*}", passthrough),
     ])
 
