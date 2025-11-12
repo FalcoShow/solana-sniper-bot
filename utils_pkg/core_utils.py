@@ -30,6 +30,7 @@ import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 from sqlalchemy import MetaData, Table, Column, BigInteger, String, Float, DateTime, text
 from typing import Any, Callable, Optional
+from .alert_manager import AlertManager
 
 import certifi
 
