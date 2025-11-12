@@ -116,9 +116,9 @@ UNROUTABLE_TTL_SEC: int = max(30, _env_int("JUP_UNROUTABLE_TTL_SEC", 1800))
 REQUOTE_BUMP_PCT: int = max(1, _env_int("JUP_REQUOTE_BUMP_PCT", 5))
 
 # Chain constants (allow env overrides, but default to canonical mainnet mints)
-SOL_MINT: str = _env_str("SOL_MINT", "So11111111111111111111111111111111111111112")
-USDC_MINT: str = _env_str("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
-USDT_MINT: str = _env_str("USDT_MINT", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB")
+SOL_MINT  = _env_str("SOL_MINT",  "So11111111111111111111111111111111111111112")
+USDC_MINT = _env_str("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+USDT_MINT = _env_str("USDT_MINT", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB")
 LAMPORTS_PER_SOL = 1_000_000_000
 
 
