@@ -78,46 +78,76 @@ except Exception:  # pragma: no cover
     C = _C()  # type: ignore
 
 # ---------------------------
-# Logging (robust shimmed version)
+# Logging (robust + collision-safe)
 # ---------------------------
+from typing import Any, Dict
+
+def _attach_log_helpers(_log):
+    """
+    Adds .event(name, **fields) and .every(key, n=60, **fields) to `_log`
+    without using logging.extra (avoids reserved LogRecord field collisions).
+    """
+    import time, threading
+
+    # Reserved LogRecord keys we must not try to stuff into logging internals
+    _RESERVED = {
+        "args","asctime","created","exc_info","exc_text","filename","funcName",
+        "levelname","levelno","lineno","module","msecs","message","msg","name",
+        "pathname","process","processName","relativeCreated","stack_info",
+        "thread","threadName"
+    }
+
+    _last: Dict[str, float] = {}
+    _lock = threading.Lock()
+
+    def _fmt(prefix: str, fields: Dict[str, Any]) -> str:
+        # Drop reserved keys; if any dropped, annotate once for visibility.
+        safe = {k: v for k, v in fields.items() if k not in _RESERVED}
+        if fields and len(safe) != len(fields):
+            dropped = [k for k in fields.keys() if k not in safe]
+            safe["_dropped_keys"] = ",".join(dropped)
+        tail = " ".join(f"{k}={safe[k]}" for k in safe)
+        return f"{prefix}{(' ' + tail) if tail else ''}"
+
+    def _event(name: str, **fields: Any) -> None:
+        # Unified event line; INFO level everywhere for simplicity.
+        try:
+            _log.info(_fmt(name, fields))
+        except Exception:
+            print(_fmt(name, fields), flush=True)
+
+    def _every(key: str, n: int = 60, **fields: Any) -> None:
+        # Simple monotonic rate-limit per key.
+        try:
+            now = time.monotonic()
+            with _lock:
+                last = _last.get(key, 0.0)
+                if now - last < max(1, n):
+                    return
+                _last[key] = now
+            _log.info(_fmt(f"[every {n}s] {key}", fields))
+        except Exception:
+            print(_fmt(f"[every {n}s] {key}", fields), flush=True)
+
+    if not hasattr(_log, "event"):
+        setattr(_log, "event", _event)
+    if not hasattr(_log, "every"):
+        setattr(_log, "every", _every)
+    return _log
+
 try:
     from logging_setup import get_logger, bump, start_global_heartbeat
-    log = get_logger()
-
-    # ── ensure log.event + log.every exist ───────────────────────────────
-    if not hasattr(log, "event"):
-        def _event(name: str, **fields):
-            """
-            Unified event logger shim.
-            Writes as INFO with an event-style message and structured fields.
-            """
-            log.info(name, extra=fields)
-        log.event = _event  # type: ignore[attr-defined]
-
-    if not hasattr(log, "every"):
-        def _every(_key: str, n: int = 60, **kw):
-            """Rate-limited logging shim fallback (no-op if not implemented)."""
-            log.info(f"[every {n}s] {_key}", extra=kw)
-        log.every = _every  # type: ignore[attr-defined]
-
-except Exception as e:
-    # ── emergency fallback: no logging_setup available ───────────────────
-    class _Dummy:
-        def _p(self, lvl: str, *a, **k):
-            msg = f"[{lvl}] " + " ".join(str(x) for x in a)
-            if k:
-                msg += " " + str(k)
-            print(msg, flush=True)
-
-        def event(self, *a, **k):  self._p("event", *a, **k)
-        def info(self, *a, **k):   self._p("info", *a, **k)
-        def warning(self, *a, **k):self._p("warn", *a, **k)
-        def error(self, *a, **k):  self._p("error", *a, **k)
-        def every(self, *a, **k):  self._p("every", *a, **k)
-
+    log = _attach_log_helpers(get_logger())
+except Exception:
+    # Emergency fallback logger with same surface area
+    class _DummyLog:
+        def info(self, *a, **k):  print("[info]",  *a, k, flush=True)
+        def warning(self, *a, **k): print("[warn]",  *a, k, flush=True)
+        def error(self, *a, **k): print("[error]", *a, k, flush=True)
+        def debug(self, *a, **k): print("[debug]", *a, k, flush=True)
     def bump(_): pass
     def start_global_heartbeat(*_a, **_k): pass
-    log = _Dummy()  # type: ignore
+    log = _attach_log_helpers(_DummyLog())
 
 # ---------------------------
 # Normalization helpers
