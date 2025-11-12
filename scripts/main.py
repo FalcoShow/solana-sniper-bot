@@ -84,81 +84,95 @@ from typing import Any, Dict
 import time
 import threading
 
-# Reserved LogRecord keys we must NOT put inside `extra`
+# Reserved LogRecord keys we must NOT place inside `extra`
 _RESERVED: set[str] = {
-    "args", "asctime", "created", "exc_info", "exc_text", "filename",
-    "funcName", "levelname", "levelno", "lineno", "module", "message",
-    "msg", "msecs", "name", "pathname", "process", "processName",
-    "relativeCreated", "stack_info", "thread", "threadName",
+    "name", "msg", "message", "levelname", "levelno", "pathname",
+    "filename", "module", "exc_info", "exc_text", "stack_info",
+    "lineno", "funcName", "created", "msecs", "relativeCreated",
+    "thread", "threadName", "process", "processName"
 }
 
 _last_every: Dict[str, float] = {}
 _every_lock = threading.Lock()
 
 
-def _safe_extra(prefix: str, fields: Dict[str, Any] | None) -> Dict[str, Any]:
-    """Rename any reserved keys in `fields` so they don't collide with LogRecord."""
-    fields = fields or {}
-    out: Dict[str, Any] = {}
+def _add_safe_extra(fields: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Copy fields, but rename any reserved logging keys so we never get:
+      KeyError: "Attempt to overwrite 'msg' in LogRecord"
+    """
+    safe: Dict[str, Any] = {}
     for k, v in fields.items():
-        out[(prefix + "_" + k) if k in _RESERVED else k] = v
-    return out
+        if k in _RESERVED:
+            safe[f"extra_{k}"] = v
+        else:
+            safe[k] = v
+    return safe
 
 
-def _attach_log_helpers(_base_log):
+def _attach_log_helpers_base(_log):
     """
-    Attach .event(name, **fields) and .every(key, n=60, **fields) to `_base_log`.
-    Both use INFO level and never put reserved names into LogRecord.extra.
+    Attach `event` and `every` helpers to a logger instance in a
+    collision-safe way (no reserved keys in `extra`).
     """
-    def _event(name: str, **fields: Any) -> None:
-        _base_log.info(name, extra=_safe_extra("x", fields))
 
-    def _every(key: str, n: int = 60, **fields: Any) -> None:
+    def event(name: str, **fields: Any) -> None:
+        _log.info(name, extra=_add_safe_extra(fields))
+
+    def every(_key: str, n: int = 60, **fields: Any) -> None:
         now = time.time()
         with _every_lock:
-            last = _last_every.get(key, 0.0)
-            if now - last < max(1, n):
+            last = _last_every.get(_key, 0.0)
+            if now - last < n:
                 return
-            _last_every[key] = now
-        _base_log.info(f"[every {n}s] {key}", extra=_safe_extra("x", fields))
+            _last_every[_key] = now
+        _log.info(f"[every {n}s] {_key}", extra=_add_safe_extra(fields))
 
-    if not hasattr(_base_log, "event"):
-        setattr(_base_log, "event", _event)
-    if not hasattr(_base_log, "every"):
-        setattr(_base_log, "every", _every)
-    return _base_log
-
-
-class _DummyLogger:
-    """Emergency logger if logging_setup is unavailable."""
-    def _p(self, lvl: str, *a, **k):
-        # mirror _safe_extra by prefixing fields, so shape is similar
-        k = {("x_" + kk): vv for kk, vv in k.items()}
-        print(f"[{lvl}]", *a, k, flush=True)
-
-    def info(self, *a, **k):    self._p("info", *a, **k)
-    def warning(self, *a, **k): self._p("warn", *a, **k)
-    def error(self, *a, **k):   self._p("error", *a, **k)
-    def event(self, *a, **k):   self._p("event", *a, **k)
-    def every(self, *a, **k):   self._p("every", *a, **k)
+    # Only attach if not already present
+    if not hasattr(_log, "event"):
+        _log.event = event  # type: ignore[attr-defined]
+    if not hasattr(_log, "every"):
+        _log.every = every  # type: ignore[attr-defined]
+    return _log
 
 
-def _make_log_bundle():
-    """
-    Returns (log, bump, start_global_heartbeat) whether or not logging_setup exists.
-    """
-    try:
-        from logging_setup import get_logger, bump as _bump, start_global_heartbeat as _hb
-    except Exception:
-        # no logging_setup: fall back to dummy logger
-        def _bump(_): pass
-        def _hb(*_a, **_k): pass
-        return _attach_log_helpers(_DummyLogger()), _bump, _hb
-    else:
-        return _attach_log_helpers(get_logger()), _bump, _hb
+try:
+    # Use real logging if available
+    from logging_setup import get_logger, bump, start_global_heartbeat
 
+    _base_log = get_logger()
 
-log, bump, start_global_heartbeat = _make_log_bundle()
+except Exception:
+    # Emergency fallback: simple stdout logger
+    class DummyLogger:
+        def _p(self, lvl: str, msg: str, **fields: Any) -> None:
+            line = f"[{lvl}] {msg}"
+            if fields:
+                line += " " + repr(fields)
+            print(line, flush=True)
+
+        def info(self, msg: str, **fields: Any) -> None:
+            self._p("INFO", msg, **fields)
+
+        def warning(self, msg: str, **fields: Any) -> None:
+            self._p("WARN", msg, **fields)
+
+        def error(self, msg: str, **fields: Any) -> None:
+            self._p("ERROR", msg, **fields)
+
+        def debug(self, msg: str, **fields: Any) -> None:
+            self._p("DEBUG", msg, **fields)
+
+    def bump(*_a, **_k):  # type: ignore[func-returns-value]
+        return None
+
+    def start_global_heartbeat(*_a, **_k):  # type: ignore[func-returns-value]
+        return None
+
+    _base_log = DummyLogger()
+
+# Final logger object used everywhere
+log = _attach_log_helpers_base(_base_log)
 
 # ---------------------------
 # Normalization helpers
