@@ -1,24 +1,22 @@
-# src/utils_pkg/lightning_impl.py
+# utils_pkg/lightning_impl.py
 from __future__ import annotations
 
 """
-utils_pkg/lightning_impl.py — Jupiter swapper (modern /swap/v1/* endpoints)
+Jupiter swapper using /swap/v1/* endpoints.
 
-Key guarantees in this build
-- Quote path is **non-legacy** (asLegacyTransaction=false) to see Pump routes.
-- Swap POST echoes the **full quoteResponse** (unmodified) and
-  **useSharedAccounts=false** (required for Simple AMMs / Pump).
-- We never mutate fields like inAmount → amount (no renaming).
-- Unroutable-pair cache + one-shot bump retry.
-- DRY-RUN safe; robust logging; optional platform fee/prio fee knobs.
+Guarantees:
+- Quote path is *non-legacy* to see Pump/simple AMM routes.
+- Swap POST passes the *full* quoteResponse (unmodified) with useSharedAccounts=false.
+- No renaming of fields (e.g., inAmount stays inAmount).
+- Unroutable-pair cache + one bumped requote attempt.
+- DRYRUN-safe; robust logging; optional platform/prio fees.
 """
 
 import os
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import httpx
-from httpx import HTTPStatusError
 
 from logging_setup import get_logger
 from utils_pkg.mints import normalize_mint
@@ -37,9 +35,19 @@ except Exception:  # pragma: no cover
 log = get_logger()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Small typed error to carry Jupiter response JSON when non-200
+# ─────────────────────────────────────────────────────────────────────────────
+class JupHTTPError(RuntimeError):
+    def __init__(self, *, status: int, url: str, body: Dict[str, Any] | None):
+        self.status = status
+        self.url = url
+        self.body = body or {}
+        super().__init__(f"HTTP {status} {self.body.get('errorCode','')} {self.body.get('error','')}".strip())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Env helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return default if v is None else v.strip()
@@ -62,17 +70,17 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return default
     return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Config (Jupiter + trade knobs)
 # ─────────────────────────────────────────────────────────────────────────────
-
 BASE: str = (_env_str("JUP_BASE_URL") or _env_str("JUP_UPSTREAM") or "https://api.jup.ag").rstrip("/")
 
-# Kept for telemetry only; **quote path ignores this and forces non-legacy**
+# Telemetry only; quote forces non-legacy
 AS_LEGACY_ENV: bool = _env_bool("JUP_AS_LEGACY", False)
 ONLY_DIRECT: bool = _env_bool("JUP_ONLY_DIRECT", False)
 
-# Variant toggles (we explicitly override to useSharedAccounts=False on POST)
+# Variant toggles (swap will still enforce useSharedAccounts=False)
 USE_SHARED_ACCOUNTS_ENV: bool = _env_bool("JUP_USE_SHARED_ACCOUNTS", False)
 USE_TOKEN_LEDGER_ENV: bool = _env_bool("JUP_USE_TOKEN_LEDGER", False)
 
@@ -86,11 +94,10 @@ PLATFORM_FEE_ACCOUNT: str = _env_str("JUP_PLATFORM_FEE_ACCOUNT", "")
 USE_PLATFORM_FEE: bool = PLATFORM_FEE_BPS > 0 and bool(PLATFORM_FEE_ACCOUNT)
 
 # Slippage / CU / priority fee
-DEFAULT_SLIPPAGE_BPS: int = _env_int("PF_SLIPPAGE_BPS", 30)
+DEFAULT_SLIPPAGE_BPS: int = _env_int("PF_SLIPPAGE_BPS", _env_int("SLIPPAGE_BPS", 30))
 COMPUTE_UNIT_LIMIT: int = _env_int("PF_COMPUTE_UNIT_LIMIT", 0)  # 0 → dynamic
 WRAP_UNWRAP_SOL: bool = _env_bool("PF_WRAP_UNWRAP_SOL", True)
 
-# Priority fee helpers
 def _micro_to_lamports(micro: int) -> int:
     try:
         return int(round(max(0, micro) / 1_000_000))
@@ -108,14 +115,16 @@ DRY_RUN: bool = _env_bool("DRYRUN", False) or _env_bool("DRY_RUN", False) or _en
 UNROUTABLE_TTL_SEC: int = max(30, _env_int("JUP_UNROUTABLE_TTL_SEC", 1800))
 REQUOTE_BUMP_PCT: int = max(1, _env_int("JUP_REQUOTE_BUMP_PCT", 5))
 
-# Chain constants
-SOL_MINT = "So11111111111111111111111111111111111111112"
+# Chain constants (allow env overrides, but default to canonical mainnet mints)
+SOL_MINT: str = _env_str("SOL_MINT", "So11111111111111111111111111111111111111112")
+USDC_MINT: str = _env_str("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+USDT_MINT: str = _env_str("USDT_MINT", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB")
 LAMPORTS_PER_SOL = 1_000_000_000
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Unroutable PAIR cache
 # ─────────────────────────────────────────────────────────────────────────────
-
 _UNROUTABLE_UNTIL: dict[tuple[str, str], float] = {}
 
 def _is_unroutable_pair(inp: str, out: str) -> bool:
@@ -125,10 +134,10 @@ def _is_unroutable_pair(inp: str, out: str) -> bool:
 def _mark_unroutable(inp: str, out: str, *, ttl: int | None = None) -> None:
     _UNROUTABLE_UNTIL[(inp, out)] = time.time() + float(ttl or UNROUTABLE_TTL_SEC)
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
 def _jup_headers() -> Dict[str, str]:
     h = {
         "accept": "application/json",
@@ -152,8 +161,7 @@ async def _http_get(url: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 body = {"text": r.text}
             log.warning("JUP_GET_NON200", extra={"url": url, "status": r.status_code, "body": body})
-            ec, em = (body or {}).get("errorCode"), (body or {}).get("error")
-            raise RuntimeError(f"HTTP {r.status_code} {ec or ''} {em or ''}".strip())
+            raise JupHTTPError(status=r.status_code, url=url, body=body)
         return r.json()
 
 async def _http_post(url: str, *, json_body: Dict[str, Any]) -> Dict[str, Any]:
@@ -165,26 +173,25 @@ async def _http_post(url: str, *, json_body: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 body = {"text": r.text}
             log.warning("JUP_POST_NON200", extra={"url": url, "status": r.status_code, "body": body})
-            ec, em = (body or {}).get("errorCode"), (body or {}).get("error")
-            raise HTTPStatusError(f"{r.status_code} {ec or ''} {em or ''}".strip(), r.request, r)
+            raise JupHTTPError(status=r.status_code, url=url, body=body)
         return r.json()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Jupiter endpoints
 # ─────────────────────────────────────────────────────────────────────────────
-
 def _quote_url() -> str:
     return f"{BASE}/swap/v1/quote"
 
 def _swap_url() -> str:
     return f"{BASE}/swap/v1/swap"
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Quote → Swap
 # ─────────────────────────────────────────────────────────────────────────────
-
 def _quote_params(*, input_mint: str, output_mint: str, amount: int, slippage_bps: int) -> Dict[str, Any]:
-    # **Force non-legacy** to ensure Pump routes are discoverable.
+    # Force non-legacy to ensure Pump/simple AMM routes are discoverable
     p: Dict[str, Any] = {
         "inputMint": input_mint,
         "outputMint": output_mint,
@@ -209,35 +216,26 @@ async def _get_quote_kwonly(*, input_mint: str, output_mint: str, amount: int, s
 
     try:
         js = await _http_get(url, params=params)
-    except HTTPStatusError as e:
-        # inspect body for error code
-        err_code = ""
-        if getattr(e, "response", None) is not None:
-            try:
-                err_code = (e.response.json() or {}).get("errorCode") or ""
-            except Exception:
-                pass
-
-        if err_code == "COULD_NOT_FIND_ANY_ROUTE":
+    except JupHTTPError as e:
+        err_code = (e.body or {}).get("errorCode", "")
+        # Jupiter returns CIRCULAR_ARB / etc when input==output; treat as unroutable too
+        if err_code in {"COULD_NOT_FIND_ANY_ROUTE", "CIRCULAR_ARBITRAGE_IS_DISABLED"}:
             _mark_unroutable(input_mint, output_mint)
+            # one bumped requote attempt
             bumped = max(int(amount * (100 + REQUOTE_BUMP_PCT) / 100), amount + 1)
             log.info("JUP_REQUOTE_BUMP", extra={"pair": [input_mint, output_mint], "amount": amount, "bumped": bumped})
             try:
                 js = await _http_get(url, params=_quote_params(
                     input_mint=input_mint, output_mint=output_mint, amount=bumped, slippage_bps=slippage_bps
                 ))
-            except HTTPStatusError as e2:
-                c2 = ""
-                if getattr(e2, "response", None) is not None:
-                    try:
-                        c2 = (e2.response.json() or {}).get("errorCode") or ""
-                    except Exception:
-                        pass
-                if c2 == "COULD_NOT_FIND_ANY_ROUTE":
+            except JupHTTPError as e2:
+                err2 = (e2.body or {}).get("errorCode", "")
+                if err2 in {"COULD_NOT_FIND_ANY_ROUTE", "CIRCULAR_ARBITRAGE_IS_DISABLED"}:
                     log.info("JUP_NO_ROUTE_FINAL", extra={"pair": [input_mint, output_mint]})
                     raise RuntimeError("jup_no_route")
                 raise
         else:
+            # Mark as unroutable if Jupiter provided a code; otherwise bubble up
             if err_code:
                 _mark_unroutable(input_mint, output_mint)
                 raise RuntimeError("jup_no_route")
@@ -254,7 +252,7 @@ async def _get_quote_kwonly(*, input_mint: str, output_mint: str, amount: int, s
     })
     return js
 
-async def _get_quote(*args, **kwargs) -> Dict[str, Any]:  # compat wrapper
+async def _get_quote(*args, **kwargs) -> Dict[str, Any]:  # positional compat
     if args and not kwargs and len(args) == 4:
         return await _get_quote_kwonly(
             input_mint=args[0], output_mint=args[1], amount=args[2], slippage_bps=args[3]
@@ -315,10 +313,10 @@ async def _send_tx_b64(tx_b64: str) -> str:
     kp = load_keypair()
     return await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API (router calls)
-# ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
 async def buy_via_lightning(*, mint: str, amount_sol: float, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Optional[str]:
     try:
         m = normalize_mint(mint)
@@ -388,3 +386,21 @@ async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_
     except Exception as e:
         log.warning("EXIT_TX_FAIL", extra={"err": f"{e}"})
         return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Optional debug helpers (nice for Render Shell smoke tests)
+# ─────────────────────────────────────────────────────────────────────────────
+async def debug_get_quote_sol_to_usdc(amount_sol: float = 0.002, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Dict[str, Any]:
+    lamports = max(1, int(amount_sol * LAMPORTS_PER_SOL))
+    return await _get_quote(input_mint=SOL_MINT, output_mint=USDC_MINT, amount=lamports, slippage_bps=slippage_bps)
+
+async def debug_build_only_sol_to_usdc(amount_sol: float = 0.002, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Tuple[int, int]:
+    """
+    Returns (inAmount_lamports, swap_tx_b64_len). Does NOT send the tx.
+    """
+    lamports = max(1, int(amount_sol * LAMPORTS_PER_SOL))
+    q = await _get_quote(input_mint=SOL_MINT, output_mint=USDC_MINT, amount=lamports, slippage_bps=slippage_bps)
+    user_pk = get_pubkey_str(load_keypair())
+    tx_b64 = await _build_swap_tx(user_pubkey=user_pk, quote=q)
+    return int(q.get("inAmount", lamports)), len(tx_b64)
