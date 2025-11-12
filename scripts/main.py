@@ -78,13 +78,18 @@ except Exception:  # pragma: no cover
     C = _C()  # type: ignore
 
 # ---------------------------
+<<<<<<< HEAD
 # Logging (robust + collision-safe)
+=======
+# Logging (robust shimmed version)
+>>>>>>> origin/main
 # ---------------------------
 from typing import Any, Dict
 import time, threading
 
 try:
     from logging_setup import get_logger, bump, start_global_heartbeat
+<<<<<<< HEAD
     _base_log = get_logger()
 except Exception:  # fallback if logging_setup isn't importable
     class _Dummy:
@@ -92,6 +97,41 @@ except Exception:  # fallback if logging_setup isn't importable
         def warning(self, *a, **k): print("[warn]", *a, k, flush=True)
         def error(self, *a, **k): print("[error]", *a, k, flush=True)
         def debug(self, *a, **k): print("[debug]", *a, k, flush=True)
+=======
+    log = get_logger()
+
+    # ── ensure log.event + log.every exist ───────────────────────────────
+    if not hasattr(log, "event"):
+        def _event(name: str, **fields):
+            """
+            Unified event logger shim.
+            Writes as INFO with an event-style message and structured fields.
+            """
+            log.info(name, extra=fields)
+        log.event = _event  # type: ignore[attr-defined]
+
+    if not hasattr(log, "every"):
+        def _every(_key: str, n: int = 60, **kw):
+            """Rate-limited logging shim fallback (no-op if not implemented)."""
+            log.info(f"[every {n}s] {_key}", extra=kw)
+        log.every = _every  # type: ignore[attr-defined]
+
+except Exception as e:
+    # ── emergency fallback: no logging_setup available ───────────────────
+    class _Dummy:
+        def _p(self, lvl: str, *a, **k):
+            msg = f"[{lvl}] " + " ".join(str(x) for x in a)
+            if k:
+                msg += " " + str(k)
+            print(msg, flush=True)
+
+        def event(self, *a, **k):  self._p("event", *a, **k)
+        def info(self, *a, **k):   self._p("info", *a, **k)
+        def warning(self, *a, **k):self._p("warn", *a, **k)
+        def error(self, *a, **k):  self._p("error", *a, **k)
+        def every(self, *a, **k):  self._p("every", *a, **k)
+
+>>>>>>> origin/main
     def bump(_): pass
     def start_global_heartbeat(*_a, **_k): pass
     _base_log = _Dummy()
