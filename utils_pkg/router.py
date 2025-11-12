@@ -38,7 +38,10 @@ from typing import Any, Dict, Optional, Tuple, Callable, List
 import requests
 from requests.exceptions import RequestException
 from utils_pkg import lightning_impl as lightning
-from utils_pkg import raydium_impl as raydium
+try:
+    from utils_pkg import raydium_impl as raydium
+except Exception:
+    raydium = None
 
 # ----- BEGIN: ENV-DRIVEN HARD JUPITER DISABLE GUARD -----
 import os, logging
