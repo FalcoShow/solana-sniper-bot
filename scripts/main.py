@@ -83,56 +83,65 @@ except Exception:  # pragma: no cover
 from typing import Any, Dict
 import time, threading
 
-try:
-    from logging_setup import get_logger, bump, start_global_heartbeat
-    _base_log = get_logger()
-except Exception:  # fallback if logging_setup isn't importable
-    class _Dummy:
-        def info(self, *a, **k): print("[info]", *a, k, flush=True)
-        def warning(self, *a, **k): print("[warn]", *a, k, flush=True)
-        def error(self, *a, **k): print("[error]", *a, k, flush=True)
-        def debug(self, *a, **k): print("[debug]", *a, k, flush=True)
-    def bump(_): pass
-    def start_global_heartbeat(*_a, **_k): pass
-    _base_log = _Dummy()
-
-# Reserved LogRecord keys we must not place inside `extra`
-_RESERVED: Dict[str, float] = {
+# reserved LogRecord keys we must NOT place inside `extra`
+_RESERVED: set[str] = {
     "args","asctime","created","exc_info","exc_text","filename","funcName",
-    "levelname","levelno","lineno","module","msecs","message","msg","name",
+    "levelname","levelno","lineno","module","message","msg","msecs","name",
     "pathname","process","processName","relativeCreated","stack_info",
-    "thread","threadName"
+    "thread","threadName",
 }
+# keep a small cache so .every() throttling is shared
+_last: Dict[str, float] = {}
 _lock = threading.Lock()
 
 def _safe_extra(prefix: str, fields: Dict[str, Any]) -> Dict[str, Any]:
-    safe = {k: v for k, v in fields.items() if k not in _RESERVED}
-    dropped = [k for k in fields.keys() if k not in safe]
-    if dropped:
-        # annotate for visibility, but never overwrite reserved keys
-        safe[f"_{prefix}_dropped"] = ",".join(dropped)
-    return safe
+    """Rename any reserved keys to avoid LogRecord collisions."""
+    out: Dict[str, Any] = {}
+    for k, v in (fields or {}).items():
+        out[(prefix + "_" + k) if k in _RESERVED else k] = v
+    return out
 
-# attach helpers to the logger (adds .event and .every)
-def attach_log_helpers(_log):
-    last: Dict[str, float] = {}
+def _attach_log_helpers(_base_log):
+    """
+    Adds .event(name, **fields) and .every(key, n=60, **fields) to `_base_log`.
+    Both use logging.INFO and never put reserved names into LogRecord.extra.
+    """
+    def _event(name: str, **fields: Any) -> None:
+        _base_log.info(name, extra=_safe_extra("x", fields))
 
-    def event(name: str, **fields: Any) -> None:
-        _log.info(name, extra=_safe_extra("event", fields))
-
-    def every(key: str, n: int = 60, **fields: Any) -> None:
+    def _every(key: str, n: int = 60, **fields: Any) -> None:
         now = time.time()
         with _lock:
-            prev = last.get(key, 0.0)
-            if now - prev >= n:
-                last[key] = now
-                _log.info(f"[every {n}s] {key}", extra=_safe_extra("every", fields))
+            last = _last.get(key, 0.0)
+            if now - last < max(1, n):
+                return
+            _last[key] = now
+        _base_log.info(f"[every {n}s] {key}", extra=_safe_extra("x", fields))
 
-    setattr(_log, "event", event)
-    setattr(_log, "every", every)
-    return _log
+    if not hasattr(_base_log, "event"):
+        setattr(_base_log, "event", _event)
+    if not hasattr(_base_log, "every"):
+        setattr(_base_log, "every", _every)
+    return _base_log
 
-log = attach_log_helpers(_base_log)
+# try to use the real logger, otherwise provide a safe fallback
+try:
+    from logging_setup import get_logger, bump, start_global_heartbeat
+    log = _attach_log_helpers(get_logger())
+except Exception:
+    class _Dummy:
+        def _p(self, lvl: str, *a, **k):
+            # prefix extras with x_ to mirror _safe_extra semantics
+            k = {("x_" + kk): vv for kk, vv in k.items()}
+            print(f"[{lvl}]", *a, k, flush=True)
+        def info(self, *a, **k):   self._p("info", *a, **k)
+        def warning(self, *a, **k):self._p("warn", *a, **k)
+        def error(self, *a, **k):  self._p("error", *a, **k)
+        def event(self, *a, **k):  self._p("event", *a, **k)
+        def every(self, *a, **k):  self._p("every", *a, **k)
+    def bump(_): pass
+    def start_global_heartbeat(*_a, **_k): pass
+    log = _Dummy()  # type: ignore
 
 # ---------------------------
 # Normalization helpers
