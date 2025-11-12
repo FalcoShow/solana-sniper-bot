@@ -78,10 +78,26 @@ except Exception:  # pragma: no cover
     C = _C()  # type: ignore
 
 # ---------------------------
+<<<<<<< HEAD
+# Logging (robust + collision-safe)
+=======
 # Logging (robust shimmed version)
+>>>>>>> origin/main
 # ---------------------------
+from typing import Any, Dict
+import time, threading
+
 try:
     from logging_setup import get_logger, bump, start_global_heartbeat
+<<<<<<< HEAD
+    _base_log = get_logger()
+except Exception:  # fallback if logging_setup isn't importable
+    class _Dummy:
+        def info(self, *a, **k): print("[info]", *a, k, flush=True)
+        def warning(self, *a, **k): print("[warn]", *a, k, flush=True)
+        def error(self, *a, **k): print("[error]", *a, k, flush=True)
+        def debug(self, *a, **k): print("[debug]", *a, k, flush=True)
+=======
     log = get_logger()
 
     # ── ensure log.event + log.every exist ───────────────────────────────
@@ -115,9 +131,48 @@ except Exception as e:
         def error(self, *a, **k):  self._p("error", *a, **k)
         def every(self, *a, **k):  self._p("every", *a, **k)
 
+>>>>>>> origin/main
     def bump(_): pass
     def start_global_heartbeat(*_a, **_k): pass
-    log = _Dummy()  # type: ignore
+    _base_log = _Dummy()
+
+# Reserved LogRecord keys we must not place inside `extra`
+_RESERVED: Dict[str, float] = {
+    "args","asctime","created","exc_info","exc_text","filename","funcName",
+    "levelname","levelno","lineno","module","msecs","message","msg","name",
+    "pathname","process","processName","relativeCreated","stack_info",
+    "thread","threadName"
+}
+_lock = threading.Lock()
+
+def _safe_extra(prefix: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+    safe = {k: v for k, v in fields.items() if k not in _RESERVED}
+    dropped = [k for k in fields.keys() if k not in safe]
+    if dropped:
+        # annotate for visibility, but never overwrite reserved keys
+        safe[f"_{prefix}_dropped"] = ",".join(dropped)
+    return safe
+
+# attach helpers to the logger (adds .event and .every)
+def attach_log_helpers(_log):
+    last: Dict[str, float] = {}
+
+    def event(name: str, **fields: Any) -> None:
+        _log.info(name, extra=_safe_extra("event", fields))
+
+    def every(key: str, n: int = 60, **fields: Any) -> None:
+        now = time.time()
+        with _lock:
+            prev = last.get(key, 0.0)
+            if now - prev >= n:
+                last[key] = now
+                _log.info(f"[every {n}s] {key}", extra=_safe_extra("every", fields))
+
+    setattr(_log, "event", event)
+    setattr(_log, "every", every)
+    return _log
+
+log = attach_log_helpers(_base_log)
 
 # ---------------------------
 # Normalization helpers
