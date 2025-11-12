@@ -161,7 +161,12 @@ async def _http_get(url: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 body = {"text": r.text}
             log.warning("JUP_GET_NON200", extra={"url": url, "status": r.status_code, "body": body})
+<<<<<<< HEAD
             raise JupHTTPError(status=r.status_code, url=url, body=body)
+=======
+            ec, em = (body or {}).get("errorCode"), (body or {}).get("error")
+            raise RuntimeError(f"HTTP {r.status_code} {ec or ''} {em or ''}".strip())
+>>>>>>> origin/main
         return r.json()
 
 async def _http_post(url: str, *, json_body: Dict[str, Any]) -> Dict[str, Any]:
