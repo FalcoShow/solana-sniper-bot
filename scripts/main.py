@@ -78,18 +78,43 @@ except Exception:  # pragma: no cover
     C = _C()  # type: ignore
 
 # ---------------------------
-# Logging
+# Logging (robust shimmed version)
 # ---------------------------
 try:
     from logging_setup import get_logger, bump, start_global_heartbeat
     log = get_logger()
-except Exception:  # pragma: no cover
+
+    # ── ensure log.event + log.every exist ───────────────────────────────
+    if not hasattr(log, "event"):
+        def _event(name: str, **fields):
+            """
+            Unified event logger shim.
+            Writes as INFO with an event-style message and structured fields.
+            """
+            log.info(name, extra=fields)
+        log.event = _event  # type: ignore[attr-defined]
+
+    if not hasattr(log, "every"):
+        def _every(_key: str, n: int = 60, **kw):
+            """Rate-limited logging shim fallback (no-op if not implemented)."""
+            log.info(f"[every {n}s] {_key}", extra=kw)
+        log.every = _every  # type: ignore[attr-defined]
+
+except Exception as e:
+    # ── emergency fallback: no logging_setup available ───────────────────
     class _Dummy:
-        def event(self, *a, **k): print("[log]", a, k, flush=True)
-        def warning(self, *a, **k): print("[warn]", a, k, flush=True)
-        def every(self, *a, **k): print("[every]", a, k, flush=True)
-        def error(self, *a, **k): print("[error]", a, k, flush=True)
-        def info(self, *a, **k): print("[info]", a, k, flush=True)
+        def _p(self, lvl: str, *a, **k):
+            msg = f"[{lvl}] " + " ".join(str(x) for x in a)
+            if k:
+                msg += " " + str(k)
+            print(msg, flush=True)
+
+        def event(self, *a, **k):  self._p("event", *a, **k)
+        def info(self, *a, **k):   self._p("info", *a, **k)
+        def warning(self, *a, **k):self._p("warn", *a, **k)
+        def error(self, *a, **k):  self._p("error", *a, **k)
+        def every(self, *a, **k):  self._p("every", *a, **k)
+
     def bump(_): pass
     def start_global_heartbeat(*_a, **_k): pass
     log = _Dummy()  # type: ignore
