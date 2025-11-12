@@ -38,12 +38,11 @@ log = get_logger()
 # Small typed error to carry Jupiter response JSON when non-200
 # ─────────────────────────────────────────────────────────────────────────────
 class JupHTTPError(RuntimeError):
-    def __init__(self, *, status: int, url: str, body: Dict[str, Any] | None):
+    def __init__(self, status: int, url: str, body: dict | str):
         self.status = status
         self.url = url
-        self.body = body or {}
-        super().__init__(f"HTTP {status} {self.body.get('errorCode','')} {self.body.get('error','')}".strip())
-
+        self.body = body
+        super().__init__(f"HTTP {status} {url}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Env helpers
@@ -116,9 +115,9 @@ UNROUTABLE_TTL_SEC: int = max(30, _env_int("JUP_UNROUTABLE_TTL_SEC", 1800))
 REQUOTE_BUMP_PCT: int = max(1, _env_int("JUP_REQUOTE_BUMP_PCT", 5))
 
 # Chain constants (allow env overrides, but default to canonical mainnet mints)
-SOL_MINT: str = _env_str("SOL_MINT", "So11111111111111111111111111111111111111112")
-USDC_MINT: str = _env_str("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
-USDT_MINT: str = _env_str("USDT_MINT", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB")
+SOL_MINT  = _env_str("SOL_MINT",  "So11111111111111111111111111111111111111112")
+USDC_MINT = _env_str("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+USDT_MINT = _env_str("USDT_MINT", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB")
 LAMPORTS_PER_SOL = 1_000_000_000
 
 
@@ -161,12 +160,7 @@ async def _http_get(url: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 body = {"text": r.text}
             log.warning("JUP_GET_NON200", extra={"url": url, "status": r.status_code, "body": body})
-<<<<<<< HEAD
             raise JupHTTPError(status=r.status_code, url=url, body=body)
-=======
-            ec, em = (body or {}).get("errorCode"), (body or {}).get("error")
-            raise RuntimeError(f"HTTP {r.status_code} {ec or ''} {em or ''}".strip())
->>>>>>> origin/main
         return r.json()
 
 async def _http_post(url: str, *, json_body: Dict[str, Any]) -> Dict[str, Any]:
