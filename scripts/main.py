@@ -41,6 +41,8 @@ import signal
 import sys
 import traceback
 from typing import Any, Dict, Optional, Tuple
+from utils_pkg.core_utils import AlertManager
+from asyncio import create_task
 
 # ---------------------------
 # Optional deps (Telegram / PG / Sentry / Health)
@@ -771,6 +773,22 @@ def _ensure_keypair_file() -> None:
 # ---------------------------
 # BUY HOOKS (submitted / filled / failed)
 # ---------------------------
+from asyncio import create_task
+from utils_pkg.core_utils import AlertManager
+
+# env toggles (safe defaults)
+NOTIFY_BUY_SUBMITTED = _as_bool(os.getenv("NOTIFY_BUY_SUBMITTED", "1"), True)
+NOTIFY_BUY_FILLED    = _as_bool(os.getenv("NOTIFY_BUY_FILLED", "1"), True)
+NOTIFY_BUY_FAILED    = _as_bool(os.getenv("NOTIFY_BUY_FAILED", "1"), True)
+
+# cheap singleton to avoid re-creating AlertManager
+_AM_SINGLETON: Optional[AlertManager] = None
+def _am() -> AlertManager:
+    global _AM_SINGLETON
+    if _AM_SINGLETON is None:
+        _AM_SINGLETON = AlertManager()
+    return _AM_SINGLETON
+
 async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
     """
     payload: {mint, pool, symbol, spend_sol, route, hint}
@@ -779,6 +797,7 @@ async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
         bump("buys_submitted")
     except Exception:
         pass
+
     try:
         log.event("BUY_SUBMITTED",
                   mint=payload.get("mint"),
@@ -789,11 +808,28 @@ async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
                   hint=payload.get("hint"))
     except Exception:
         pass
-    if NOTIFY_BUY_SUBMITTED and _tg_send_text:
-        txt = f"🟡 Submitted BUY {payload.get('symbol') or ''}\n" \
-              f"mint={payload.get('mint')}  route={payload.get('route')}  size={payload.get('spend_sol')} SOL"
-        with contextlib.suppress(Exception):
-            await _tg_send_text(txt)
+
+    # Telegram/alerts (lightweight text on submission)
+    if NOTIFY_BUY_SUBMITTED:
+        try:
+            txt = (
+                f"🟡 Submitted BUY {payload.get('symbol') or ''}\n"
+                f"mint={payload.get('mint')}  route={payload.get('route') or 'auto'}  "
+                f"size={payload.get('spend_sol') or '—'} SOL"
+            )
+            create_task(_am().notify_text(txt))
+        except Exception as _e:
+            log.warning("ALERT_BUY_SUBMIT_FAIL", extra={"err": str(_e)[:200]})
+
+# --- Notion (optional daily PnL sync) ---
+try:
+    from utils_pkg.notion_pnl import push_daily_pnl  # safe no-op if NOTION_ENABLED!=1
+except Exception:  # pragma: no cover
+    def push_daily_pnl(_snapshot):  # fallback no-op
+        return None
+
+# Debounce for intraday push after fills (seconds granularity)
+_LAST_NOTION_PUSH_TS: float = 0.0
 
 async def _notion_intraday_snapshot_push(note: str = "") -> None:
     """Lightweight intraday push to Notion after a buy fill (debounced)."""
@@ -827,26 +863,18 @@ async def _notion_intraday_snapshot_push(note: str = "") -> None:
     except Exception as e:
         log.event("NOTION_INTRADAY_PUSH_FAIL", err=str(e))
 
-# --- Notion (optional daily PnL sync) ---
-try:
-    from utils_pkg.notion_pnl import push_daily_pnl  # safe no-op if NOTION_ENABLED!=1
-except Exception:  # pragma: no cover
-    def push_daily_pnl(_snapshot):  # fallback no-op
-        return None
-
-# Debounce for intraday push after fills (seconds granularity)
-_LAST_NOTION_PUSH_TS: float = 0.0
-
 async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
     """
-    ev: { mint, signature, symbol, spend_sol, pool }
+    ev: { mint, signature, symbol, spend_sol, pool, amount_raw? }
     """
     if _dryrun_env_on():
         return
+
     try:
         bump("buys_filled")
     except Exception:
         pass
+
     try:
         log.event("BUY_FILLED",
                   mint=ev.get("mint"),
@@ -856,12 +884,21 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
                   sig=ev.get("signature"))
     except Exception:
         pass
-    # Telegram (optional)
-    if NOTIFY_BUY_FILLED and _tg_send_text:
-        txt = f"🟢 BUY FILLED {ev.get('symbol') or ''}\n" \
-              f"mint={ev.get('mint')}  size={ev.get('spend_sol')} SOL\nsig={ev.get('signature')}"
-        with contextlib.suppress(Exception):
-            await _tg_send_text(txt)
+
+    # Primary alert path (AlertManager)
+    if NOTIFY_BUY_FILLED:
+        try:
+            create_task(_am().notify_trade_fill(
+                side="BUY",
+                mint=ev.get("mint"),
+                symbol=ev.get("symbol"),
+                pool=ev.get("pool"),
+                sig=ev.get("signature"),
+                spend_sol=ev.get("spend_sol"),
+                out_amount=ev.get("amount_raw"),   # if present
+            ))
+        except Exception as _e:
+            log.warning("ALERT_BUY_FILLED_FAIL", extra={"err": str(_e)[:200]})
 
     # Kick an intraday Notion push (debounced)
     asyncio.create_task(_notion_intraday_snapshot_push())
@@ -874,7 +911,8 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
         return
     except TypeError:
         with contextlib.suppress(Exception):
-            await exit_engine.on_buy_filled(raw_id_or_mint=ev.get("mint"), tx_sig=ev.get("signature"))  # type: ignore[misc]
+            await exit_engine.on_buy_filled(raw_id_or_mint=ev.get("mint"),
+                                            tx_sig=ev.get("signature"))  # type: ignore[misc]
     except Exception as e:
         log.warning("EXIT_ENGINE_FILL_HOOK_FAIL %s", e)
 
@@ -893,13 +931,18 @@ async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
                   error=payload.get("error"))
     except Exception:
         pass
-    # Optional Telegram
-    if NOTIFY_BUY_FAILED and _tg_send_text:
-        txt = f"🔴 BUY FAILED {payload.get('symbol') or ''}\n" \
-              f"mint={payload.get('mint')}  route={payload.get('route')}\n" \
-              f"reason={payload.get('reason')}  err={payload.get('error') or '—'}"
-        with contextlib.suppress(Exception):
-            await _tg_send_text(txt)
+
+    if NOTIFY_BUY_FAILED:
+        try:
+            txt = (
+                f"🔴 BUY FAILED {payload.get('symbol') or ''}\n"
+                f"mint={payload.get('mint')}  route={payload.get('route') or 'auto'}\n"
+                f"reason={payload.get('reason') or '—'}  err={payload.get('error') or '—'}"
+            )
+            create_task(_am().notify_text(txt))
+        except Exception as _e:
+            log.warning("ALERT_BUY_FAILED_FAIL", extra={"err": str(_e)[:200]})
+
     # Optional telemetry
     try:
         record_buy_result(ok=False, reason=str(payload.get("reason") or "failed"), error=payload.get("error"))
@@ -1067,7 +1110,23 @@ class Strategy:
 
                         ok, info = await _confirm_sig(tx_sig)
                         if ok:
+                            # Keep this log (your earlier logs show BUY_FILLED at ~1219)
                             log.info("BUY_FILLED", extra={"mint": mint_norm, "tx_sig": tx_sig, "slot": info})
+
+                            # Fire alert for BUY_FILLED here as well (belt & suspenders)
+                            try:
+                                create_task(_am().notify_trade_fill(
+                                    side="BUY",
+                                    mint=mint_norm,
+                                    symbol=ui.get("symbol"),
+                                    pool=ui.get("pool") or "unknown",
+                                    sig=tx_sig,
+                                    spend_sol=ui.get("spend_sol"),
+                                    out_amount=ui.get("amount_raw"),
+                                ))
+                            except Exception as _e:
+                                log.warning("ALERT_BUY_FILLED_FAIL", extra={"err": str(_e)[:200]})
+
                             try:
                                 await exit_engine.on_buy_filled(mint=mint_norm, ui=ui, tx_sig=tx_sig)
                             except Exception:
@@ -1217,6 +1276,20 @@ class Strategy:
                         ok, info = await _confirm_sig(tx_sig)
                         if ok:
                             log.info("BUY_FILLED", extra={"mint": mint_norm, "tx_sig": tx_sig, "slot": info})
+
+                            try:
+                                create_task(_am().notify_trade_fill(
+                                    side="BUY",
+                                    mint=mint_norm,
+                                    symbol=ui.get("symbol"),
+                                    pool=ui.get("pool") or "unknown",
+                                    sig=tx_sig,
+                                    spend_sol=ui.get("spend_sol"),
+                                    out_amount=ui.get("amount_raw"),
+                                ))
+                            except Exception as _e:
+                                log.warning("ALERT_BUY_FILLED_FAIL", extra={"err": str(_e)[:200]})
+
                             try:
                                 await exit_engine.on_buy_filled(mint=mint_norm, ui=ui, tx_sig=tx_sig)
                             except Exception:
