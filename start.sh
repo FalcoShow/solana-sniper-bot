@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # start.sh — Render entrypoint (end-to-end, hardened)
-# - Loads .env
+# - Loads .env + secret files
 # - Optional local Jupiter relay (IPv4 only)
 # - Normalizes DSNs, light health checks, verbose logging
 # - Starts main app
@@ -12,9 +12,11 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log(){ printf '[start] %s %s\n' "$(ts)" "$*"; }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 0) Load .env FIRST
+# 0) Load env files FIRST (.env + secret files)
 # ──────────────────────────────────────────────────────────────────────────────
 set -a
+
+# Repo .env (optional, mostly for local dev)
 if [[ -f .env ]]; then
   # shellcheck disable=SC1091
   . ./.env
@@ -22,18 +24,38 @@ if [[ -f .env ]]; then
 else
   log "no .env found (ok if using Render dashboard env)"
 fi
+
+# Secret files created in Render dashboard:
+#   - /etc/secrets/.env           (optional)
+#   - /etc/secrets/.env.extra     (your overflow config)
+if [[ -f /etc/secrets/.env ]]; then
+  # shellcheck disable=SC1091
+  . /etc/secrets/.env
+  log "loaded /etc/secrets/.env"
+fi
+
+if [[ -f /etc/secrets/.env.extra ]]; then
+  # shellcheck disable=SC1091
+  . /etc/secrets/.env.extra
+  log "loaded /etc/secrets/.env.extra"
+fi
+
 set +a
 
 log "booting…"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) Jupiter readiness (new endpoints)
-#    - No more /etc/hosts pinning or /v6/ping
 #    - Default base is https://api.jup.ag
+#    - Also keep JUPITER_SWAP_API for legacy code paths
 # ──────────────────────────────────────────────────────────────────────────────
 : "${JUP_BASE_URL:=https://api.jup.ag}"
 : "${JUP_ALT_BASE_URLS:=https://api.jup.ag}"
-export JUP_BASE_URL JUP_ALT_BASE_URLS
+
+# Legacy compatibility: anything expecting JUPITER_SWAP_API will just use base
+: "${JUPITER_SWAP_API:=${JUP_BASE_URL}}"
+
+export JUP_BASE_URL JUP_ALT_BASE_URLS JUPITER_SWAP_API
 
 if command -v curl >/dev/null 2>&1; then
   log "checking Jupiter quote…"
@@ -46,20 +68,27 @@ fi
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 2) Wallet bootstrap (optional)
+#    - WALLET_JSON (inline JSON array) → /opt/render/.secrets/wallet.json
+#    - WALLET_PRIVATE_KEY defaults to that path if not explicitly set
 # ──────────────────────────────────────────────────────────────────────────────
 mkdir -p /opt/render/.secrets
-chmod 700 /opt/render/.secrets
+chmod 700 /opt/render/.secrets 2>/dev/null || true
+
 if [[ -n "${WALLET_JSON:-}" && ! -f /opt/render/.secrets/wallet.json ]]; then
   printf '%s' "$WALLET_JSON" > /opt/render/.secrets/wallet.json
-  chmod 600 /opt/render/.secrets/wallet.json
+  chmod 600 /opt/render/.secrets/wallet.json 2>/dev/null || true
+  log "wrote wallet.json from WALLET_JSON"
 fi
+
+# If dashboard/secret file already set WALLET_PRIVATE_KEY, keep it.
+# Otherwise default to our wallet.json path.
 export WALLET_PRIVATE_KEY="${WALLET_PRIVATE_KEY:-/opt/render/.secrets/wallet.json}"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3) Local data dirs
 # ──────────────────────────────────────────────────────────────────────────────
 mkdir -p /opt/render/data /tmp
-chmod 755 /opt/render/data || true
+chmod 755 /opt/render/data 2>/dev/null || true
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 4) Python selection
@@ -69,7 +98,7 @@ PYTHON="python"
 log "python: $(${PYTHON} -V 2>&1)"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5) DSN normalizers
+# 5) DSN normalizers (Postgres)
 # ──────────────────────────────────────────────────────────────────────────────
 normalize_sqlalchemy_dsn() {
   local v="$1"
@@ -82,6 +111,7 @@ normalize_sqlalchemy_dsn() {
   fi
   printf '%s' "$v"
 }
+
 normalize_asyncpg_dsn() {
   local v="$1"
   v="${v/postgresql+asyncpg:\/\//postgresql://}"
@@ -157,6 +187,7 @@ if [[ "${RELAY_ENABLED}" = "1" ]]; then
         log "relay up on ${RELAY_BIND}:${RELAY_PORT}"
         export JUP_BASE_URL="http://${RELAY_BIND}:${RELAY_PORT}"
         export JUP_ALT_BASE_URLS="http://${RELAY_BIND}:${RELAY_PORT}"
+        export JUPITER_SWAP_API="${JUP_BASE_URL}"
         break
       fi
       sleep 1
@@ -168,17 +199,20 @@ if [[ "${RELAY_ENABLED}" = "1" ]]; then
       log "falling back to public Jupiter endpoints"
       export JUP_BASE_URL="https://api.jup.ag"
       export JUP_ALT_BASE_URLS="https://api.jup.ag"
+      export JUPITER_SWAP_API="${JUP_BASE_URL}"
     fi
   else
     log "RELAY_ENABLED=1 but jup_relay.py not found; using public Jupiter"
     export JUP_BASE_URL="https://api.jup.ag"
     export JUP_ALT_BASE_URLS="https://api.jup.ag"
+    export JUPITER_SWAP_API="${JUP_BASE_URL}"
   fi
 else
   log "skipping local Jupiter relay (RELAY_ENABLED!=1)"
   : "${JUP_BASE_URL:=https://api.jup.ag}"
   : "${JUP_ALT_BASE_URLS:=https://api.jup.ag}"
-  export JUP_BASE_URL JUP_ALT_BASE_URLS
+  : "${JUPITER_SWAP_API:=${JUP_BASE_URL}}"
+  export JUP_BASE_URL JUP_ALT_BASE_URLS JUPITER_SWAP_API
 fi
 
 log "JUP_BASE_URL: ${JUP_BASE_URL}"
@@ -210,7 +244,8 @@ if [[ "${PRINT_ENV:-0}" = "1" ]]; then
   log "env snapshot (selected):"
   printf '  RELAY_ENABLED=%s\n  RELAY_BIND=%s\n  RELAY_PORT=%s\n  RELAY_UPSTREAM=%s\n' \
     "${RELAY_ENABLED}" "${RELAY_BIND}" "${RELAY_PORT}" "${RELAY_UPSTREAM}"
-  printf '  JUP_BASE_URL=%s\n  JUP_ALT_BASE_URLS=%s\n' "${JUP_BASE_URL}" "${JUP_ALT_BASE_URLS}"
+  printf '  JUP_BASE_URL=%s\n  JUP_ALT_BASE_URLS=%s\n  JUPITER_SWAP_API=%s\n' \
+    "${JUP_BASE_URL}" "${JUP_ALT_BASE_URLS}" "${JUPITER_SWAP_API}"
 fi
 
 exec "${PYTHON}" -m scripts.main
