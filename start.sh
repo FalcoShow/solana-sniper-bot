@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
 # start.sh — Render entrypoint (end-to-end, hardened)
-# - Loads .env + secret files
-# - Optional local Jupiter relay (IPv4 only)
-# - Normalizes DSNs, light health checks, verbose logging
-# - Starts main app
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -12,11 +8,11 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log(){ printf '[start] %s %s\n' "$(ts)" "$*"; }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 0) Load env files FIRST (.env + secret files)
+# 0) Load env from .env and any /etc/secrets/* files
 # ──────────────────────────────────────────────────────────────────────────────
 set -a
 
-# Repo .env (optional, mostly for local dev)
+# Local .env (optional)
 if [[ -f .env ]]; then
   # shellcheck disable=SC1091
   . ./.env
@@ -25,19 +21,17 @@ else
   log "no .env found (ok if using Render dashboard env)"
 fi
 
-# Secret files created in Render dashboard:
-#   - /etc/secrets/.env           (optional)
-#   - /etc/secrets/.env.extra     (your overflow config)
-if [[ -f /etc/secrets/.env ]]; then
-  # shellcheck disable=SC1091
-  . /etc/secrets/.env
-  log "loaded /etc/secrets/.env"
-fi
-
-if [[ -f /etc/secrets/.env.extra ]]; then
-  # shellcheck disable=SC1091
-  . /etc/secrets/.env.extra
-  log "loaded /etc/secrets/.env.extra"
+# Render “Secret file(s)” (mounted under /etc/secrets/<name>)
+if compgen -G "/etc/secrets/*" > /dev/null; then
+  for f in /etc/secrets/*; do
+    if [[ -f "$f" ]]; then
+      log "sourcing secret file: $f"
+      # shellcheck disable=SC1090
+      . "$f"
+    fi
+  done
+else
+  log "no /etc/secrets/* files found"
 fi
 
 set +a
