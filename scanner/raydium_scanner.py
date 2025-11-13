@@ -1,5 +1,5 @@
 # scanner/raydium_scanner.py
-# Finds Raydium pairs via Dexscreener (stable public JSON) — resilient edition.
+# Finds Raydium pairs via Dexscreener (stable public JSON) — runner-focused edition.
 from __future__ import annotations
 
 import os
@@ -12,10 +12,26 @@ from typing import List, Dict, Any, Optional, Tuple
 import aiohttp
 import certifi
 
+from config import (
+    SCANNER_MIN_LIQ_USD,
+    SCANNER_MIN_FDV_USD,
+    SCANNER_MIN_BUYS_5M,
+    SCANNER_MIN_BUYS_15M,
+    SCANNER_MIN_VOLUME_5M_USD,
+    SCANNER_MIN_VOLUME_15M_USD,
+    SCANNER_MIN_BUY_RATIO,
+    SCANNER_REQUIRE_BUY_PRESSURE,
+    SCANNER_MIN_PRICE_CHANGE_5M,
+    SCANNER_MIN_PRICE_CHANGE_15M,
+    SCANNER_MAX_AGE_MIN,
+    SCANNER_MAX_MC_USD,
+    SCANNER_MIN_HOLDERS,
+)
+
 logger = logging.getLogger("scanner.raydium")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Config / env
+# Config / env (Raydium overrides on top of global scanner defaults)
 # ──────────────────────────────────────────────────────────────────────────────
 UA = os.getenv(
     "SCANNER_UA",
@@ -24,14 +40,35 @@ UA = os.getenv(
 BASE = os.getenv("DEXSCREENER_BASE_URL", "https://api.dexscreener.com").rstrip("/")
 
 LIMIT = int(os.getenv("RAYDIUM_LIMIT", "40"))
-MIN_LIQ_USD = float(os.getenv("RAYDIUM_MIN_LIQ_USD", "10000"))
+
+MIN_LIQ_USD = float(os.getenv("RAYDIUM_MIN_LIQ_USD",        str(SCANNER_MIN_LIQ_USD)))
+MIN_FDV_USD = float(os.getenv("RAYDIUM_MIN_FDV_USD",        str(SCANNER_MIN_FDV_USD)))
+MIN_BUYS_5M = int(  os.getenv("RAYDIUM_MIN_BUYS_5M",        str(SCANNER_MIN_BUYS_5M)))
+MIN_BUYS_15M= int(  os.getenv("RAYDIUM_MIN_BUYS_15M",       str(SCANNER_MIN_BUYS_15M)))
+MIN_VOL_5M_USD  = float(os.getenv("RAYDIUM_MIN_VOLUME_5M_USD",  str(SCANNER_MIN_VOLUME_5M_USD)))
+MIN_VOL_15M_USD = float(os.getenv("RAYDIUM_MIN_VOLUME_15M_USD", str(SCANNER_MIN_VOLUME_15M_USD)))
+MIN_BUY_RATIO   = float(os.getenv("RAYDIUM_MIN_BUY_RATIO",  str(SCANNER_MIN_BUY_RATIO)))
+REQUIRE_BUY_PRESSURE = os.getenv(
+    "RAYDIUM_REQUIRE_BUY_PRESSURE",
+    "1" if SCANNER_REQUIRE_BUY_PRESSURE else "0",
+).strip().lower() in {"1", "true", "yes", "y"}
+MIN_CHG_5M  = float(os.getenv("RAYDIUM_MIN_PRICE_CHANGE_5M",  str(SCANNER_MIN_PRICE_CHANGE_5M)))
+MIN_CHG_15M = float(os.getenv("RAYDIUM_MIN_PRICE_CHANGE_15M", str(SCANNER_MIN_PRICE_CHANGE_15M)))
+MAX_AGE_MIN = int(os.getenv("RAYDIUM_MAX_AGE_MIN",            str(SCANNER_MAX_AGE_MIN)))
+MAX_MC_USD  = float(os.getenv("RAYDIUM_MAX_MC_USD",           str(SCANNER_MAX_MC_USD)))
+MIN_HOLDERS = int(os.getenv("RAYDIUM_MIN_HOLDERS",            str(SCANNER_MIN_HOLDERS)))
+
 TIMEOUT_S = float(os.getenv("RAYDIUM_HTTP_TIMEOUT_SEC", "12"))
 RETRIES = max(1, int(os.getenv("RAYDIUM_HTTP_RETRIES", "3")))
 BACKOFF_S = max(0.1, float(os.getenv("RAYDIUM_HTTP_BACKOFF_SEC", "0.6")))
 TRUST_ENV = (os.getenv("RAYDIUM_TRUST_ENV", "1").strip().lower() in {"1", "true", "yes", "y"})
 
 # You can override the search queries; all results are filtered to dexId=raydium anyway.
-SEARCH_QUERIES = [q.strip() for q in os.getenv("RAYDIUM_SEARCH_QUERIES", "raydium,solana").split(",") if q.strip()]
+SEARCH_QUERIES = [
+    q.strip()
+    for q in os.getenv("RAYDIUM_SEARCH_QUERIES", "raydium,solana").split(",")
+    if q.strip()
+]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -54,6 +91,12 @@ def _nz_float(v: Any, d: float = 0.0) -> float:
     except Exception:
         return d
 
+def _safe_int(v: Any, d: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return d
+
 def _age_min(pair_created_ms: Optional[int]) -> Optional[float]:
     try:
         if pair_created_ms is None:
@@ -66,6 +109,10 @@ def _age_min(pair_created_ms: Optional[int]) -> Optional[float]:
         return diff_s / 60.0
     except Exception:
         return None
+
+def _runner_buy_ratio(buys: int, sells: int) -> float:
+    total = max(1, buys + sells)
+    return float(buys) / float(total)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP
@@ -133,8 +180,91 @@ async def _fetch_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Normalize
+# Metric extraction & normalization
 # ──────────────────────────────────────────────────────────────────────────────
+def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
+    liq_usd = _nz_float((pair.get("liquidity") or {}).get("usd"), 0.0)
+
+    fdv = _nz_float(pair.get("fdv") or pair.get("fdvUsd") or pair.get("fullyDilutedValuation"), 0.0)
+    mc  = _nz_float(
+        pair.get("marketCap")
+        or pair.get("marketCapUsd")
+        or pair.get("mcap")
+        or fdv,
+        0.0,
+    )
+
+    txs = (pair.get("txns") or {})
+    m5 = txs.get("m5") or {}
+    h1 = txs.get("h1") or {}
+    h24 = txs.get("h24") or {}
+
+    buys_5m  = _safe_int(m5.get("buys"), 0)
+    sells_5m = _safe_int(m5.get("sells"), 0)
+
+    buys_1h  = _safe_int(h1.get("buys"), 0)
+    sells_1h = _safe_int(h1.get("sells"), 0)
+
+    buys_24h  = _safe_int(h24.get("buys"), 0)
+    sells_24h = _safe_int(h24.get("sells"), 0)
+
+    # Approximate 15m from 1h/24h when missing
+    if buys_1h > 0:
+        buys_15m = max(1, buys_1h // 4)
+        sells_15m = max(0, sells_1h // 4)
+    elif buys_24h > 0:
+        buys_15m = max(1, buys_24h // 96)
+        sells_15m = max(0, sells_24h // 96)
+    else:
+        buys_15m = 0
+        sells_15m = 0
+
+    # Volume: Dexscreener mainly has h24
+    vol = pair.get("volume") or {}
+    vol24 = _nz_float(vol.get("h24"), 0.0)
+    vol5 = vol24 / 288.0 if vol24 > 0 else 0.0
+    vol15 = vol24 / 96.0 if vol24 > 0 else 0.0
+
+    # Price change – Dexscreener usually has h1,h6,h24
+    pc = pair.get("priceChange") or {}
+    chg1h = _nz_float(pc.get("h1"), 0.0)
+    chg6h = _nz_float(pc.get("h6"), 0.0)
+    chg24h = _nz_float(pc.get("h24"), 0.0)
+
+    # Rough approximations for 5m / 15m
+    chg5 = chg1h / 12.0 if chg1h else chg24h / 288.0
+    chg15 = chg1h / 4.0 if chg1h else chg24h / 96.0
+
+    price_usd = _nz_float(pair.get("priceUsd"), 0.0)
+
+    pair_created_ms = (
+        pair.get("pairCreatedAt")
+        or pair.get("pairCreatedAtMs")
+        or pair.get("pairCreatedAtTs")
+    )
+    age_min = _age_min(pair_created_ms)
+
+    # Holders not exposed by Dexscreener; keep 0 (filters only apply when >0)
+    holders = 0
+
+    return {
+        "liq_usd": liq_usd,
+        "fdv_usd": fdv,
+        "mc_usd": mc,
+        "buys_5m": buys_5m,
+        "sells_5m": sells_5m,
+        "buys_15m": buys_15m,
+        "sells_15m": sells_15m,
+        "volume_5m_usd": vol5,
+        "volume_15m_usd": vol15,
+        "volume_24h_usd": vol24,
+        "price_change_5m": chg5,
+        "price_change_15m": chg15,
+        "price_usd": price_usd,
+        "age_min": age_min,
+        "holders": holders,
+    }
+
 def _normalize(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         if (pair.get("chainId") or "").lower() != "solana":
@@ -142,8 +272,9 @@ def _normalize(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if (pair.get("dexId") or "").lower() != "raydium":
             return None
 
-        liq = _nz_float((pair.get("liquidity") or {}).get("usd"), 0.0)
-        if liq < MIN_LIQ_USD:
+        metrics = _extract_metrics(pair)
+
+        if metrics["liq_usd"] < MIN_LIQ_USD:
             return None
 
         base = pair.get("baseToken") or {}
@@ -152,39 +283,127 @@ def _normalize(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return None
 
         symbol = (base.get("symbol") or "").strip() or mint[:6]
-        price_usd = _nz_float(pair.get("priceUsd"), 0.0)
 
-        tx5 = (pair.get("txns") or {}).get("m5") or {}
-        buys = int(tx5.get("buys") or 0)
-        sells = int(tx5.get("sells") or 0)
-        skew5m = (buys + 1) / (sells + 1)
+        buys_5m = metrics["buys_5m"]
+        sells_5m = metrics["sells_5m"]
+        buys_15m = metrics["buys_15m"]
+        sells_15m = metrics["sells_15m"]
 
-        pair_created_ms = pair.get("pairCreatedAt") or pair.get("pairCreatedAtMs") or pair.get("pairCreatedAtTs")
-        pool_age_min = _age_min(pair_created_ms)
+        buy_ratio_5m = _runner_buy_ratio(buys_5m, sells_5m)
+        buy_ratio_15m = _runner_buy_ratio(buys_15m, sells_15m)
 
         url = pair.get("url") or pair.get("pairUrl") or f"https://dexscreener.com/solana/{mint}"
 
-        out = {
-            "source": "raydium(dex)",
+        out: Dict[str, Any] = {
+            "source": "raydium",
             "mint": mint,
             "symbol": symbol,
-            "liq_usd": liq,
-            "price_usd": price_usd,
-            "skew5m": float(skew5m),
-            "pool_age_min": pool_age_min,
             "pair_url": url,
+            "liq_usd": metrics["liq_usd"],
+            "price_usd": metrics["price_usd"],
+            "pool_age_min": metrics["age_min"],
+            "fdv_usd": metrics["fdv_usd"],
+            "mc_usd": metrics["mc_usd"],
+            "volume_5m_usd": metrics["volume_5m_usd"],
+            "volume_15m_usd": metrics["volume_15m_usd"],
+            "volume_24h_usd": metrics["volume_24h_usd"],
+            "buys_5m": buys_5m,
+            "sells_5m": sells_5m,
+            "buys_15m": buys_15m,
+            "sells_15m": sells_15m,
+            "buy_ratio_5m": buy_ratio_5m,
+            "buy_ratio_15m": buy_ratio_15m,
+            "price_change_5m": metrics["price_change_5m"],
+            "price_change_15m": metrics["price_change_15m"],
+            "holders": metrics["holders"],
         }
-
-        fdv = _nz_float(pair.get("fdv"), 0.0)
-        if fdv > 0:
-            out["fdv_usd"] = fdv
-        vol24 = _nz_float((pair.get("volume") or {}).get("h24"), 0.0)
-        if vol24 > 0:
-            out["volumeUsd24h"] = vol24
 
         return out
     except Exception:
         return None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Runner filters & scoring
+# ──────────────────────────────────────────────────────────────────────────────
+def _passes_runner_filters(c: Dict[str, Any]) -> bool:
+    if c.get("liq_usd", 0.0) < MIN_LIQ_USD:
+        return False
+
+    fdv = c.get("fdv_usd", 0.0)
+    if fdv and fdv < MIN_FDV_USD:
+        return False
+
+    mc = c.get("mc_usd", 0.0)
+    if MAX_MC_USD > 0 and mc and mc > MAX_MC_USD:
+        return False
+
+    age = c.get("pool_age_min")
+    if age is not None and age > MAX_AGE_MIN:
+        return False
+
+    holders = c.get("holders") or 0
+    if MIN_HOLDERS > 0 and holders and holders < MIN_HOLDERS:
+        return False
+
+    buys5 = int(c.get("buys_5m") or 0)
+    buys15 = int(c.get("buys_15m") or 0)
+    if buys5 < MIN_BUYS_5M:
+        return False
+    if buys15 < MIN_BUYS_15M:
+        return False
+
+    vol5 = float(c.get("volume_5m_usd") or 0.0)
+    vol15 = float(c.get("volume_15m_usd") or 0.0)
+    if vol5 < MIN_VOL_5M_USD:
+        return False
+    if vol15 < MIN_VOL_15M_USD:
+        return False
+
+    chg5 = float(c.get("price_change_5m") or 0.0)
+    chg15 = float(c.get("price_change_15m") or 0.0)
+    if chg5 < MIN_CHG_5M:
+        return False
+    if chg15 < MIN_CHG_15M:
+        return False
+
+    if REQUIRE_BUY_PRESSURE:
+        if float(c.get("buy_ratio_5m") or 0.0) < MIN_BUY_RATIO:
+            return False
+
+    return True
+
+def _runner_score(c: Dict[str, Any]) -> float:
+    """
+    Heuristic score:
+    - strong recent buy pressure
+    - positive 5m/15m price change
+    - solid 5m volume
+    - decent liquidity
+    """
+    buy_ratio = float(c.get("buy_ratio_5m") or 0.0)
+    chg5 = float(c.get("price_change_5m") or 0.0)
+    chg15 = float(c.get("price_change_15m") or 0.0)
+    vol5 = float(c.get("volume_5m_usd") or 0.0)
+    liq = float(c.get("liq_usd") or 0.0)
+
+    buy_component = buy_ratio * 3.0
+    price_component = max(0.0, chg5) / 10.0 + max(0.0, chg15) / 15.0
+    vol_component = min(vol5, 50_000.0) / 10_000.0
+    liq_component = min(liq, 200_000.0) / 50_000.0
+
+    return buy_component + price_component + vol_component + liq_component
+
+def _filter_and_rank(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for c in candidates:
+        if not _passes_runner_filters(c):
+            continue
+        c = dict(c)
+        c["runner_score"] = _runner_score(c)
+        out.append(c)
+
+    out.sort(key=lambda x: x.get("runner_score", 0.0), reverse=True)
+    return out[:LIMIT]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public entry
@@ -219,21 +438,35 @@ async def scan_raydium(*args):
         sslctx = ssl.create_default_context(cafile=certifi.where())
         timeout = aiohttp.ClientTimeout(total=TIMEOUT_S + 3)
         conn = aiohttp.TCPConnector(ssl=sslctx, limit=50)
-        sess = aiohttp.ClientSession(headers=_headers(), connector=conn, trust_env=TRUST_ENV, timeout=timeout)
+        sess = aiohttp.ClientSession(
+            headers=_headers(),
+            connector=conn,
+            trust_env=TRUST_ENV,
+            timeout=timeout,
+        )
         own_session = True
 
     try:
-        logger.info("🔎 Raydium scan via Dexscreener: queries=%s min_liq=$%.0f limit=%d",
-                    ",".join(SEARCH_QUERIES), MIN_LIQ_USD, LIMIT)
+        logger.info(
+            "🔎 Raydium scan via Dexscreener: queries=%s min_liq=$%.0f limit=%d",
+            ",".join(SEARCH_QUERIES),
+            MIN_LIQ_USD,
+            LIMIT,
+        )
         pairs = await _fetch_pairs(sess)
-        rows: List[Dict[str, Any]] = []
+        normalized: List[Dict[str, Any]] = []
         for p in pairs:
             r = _normalize(p)
             if r:
-                rows.append(r)
-        # Sort by liquidity then 5m skew
-        rows.sort(key=lambda x: (x.get("liq_usd", 0.0), x.get("skew5m", 1.0)), reverse=True)
-        return rows[:LIMIT]
+                normalized.append(r)
+
+        runners = _filter_and_rank(normalized)
+        logger.info(
+            "scanner.raydium: %s runner candidates (from %s raw pairs)",
+            len(runners),
+            len(normalized),
+        )
+        return runners
     except Exception as e:
         logger.warning("Raydium scan error: %s", e)
         return []
