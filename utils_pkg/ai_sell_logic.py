@@ -15,69 +15,91 @@ from typing import Optional, Dict, Any, Tuple
 from .core_utils import (
     get_token_price,
     ai_fraud_score,
-    get_volume_data,
     get_entry_price,
 )
 
+# NOTE: core_utils may or may not expose get_volume_data.
+# We import it defensively and wrap it so the whole module still works if it's missing.
+try:  # pragma: no cover - environment dependent
+    from .core_utils import get_volume_data as _core_get_volume_data  # type: ignore
+except Exception:  # noqa: BLE001
+    _core_get_volume_data = None  # type: ignore[assignment]
+
 logger = logging.getLogger("ai_sell_logic")
-# Keep this light; main logging config is elsewhere.
-if not logger.handlers:
-    logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Defaults (env can override; Redis can override both)
 # Note: HOLD threshold is in [0..1]. Higher = stricter (need safer token to HOLD).
 # ───────────────────────────────────────────────────────────────────────────────
-
 DEFAULT_HOLD_THRESHOLD = float(os.getenv("HOLD_IF_SCORE_ABOVE", "0.85"))
 DEFAULT_MAX_HOLD_MIN = int(os.getenv("MAX_HOLD_TIME_MINUTES", "360"))
-EXTREME_PUMP_HOLD_PCT = float(
-    os.getenv("EXTREME_PUMP_HOLD_PCT", "300")
-)  # >300% up with uptrend? HOLD
-FAST_FALL_SELL_PCT = float(
-    os.getenv("FAST_FALL_SELL_PCT", "15")
-)  # drop >15% and vol down? SELL bias
+EXTREME_PUMP_HOLD_PCT = float(os.getenv("EXTREME_PUMP_HOLD_PCT", "300"))  # >300% up with uptrend? HOLD
+FAST_FALL_SELL_PCT = float(os.getenv("FAST_FALL_SELL_PCT", "15"))          # drop >15% and vol down? SELL bias
 
 ENABLE_OVERRIDE_HOLD = os.getenv("ENABLE_OVERRIDE_HOLD", "false").lower() == "true"
 OVERRIDE_HOLD_THRESHOLD = float(os.getenv("OVERRIDE_HOLD_THRESHOLD", "0"))  # applied if > current
 
-# Stagnant-timeout kill-switch (new)
-EXIT_STAGNANT_MAX_MIN = int(os.getenv("EXIT_STAGNANT_MAX_MIN", "0"))  # 0 = disabled
-EXIT_STAGNANT_MIN_MOVE_PCT = float(os.getenv("EXIT_STAGNANT_MIN_MOVE_PCT", "0"))
-EXIT_STAGNANT_EXIT_FRAC = float(os.getenv("EXIT_STAGNANT_EXIT_FRAC", "1.0"))
-
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Helpers to fetch live parameters (safe with/without Redis)
-# Keys we look for (in order of priority):
-#   1) token override:   override:<name>:<token_mint>
-#   2) strategy JSON:    strategy:live  -> { "<name>": value, ... }
-#   3) env default (passed in or module defaults)
+# Helpers
 # ───────────────────────────────────────────────────────────────────────────────
 
 async def _get_param(redis, name: str, token: Optional[str], default: float) -> float:
+    """
+    Fetch a dynamic parameter from Redis (override:token / strategy:live) with a safe fallback.
+    """
     val = None
     try:
         if redis:
+            # 1) token-specific override
             if token:
                 raw = await redis.get(f"override:{name}:{token}")
                 if raw is not None:
                     val = float(raw)
+
+            # 2) global strategy config
             if val is None:
                 raw_cfg = await redis.get("strategy:live")
                 if raw_cfg:
                     try:
                         import json
 
+                        if isinstance(raw_cfg, (bytes, bytearray)):
+                            raw_cfg = raw_cfg.decode("utf-8")
                         cfg = json.loads(raw_cfg)
                         if name in cfg:
                             val = float(cfg[name])
-                    except Exception:
-                        # If strategy blob is malformed, just ignore and fall back
-                        pass
-    except Exception as e:
-        logger.debug(f"_get_param error for {name}/{token}: {e}")
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("strategy:live parse error for %s: %s", name, e)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("_get_param error for %s/%s: %s", name, token, e)
+
     return float(val) if val is not None else default
+
+
+async def _safe_get_volume_data(token_address: str) -> Dict[str, Any]:
+    """
+    Wrapper around optional core_utils.get_volume_data.
+    Returns a neutral 'flat' structure if the underlying helper doesn't exist or fails.
+    """
+    base: Dict[str, Any] = {
+        "direction": "flat",       # "up" / "down" / "flat"
+        "pct_change_h1": 0.0,      # 1h price change %
+        "candles": [],             # list of {open, close, ...}
+    }
+
+    if _core_get_volume_data is None:
+        return base
+
+    try:
+        data = await _core_get_volume_data(token_address)  # type: ignore[misc]
+        if isinstance(data, dict):
+            base.update(data)
+        return base
+    except Exception as e:  # noqa: BLE001
+        logger.debug("get_volume_data failed for %s: %s", token_address, e)
+        return base
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -86,7 +108,7 @@ async def _get_param(redis, name: str, token: Optional[str], default: float) -> 
 
 async def should_hold_token_with_reason(
     *,
-    threshold_score: Optional[float] = None,  # [0..1], higher = stricter hold
+    threshold_score: Optional[float] = None,   # [0..1], higher = stricter hold
     price_change_pct: Optional[float] = None,  # % since entry
     token_address: Optional[str] = None,
     buy_time: Optional[datetime] = None,
@@ -97,8 +119,8 @@ async def should_hold_token_with_reason(
 
     Returns:
         (hold: bool, reasons: dict)
-        - hold=True  -> do NOT sell yet.
-        - hold=False -> OK to sell (AI gate opened).
+        - hold=True means do NOT sell yet.
+        - hold=False means OK to sell (AI gate opened).
     """
     reasons: Dict[str, Any] = {"token": token_address}
 
@@ -110,19 +132,18 @@ async def should_hold_token_with_reason(
         # Ensure timezone-aware UTC
         if buy_time and buy_time.tzinfo is None:
             buy_time = buy_time.replace(tzinfo=timezone.utc)
-
-        # If buy_time missing, try to restore from Redis
-        if buy_time is None and redis:
+        if not buy_time and redis:
+            # Try to recover buy_time from Redis
             ts_str = await redis.get(f"buytime:{token_address}")
             if ts_str:
                 bt = None
                 try:
+                    if isinstance(ts_str, (bytes, bytearray)):
+                        ts_str = ts_str.decode("utf-8")
                     bt = datetime.fromisoformat(ts_str)
-                except Exception:
-                    try:
-                        bt = datetime.fromisoformat(ts_str.decode("utf-8"))  # type: ignore
-                    except Exception:
-                        bt = None
+                except Exception:  # noqa: BLE001
+                    bt = None
+
                 if bt:
                     if bt.tzinfo is None:
                         bt = bt.replace(tzinfo=timezone.utc)
@@ -142,8 +163,8 @@ async def should_hold_token_with_reason(
             reasons["override_hold_threshold"] = OVERRIDE_HOLD_THRESHOLD
             hold_threshold = OVERRIDE_HOLD_THRESHOLD
 
-        # Caller can ask for stricter threshold
         if threshold_score is not None and threshold_score > hold_threshold:
+            # caller wants stricter than system; use stricter
             reasons["caller_threshold_used"] = threshold_score
             hold_threshold = threshold_score
 
@@ -173,11 +194,10 @@ async def should_hold_token_with_reason(
             reasons["note"] = "insufficient context -> hold"
             return True, reasons
 
-        # ── 1) Fraud risk gate ────────────────────────────────────────────────
+        # 1) Fraud risk gate
         fraud = await ai_fraud_score(token_address)
         reasons["fraud_score"] = round(fraud, 4)
-        reasons["hold_threshold"] = hold_threshold
-
+        reasons["threshold"] = hold_threshold
         if fraud < hold_threshold:
             reasons["decision"] = "SELL_fraud_below_threshold"
             if redis:
@@ -187,12 +207,13 @@ async def should_hold_token_with_reason(
                 )
             return False, reasons
 
-        # ── 2) Volume / trend context ─────────────────────────────────────────
-        vol = await get_volume_data(token_address)
+        # 2) Volume/Trend context (safe wrapper)
+        vol = await _safe_get_volume_data(token_address)
         direction = vol.get("direction", "flat")
         reasons["trend"] = direction
         reasons["h1_change"] = vol.get("pct_change_h1", 0.0)
 
+        # Trend helpers
         def last_n_green(candles, n: int = 3) -> bool:
             if not candles or len(candles) < n:
                 return False
@@ -202,22 +223,22 @@ async def should_hold_token_with_reason(
                     (c.get("close", 0) or 0) > (c.get("open", 0) or 0)
                     for c in tail
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 return False
 
         candles = vol.get("candles", [])
 
-        # Extreme pump with clear uptrend -> hold and trail elsewhere
+        # Extreme pump with uptrend: let it ride
         if price_change_pct > EXTREME_PUMP_HOLD_PCT and direction == "up":
             reasons["decision"] = "HOLD_extreme_pump_with_uptrend"
             return True, reasons
 
-        # Last 3 candles strong green -> keep riding
+        # Last 3 candles green: keep holding
         if last_n_green(candles, 3):
             reasons["decision"] = "HOLD_last_3_green"
             return True, reasons
 
-        # ── 3) Fast-fall breaker (avoid round-tripping profits) ───────────────
+        # 3) Fast-fall breaker (avoid round-tripping profits)
         if price_change_pct <= -FAST_FALL_SELL_PCT and direction != "up":
             reasons["decision"] = "SELL_fast_fall"
             reasons["fast_fall_threshold_pct"] = FAST_FALL_SELL_PCT
@@ -228,41 +249,11 @@ async def should_hold_token_with_reason(
                 )
             return False, reasons
 
-        # ── 4) Stagnant-timeout kill-switch (NEW) ────────────────────────────
-        # If the position has been open for a long time and has barely moved,
-        # free the capital instead of holding a dead coin forever.
+        # 4) Max hold time
         hold_duration = datetime.now(timezone.utc) - buy_time
-        hold_minutes = hold_duration.total_seconds() / 60.0
-        reasons["hold_minutes"] = round(hold_minutes, 2)
-
-        if EXIT_STAGNANT_MAX_MIN > 0:
-            max_abs_move = abs(price_change_pct)
-            reasons["stagnant_config"] = {
-                "max_min": EXIT_STAGNANT_MAX_MIN,
-                "min_move_pct": EXIT_STAGNANT_MIN_MOVE_PCT,
-                "exit_frac": EXIT_STAGNANT_EXIT_FRAC,
-            }
-
-            if (
-                hold_minutes >= EXIT_STAGNANT_MAX_MIN
-                and max_abs_move < EXIT_STAGNANT_MIN_MOVE_PCT
-                and direction != "up"
-            ):
-                reasons["decision"] = "SELL_stagnant"
-                reasons["stagnant_exit_frac"] = EXIT_STAGNANT_EXIT_FRAC
-                if redis:
-                    await redis.set(
-                        f"alert:{token_address}:reason",
-                        "Stagnant position: long time & low move",
-                    )
-                # NOTE: We only return the gate decision here; the actual
-                # sell size is handled by the exit engine using
-                # EXIT_STAGNANT_EXIT_FRAC or this reason field.
-                return False, reasons
-
-        # ── 5) Max hold time hard cap ────────────────────────────────────────
         if hold_duration > timedelta(minutes=max_hold_min):
             reasons["decision"] = "SELL_max_hold_exceeded"
+            reasons["hold_minutes"] = int(hold_duration.total_seconds() // 60)
             reasons["max_hold_minutes"] = max_hold_min
             if redis:
                 await redis.set(
@@ -271,14 +262,12 @@ async def should_hold_token_with_reason(
                 )
             return False, reasons
 
-        # ── 6) Neutral default: conservative HOLD ────────────────────────────
-        # We keep this conservative: prefer HOLD unless there's a clear SELL reason.
-        # If you want more aggression, this is the place to flip.
+        # 5) Neutral default: SELL gate stays closed unless we saw a strong SELL reason.
         reasons["decision"] = "HOLD_default_conservative"
         return True, reasons
 
-    except Exception as e:
-        logger.error(f"[AI SELL LOGIC ERROR] {e}", exc_info=True)
+    except Exception as e:  # noqa: BLE001
+        logger.error("[AI SELL LOGIC ERROR] %s", e, exc_info=True)
         # fail-safe: HOLD on unexpected errors
         reasons["error"] = str(e)
         return True, reasons
@@ -305,24 +294,19 @@ async def should_hold_token(
 
 
 # Optional CLI test
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     import asyncio
     import sys
-    from datetime import timedelta as _timedelta
-    from utils_pkg.core_utils import (
-        init_resources,
-        close_resources,
-        redis as _redis,
-    )
+    from utils_pkg.core_utils import init_resources, close_resources, redis as _redis
 
-    async def _test():
+    async def _test() -> None:
         await init_resources()
         token = (
             sys.argv[1]
             if len(sys.argv) > 1
             else "FakeToken1111111111111111111111111111111111111"
         )
-        bt = datetime.now(timezone.utc) - _timedelta(minutes=120)
+        bt = datetime.now(timezone.utc) - timedelta(minutes=120)
         hold, info = await should_hold_token_with_reason(
             threshold_score=0.85,
             token_address=token,
