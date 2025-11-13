@@ -8,8 +8,19 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log(){ printf '[start] %s %s\n' "$(ts)" "$*"; }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 0) Load env from .env and any /etc/secrets/* files
+# 0) Load env-style secrets from /etc/secrets (like .env.extra), THEN .env
 # ──────────────────────────────────────────────────────────────────────────────
+
+# 0a) env-style secret file mounted by Render (your extra vars)
+if [[ -f /etc/secrets/.env.extra ]]; then
+  log "sourcing env secret file: /etc/secrets/.env.extra"
+  set -a
+  # shellcheck disable=SC1091
+  . /etc/secrets/.env.extra
+  set +a
+fi
+
+# 0b) normal .env in repo (optional)
 set -a
 
 # Local .env (optional)
