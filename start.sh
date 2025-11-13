@@ -8,11 +8,20 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log(){ printf '[start] %s %s\n' "$(ts)" "$*"; }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 0) Load env from .env and any /etc/secrets/* files
+# 0) Load env-style secrets from /etc/secrets (like .env.extra), THEN .env
 # ──────────────────────────────────────────────────────────────────────────────
-set -a
 
-# Local .env (optional)
+# 0a) env-style secret file mounted by Render (your extra vars)
+if [[ -f /etc/secrets/.env.extra ]]; then
+  log "sourcing env secret file: /etc/secrets/.env.extra"
+  set -a
+  # shellcheck disable=SC1091
+  . /etc/secrets/.env.extra
+  set +a
+fi
+
+# 0b) normal .env in repo (optional)
+set -a
 if [[ -f .env ]]; then
   # shellcheck disable=SC1091
   . ./.env
@@ -20,26 +29,6 @@ if [[ -f .env ]]; then
 else
   log "no .env found (ok if using Render dashboard env)"
 fi
-
-# Render “Secret file(s)” (mounted under /etc/secrets/<name>)
-# Only source files that LOOK like KEY=VALUE env files.
-if compgen -G "/etc/secrets/*" > /dev/null; then
-  for f in /etc/secrets/*; do
-    if [[ -f "$f" ]]; then
-      first_line="$(head -n 1 "$f" || true)"
-      if printf '%s\n' "$first_line" | grep -q '='; then
-        log "sourcing env-style secret file: $f"
-        # shellcheck disable=SC1090
-        . "$f"
-      else
-        log "skipping non-env secret file: $f (first line has no '=')"
-      fi
-    fi
-  done
-else
-  log "no /etc/secrets/* files found"
-fi
-
 set +a
 
 log "booting…"
