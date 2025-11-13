@@ -22,12 +22,18 @@ else
 fi
 
 # Render “Secret file(s)” (mounted under /etc/secrets/<name>)
+# Only source files that LOOK like KEY=VALUE env files.
 if compgen -G "/etc/secrets/*" > /dev/null; then
   for f in /etc/secrets/*; do
     if [[ -f "$f" ]]; then
-      log "sourcing secret file: $f"
-      # shellcheck disable=SC1090
-      . "$f"
+      first_line="$(head -n 1 "$f" || true)"
+      if printf '%s\n' "$first_line" | grep -q '='; then
+        log "sourcing env-style secret file: $f"
+        # shellcheck disable=SC1090
+        . "$f"
+      else
+        log "skipping non-env secret file: $f (first line has no '=')"
+      fi
     fi
   done
 else
