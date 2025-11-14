@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# start.sh — Render entrypoint (end-to-end, hardened)
-
 set -Eeuo pipefail
 IFS=$'\n\t'
 
