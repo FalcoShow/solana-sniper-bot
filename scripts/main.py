@@ -1034,21 +1034,39 @@ async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
 # ---------------------------
 class Strategy:
     def __init__(self) -> None:
-        self._sema = asyncio.Semaphore(max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2)))
-        self._gate_sema = asyncio.Semaphore(max(1, _as_int(os.getenv("ENTRY_MOMENTUM_MAX_PARALLEL", os.getenv("ENTRY_MOMO_MAX_PARALLEL","6")), 6)))
+        # How many buys can run in parallel
+        self._sema = asyncio.Semaphore(
+            max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2))
+        )
+        # How many momentum gates can run in parallel
+        self._gate_sema = asyncio.Semaphore(
+            max(
+                1,
+                _as_int(
+                    os.getenv(
+                        "ENTRY_MOMENTUM_MAX_PARALLEL",
+                        os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"),
+                    ),
+                    6,
+                ),
+            )
+        )
+        # Per-mint state while we observe trades/prices in the window
         self._gate_state: Dict[str, Dict[str, Any]] = {}
+
+        # Diagnostics
         self._diag = {
             "events_total": 0,
             "events_trade": 0,
             "events_new_token": 0,
             "rejected_filters": 0,
             "rejected_guardrails": 0,
-            "rejected_momo": 0,
+            "rejected_momo": 0,          # includes no-data skips
             "buys_submitted": 0,
             "buys_filled": 0,
         }
 
-    # --- DIAGNOSTICS ---
+    # --- DIAGNOSTICS -----------------------------------------------------
     async def diag_loop(self, stop_evt: asyncio.Event, interval_s: float = 60.0) -> None:
         last_total = 0
         while not stop_evt.is_set():
@@ -1069,40 +1087,69 @@ class Strategy:
                 buys_fill=self._diag["buys_filled"],
             )
 
+    # --- TRADE TICKS (for momo counts) ----------------------------------
     async def on_trade(self, raw_event: Dict[str, Any]) -> None:
         self._diag["events_total"] += 1
         self._diag["events_trade"] += 1
+
         if _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True):
             try:
                 await exit_engine.on_trade_tick(raw_event)
             except Exception:
                 if _as_bool(os.getenv("PF_DEBUG_TX", "0"), False):
                     traceback.print_exc()
-        m = str(_get_first(raw_event, "mint", "mintAddress", "mint_address", "id", default="")).strip()
+
+        m = str(
+            _get_first(
+                raw_event,
+                "mint",
+                "mintAddress",
+                "mint_address",
+                "id",
+                default="",
+            )
+        ).strip()
         if not m:
             return
+
         st = self._gate_state.get(m)
         if st is not None:
             st["trades"] = int(st.get("trades", 0)) + 1
 
+    # --- MOMENTUM GATE ---------------------------------------------------
     async def _gate_candidate(self, ui: Dict[str, Any], mint_raw: str, mint_norm: str) -> None:
         DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
         PF_GATE_TTL_SEC = _as_int(os.getenv("PF_GATE_TTL_SEC", "60"), 60)
+
         ENTRY_MOMO_WINDOW_SEC = _as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10)
         ENTRY_MOMO_PRICE_TRIES = _as_int(os.getenv("ENTRY_MOMO_PRICE_TRIES", "4"), 4)
-        ENTRY_MOMO_PRICE_DELAY_S = _as_float(os.getenv("ENTRY_MOMO_PRICE_DELAY_S", "0.7"), 0.7)
-        ENTRY_MOMO_MIN_TRADES = _as_int(os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6)
-        ENTRY_MOMO_MIN_UP_PCT = _as_float(os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0)
+        ENTRY_MOMO_PRICE_DELAY_S = _as_float(
+            os.getenv("ENTRY_MOMO_PRICE_DELAY_S", "0.7"), 0.7
+        )
+        ENTRY_MOMO_MIN_TRADES = _as_int(
+            os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6
+        )
+        ENTRY_MOMO_MIN_UP_PCT = _as_float(
+            os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0
+        )
+
         IS_DRYRUN = (_dryrun_env_on() or _pkg_is_dryrun)
 
         async with self._gate_sema:
+            # Dedupe gating per mint
             if _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True):
                 if not claim_once(f"gate:{mint_norm}", ttl=int(PF_GATE_TTL_SEC)):
                     if DEBUG_TX:
-                        print(f".[dedupe] gate already running for {mint_norm} — skip", flush=True)
+                        print(
+                            f".[dedupe] gate already running for {mint_norm} — skip",
+                            flush=True,
+                        )
                     return
 
+            # Initialise gate state for this mint
             self._gate_state[mint_raw] = {"trades": 0, "price0": 0.0}
+
+            # First price sample (price0)
             price0 = 0.0
             if _is_probable_mint(mint_norm):
                 for _ in range(max(1, ENTRY_MOMO_PRICE_TRIES)):
@@ -1115,9 +1162,14 @@ class Strategy:
                     await asyncio.sleep(ENTRY_MOMO_PRICE_DELAY_S)
 
             self._gate_state[mint_raw]["price0"] = price0
+
+            # Wait the momentum window
             await asyncio.sleep(max(1, ENTRY_MOMO_WINDOW_SEC))
+
+            # Snapshot state after the window
             st = self._gate_state.get(mint_raw, {})
             trades = int(st.get("trades", 0))
+
             price1 = 0.0
             if _is_probable_mint(mint_norm):
                 try:
@@ -1125,10 +1177,28 @@ class Strategy:
                 except Exception:
                     price1 = 0.0
 
-            up_ok = True
-            if price0 > 0 and price1 > 0:
-                up_pct = ((price1 / price0) - 1.0) * 100.0
-                up_ok = up_pct >= ENTRY_MOMO_MIN_UP_PCT
+            # Always clear gate state for this mint from here
+            self._gate_state.pop(mint_raw, None)
+
+            # ---- STRICT NO-DATA / DEAD-COIN GUARD -----------------------
+            if price0 <= 0.0 or price1 <= 0.0 or trades == 0:
+                log.event(
+                    "MOMO_SKIP_NO_DATA",
+                    mint=mint_raw,
+                    trades=trades,
+                    price0=price0,
+                    price1=price1,
+                    min_trades=ENTRY_MOMO_MIN_TRADES,
+                    min_up_pct=ENTRY_MOMO_MIN_UP_PCT,
+                )
+                record_buy_result(ok=False, reason="momo_no_data")
+                self._diag["rejected_momo"] += 1
+                return
+
+            # Compute percentage move over the window
+            pct_up = ((price1 / price0) - 1.0) * 100.0
+
+            up_ok = pct_up >= ENTRY_MOMO_MIN_UP_PCT
             trades_ok = trades >= ENTRY_MOMO_MIN_TRADES
 
             log.event(
@@ -1137,17 +1207,26 @@ class Strategy:
                 trades=trades,
                 price0=price0,
                 price1=price1,
+                pct_up=pct_up,
                 min_trades=ENTRY_MOMO_MIN_TRADES,
                 min_up_pct=ENTRY_MOMO_MIN_UP_PCT,
                 up_ok=int(up_ok),
                 trades_ok=int(trades_ok),
             )
-            self._gate_state.pop(mint_raw, None)
 
-            # Guardrails
+            # If it doesn't meet momentum conditions, bail out
+            if not (up_ok and trades_ok):
+                record_buy_result(ok=False, reason="momo_reject")
+                self._diag["rejected_momo"] += 1
+                return
+
+            # ---- Guardrails before executing a buy ----------------------
             if not buys_allowed() or _as_bool(os.getenv("PAUSE_TRADING", "0"), False):
                 if DEBUG_TX:
-                    print("[guardrails] buys not allowed at gate decision — skip", flush=True)
+                    print(
+                        "[guardrails] buys not allowed at gate decision — skip",
+                        flush=True,
+                    )
                 record_buy_result(ok=False, reason="guardrails_halt")
                 self._diag["rejected_guardrails"] += 1
                 return
@@ -1163,39 +1242,50 @@ class Strategy:
                 except Exception:
                     pass
 
-            if trades_ok and up_ok:
-                if _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True) and not claim_once(f"buy:{mint_norm}", ttl=int(_as_int(os.getenv("PF_BUY_TTL_SEC", "600"), 600))):
+            # Dedupe final buy
+            if _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True):
+                if not claim_once(
+                    f"buy:{mint_norm}",
+                    ttl=int(_as_int(os.getenv("PF_BUY_TTL_SEC", "600"), 600)),
+                ):
                     if DEBUG_TX:
-                        print(f".[dedupe] buy already claimed for {mint_norm} — skip", flush=True)
+                        print(
+                            f".[dedupe] buy already claimed for {mint_norm} — skip",
+                            flush=True,
+                        )
                     record_buy_result(ok=False, reason="buy_claimed_elsewhere")
                     return
 
-                # *** KEY CHANGE: do NOT short-circuit for DRYRUN here. ***
-                try:
-                    async with self._sema:
-                        tx_sig = await maybe_buy(
-                            mint=mint_norm,
-                            ui=ui | {"dryrun": IS_DRYRUN},
-                            on_buy_submitted=_buy_hook_submitted,
-                            on_buy_filled=_buy_hook_filled,
-                            on_buy_failed=_buy_hook_failed,
+            # ---- Execute buy via router / maybe_buy ---------------------
+            try:
+                async with self._sema:
+                    tx_sig = await maybe_buy(
+                        mint=mint_norm,
+                        ui=ui | {"dryrun": IS_DRYRUN},
+                        on_buy_submitted=_buy_hook_submitted,
+                        on_buy_filled=_buy_hook_filled,
+                        on_buy_failed=_buy_hook_failed,
+                    )
+                self._diag["buys_submitted"] += 1
+
+                if tx_sig:
+                    # Fire submitted hook again as a safety net
+                    try:
+                        await _buy_hook_submitted({"mint": mint_norm, **ui})
+                    except Exception:
+                        pass
+
+                    ok, info = await _confirm_sig(tx_sig)
+                    if ok:
+                        log.info(
+                            "BUY_FILLED",
+                            extra={"mint": mint_norm, "tx_sig": tx_sig, "slot": info},
                         )
-                    self._diag["buys_submitted"] += 1
 
-                    if tx_sig:
+                        # Alerts (Telegram/Notion)
                         try:
-                            await _buy_hook_submitted({"mint": mint_norm, **ui})
-                        except Exception:
-                            pass
-
-                        ok, info = await _confirm_sig(tx_sig)
-                        if ok:
-                            # Keep this log (your earlier logs show BUY_FILLED at ~1219)
-                            log.info("BUY_FILLED", extra={"mint": mint_norm, "tx_sig": tx_sig, "slot": info})
-
-                            # Fire alert for BUY_FILLED here as well (belt & suspenders)
-                            try:
-                                create_task(_am().notify_trade_fill(
+                            create_task(
+                                _am().notify_trade_fill(
                                     side="BUY",
                                     mint=mint_norm,
                                     symbol=ui.get("symbol"),
@@ -1203,40 +1293,50 @@ class Strategy:
                                     sig=tx_sig,
                                     spend_sol=ui.get("spend_sol"),
                                     out_amount=ui.get("amount_raw"),
-                                ))
-                            except Exception as _e:
-                                log.warning("ALERT_BUY_FILLED_FAIL", extra={"err": str(_e)[:200]})
+                                )
+                            )
+                        except Exception as _e:
+                            log.warning(
+                                "ALERT_BUY_FILLED_FAIL",
+                                extra={"err": str(_e)[:200]},
+                            )
 
-                            try:
-                                await exit_engine.on_buy_filled(mint=mint_norm, ui=ui, tx_sig=tx_sig)
-                            except Exception:
-                                pass
-                            self._diag["buys_filled"] += 1
-                            record_buy_result(ok=True, reason="executed", sig=tx_sig)
-                            asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
-                        else:
-                            log.error("BUY_FAILED", extra={"mint": mint_norm, "tx_sig": tx_sig, "reason": info})
-                            try:
-                                await _buy_hook_failed({"mint": mint_norm, "reason": info, **ui})
-                            except Exception:
-                                pass
-                            record_buy_result(ok=False, reason=info)
+                        # Exit engine hook
+                        try:
+                            await exit_engine.on_buy_filled(
+                                mint=mint_norm, ui=ui, tx_sig=tx_sig
+                            )
+                        except Exception:
+                            pass
+
+                        self._diag["buys_filled"] += 1
+                        record_buy_result(ok=True, reason="executed", sig=tx_sig)
+                        asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
                     else:
-                        # DRYRUN path naturally returns None from the impl — treat distinctly.
-                        if IS_DRYRUN:
-                            log.event("BUY_DRYRUN_EXIT", mint=mint_norm)
-                            record_buy_result(ok=False, reason="dryrun_exit")
-                        else:
-                            record_buy_result(ok=False, reason="no_tx_sig")
+                        log.error(
+                            "BUY_FAILED",
+                            extra={"mint": mint_norm, "tx_sig": tx_sig, "reason": info},
+                        )
+                        try:
+                            await _buy_hook_failed(
+                                {"mint": mint_norm, "reason": info, **ui}
+                            )
+                        except Exception:
+                            pass
+                        record_buy_result(ok=False, reason=info)
+                else:
+                    # DRYRUN path usually returns None
+                    if IS_DRYRUN:
+                        log.event("BUY_DRYRUN_EXIT", mint=mint_norm)
+                        record_buy_result(ok=False, reason="dryrun_exit")
+                    else:
+                        record_buy_result(ok=False, reason="no_tx_sig")
 
-                except Exception:
-                    traceback.print_exc()
-                    record_buy_result(ok=False, reason="exception")
+            except Exception:
+                traceback.print_exc()
+                record_buy_result(ok=False, reason="exception")
 
-            else:
-                record_buy_result(ok=False, reason="momo_reject")
-                self._diag["rejected_momo"] += 1
-
+    # --- NEW TOKENS (entry point for gating) -----------------------------
     async def on_new_token(self, raw_event: Dict[str, Any]) -> None:
         DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
         IS_DRYRUN = (_dryrun_env_on() or _pkg_is_dryrun)
@@ -1244,6 +1344,7 @@ class Strategy:
         self._diag["events_total"] += 1
         self._diag["events_new_token"] += 1
 
+        # Top-level guardrails
         if _as_bool(os.getenv("PAUSE_TRADING", "0"), False) or not buys_allowed():
             if DEBUG_TX:
                 print("[guardrails] buys not allowed now — skip", flush=True)
@@ -1260,6 +1361,7 @@ class Strategy:
             except Exception:
                 pass
 
+        # Extract and normalise mint
         mint_source = _extract_raw_mint(raw_event)
         if not mint_source:
             if DEBUG_TX:
@@ -1269,30 +1371,51 @@ class Strategy:
         mint_norm = _normalize_from_source(mint_source)
         if not _is_probable_mint(mint_norm):
             if DEBUG_TX:
-                print(f"[strategy] implausible mint after normalize => skip ({mint_source})", flush=True)
+                print(
+                    f"[strategy] implausible mint after normalize => skip ({mint_source})",
+                    flush=True,
+                )
             return
 
+        # Static filters (age, mc, renounce, etc.)
         if not _passes_basic_filters(raw_event):
             self._diag["rejected_filters"] += 1
             return
 
+        # Liquidity screen
         dec_from_liq: Optional[int] = None
         if _as_bool(os.getenv("ENTRY_LIQ_FILTER", "1"), True):
             ok, rep = await _screen_with_retry(mint_norm, tries=3, first_wait=0.8)
             if not ok and str((rep or {}).get("reason")) == "no_account":
-                dec_from_liq = await _await_mint_ready(mint_norm, max_wait_s=45, step_s=3.0)
+                # Fresh bond curve: wait a bit for mint to become readable
+                dec_from_liq = await _await_mint_ready(
+                    mint_norm, max_wait_s=45, step_s=3.0
+                )
                 if dec_from_liq is not None:
                     ok = True
-                    rep = {"ok": True, "reason": "await_mint_ready", "decimals": dec_from_liq}
+                    rep = {
+                        "ok": True,
+                        "reason": "await_mint_ready",
+                        "decimals": dec_from_liq,
+                    }
+
             if not ok:
                 if DEBUG_TX:
                     print(f"[liquidity] screen failed for {mint_norm}: {rep}", flush=True)
                 self._diag["rejected_filters"] += 1
                 return
+
             if dec_from_liq is None:
                 dec_from_liq = (rep or {}).get("decimals")
-            log.event("ENTRY_LIQ_OK", mint=mint_norm, priceImpactPct=(rep or {}).get("priceImpactPct"), dec=dec_from_liq)
 
+            log.event(
+                "ENTRY_LIQ_OK",
+                mint=mint_norm,
+                priceImpactPct=(rep or {}).get("priceImpactPct"),
+                dec=dec_from_liq,
+            )
+
+        # Build UI payload / context for downstream
         ui: Dict[str, Any] = dict(raw_event)
         ui.setdefault("pool", (raw_event.get("pool") or "pump").lower())
         ui.setdefault("symbol", _extract_symbol(raw_event))
@@ -1303,28 +1426,50 @@ class Strategy:
         if dec_from_liq is not None:
             ui["decimals"] = dec_from_liq
 
-        print(f"[trade] pool={ui.get('pool','?')} symbol={(ui.get('symbol') or '?')} mint={mint_norm}", flush=True)
+        print(
+            f"[trade] pool={ui.get('pool','?')} "
+            f"symbol={(ui.get('symbol') or '?')} mint={mint_norm}",
+            flush=True,
+        )
 
-        if _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True) and _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True):
-            if not claim_once(f"gate-propose:{mint_norm}", ttl=int(_as_int(os.getenv("PF_GATE_TTL_SEC", "60"), 60))):
+        # Dedupe gate proposals
+        if _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True) and _as_bool(
+            os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True
+        ):
+            if not claim_once(
+                f"gate-propose:{mint_norm}",
+                ttl=int(_as_int(os.getenv("PF_GATE_TTL_SEC", "60"), 60)),
+            ):
                 if DEBUG_TX:
-                    print(f".[dedupe] gate-propose taken for {mint_norm} — skip", flush=True)
+                    print(
+                        f".[dedupe] gate-propose taken for {mint_norm} — skip", flush=True
+                    )
                 return
 
+        # Momentum enabled → send into gate; otherwise buy immediately
         if _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True):
             asyncio.create_task(self._gate_candidate(ui, mint_source, mint_norm))
         else:
-            if _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True) and not claim_once(f"buy:{mint_norm}", ttl=int(_as_int(os.getenv("PF_BUY_TTL_SEC", "600"), 600))):
+            # Direct-buy path, still respecting dedupe/guardrails
+            if _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True) and not claim_once(
+                f"buy:{mint_norm}",
+                ttl=int(_as_int(os.getenv("PF_BUY_TTL_SEC", "600"), 600)),
+            ):
                 if DEBUG_TX:
-                    print(f".[dedupe] buy already claimed for {mint_norm} — skip", flush=True)
+                    print(
+                        f".[dedupe] buy already claimed for {mint_norm} — skip",
+                        flush=True,
+                    )
                 return
 
-            # *** KEY CHANGE: do NOT short-circuit for DRYRUN here. ***
             async with self._sema:
                 try:
                     if _as_bool(os.getenv("PAUSE_TRADING", "0"), False) or not buys_allowed():
                         if DEBUG_TX:
-                            print("[guardrails] buys not allowed at execution — skip", flush=True)
+                            print(
+                                "[guardrails] buys not allowed at execution — skip",
+                                flush=True,
+                            )
                         self._diag["rejected_guardrails"] += 1
                         return
 
@@ -1355,32 +1500,47 @@ class Strategy:
 
                         ok, info = await _confirm_sig(tx_sig)
                         if ok:
-                            log.info("BUY_FILLED", extra={"mint": mint_norm, "tx_sig": tx_sig, "slot": info})
+                            log.info(
+                                "BUY_FILLED",
+                                extra={"mint": mint_norm, "tx_sig": tx_sig, "slot": info},
+                            )
 
                             try:
-                                create_task(_am().notify_trade_fill(
-                                    side="BUY",
-                                    mint=mint_norm,
-                                    symbol=ui.get("symbol"),
-                                    pool=ui.get("pool") or "unknown",
-                                    sig=tx_sig,
-                                    spend_sol=ui.get("spend_sol"),
-                                    out_amount=ui.get("amount_raw"),
-                                ))
+                                create_task(
+                                    _am().notify_trade_fill(
+                                        side="BUY",
+                                        mint=mint_norm,
+                                        symbol=ui.get("symbol"),
+                                        pool=ui.get("pool") or "unknown",
+                                        sig=tx_sig,
+                                        spend_sol=ui.get("spend_sol"),
+                                        out_amount=ui.get("amount_raw"),
+                                    )
+                                )
                             except Exception as _e:
-                                log.warning("ALERT_BUY_FILLED_FAIL", extra={"err": str(_e)[:200]})
+                                log.warning(
+                                    "ALERT_BUY_FILLED_FAIL",
+                                    extra={"err": str(_e)[:200]},
+                                )
 
                             try:
-                                await exit_engine.on_buy_filled(mint=mint_norm, ui=ui, tx_sig=tx_sig)
+                                await exit_engine.on_buy_filled(
+                                    mint=mint_norm, ui=ui, tx_sig=tx_sig
+                                )
                             except Exception:
                                 pass
                             self._diag["buys_filled"] += 1
                             record_buy_result(ok=True, reason="executed", sig=tx_sig)
                             asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
                         else:
-                            log.error("BUY_FAILED", extra={"mint": mint_norm, "tx_sig": tx_sig, "reason": info})
+                            log.error(
+                                "BUY_FAILED",
+                                extra={"mint": mint_norm, "tx_sig": tx_sig, "reason": info},
+                            )
                             try:
-                                await _buy_hook_failed({"mint": mint_norm, "reason": info, **ui})
+                                await _buy_hook_failed(
+                                    {"mint": mint_norm, "reason": info, **ui}
+                                )
                             except Exception:
                                 pass
                             record_buy_result(ok=False, reason=info)
@@ -1395,6 +1555,7 @@ class Strategy:
                     traceback.print_exc()
                     record_buy_result(ok=False, reason="exception")
 
+        # Cooldown between processing new tokens
         await asyncio.sleep(_as_float(os.getenv("PF_COOLDOWN_SEC", "15"), 15.0))
 
 # ---------------------------
