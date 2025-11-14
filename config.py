@@ -4,12 +4,14 @@
 # - Backward-compat aliases (PG_DSN*, NOTION_* aliases, RAYDIUM_PAIRS_API, etc.)
 # - Switches for AI scoring, adaptive sell, scanners, social, whale filters, daytrader
 # - Storage: Redis + SQLite + optional Postgres
+
 from __future__ import annotations
 
 import os
 import json
 import logging
 from typing import Dict, List
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -80,6 +82,7 @@ STRICT_CONFIG = _get_bool("STRICT_CONFIG", False)
 ENABLE_METRICS = _get_bool("ENABLE_METRICS", True)
 METRICS_PORT = _get_int("METRICS_PORT", 9108)
 
+
 # ---------------------------------------------------------------------------
 # RPC / chain
 # ---------------------------------------------------------------------------
@@ -101,6 +104,7 @@ JITO_BLOCK_ENGINE_URL = os.getenv("JITO_BLOCK_ENGINE_URL", "")
 JITO_TIP_LAMPORTS = _get_int("JITO_TIP_LAMPORTS", 50_000)  # ~0.00005 SOL
 JITO_FEE_MICROLAMPORTS = _get_int("JITO_FEE_MICROLAMPORTS", 0)  # optional CU price
 
+
 # ---------------------------------------------------------------------------
 # Wallet(s)
 # ---------------------------------------------------------------------------
@@ -109,6 +113,7 @@ JITO_FEE_MICROLAMPORTS = _get_int("JITO_FEE_MICROLAMPORTS", 0)  # optional CU pr
 WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY", "")
 WALLET_PUBKEY = os.getenv("WALLET_PUBKEY", os.getenv("WALLET_PUBLIC_KEY", ""))
 SAVINGS_WALLET = os.getenv("SAVINGS_WALLET", "")
+
 
 # ---------------------------------------------------------------------------
 # External APIs / scanners
@@ -143,6 +148,7 @@ PUMPFUN_DOM_LIMIT = _get_int("PUMPFUN_DOM_LIMIT", PUMPFUN_API_LIMIT)
 PUMPFUN_SKIP_NEXT = _get_bool("PUMPFUN_SKIP_NEXT", False)
 PUMPFUN_SKIP_HTMLNEXT = _get_bool("PUMPFUN_SKIP_HTMLNEXT", False)
 
+
 # ---------------------------------------------------------------------------
 # Jupiter v6 / router
 # ---------------------------------------------------------------------------
@@ -159,6 +165,7 @@ JUP_PRO_KEY = os.getenv("JUP_PRO_KEY", os.getenv("JUP_API_KEY", ""))
 JUPITER_API_BASE = os.getenv("JUPITER_API_BASE", "https://quote-api.jup.ag/v6")
 JUPITER_QUOTE_API = os.getenv("JUPITER_QUOTE_API", f"{JUPITER_API_BASE}/quote")
 JUPITER_SWAP_API = os.getenv("JUPITER_SWAP_API", JUPITER_API_BASE)
+
 
 # ---------------------------------------------------------------------------
 # Credentials / keys
@@ -194,6 +201,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
 FINE_TUNED_MODEL = os.getenv("FINE_TUNED_MODEL", "")
 
+
 # ---------------------------------------------------------------------------
 # Storage
 # ---------------------------------------------------------------------------
@@ -217,6 +225,7 @@ PG_DSN = os.getenv("PG_DSN", "")
 PG_DSN_INTERNAL = os.getenv("PG_DSN_INTERNAL", "")
 PG_DSN_EXTERNAL = os.getenv("PG_DSN_EXTERNAL", "")
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", PG_DSN or PG_DSN_INTERNAL or PG_DSN_EXTERNAL)
+
 
 # ---------------------------------------------------------------------------
 # Trading / execution (shared)
@@ -267,26 +276,32 @@ REINVESTMENT_VOLUME_MIN = _get_float("REINVESTMENT_VOLUME_MIN", 5_000.0)
 REINVESTMENT_MIN_PROFIT_SOL = _get_float("REINVESTMENT_MIN_PROFIT_SOL", 0.01)
 REINVESTMENT_HONEYPOT_CHECK = _get_bool("REINVESTMENT_HONEYPOT_CHECK", True)
 
+
 # ---------------------------------------------------------------------------
-# Sniper loop / scanners tuning (matches sniper/sniper.py v10.1)
+# Sniper loop / scanners tuning (matches sniper/sniper.py)
 # ---------------------------------------------------------------------------
 
 # Scan cadence
-SCAN_INTERVAL = _get_int("SCAN_INTERVAL", 60)  # general use
-SCANNER_PERIOD_SEC = _get_int("SCANNER_PERIOD_SEC", 15)  # sniper main loop
+SCAN_INTERVAL = _get_int("SCAN_INTERVAL", 60)           # generic
+SCANNER_PERIOD_SEC = _get_int("SCANNER_PERIOD_SEC", 4)  # main loop
 
 # Buy / concurrency
-BUY_COOLDOWN_SEC = _get_int("BUY_COOLDOWN_SEC", 120)
+BUY_COOLDOWN_SEC = _get_int("BUY_COOLDOWN_SEC", 3)
 MAX_CONCURRENT_BUYS = _get_int("MAX_CONCURRENT_BUYS", 2)
-PREWARM_TOP_N = _get_int("PREWARM_TOP_N", 8)
+# PF_MAX_CONCURRENT is what the pipeline actually uses; expose as alias
+PF_MAX_CONCURRENT = _get_int("PF_MAX_CONCURRENT", MAX_CONCURRENT_BUYS)
+
+PREWARM_TOP_N = _get_int("PREWARM_TOP_N", 5)
 
 # Global min-liquidity filter used by scanners + sniper basic filters
-SCANNER_MIN_LIQ_USD = _get_float("SCANNER_MIN_LIQ_USD", 1_000.0)
+SCANNER_MIN_LIQ_USD = _get_float("SCANNER_MIN_LIQ_USD", 3_500.0)
 # Local per-sniper filter (defaults to scanner min-liq)
 MIN_LIQ_USD = _get_float("MIN_LIQ_USD", SCANNER_MIN_LIQ_USD)
+# Alias for old typo used in summarize()
+LIQ_MIN_USD = MIN_LIQ_USD
 
 # Basic pool filters
-MIN_POOL_AGE_MIN = _get_int("MIN_POOL_AGE_MIN", 0)
+MIN_POOL_AGE_MIN = _get_int("MIN_POOL_AGE_MIN", 1)
 
 # RouteGuard cooldown (no-route backoff)
 NOROUTE_COOLDOWN_SEC = _get_int("NOROUTE_COOLDOWN_SEC", 600)
@@ -298,11 +313,13 @@ ALLOWLIST_MINTS = _get_list("ALLOWLIST_MINTS", [])
 # Strategy preset
 STRATEGY_PRESET = os.getenv("STRATEGY_PRESET", "max-pnl").lower()
 
-# Heartbeats / Telegram
+# Heartbeats / Telegram / PnL
 TELEGRAM_HEARTBEATS = _get_bool("TELEGRAM_HEARTBEATS", True)
 HEARTBEAT_EVERY_SEC = _get_int("HEARTBEAT_EVERY_SEC", 300)
 HEARTBEAT_ONLY_ON_CHANGE = _get_bool("HEARTBEAT_ONLY_ON_CHANGE", True)
 TELEGRAM_NOTIFY_ROUTE_BLOCKS = _get_bool("TELEGRAM_NOTIFY_ROUTE_BLOCKS", True)
+
+PNL_TELEGRAM_HEARTBEAT = _get_bool("PNL_TELEGRAM_HEARTBEAT", True)
 
 # Moonshot budget (tiny new/low-liq plays)
 MOONSHOT_ENABLED = _get_bool("MOONSHOT_ENABLED", True)
@@ -311,6 +328,7 @@ MOONSHOT_MAX_TRADE_USD = _get_float("MOONSHOT_MAX_TRADE_USD", 25.0)
 MOONSHOT_AGE_CUTOFF_MIN = _get_int("MOONSHOT_AGE_CUTOFF_MIN", 30)
 MOONSHOT_LIQ_CUTOFF_USD = _get_float("MOONSHOT_LIQ_CUTOFF_USD", 20_000.0)
 MOONSHOT_IMPACT_CUTOFF_BPS = _get_float("MOONSHOT_IMPACT_CUTOFF_BPS", 150.0)
+
 
 # ---------------------------------------------------------------------------
 # Scanners / arbitrage
@@ -372,6 +390,7 @@ X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "")
 TELEGRAM_SCRAPE_BOT = os.getenv("TELEGRAM_SCRAPE_BOT", "")
 DISCORD_SEARCH_CHANNEL_ID = os.getenv("DISCORD_SEARCH_CHANNEL_ID", "")
 
+
 # ---------------------------------------------------------------------------
 # Daytrader (pro)
 # ---------------------------------------------------------------------------
@@ -400,6 +419,7 @@ DT_TRAILING_BPS = _get_int("DT_TRAILING_BPS", 50)
 DT_COOLDOWN_SEC = _get_int("DT_COOLDOWN_SEC", 60)
 DT_PAPER_TRADING = _get_bool("DT_PAPER_TRADING", True)
 
+
 # ---------------------------------------------------------------------------
 # Compat exports / aliases
 # ---------------------------------------------------------------------------
@@ -408,6 +428,7 @@ DT_PAPER_TRADING = _get_bool("DT_PAPER_TRADING", True)
 RAYDIUM_PAIRS_API = RAYDIUM_API_URL          # alias expected by old raydium scanner
 DEXSCREENER_TOKENS_API = DEXSCREENER_API_URL
 PUMPFUN_TOKENS_API = PUMPFUN_API_URL
+
 
 # ---------------------------------------------------------------------------
 # Validation (optional)
@@ -430,6 +451,7 @@ elif _missing:
     logging.getLogger(__name__).warning(
         "⚠️ Missing env vars (running in non-strict mode): %s", ", ".join(_missing)
     )
+
 
 # ---------------------------------------------------------------------------
 # Summary helper
@@ -469,11 +491,11 @@ def summarize():
             "min_fraud_score": SCANNER_MIN_FRAUD_SCORE,
             "alerts": SCANNER_ALERTS_ENABLED,
 
-            # volume & buys – loosened defaults for phase-1
-            "min_buys_5m": int(os.getenv("SCANNER_MIN_BUYS_5M", "3")),        # was 5
-            "min_buys_15m": int(os.getenv("SCANNER_MIN_BUYS_15M", "5")),      # was 8
-            "min_vol_5m": float(os.getenv("SCANNER_MIN_VOLUME_5M_USD", "1000")),   # was 2500
-            "min_vol_15m": float(os.getenv("SCANNER_MIN_VOLUME_15M_USD", "2000")), # was 5000
+            # volume & buys – loosened defaults can be overridden via env
+            "min_buys_5m": int(os.getenv("SCANNER_MIN_BUYS_5M", "3")),        # default 3
+            "min_buys_15m": int(os.getenv("SCANNER_MIN_BUYS_15M", "5")),      # default 5
+            "min_vol_5m": float(os.getenv("SCANNER_MIN_VOLUME_5M_USD", "1000")),   # default 1000
+            "min_vol_15m": float(os.getenv("SCANNER_MIN_VOLUME_15M_USD", "2000")), # default 2000
 
             # buy pressure – still requires buyers > sellers
             "min_buy_ratio": float(os.getenv("SCANNER_MIN_BUY_RATIO", "0.55")),
@@ -481,13 +503,13 @@ def summarize():
                 "SCANNER_REQUIRE_BUY_PRESSURE", "true"
             ).lower() in {"1", "true", "yes", "on"},
 
-            # price change filters (kept at current values)
+            # price change filters
             "min_chg_5m": float(os.getenv("SCANNER_MIN_PRICE_CHANGE_5M", "5.0")),
             "min_chg_15m": float(os.getenv("SCANNER_MIN_PRICE_CHANGE_15M", "10.0")),
 
             # age / holders
-            "max_age_min": int(os.getenv("SCANNER_MAX_AGE_MIN", "120")),      # was 90
-            "max_mc_usd": float(os.getenv("SCANNER_MAX_MC_USD", "2000000")),  # unchanged
-            "min_holders": int(os.getenv("SCANNER_MIN_HOLDERS", "20")),       # was 50
+            "max_age_min": int(os.getenv("SCANNER_MAX_AGE_MIN", "120")),      # default 120
+            "max_mc_usd": float(os.getenv("SCANNER_MAX_MC_USD", "2000000")),
+            "min_holders": int(os.getenv("SCANNER_MIN_HOLDERS", "20")),       # default 20
         },
     }
