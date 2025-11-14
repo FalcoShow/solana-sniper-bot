@@ -1,217 +1,145 @@
 # scripts/export_ai_training.py
-"""
-Export past trades into OpenAI fine-tuning format (JSONL).
-
-We use the existing `public.trades` table and derive:
-- Features about the trade (side, size, prices, etc.)
-- A label (GOOD / BAD) based on realized profit
-
-Output: ai_training.jsonl (one {"messages":[...]} per line)
-"""
+#
+# Export past trades from Postgres into an OpenAI fine-tuning JSONL file.
+# Heuristic labels:
+#   - GOOD:   strong positive pnl_usd
+#   - BAD:    strong negative pnl_usd
+#   - NEUTRAL: everything else
+#
+# This gives the AI gate signal actual "shape" instead of all-neutral.
 
 from __future__ import annotations
 
-import asyncio
-import json
-import math
 import os
-from datetime import datetime, timezone
-from typing import Any, Dict, List
+import json
+import asyncio
+import datetime as dt
+from typing import Any, Dict
 
 import asyncpg
 
 
-def env_dsn() -> str:
-    dsn = os.environ.get("PNL_DSN") or os.environ.get("PG_DSN")
-    if not dsn:
-        raise SystemExit("No PNL_DSN or PG_DSN in env")
-    return dsn
+DSN = os.environ.get("PNL_DSN") or os.environ.get("PG_DSN")
+OUT_PATH = os.environ.get("AI_TRAINING_PATH", "ai_training.jsonl")
+
+# How many rows to export
+LIMIT = int(os.getenv("AI_TRAINING_LIMIT", "500"))
+
+# Heuristic thresholds (USD PnL). Tune these as your bot grows.
+GOOD_PNL_USD = float(os.getenv("AI_GOOD_PNL_USD", "5.0"))
+BAD_PNL_USD = float(os.getenv("AI_BAD_PNL_USD", "-3.0"))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers to derive label / scoring from trade row
-# ──────────────────────────────────────────────────────────────────────────────
-def make_label(row: Dict[str, Any]) -> str:
+def _to_float(x: Any) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def label_trade(row: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Simple v1 label:
-      - GOOD if profit or pnl_usd is clearly > 0
-      - BAD  if clearly < 0
-      - NEUTRAL otherwise (small/no change)
+    Decide GOOD / BAD / NEUTRAL based on pnl_usd.
+    You can later add pnl_pct or other fields as your data gets richer.
     """
-    profit = row.get("profit")
-    pnl_usd = row.get("pnl_usd")
+    pnl_usd = _to_float(row.get("pnl_usd"))
 
-    val = None
-    if isinstance(profit, (int, float)):
-        val = profit
-    elif isinstance(pnl_usd, (int, float)):
-        val = pnl_usd
+    if pnl_usd >= GOOD_PNL_USD:
+        label = "GOOD"
+        score = 0.9
+    elif pnl_usd <= BAD_PNL_USD:
+        label = "BAD"
+        score = 0.9
+    else:
+        label = "NEUTRAL"
+        score = 0.5
 
-    if val is None:
-        return "NEUTRAL"
-
-    if val > 0.0:
-        return "GOOD"
-    if val < 0.0:
-        return "BAD"
-    return "NEUTRAL"
+    return {"label": label, "score": score, "pnl_usd": pnl_usd}
 
 
-def make_score(row: Dict[str, Any]) -> float:
+def build_example(row: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Map profit → a soft score between 0 and 1 for training:
-      - 0.5 baseline
-      - > 0.5 if profitable
-      - < 0.5 if loss
-    """
-    profit = row.get("profit")
-    pnl_usd = row.get("pnl_usd")
-    val = None
-    if isinstance(profit, (int, float)):
-        val = profit
-    elif isinstance(pnl_usd, (int, float)):
-        val = pnl_usd
-    if val is None:
-        return 0.5
-
-    # Squash via tanh to avoid huge outliers dominating
-    scaled = math.tanh(val / 20.0)  # 20 USD as soft scale
-    return 0.5 + 0.5 * scaled
-
-
-def build_feature_summary(row: Dict[str, Any]) -> str:
-    """
-    Turn the row into a short natural-language description the model can learn from.
+    Build a single fine-tuning example in the chat format OpenAI expects.
     """
     ts = row.get("ts")
-    if isinstance(ts, datetime):
-        ts_str = ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    if isinstance(ts, dt.datetime):
+        ts_str = ts.strftime("%Y-%m-%d %H:%M:%S %Z") or ts.isoformat()
     else:
         ts_str = str(ts)
 
-    side = row.get("side") or "unknown"
-    symbol = row.get("symbol") or "UNKNOWN"
-    token = row.get("token") or row.get("mint") or "unknown"
-    sol_amount = row.get("sol_amount")
-    price_sol = row.get("price_sol")
-    price_usd = row.get("price_usd")
+    side = row.get("side")
+    symbol = row.get("symbol")
+    mint = row.get("mint") or row.get("token")
+    reason = row.get("reason")
+
     entry = row.get("entry")
     current = row.get("current")
     profit = row.get("profit")
+
     pnl_usd = row.get("pnl_usd")
-    reason = row.get("reason")
+    pnl_sol = row.get("pnl_sol")
 
-    parts: List[str] = []
-    parts.append(f"Timestamp: {ts_str}")
-    parts.append(f"Side: {side}")
-    parts.append(f"Symbol: {symbol}")
-    parts.append(f"Mint: {token}")
+    lab = label_trade(row)
 
-    if sol_amount is not None:
-        parts.append(f"Size (SOL): {sol_amount:.6f}")
-    if price_sol is not None:
-        parts.append(f"Entry price in SOL: {price_sol:.9f}")
-    if price_usd is not None:
-        parts.append(f"Entry price in USD: {price_usd:.6f}")
-    if entry is not None:
-        parts.append(f"Entry metric: {entry:.6f}")
-    if current is not None:
-        parts.append(f"Exit metric (current): {current:.6f}")
-    if profit is not None:
-        parts.append(f"Realized profit metric: {profit:.6f}")
-    if pnl_usd is not None:
-        parts.append(f"Realized PnL USD: {pnl_usd:.6f}")
-    if reason:
-        parts.append(f"Entry reason: {reason}")
+    user_content = (
+        "Here is a past trade. Analyze it and decide if this type of setup is GOOD, BAD, or NEUTRAL:\n"
+        f"Timestamp: {ts_str} | Side: {side} | Symbol: {symbol} | Mint: {mint}\n"
+        f"Entry metric: {entry} | Exit metric (current): {current} | Realized profit metric: {profit}\n"
+        f"PNL USD: {pnl_usd} | PNL SOL: {pnl_sol} | Entry reason: {reason}\n\n"
+        'Respond with JSON like: {"label": "GOOD|BAD|NEUTRAL", "score": number between 0 and 1}.'
+    )
 
-    return " | ".join(parts)
+    system_msg = (
+        "You are an AI risk and PnL assistant for a Solana meme coin sniper bot. "
+        "Given the trade context, you decide whether similar future trades are GOOD candidates, BAD candidates, "
+        "or NEUTRAL. You respond with a JSON object containing 'label' and 'score'."
+    )
 
+    assistant_msg = json.dumps(
+        {
+            "label": lab["label"],
+            "score": lab["score"],
+        }
+    )
 
-def build_training_example(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Build one OpenAI chat-like training example from a trade row.
-    """
-    label = make_label(row)
-    score = make_score(row)
-    summary = build_feature_summary(row)
-
-    # You can tune the "instructions" text later — this is v1.
-    system_msg = {
-        "role": "system",
-        "content": (
-            "You are an AI risk and PnL assistant for a Solana meme coin sniper bot. "
-            "Given the trade context, you decide whether similar future trades are GOOD candidates, "
-            "BAD candidates, or NEUTRAL. You respond with a JSON object containing 'label' and 'score'."
-        ),
+    return {
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": assistant_msg},
+        ]
     }
 
-    user_msg = {
-        "role": "user",
-        "content": (
-            "Here is a past trade. Analyze it and decide if this type of setup is GOOD, BAD, or NEUTRAL:\n"
-            f"{summary}\n\n"
-            "Respond with JSON like: {\"label\": \"GOOD|BAD|NEUTRAL\", \"score\": number between 0 and 1}."
-        ),
-    }
 
-    assistant_msg = {
-        "role": "assistant",
-        "content": json.dumps({"label": label, "score": round(score, 4)}),
-    }
-
-    return {"messages": [system_msg, user_msg, assistant_msg]}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Main async export
-# ──────────────────────────────────────────────────────────────────────────────
 async def main() -> None:
-    dsn = env_dsn()
-    conn = await asyncpg.connect(dsn)
+    if not DSN:
+        raise SystemExit("No PNL_DSN/PG_DSN set in env")
 
-    # Pull trades with a real profit signal in last 90 days
+    conn = await asyncpg.connect(DSN)
     rows = await conn.fetch(
-        """
-        SELECT
-          id,
-          ts,
-          token,
-          symbol,
-          side,
-          sol_amount,
-          price_sol,
-          price_usd,
-          pnl_sol,
-          pnl_usd,
-          reason,
-          signature,
-          wallet,
-          amount,
-          entry,
-          current,
-          profit,
-          mint
+        f"""
+        SELECT *
         FROM trades
-        WHERE profit IS NOT NULL
-          AND ts >= now() - interval '90 days'
+        WHERE pnl_usd IS NOT NULL
         ORDER BY ts DESC
-        LIMIT 2000;
+        LIMIT {LIMIT};
         """
     )
     await conn.close()
 
     print(f"Fetched {len(rows)} rows from trades")
 
-    out_path = "ai_training.jsonl"
-    n_written = 0
-    with open(out_path, "w", encoding="utf-8") as f:
+    out = []
+    with open(OUT_PATH, "w", encoding="utf-8") as f:
         for r in rows:
-            row_dict = dict(r)
-            example = build_training_example(row_dict)
-            f.write(json.dumps(example, separators=(",", ":")) + "\n")
-            n_written += 1
+            d = dict(r)
+            ex = build_example(d)
+            out.append(ex)
+            f.write(json.dumps(ex, ensure_ascii=False) + "\n")
 
-    print(f"Wrote {n_written} examples to {out_path}")
+    print(f"Wrote {len(out)} examples to {OUT_PATH}")
+    os.system(f"ls -lh {OUT_PATH}")
+    os.system(f"head -n 3 {OUT_PATH}")
 
 
 if __name__ == "__main__":

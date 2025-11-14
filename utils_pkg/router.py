@@ -5,6 +5,7 @@ utils_pkg/router.py — Clean, end-to-end rewrite (delegates swaps to lightning_
 
 Additions in this rewrite
 - BUY/SELL wrappers that catch Jupiter "no route" and cleanly fall back to Raydium.
+- Pump.fun-specific BUY wrapper that falls back to direct Pump.fun buy when Jupiter has no route.
 - Keeps your existing API surface, registries, caching, pricing, Telegram helpers, etc.
 - Does NOT change call sites — BUY_IMPLS/SELL_IMPLS still expose "pump"/"raydium" keys.
 
@@ -37,19 +38,29 @@ from typing import Any, Dict, Optional, Tuple, Callable, List
 
 import requests
 from requests.exceptions import RequestException
+import httpx
+from httpx import HTTPStatusError
+
 from utils_pkg import lightning_impl as lightning
 try:
     from utils_pkg import raydium_impl as raydium
 except Exception:
     raydium = None
 
+try:
+    from utils_pkg import pump_trader
+except Exception:
+    pump_trader = None
+
 # ----- BEGIN: ENV-DRIVEN HARD JUPITER DISABLE GUARD -----
-import os, logging
+import logging
 
 log = logging.getLogger(__name__) if 'log' not in globals() else log
 
+
 def _env_false(val: str) -> bool:
     return str(val).strip().lower() in ("0", "false", "no", "")
+
 
 JUPIER_DISABLED_BY_ENV = (
     _env_false(os.getenv("ROUTER_ALLOW_JUPITER", "0"))  # prefer explicit allow flag
@@ -65,7 +76,9 @@ if JUPIER_DISABLED_BY_ENV:
 
     # Provide a safe stub for the common Jupiter call sites used by router
     def _jupiter_quote_stub(*args, **kwargs):
-        raise RuntimeError("Jupiter disabled by environment - quote requested but blocked")
+        raise RuntimeError(
+            "Jupiter disabled by environment - quote requested but blocked"
+        )
 
     try:
         globals()["quote_price_via_jupiter"] = _jupiter_quote_stub
@@ -78,17 +91,33 @@ if JUPIER_DISABLED_BY_ENV:
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from logging_setup import get_logger
+
     log = get_logger()
 except Exception:  # pragma: no cover
+
     class _L:
-        def event(self, *a, **k): pass
-        def every(self, *a, **k): pass
-        def info(self, *a, **k): pass
+        def event(self, *a, **k):
+            pass
+
+        def every(self, *a, **k):
+            pass
+
+        def info(self, *a, **k):
+            pass
+
+        def warning(self, *a, **k):
+            pass
+
+        def exception(self, *a, **k):
+            pass
+
     log = _L()  # type: ignore
 
 if not hasattr(log, "every"):
+
     def _every(_key: str, n: int = 10, msg: str | None = None, **kw):
         return log.event(msg or _key, **kw)
+
     setattr(log, "every", _every)  # type: ignore[attr-defined]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -97,9 +126,9 @@ if not hasattr(log, "every"):
 from utils_pkg.solana_wallet import (
     load_keypair,
     get_pubkey_str,
-    sign_and_send_b64_tx,   # fallback sender
-    _send_b64_with_diag,    # robust sender w/ simulate diagnostics
-    get_balance_lamports,   # sync balance helper
+    sign_and_send_b64_tx,  # fallback sender
+    _send_b64_with_diag,  # robust sender w/ simulate diagnostics
+    get_balance_lamports,  # sync balance helper
 )
 
 try:
@@ -112,18 +141,29 @@ except Exception:
 try:
     from utils_pkg.core_utils import send_telegram as _core_send_telegram  # type: ignore
 except Exception:  # pragma: no cover
+
     async def _core_send_telegram(_msg: str, **_kw) -> None:  # type: ignore
         return
+
 
 # Optional budget hooks
 try:
     from utils_pkg import budget  # type: ignore
 except Exception:  # pragma: no cover
+
     class _BudgetNoop:
-        def before_quote(self, units: int = 1) -> bool: return True
-        def after_quote(self, units: int = 1) -> None:  return None
-        def before_rpc(self, method: str, *, weight: Optional[int] = None) -> bool: return True
-        def after_rpc(self, method: str, *, weight: Optional[int] = None) -> None:  return None
+        def before_quote(self, units: int = 1) -> bool:
+            return True
+
+        def after_quote(self, units: int = 1) -> None:
+            return None
+
+        def before_rpc(self, method: str, *, weight: Optional[int] = None) -> bool:
+            return True
+
+        def after_rpc(self, method: str, *, weight: Optional[int] = None) -> None:
+            return None
+
     budget = _BudgetNoop()  # type: ignore
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -135,11 +175,13 @@ def _envb(k: str, default: bool = False) -> bool:
         return default
     return v in {"1", "true", "yes", "y", "on"}
 
+
 def _envf(k: str, d: float) -> float:
     try:
         return float(os.getenv(k, str(d)))
     except Exception:
         return float(d)
+
 
 def _envi(k: str, d: int) -> int:
     try:
@@ -147,33 +189,45 @@ def _envi(k: str, d: int) -> int:
     except Exception:
         return int(d)
 
+
 # --- Router registration shim (safe default to lightning) ---
 def _env_bool(name, default=False):
     v = os.getenv(name)
     if v is None:
         return default
-    return str(v).strip().lower() in ("1","true","yes","on")
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
-ALLOW_PUMP    = _env_bool("ROUTER_ALLOW_PUMP", True)
+
+ALLOW_PUMP = _env_bool("ROUTER_ALLOW_PUMP", True)
 ALLOW_RAYDIUM = _env_bool("ROUTER_ALLOW_RAYDIUM", True)
 
-BUY_IMPL  = os.getenv("ROUTER_BUY_IMPL", "lightning").strip().lower()
+BUY_IMPL = os.getenv("ROUTER_BUY_IMPL", "lightning").strip().lower()
 SELL_IMPL = os.getenv("ROUTER_SELL_IMPL", "lightning").strip().lower()
 
 # Global registries the main loop uses
-BUY_IMPLS  = {}
-SELL_IMPLS = {}
+BUY_IMPLS: Dict[str, Callable[..., Any]] = {}
+SELL_IMPLS: Dict[str, Callable[..., Any]] = {}
 
 # Import the lightning impls once (source of truth for swaps)
-from utils_pkg.lightning_impl import buy_via_lightning as _buy_lightning, sell_via_lightning as _sell_lightning
+from utils_pkg.lightning_impl import (
+    buy_via_lightning as _buy_lightning,
+    sell_via_lightning as _sell_lightning,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Chain / RPC config
 # ──────────────────────────────────────────────────────────────────────────────
 try:
-    from utils_pkg.txlearn import RPC_URL as _TX_RPC_URL, TX_COMMITMENT as _TX_COMMITMENT  # type: ignore
+    from utils_pkg.txlearn import (  # type: ignore
+        RPC_URL as _TX_RPC_URL,
+        TX_COMMITMENT as _TX_COMMITMENT,
+    )
 except Exception:  # pragma: no cover
-    _TX_RPC_URL = os.getenv("SOL_RPC_URL") or os.getenv("RPC_URL") or "https://api.mainnet-beta.solana.com"
+    _TX_RPC_URL = (
+        os.getenv("SOL_RPC_URL")
+        or os.getenv("RPC_URL")
+        or "https://api.mainnet-beta.solana.com"
+    )
     _TX_COMMITMENT = (os.getenv("CONFIRM_COMMITMENT") or "confirmed").strip().lower()
 
 TX_RPC_URL = _TX_RPC_URL
@@ -191,21 +245,21 @@ LAMPORTS_PER_SOL = 1_000_000_000
 DRY_RUN = _envb("DRYRUN", False) or _envb("DRY_RUN", False) or _envb("IS_DRYRUN", False)
 MIN_SOL_BALANCE = _envf("MIN_SOL_BALANCE", 3.0)
 
-HTTP_TIMEOUT_GET  = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
+HTTP_TIMEOUT_GET = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
 HTTP_TIMEOUT_POST = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_POST_SEC", 25.0))
-RPC_TIMEOUT_SEC   = max(3.0, _envf("ROUTER_RPC_TIMEOUT_SEC", 10.0))
+RPC_TIMEOUT_SEC = max(3.0, _envf("ROUTER_RPC_TIMEOUT_SEC", 10.0))
 
 QUOTE_RETRIES = max(1, _envi("ROUTER_QUOTE_RETRIES", 6))
-SWAP_RETRIES  = max(1, _envi("ROUTER_SWAP_RETRIES", 9))
+SWAP_RETRIES = max(1, _envi("ROUTER_SWAP_RETRIES", 9))
 RETRY_BACKOFF = max(0.05, _envf("ROUTER_RETRY_BACKOFF_SEC", 1.2))
 
-JUP_MAX_QPS       = max(1, _envi("JUP_MAX_QPS", 2))
+JUP_MAX_QPS = max(1, _envi("JUP_MAX_QPS", 2))
 _JUP_MIN_INTERVAL = 1.0 / float(JUP_MAX_QPS)
-_JUP_RATE_LOCK    = asyncio.Lock()
+_JUP_RATE_LOCK = asyncio.Lock()
 _JUP_LAST_TS: float = 0.0
 
-QUOTE_TTL_SEC  = max(0.0, _envf("ROUTER_QUOTE_TTL_SEC", 8.0))
-PRICE_TTL_SEC  = max(0.0, _envf("PF_PRICE_TTL_SEC", 6.0))
+QUOTE_TTL_SEC = max(0.0, _envf("ROUTER_QUOTE_TTL_SEC", 8.0))
+PRICE_TTL_SEC = max(0.0, _envf("PF_PRICE_TTL_SEC", 6.0))
 TOKENS_TTL_SEC = max(30.0, _envf("ROUTER_TOKENS_TTL_SEC", 900.0))
 
 _QUOTE_CACHE: Dict[str, Tuple[float, dict]] = {}
@@ -218,31 +272,53 @@ _quote_lock = asyncio.Lock()
 BAD_ID_TTL_SEC = max(10, _envi("ROUTER_BAD_ID_TTL_SEC", 60))
 _BAD_PRICE_BLACKLIST: Dict[str, float] = {}
 
-_UA = {"user-agent": "pnlsniper/router", "accept": "application/json", "content-type": "application/json"}
+_UA = {
+    "user-agent": "pnlsniper/router",
+    "accept": "application/json",
+    "content-type": "application/json",
+}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Jupiter upstream (v6-first)
 # ──────────────────────────────────────────────────────────────────────────────
 JUP_UPSTREAM: str = (
-    os.getenv("JUP_UPSTREAM")
-    or os.getenv("JUP_BASE_URL")
-    or "https://api.jup.ag"
+    os.getenv("JUP_UPSTREAM") or os.getenv("JUP_BASE_URL") or "https://api.jup.ag"
 ).rstrip("/")
-JUP_ALT_BASE_URLS: List[str] = [u.strip().rstrip("/") for u in (os.getenv("JUP_ALT_BASE_URLS") or "").split(",") if u.strip()]
+JUP_ALT_BASE_URLS: List[str] = [
+    u.strip().rstrip("/")
+    for u in (os.getenv("JUP_ALT_BASE_URLS") or "").split(",")
+    if u.strip()
+]
 AS_LEGACY = _envb("JUP_AS_LEGACY", False)
 ONLY_DIRECT_DEFAULT = _envb("JUP_ONLY_DIRECT", False)
 if not AS_LEGACY:
     JUP_ALT_BASE_URLS = [os.getenv("JUP_BASE_URL", "https://api.jup.ag")]
 _JUP_LAST_GOOD_BASE: Optional[str] = None
 
+
 def _quote_url(base: str) -> str:
-    return f"{base.rstrip('/')}/swap/v1/quote" if AS_LEGACY else f"{base.rstrip('/')}/quote"
+    return (
+        f"{base.rstrip('/')}/swap/v1/quote"
+        if AS_LEGACY
+        else f"{base.rstrip('/')}/quote"
+    )
+
 
 def _swap_url(base: str) -> str:
-    return f"{base.rstrip('/')}/swap/v1/swap" if AS_LEGACY else f"{base.rstrip('/')}/swap"
+    return (
+        f"{base.rstrip('/')}/swap/v1/swap"
+        if AS_LEGACY
+        else f"{base.rstrip('/')}/swap"
+    )
+
 
 def _jup_headers() -> Dict[str, str]:
-    h = {"accept": "application/json", "content-type": "application/json", "origin": "https://jup.ag", "referer": "https://jup.ag/"}
+    h = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "origin": "https://jup.ag",
+        "referer": "https://jup.ag/",
+    }
     key = (os.getenv("JUP_API_KEY") or os.getenv("JUP_PRO_KEY") or "").strip()
     if key:
         h["x-api-key"] = key
@@ -250,6 +326,7 @@ def _jup_headers() -> Dict[str, str]:
     if bearer:
         h["x-jup-auth"] = f"Bearer {bearer}"
     return h
+
 
 def _bases() -> List[str]:
     # Order: last good → primary → alternates (deduped)
@@ -263,15 +340,18 @@ def _bases() -> List[str]:
             out.append(a)
     return out
 
+
 # Circuit breaker
 _JUP_FAIL_COUNT = 0
 _JUP_FAIL_LIMIT = _envi("JUP_FAIL_LIMIT", 8)
 _JUP_BREAKER_COOLDOWN = _envf("JUP_BREAKER_COOLDOWN_SEC", 30.0)
 _JUP_BREAKER_UNTIL: float = 0.0
 
+
 def _jup_breaker_check() -> None:
     if time.time() < _JUP_BREAKER_UNTIL:
         raise RuntimeError("JUP_CIRCUIT_BREAKER active")
+
 
 def _jup_record_success(base: str) -> None:
     global _JUP_FAIL_COUNT, _JUP_BREAKER_UNTIL, _JUP_LAST_GOOD_BASE
@@ -280,6 +360,7 @@ def _jup_record_success(base: str) -> None:
     _JUP_FAIL_COUNT = 0
     _JUP_BREAKER_UNTIL = 0
     _JUP_LAST_GOOD_BASE = (base or "").strip().rstrip("/")
+
 
 def _jup_record_failure() -> None:
     global _JUP_FAIL_COUNT, _JUP_BREAKER_UNTIL
@@ -296,6 +377,7 @@ _MARKDOWNV2_SPECIALS = r"_*[]()~`>#+-=|{}.!\\"
 def _tg_plain(msg: str) -> str:
     return "".join(ch for ch in msg if ch not in _MARKDOWNV2_SPECIALS)
 
+
 def _tg_ready() -> tuple[bool, str]:
     if not _envb("TELEGRAM_ENABLED", False):
         return False, "TELEGRAM_ENABLED=0"
@@ -307,6 +389,7 @@ def _tg_ready() -> tuple[bool, str]:
         return False, "no TELEGRAM_CHAT_ID"
     return True, "ok"
 
+
 async def _tg_send(msg: str, *, src: str) -> None:
     ok, why = _tg_ready()
     if not ok:
@@ -315,21 +398,33 @@ async def _tg_send(msg: str, *, src: str) -> None:
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     chat_id = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": _tg_plain(msg), "disable_web_page_preview": True}
+    payload = {
+        "chat_id": chat_id,
+        "text": _tg_plain(msg),
+        "disable_web_page_preview": True,
+    }
     try:
+
         def _post():
             return requests.post(url, json=payload, timeout=8)
+
         resp = await asyncio.to_thread(_post)
         try:
             ok_json = resp.json()
         except Exception:
             ok_json = {}
         if resp.status_code != 200 or not ok_json.get("ok", False):
-            log.event("TG_SEND_ERROR", src=src, http=resp.status_code, body=str(ok_json)[:200])
+            log.event(
+                "TG_SEND_ERROR",
+                src=src,
+                http=resp.status_code,
+                body=str(ok_json)[:200],
+            )
         else:
             log.every("tg.sent", n=60, msg="TG_SENT_ONCE", src=src)
     except Exception as e:
         log.event("TG_SEND_ERROR", src=src, err=str(e))
+
 
 async def _send_safe(msg: str, *, src: str) -> None:
     try:
@@ -342,6 +437,7 @@ async def _send_safe(msg: str, *, src: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _IDX = {c: i for i, c in enumerate(_B58)}
+
 
 def _b58decode(s: str) -> bytes:
     s = (s or "").strip()
@@ -357,18 +453,22 @@ def _b58decode(s: str) -> bytes:
     pad = len(s) - len(s.lstrip("1"))
     return b"\x00" * pad + full
 
+
 def _is_valid_pubkey_str(s: str) -> bool:
     try:
         return len(_b58decode(s)) == 32
     except Exception:
         return False
 
+
 def is_valid_pubkey_str(s: str) -> bool:
     return _is_valid_pubkey_str(s)
+
 
 def _assert_pubkey(s: str, name: str) -> None:
     if not _is_valid_pubkey_str(s):
         raise ValueError(f"Invalid {name} (must be 32-byte base58): {s}")
+
 
 def _sanitize_mint(m: str) -> str:
     if m is None:
@@ -379,6 +479,7 @@ def _sanitize_mint(m: str) -> str:
     if not _is_valid_pubkey_str(m):
         raise ValueError(f"Invalid mint (must be 32-byte base58): {m}")
     return m
+
 
 def normalize_pump_id_to_mint(raw: str) -> str:
     """API compatibility: try external normalize_mint, else accept valid base58 pubkeys."""
@@ -404,7 +505,10 @@ async def _jup_gate() -> None:
             await asyncio.sleep(wait_for)
         _JUP_LAST_TS = time.time()
 
-async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: str, **kwargs) -> Any:
+
+async def _retry(
+    coro_fn: Callable, *args, tries: int, backoff: float, label: str, **kwargs
+) -> Any:
     last_err: Optional[Exception] = None
     for i in range(1, tries + 1):
         try:
@@ -422,13 +526,16 @@ async def _retry(coro_fn: Callable, *args, tries: int, backoff: float, label: st
                 raise
     raise last_err or RuntimeError(label + " failed")
 
+
 async def _http_get(kind: str, *, params: dict, timeout: float) -> dict:
     _jup_breaker_check()
     last_err: Optional[Exception] = None
     for base in _bases():
         try:
             url = _quote_url(base) if kind == "quote" else f"{base.rstrip('/')}/{kind}"
-            r = requests.get(url, params=params, timeout=timeout, headers=_jup_headers())
+            r = requests.get(
+                url, params=params, timeout=timeout, headers=_jup_headers()
+            )
             try:
                 js = r.json()
             except Exception:
@@ -437,7 +544,9 @@ async def _http_get(kind: str, *, params: dict, timeout: float) -> dict:
             if r.status_code in (200, 201):
                 _jup_record_success(base)
                 return js
-            last_err = RuntimeError(f"{url} -> HTTP {r.status_code}: {str(js)[:180]}")
+            last_err = RuntimeError(
+                f"{url} -> HTTP {r.status_code}: {str(js)[:180]}"
+            )
         except RequestException as e:
             last_err = e
         except Exception as e:
@@ -446,13 +555,22 @@ async def _http_get(kind: str, *, params: dict, timeout: float) -> dict:
     _jup_record_failure()
     raise last_err or RuntimeError(f"all {kind} endpoints failed")
 
-async def _http_post_swap(*, json_body: Optional[dict], params: Optional[dict], timeout: float) -> dict:
+
+async def _http_post_swap(
+    *, json_body: Optional[dict], params: Optional[dict], timeout: float
+) -> dict:
     _jup_breaker_check()
     last_err: Optional[Exception] = None
     for base in _bases():
         try:
             url = _swap_url(base)
-            r = requests.post(url, json=json_body, params=params, timeout=timeout, headers=_jup_headers())
+            r = requests.post(
+                url,
+                json=json_body,
+                params=params,
+                timeout=timeout,
+                headers=_jup_headers(),
+            )
             try:
                 js = r.json()
             except Exception:
@@ -461,7 +579,9 @@ async def _http_post_swap(*, json_body: Optional[dict], params: Optional[dict], 
             if r.status_code in (200, 201):
                 _jup_record_success(base)
                 return js
-            last_err = RuntimeError(f"{url} -> HTTP {r.status_code}: {str(js)[:180]}")
+            last_err = RuntimeError(
+                f"{url} -> HTTP {r.status_code}: {str(js)[:180]}"
+            )
         except RequestException as e:
             last_err = e
         except Exception as e:
@@ -481,6 +601,7 @@ _KNOWN_DECIMALS: Dict[str, int] = {
     "DezXAZ8z7PnrnRJjz3wXBoRqiXCa6xjnB7YaB1pPB263": 5,  # BONK
 }
 _DECIMALS: Dict[str, int] = {}
+
 
 async def _tokens_catalog() -> List[dict]:
     global _TOKENS_CACHE
@@ -502,13 +623,19 @@ async def _tokens_catalog() -> List[dict]:
     except Exception:
         return _TOKENS_CACHE[1] if _TOKENS_CACHE else []
 
+
 def _rpc_post(method: str, params: list) -> dict:
     if not TX_RPC_URL:
         return {}
     if not budget.before_rpc(method):
         return {}
     try:
-        r = requests.post(TX_RPC_URL, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=RPC_TIMEOUT_SEC, headers=_UA)
+        r = requests.post(
+            TX_RPC_URL,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            timeout=RPC_TIMEOUT_SEC,
+            headers=_UA,
+        )
         r.raise_for_status()
         return r.json()
     finally:
@@ -517,6 +644,7 @@ def _rpc_post(method: str, params: list) -> dict:
         except Exception:
             pass
 
+
 def _mint_decimals_from_data(b: bytes) -> Optional[int]:
     try:
         if len(b) >= 45:
@@ -524,6 +652,7 @@ def _mint_decimals_from_data(b: bytes) -> Optional[int]:
     except Exception:
         pass
     return None
+
 
 async def _decimals_from_tokens_api(mint: str) -> Optional[int]:
     arr = await _tokens_catalog()
@@ -537,6 +666,7 @@ async def _decimals_from_tokens_api(mint: str) -> Optional[int]:
         return dv if 0 <= dv <= 18 else None
     except Exception:
         return None
+
 
 async def _get_decimals(mint: str) -> Optional[int]:
     k = _KNOWN_DECIMALS.get(mint)
@@ -574,6 +704,7 @@ async def _get_decimals(mint: str) -> Optional[int]:
         return int(dec)
     return None
 
+
 async def get_decimals(mint: str) -> Optional[int]:
     m = _sanitize_mint(mint)
     _assert_pubkey(m, "mint")
@@ -593,8 +724,21 @@ def _slippage_bps_default() -> int:
     s = _envf("JUPITER_MAX_SLIPPAGE", 0.006)
     return max(1, min(5000, int(round(s * 10_000))))
 
-def _qkey(input_mint: str, output_mint: str, amount_iu: int, slippage_bps: int, swap_mode: str, direct: bool, legacy: bool) -> str:
-    return f"{input_mint}:{output_mint}:{amount_iu}:{slippage_bps}:{swap_mode}:{int(direct)}:{int(legacy)}"
+
+def _qkey(
+    input_mint: str,
+    output_mint: str,
+    amount_iu: int,
+    slippage_bps: int,
+    swap_mode: str,
+    direct: bool,
+    legacy: bool,
+) -> str:
+    return (
+        f"{input_mint}:{output_mint}:{amount_iu}:{slippage_bps}:"
+        f"{swap_mode}:{int(direct)}:{int(legacy)}"
+    )
+
 
 async def _get_cached_quote(key: str) -> Optional[dict]:
     if QUOTE_TTL_SEC <= 0:
@@ -608,9 +752,11 @@ async def _get_cached_quote(key: str) -> Optional[dict]:
     _QUOTE_CACHE.pop(key, None)
     return None
 
+
 async def _set_cached_quote(key: str, payload: dict, ttl: float) -> None:
     if ttl > 0:
         _QUOTE_CACHE[key] = (time.time() + ttl, payload)
+
 
 async def _singleflight_quote(key: str, maker: Callable[[], Any]) -> dict:
     async with _quote_lock:
@@ -624,7 +770,16 @@ async def _singleflight_quote(key: str, maker: Callable[[], Any]) -> dict:
         async with _quote_lock:
             _QUOTE_FLIGHT.pop(key, None)
 
-async def _jup_quote(input_mint: str, output_mint: str, amount_iu: int, *, slippage_bps: Optional[int] = None, swap_mode: str = "ExactIn", only_direct: bool = False) -> dict:
+
+async def _jup_quote(
+    input_mint: str,
+    output_mint: str,
+    amount_iu: int,
+    *,
+    slippage_bps: Optional[int] = None,
+    swap_mode: str = "ExactIn",
+    only_direct: bool = False,
+) -> dict:
     if amount_iu <= 0:
         raise ValueError("amount_iu must be > 0")
     _assert_pubkey(input_mint, "inputMint")
@@ -663,18 +818,66 @@ async def _jup_quote(input_mint: str, output_mint: str, amount_iu: int, *, slipp
     return await _singleflight_quote(key, _fetch)
 
 # Public quote helpers (no on-chain send)
-async def get_sell_quote(*, mint: str, amount_raw: int, slippage_bps: Optional[int] = None, only_direct: Optional[bool] = None) -> Dict[str, Any]:
+def _clamp_slippage_bps(v: Optional[int]) -> int:
+    try:
+        sv = int(v if v is not None else _slippage_bps_default())
+    except Exception:
+        sv = _slippage_bps_default()
+    if sv < 1:
+        sv = 1
+    if sv > 5000:
+        sv = 5000
+    return sv
+
+
+async def _safe_decimals(mint: str, fallback: int = 6) -> int:
+    try:
+        dec = await _get_decimals(mint)
+        if isinstance(dec, int) and 0 <= dec <= 18:
+            return dec
+    except Exception:
+        pass
+    return fallback
+
+
+async def get_sell_quote(
+    *, mint: str, amount_raw: int, slippage_bps: Optional[int] = None, only_direct: Optional[bool] = None
+) -> Dict[str, Any]:
     if not isinstance(amount_raw, int) or amount_raw <= 0:
         raise ValueError("amount_raw must be a positive integer")
     m = _sanitize_mint(mint)
     sbps = _clamp_slippage_bps(slippage_bps)
     direct = only_direct if isinstance(only_direct, bool) else ONLY_DIRECT_DEFAULT
-    q = await _retry(_jup_quote, m, SOL_MINT, amount_raw, tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-sell", slippage_bps=sbps, only_direct=direct)
+    q = await _retry(
+        _jup_quote,
+        m,
+        SOL_MINT,
+        amount_raw,
+        tries=QUOTE_RETRIES,
+        backoff=RETRY_BACKOFF,
+        label="quote-sell",
+        slippage_bps=sbps,
+        only_direct=direct,
+    )
     lamports_out = int(q.get("outAmount") or 0)
     dec = await _safe_decimals(m)
-    return {**q, "amount_in_raw": amount_raw, "out_amount_lamports": lamports_out, "out_amount_sol": lamports_out / LAMPORTS_PER_SOL, "decimals": dec}
+    return {
+        **q,
+        "amount_in_raw": amount_raw,
+        "out_amount_lamports": lamports_out,
+        "out_amount_sol": lamports_out / LAMPORTS_PER_SOL,
+        "decimals": dec,
+    }
 
-async def get_buy_quote(*, mint: str, lamports_in: Optional[int] = None, amount_sol: Optional[float] = None, slippage_bps: Optional[int] = None, only_direct: Optional[bool] = None) -> Dict[str, Any]:
+
+async def get_buy_quote(
+    *,
+    mint: str,
+    lamports_in: Optional[int] = None,
+    amount_sol: Optional[float] = None,
+    slippage_bps: Optional[int] = None,
+    only_direct: Optional[bool] = None,
+) -> Dict[str, Any]:
     m = _sanitize_mint(mint)
     if lamports_in is None and amount_sol is None:
         amount_sol = _envf("PF_TRADE_SOL", 0.0)
@@ -687,35 +890,44 @@ async def get_buy_quote(*, mint: str, lamports_in: Optional[int] = None, amount_
         raise ValueError("Provide a positive lamports_in or amount_sol > 0")
     sbps = _clamp_slippage_bps(slippage_bps)
     direct = only_direct if isinstance(only_direct, bool) else ONLY_DIRECT_DEFAULT
-    q = await _retry(_jup_quote, SOL_MINT, m, lamports_in, tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-buy", slippage_bps=sbps, only_direct=direct)
+    q = await _retry(
+        _jup_quote,
+        SOL_MINT,
+        m,
+        lamports_in,
+        tries=QUOTE_RETRIES,
+        backoff=RETRY_BACKOFF,
+        label="quote-buy",
+        slippage_bps=sbps,
+        only_direct=direct,
+    )
     out_raw = int(q.get("outAmount") or 0)
     dec = await _safe_decimals(m)
-    out_ui = out_raw / (10 ** dec) if out_raw > 0 else 0.0
-    return {**q, "lamports_in": lamports_in, "out_amount_raw": out_raw, "out_amount_ui": out_ui, "decimals": dec}
+    out_ui = out_raw / (10**dec) if out_raw > 0 else 0.0
+    return {
+        **q,
+        "lamports_in": lamports_in,
+        "out_amount_raw": out_raw,
+        "out_amount_ui": out_ui,
+        "decimals": dec,
+    }
 
-def _clamp_slippage_bps(v: Optional[int]) -> int:
-    try:
-        sv = int(v if v is not None else _slippage_bps_default())
-    except Exception:
-        sv = _slippage_bps_default()
-    if sv < 1: sv = 1
-    if sv > 5000: sv = 5000
-    return sv
-
-async def _safe_decimals(mint: str, fallback: int = 6) -> int:
-    try:
-        dec = await _get_decimals(mint)
-        if isinstance(dec, int) and 0 <= dec <= 18:
-            return dec
-    except Exception:
-        pass
-    return fallback
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Price helper
+# ──────────────────────────────────────────────────────────────────────────────
 def _price_probe_amounts(dec: int) -> List[int]:
     dec = max(0, min(int(dec or 0), 18))
     ui_steps = (1.0, 0.1, 0.01, 0.001)
-    raw = sorted({int(round(ui * (10 ** dec))) for ui in ui_steps if (ui * (10 ** dec)) >= 1}, reverse=True)
+    raw = sorted(
+        {
+            int(round(ui * (10**dec)))
+            for ui in ui_steps
+            if (ui * (10**dec)) >= 1
+        },
+        reverse=True,
+    )
     return raw or [1]
+
 
 async def get_price_ui(mint: str) -> float:
     # Fast path
@@ -744,12 +956,20 @@ async def get_price_ui(mint: str) -> float:
     dec = await _safe_decimals(m)
     for amt_raw in _price_probe_amounts(dec):
         try:
-            q = await _retry(_jup_quote, m, SOL_MINT, amt_raw, tries=QUOTE_RETRIES, backoff=RETRY_BACKOFF, label="quote-price")
+            q = await _retry(
+                _jup_quote,
+                m,
+                SOL_MINT,
+                amt_raw,
+                tries=QUOTE_RETRIES,
+                backoff=RETRY_BACKOFF,
+                label="quote-price",
+            )
             lamports = int(q.get("outAmount") or 0)
             if lamports <= 0:
                 continue
             sol_out = lamports / LAMPORTS_PER_SOL
-            tokens_ui = amt_raw / (10 ** dec)
+            tokens_ui = amt_raw / (10**dec)
             px = sol_out / tokens_ui if tokens_ui > 0 else 0.0
             if px > 0:
                 if PRICE_TTL_SEC > 0:
@@ -760,9 +980,11 @@ async def get_price_ui(mint: str) -> float:
     _BAD_PRICE_BLACKLIST[raw] = time.time() + BAD_ID_TTL_SEC
     return 0.0
 
+
 # Aliases for backwards compatibility
 price_of_ui = get_price_ui
 price_of = get_price_ui
+
 
 async def mint_decimals(mint: str) -> Optional[int]:
     return await get_decimals(mint)
@@ -770,7 +992,6 @@ async def mint_decimals(mint: str) -> Optional[int]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Priority fee tuner (scaffold) + status polling (usable by impl)
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _to_sol_from_lamports_like(x: float) -> float:
     lamports = float(x)
     # Some providers return microlamports
@@ -778,9 +999,11 @@ def _to_sol_from_lamports_like(x: float) -> float:
         lamports = lamports / 1e6
     return lamports / 1e9
 
-QN_PRIORITY_HINT   = _envb("QN_PRIORITY_HINT", False)
-QN_RPC_URL         = (os.getenv("SOL_RPC_URL") or "").strip()
-QN_HINT_TIMEOUT_S  = max(0.8, _envf("QN_PRIORITY_TIMEOUT_SEC", 2.5))
+
+QN_PRIORITY_HINT = _envb("QN_PRIORITY_HINT", False)
+QN_RPC_URL = (os.getenv("SOL_RPC_URL") or "").strip()
+QN_HINT_TIMEOUT_S = max(0.8, _envf("QN_PRIORITY_TIMEOUT_SEC", 2.5))
+
 
 def _qn_priority_seed_blocking() -> Optional[float]:
     if not (QN_PRIORITY_HINT and QN_RPC_URL):
@@ -803,7 +1026,11 @@ def _qn_priority_seed_blocking() -> Optional[float]:
                 vals = []
                 for it in res:
                     if isinstance(it, dict):
-                        v = it.get("prioritizationFee") or it.get("lamports") or it.get("median")
+                        v = (
+                            it.get("prioritizationFee")
+                            or it.get("lamports")
+                            or it.get("median")
+                        )
                         if v is not None:
                             vals.append(float(v))
                 if vals:
@@ -814,15 +1041,16 @@ def _qn_priority_seed_blocking() -> Optional[float]:
             continue
     return None
 
+
 class DynPriority:
     def __init__(self) -> None:
         base = _envf("PF_PRIORITY_SOL", 0.0015)
-        self.enabled     = _envb("PF_PRIORITY_DYNAMIC", True)
-        self.target_sec  = _envf("PF_PRIORITY_TARGET_SEC", 0.6)
-        self.step_up     = _envf("PF_PRIORITY_STEP_UP", 1.6)
-        self.step_down   = _envf("PF_PRIORITY_STEP_DOWN", 0.8)
-        self.min_sol     = _envf("PF_PRIORITY_MIN_SOL", max(0.0, base * 0.5))
-        self.max_sol     = _envf("PF_PRIORITY_MAX_SOL", max(self.min_sol, 0.12))
+        self.enabled = _envb("PF_PRIORITY_DYNAMIC", True)
+        self.target_sec = _envf("PF_PRIORITY_TARGET_SEC", 0.6)
+        self.step_up = _envf("PF_PRIORITY_STEP_UP", 1.6)
+        self.step_down = _envf("PF_PRIORITY_STEP_DOWN", 0.8)
+        self.min_sol = _envf("PF_PRIORITY_MIN_SOL", max(0.0, base * 0.5))
+        self.max_sol = _envf("PF_PRIORITY_MAX_SOL", max(self.min_sol, 0.12))
         self.current_sol = max(self.min_sol, min(self.max_sol, base))
         self._pending: Dict[str, float] = {}
         self._seed_task: Optional[asyncio.Task[None]] = None
@@ -861,9 +1089,12 @@ class DynPriority:
         while time.time() < deadline:
             try:
                 st = await _get_signature_status(sig)
-                if st and (st.get("confirmationStatus") or st.get("slot") or st.get("confirmed")):
+                if st and (
+                    st.get("confirmationStatus")
+                    or st.get("slot")
+                    or st.get("confirmed")
+                ):
                     dur = max(0.0, time.time() - self._pending.pop(sig, time.time()))
-                    err = st.get("err")
                     # tuning is left to the impl; we only report here if needed
                     log.every("prio.obs", n=10, msg="PRIO_OBS", sig=sig, dur=dur)
                     return
@@ -872,25 +1103,34 @@ class DynPriority:
             await asyncio.sleep(poll)
         self._pending.pop(sig, None)
 
+
 _PRIO = DynPriority()
+
 
 async def _get_signature_status(sig: str) -> Optional[dict]:
     def _call() -> Optional[dict]:
         try:
-            js = _rpc_post("getSignatureStatuses", [[sig], {"searchTransactionHistory": False}])
+            js = _rpc_post(
+                "getSignatureStatuses",
+                [[sig], {"searchTransactionHistory": False}],
+            )
             res = js.get("result", {}).get("value", [])
             if res and isinstance(res[0], dict):
                 return res[0]
         except Exception:
             pass
         return None
+
     return await asyncio.to_thread(_call)
+
 
 async def start() -> None:
     await _PRIO.start()
 
+
 async def shutdown() -> None:
     return None
+
 
 async def _enforce_min_sol(required_spend_lamports: int = 0) -> bool:
     """Kept for impls that may import this guard."""
@@ -909,7 +1149,9 @@ async def _enforce_min_sol(required_spend_lamports: int = 0) -> bool:
     spend = int(required_spend_lamports or 0)
     if bal_lamports - spend < reserve:
         try:
-            need_ui = max(0.0, (reserve + spend - bal_lamports) / LAMPORTS_PER_SOL)
+            need_ui = max(
+                0.0, (reserve + spend - bal_lamports) / LAMPORTS_PER_SOL
+            )
             await _send_safe(
                 "TRADE BLOCKED (SOL reserve)\n"
                 f"Balance: {bal_lamports/1e9:.4f} SOL\n"
@@ -924,69 +1166,302 @@ async def _enforce_min_sol(required_spend_lamports: int = 0) -> bool:
     return True
 
 # ──────────────────────────────────────────────────────────────────────────────
-# BUY/SELL WRAPPERS with Jupiter→Raydium fallback
+# BUY/SELL WRAPPERS with Jupiter→Raydium fallback + Pump.fun fallback
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Error markers thrown by utils_pkg/lightning_impl when Jupiter has no route
+# Error markers that lightning_impl uses when there is no route
 _NO_ROUTE_ERRORS = {"jup_no_route", "jup_no_route_cached"}
 
-async def _fallback_buy_on_raydium(*, mint: str, amount_sol: float, slippage_bps: int) -> Optional[str]:
+
+async def _fallback_buy_on_raydium(
+    *, mint: str, amount_sol: float, slippage_bps: int
+) -> Optional[str]:
     """Try Raydium path if available; tolerate absence gracefully."""
+    if raydium is None:
+        return None
     try:
         if hasattr(raydium, "buy") and callable(getattr(raydium, "buy")):
-            return await raydium.buy(mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps)  # type: ignore
-        if hasattr(raydium, "buy_via_raydium") and callable(getattr(raydium, "buy_via_raydium")):
-            return await raydium.buy_via_raydium(mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps)  # type: ignore
+            return await raydium.buy(  # type: ignore
+                mint=mint,
+                amount_sol=amount_sol,
+                slippage_bps=slippage_bps,
+            )
+        if hasattr(raydium, "buy_via_raydium") and callable(
+            getattr(raydium, "buy_via_raydium")
+        ):
+            return await raydium.buy_via_raydium(  # type: ignore
+                mint=mint,
+                amount_sol=amount_sol,
+                slippage_bps=slippage_bps,
+            )
     except Exception as e:
         log.event("ROUTER_RAYDIUM_BUY_FAIL", mint=mint, err=str(e)[:200])
     return None
 
-async def _fallback_sell_on_raydium(*, mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int) -> Optional[str]:
+
+async def _fallback_sell_on_raydium(
+    *, mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int
+) -> Optional[str]:
+    if raydium is None:
+        return None
     try:
         if hasattr(raydium, "sell") and callable(getattr(raydium, "sell")):
-            return await raydium.sell(mint=mint, token_program=token_program, amount_raw=amount_raw, slippage_bps=slippage_bps)  # type: ignore
-        if hasattr(raydium, "sell_via_raydium") and callable(getattr(raydium, "sell_via_raydium")):
-            return await raydium.sell_via_raydium(mint=mint, token_program=token_program, amount_raw=amount_raw, slippage_bps=slippage_bps)  # type: ignore
+            return await raydium.sell(  # type: ignore
+                mint=mint,
+                token_program=token_program,
+                amount_raw=amount_raw,
+                slippage_bps=slippage_bps,
+            )
+        if hasattr(raydium, "sell_via_raydium") and callable(
+            getattr(raydium, "sell_via_raydium")
+        ):
+            return await raydium.sell_via_raydium(  # type: ignore
+                mint=mint,
+                token_program=token_program,
+                amount_raw=amount_raw,
+                slippage_bps=slippage_bps,
+            )
     except Exception as e:
         log.event("ROUTER_RAYDIUM_SELL_FAIL", mint=mint, err=str(e)[:200])
     return None
 
-# Public wrappers that used to be aliases — now add fallback logic
-async def buy_via_lightning(*, mint: str, amount_sol: float, slippage_bps: int = None) -> Optional[str]:
-    """Primary BUY path: try Jupiter via lightning_impl, then fallback to Raydium on no-route."""
+
+async def buy_via_lightning(
+    *, mint: str, amount_sol: float, slippage_bps: int | None = None
+) -> Optional[str]:
+    """
+    Primary BUY path for generic pools (raydium/lightning):
+    try Jupiter via lightning_impl, then fallback to Raydium on no-route.
+    """
     if slippage_bps is None:
         slippage_bps = _clamp_slippage_bps(None)
     try:
-        sig = await _buy_lightning(mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps)
+        sig = await _buy_lightning(
+            mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps
+        )
         if sig:
             return sig
         return None
     except RuntimeError as e:
         if str(e) in _NO_ROUTE_ERRORS:
             log.info({"event": "ROUTER_FALLBACK_RAYDIUM", "mint": mint})
-            return await _fallback_buy_on_raydium(mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps)
+            return await _fallback_buy_on_raydium(
+                mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps
+            )
         raise
 
-async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int = None) -> Optional[str]:
-    """Primary SELL path: try Jupiter via lightning_impl, fallback to Raydium on no-route."""
+
+async def sell_via_lightning(
+    *,
+    mint: str,
+    token_program: Optional[str],
+    amount_raw: int,
+    slippage_bps: int | None = None,
+) -> Optional[str]:
+    """
+    Primary SELL path: try Jupiter via lightning_impl, fallback to Raydium on no-route.
+    """
     if slippage_bps is None:
         slippage_bps = _clamp_slippage_bps(None)
     try:
-        sig = await _sell_lightning(mint=mint, token_program=token_program, amount_raw=amount_raw, slippage_bps=slippage_bps)
+        sig = await _sell_lightning(
+            mint=mint,
+            token_program=token_program,
+            amount_raw=amount_raw,
+            slippage_bps=slippage_bps,
+        )
         if sig:
             return sig
         return None
     except RuntimeError as e:
         if str(e) in _NO_ROUTE_ERRORS:
             log.info({"event": "ROUTER_FALLBACK_RAYDIUM_SELL", "mint": mint})
-            return await _fallback_sell_on_raydium(mint=mint, token_program=token_program, amount_raw=amount_raw, slippage_bps=slippage_bps)
+            return await _fallback_sell_on_raydium(
+                mint=mint,
+                token_program=token_program,
+                amount_raw=amount_raw,
+                slippage_bps=slippage_bps,
+            )
         raise
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pump.fun direct-buy fallback wrapper
+# ──────────────────────────────────────────────────────────────────────────────
+LAMPORTS_PER_SOL_F = float(LAMPORTS_PER_SOL)
+
+
+async def _pump_direct_buy_lamports(
+    *, mint: str, in_amount_lamports: int, slippage_bps: int
+) -> dict:
+    """
+    Thin adapter around utils_pkg.pump_trader.
+
+    Expects pump_trader to expose either:
+      - buy_direct_lamports(mint=..., in_amount_lamports=..., slippage_bps=...)
+        OR
+      - buy_pump_token(mint=..., sol_amount=..., slippage_bps=...)
+    """
+    if pump_trader is None:
+        return {
+            "ok": False,
+            "error": "pump_trader not available",
+            "mint": mint,
+        }
+
+    try:
+        if hasattr(pump_trader, "buy_direct_lamports") and callable(
+            getattr(pump_trader, "buy_direct_lamports")
+        ):
+            return await pump_trader.buy_direct_lamports(  # type: ignore
+                mint=mint,
+                in_amount_lamports=in_amount_lamports,
+                slippage_bps=slippage_bps,
+            )
+
+        # Fallback: derive SOL amount and call a sol-amount-based helper
+        sol_amount = in_amount_lamports / LAMPORTS_PER_SOL_F
+        if hasattr(pump_trader, "buy_pump_token") and callable(
+            getattr(pump_trader, "buy_pump_token")
+        ):
+            res = await pump_trader.buy_pump_token(  # type: ignore
+                mint=mint,
+                sol_amount=sol_amount,
+                slippage_bps=slippage_bps,
+            )
+            if isinstance(res, dict):
+                return res
+            return {"ok": True, "txid": str(res), "mint": mint}
+
+    except Exception as e:
+        log.exception(
+            "PUMP_DIRECT_BUY_ERROR",
+            extra={"mint": mint, "err": str(e)},
+        )
+        return {"ok": False, "error": str(e), "mint": mint}
+
+    return {
+        "ok": False,
+        "error": "no suitable pump_trader buy function found",
+        "mint": mint,
+    }
+
+
+async def pump_buy_with_fallback(
+    *,
+    mint: str,
+    amount_sol: float,
+    slippage_bps: int | None = None,
+    label: str = "pump-buy",
+) -> Optional[str]:
+    """
+    Pump-specific BUY path:
+
+    1) Try lightning_impl (Jupiter) first.
+    2) If Jupiter has no route (404/400 or 'No routes' msg), fall back to direct Pump.fun buy.
+    """
+    if slippage_bps is None:
+        slippage_bps = _clamp_slippage_bps(None)
+
+    # 1) Try Jupiter via lightning_impl
+    try:
+        sig = await _buy_lightning(
+            mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps
+        )
+        if sig:
+            return sig
+        return None
+
+    except HTTPStatusError as e:
+        # Explicitly handle HTTP 400/404 / no-route cases
+        status = e.response.status_code
+        text = ""
+        try:
+            text = e.response.text
+        except Exception:
+            pass
+
+        if status not in (400, 404) and "No routes" not in text and "no routes" not in text:
+            # Unexpected HTTP error -> bubble up
+            raise
+
+        log.info(
+            {
+                "event": "PUMP_FALLBACK_JUP_NO_ROUTE",
+                "mint": mint,
+                "status": status,
+                "snippet": text[:160],
+                "label": label,
+            }
+        )
+
+    except RuntimeError as e:
+        # Preserve existing special no-route markers if lightning_impl uses them
+        if str(e) in _NO_ROUTE_ERRORS:
+            log.info(
+                {
+                    "event": "PUMP_FALLBACK_JUP_MARKER",
+                    "mint": mint,
+                    "label": label,
+                }
+            )
+        else:
+            log.warning(
+                {
+                    "event": "PUMP_FALLBACK_JUP_RUNTIME",
+                    "mint": mint,
+                    "err": str(e),
+                    "label": label,
+                }
+            )
+
+    except Exception as e:
+        # Generic failure -> we still *attempt* Pump.fun, but log loudly
+        log.warning(
+            {
+                "event": "PUMP_FALLBACK_JUP_ERROR",
+                "mint": mint,
+                "err": str(e),
+                "label": label,
+            }
+        )
+
+    # 2) Fallback: direct Pump.fun bonding curve buy
+    in_amount_lamports = int(round(float(amount_sol) * LAMPORTS_PER_SOL_F))
+    if in_amount_lamports <= 0:
+        return None
+
+    pump_res = await _pump_direct_buy_lamports(
+        mint=mint,
+        in_amount_lamports=in_amount_lamports,
+        slippage_bps=slippage_bps,
+    )
+
+    if pump_res.get("ok"):
+        txid = pump_res.get("txid") or pump_res.get("signature")
+        log.info(
+            {
+                "event": "PUMP_FALLBACK_DIRECT_OK",
+                "mint": mint,
+                "txid": txid,
+            }
+        )
+        return str(txid) if txid else None
+
+    log.warning(
+        {
+            "event": "PUMP_FALLBACK_DIRECT_FAIL",
+            "mint": mint,
+            "err": pump_res.get("error"),
+        }
+    )
+    return None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Token metadata helpers
 # ──────────────────────────────────────────────────────────────────────────────
 async def get_tokens() -> List[dict]:
     return await _tokens_catalog()
+
 
 def get_token_symbol(mint: str) -> Optional[str]:
     try:
@@ -1000,29 +1475,34 @@ def get_token_symbol(mint: str) -> Optional[str]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Registry wiring — register AFTER wrappers are defined so we point to them
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _register_lightning():
-    # Register under pool names the app expects, so routing works without further changes.
+def _register_lightning() -> None:
+    # pump uses dedicated Pump.fun fallback wrapper
     if ALLOW_PUMP:
-        BUY_IMPLS["pump"]  = buy_via_lightning
+        BUY_IMPLS["pump"] = pump_buy_with_fallback
         SELL_IMPLS["pump"] = sell_via_lightning
+
+    # raydium uses the generic lightning wrapper with Raydium fallback
     if ALLOW_RAYDIUM:
-        BUY_IMPLS["raydium"]  = buy_via_lightning
+        BUY_IMPLS["raydium"] = buy_via_lightning
         SELL_IMPLS["raydium"] = sell_via_lightning
+
     # Also provide a generic "lightning" key for direct calls, if any.
     BUY_IMPLS.setdefault("lightning", buy_via_lightning)
     SELL_IMPLS.setdefault("lightning", sell_via_lightning)
+
 
 if BUY_IMPL == "lightning":
     _register_lightning()
 
 # Helpful startup log (confirms registration happened)
 try:
-    from logging_setup import get_logger
-    log = get_logger()
-    log.info({"event":"ROUTER_IMPLS",
-              "buy_keys": list(BUY_IMPLS.keys()),
-              "sell_keys": list(SELL_IMPLS.keys())})
+    log.info(
+        {
+            "event": "ROUTER_IMPLS",
+            "buy_keys": list(BUY_IMPLS.keys()),
+            "sell_keys": list(SELL_IMPLS.keys()),
+        }
+    )
 except Exception:
     pass
 
@@ -1031,15 +1511,28 @@ except Exception:
 # ──────────────────────────────────────────────────────────────────────────────
 __all__ = [
     # lifecycle
-    "start", "shutdown",
+    "start",
+    "shutdown",
     # price/quote
-    "get_sell_quote", "get_buy_quote", "get_price_ui", "price_of_ui", "price_of",
+    "get_sell_quote",
+    "get_buy_quote",
+    "get_price_ui",
+    "price_of_ui",
+    "price_of",
     # tokens/meta
-    "get_tokens", "get_token_symbol", "mint_decimals", "get_decimals",
+    "get_tokens",
+    "get_token_symbol",
+    "mint_decimals",
+    "get_decimals",
     # swaps (delegated with fallback)
-    "buy_via_lightning", "sell_via_lightning",
+    "buy_via_lightning",
+    "sell_via_lightning",
+    "pump_buy_with_fallback",
     # utils
-    "normalize_pump_id_to_mint", "_is_valid_pubkey_str", "is_valid_pubkey_str",
+    "normalize_pump_id_to_mint",
+    "_is_valid_pubkey_str",
+    "is_valid_pubkey_str",
     # config
-    "TX_RPC_URL", "TX_COMMITMENT",
+    "TX_RPC_URL",
+    "TX_COMMITMENT",
 ]
