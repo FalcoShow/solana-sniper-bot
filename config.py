@@ -435,122 +435,59 @@ elif _missing:
 # Summary helper
 # ---------------------------------------------------------------------------
 
-def summarize() -> dict:
-    """Convenient for /health endpoints & debugging."""
+def summarize():
+    """
+    Lightweight summary of the main knobs we care about for debugging
+    and sanity checks.  This is only for introspection, not core logic.
+    """
     return {
-        "app": APP_NAME,
-        "env": ENV,
-        "log_level": LOG_LEVEL,
-        "rpc_primary": RPC_URL,
-        "rpc_pool_count": len(RPC_URLS),
-        "commitment": COMMITMENT,
-        "jito_enabled": ENABLE_JITO,
-        "metrics": {"enabled": ENABLE_METRICS, "port": METRICS_PORT},
-        "redis_url": REDIS_URL,
-        "sqlite_db": SQLITE_DB_PATH,
-        "pg": {
-            "enabled": PG_ENABLED,
-            "dsn": bool(
-                POSTGRES_DSN or PG_DSN or PG_DSN_INTERNAL or PG_DSN_EXTERNAL
-            ),
+        "sniper": {
+            "pause_trading": PAUSE_TRADING,
+            "dry_run": DRY_RUN,
+            "scanner_period_sec": SCANNER_PERIOD_SEC,
+            "buy_cooldown_sec": BUY_COOLDOWN_SEC,
+            "max_concurrent_buys": PF_MAX_CONCURRENT,
+            "prewarm_top_n": PREWARM_TOP_N,
+            "min_liq_usd": LIQ_MIN_USD,
+            "min_pool_age_min": MIN_POOL_AGE_MIN,
+            "strategy_preset": STRATEGY_PRESET,
+            "telegram_heartbeats": PNL_TELEGRAM_HEARTBEAT,
+            "route_blocks_notify": TELEGRAM_NOTIFY_ROUTE_BLOCKS,
+            "moonshot_enabled": MOONSHOT_ENABLED,
+            "moonshot_daily_usd": MOONSHOT_DAILY_USD,
         },
-        "notion": {
-            "enabled": ENABLE_NOTION_LOGGING
-            and bool(NOTION_TOKEN and NOTION_DATABASE_ID),
-            "props": {
-                "title": NOTION_TITLE_PROP,
-                "mint": NOTION_PROP_TOKEN,
-                "entry": NOTION_PROP_ENTRY,
-                "current": NOTION_PROP_CURRENT,
-                "profit": NOTION_PROP_PROFIT,
-                "reason": NOTION_PROP_REASON,
-                "time": NOTION_PROP_TIME,
-            },
-        },
-        "openai": {
-            "model": OPENAI_MODEL or FINE_TUNED_MODEL,
-            "base_url": bool(OPENAI_BASE_URL),
+
         "scanners": {
             "raydium": ENABLE_RAYDIUM_SCANNER,
             "dexscreener": ENABLE_DEXSCREENER_SCANNER,
             "pumpfun": ENABLE_PUMPFUN_SCANNER,
             "arbitrage": ENABLE_ARBITRAGE,
 
-            # core safety rails (same as before, driven by env)
+            # core safety rails
             "min_liq_usd": SCANNER_MIN_LIQ_USD,
             "min_fdv_usd": SCANNER_MIN_FDV_USD,
             "min_fraud_score": SCANNER_MIN_FRAUD_SCORE,
             "alerts": SCANNER_ALERTS_ENABLED,
 
-            # 🔍 volume & buys – loosened for more entries, but still sane
-            # Defaults are our “phase 1” values; env vars can override.
+            # volume & buys – loosened defaults for phase-1
             "min_buys_5m": int(os.getenv("SCANNER_MIN_BUYS_5M", "3")),        # was 5
             "min_buys_15m": int(os.getenv("SCANNER_MIN_BUYS_15M", "5")),      # was 8
             "min_vol_5m": float(os.getenv("SCANNER_MIN_VOLUME_5M_USD", "1000")),   # was 2500
             "min_vol_15m": float(os.getenv("SCANNER_MIN_VOLUME_15M_USD", "2000")), # was 5000
 
-            # buy pressure – slightly looser but still requires buyers > sellers
+            # buy pressure – still requires buyers > sellers
             "min_buy_ratio": float(os.getenv("SCANNER_MIN_BUY_RATIO", "0.55")),
             "require_buy_pressure": os.getenv(
                 "SCANNER_REQUIRE_BUY_PRESSURE", "true"
             ).lower() in {"1", "true", "yes", "on"},
 
-            # price change filters (keep as-is for now)
+            # price change filters (kept at current values)
             "min_chg_5m": float(os.getenv("SCANNER_MIN_PRICE_CHANGE_5M", "5.0")),
             "min_chg_15m": float(os.getenv("SCANNER_MIN_PRICE_CHANGE_15M", "10.0")),
 
-            # age / holders caps – allow slightly older & younger tokens
-            "max_age_min": int(os.getenv("SCANNER_MAX_AGE_MIN", "120")),     # was 90
-            "max_mc_usd": float(os.getenv("SCANNER_MAX_MC_USD", "2000000")), # unchanged
-            "min_holders": int(os.getenv("SCANNER_MIN_HOLDERS", "20")),      # was 50
+            # age / holders
+            "max_age_min": int(os.getenv("SCANNER_MAX_AGE_MIN", "120")),      # was 90
+            "max_mc_usd": float(os.getenv("SCANNER_MAX_MC_USD", "2000000")),  # unchanged
+            "min_holders": int(os.getenv("SCANNER_MIN_HOLDERS", "20")),       # was 50
         },
-        "sniper": {
-            "pause_trading": PAUSE_TRADING,
-            "dry_run": DRY_RUN,
-            "scanner_period_sec": SCANNER_PERIOD_SEC,
-            "buy_cooldown_sec": BUY_COOLDOWN_SEC,
-            "max_concurrent_buys": MAX_CONCURRENT_BUYS,
-            "prewarm_top_n": PREWARM_TOP_N,
-            "min_liq_usd": MIN_LIQ_USD,
-            "min_pool_age_min": MIN_POOL_AGE_MIN,
-            "strategy_preset": STRATEGY_PRESET,
-            "telegram_heartbeats": TELEGRAM_HEARTBEATS,
-            "route_blocks_notify": TELEGRAM_NOTIFY_ROUTE_BLOCKS,
-            "moonshot_enabled": MOONSHOT_ENABLED,
-            "moonshot_daily_usd": MOONSHOT_DAILY_USD,
-        },
-        "trading": {
-            "slippage": JUPITER_MAX_SLIPPAGE,
-            "max_risk_per_trade": MAX_RISK_PER_TRADE,
-            "min_sol_balance": MIN_SOL_BALANCE,
-            "min_volatility": MIN_VOLATILITY,
-            "partial_sell_chunks": PARTIAL_SELL_CHUNKS,
-            "target_profit_pct": TARGET_PROFIT_PERCENT,
-            "stop_loss_pct": STOP_LOSS_PERCENT,
-            "tp1_pct": TAKE_PROFIT1_PCT,
-            "tp2_pct": TAKE_PROFIT2_PCT,
-            "tp3_pct": TAKE_PROFIT3_PCT,
-            "trailing_stop": TRAILING_STOP_ENABLED,
-            "max_hold_minutes": MAX_HOLD_TIME_MINUTES,
-            "hold_score_threshold": HOLD_IF_SCORE_ABOVE,
-            "ticket_pct_equity": TICKET_PCT_EQUITY,
-            "ticket_usd_cap": TICKET_USD_CAP,
-            "auto_buy": AUTO_BUY_ENABLED,
-            "auto_sell": AUTO_SELL_ENABLED,
-            "paper_trading": PAPER_TRADING,
-        },
-        "daytrader": {
-            "enabled": ENABLE_DAYTRADER,
-            "symbols": DAYTRADER_SYMBOLS,
-            "tfs": DAYTRADER_TIMEFRAMES,
-            "exchanges": DAYTRADER_EXCHANGES,
-            "model": DT_MODEL_KIND,
-            "prob_threshold": DT_PROB_THRESHOLD,
-            "max_concurrent": DT_MAX_CONCURRENT,
-            "paper_trading": DT_PAPER_TRADING,
-        },
-        "dexes": DEXES,
-        "whales_enabled": ENABLE_WHALE_FILTERS,
-        "dynamic_whales": DYNAMIC_WHALE_DISCOVERY,
-        "whale_list_size": len(WHALE_WALLETS),
     }
