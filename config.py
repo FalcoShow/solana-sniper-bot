@@ -470,27 +470,39 @@ def summarize() -> dict:
         "openai": {
             "model": OPENAI_MODEL or FINE_TUNED_MODEL,
             "base_url": bool(OPENAI_BASE_URL),
-        },
         "scanners": {
             "raydium": ENABLE_RAYDIUM_SCANNER,
             "dexscreener": ENABLE_DEXSCREENER_SCANNER,
             "pumpfun": ENABLE_PUMPFUN_SCANNER,
             "arbitrage": ENABLE_ARBITRAGE,
+
+            # core safety rails (same as before, driven by env)
             "min_liq_usd": SCANNER_MIN_LIQ_USD,
             "min_fdv_usd": SCANNER_MIN_FDV_USD,
             "min_fraud_score": SCANNER_MIN_FRAUD_SCORE,
             "alerts": SCANNER_ALERTS_ENABLED,
-            "min_buys_5m": SCANNER_MIN_BUYS_5M,
-            "min_buys_15m": SCANNER_MIN_BUYS_15M,
-            "min_vol_5m": SCANNER_MIN_VOLUME_5M_USD,
-            "min_vol_15m": SCANNER_MIN_VOLUME_15M_USD,
-            "min_buy_ratio": SCANNER_MIN_BUY_RATIO,
-            "require_buy_pressure": SCANNER_REQUIRE_BUY_PRESSURE,
-            "min_chg_5m": SCANNER_MIN_PRICE_CHANGE_5M,
-            "min_chg_15m": SCANNER_MIN_PRICE_CHANGE_15M,
-            "max_age_min": SCANNER_MAX_AGE_MIN,
-            "max_mc_usd": SCANNER_MAX_MC_USD,
-            "min_holders": SCANNER_MIN_HOLDERS,
+
+            # 🔍 volume & buys – loosened for more entries, but still sane
+            # Defaults are our “phase 1” values; env vars can override.
+            "min_buys_5m": int(os.getenv("SCANNER_MIN_BUYS_5M", "3")),        # was 5
+            "min_buys_15m": int(os.getenv("SCANNER_MIN_BUYS_15M", "5")),      # was 8
+            "min_vol_5m": float(os.getenv("SCANNER_MIN_VOLUME_5M_USD", "1000")),   # was 2500
+            "min_vol_15m": float(os.getenv("SCANNER_MIN_VOLUME_15M_USD", "2000")), # was 5000
+
+            # buy pressure – slightly looser but still requires buyers > sellers
+            "min_buy_ratio": float(os.getenv("SCANNER_MIN_BUY_RATIO", "0.55")),
+            "require_buy_pressure": os.getenv(
+                "SCANNER_REQUIRE_BUY_PRESSURE", "true"
+            ).lower() in {"1", "true", "yes", "on"},
+
+            # price change filters (keep as-is for now)
+            "min_chg_5m": float(os.getenv("SCANNER_MIN_PRICE_CHANGE_5M", "5.0")),
+            "min_chg_15m": float(os.getenv("SCANNER_MIN_PRICE_CHANGE_15M", "10.0")),
+
+            # age / holders caps – allow slightly older & younger tokens
+            "max_age_min": int(os.getenv("SCANNER_MAX_AGE_MIN", "120")),     # was 90
+            "max_mc_usd": float(os.getenv("SCANNER_MAX_MC_USD", "2000000")), # unchanged
+            "min_holders": int(os.getenv("SCANNER_MIN_HOLDERS", "20")),      # was 50
         },
         "sniper": {
             "pause_trading": PAUSE_TRADING,
