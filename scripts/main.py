@@ -43,6 +43,7 @@ import traceback
 from typing import Any, Dict, Optional, Tuple
 from utils_pkg.core_utils import AlertManager
 from asyncio import create_task
+from utils_pkg import auto_exit_worker
 
 # ---------------------------
 # Optional deps (Telegram / PG / Sentry / Health)
@@ -1092,6 +1093,7 @@ class Strategy:
         self._diag["events_total"] += 1
         self._diag["events_trade"] += 1
 
+        # Pass trade ticks into exit engine (for follow-through logic, etc.)
         if _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True):
             try:
                 await exit_engine.on_trade_tick(raw_event)
@@ -1301,13 +1303,19 @@ class Strategy:
                                 extra={"err": str(_e)[:200]},
                             )
 
-                        # Exit engine hook
+                        # Exit engine hook (new dict-style API)
                         try:
-                            await exit_engine.on_buy_filled(
-                                mint=mint_norm, ui=ui, tx_sig=tx_sig
-                            )
+                            ev = {
+                                "mint": mint_norm,
+                                "signature": tx_sig,
+                                "symbol": ui.get("symbol"),
+                                "spend_sol": ui.get("spend_sol") or 0.0,
+                                "pool": ui.get("pool") or "unknown",
+                            }
+                            await exit_engine.on_buy_filled(ev)
                         except Exception:
-                            pass
+                            if DEBUG_TX:
+                                traceback.print_exc()
 
                         self._diag["buys_filled"] += 1
                         record_buy_result(ok=True, reason="executed", sig=tx_sig)
@@ -1523,12 +1531,22 @@ class Strategy:
                                     extra={"err": str(_e)[:200]},
                                 )
 
+                            # Exit engine hook (new dict-style API)
                             try:
-                                await exit_engine.on_buy_filled(
-                                    mint=mint_norm, ui=ui, tx_sig=tx_sig
-                                )
+                                ev = {
+                                    "mint": mint_norm,
+                                    "signature": tx_sig,
+                                    "symbol": ui.get("symbol"),
+                                    "spend_sol": ui.get("spend_sol") or 0.0,
+                                    "pool": ui.get("pool") or "legacy",
+                                }
+                                await exit_engine.on_buy_filled(ev)
                             except Exception:
-                                pass
+                                if DEBUG_TX:
+                               
+
+                                    traceback.print_exc()
+
                             self._diag["buys_filled"] += 1
                             record_buy_result(ok=True, reason="executed", sig=tx_sig)
                             asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
@@ -1653,7 +1671,7 @@ async def _pnl_pg_insert_row(*, realized_sol: float, unrealized_sol: float,
                 VALUES (NOW() AT TIME ZONE 'UTC', $1, $2, $3, $4, $5::jsonb)
             """, realized_sol, unrealized_sol, open_positions, wallet_sol, json.dumps(notes))
             log.event("DAILY_PNL_PG_INSERTED",
-                      realized_sol=realized_sol, unrealized_sol=unrealized_sol,
+                      realized_sol=realized_sol, unrealized_sol=unrl_sol,
                       open_positions=open_positions)
         finally:
             await conn.close()
@@ -1987,6 +2005,7 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
 async def _start_background_tasks(stop_evt: asyncio.Event) -> Dict[str, asyncio.Task]:
     tasks: Dict[str, asyncio.Task] = {}
 
+    # Raydium scanner
     want_raydium = getattr(C, "ENABLE_RAYDIUM_SCANNER", True)
     pools_ok = (not POOLS_FILTER) or ("raydium" in POOLS_FILTER)
     if want_raydium and pools_ok:
@@ -1994,11 +2013,23 @@ async def _start_background_tasks(stop_evt: asyncio.Event) -> Dict[str, asyncio.
         tasks["scan.raydium"] = t
         log.event("SCAN_RAYDIUM_SCHEDULED", task="scan.raydium")
 
+    # Daily PnL loop
     if _as_bool(os.getenv("DAILY_PNL_ENABLED", "1"), True):
         t = asyncio.create_task(_run_daily_pnl_loop(stop_evt), name="telemetry.daily_pnl")
         tasks["telemetry.daily_pnl"] = t
         log.event("DAILY_PNL_SCHEDULED", hour_utc=_as_int(os.getenv("DAILY_PNL_HOUR_UTC", "23"), 23))
 
+    # Auto-exit worker: processes exit_request:* and does forced sells
+    if _as_bool(os.getenv("EXIT_WORKER_ENABLED", "1"), True):
+        t = asyncio.create_task(auto_exit_worker.exit_worker_loop(stop_evt), name="exit.worker")
+        tasks["exit.worker"] = t
+        log.event(
+            "EXIT_WORKER_SCHEDULED",
+            poll_sec=os.getenv("EXIT_WORKER_POLL_SEC", "3"),
+            sell_pct=os.getenv("EXIT_WORKER_SELL_PCT", "1.0"),
+        )
+
+    # Health server
     ht = await _maybe_start_health_server(stop_evt)
     if ht:
         tasks["health.server"] = ht
