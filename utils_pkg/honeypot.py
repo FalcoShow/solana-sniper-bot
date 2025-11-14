@@ -378,15 +378,17 @@ async def _rpc_mint_flags(mint: str) -> Dict[str, Any]:
     return out
 
 
-async def _jupiter_sell_route_check(
-    mint: str,
-    test_amount_base_units: int = 1_000_000,
-) -> Dict[str, Any]:
+async def _jupiter_sell_route_check(mint: str, test_amount_base_units: int = 1_000_000) -> Dict[str, Any]:
     """
-    Ask Jupiter v6 for a SELL quote mint -> WSOL for a small test amount.
+    Ask Jupiter for a SELL quote mint -> wSOL for a small test amount.
 
-    If there's no routePlan or outAmount is tiny, treat as potential honeypot / illiquid.
+    * If we get a clean 200 + routePlan + outAmount, we treat that as strong
+      evidence that the token is sellable via Jupiter.
+    * If Jupiter returns a transient HTTP error (401/403/429/5xx) or we hit a
+      network error, we treat it as a **soft** failure by default so it does
+      NOT block entries. You can flip this via HONEYPOT_JUP_STRICT=1.
     """
+
     out: Dict[str, Any] = {
         "source": "jupiter",
         "route_available": None,
@@ -395,11 +397,14 @@ async def _jupiter_sell_route_check(
         "reasons": [],
     }
 
+    strict = (os.getenv("HONEYPOT_JUP_STRICT", "0").strip().lower()
+              in {"1", "true", "yes", "on"})
+
     params = {
         "inputMint": mint,
         "outputMint": WSOL_MINT,
         "amount": str(test_amount_base_units),
-        "slippageBps": "300",  # 3% probe
+        "slippageBps": "300",     # 3% probe
         "swapMode": "ExactIn",
         "onlyDirectRoutes": "false",
     }
@@ -407,22 +412,47 @@ async def _jupiter_sell_route_check(
     sess = await _get_session()
     try:
         async with sess.get(JUPITER_QUOTE_URL, params=params) as resp:
-            if resp.status != 200:
-                out["ok"] = False
-                out["reasons"].append(f"jupiter:http_{resp.status}")
+            status = resp.status
+            if status != 200:
+                # Log body at debug level only
+                try:
+                    body = await resp.text()
+                    logger.debug("Jupiter SELL probe %s %s: %s", status, JUPITER_QUOTE_URL, body)
+                except Exception:
+                    body = "<no-body>"
+
+                out["route_available"] = None
+                out["out_amount"] = None
+
+                tag = f"jupiter:http_{status}"
+                if strict:
+                    out["ok"] = False
+                    out["reasons"].append(tag)
+                else:
+                    # Soft-fail: note it, but don't block the token just because
+                    # Jupiter is grumpy / requires auth / rate-limiting.
+                    out["ok"] = True
+                    out["reasons"].append(tag + ":soft")
                 return out
+
             js = await resp.json()
     except Exception as e:
-        out["ok"] = False
-        out["reasons"].append(f"jupiter:error:{e}")
+        tag = f"jupiter:error:{e}"
+        if strict:
+            out["ok"] = False
+            out["reasons"].append(tag)
+        else:
+            out["ok"] = True
+            out["reasons"].append(tag + ":soft")
         return out
 
+    # v6-style payload: top-level outAmount + routePlan
     route_plan: List[Any] = js.get("routePlan") or []
     out_amt = js.get("outAmount")
 
     if not route_plan:
         out["route_available"] = False
-        if REQUIRE_JUP_SELL_ROUTE:
+        if REQUIRE_JUP_SELL_ROUTE and strict:
             out["ok"] = False
             out["reasons"].append("jupiter:no_route")
         return out
@@ -433,8 +463,7 @@ async def _jupiter_sell_route_check(
         out["out_amount"] = None
 
     out["route_available"] = True
-
-    if REQUIRE_JUP_SELL_ROUTE and (out["out_amount"] is None or out["out_amount"] <= 0):
+    if REQUIRE_JUP_SELL_ROUTE and strict and (out["out_amount"] is None or out["out_amount"] <= 0):
         out["ok"] = False
         out["reasons"].append("jupiter:route_zero_out")
 
