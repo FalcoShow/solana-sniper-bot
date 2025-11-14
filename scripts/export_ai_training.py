@@ -1,155 +1,217 @@
 # scripts/export_ai_training.py
+"""
+Export past trades into OpenAI fine-tuning format (JSONL).
+
+We use the existing `public.trades` table and derive:
+- Features about the trade (side, size, prices, etc.)
+- A label (GOOD / BAD) based on realized profit
+
+Output: ai_training.jsonl (one {"messages":[...]} per line)
+"""
+
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
-from typing import Any, Dict
+from datetime import datetime, timezone
+from typing import Any, Dict, List
 
 import asyncpg
 
 
-PG_DSN = os.getenv("PNL_DSN") or os.getenv("PG_DSN")
-OUT_PATH = "ai_training.jsonl"
-
-"""
-Assumptions (adjust to your schema!):
-
-We assume a table `trades` with columns like:
-- mint TEXT
-- symbol TEXT
-- liq_usd NUMERIC
-- age_sec INT
-- buys_5m INT
-- buys_15m INT
-- vol_5m_usd NUMERIC
-- vol_15m_usd NUMERIC
-- chg_5m_pct NUMERIC
-- chg_15m_pct NUMERIC
-- pnl_pct NUMERIC          -- realized PnL %
-- hold_sec INT             -- how long you held
-- outcome TEXT             -- 'win' | 'loss' | 'breakeven' (or derive from pnl_pct)
-
-You will need to tweak the query + fields to your actual schema.
-"""
+def env_dsn() -> str:
+    dsn = os.environ.get("PNL_DSN") or os.environ.get("PG_DSN")
+    if not dsn:
+        raise SystemExit("No PNL_DSN or PG_DSN in env")
+    return dsn
 
 
-def make_label(row: asyncpg.Record) -> str:
-    """Simple heuristic → you can tune this to be more/less aggressive."""
-    pnl = float(row["pnl_pct"])
-    hold_sec = int(row["hold_sec"] or 0)
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers to derive label / scoring from trade row
+# ──────────────────────────────────────────────────────────────────────────────
+def make_label(row: Dict[str, Any]) -> str:
+    """
+    Simple v1 label:
+      - GOOD if profit or pnl_usd is clearly > 0
+      - BAD  if clearly < 0
+      - NEUTRAL otherwise (small/no change)
+    """
+    profit = row.get("profit")
+    pnl_usd = row.get("pnl_usd")
 
-    if pnl >= 40 and hold_sec <= 3600:
-        return "BUY_HIGH"
-    if pnl >= 15:
-        return "BUY"
-    if pnl <= -20:
-        return "AVOID"
-    return "SKIP"
+    val = None
+    if isinstance(profit, (int, float)):
+        val = profit
+    elif isinstance(pnl_usd, (int, float)):
+        val = pnl_usd
+
+    if val is None:
+        return "NEUTRAL"
+
+    if val > 0.0:
+        return "GOOD"
+    if val < 0.0:
+        return "BAD"
+    return "NEUTRAL"
 
 
-def make_score(row: asyncpg.Record) -> float:
-    """Turn pnl into a 0–1-ish score."""
-    pnl = float(row["pnl_pct"])
-    # compress pnl into 0–1
-    if pnl <= -30:
-        return 0.0
-    if pnl >= 100:
-        return 1.0
-    # linear between -30 and 100
-    return max(0.0, min(1.0, (pnl + 30.0) / 130.0))
+def make_score(row: Dict[str, Any]) -> float:
+    """
+    Map profit → a soft score between 0 and 1 for training:
+      - 0.5 baseline
+      - > 0.5 if profitable
+      - < 0.5 if loss
+    """
+    profit = row.get("profit")
+    pnl_usd = row.get("pnl_usd")
+    val = None
+    if isinstance(profit, (int, float)):
+        val = profit
+    elif isinstance(pnl_usd, (int, float)):
+        val = pnl_usd
+    if val is None:
+        return 0.5
+
+    # Squash via tanh to avoid huge outliers dominating
+    scaled = math.tanh(val / 20.0)  # 20 USD as soft scale
+    return 0.5 + 0.5 * scaled
 
 
-def build_features(row: asyncpg.Record) -> Dict[str, Any]:
-    """What the model sees as 'user' content (we send as JSON text)."""
-    return {
-        "mint": row["mint"],
-        "symbol": row.get("symbol"),
-        "liq_usd": float(row["liq_usd"] or 0),
-        "age_sec": int(row["age_sec"] or 0),
-        "buys_5m": int(row["buys_5m"] or 0),
-        "buys_15m": int(row["buys_15m"] or 0),
-        "vol_5m_usd": float(row["vol_5m_usd"] or 0),
-        "vol_15m_usd": float(row["vol_15m_usd"] or 0),
-        "chg_5m_pct": float(row["chg_5m_pct"] or 0),
-        "chg_15m_pct": float(row["chg_15m_pct"] or 0),
-        "pnl_pct": float(row["pnl_pct"] or 0),
-        "hold_sec": int(row["hold_sec"] or 0),
+def build_feature_summary(row: Dict[str, Any]) -> str:
+    """
+    Turn the row into a short natural-language description the model can learn from.
+    """
+    ts = row.get("ts")
+    if isinstance(ts, datetime):
+        ts_str = ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    else:
+        ts_str = str(ts)
+
+    side = row.get("side") or "unknown"
+    symbol = row.get("symbol") or "UNKNOWN"
+    token = row.get("token") or row.get("mint") or "unknown"
+    sol_amount = row.get("sol_amount")
+    price_sol = row.get("price_sol")
+    price_usd = row.get("price_usd")
+    entry = row.get("entry")
+    current = row.get("current")
+    profit = row.get("profit")
+    pnl_usd = row.get("pnl_usd")
+    reason = row.get("reason")
+
+    parts: List[str] = []
+    parts.append(f"Timestamp: {ts_str}")
+    parts.append(f"Side: {side}")
+    parts.append(f"Symbol: {symbol}")
+    parts.append(f"Mint: {token}")
+
+    if sol_amount is not None:
+        parts.append(f"Size (SOL): {sol_amount:.6f}")
+    if price_sol is not None:
+        parts.append(f"Entry price in SOL: {price_sol:.9f}")
+    if price_usd is not None:
+        parts.append(f"Entry price in USD: {price_usd:.6f}")
+    if entry is not None:
+        parts.append(f"Entry metric: {entry:.6f}")
+    if current is not None:
+        parts.append(f"Exit metric (current): {current:.6f}")
+    if profit is not None:
+        parts.append(f"Realized profit metric: {profit:.6f}")
+    if pnl_usd is not None:
+        parts.append(f"Realized PnL USD: {pnl_usd:.6f}")
+    if reason:
+        parts.append(f"Entry reason: {reason}")
+
+    return " | ".join(parts)
+
+
+def build_training_example(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build one OpenAI chat-like training example from a trade row.
+    """
+    label = make_label(row)
+    score = make_score(row)
+    summary = build_feature_summary(row)
+
+    # You can tune the "instructions" text later — this is v1.
+    system_msg = {
+        "role": "system",
+        "content": (
+            "You are an AI risk and PnL assistant for a Solana meme coin sniper bot. "
+            "Given the trade context, you decide whether similar future trades are GOOD candidates, "
+            "BAD candidates, or NEUTRAL. You respond with a JSON object containing 'label' and 'score'."
+        ),
     }
 
+    user_msg = {
+        "role": "user",
+        "content": (
+            "Here is a past trade. Analyze it and decide if this type of setup is GOOD, BAD, or NEUTRAL:\n"
+            f"{summary}\n\n"
+            "Respond with JSON like: {\"label\": \"GOOD|BAD|NEUTRAL\", \"score\": number between 0 and 1}."
+        ),
+    }
 
-SYSTEM_PROMPT = (
-    "You are an expert Solana meme-coin risk and quality model used in an automated "
-    "sniper bot. You receive a JSON object describing a single token candidate with "
-    "liquidity, age, recent volume, buy/sell pressure, and other stats.\n\n"
-    "Your job is to decide if this token should have been bought, and how strong "
-    "that decision is, based on historical profit and risk.\n\n"
-    "You MUST reply in the following format:\n"
-    "label: <BUY_HIGH|BUY|SKIP|AVOID>\n"
-    "score: <float between 0 and 1>\n"
-    "rationale: <1-2 sentence explanation>\n"
-)
+    assistant_msg = {
+        "role": "assistant",
+        "content": json.dumps({"label": label, "score": round(score, 4)}),
+    }
+
+    return {"messages": [system_msg, user_msg, assistant_msg]}
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Main async export
+# ──────────────────────────────────────────────────────────────────────────────
 async def main() -> None:
-    if not PG_DSN:
-        raise SystemExit("PG_DSN / PNL_DSN not set")
+    dsn = env_dsn()
+    conn = await asyncpg.connect(dsn)
 
-    conn = await asyncpg.connect(PG_DSN)
-
-    # TODO: adjust this query to your schema
+    # Pull trades with a real profit signal in last 90 days
     rows = await conn.fetch(
         """
         SELECT
-          mint,
+          id,
+          ts,
+          token,
           symbol,
-          liq_usd,
-          age_sec,
-          buys_5m,
-          buys_15m,
-          vol_5m_usd,
-          vol_15m_usd,
-          chg_5m_pct,
-          chg_15m_pct,
-          pnl_pct,
-          hold_sec
-        FROM sniper_trades
-        WHERE pnl_pct IS NOT NULL
-          AND created_at >= now() - interval '60 days'
+          side,
+          sol_amount,
+          price_sol,
+          price_usd,
+          pnl_sol,
+          pnl_usd,
+          reason,
+          signature,
+          wallet,
+          amount,
+          entry,
+          current,
+          profit,
+          mint
+        FROM trades
+        WHERE profit IS NOT NULL
+          AND ts >= now() - interval '90 days'
+        ORDER BY ts DESC
         LIMIT 2000;
         """
     )
-
     await conn.close()
 
-    n = 0
-    with open(OUT_PATH, "w", encoding="utf-8") as f:
-        for row in rows:
-            features = build_features(row)
-            label = make_label(row)
-            score = make_score(row)
+    print(f"Fetched {len(rows)} rows from trades")
 
-            assistant_reply = (
-                f"label: {label}\n"
-                f"score: {score:.3f}\n"
-                "rationale: This label and score are based on historical pnl_pct, "
-                "liquidity, age, and recent volume trends.\n"
-            )
+    out_path = "ai_training.jsonl"
+    n_written = 0
+    with open(out_path, "w", encoding="utf-8") as f:
+        for r in rows:
+            row_dict = dict(r)
+            example = build_training_example(row_dict)
+            f.write(json.dumps(example, separators=(",", ":")) + "\n")
+            n_written += 1
 
-            record = {
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": json.dumps(features, separators=(",", ":")),
-                    },
-                    {"role": "assistant", "content": assistant_reply},
-                ]
-            }
-            f.write(json.dumps(record) + "\n")
-            n += 1
-
-    print(f"Wrote {n} examples to {OUT_PATH}")
+    print(f"Wrote {n_written} examples to {out_path}")
 
 
 if __name__ == "__main__":
