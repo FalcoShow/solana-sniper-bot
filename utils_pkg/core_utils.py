@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 from sqlalchemy import MetaData, Table, Column, BigInteger, String, Float, DateTime, text
 from typing import Any, Callable, Optional
 from .alert_manager import AlertManager
+from logging_setup import get_logger
 
 import certifi
 
@@ -103,6 +104,7 @@ except Exception:
 logger = logging.getLogger("core_utils")
 logging.basicConfig(level=logging.INFO)
 jlog = logging.getLogger("core_utils.jito")
+log = get_logger()
 
 # SSL for aiohttp
 ssl_context = ssl.create_default_context(cafile=certifi.where())
