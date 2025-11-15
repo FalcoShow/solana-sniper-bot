@@ -1303,7 +1303,7 @@ class Strategy:
                                 extra={"err": str(_e)[:200]},
                             )
 
-                        # Exit engine hook (new dict-style API)
+                        # Exit engine hook (dict-style API) — now passes tx_sig
                         try:
                             ev = {
                                 "mint": mint_norm,
@@ -1312,7 +1312,7 @@ class Strategy:
                                 "spend_sol": ui.get("spend_sol") or 0.0,
                                 "pool": ui.get("pool") or "unknown",
                             }
-                            await exit_engine.on_buy_filled(ev)
+                            await exit_engine.on_buy_filled(ev, tx_sig)
                         except Exception:
                             if DEBUG_TX:
                                 traceback.print_exc()
@@ -1531,7 +1531,7 @@ class Strategy:
                                     extra={"err": str(_e)[:200]},
                                 )
 
-                            # Exit engine hook (new dict-style API)
+                            # Exit engine hook (dict-style API) — now passes tx_sig
                             try:
                                 ev = {
                                     "mint": mint_norm,
@@ -1540,11 +1540,9 @@ class Strategy:
                                     "spend_sol": ui.get("spend_sol") or 0.0,
                                     "pool": ui.get("pool") or "legacy",
                                 }
-                                await exit_engine.on_buy_filled(ev)
+                                await exit_engine.on_buy_filled(ev, tx_sig)
                             except Exception:
                                 if DEBUG_TX:
-                               
-
                                     traceback.print_exc()
 
                             self._diag["buys_filled"] += 1
