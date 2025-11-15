@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from .core_utils import redis
 from utils_pkg.lightning_impl import sell_via_lightning
@@ -14,6 +14,7 @@ log = logging.getLogger("sniper.exit_worker")
 # ──────────────────────────────────────────────────────────────────────────────
 # Env helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def _env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
@@ -46,6 +47,8 @@ DRYRUN = (
     or _env_bool("IS_DRYRUN", False)
 )
 
+EXIT_ENGINE_ENABLED = _env_bool("EXIT_ENGINE_ENABLED", True)
+
 EXIT_WORKER_ENABLED = _env_bool("EXIT_WORKER_ENABLED", True)
 EXIT_WORKER_POLL_SEC = _env_float("EXIT_WORKER_POLL_SEC", 3.0)
 EXIT_WORKER_BATCH = _env_int("EXIT_WORKER_BATCH", 5)
@@ -56,12 +59,16 @@ EXIT_WORKER_SLIPPAGE_BPS = _env_int("EXIT_WORKER_SLIPPAGE_BPS", PF_SLIPPAGE_BPS)
 # how much of the position to dump, 1.0 = 100%
 EXIT_WORKER_SELL_PCT = float(os.getenv("EXIT_WORKER_SELL_PCT", "1.0"))
 
+# TTL for exit_request keys in Redis (seconds)
+EXIT_REQUEST_TTL_SEC = _env_int("EXIT_REQUEST_TTL_SEC", 600)
+
 LAMPORTS_PER_SOL = 1_000_000_000  # only used for logging / sanity
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Redis helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 async def _scan_exit_requests(limit: int) -> List[str]:
     """
@@ -139,6 +146,7 @@ async def _delete_exit_request(key: str) -> None:
 #       If it's missing, we bail and leave the key for a later pass.
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def _extract_amount_raw(req: Dict[str, Any]) -> Optional[int]:
     """
     Determine how many raw tokens to sell from an exit_request payload.
@@ -168,8 +176,155 @@ def _extract_amount_raw(req: Dict[str, Any]) -> Optional[int]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core exit execution
+# Exit engine
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+class _ExitEngine:
+    """
+    Exit engine:
+
+    - on_trade_tick: placeholder for future follow-through logic.
+    - on_buy_filled: tolerant API used by Strategy to enqueue exit requests.
+
+    It is deliberately conservative: if we can't determine mint or size,
+    we just log and skip instead of throwing.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = EXIT_ENGINE_ENABLED
+
+    async def on_trade_tick(self, raw_event: Dict[str, Any]) -> None:
+        """
+        Called on every trade tick (for future momentum/follow-through usage).
+        At the moment this is a no-op, but we keep the hook so the rest
+        of the system doesn't break.
+        """
+        if not self.enabled:
+            return
+        # NOTE: you can add per-mint tracking / stats here later if you want.
+        return
+
+    async def on_buy_filled(
+        self,
+        ev: Dict[str, Any],
+        tx_sig: Optional[str] = None,
+    ) -> None:
+        """
+        Called when a BUY is filled.
+
+        Tolerant signature:
+
+            await exit_engine.on_buy_filled(ev)          # old style
+            await exit_engine.on_buy_filled(ev, tx_sig)  # new style
+
+        We pull what we can from `ev`, enqueue an exit_request in Redis,
+        and let the background worker actually perform the sell.
+        """
+        if not self.enabled:
+            return
+        if redis is None:
+            log.debug("EXIT_ENGINE_NO_REDIS")
+            return
+        if not isinstance(ev, dict):
+            return
+
+        # --- Mint --------------------------------------------------------
+        mint = (
+            ev.get("mint")
+            or ev.get("token")
+            or ev.get("mintAddress")
+            or ev.get("mint_address")
+            or ev.get("id")
+        )
+        if not mint:
+            log.info("EXIT_ENGINE_SKIP_NO_MINT", extra={"ev_keys": list(ev.keys())})
+            return
+        mint = str(mint)
+
+        # --- Signature (tolerant) ---------------------------------------
+        if tx_sig is None:
+            tx_sig = (
+                ev.get("signature")
+                or ev.get("tx_sig")
+                or ev.get("sig")
+                or ev.get("tx")
+            )
+            if tx_sig:
+                tx_sig = str(tx_sig)
+
+        # --- Position size ----------------------------------------------
+        amount_raw: Optional[int] = None
+        for k in ("position_raw", "amount_raw", "out_amount", "raw_amount_out"):
+            v = ev.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                amount_raw = int(v)
+                break
+
+        if amount_raw is None or amount_raw <= 0:
+            log.info(
+                "EXIT_ENGINE_SKIP_NO_SIZE",
+                extra={"mint": mint, "keys": list(ev.keys())},
+            )
+            return
+
+        # --- Spend SOL (for diagnostics) --------------------------------
+        spend_sol = ev.get("spend_sol") or ev.get("entry_spend_sol") or 0.0
+        try:
+            spend_sol = float(spend_sol)
+        except Exception:
+            spend_sol = 0.0
+
+        # --- General metadata -------------------------------------------
+        reason = str(ev.get("reason", "on_buy_filled"))
+        sell_pct = float(ev.get("sell_pct", EXIT_WORKER_SELL_PCT))
+        sell_pct = max(0.01, min(1.0, sell_pct))
+
+        follow_stats = ev.get("follow_stats")
+        if not isinstance(follow_stats, dict):
+            follow_stats = {}
+
+        key = f"exit_request:{mint}"
+
+        payload: Dict[str, Any] = {
+            "mint": mint,
+            "position_raw": int(amount_raw),
+            "entry_spend_sol": float(spend_sol),
+            "sell_pct": float(sell_pct),
+            "reason": reason,
+            "follow_stats": follow_stats,
+        }
+        if tx_sig:
+            payload["tx_sig"] = tx_sig
+
+        try:
+            await redis.set(key, json.dumps(payload), ex=EXIT_REQUEST_TTL_SEC)
+            log.info(
+                "EXIT_ENGINE_REQUEST_ENQUEUED",
+                extra={
+                    "key": key,
+                    "mint": mint,
+                    "amount_raw": int(amount_raw),
+                    "sell_pct": sell_pct,
+                    "reason": reason,
+                    "tx_sig": tx_sig,
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "EXIT_ENGINE_REDIS_ERROR",
+                extra={"mint": mint, "err": str(e)[:200]},
+            )
+
+
+# Global instance used by scripts/main.py
+exit_engine = _ExitEngine()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core exit execution (worker)
+# ──────────────────────────────────────────────────────────────────────────────
+
 
 async def _execute_exit(req: Dict[str, Any]) -> None:
     """
@@ -177,7 +332,7 @@ async def _execute_exit(req: Dict[str, Any]) -> None:
     """
     mint = str(req.get("mint"))
     reason = str(req.get("reason", "unknown"))
-    follow = req.get("follow_stats", {})
+    follow = req.get("follow_stats", {}) or {}
 
     amount_raw = _extract_amount_raw(req)
     if amount_raw is None or amount_raw <= 0:
@@ -272,6 +427,7 @@ async def _process_once() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Public loop entrypoint
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 async def exit_worker_loop(stop_evt: asyncio.Event) -> None:
     """
