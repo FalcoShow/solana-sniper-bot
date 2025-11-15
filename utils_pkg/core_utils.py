@@ -263,86 +263,52 @@ def get_wallet_pubkey() -> str:
     except Exception:
         return ""
 
-# --------------------------------------------------------------------------
-# Redis / SQLite helpers
-# --------------------------------------------------------------------------
-async def cache_sniped_token(token: str, price: float) -> None:
-    ts = int(time.time())
-    if redis:
-        await redis.setex(f"sniped:{token}", 86400, "1")
+# ─────────────────────────────────────────────────────────────
+# Redis / Upstash
+# ─────────────────────────────────────────────────────────────
+REDIS_URL = (os.getenv("REDIS_URL") or "").strip()
+UPSTASH_REDIS_REST_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or "").strip()
+UPSTASH_REDIS_REST_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or "").strip()
 
-    conn_cm = aiosqlite.connect(SQLITE_DB_PATH)
-    if inspect.isawaitable(conn_cm):      # tests monkeypatch to an async function
-        conn_cm = await conn_cm
-    async with conn_cm as db:
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS sniped_tokens (token TEXT PRIMARY KEY, price REAL, timestamp INTEGER)"
+# try redis.asyncio first, fall back to old aioredis if present
+try:
+    import redis.asyncio as _redis_async  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    _redis_async = None
+    try:
+        import aioredis as _redis_async  # type: ignore[assignment, import]
+    except Exception:
+        _redis_async = None  # type: ignore[assignment]
+
+redis = None  # this is what other modules import
+
+def _mask_redis_url(u: str) -> str:
+    if not u:
+        return ""
+    try:
+        return u.split("@", 1)[-1]
+    except Exception:
+        return "<redis>"
+
+if REDIS_URL and _redis_async is not None:
+    try:
+        # Upstash supports TLS via the rediss:// scheme
+        redis = _redis_async.from_url(
+            REDIS_URL,
+            encoding="utf-8",
+            decode_responses=True,
         )
-        await db.execute(
-            "INSERT OR REPLACE INTO sniped_tokens(token, price, timestamp) VALUES (?, ?, ?)",
-            (token, float(price), int(ts)),
+        log.event("REDIS_INIT_OK", url_mask=_mask_redis_url(REDIS_URL))
+    except Exception as e:  # pragma: no cover
+        redis = None
+        log.event(
+            "REDIS_INIT_FAIL",
+            error=str(e)[:200],
+            url_mask=_mask_redis_url(REDIS_URL),
         )
-        await db.commit()
-
-async def was_token_sniped(token: str) -> bool:
-    if not redis:
-        return False
-    try:
-        return (await redis.exists(f"sniped:{token}")) == 1
-    except Exception:
-        return False
-
-async def rpc_post(payload: dict):
-    url = HELIUS_URL or RPC_FALLBACK_URL
-    headers = {}
-    # If you use the base URL without the ?api-key, send header instead
-    if HELIUS_API_KEY and "api-key=" not in (url or ""):
-        headers["x-api-key"] = HELIUS_API_KEY
-
-    try:
-        r = await _http.post(url, json=payload, headers=headers or None)
-        if r.status_code == 401 and RPC_FALLBACK_URL and RPC_FALLBACK_URL != url:
-            # retry on fallback
-            return await _http.post(RPC_FALLBACK_URL, json=payload)
-        return r
-    except Exception:
-        if RPC_FALLBACK_URL and RPC_FALLBACK_URL != url:
-            return await _http.post(RPC_FALLBACK_URL, json=payload)
-        raise
-
-async def save_entry_price(redis_client: aioredis.Redis, token_address: str, entry_price: float) -> None:
-    payload = {"price": entry_price, "timestamp": datetime.now(timezone.utc).isoformat()}
-    try:
-        await redis_client.set(f"entry_price:{token_address}", json.dumps(payload), ex=172800)
-    except Exception as e:
-        logger.warning(f"save_entry_price failed for {token_address}: {e}")
-
-async def get_entry_price(redis_client: aioredis.Redis, token_address: str) -> Optional[float]:
-    try:
-        raw = await redis_client.get(f"entry_price:{token_address}")
-        if not raw:
-            return None
-        return float(json.loads(raw).get("price"))
-    except Exception:
-        return None
-
-async def get_entry_price_from_redis(token_address: str):
-    if redis is None:
-        raise RuntimeError("Redis not initialized. Call init_resources() first.")
-    return await get_entry_price(redis, token_address)
-
-async def save_entry_price_to_redis(token_address: str, entry_price: float):
-    if redis is None:
-        raise RuntimeError("Redis not initialized. Call init_resources() first.")
-    await save_entry_price(redis, token_address, entry_price)
-
-def dca_profit_exit(current: float, entry: float, target: float = 2.0) -> bool:
-    try:
-        if entry <= 0:
-            return False
-        return float(current) >= float(entry) * float(target)
-    except Exception:
-        return False
+else:
+    reason = "no_url" if not REDIS_URL else "no_client_lib"
+    log.event("REDIS_INIT_SKIP", reason=reason)
 
 # --------------------------------------------------------------------------
 # Alerts (Telegram / Discord)
