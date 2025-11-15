@@ -1,36 +1,5 @@
 from __future__ import annotations
 
-"""
-scripts/main.py (vNext + DSN-normalizer + full buy hooks + healthcheck + sentry)
-
-- Hardens startup, logging, and shutdown.
-- Adds event-rate diagnostics + momentum gate + guardrails.
-- Enforces PF_POOLS filter and supervises the Raydium scanner with backoff+jitter.
-- Local Jupiter relay compatible (removes Brotli decode issues upstream).
-- **Daily PnL rollup**: once/day Telegram message + row in PG table `daily_pnl`.
-- **DRYRUN enforcement** before any buy (IS_DRYRUN/DRYRUN + package flag).
-- **DSN normalizer** so asyncpg always gets postgresql:// (never postgresql+asyncpg://).
-- **BUY HOOKS**: passes coroutines to utils_pkg.pump_trader.maybe_buy:
-      - on_buy_submitted   (fires when swap submitted)
-      - on_buy_filled      (fires when swap confirmed)  -> forwards to exit engine
-      - on_buy_failed      (fires when swap fails)
-- Optional **/health** endpoint (aiohttp present + HEALTH_PORT set).
-- Optional **Sentry** init (SENTRY_DSN).
-- Degrades gracefully if optional dependencies are missing.
-
-NEW in this edition:
-- Notion daily sync integrated into daily-PnL loop
-- Debounced intraday Notion sync on BUY_FILLED (default 10 min)
-
-HOTFIX:
-- Force-wire maybe_buy() to the router’s implementation used in shell tests.
-
-PATCHES IN THIS BUILD:
-- PumpPortalClient no longer called with `subscribe_trades=` (version-safe).
-  We subscribe via `client._subscribe("trades")` or other public methods if available.
-- When router has no buy-capable function, we log `ROUTER_NO_BUY_CAPABLE` with context.
-"""
-
 import asyncio
 import contextlib
 import datetime as _dt
@@ -41,31 +10,55 @@ import signal
 import sys
 import traceback
 from typing import Any, Dict, Optional, Tuple
-from utils_pkg.core_utils import AlertManager
 from asyncio import create_task
-from utils_pkg import auto_exit_worker
+
+# Core utils (alerts + shared Redis client)
+from utils_pkg.core_utils import AlertManager, redis
+
+"""
+scripts/main.py (vNext + DSN-normalizer + full buy hooks + healthcheck + sentry)
+
+- Hardens startup, logging, and shutdown.
+- Adds event-rate diagnostics + momentum gate + guardrails.
+- Enforces PF_POOLS filter and supervises the Raydium scanner with backoff+jitter.
+- Local Jupiter relay compatible (removes Brotli decode issues upstream).
+- Daily PnL rollup + Notion integration.
+- DRYRUN enforcement before any buy (IS_DRYRUN/DRYRUN + package flag).
+- DSN normalizer so asyncpg always gets postgresql:// (never postgresql+asyncpg://).
+- BUY HOOKS: passes coroutines to maybe_buy:
+      - on_buy_submitted   (fires when swap submitted)
+      - on_buy_filled      (fires when swap confirmed)  -> forwards to exit engine
+      - on_buy_failed      (fires when swap fails)
+- Optional /health endpoint (aiohttp present + HEALTH_PORT set).
+- Optional Sentry init (SENTRY_DSN).
+- Degrades gracefully if optional dependencies are missing.
+
+This build also wires:
+- auto_exit_worker.exit_engine for on_buy_filled → Redis exit_request:* keys.
+- risk_manager loop + exit_worker loop (scheduled later in main()).
+"""
 
 # ---------------------------
 # Optional deps (Telegram / PG / Sentry / Health)
 # ---------------------------
 try:
     import httpx
-except Exception:
+except Exception:  # pragma: no cover
     httpx = None  # type: ignore
 
 try:
     import asyncpg
-except Exception:
+except Exception:  # pragma: no cover
     asyncpg = None  # type: ignore
 
 try:
     import sentry_sdk  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     sentry_sdk = None  # type: ignore
 
 try:
     from aiohttp import web  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     web = None  # type: ignore
 
 # ---------------------------
@@ -81,16 +74,16 @@ except Exception:  # pragma: no cover
 # ---------------------------
 # Logging (robust + collision-safe)
 # ---------------------------
-from typing import Any, Dict
-import time
+import logging
 import threading
+import time
 
 # Reserved LogRecord keys we must NOT place inside `extra`
 _RESERVED: set[str] = {
     "name", "msg", "message", "levelname", "levelno", "pathname",
     "filename", "module", "exc_info", "exc_text", "stack_info",
     "lineno", "funcName", "created", "msecs", "relativeCreated",
-    "thread", "threadName", "process", "processName"
+    "thread", "threadName", "process", "processName",
 }
 
 _last_every: Dict[str, float] = {}
@@ -111,7 +104,7 @@ def _add_safe_extra(fields: Dict[str, Any]) -> Dict[str, Any]:
     return safe
 
 
-def _attach_log_helpers_base(_log):
+def _attach_log_helpers_base(_log: logging.Logger):
     """
     Attach `event` and `every` helpers to a logger instance in a
     collision-safe way (no reserved keys in `extra`).
@@ -142,26 +135,28 @@ try:
     from logging_setup import get_logger, bump, start_global_heartbeat
 
     _base_log = get_logger()
-
-except Exception:
+except Exception:  # pragma: no cover
     # Emergency fallback: simple stdout logger
-    class DummyLogger:
+    class DummyLogger(logging.Logger):
+        def __init__(self):
+            super().__init__("dummy")
+
         def _p(self, lvl: str, msg: str, **fields: Any) -> None:
             line = f"[{lvl}] {msg}"
             if fields:
                 line += " " + repr(fields)
             print(line, flush=True)
 
-        def info(self, msg: str, **fields: Any) -> None:
+        def info(self, msg: str, **fields: Any) -> None:  # type: ignore[override]
             self._p("INFO", msg, **fields)
 
-        def warning(self, msg: str, **fields: Any) -> None:
+        def warning(self, msg: str, **fields: Any) -> None:  # type: ignore[override]
             self._p("WARN", msg, **fields)
 
-        def error(self, msg: str, **fields: Any) -> None:
+        def error(self, msg: str, **fields: Any) -> None:  # type: ignore[override]
             self._p("ERROR", msg, **fields)
 
-        def debug(self, msg: str, **fields: Any) -> None:
+        def debug(self, msg: str, **fields: Any) -> None:  # type: ignore[override]
             self._p("DEBUG", msg, **fields)
 
     def bump(*_a, **_k):  # type: ignore[func-returns-value]
@@ -180,7 +175,7 @@ log = _attach_log_helpers_base(_base_log)
 # ---------------------------
 try:
     from scripts.pp_utils import normalize_mint as _pp_normalize
-except Exception:
+except Exception:  # pragma: no cover
     def _pp_normalize(s: str) -> str:  # type: ignore
         return s.strip()
 
@@ -193,19 +188,21 @@ except Exception:  # pragma: no cover
     _mg_normalize = None  # type: ignore
     _mg_prob = None  # type: ignore
 
-# --- Unified env-bool helper (same semantics as lightning_impl.env_bool) ---
-def _env_bool(key: str, default: bool=False) -> bool:
+
+def _env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
     if v is None:
         return default
-    return str(v).strip().lower() in ("1","true","t","yes","y","on")
+    return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
+
 
 def _dryrun_env_on() -> bool:
-    # honor any of these
+    # honour any of these
     return _env_bool("DRYRUN") or _env_bool("DRY_RUN") or _env_bool("IS_DRYRUN")
 
+
 # ---------------------------
-# Event source + trading hooks
+# Event source + trading / exit hooks
 # ---------------------------
 try:
     from utils_pkg.pumpportal_client import PumpPortalClient
@@ -214,21 +211,33 @@ except Exception:  # pragma: no cover
         def __init__(self, *a, **kw):
             raise RuntimeError("PumpPortalClient not available")
 
-# NOTE: We intentionally DO NOT import maybe_buy from pump_trader here.
-# We wire maybe_buy() directly to the router so it always matches whatever impls exist.
 
+# We intentionally *don't* import maybe_buy from pump_trader.
+# Instead we wire to whatever buy-capable function router exposes.
 try:
-    from utils_pkg.trader import sell_on_jupiter, exit_engine, IS_DRYRUN as _pkg_is_dryrun
+    from utils_pkg.trader import sell_on_jupiter, IS_DRYRUN as _pkg_is_dryrun
 except Exception:  # pragma: no cover
     async def sell_on_jupiter(*_a, **_kw):  # type: ignore
         raise RuntimeError("sell_on_jupiter not available")
+
+    _pkg_is_dryrun = True  # type: ignore[assignment]
+
+# Exit engine + worker come from auto_exit_worker (this is the thing that enqueues
+# exit_request:* keys into Redis, which the worker consumes).
+try:
+    from utils_pkg.auto_exit_worker import exit_worker_loop, exit_engine  # type: ignore
+except Exception:  # pragma: no cover
+    async def exit_worker_loop(stop_evt: asyncio.Event) -> None:  # type: ignore
+        while not stop_evt.is_set():
+            await asyncio.sleep(5)
+
     class _NoopExit:
         async def on_trade_tick(self, *_a, **_kw): ...
         async def on_buy_filled(self, *_a, **_kw): ...
-    exit_engine = _NoopExit()  # type: ignore
-    _pkg_is_dryrun = True
 
-# Optional utils
+    exit_engine = _NoopExit()  # type: ignore
+
+# Optional position / guardrail helpers
 try:
     from utils_pkg.dedupe import claim_once  # (key:str, ttl:int) -> bool
 except Exception:  # pragma: no cover
@@ -240,6 +249,7 @@ try:
 except Exception:  # pragma: no cover
     def buys_allowed() -> bool:  # type: ignore
         return True
+
     def record_buy_result(*_args, **_kwargs):  # type: ignore
         return None
 
@@ -249,35 +259,42 @@ except Exception:  # pragma: no cover
     def all_positions():  # type: ignore
         return []
 
+# Optional extra risk loop (separate from auto_exit_worker)
 try:
-    from scripts.sell_engine import run_sell_loop
+    from utils_pkg.risk_manager import risk_manager_loop  # type: ignore
 except Exception:  # pragma: no cover
-    async def run_sell_loop(stop_evt: asyncio.Event):  # type: ignore
+    async def risk_manager_loop(stop_evt: asyncio.Event) -> None:  # type: ignore
+        # No-op if risk manager is not present
         while not stop_evt.is_set():
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
+
 
 # Router + price helpers
 try:
-    from utils_pkg import router  # provides start()/shutdown() and buy function(s)
+    from utils_pkg import router  # provides buy function(s)
     from utils_pkg.router import get_price_ui as _route_price_ui
     try:
         from utils_pkg.router import get_decimals as _route_get_decimals
-    except Exception:
+    except Exception:  # pragma: no cover
         _route_get_decimals = None  # type: ignore
 except Exception:  # pragma: no cover
     router = None  # type: ignore
+
     async def _route_price_ui(_mint: str) -> float:  # type: ignore
         return 0.0
+
     _route_get_decimals = None  # type: ignore
 
 # ---------- HOTFIX: wire maybe_buy to router ----------
 import inspect
+
 
 def _safe_log_router_state(event: str, **fields: Any) -> None:
     try:
         log.event(event, **fields)
     except Exception:
         pass
+
 
 def _candidate_buy_names() -> list[str]:
     return [
@@ -295,6 +312,7 @@ def _candidate_buy_names() -> list[str]:
         "buy_pump",
     ]
 
+
 def _pick_router_buy_callable() -> Optional[tuple[str, Any]]:
     if router is None:
         return None
@@ -305,7 +323,8 @@ def _pick_router_buy_callable() -> Optional[tuple[str, Any]]:
     try:
         names = [n for n in dir(router) if "buy" in n.lower()]
         for n in names:
-            if any(bad in n.lower() for bad in ("sell", "quote")):
+            low = n.lower()
+            if any(bad in low for bad in ("sell", "quote")):
                 continue
             fn = getattr(router, n, None)
             if callable(fn):
@@ -313,6 +332,7 @@ def _pick_router_buy_callable() -> Optional[tuple[str, Any]]:
     except Exception:
         pass
     return None
+
 
 def _compute_spend_sol(ui: Dict[str, Any]) -> float:
     for k in ("spend_sol", "buy_size_sol", "amount_sol"):
@@ -331,14 +351,22 @@ def _compute_spend_sol(ui: Dict[str, Any]) -> float:
             pass
     return 0.02
 
+
 def _env_slippage_bps() -> int:
     try:
         return int(os.getenv("SLIPPAGE_BPS", os.getenv("ENTRY_SLIPPAGE_BPS", "50")))
     except Exception:
         return 50
 
-def _build_kwargs_for_router(fn: Any, mint: str, ui: Dict[str, Any],
-                             on_buy_submitted, on_buy_filled, on_buy_failed) -> Dict[str, Any]:
+
+def _build_kwargs_for_router(
+    fn: Any,
+    mint: str,
+    ui: Dict[str, Any],
+    on_buy_submitted,
+    on_buy_filled,
+    on_buy_failed,
+) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {}
     try:
         sig = inspect.signature(fn)
@@ -360,7 +388,10 @@ def _build_kwargs_for_router(fn: Any, mint: str, ui: Dict[str, Any],
             kwargs["slippage_bps"] = _env_slippage_bps()
 
         if "only_direct" in names:
-            kwargs["only_direct"] = bool(os.getenv("ONLY_DIRECT", "0") in {"1","true","yes","on"})
+            kwargs["only_direct"] = bool(
+                os.getenv("ONLY_DIRECT", "0").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
 
         if "on_buy_submitted" in names:
             kwargs["on_buy_submitted"] = on_buy_submitted
@@ -372,19 +403,41 @@ def _build_kwargs_for_router(fn: Any, mint: str, ui: Dict[str, Any],
         kwargs = {"mint": mint, "ui": ui}
     return kwargs
 
-async def _call_with_variants(fn: Any, *, mint: str, ui: Dict[str, Any],
-                              on_buy_submitted, on_buy_filled, on_buy_failed):
+
+async def _call_with_variants(
+    fn: Any,
+    *,
+    mint: str,
+    ui: Dict[str, Any],
+    on_buy_submitted,
+    on_buy_filled,
+    on_buy_failed,
+):
     try:
-        kw_sig = _build_kwargs_for_router(fn, mint, ui, on_buy_submitted, on_buy_filled, on_buy_failed)
+        kw_sig = _build_kwargs_for_router(
+            fn, mint, ui, on_buy_submitted, on_buy_filled, on_buy_failed
+        )
         res = fn(**kw_sig)
         if inspect.isawaitable(res):
             res = await res
-        _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_sig", sent_keys=sorted(kw_sig.keys()))
+        _safe_log_router_state(
+            "ROUTER_BUY_CALL",
+            variant="kw_sig",
+            sent_keys=sorted(kw_sig.keys()),
+        )
         return res
     except TypeError as e:
-        _safe_log_router_state("ROUTER_BUY_CALL_TYPERR", where="kw_sig", err=str(e))
+        _safe_log_router_state(
+            "ROUTER_BUY_CALL_TYPERR",
+            where="kw_sig",
+            err=str(e),
+        )
     except Exception as e:
-        _safe_log_router_state("ROUTER_BUY_CALL_ERR", where="kw_sig", err=str(e))
+        _safe_log_router_state(
+            "ROUTER_BUY_CALL_ERR",
+            where="kw_sig",
+            err=str(e),
+        )
 
     try:
         res = fn(mint=mint, ui=ui)
@@ -393,7 +446,11 @@ async def _call_with_variants(fn: Any, *, mint: str, ui: Dict[str, Any],
         _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_min_mint_ui")
         return res
     except Exception as e:
-        _safe_log_router_state("ROUTER_BUY_CALL_ERR", where="kw_min_mint_ui", err=str(e))
+        _safe_log_router_state(
+            "ROUTER_BUY_CALL_ERR",
+            where="kw_min_mint_ui",
+            err=str(e),
+        )
 
     try:
         res = fn(mint=mint)
@@ -402,14 +459,26 @@ async def _call_with_variants(fn: Any, *, mint: str, ui: Dict[str, Any],
         _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_mint_only")
         return res
     except Exception as e:
-        _safe_log_router_state("ROUTER_BUY_CALL_ERR", where="kw_mint_only", err=str(e))
+        _safe_log_router_state(
+            "ROUTER_BUY_CALL_ERR",
+            where="kw_mint_only",
+            err=str(e),
+        )
 
-    _safe_log_router_state("ROUTER_BUY_ALL_VARIANTS_FAILED", error="no compatible kwargs")
+    _safe_log_router_state(
+        "ROUTER_BUY_ALL_VARIANTS_FAILED",
+        error="no compatible kwargs",
+    )
     return None
 
+
 async def maybe_buy(
-    *, mint: str, ui: Dict[str, Any],
-    on_buy_submitted=None, on_buy_filled=None, on_buy_failed=None
+    *,
+    mint: str,
+    ui: Dict[str, Any],
+    on_buy_submitted=None,
+    on_buy_filled=None,
+    on_buy_failed=None,
 ) -> Optional[str]:
     if router is None:
         _safe_log_router_state("ROUTER_UNAVAILABLE_FOR_BUY")
@@ -419,8 +488,7 @@ async def maybe_buy(
     if not choice:
         _safe_log_router_state(
             "ROUTER_NO_BUY_CAPABLE",
-            impls=os.getenv("ROUTER_IMPLS"),
-            buy_keys=getattr(router, "buy_keys", None),
+            impls=getattr(router, "buy_keys", None),
             sell_keys=getattr(router, "sell_keys", None),
             file=getattr(router, "__file__", "<router?>"),
         )
@@ -430,12 +498,15 @@ async def maybe_buy(
     _safe_log_router_state(
         "ROUTER_BUY_FN",
         fn=fn_name,
-        impls=os.getenv("ROUTER_IMPLS"),
+        impls=getattr(router, "buy_keys", None),
+        sell_keys=getattr(router, "sell_keys", None),
         file=getattr(router, "__file__", "<router?>"),
     )
 
     res = await _call_with_variants(
-        fn, mint=mint, ui=ui,
+        fn,
+        mint=mint,
+        ui=ui,
         on_buy_submitted=on_buy_submitted,
         on_buy_filled=on_buy_filled,
         on_buy_failed=on_buy_failed,
@@ -480,15 +551,18 @@ def _get_raydium_scanner():
     except Exception:
         return None
 
-# --- Solana tx confirmation helpers (keyword-only friendly) ---
-import json as _json
-import httpx as _httpx
-
+# --- Solana tx confirmation helpers ---
 def _rpc_url() -> str:
-    return os.getenv("SOLANA_RPC_URL") or os.getenv("RPC_URL") or "https://api.mainnet-beta.solana.com"
+    return (
+        os.getenv("SOLANA_RPC_URL")
+        or os.getenv("RPC_URL")
+        or "https://api.mainnet-beta.solana.com"
+    )
+
 
 def _confirm_commitment() -> str:
     return os.getenv("CONFIRM_COMMITMENT", "confirmed")
+
 
 def _confirm_timeout_sec() -> float:
     try:
@@ -496,22 +570,27 @@ def _confirm_timeout_sec() -> float:
     except Exception:
         return 25.0
 
+
 async def _get_sig_status(sig: str) -> Optional[dict]:
+    if httpx is None:
+        return None
     body = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getSignatureStatuses",
         "params": [[sig], {"searchTransactionHistory": True}],
     }
-    async with _httpx.AsyncClient(timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10) as c:  # type: ignore[attr-defined]
         r = await c.post(_rpc_url(), json=body)
         r.raise_for_status()
         j = r.json()
         val = (j.get("result") or {}).get("value") or []
-        return (val[0] if val else None)
+        return val[0] if val else None
 
-async def _confirm_sig(sig: str) -> tuple[bool, Optional[str]]:
+
+async def _confirm_sig(sig: str) -> Tuple[bool, Optional[str]]:
     import time as _time
+
     deadline = _time.monotonic() + _confirm_timeout_sec()
     want = _confirm_commitment()
     ok_states = {"confirmed", "finalized"}
@@ -533,6 +612,7 @@ async def _confirm_sig(sig: str) -> tuple[bool, Optional[str]]:
 
     return False, "timeout"
 
+
 # ---------------------------
 # ENV helpers
 # ---------------------------
@@ -541,17 +621,20 @@ def _as_bool(val: Optional[str], default: bool = False) -> bool:
         return default
     return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
 def _as_float(val: Any, default: float) -> float:
     try:
         return float(val)
     except Exception:
         return default
 
+
 def _as_int(val: Any, default: int) -> int:
     try:
         return int(val)
     except Exception:
         return default
+
 
 # ---------------------------
 # DSN normalizer
@@ -570,7 +653,8 @@ def _dsn_to_asyncpg(dsn: str | None) -> str:
         s = "postgres://" + s.split("://", 1)[1]
     return s
 
-def _pick_env_dsn() -> tuple[str, str, str]:
+
+def _pick_env_dsn() -> Tuple[str, str, str]:
     raw_candidates = [
         os.getenv("PNL_DSN"),
         os.getenv("TELEMETRY_PG_DSN"),
@@ -581,11 +665,17 @@ def _pick_env_dsn() -> tuple[str, str, str]:
         os.getenv("PG_DSN_EXTERNAL"),
     ]
     pnl_raw = next((x for x in raw_candidates if x and x.strip()), "") or ""
-    pg_raw  = (os.getenv("PG_DSN") or os.getenv("DATABASE_URL") or os.getenv("PG_DSN_INTERNAL")
-               or os.getenv("PG_DSN_EXTERNAL") or os.getenv("POSITIONS_PG_DSN") or "").strip()
+    pg_raw = (
+        os.getenv("PG_DSN")
+        or os.getenv("DATABASE_URL")
+        or os.getenv("PG_DSN_INTERNAL")
+        or os.getenv("PG_DSN_EXTERNAL")
+        or os.getenv("POSITIONS_PG_DSN")
+        or ""
+    ).strip()
 
     pnl_async = _dsn_to_asyncpg(pnl_raw)
-    pg_async  = _dsn_to_asyncpg(pg_raw)
+    pg_async = _dsn_to_asyncpg(pg_raw)
 
     def _mask(s: str) -> str:
         if not s:
@@ -593,35 +683,36 @@ def _pick_env_dsn() -> tuple[str, str, str]:
         try:
             body = s.split("://", 1)[1]
             after_at = body.split("@", 1)[-1]
-            host_db  = after_at.split("?", 1)[0]
+            host_db = after_at.split("?", 1)[0]
             return host_db
         except Exception:
             return "<dsn>"
 
     return pnl_async, pg_async, (_mask(pnl_async) or _mask(pg_async) or "")
 
+
 _PNL_DSN_ASYNC, _PG_DSN_ASYNC, _PG_DSN_MASK = _pick_env_dsn()
 
 # ---------------------------
 # Config (env)
 # ---------------------------
-EXIT_ENGINE_ENABLED   = _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True)
-DEDUPE_ENABLED        = _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True)
-DEDUPE_TTL_SEC        = _as_int(os.getenv("PF_DEDUPE_TTL_SEC", "3600"), 3600)
-LIQ_FILTER_ENABLED    = _as_bool(os.getenv("ENTRY_LIQ_FILTER", "1"), True)
+EXIT_ENGINE_ENABLED = _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True)
+DEDUPE_ENABLED = _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True)
+DEDUPE_TTL_SEC = _as_int(os.getenv("PF_DEDUPE_TTL_SEC", "3600"), 3600)
+LIQ_FILTER_ENABLED = _as_bool(os.getenv("ENTRY_LIQ_FILTER", "1"), True)
 
-ENTRY_MOMENTUM_ENABLED   = _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True)
-ENTRY_MOMO_WINDOW_SEC    = _as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10)
-ENTRY_MOMO_MIN_TRADES    = _as_int(os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6)
-ENTRY_MOMO_MIN_UP_PCT    = _as_float(os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0)
-ENTRY_MOMO_PRICE_TRIES   = _as_int(os.getenv("ENTRY_MOMO_PRICE_TRIES", "4"), 4)
+ENTRY_MOMENTUM_ENABLED = _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True)
+ENTRY_MOMO_WINDOW_SEC = _as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10)
+ENTRY_MOMO_MIN_TRADES = _as_int(os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6)
+ENTRY_MOMO_MIN_UP_PCT = _as_float(os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0)
+ENTRY_MOMO_PRICE_TRIES = _as_int(os.getenv("ENTRY_MOMO_PRICE_TRIES", "4"), 4)
 ENTRY_MOMO_PRICE_DELAY_S = _as_float(os.getenv("ENTRY_MOMO_PRICE_DELAY_S", "0.7"), 0.7)
-ENTRY_MOMO_MAX_PARALLEL  = max(1, _as_int(os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"), 6))
+ENTRY_MOMO_MAX_PARALLEL = max(1, _as_int(os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"), 6))
 
-MIN_INITIAL_BUY_SOL   = _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
-MAX_NAME_LEN          = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
-ENTRY_MAX_AGE_MIN     = _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20)
-MIN_POOL_AGE_MIN      = _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3)
+MIN_INITIAL_BUY_SOL = _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
+MAX_NAME_LEN = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
+ENTRY_MAX_AGE_MIN = _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20)
+MIN_POOL_AGE_MIN = _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3)
 
 SYMBOL_BLACKLIST = {
     s.strip().upper()
@@ -629,37 +720,57 @@ SYMBOL_BLACKLIST = {
     if s.strip()
 }
 
-MAX_CONCURRENCY   = max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2))
+MAX_CONCURRENCY = max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2))
 LOOP_COOLDOWN_SEC = _as_float(os.getenv("PF_COOLDOWN_SEC", "15"), 15.0)
-MAX_TRADEABLE     = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)  # 0 = unlimited
-PAUSE_TRADING     = _as_bool(os.getenv("PAUSE_TRADING", "0"), False)
-DEBUG_TX          = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
+MAX_TRADEABLE = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)  # 0 = unlimited
+PAUSE_TRADING = _as_bool(os.getenv("PAUSE_TRADING", "0"), False)
+DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
 
 # Pools filter (affects printing and Raydium scanner scheduling)
-_POOLS_ENV  = [p.strip().lower() for p in (os.getenv("PF_POOLS") or "").split(",") if p.strip()]
+_POOLS_ENV = [
+    p.strip().lower()
+    for p in (os.getenv("PF_POOLS") or "").split(",")
+    if p.strip()
+]
 POOLS_FILTER: set[str] = set(_POOLS_ENV)
 
 # Daily PnL env
-DAILY_PNL_ENABLED   = _as_bool(os.getenv("DAILY_PNL_ENABLED", "1"), True)
-DAILY_PNL_HOUR_UTC  = _as_int(os.getenv("DAILY_PNL_HOUR_UTC", "23"), 23)
-DAILY_PNL_TEST_NOW  = _as_bool(os.getenv("DAILY_PNL_TEST_NOW", "0"), False)
-DAILY_PNL_CHAT_ID   = (os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
-DAILY_PNL_BOT       = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+DAILY_PNL_ENABLED = _as_bool(os.getenv("DAILY_PNL_ENABLED", "1"), True)
+DAILY_PNL_HOUR_UTC = _as_int(os.getenv("DAILY_PNL_HOUR_UTC", "23"), 23)
+DAILY_PNL_TEST_NOW = _as_bool(os.getenv("DAILY_PNL_TEST_NOW", "0"), False)
+DAILY_PNL_CHAT_ID = (
+    os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or ""
+).strip()
+DAILY_PNL_BOT = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 DAILY_PNL_DEBOUNCE_MIN = _as_int(os.getenv("DAILY_PNL_DEBOUNCE_MIN", "10"), 10)
 
 # Scanner + dedupe tuning
-RAYDIUM_SCAN_INTERVAL_SEC = _as_float(os.getenv("RAYDIUM_SCAN_INTERVAL_SEC", "30"), 30.0)
-PF_GATE_TTL_SEC     = _as_int(os.getenv("PF_GATE_TTL_SEC", str(max(_as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC","10"),10)*2, 60))), max(ENTRY_MOMO_WINDOW_SEC*2, 60))
-PF_BUY_TTL_SEC      = _as_int(os.getenv("PF_BUY_TTL_SEC", "600"), 600)
+RAYDIUM_SCAN_INTERVAL_SEC = _as_float(
+    os.getenv("RAYDIUM_SCAN_INTERVAL_SEC", "30"), 30.0
+)
+PF_GATE_TTL_SEC = _as_int(
+    os.getenv(
+        "PF_GATE_TTL_SEC",
+        str(max(_as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10) * 2, 60)),
+    ),
+    max(ENTRY_MOMO_WINDOW_SEC * 2, 60),
+)
+PF_BUY_TTL_SEC = _as_int(os.getenv("PF_BUY_TTL_SEC", "600"), 600)
 
-# Buy-hook Telegram toggles (optional)
-NOTIFY_BUY_SUBMITTED = _as_bool(os.getenv("TELEGRAM_NOTIFY_SUBMITTED", "0"), False)
-NOTIFY_BUY_FAILED    = _as_bool(os.getenv("TELEGRAM_NOTIFY_FAILED", "0"), False)
-NOTIFY_BUY_FILLED    = _as_bool(os.getenv("TELEGRAM_NOTIFY_FILLED", "0"), False)
+# Buy-hook Telegram toggles (optional) – keep defaults to ON for visibility
+NOTIFY_BUY_SUBMITTED = _as_bool(os.getenv("NOTIFY_BUY_SUBMITTED", "1"), True)
+NOTIFY_BUY_FAILED = _as_bool(os.getenv("NOTIFY_BUY_FAILED", "1"), True)
+NOTIFY_BUY_FILLED = _as_bool(os.getenv("NOTIFY_BUY_FILLED", "1"), True)
 
 # Health / Sentry
 HEALTH_PORT = _as_int(os.getenv("HEALTH_PORT", "0"), 0)
-SENTRY_DSN  = (os.getenv("SENTRY_DSN") or "").strip()
+SENTRY_DSN = (os.getenv("SENTRY_DSN") or "").strip()
+
+# Risk manager toggles (loop wired in part 2)
+RISK_MANAGER_ENABLED = _as_bool(os.getenv("RISK_MANAGER_ENABLED", "1"), True)
+RISK_MANAGER_POLL_SEC = _as_float(
+    os.getenv("RISK_MANAGER_POLL_SEC", "60"), 60.0
+)
 
 # ---------------------------
 # Small helpers
@@ -670,19 +781,29 @@ def _get_first(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
             return d[k]
     return default
 
+
 def _extract_symbol(msg: Dict[str, Any]) -> str:
     return str(_get_first(msg, "symbol", "ticker", default="")).strip()
+
 
 def _extract_name(msg: Dict[str, Any]) -> str:
     return str(_get_first(msg, "name", default="")).strip()
 
+
 def _extract_raw_mint(msg: Dict[str, Any]) -> str:
     raw = _get_first(
         msg,
-        "mint","mintAddress","mint_address","bondingCurve","bonding_curve","address","id",
+        "mint",
+        "mintAddress",
+        "mint_address",
+        "bondingCurve",
+        "bonding_curve",
+        "address",
+        "id",
         default="",
     )
     return ("" if raw is None else str(raw)).strip()
+
 
 def _approx_minutes_since(ts_any: Any) -> Optional[float]:
     try:
@@ -714,64 +835,112 @@ def _approx_minutes_since(ts_any: Any) -> Optional[float]:
         return None
     return None
 
+
 def utc_today_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+
 
 # ---------------------------
 # Basic filters
 # ---------------------------
 def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
     pool = str((_get_first(msg, "pool", default="") or "")).strip().lower()
-    is_raydium = (pool == "raydium")
+    is_raydium = pool == "raydium"
 
     if POOLS_FILTER and pool and pool not in POOLS_FILTER:
         if DEBUG_TX:
-            print(f".[filter] pool '{pool}' not in {sorted(POOLS_FILTER)} — skip", flush=True)
+            print(
+                f".[filter] pool '{pool}' not in {sorted(POOLS_FILTER)} — skip",
+                flush=True,
+            )
         return False
 
     typ = str(_get_first(msg, "txType", "type", default="")).strip().lower()
     if not is_raydium and typ != "create":
         return False
 
-    init_buy = _as_float(_get_first(msg, "initialBuy", "initial_buy", default=0.0), 0.0)
-    if not is_raydium and init_buy < _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0):
+    init_buy = _as_float(
+        _get_first(msg, "initialBuy", "initial_buy", default=0.0),
+        0.0,
+    )
+    if (
+        not is_raydium
+        and init_buy < _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
+    ):
         if DEBUG_TX:
-            print(f".[filter] initialBuy {init_buy} < min — skip", flush=True)
+            print(
+                f".[filter] initialBuy {init_buy} < min — skip",
+                flush=True,
+            )
         return False
 
     sym = _extract_symbol(msg).upper()
-    if any(bad and bad in sym for bad in {
-        s.strip().upper()
-        for s in os.getenv("ENTRY_SYMBOL_BLACKLIST", "RUG,SCAM").split(",")
-        if s.strip()
-    }):
+    if any(
+        bad and bad in sym
+        for bad in {
+            s.strip().upper()
+            for s in os.getenv("ENTRY_SYMBOL_BLACKLIST", "RUG,SCAM").split(",")
+            if s.strip()
+        }
+    ):
         if DEBUG_TX:
-            print(f".[filter] symbol '{sym}' hits blacklist — skip", flush=True)
+            print(
+                f".[filter] symbol '{sym}' hits blacklist — skip",
+                flush=True,
+            )
         return False
 
     nm = _extract_name(msg)
-    if (m := _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)) > 0 and len(nm) > m:
+    max_name = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
+    if max_name > 0 and len(nm) > max_name:
         if DEBUG_TX:
-            print(f".[filter] name too long ({len(nm)} > {m}) — skip", flush=True)
+            print(
+                f".[filter] name too long ({len(nm)} > {max_name}) — skip",
+                flush=True,
+            )
         return False
 
     mins_since_token = _approx_minutes_since(
-        _get_first(msg, "created_at", "createdAt", "timestamp", "ts", default=None)
+        _get_first(
+            msg,
+            "created_at",
+            "createdAt",
+            "timestamp",
+            "ts",
+            default=None,
+        )
     )
-    if mins_since_token is not None and _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20) > 0 and \
-       mins_since_token > _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20):
+    max_age = _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20)
+    if (
+        mins_since_token is not None
+        and max_age > 0
+        and mins_since_token > max_age
+    ):
         if DEBUG_TX:
-            print(f".[filter] token age {mins_since_token:.1f}m — skip", flush=True)
+            print(
+                f".[filter] token age {mins_since_token:.1f}m — skip",
+                flush=True,
+            )
         return False
 
-    mins_since_pool = _approx_minutes_since(_get_first(msg, "poolCreatedAt","pool_created_at", default=None))
-    if mins_since_pool is not None and _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3) > 0 and \
-       mins_since_pool < _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3):
+    mins_since_pool = _approx_minutes_since(
+        _get_first(msg, "poolCreatedAt", "pool_created_at", default=None)
+    )
+    min_pool_age = _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3)
+    if (
+        mins_since_pool is not None
+        and min_pool_age > 0
+        and mins_since_pool < min_pool_age
+    ):
         if DEBUG_TX:
-            print(f".[filter] pool age {mins_since_pool:.1f}m — skip", flush=True)
+            print(
+                f".[filter] pool age {mins_since_pool:.1f}m — skip",
+                flush=True,
+            )
         return False
 
     return True
+
 
 # ---------------------------
 # Post-buy optional immediate sell test
@@ -786,10 +955,15 @@ async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
         if DEBUG_TX:
             traceback.print_exc()
 
+
 # ---------------------------
 # Liquidity retry helper
 # ---------------------------
-async def _screen_with_retry(mint: str, tries: int = 3, first_wait: float = 0.8):
+async def _screen_with_retry(
+    mint: str,
+    tries: int = 3,
+    first_wait: float = 0.8,
+):
     wait = first_wait
     last = None
     for i in range(tries):
@@ -801,12 +975,20 @@ async def _screen_with_retry(mint: str, tries: int = 3, first_wait: float = 0.8)
             return False, rep
         if i < tries - 1:
             if DEBUG_TX:
-                print(f"[liquidity] retrying for {mint} (no_account) in {wait:.2f}s", flush=True)
+                print(
+                    f"[liquidity] retrying for {mint} (no_account) in {wait:.2f}s",
+                    flush=True,
+                )
             await asyncio.sleep(wait)
             wait *= 1.6
     return False, last
 
-async def _await_mint_ready(mint_norm: str, max_wait_s: int = 45, step_s: float = 3.0) -> Optional[int]:
+
+async def _await_mint_ready(
+    mint_norm: str,
+    max_wait_s: int = 45,
+    step_s: float = 3.0,
+) -> Optional[int]:
     if _route_get_decimals is None:
         return None
     waited = 0.0
@@ -821,11 +1003,14 @@ async def _await_mint_ready(mint_norm: str, max_wait_s: int = 45, step_s: float 
         waited += step_s
     return None
 
+
 # ---------------------------
 # Boot: ensure keypair file
 # ---------------------------
 def _ensure_keypair_file() -> None:
-    import pathlib, stat
+    import pathlib
+    import stat
+
     try:
         home = os.path.expanduser("~")
         cfg_dir = pathlib.Path(home) / ".config" / "solana"
@@ -834,10 +1019,17 @@ def _ensure_keypair_file() -> None:
             return
         raw = os.getenv("KEYPAIR_JSON") or os.getenv("SOLANA_KEYPAIR_JSON")
         if not raw:
-            log.event("KEYPAIR_ENV_MISSING", hint="set KEYPAIR_JSON to auto-create wallet")
+            log.event(
+                "KEYPAIR_ENV_MISSING",
+                hint="set KEYPAIR_JSON to auto-create wallet",
+            )
             return
         kp = json.loads(raw)
-        if not (isinstance(kp, list) and len(kp) == 64 and all(isinstance(x, int) for x in kp)):
+        if not (
+            isinstance(kp, list)
+            and len(kp) == 64
+            and all(isinstance(x, int) for x in kp)
+        ):
             raise ValueError("KEYPAIR_JSON must be a JSON array of 64 integers")
         cfg_dir.mkdir(parents=True, exist_ok=True)
         key_path.write_text(json.dumps(kp), encoding="utf-8")
@@ -851,24 +1043,21 @@ def _ensure_keypair_file() -> None:
         except Exception:
             print(f"[boot] could not write wallet: {e}", flush=True)
 
+
 # ---------------------------
 # BUY HOOKS (submitted / filled / failed)
 # ---------------------------
-from asyncio import create_task
-from utils_pkg.core_utils import AlertManager
-
-# env toggles (safe defaults)
-NOTIFY_BUY_SUBMITTED = _as_bool(os.getenv("NOTIFY_BUY_SUBMITTED", "1"), True)
-NOTIFY_BUY_FILLED    = _as_bool(os.getenv("NOTIFY_BUY_FILLED", "1"), True)
-NOTIFY_BUY_FAILED    = _as_bool(os.getenv("NOTIFY_BUY_FAILED", "1"), True)
 
 # cheap singleton to avoid re-creating AlertManager
 _AM_SINGLETON: Optional[AlertManager] = None
+
+
 def _am() -> AlertManager:
     global _AM_SINGLETON
     if _AM_SINGLETON is None:
         _AM_SINGLETON = AlertManager()
     return _AM_SINGLETON
+
 
 async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
     """
@@ -880,13 +1069,15 @@ async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
         pass
 
     try:
-        log.event("BUY_SUBMITTED",
-                  mint=payload.get("mint"),
-                  symbol=payload.get("symbol"),
-                  pool=payload.get("pool"),
-                  route=payload.get("route"),
-                  spend_sol=payload.get("spend_sol"),
-                  hint=payload.get("hint"))
+        log.event(
+            "BUY_SUBMITTED",
+            mint=payload.get("mint"),
+            symbol=payload.get("symbol"),
+            pool=payload.get("pool"),
+            route=payload.get("route"),
+            spend_sol=payload.get("spend_sol"),
+            hint=payload.get("hint"),
+        )
     except Exception:
         pass
 
@@ -900,21 +1091,28 @@ async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
             )
             create_task(_am().notify_text(txt))
         except Exception as _e:
-            log.warning("ALERT_BUY_SUBMIT_FAIL", extra={"err": str(_e)[:200]})
+            log.warning(
+                "ALERT_BUY_SUBMIT_FAIL",
+                extra={"err": str(_e)[:200]},
+            )
+
 
 # --- Notion (optional daily PnL sync) ---
 try:
     from utils_pkg.notion_pnl import push_daily_pnl  # safe no-op if NOTION_ENABLED!=1
 except Exception:  # pragma: no cover
-    def push_daily_pnl(_snapshot):  # fallback no-op
+    def push_daily_pnl(_snapshot):  # type: ignore[override]
         return None
+
 
 # Debounce for intraday push after fills (seconds granularity)
 _LAST_NOTION_PUSH_TS: float = 0.0
 
+
 async def _notion_intraday_snapshot_push(note: str = "") -> None:
     """Lightweight intraday push to Notion after a buy fill (debounced)."""
     import time as _time
+
     global _LAST_NOTION_PUSH_TS
     try:
         if os.getenv("NOTION_ENABLED", "0") != "1":
@@ -930,6 +1128,7 @@ async def _notion_intraday_snapshot_push(note: str = "") -> None:
         wallet = await _get_wallet_sol_balance()
 
         from datetime import date as _date
+
         sn = {
             "date": _date.today().isoformat(),
             "realized_sol": realized,
@@ -944,11 +1143,12 @@ async def _notion_intraday_snapshot_push(note: str = "") -> None:
     except Exception as e:
         log.event("NOTION_INTRADAY_PUSH_FAIL", err=str(e))
 
+
 async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
     """
     ev: { mint, signature, symbol, spend_sol, pool, amount_raw? }
     """
-    if _dryrun_env_on():
+    if _dryrun_env_on() or _pkg_is_dryrun:
         return
 
     try:
@@ -957,29 +1157,36 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
         pass
 
     try:
-        log.event("BUY_FILLED",
-                  mint=ev.get("mint"),
-                  symbol=ev.get("symbol"),
-                  pool=ev.get("pool"),
-                  spend_sol=ev.get("spend_sol"),
-                  sig=ev.get("signature"))
+        log.event(
+            "BUY_FILLED",
+            mint=ev.get("mint"),
+            symbol=ev.get("symbol"),
+            pool=ev.get("pool"),
+            spend_sol=ev.get("spend_sol"),
+            sig=ev.get("signature"),
+        )
     except Exception:
         pass
 
     # Primary alert path (AlertManager)
     if NOTIFY_BUY_FILLED:
         try:
-            create_task(_am().notify_trade_fill(
-                side="BUY",
-                mint=ev.get("mint"),
-                symbol=ev.get("symbol"),
-                pool=ev.get("pool"),
-                sig=ev.get("signature"),
-                spend_sol=ev.get("spend_sol"),
-                out_amount=ev.get("amount_raw"),   # if present
-            ))
+            create_task(
+                _am().notify_trade_fill(
+                    side="BUY",
+                    mint=ev.get("mint"),
+                    symbol=ev.get("symbol"),
+                    pool=ev.get("pool"),
+                    sig=ev.get("signature"),
+                    spend_sol=ev.get("spend_sol"),
+                    out_amount=ev.get("amount_raw"),  # if present
+                )
+            )
         except Exception as _e:
-            log.warning("ALERT_BUY_FILLED_FAIL", extra={"err": str(_e)[:200]})
+            log.warning(
+                "ALERT_BUY_FILLED_FAIL",
+                extra={"err": str(_e)[:200]},
+            )
 
     # Kick an intraday Notion push (debounced)
     asyncio.create_task(_notion_intraday_snapshot_push())
@@ -992,24 +1199,29 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
         return
     except TypeError:
         with contextlib.suppress(Exception):
-            await exit_engine.on_buy_filled(raw_id_or_mint=ev.get("mint"),
-                                            tx_sig=ev.get("signature"))  # type: ignore[misc]
+            await exit_engine.on_buy_filled(  # type: ignore[misc]
+                raw_id_or_mint=ev.get("mint"),
+                tx_sig=ev.get("signature"),
+            )
     except Exception as e:
         log.warning("EXIT_ENGINE_FILL_HOOK_FAIL %s", e)
+
 
 async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
     """
     payload: {mint, pool, symbol, spend_sol, route, hint, reason, error}
     """
     try:
-        log.event("BUY_FAILED",
-                  mint=payload.get("mint"),
-                  symbol=payload.get("symbol"),
-                  pool=payload.get("pool"),
-                  route=payload.get("route"),
-                  spend_sol=payload.get("spend_sol"),
-                  reason=payload.get("reason"),
-                  error=payload.get("error"))
+        log.event(
+            "BUY_FAILED",
+            mint=payload.get("mint"),
+            symbol=payload.get("symbol"),
+            pool=payload.get("pool"),
+            route=payload.get("route"),
+            spend_sol=payload.get("spend_sol"),
+            reason=payload.get("reason"),
+            error=payload.get("error"),
+        )
     except Exception:
         pass
 
@@ -1022,11 +1234,18 @@ async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
             )
             create_task(_am().notify_text(txt))
         except Exception as _e:
-            log.warning("ALERT_BUY_FAILED_FAIL", extra={"err": str(_e)[:200]})
+            log.warning(
+                "ALERT_BUY_FAILED_FAIL",
+                extra={"err": str(_e)[:200]},
+            )
 
     # Optional telemetry
     try:
-        record_buy_result(ok=False, reason=str(payload.get("reason") or "failed"), error=payload.get("error"))
+        record_buy_result(
+            ok=False,
+            reason=str(payload.get("reason") or "failed"),
+            error=payload.get("error"),
+        )
     except Exception:
         pass
 
@@ -1088,17 +1307,17 @@ class Strategy:
                 buys_fill=self._diag["buys_filled"],
             )
 
-    # --- TRADE TICKS (for momo counts) ----------------------------------
+    # --- TRADE TICKS (for momo counts + exit engine) --------------------
     async def on_trade(self, raw_event: Dict[str, Any]) -> None:
         self._diag["events_total"] += 1
         self._diag["events_trade"] += 1
 
         # Pass trade ticks into exit engine (for follow-through logic, etc.)
-        if _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True):
+        if EXIT_ENGINE_ENABLED:
             try:
                 await exit_engine.on_trade_tick(raw_event)
             except Exception:
-                if _as_bool(os.getenv("PF_DEBUG_TX", "0"), False):
+                if DEBUG_TX:
                     traceback.print_exc()
 
         m = str(
@@ -1139,7 +1358,7 @@ class Strategy:
 
         async with self._gate_sema:
             # Dedupe gating per mint
-            if _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True):
+            if DEDUPE_ENABLED:
                 if not claim_once(f"gate:{mint_norm}", ttl=int(PF_GATE_TTL_SEC)):
                     if DEBUG_TX:
                         print(
@@ -1223,7 +1442,7 @@ class Strategy:
                 return
 
             # ---- Guardrails before executing a buy ----------------------
-            if not buys_allowed() or _as_bool(os.getenv("PAUSE_TRADING", "0"), False):
+            if not buys_allowed() or PAUSE_TRADING:
                 if DEBUG_TX:
                     print(
                         "[guardrails] buys not allowed at gate decision — skip",
@@ -1233,7 +1452,7 @@ class Strategy:
                 self._diag["rejected_guardrails"] += 1
                 return
 
-            max_tradeable = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)
+            max_tradeable = MAX_TRADEABLE
             if max_tradeable > 0:
                 try:
                     if len(list(all_positions())) >= max_tradeable:
@@ -1245,10 +1464,10 @@ class Strategy:
                     pass
 
             # Dedupe final buy
-            if _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True):
+            if DEDUPE_ENABLED:
                 if not claim_once(
                     f"buy:{mint_norm}",
-                    ttl=int(_as_int(os.getenv("PF_BUY_TTL_SEC", "600"), 600)),
+                    ttl=int(PF_BUY_TTL_SEC),
                 ):
                     if DEBUG_TX:
                         print(
@@ -1304,18 +1523,19 @@ class Strategy:
                             )
 
                         # Exit engine hook (dict-style API) — now passes tx_sig
-                        try:
-                            ev = {
-                                "mint": mint_norm,
-                                "signature": tx_sig,
-                                "symbol": ui.get("symbol"),
-                                "spend_sol": ui.get("spend_sol") or 0.0,
-                                "pool": ui.get("pool") or "unknown",
-                            }
-                            await exit_engine.on_buy_filled(ev, tx_sig)
-                        except Exception:
-                            if DEBUG_TX:
-                                traceback.print_exc()
+                        if EXIT_ENGINE_ENABLED:
+                            try:
+                                ev = {
+                                    "mint": mint_norm,
+                                    "signature": tx_sig,
+                                    "symbol": ui.get("symbol"),
+                                    "spend_sol": ui.get("spend_sol") or 0.0,
+                                    "pool": ui.get("pool") or "unknown",
+                                }
+                                await exit_engine.on_buy_filled(ev)
+                            except Exception:
+                                if DEBUG_TX:
+                                    traceback.print_exc()
 
                         self._diag["buys_filled"] += 1
                         record_buy_result(ok=True, reason="executed", sig=tx_sig)
@@ -1331,7 +1551,7 @@ class Strategy:
                             )
                         except Exception:
                             pass
-                        record_buy_result(ok=False, reason=info)
+                        record_buy_result(ok=False, reason=str(info))
                 else:
                     # DRYRUN path usually returns None
                     if IS_DRYRUN:
@@ -1353,13 +1573,13 @@ class Strategy:
         self._diag["events_new_token"] += 1
 
         # Top-level guardrails
-        if _as_bool(os.getenv("PAUSE_TRADING", "0"), False) or not buys_allowed():
+        if PAUSE_TRADING or not buys_allowed():
             if DEBUG_TX:
                 print("[guardrails] buys not allowed now — skip", flush=True)
             self._diag["rejected_guardrails"] += 1
             return
 
-        max_tradeable = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)
+        max_tradeable = MAX_TRADEABLE
         if max_tradeable > 0:
             try:
                 if len(list(all_positions())) >= max_tradeable:
@@ -1385,14 +1605,14 @@ class Strategy:
                 )
             return
 
-        # Static filters (age, mc, renounce, etc.)
+        # Static filters (age, name, blacklist, etc.)
         if not _passes_basic_filters(raw_event):
             self._diag["rejected_filters"] += 1
             return
 
         # Liquidity screen
         dec_from_liq: Optional[int] = None
-        if _as_bool(os.getenv("ENTRY_LIQ_FILTER", "1"), True):
+        if LIQ_FILTER_ENABLED:
             ok, rep = await _screen_with_retry(mint_norm, tries=3, first_wait=0.8)
             if not ok and str((rep or {}).get("reason")) == "no_account":
                 # Fresh bond curve: wait a bit for mint to become readable
@@ -1441,27 +1661,26 @@ class Strategy:
         )
 
         # Dedupe gate proposals
-        if _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True) and _as_bool(
-            os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True
-        ):
+        if DEDUPE_ENABLED and ENTRY_MOMENTUM_ENABLED:
             if not claim_once(
                 f"gate-propose:{mint_norm}",
-                ttl=int(_as_int(os.getenv("PF_GATE_TTL_SEC", "60"), 60)),
+                ttl=int(PF_GATE_TTL_SEC),
             ):
                 if DEBUG_TX:
                     print(
-                        f".[dedupe] gate-propose taken for {mint_norm} — skip", flush=True
+                        f".[dedupe] gate-propose taken for {mint_norm} — skip",
+                        flush=True,
                     )
                 return
 
         # Momentum enabled → send into gate; otherwise buy immediately
-        if _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True):
+        if ENTRY_MOMENTUM_ENABLED:
             asyncio.create_task(self._gate_candidate(ui, mint_source, mint_norm))
         else:
             # Direct-buy path, still respecting dedupe/guardrails
-            if _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True) and not claim_once(
+            if DEDUPE_ENABLED and not claim_once(
                 f"buy:{mint_norm}",
-                ttl=int(_as_int(os.getenv("PF_BUY_TTL_SEC", "600"), 600)),
+                ttl=int(PF_BUY_TTL_SEC),
             ):
                 if DEBUG_TX:
                     print(
@@ -1472,7 +1691,7 @@ class Strategy:
 
             async with self._sema:
                 try:
-                    if _as_bool(os.getenv("PAUSE_TRADING", "0"), False) or not buys_allowed():
+                    if PAUSE_TRADING or not buys_allowed():
                         if DEBUG_TX:
                             print(
                                 "[guardrails] buys not allowed at execution — skip",
@@ -1481,7 +1700,7 @@ class Strategy:
                         self._diag["rejected_guardrails"] += 1
                         return
 
-                    max_tradeable = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)
+                    max_tradeable = MAX_TRADEABLE
                     if max_tradeable > 0:
                         try:
                             if len(list(all_positions())) >= max_tradeable:
@@ -1531,19 +1750,20 @@ class Strategy:
                                     extra={"err": str(_e)[:200]},
                                 )
 
-                            # Exit engine hook (dict-style API) — now passes tx_sig
-                            try:
-                                ev = {
-                                    "mint": mint_norm,
-                                    "signature": tx_sig,
-                                    "symbol": ui.get("symbol"),
-                                    "spend_sol": ui.get("spend_sol") or 0.0,
-                                    "pool": ui.get("pool") or "legacy",
-                                }
-                                await exit_engine.on_buy_filled(ev, tx_sig)
-                            except Exception:
-                                if DEBUG_TX:
-                                    traceback.print_exc()
+                            # Exit engine hook (dict-style API)
+                            if EXIT_ENGINE_ENABLED:
+                                try:
+                                    ev = {
+                                        "mint": mint_norm,
+                                        "signature": tx_sig,
+                                        "symbol": ui.get("symbol"),
+                                        "spend_sol": ui.get("spend_sol") or 0.0,
+                                        "pool": ui.get("pool") or "legacy",
+                                    }
+                                    await exit_engine.on_buy_filled(ev)
+                                except Exception:
+                                    if DEBUG_TX:
+                                        traceback.print_exc()
 
                             self._diag["buys_filled"] += 1
                             record_buy_result(ok=True, reason="executed", sig=tx_sig)
@@ -1559,7 +1779,7 @@ class Strategy:
                                 )
                             except Exception:
                                 pass
-                            record_buy_result(ok=False, reason=info)
+                            record_buy_result(ok=False, reason=str(info))
                     else:
                         if IS_DRYRUN:
                             log.event("BUY_DRYRUN_EXIT", mint=mint_norm)
@@ -1572,7 +1792,7 @@ class Strategy:
                     record_buy_result(ok=False, reason="exception")
 
         # Cooldown between processing new tokens
-        await asyncio.sleep(_as_float(os.getenv("PF_COOLDOWN_SEC", "15"), 15.0))
+        await asyncio.sleep(LOOP_COOLDOWN_SEC)
 
 # ---------------------------
 # Mint normalization wrappers
@@ -1615,14 +1835,20 @@ def _fmt_sol(x: Optional[float]) -> str:
         return str(x)
 
 async def _telegram_send(text: str) -> None:
-    if not ((os.getenv("TELEGRAM_BOT_TOKEN") or "").strip() and (os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or "").strip()) or not httpx:
+    bot = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat = (os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    if not (bot and chat and httpx):
         log.event("DAILY_PNL_TG_SKIP", reason="missing_cfg_or_httpx")
         return
     try:
-        url = f"https://api.telegram.org/bot{(os.getenv('TELEGRAM_BOT_TOKEN') or '').strip()}/sendMessage"
-        payload = {"chat_id": ((os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or "").strip()),
-                   "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-        async with httpx.AsyncClient(timeout=15) as cli:
+        url = f"https://api.telegram.org/bot{bot}/sendMessage"
+        payload = {
+            "chat_id": chat,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        async with httpx.AsyncClient(timeout=15) as cli:  # type: ignore[arg-type]
             r = await cli.post(url, json=payload)
             log.event("DAILY_PNL_TG_SENT", http_status=getattr(r, "status_code", None))
     except Exception as e:
@@ -1651,7 +1877,7 @@ async def _pnl_pg_ensure_table() -> None:
         finally:
             await conn.close()
     except Exception as e:
-        if _as_bool(os.getenv("PF_DEBUG_TX", "0"), False):
+        if DEBUG_TX:
             traceback.print_exc()
         log.event("DAILY_PNL_PG_ERROR", when="ensure_table", error=str(e))
 
@@ -1664,17 +1890,27 @@ async def _pnl_pg_insert_row(*, realized_sol: float, unrealized_sol: float,
     try:
         conn = await asyncpg.connect(_PNL_DSN_ASYNC)
         try:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO daily_pnl (at_utc, realized_sol, unrealized_sol, open_positions, wallet_sol, notes)
                 VALUES (NOW() AT TIME ZONE 'UTC', $1, $2, $3, $4, $5::jsonb)
-            """, realized_sol, unrealized_sol, open_positions, wallet_sol, json.dumps(notes))
-            log.event("DAILY_PNL_PG_INSERTED",
-                      realized_sol=realized_sol, unrealized_sol=unrl_sol,
-                      open_positions=open_positions)
+                """,
+                realized_sol,
+                unrealized_sol,
+                open_positions,
+                wallet_sol,
+                json.dumps(notes),
+            )
+            log.event(
+                "DAILY_PNL_PG_INSERTED",
+                realized_sol=realized_sol,
+                unrealized_sol=unrealized_sol,
+                open_positions=open_positions,
+            )
         finally:
             await conn.close()
     except Exception as e:
-        if _as_bool(os.getenv("PF_DEBUG_TX", "0"), False):
+        if DEBUG_TX:
             traceback.print_exc()
         log.event("DAILY_PNL_PG_ERROR", when="insert_row", error=str(e))
 
@@ -1702,7 +1938,12 @@ async def _estimate_unrealized_from_positions() -> Tuple[float, int, Dict[str, A
             qty = float(p.get("amount") or p.get("qty") or p.get("size") or 0) or 0.0
             if qty <= 0:
                 continue
-            cost = float(p.get("entry_total_sol") or p.get("cost_basis_sol") or p.get("cost") or 0.0)
+            cost = float(
+                p.get("entry_total_sol")
+                or p.get("cost_basis_sol")
+                or p.get("cost")
+                or 0.0
+            )
             price = 0.0
             try:
                 price = float(await _route_price_ui(mint))
@@ -1712,16 +1953,18 @@ async def _estimate_unrealized_from_positions() -> Tuple[float, int, Dict[str, A
             unrl = cur_val - cost
             total_unrl += unrl
             open_n += 1
-            details["legs"].append({
-                "mint": mint,
-                "qty": qty,
-                "entry_cost_sol": cost,
-                "mark_price_sol": price,
-                "cur_val_sol": cur_val,
-                "unrealized_sol": unrl,
-            })
+            details["legs"].append(
+                {
+                    "mint": mint,
+                    "qty": qty,
+                    "entry_cost_sol": cost,
+                    "mark_price_sol": price,
+                    "cur_val_sol": cur_val,
+                    "unrealized_sol": unrl,
+                }
+            )
         except Exception:
-            if _as_bool(os.getenv("PF_DEBUG_TX", "0"), False):
+            if DEBUG_TX:
                 traceback.print_exc()
             continue
     return total_unrl, open_n, details
@@ -1742,7 +1985,7 @@ async def _estimate_realized_today() -> Tuple[float, Dict[str, Any]]:
     return 0.0, {"source": "fallback_zero"}
 
 async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
-    if not _as_bool(os.getenv("DAILY_PNL_ENABLED", "1"), True):
+    if not DAILY_PNL_ENABLED:
         return
 
     await _pnl_pg_ensure_table()
@@ -1761,17 +2004,19 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
 
         # --- Notion: push daily snapshot (safe no-op if NOTION_ENABLED != 1)
         try:
-            _page = push_daily_pnl({
-                "date": utc_today_iso(),
-                "realized_sol": realized_sol,
-                "unrealized_sol": unrl_sol,
-                "open_positions": open_n,
-                "wallet_sol": wallet_sol,
-                "net_sol": (realized_sol + unrl_sol),
-                "note": "Auto-daily sync",
-            })
-            if _page:
-                log.event("NOTION_DAILY_PNL_UPSERTED", page_id=_page)
+            page = push_daily_pnl(
+                {
+                    "date": utc_today_iso(),
+                    "realized_sol": realized_sol,
+                    "unrealized_sol": unrl_sol,
+                    "open_positions": open_n,
+                    "wallet_sol": wallet_sol,
+                    "net_sol": (realized_sol + unrl_sol),
+                    "note": "Auto-daily sync",
+                }
+            )
+            if page:
+                log.event("NOTION_DAILY_PNL_UPSERTED", page_id=page)
         except Exception as e:
             log.warning("NOTION_DAILY_PNL_FAILED %s", e)
 
@@ -1805,13 +2050,18 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
             wallet_sol=wallet_sol,
         )
 
-    if _as_bool(os.getenv("DAILY_PNL_TEST_NOW", "0"), False) and not stop_evt.is_set():
+    if DAILY_PNL_TEST_NOW and not stop_evt.is_set():
         with contextlib.suppress(Exception):
             await _once()
 
     while not stop_evt.is_set():
         now = _dt.datetime.now(_dt.timezone.utc)
-        run_at = now.replace(hour=DAILY_PNL_HOUR_UTC, minute=0, second=0, microsecond=0)
+        run_at = now.replace(
+            hour=DAILY_PNL_HOUR_UTC,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
         if run_at <= now:
             run_at = run_at + _dt.timedelta(days=1)
         wait_s = (run_at - now).total_seconds()
@@ -1834,12 +2084,14 @@ async def _maybe_start_health_server(stop_evt: asyncio.Event) -> Optional[asynci
     app = web.Application()
 
     async def _health(_request):
-        return web.json_response({
-            "ok": True,
-            "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            "dryrun": _dryrun_env_on() or bool(_pkg_is_dryrun),
-            "pools": sorted(POOLS_FILTER) if POOLS_FILTER else ["<all>"],
-        })
+        return web.json_response(
+            {
+                "ok": True,
+                "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                "dryrun": _dryrun_env_on() or bool(_pkg_is_dryrun),
+                "pools": sorted(POOLS_FILTER) if POOLS_FILTER else ["<all>"],
+            }
+        )
 
     app.router.add_get("/health", _health)
     runner = web.AppRunner(app)
@@ -1859,7 +2111,7 @@ async def _maybe_start_health_server(stop_evt: asyncio.Event) -> Optional[asynci
     return asyncio.create_task(_waiter(), name="health.server")
 
 # ---------------------------
-# Streaming loop
+# Streaming loop (PumpPortal)
 # ---------------------------
 async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
     """
@@ -1905,19 +2157,41 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
                     res = fn()
                     if asyncio.iscoroutine(res):
                         await res
-                    log.every("pump.subscribe", n=30, msg="PUMP_SUBSCRIBED", via=name)
+                    log.every(
+                        "pump.subscribe",
+                        n=30,
+                        msg="PUMP_SUBSCRIBED",
+                        via=name,
+                    )
                     return
                 except Exception as e:
-                    log.every("pump.subscribe.err", n=5, msg="PUMP_SUBSCRIBE_FAIL", via=name, err=str(e))
+                    log.every(
+                        "pump.subscribe.err",
+                        n=5,
+                        msg="PUMP_SUBSCRIBE_FAIL",
+                        via=name,
+                        err=str(e),
+                    )
         try:
             sub = getattr(client, "_subscribe", None)
             if callable(sub):
                 res = sub("trades")
                 if asyncio.iscoroutine(res):
                     await res
-                log.every("pump.subscribe", n=30, msg="PUMP_SUBSCRIBED", via="_subscribe")
+                log.every(
+                    "pump.subscribe",
+                    n=30,
+                    msg="PUMP_SUBSCRIBED",
+                    via="_subscribe",
+                )
         except Exception as e:
-            log.every("pump.subscribe.err", n=5, msg="PUMP_SUBSCRIBE_FAIL", via="_subscribe", err=str(e))
+            log.every(
+                "pump.subscribe.err",
+                n=5,
+                msg="PUMP_SUBSCRIBE_FAIL",
+                via="_subscribe",
+                err=str(e),
+            )
 
     async def _run_with_client_obj(client: Any) -> None:
         print("[main] Connecting:", _mask_uri(client), flush=True)
@@ -1952,7 +2226,7 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
                     if hasattr(client, "close"):
                         maybe_awaitable = client.close()
                         if asyncio.iscoroutine(maybe_awaitable):
-                            await maybe_awaitable  # type: ignore
+                            await maybe_awaitable  # type: ignore[arg-type]
     finally:
         with contextlib.suppress(Exception):
             local_stop.set()
@@ -1968,7 +2242,7 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
         log.event("SCAN_RAYDIUM_UNAVAILABLE")
         return
 
-    base_interval = _as_float(os.getenv("RAYDIUM_SCAN_INTERVAL_SEC", "30"), 30.0)
+    base_interval = RAYDIUM_SCAN_INTERVAL_SEC
     jitter_seed = (os.getpid() % 7) / 6.0
     backoff = 2.0
     first_log = True
@@ -2000,6 +2274,9 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 1.7, 30.0)
 
+# ---------------------------
+# Background tasks: scanners, PnL, exit worker, risk manager, health
+# ---------------------------
 async def _start_background_tasks(stop_evt: asyncio.Event) -> Dict[str, asyncio.Task]:
     tasks: Dict[str, asyncio.Task] = {}
 
@@ -2007,24 +2284,58 @@ async def _start_background_tasks(stop_evt: asyncio.Event) -> Dict[str, asyncio.
     want_raydium = getattr(C, "ENABLE_RAYDIUM_SCANNER", True)
     pools_ok = (not POOLS_FILTER) or ("raydium" in POOLS_FILTER)
     if want_raydium and pools_ok:
-        t = asyncio.create_task(_run_raydium_scanner_forever(stop_evt), name="scan.raydium")
+        t = asyncio.create_task(
+            _run_raydium_scanner_forever(stop_evt),
+            name="scan.raydium",
+        )
         tasks["scan.raydium"] = t
-        log.event("SCAN_RAYDIUM_SCHEDULED", task="scan.raydium")
+        log.event(
+            "SCAN_RAYDIUM_SCHEDULED",
+            task="scan.raydium",
+            interval=RAYDIUM_SCAN_INTERVAL_SEC,
+        )
 
     # Daily PnL loop
-    if _as_bool(os.getenv("DAILY_PNL_ENABLED", "1"), True):
-        t = asyncio.create_task(_run_daily_pnl_loop(stop_evt), name="telemetry.daily_pnl")
+    if DAILY_PNL_ENABLED:
+        t = asyncio.create_task(
+            _run_daily_pnl_loop(stop_evt),
+            name="telemetry.daily_pnl",
+        )
         tasks["telemetry.daily_pnl"] = t
-        log.event("DAILY_PNL_SCHEDULED", hour_utc=_as_int(os.getenv("DAILY_PNL_HOUR_UTC", "23"), 23))
-
-    # Auto-exit worker: processes exit_request:* and does forced sells
-    if _as_bool(os.getenv("EXIT_WORKER_ENABLED", "1"), True):
-        t = asyncio.create_task(auto_exit_worker.exit_worker_loop(stop_evt), name="exit.worker")
-        tasks["exit.worker"] = t
         log.event(
-            "EXIT_WORKER_SCHEDULED",
-            poll_sec=os.getenv("EXIT_WORKER_POLL_SEC", "3"),
-            sell_pct=os.getenv("EXIT_WORKER_SELL_PCT", "1.0"),
+            "DAILY_PNL_SCHEDULED",
+            hour_utc=DAILY_PNL_HOUR_UTC,
+        )
+
+    # Auto-exit worker: processes exit_request:* in Redis and executes sells
+    if _as_bool(os.getenv("EXIT_WORKER_ENABLED", "1"), True):
+        if redis is None:
+            log.event(
+                "EXIT_WORKER_SKIP",
+                reason="redis_none",
+                hint="check REDIS_URL / core_utils",
+            )
+        else:
+            t = asyncio.create_task(
+                exit_worker_loop(stop_evt),
+                name="exit.worker",
+            )
+            tasks["exit.worker"] = t
+            log.event(
+                "EXIT_WORKER_SCHEDULED",
+                poll_sec=os.getenv("EXIT_WORKER_POLL_SEC", "3"),
+            )
+
+    # Risk manager loop (portfolio-level risk / stop-losses, etc.)
+    if RISK_MANAGER_ENABLED:
+        t = asyncio.create_task(
+            risk_manager_loop(stop_evt),
+            name="risk.manager",
+        )
+        tasks["risk.manager"] = t
+        log.event(
+            "RISK_MANAGER_SCHEDULED",
+            poll_sec=RISK_MANAGER_POLL_SEC,
         )
 
     # Health server
@@ -2082,16 +2393,16 @@ def _boot_banner() -> None:
     print(
         "\n=== 🟢 sniper main boot ===\n"
         f"DRYRUN={effective_dryrun}\n"
-        f"PF_DEBUG_TX={int(_as_bool(os.getenv('PF_DEBUG_TX','0'), False))} | "
+        f"PF_DEBUG_TX={int(DEBUG_TX)} | "
         f"PF_MAX_CONCURRENT={_as_int(os.getenv('PF_MAX_CONCURRENT','2'), 2)} | "
-        f"PF_COOLDOWN_SEC={_as_float(os.getenv('PF_COOLDOWN_SEC','15'), 15.0)}\n"
-        f"MOMO: on={int(_as_bool(os.getenv('ENTRY_MOMENTUM_ENABLED','1'), True))} "
+        f"PF_COOLDOWN_SEC={LOOP_COOLDOWN_SEC}\n"
+        f"MOMO: on={int(ENTRY_MOMENTUM_ENABLED)} "
         f"window={_as_int(os.getenv('ENTRY_MOMENTUM_WINDOW_SEC', os.getenv('ENTRY_MOMO_WINDOW_SEC','10')),10)}s "
-        f"min_trades={_as_int(os.getenv('ENTRY_MOMENTUM_MIN_TRADES', os.getenv('ENTRY_MOMO_MIN_TRADES','6')),6)} "
-        f"min_up={_as_float(os.getenv('ENTRY_MOMENTUM_MIN_UP_PCT', os.getenv('ENTRY_MOMO_MIN_UP_PCT','5')),5.0)}%\n"
-        f"LIQ_FILTER={int(_as_bool(os.getenv('ENTRY_LIQ_FILTER','1'), True))} | "
-        f"EXIT_ENGINE={int(_as_bool(os.getenv('EXIT_ENGINE_ENABLED','1'), True))} | "
-        f"MAX_TRADEABLE={_as_int(os.getenv('MAX_TRADEABLE','0'),0)}\n"
+        f"min_trades={ENTRY_MOMO_MIN_TRADES} "
+        f"min_up={ENTRY_MOMO_MIN_UP_PCT}%\n"
+        f"LIQ_FILTER={int(LIQ_FILTER_ENABLED)} | "
+        f"EXIT_ENGINE={int(EXIT_ENGINE_ENABLED)} | "
+        f"MAX_TRADEABLE={MAX_TRADEABLE}\n"
         f"POOLS={pools} | PUMP_TRADES={int(pump_trades)}\n"
         f"PG(asyncpg) DSN={_PG_DSN_MASK or '<none>'} | HEALTH_PORT={HEALTH_PORT or 'off'}\n"
         "===========================\n",
@@ -2100,15 +2411,30 @@ def _boot_banner() -> None:
 
 def _env_hints() -> None:
     if not (os.getenv("KEYPAIR_JSON") or os.getenv("SOLANA_KEYPAIR_JSON")):
-        log.event("HINT_KEYPAIR_JSON_MISSING", note="wallet auto-create disabled (ok if mounted)")
-    if not (os.getenv("TELEGRAM_BOT_TOKEN") and (os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID"))):
-        log.event("HINT_TELEGRAM_MISSING", note="daily pnl / buy notifications off")
+        log.event(
+            "HINT_KEYPAIR_JSON_MISSING",
+            note="wallet auto-create disabled (ok if mounted)",
+        )
+    if not (
+        os.getenv("TELEGRAM_BOT_TOKEN")
+        and (os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID"))
+    ):
+        log.event(
+            "HINT_TELEGRAM_MISSING",
+            note="daily pnl / buy notifications off",
+        )
     if not (_PNL_DSN_ASYNC or _PG_DSN_ASYNC):
-        log.event("HINT_PG_DSN_MISSING", note="daily pnl persistence disabled")
+        log.event(
+            "HINT_PG_DSN_MISSING",
+            note="daily pnl persistence disabled",
+        )
 
 async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     with contextlib.suppress(Exception):
-        start_global_heartbeat(log, interval=float(os.getenv("PF_HEARTBEAT_SEC", "45")))
+        start_global_heartbeat(
+            log,
+            interval=float(os.getenv("PF_HEARTBEAT_SEC", "45")),
+        )
         bump("boot")
 
     _maybe_init_sentry()
@@ -2123,6 +2449,7 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     except Exception as e:
         log.event("ROUTER_PRIO_INIT_FAIL", error=str(e))
 
+    # Optional legacy sell loop if positions already exist
     sell_stop_evt: Optional[asyncio.Event] = None
     sell_task: Optional[asyncio.Task] = None
     try:
@@ -2139,8 +2466,14 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(_graceful_shutdown(local_stop, sell_task, bg_tasks)))
+            loop.add_signal_handler(
+                sig,
+                lambda s=sig: asyncio.create_task(
+                    _graceful_shutdown(local_stop, sell_task, bg_tasks)
+                ),
+            )
         except NotImplementedError:
+            # Windows / restricted env: ignore
             pass
 
     backoff = 3.0
@@ -2148,7 +2481,10 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
         while not local_stop.is_set():
             try:
                 await stream_loop(local_stop)
-                print("[main] stream ended (remote closed). Reconnecting...", flush=True)
+                print(
+                    "[main] stream ended (remote closed). Reconnecting...",
+                    flush=True,
+                )
                 backoff = 3.0
             except asyncio.CancelledError:
                 raise
