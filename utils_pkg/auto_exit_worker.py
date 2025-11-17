@@ -47,17 +47,25 @@ DRYRUN = (
     or _env_bool("IS_DRYRUN", False)
 )
 
+# Master flag for the overall exit engine (logic side)
 EXIT_ENGINE_ENABLED = _env_bool("EXIT_ENGINE_ENABLED", True)
 
+# Background worker that actually sends sells
 EXIT_WORKER_ENABLED = _env_bool("EXIT_WORKER_ENABLED", True)
 EXIT_WORKER_POLL_SEC = _env_float("EXIT_WORKER_POLL_SEC", 3.0)
 EXIT_WORKER_BATCH = _env_int("EXIT_WORKER_BATCH", 5)
 
+# Slippage settings
 PF_SLIPPAGE_BPS = _env_int("PF_SLIPPAGE_BPS", 200)
 EXIT_WORKER_SLIPPAGE_BPS = _env_int("EXIT_WORKER_SLIPPAGE_BPS", PF_SLIPPAGE_BPS)
 
-# how much of the position to dump, 1.0 = 100%
+# How much of the position to dump, 1.0 = 100%
 EXIT_WORKER_SELL_PCT = float(os.getenv("EXIT_WORKER_SELL_PCT", "1.0"))
+
+# Whether requests coming from on_buy_filled() should be executed immediately.
+# Safe default is False – other modules (risk manager) can enqueue their own
+# "sell now" requests.
+EXIT_ON_BUY_FILLED = _env_bool("EXIT_ON_BUY_FILLED", False)
 
 # TTL for exit_request keys in Redis (seconds)
 EXIT_REQUEST_TTL_SEC = _env_int("EXIT_REQUEST_TTL_SEC", 600)
@@ -129,6 +137,9 @@ async def _load_exit_request(key: str) -> Optional[Dict[str, Any]]:
 
 
 async def _delete_exit_request(key: str) -> None:
+    """
+    Best-effort deletion of an exit_request:* key.
+    """
     if redis is None:
         return
     try:
@@ -138,16 +149,37 @@ async def _delete_exit_request(key: str) -> None:
         log.debug("EXIT_WORKER_DELETE_ERROR key=%s", key, exc_info=True)
 
 
+async def _store_exit_request(payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Internal helper to persist an exit_request to Redis, returning the key.
+    """
+    if redis is None:
+        log.debug("EXIT_ENGINE_NO_REDIS_FOR_STORE")
+        return None
+
+    mint = str(payload.get("mint", "")).strip()
+    if not mint:
+        return None
+
+    key = f"exit_request:{mint}"
+
+    try:
+        await redis.set(key, json.dumps(payload), ex=EXIT_REQUEST_TTL_SEC)
+        return key
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "EXIT_ENGINE_REDIS_ERROR",
+            extra={"mint": mint, "err": str(e)[:200]},
+        )
+        return None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Position helpers
-# NOTE: we do NOT try to be too smart here; we assume lightning_impl
-#       can sell an explicit raw amount. For now we use the raw amount
-#       provided in the exit_request payload if present.
-#       If it's missing, we bail and leave the key for a later pass.
+# Amount helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _extract_amount_raw(req: Dict[str, Any]) -> Optional[int]:
+def _extract_amount_raw_from_req(req: Dict[str, Any]) -> Optional[int]:
     """
     Determine how many raw tokens to sell from an exit_request payload.
 
@@ -156,7 +188,6 @@ def _extract_amount_raw(req: Dict[str, Any]) -> Optional[int]:
         {
           "mint": "...",
           "position_raw": 123456,       # preferred
-          "entry_spend_sol": 0.15,      # informational
           "sell_pct": 1.0,              # optional override
           ...
         }
@@ -176,7 +207,7 @@ def _extract_amount_raw(req: Dict[str, Any]) -> Optional[int]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Exit engine
+# Exit engine – logic side
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -186,6 +217,8 @@ class _ExitEngine:
 
     - on_trade_tick: placeholder for future follow-through logic.
     - on_buy_filled: tolerant API used by Strategy to enqueue exit requests.
+    - enqueue_exit_request: generic way for other modules (risk manager,
+      manual hotkeys, etc.) to schedule exits.
 
     It is deliberately conservative: if we can't determine mint or size,
     we just log and skip instead of throwing.
@@ -193,6 +226,10 @@ class _ExitEngine:
 
     def __init__(self) -> None:
         self.enabled = EXIT_ENGINE_ENABLED
+
+    # ------------------------------------------------------------------ #
+    # Hooks used by scanners / strategy
+    # ------------------------------------------------------------------ #
 
     async def on_trade_tick(self, raw_event: Dict[str, Any]) -> None:
         """
@@ -202,24 +239,32 @@ class _ExitEngine:
         """
         if not self.enabled:
             return
-        # NOTE: you can add per-mint tracking / stats here later if you want.
+        # You can later track per-mint stats here if desired.
         return
 
     async def on_buy_filled(
         self,
         ev: Dict[str, Any],
         tx_sig: Optional[str] = None,
+        *,
+        amount_raw: Optional[int] = None,
     ) -> None:
         """
         Called when a BUY is filled.
 
         Tolerant signature:
 
-            await exit_engine.on_buy_filled(ev)          # old style
-            await exit_engine.on_buy_filled(ev, tx_sig)  # new style
+            await exit_engine.on_buy_filled(ev)                     # old style
+            await exit_engine.on_buy_filled(ev, tx_sig)             # old style
+            await exit_engine.on_buy_filled(ev, tx_sig, amount_raw=123)  # new style
 
-        We pull what we can from `ev`, enqueue an exit_request in Redis,
-        and let the background worker actually perform the sell.
+        We pull what we can from `ev`, construct an exit_request payload,
+        and store it in Redis. The background worker will perform the
+        actual sell if/when the request should be honored.
+
+        IMPORTANT:
+          - If amount_raw is not provided and can't be inferred from `ev`,
+            we log EXIT_ENGINE_SKIP_NO_SIZE and do nothing.
         """
         if not self.enabled:
             return
@@ -254,21 +299,27 @@ class _ExitEngine:
                 tx_sig = str(tx_sig)
 
         # --- Position size ----------------------------------------------
-        amount_raw: Optional[int] = None
-        for k in ("position_raw", "amount_raw", "out_amount", "raw_amount_out"):
-            v = ev.get(k)
-            if isinstance(v, (int, float)) and v > 0:
-                amount_raw = int(v)
-                break
+        # Preferred: explicit amount_raw argument from caller (main.py).
+        if amount_raw is None:
+            for k in ("position_raw", "amount_raw", "out_amount", "raw_amount_out"):
+                v = ev.get(k)
+                if isinstance(v, (int, float)) and v > 0:
+                    amount_raw = int(v)
+                    break
 
         if amount_raw is None or amount_raw <= 0:
             log.info(
                 "EXIT_ENGINE_SKIP_NO_SIZE",
-                extra={"mint": mint, "keys": list(ev.keys())},
+                extra={
+                    "mint": mint,
+                    "keys": list(ev.keys()),
+                    "spend_sol": ev.get("spend_sol"),
+                    "pool": ev.get("pool"),
+                },
             )
             return
 
-        # --- Spend SOL (for diagnostics) --------------------------------
+        # --- Spend SOL (diagnostic only) --------------------------------
         spend_sol = ev.get("spend_sol") or ev.get("entry_spend_sol") or 0.0
         try:
             spend_sol = float(spend_sol)
@@ -284,8 +335,6 @@ class _ExitEngine:
         if not isinstance(follow_stats, dict):
             follow_stats = {}
 
-        key = f"exit_request:{mint}"
-
         payload: Dict[str, Any] = {
             "mint": mint,
             "position_raw": int(amount_raw),
@@ -293,12 +342,16 @@ class _ExitEngine:
             "sell_pct": float(sell_pct),
             "reason": reason,
             "follow_stats": follow_stats,
+            "source": "on_buy_filled",
         }
         if tx_sig:
             payload["tx_sig"] = tx_sig
 
-        try:
-            await redis.set(key, json.dumps(payload), ex=EXIT_REQUEST_TTL_SEC)
+        # NOTE: If EXIT_ON_BUY_FILLED is False, we still enqueue the request,
+        # but the worker will skip "on_buy_filled" reasons. This gives other
+        # modules a chance to modify / re-enqueue with a different reason.
+        key = await _store_exit_request(payload)
+        if key:
             log.info(
                 "EXIT_ENGINE_REQUEST_ENQUEUED",
                 extra={
@@ -310,14 +363,82 @@ class _ExitEngine:
                     "tx_sig": tx_sig,
                 },
             )
-        except Exception as e:  # noqa: BLE001
-            log.warning(
-                "EXIT_ENGINE_REDIS_ERROR",
-                extra={"mint": mint, "err": str(e)[:200]},
+
+    # ------------------------------------------------------------------ #
+    # Generic API for risk manager / manual exits
+    # ------------------------------------------------------------------ #
+
+    async def enqueue_exit_request(
+        self,
+        *,
+        mint: str,
+        amount_raw: int,
+        reason: str = "manual",
+        sell_pct: float | None = None,
+        entry_spend_sol: float | None = None,
+        follow_stats: Optional[Dict[str, Any]] = None,
+        tx_sig: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Generic way to schedule an exit for a position.
+
+        This is intended for the risk manager, stop-loss logic, or manual
+        "panic sell" triggers.
+
+        Returns the Redis key used, or None on failure.
+        """
+        if not self.enabled:
+            return None
+        if redis is None:
+            log.debug("EXIT_ENGINE_NO_REDIS")
+            return None
+
+        mint = str(mint).strip()
+        if not mint:
+            return None
+
+        if amount_raw <= 0:
+            log.info(
+                "EXIT_ENGINE_ENQUEUE_SKIP_BAD_SIZE",
+                extra={"mint": mint, "amount_raw": amount_raw},
             )
+            return None
+
+        if sell_pct is None:
+            sell_pct = EXIT_WORKER_SELL_PCT
+        sell_pct = max(0.01, min(1.0, float(sell_pct)))
+
+        if follow_stats is None:
+            follow_stats = {}
+
+        payload: Dict[str, Any] = {
+            "mint": mint,
+            "position_raw": int(amount_raw),
+            "sell_pct": float(sell_pct),
+            "reason": str(reason),
+            "entry_spend_sol": float(entry_spend_sol or 0.0),
+            "follow_stats": follow_stats,
+            "source": "manual",
+        }
+        if tx_sig:
+            payload["tx_sig"] = str(tx_sig)
+
+        key = await _store_exit_request(payload)
+        if key:
+            log.info(
+                "EXIT_ENGINE_MANUAL_ENQUEUED",
+                extra={
+                    "key": key,
+                    "mint": mint,
+                    "amount_raw": int(amount_raw),
+                    "sell_pct": sell_pct,
+                    "reason": reason,
+                },
+            )
+        return key
 
 
-# Global instance used by scripts/main.py
+# Global instance used by scripts/main.py and others
 exit_engine = _ExitEngine()
 
 
@@ -332,9 +453,20 @@ async def _execute_exit(req: Dict[str, Any]) -> None:
     """
     mint = str(req.get("mint"))
     reason = str(req.get("reason", "unknown"))
+    source = str(req.get("source", "unknown"))
     follow = req.get("follow_stats", {}) or {}
 
-    amount_raw = _extract_amount_raw(req)
+    # If this request is just the placeholder from on_buy_filled() and the
+    # operator has not enabled EXIT_ON_BUY_FILLED, skip it. This gives the
+    # risk manager a chance to transform/replace it.
+    if source == "on_buy_filled" and reason == "on_buy_filled" and not EXIT_ON_BUY_FILLED:
+        log.debug(
+            "EXIT_WORKER_SKIP_PLACEHOLDER",
+            extra={"mint": mint, "reason": reason, "source": source},
+        )
+        return
+
+    amount_raw = _extract_amount_raw_from_req(req)
     if amount_raw is None or amount_raw <= 0:
         log.info(
             "EXIT_WORKER_SKIP_NO_AMOUNT",
@@ -414,7 +546,12 @@ async def _process_once() -> None:
 
         log.info(
             "EXIT_WORKER_REQUEST",
-            extra={"key": key, "mint": mint, "reason": reason},
+            extra={
+                "key": key,
+                "mint": mint,
+                "reason": reason,
+                "source": req.get("source", "unknown"),
+            },
         )
 
         await _execute_exit(req)
