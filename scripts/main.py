@@ -268,6 +268,14 @@ except Exception:  # pragma: no cover
         while not stop_evt.is_set():
             await asyncio.sleep(10)
 
+# Optional legacy sell-loop worker
+try:
+    from utils_pkg.sell_loop import run_sell_loop  # type: ignore
+except Exception:  # pragma: no cover
+    async def run_sell_loop(stop_evt):  # type: ignore
+        # Legacy no-op fallback so main never crashes if module is absent
+        while not stop_evt.is_set():
+            await asyncio.sleep(10)
 
 # Router + price helpers
 try:
@@ -1977,9 +1985,10 @@ async def _estimate_realized_today() -> Tuple[float, Dict[str, Any]]:
     except Exception:
         pass
     try:
-        from positions_pg import realized_today_sol as pg_realized_today_sol  # type: ignore
+        # NOTE: Postgres-backed realized_from_positions (if implemented)
+        from utils_pkg.positions_pg import realized_today_sol as pg_realized_today_sol  # type: ignore
         v = await pg_realized_today_sol()
-        return float(v or 0.0), {"source": "positions_pg.realized_today_sol"}
+        return float(v or 0.0), {"source": "utils_pkg.positions_pg.realized_today_sol"}
     except Exception:
         pass
     return 0.0, {"source": "fallback_zero"}
