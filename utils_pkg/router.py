@@ -772,7 +772,6 @@ async def _singleflight_quote(key: str, maker: Callable[[], Any]) -> dict:
         async with _quote_lock:
             _QUOTE_FLIGHT.pop(key, None)
 
-
 async def _jup_quote(
     input_mint: str,
     output_mint: str,
@@ -808,12 +807,15 @@ async def _jup_quote(
                 "asLegacyTransaction": "true" if legacy else "false",
                 "swapMode": swap_mode,  # ignored by modern /quote but fine to include
             }
-log.every(
-    "jup.quote.debug",
-    n=50,
-    msg="JUP_QUOTE_DEBUG",
-    params=params,
-)
+
+            # Optional debug: logs params every ~50 calls so we can see bad/no-route cases
+            log.every(
+                "jup.quote.debug",
+                n=50,
+                msg="JUP_QUOTE_DEBUG",
+                params=params,
+            )
+
             js = await _http_get("quote", params=params, timeout=HTTP_TIMEOUT_GET)
             await _set_cached_quote(key, js, QUOTE_TTL_SEC)
             return js
