@@ -291,7 +291,9 @@ JUP_ALT_BASE_URLS: List[str] = [
 ]
 AS_LEGACY = _envb("JUP_AS_LEGACY", False)
 ONLY_DIRECT_DEFAULT = _envb("JUP_ONLY_DIRECT", False)
-if not AS_LEGACY:
+
+# Only supply a default alt if user didn't specify any
+if not AS_LEGACY and not JUP_ALT_BASE_URLS:
     JUP_ALT_BASE_URLS = [os.getenv("JUP_BASE_URL", "https://api.jup.ag")]
 _JUP_LAST_GOOD_BASE: Optional[str] = None
 
@@ -806,6 +808,12 @@ async def _jup_quote(
                 "asLegacyTransaction": "true" if legacy else "false",
                 "swapMode": swap_mode,  # ignored by modern /quote but fine to include
             }
+log.every(
+    "jup.quote.debug",
+    n=50,
+    msg="JUP_QUOTE_DEBUG",
+    params=params,
+)
             js = await _http_get("quote", params=params, timeout=HTTP_TIMEOUT_GET)
             await _set_cached_quote(key, js, QUOTE_TTL_SEC)
             return js
