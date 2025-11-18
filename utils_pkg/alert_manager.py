@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import os
 import json
-import httpx
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Mapping
+
+import httpx
 
 from logging_setup import get_logger
 
@@ -21,12 +22,37 @@ def _b(name: str, default: bool = False) -> bool:
         return default
     return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
+
 def _s(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return default if v is None else v.strip()
 
+
 def _dryrun_env_on() -> bool:
     return _b("DRYRUN", False)
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# MOMO constants
+# ───────────────────────────────────────────────────────────────────────────────
+
+# Events we explicitly allow to reach Telegram/Discord
+GOOD_MOMO_EVENTS = {
+    "MOMO_OK",
+    "MOMO_TAKE",
+    "MOMO_LONG",
+    "MOMO_SCALP",
+    # add more "positive" events here if/when you introduce them
+}
+
+# Optional: friendly labels for a few common ones
+MOMO_LABELS = {
+    "MOMO_OK": "Momentum OK",
+    "MOMO_TAKE": "Momentum TAKE",
+    "MOMO_LONG": "Momentum LONG",
+    "MOMO_SCALP": "Momentum SCALP",
+}
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # AlertManager
@@ -34,7 +60,7 @@ def _dryrun_env_on() -> bool:
 
 class AlertManager:
     """
-    Single place to fan out alerts to Telegram and Notion.
+    Single place to fan out alerts to Telegram, Discord, and Notion.
 
     Notion "trade fill" rows target a DB with the following properties:
       - Name       (title)
@@ -65,8 +91,12 @@ class AlertManager:
         self.tg_token = _s("TELEGRAM_BOT_TOKEN")
         self.tg_chat  = _s("TELEGRAM_CHAT_ID")
 
+        # Discord (optional, via simple webhook)
+        self.discord_enabled = _b("ALERTS_DISCORD_ENABLED", False)
+        self.discord_webhook = _s("DISCORD_WEBHOOK_URL")
+
         # Notion config (separate DBs for PnL and Trades; we use TRADES here)
-        self.notion_token   = _s("NOTION_API_KEY")
+        self.notion_token     = _s("NOTION_API_KEY")
         self.notion_trades_db = _s("NOTION_TRADES_DB_ID")  # <- your Sniper Trades DB
 
         if self.debug:
@@ -75,6 +105,7 @@ class AlertManager:
                 extra={
                     "enabled": self.enabled,
                     "tg": self.tg_enabled and bool(self.tg_token and self.tg_chat),
+                    "discord": self.discord_enabled and bool(self.discord_webhook),
                     "notion": self.notion_enabled and bool(self.notion_token and self.notion_trades_db),
                 },
             )
@@ -86,6 +117,9 @@ class AlertManager:
     def _tg_ok(self) -> bool:
         return self.enabled and self.tg_enabled and bool(self.tg_token and self.tg_chat)
 
+    def _discord_ok(self) -> bool:
+        return self.enabled and self.discord_enabled and bool(self.discord_webhook)
+
     def _notion_ok(self) -> bool:
         return self.enabled and self.notion_enabled and bool(self.notion_token and self.notion_trades_db)
 
@@ -96,8 +130,10 @@ class AlertManager:
     async def _send_tg(self, text: str) -> None:
         if not self._tg_ok():
             return
+
         url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
         data = {"chat_id": self.tg_chat, "text": text, "disable_web_page_preview": True}
+
         try:
             async with httpx.AsyncClient(timeout=10) as c:
                 r = await c.post(url, data=data)
@@ -110,6 +146,29 @@ class AlertManager:
                 log.info("ALERT_TG_SEND_OK")
         except Exception as e:
             log.warning("ALERT_TG_SEND_EXC", extra={"err": str(e)})
+
+    # ────────────────────────────────────────────────────────────────────
+    # Discord (optional)
+    # ────────────────────────────────────────────────────────────────────
+
+    async def _send_discord(self, text: str) -> None:
+        if not self._discord_ok():
+            return
+
+        payload = {"content": text}
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.post(self.discord_webhook, json=payload)
+            if r.status_code >= 300:
+                log.warning(
+                    "ALERT_DISCORD_SEND_FAIL",
+                    extra={"status": r.status_code, "body": r.text[:400]},
+                )
+            elif self.debug:
+                log.info("ALERT_DISCORD_SEND_OK")
+        except Exception as e:
+            log.warning("ALERT_DISCORD_SEND_EXC", extra={"err": str(e)})
 
     # ────────────────────────────────────────────────────────────────────
     # Notion (Trades DB — per-fill rows)
@@ -150,12 +209,38 @@ class AlertManager:
             log.warning("ALERT_NOTION_EXC", extra={"err": str(e)})
 
     # ────────────────────────────────────────────────────────────────────
-    # Public helpers
+    # Public helpers: generic text / errors
     # ────────────────────────────────────────────────────────────────────
 
     async def notify_text(self, text: str) -> None:
-        """Plain text ping (Telegram only)."""
+        """
+        Plain text ping (Telegram + Discord, if enabled).
+        """
         await self._send_tg(text)
+        await self._send_discord(text)
+
+    async def notify_error(
+        self,
+        label: str,
+        err: Exception | str,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """
+        Convenience helper for error alerts with some context.
+        """
+        msg_lines = [f"⚠️ {label}"]
+        msg_lines.append(f"error={err}")
+        if extra:
+            for k, v in extra.items():
+                msg_lines.append(f"{k}={v}")
+        text = "\n".join(msg_lines)
+
+        await self._send_tg(text)
+        await self._send_discord(text)
+
+    # ────────────────────────────────────────────────────────────────────
+    # Public helpers: trade fill -> TG + Notion
+    # ────────────────────────────────────────────────────────────────────
 
     async def notify_trade_fill(
         self,
@@ -169,36 +254,40 @@ class AlertManager:
         out_amount: Optional[int],
     ) -> None:
         """
-        Fan out a trade fill to Telegram and Notion (Trades DB).
+        Fan out a trade fill to Telegram, Discord, and Notion (Trades DB).
         """
 
-        # ── Telegram message
-        # Normalize tx URL
+        # ── Normalize tx URL
         tx_url = None
         if sig:
             tx_url = sig if sig.startswith("http") else f"https://solscan.io/tx/{sig}"
 
+        side_upper = str(side).strip().upper()
+        side_select = "Buy" if side_upper.startswith("B") else "Sell"
+
         human = (
-            f"✅ {side.upper()} FILLED\n"
+            f"✅ {side_upper} FILLED\n"
             f"pool={pool}  symbol={symbol or '-'}\n"
             f"mint={mint}\n"
             f"spendSOL={spend_sol if spend_sol is not None else '-'}  "
             f"outRaw={out_amount if out_amount is not None else '-'}\n"
             f"tx={(tx_url or '—')}"
         )
+
+        # Telegram + Discord notifications
         await self._send_tg(human)
+        await self._send_discord(human)
 
         # ── Notion row (Sniper Trades schema)
-        side_select = "Buy" if str(side).strip().lower().startswith("b") else "Sell"
         now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
         props: Dict[str, Any] = {
-            "Name":     {"title": [{"text": {"content": f"{side_select} {symbol or mint[:6]}…"}}]},
-            "Side":     {"select": {"name": side_select}},
-            "Symbol":   {"rich_text": [{"text": {"content": symbol or ""}}]},
-            "Pool":     {"rich_text": [{"text": {"content": pool}}]},
-            "Mint":     {"rich_text": [{"text": {"content": mint}}]},
-            "Time":     {"date": {"start": now_iso}},
+            "Name":   {"title": [{"text": {"content": f"{side_select} {symbol or mint[:6]}…"}}]},
+            "Side":   {"select": {"name": side_select}},
+            "Symbol": {"rich_text": [{"text": {"content": symbol or ""}}]},
+            "Pool":   {"rich_text": [{"text": {"content": pool}}]},
+            "Mint":   {"rich_text": [{"text": {"content": mint}}]},
+            "Time":   {"date": {"start": now_iso}},
         }
         if spend_sol is not None:
             props["SpendSOL"] = {"number": float(spend_sol)}
@@ -212,4 +301,57 @@ class AlertManager:
             await self._notion_insert_trade(props)
         else:
             if self.debug:
-                log.info("ALERT_NOTION_SKIPPED", extra={"dryrun": _dryrun_env_on(), "allow_dryrun": self.allow_dryrun_notion})
+                log.info(
+                    "ALERT_NOTION_SKIPPED",
+                    extra={"dryrun": _dryrun_env_on(), "allow_dryrun": self.allow_dryrun_notion},
+                )
+
+    # ────────────────────────────────────────────────────────────────────
+    # Public helpers: MOMO events (scanner signals)
+    # ────────────────────────────────────────────────────────────────────
+
+    async def send_momo_event(self, event: str, ctx: Dict[str, Any]) -> None:
+        """
+        Central MOMO notifier used by scanners.
+
+        Behaviour:
+          - Completely ignore skip events (MOMO_SKIP_*)
+          - Optionally only allow an explicit whitelist of "good" events.
+        """
+
+        # 1) Ignore everything that is clearly a skip (these caused the spam)
+        if event.startswith("MOMO_SKIP"):
+            if self.debug:
+                log.debug("Ignoring MOMO skip event: %s", event)
+            return
+
+        # 2) Only allow whitelisted "good" events
+        if event not in GOOD_MOMO_EVENTS:
+            if self.debug:
+                log.debug("Ignoring non-whitelisted MOMO event: %s", event)
+            return
+
+        symbol = ctx.get("symbol") or ctx.get("mint") or ctx.get("name") or "?"
+        pool   = ctx.get("pool") or ctx.get("pair") or "-"
+        reason = ctx.get("reason") or ""
+
+        label = MOMO_LABELS.get(event, event)
+        header = f"📈 {label}"
+        body_lines = [header, f"symbol={symbol}", f"pool={pool}"]
+
+        # Add a few common optional fields if present
+        if "age_sec" in ctx:
+            body_lines.append(f"age={ctx['age_sec']}s")
+        if "liq_usd" in ctx:
+            body_lines.append(f"liq≈${ctx['liq_usd']}")
+        if "vol_5m" in ctx:
+            body_lines.append(f"vol_5m≈${ctx['vol_5m']}")
+        if "up_pct" in ctx:
+            body_lines.append(f"up={ctx['up_pct']}%")
+        if reason:
+            body_lines.append(f"reason={reason}")
+
+        text = "\n".join(body_lines)
+
+        await self._send_tg(text)
+        await self._send_discord(text)

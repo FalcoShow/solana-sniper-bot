@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 """
-Jupiter swapper using /swap/v1/* endpoints.
+Jupiter swapper using /swap/v1/* endpoints (v6 style).
 
-Guarantees:
-- Quote path is *non-legacy* to see Pump/simple AMM routes.
-- Swap POST passes the *full* quoteResponse (unmodified) with useSharedAccounts=false.
-- No renaming of fields (e.g., inAmount stays inAmount).
+Goals / guarantees:
+- Quote is **non-legacy** so Pump.fun + simple AMM routes are visible.
+- Swap POST passes the **full** quoteResponse (unmodified) with useSharedAccounts=False.
+- No field renames (e.g., inAmount stays inAmount).
 - Unroutable-pair cache + one bumped requote attempt.
 - DRYRUN-safe; robust logging; optional platform/prio fees.
 """
@@ -37,6 +37,7 @@ log = get_logger()
 # ─────────────────────────────────────────────────────────────────────────────
 # Small typed error to carry Jupiter response JSON when non-200
 # ─────────────────────────────────────────────────────────────────────────────
+
 class JupHTTPError(RuntimeError):
     def __init__(self, status: int, url: str, body: dict | str):
         self.status = status
@@ -44,12 +45,15 @@ class JupHTTPError(RuntimeError):
         self.body = body
         super().__init__(f"HTTP {status} {url}")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Env helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return default if v is None else v.strip()
+
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -57,11 +61,13 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float((os.getenv(name, str(default)) or str(default)).strip())
     except Exception:
         return default
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
@@ -73,7 +79,12 @@ def _env_bool(name: str, default: bool = False) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 # Config (Jupiter + trade knobs)
 # ─────────────────────────────────────────────────────────────────────────────
-BASE: str = (_env_str("JUP_BASE_URL") or _env_str("JUP_UPSTREAM") or "https://api.jup.ag").rstrip("/")
+
+BASE: str = (
+    _env_str("JUP_BASE_URL")
+    or _env_str("JUP_UPSTREAM")
+    or "https://api.jup.ag"
+).rstrip("/")
 
 # Telemetry only; quote forces non-legacy
 AS_LEGACY_ENV: bool = _env_bool("JUP_AS_LEGACY", False)
@@ -97,18 +108,27 @@ DEFAULT_SLIPPAGE_BPS: int = _env_int("PF_SLIPPAGE_BPS", _env_int("SLIPPAGE_BPS",
 COMPUTE_UNIT_LIMIT: int = _env_int("PF_COMPUTE_UNIT_LIMIT", 0)  # 0 → dynamic
 WRAP_UNWRAP_SOL: bool = _env_bool("PF_WRAP_UNWRAP_SOL", True)
 
+
 def _micro_to_lamports(micro: int) -> int:
     try:
         return int(round(max(0, micro) / 1_000_000))
     except Exception:
         return 0
 
+
 _fallback_micro = _env_int("JITO_FEE_MICROLAMPORTS", 0)
-PF_PRIORITY_LAMPORTS: int = _env_int("PF_PRIORITY_LAMPORTS", _micro_to_lamports(_fallback_micro))
+PF_PRIORITY_LAMPORTS: int = _env_int(
+    "PF_PRIORITY_LAMPORTS",
+    _micro_to_lamports(_fallback_micro),
+)
 PF_PRIORITY_SOL: float = _env_float("PF_PRIORITY_SOL", 0.0)
 
 # Dry-run toggle
-DRY_RUN: bool = _env_bool("DRYRUN", False) or _env_bool("DRY_RUN", False) or _env_bool("IS_DRYRUN", False)
+DRY_RUN: bool = (
+    _env_bool("DRYRUN", False)
+    or _env_bool("DRY_RUN", False)
+    or _env_bool("IS_DRYRUN", False)
+)
 
 # Unroutable + bump knobs
 UNROUTABLE_TTL_SEC: int = max(30, _env_int("JUP_UNROUTABLE_TTL_SEC", 1800))
@@ -124,11 +144,14 @@ LAMPORTS_PER_SOL = 1_000_000_000
 # ─────────────────────────────────────────────────────────────────────────────
 # Unroutable PAIR cache
 # ─────────────────────────────────────────────────────────────────────────────
+
 _UNROUTABLE_UNTIL: dict[tuple[str, str], float] = {}
+
 
 def _is_unroutable_pair(inp: str, out: str) -> bool:
     exp = _UNROUTABLE_UNTIL.get((inp, out))
     return bool(exp and exp > time.time())
+
 
 def _mark_unroutable(inp: str, out: str, *, ttl: int | None = None) -> None:
     _UNROUTABLE_UNTIL[(inp, out)] = time.time() + float(ttl or UNROUTABLE_TTL_SEC)
@@ -137,19 +160,22 @@ def _mark_unroutable(inp: str, out: str, *, ttl: int | None = None) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 def _jup_headers() -> Dict[str, str]:
     h = {
         "accept": "application/json",
         "content-type": "application/json",
         "origin": "https://jup.ag",
         "referer": "https://jup.ag/",
-        "user-agent": "pnlsniper/router",
+        "user-agent": "pnlsniper",
     }
     if JUP_API_KEY:
         h["x-api-key"] = JUP_API_KEY
     if JUP_BEARER:
+        # Official Jupiter internal header for bearer-based auth
         h["x-jup-auth"] = f"Bearer {JUP_BEARER}"
     return h
+
 
 async def _http_get(url: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=20) as c:
@@ -159,9 +185,13 @@ async def _http_get(url: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
                 body = r.json()
             except Exception:
                 body = {"text": r.text}
-            log.warning("JUP_GET_NON200", extra={"url": url, "status": r.status_code, "body": body})
+            log.warning(
+                "JUP_GET_NON200",
+                extra={"url": url, "status": r.status_code, "body": body},
+            )
             raise JupHTTPError(status=r.status_code, url=url, body=body)
         return r.json()
+
 
 async def _http_post(url: str, *, json_body: Dict[str, Any]) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=25) as c:
@@ -171,7 +201,10 @@ async def _http_post(url: str, *, json_body: Dict[str, Any]) -> Dict[str, Any]:
                 body = r.json()
             except Exception:
                 body = {"text": r.text}
-            log.warning("JUP_POST_NON200", extra={"url": url, "status": r.status_code, "body": body})
+            log.warning(
+                "JUP_POST_NON200",
+                extra={"url": url, "status": r.status_code, "body": body},
+            )
             raise JupHTTPError(status=r.status_code, url=url, body=body)
         return r.json()
 
@@ -179,18 +212,44 @@ async def _http_post(url: str, *, json_body: Dict[str, Any]) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 # Jupiter endpoints
 # ─────────────────────────────────────────────────────────────────────────────
+
 def _quote_url() -> str:
     return f"{BASE}/swap/v1/quote"
+
 
 def _swap_url() -> str:
     return f"{BASE}/swap/v1/swap"
 
 
+def _variant_flags() -> Dict[str, Any]:
+    """
+    Small helper used in shell tests to introspect how we're configured.
+    """
+    return {
+        "base": BASE,
+        "as_legacy_env": AS_LEGACY_ENV,
+        "only_direct": ONLY_DIRECT,
+        "use_shared_accounts_env": USE_SHARED_ACCOUNTS_ENV,
+        "use_token_ledger_env": USE_TOKEN_LEDGER_ENV,
+        "use_platform_fee": USE_PLATFORM_FEE,
+        "platform_fee_bps": PLATFORM_FEE_BPS,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Quote → Swap
 # ─────────────────────────────────────────────────────────────────────────────
-def _quote_params(*, input_mint: str, output_mint: str, amount: int, slippage_bps: int) -> Dict[str, Any]:
-    # Force non-legacy to ensure Pump/simple AMM routes are discoverable
+
+def _quote_params(
+    *,
+    input_mint: str,
+    output_mint: str,
+    amount: int,
+    slippage_bps: int,
+) -> Dict[str, Any]:
+    """
+    Fully non-legacy quote to ensure v6 routes (Pump, simple AMMs) are included.
+    """
     p: Dict[str, Any] = {
         "inputMint": input_mint,
         "outputMint": output_mint,
@@ -204,31 +263,68 @@ def _quote_params(*, input_mint: str, output_mint: str, amount: int, slippage_bp
         p["platformFeeBps"] = int(PLATFORM_FEE_BPS)
     return p
 
-async def _get_quote_kwonly(*, input_mint: str, output_mint: str, amount: int, slippage_bps: int) -> Dict[str, Any]:
+
+async def _get_quote_kwonly(
+    *,
+    input_mint: str,
+    output_mint: str,
+    amount: int,
+    slippage_bps: int,
+) -> Dict[str, Any]:
+    """
+    Low-level Jupiter quote wrapper. Raises:
+      - RuntimeError("jup_no_route")      → no route even after bump
+      - RuntimeError("jup_no_route_cached") → cached unroutable
+      - JupHTTPError                      → for non-routing HTTP issues
+    """
     # unroutable cache gate
     if _is_unroutable_pair(input_mint, output_mint):
-        log.info("JUP_NO_ROUTE_CACHED", extra={"pair": [input_mint, output_mint], "ttl": UNROUTABLE_TTL_SEC})
+        log.info(
+            "JUP_NO_ROUTE_CACHED",
+            extra={"pair": [input_mint, output_mint], "ttl": UNROUTABLE_TTL_SEC},
+        )
         raise RuntimeError("jup_no_route_cached")
 
     url = _quote_url()
-    params = _quote_params(input_mint=input_mint, output_mint=output_mint, amount=amount, slippage_bps=slippage_bps)
+    params = _quote_params(
+        input_mint=input_mint,
+        output_mint=output_mint,
+        amount=amount,
+        slippage_bps=slippage_bps,
+    )
 
     try:
         js = await _http_get(url, params=params)
     except JupHTTPError as e:
-        err_code = (e.body or {}).get("errorCode", "")
-        # Jupiter returns CIRCULAR_ARB / etc when input==output; treat as unroutable too
+        body = e.body or {}
+        err_code = body.get("errorCode", "") if isinstance(body, dict) else ""
+        # Jupiter returns COULD_NOT_FIND_ANY_ROUTE / CIRCULAR_ARB when no route
         if err_code in {"COULD_NOT_FIND_ANY_ROUTE", "CIRCULAR_ARBITRAGE_IS_DISABLED"}:
             _mark_unroutable(input_mint, output_mint)
             # one bumped requote attempt
             bumped = max(int(amount * (100 + REQUOTE_BUMP_PCT) / 100), amount + 1)
-            log.info("JUP_REQUOTE_BUMP", extra={"pair": [input_mint, output_mint], "amount": amount, "bumped": bumped})
+            log.info(
+                "JUP_REQUOTE_BUMP",
+                extra={
+                    "pair": [input_mint, output_mint],
+                    "amount": amount,
+                    "bumped": bumped,
+                    "slippage_bps": slippage_bps,
+                },
+            )
             try:
-                js = await _http_get(url, params=_quote_params(
-                    input_mint=input_mint, output_mint=output_mint, amount=bumped, slippage_bps=slippage_bps
-                ))
+                js = await _http_get(
+                    url,
+                    params=_quote_params(
+                        input_mint=input_mint,
+                        output_mint=output_mint,
+                        amount=bumped,
+                        slippage_bps=slippage_bps,
+                    ),
+                )
             except JupHTTPError as e2:
-                err2 = (e2.body or {}).get("errorCode", "")
+                body2 = e2.body or {}
+                err2 = body2.get("errorCode", "") if isinstance(body2, dict) else ""
                 if err2 in {"COULD_NOT_FIND_ANY_ROUTE", "CIRCULAR_ARBITRAGE_IS_DISABLED"}:
                     log.info("JUP_NO_ROUTE_FINAL", extra={"pair": [input_mint, output_mint]})
                     raise RuntimeError("jup_no_route")
@@ -240,25 +336,44 @@ async def _get_quote_kwonly(*, input_mint: str, output_mint: str, amount: int, s
                 raise RuntimeError("jup_no_route")
             raise
 
-    log.info("QUOTE_OK", extra={
-        "base": BASE,
-        "legacy_env": AS_LEGACY_ENV,
-        "input": input_mint,
-        "output": output_mint,
-        "in": str(amount),
-        "out": js.get("outAmount"),
-        "priceImpactPct": js.get("priceImpactPct"),
-    })
+    log.info(
+        "JUP_QUOTE_OK",
+        extra={
+            "base": BASE,
+            "legacy_env": AS_LEGACY_ENV,
+            "input": input_mint,
+            "output": output_mint,
+            "in": str(amount),
+            "out": js.get("outAmount"),
+            "priceImpactPct": js.get("priceImpactPct"),
+        },
+    )
     return js
 
-async def _get_quote(*args, **kwargs) -> Dict[str, Any]:  # positional compat
+
+async def _get_quote(*args, **kwargs) -> Dict[str, Any]:
+    """
+    Positional-compatible wrapper around _get_quote_kwonly.
+
+    Accepts either positional:
+      _get_quote(input_mint, output_mint, amount, slippage_bps)
+    or keyword-only:
+      _get_quote(input_mint=..., output_mint=..., amount=..., slippage_bps=...)
+    """
     if args and not kwargs and len(args) == 4:
         return await _get_quote_kwonly(
-            input_mint=args[0], output_mint=args[1], amount=args[2], slippage_bps=args[3]
+            input_mint=args[0],
+            output_mint=args[1],
+            amount=args[2],
+            slippage_bps=args[3],
         )
     return await _get_quote_kwonly(**kwargs)
 
+
 def _choose_priority_lamports() -> Optional[int]:
+    """
+    Convert PF_PRIORITY_SOL or PF_PRIORITY_LAMPORTS envs into actual lamports.
+    """
     if PF_PRIORITY_LAMPORTS > 0:
         return int(PF_PRIORITY_LAMPORTS)
     if PF_PRIORITY_SOL > 0:
@@ -268,6 +383,7 @@ def _choose_priority_lamports() -> Optional[int]:
             return None
     return None
 
+
 async def _build_swap_tx(*, user_pubkey: str, quote: Dict[str, Any]) -> str:
     """
     Build swap using FULL quoteResponse (unmodified) and **useSharedAccounts=false**.
@@ -275,7 +391,7 @@ async def _build_swap_tx(*, user_pubkey: str, quote: Dict[str, Any]) -> str:
     dynamic_cu = not (COMPUTE_UNIT_LIMIT and COMPUTE_UNIT_LIMIT > 0)
 
     body: Dict[str, Any] = {
-        "quoteResponse": quote,                 # ← pass through, includes inAmount
+        "quoteResponse": quote,                 # ← pass through, includes inAmount/outAmount
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": WRAP_UNWRAP_SOL,
         "dynamicComputeUnitLimit": dynamic_cu,
@@ -300,10 +416,21 @@ async def _build_swap_tx(*, user_pubkey: str, quote: Dict[str, Any]) -> str:
     tx_b64 = js.get("swapTransaction")
     if not tx_b64:
         raise RuntimeError(f"Jupiter /swap missing swapTransaction: {js}")
-    log.info("SWAP_BUILT", extra={"variant": "useSharedAccounts:false"})
+    log.info(
+        "JUP_SWAP_BUILT",
+        extra={
+            "variant": "useSharedAccounts:false",
+            "dynamic_cu": dynamic_cu,
+            "prio_lamports": prio,
+        },
+    )
     return tx_b64
 
+
 async def _send_tx_b64(tx_b64: str) -> str:
+    """
+    Send a base64 transaction via diagnostic sender if available, else sign locally.
+    """
     if _send_b64_with_diag is not None:
         try:
             return await _send_b64_with_diag(tx_b64, skip_preflight=True)  # type: ignore[arg-type]
@@ -314,9 +441,25 @@ async def _send_tx_b64(tx_b64: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public API
+# Public API (entry/exit)
 # ─────────────────────────────────────────────────────────────────────────────
-async def buy_via_lightning(*, mint: str, amount_sol: float, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Optional[str]:
+
+async def buy_via_lightning(
+    *,
+    mint: str,
+    amount_sol: float,
+    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+) -> Optional[str]:
+    """
+    SOL → mint using Jupiter v6.
+
+    - amount_sol: how much SOL to spend
+    - slippage_bps: basis-point slippage (defaults to PF_SLIPPAGE_BPS/SLIPPAGE_BPS)
+
+    Returns:
+      - tx signature string on success
+      - None on failure or DRYRUN
+    """
     try:
         m = normalize_mint(mint)
         lamports_in = max(1, int(float(amount_sol) * LAMPORTS_PER_SOL))
@@ -329,13 +472,20 @@ async def buy_via_lightning(*, mint: str, amount_sol: float, slippage_bps: int =
         )
 
         if DRY_RUN:
-            log.info("ENTRY_TX_DRYRUN", extra={"mint": m, "lamports_in": lamports_in, "slippage_bps": slippage_bps})
+            log.info(
+                "ENTRY_TX_DRYRUN",
+                extra={
+                    "mint": m,
+                    "lamports_in": lamports_in,
+                    "slippage_bps": slippage_bps,
+                },
+            )
             return None
 
         user_pk = get_pubkey_str(load_keypair())
         tx_b64 = await _build_swap_tx(user_pubkey=user_pk, quote=quote)
         sig = await _send_tx_b64(tx_b64)
-        log.info("ENTRY_TX_OK", extra={"sig": sig})
+        log.info("ENTRY_TX_OK", extra={"sig": sig, "mint": m})
         return sig
 
     except RuntimeError as e:
@@ -351,8 +501,22 @@ async def buy_via_lightning(*, mint: str, amount_sol: float, slippage_bps: int =
         log.warning("ENTRY_TX_FAIL", extra={"err": f"{e}"})
         return None
 
-async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Optional[str]:
+
+async def sell_via_lightning(
+    *,
+    mint: str,
+    token_program: Optional[str],
+    amount_raw: int,
+    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+) -> Optional[str]:
+    """
+    mint → SOL using Jupiter v6.
+
+    - amount_raw: raw token units (already adjusted for decimals)
+    - token_program: ignored for Jupiter v6, kept for call-site compatibility
+    """
     del token_program  # not needed for Jupiter v6
+
     try:
         m = normalize_mint(mint)
 
@@ -364,13 +528,20 @@ async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_
         )
 
         if DRY_RUN:
-            log.info("EXIT_TX_DRYRUN", extra={"mint": m, "amount_raw": amount_raw, "slippage_bps": slippage_bps})
+            log.info(
+                "EXIT_TX_DRYRUN",
+                extra={
+                    "mint": m,
+                    "amount_raw": amount_raw,
+                    "slippage_bps": slippage_bps,
+                },
+            )
             return None
 
         user_pk = get_pubkey_str(load_keypair())
         tx_b64 = await _build_swap_tx(user_pubkey=user_pk, quote=quote)
         sig = await _send_tx_b64(tx_b64)
-        log.info("EXIT_TX_OK", extra={"sig": sig})
+        log.info("EXIT_TX_OK", extra={"sig": sig, "mint": m})
         return sig
 
     except RuntimeError as e:
@@ -390,16 +561,48 @@ async def sell_via_lightning(*, mint: str, token_program: Optional[str], amount_
 # ─────────────────────────────────────────────────────────────────────────────
 # Optional debug helpers (nice for Render Shell smoke tests)
 # ─────────────────────────────────────────────────────────────────────────────
-async def debug_get_quote_sol_to_usdc(amount_sol: float = 0.002, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Dict[str, Any]:
-    lamports = max(1, int(amount_sol * LAMPORTS_PER_SOL))
-    return await _get_quote(input_mint=SOL_MINT, output_mint=USDC_MINT, amount=lamports, slippage_bps=slippage_bps)
 
-async def debug_build_only_sol_to_usdc(amount_sol: float = 0.002, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Tuple[int, int]:
+async def debug_get_quote_sol_to_usdc(
+    amount_sol: float = 0.002,
+    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+) -> Dict[str, Any]:
+    """
+    Quick smoke test for /swap/v1/quote:
+
+    python - <<'PY'
+    import asyncio
+    from utils_pkg import lightning_impl as L
+    async def main():
+        q = await L.debug_get_quote_sol_to_usdc(0.002)
+        print("quote keys:", sorted(q.keys()))
+        print("inAmount:", q.get("inAmount"), "outAmount:", q.get("outAmount"))
+    asyncio.run(main())
+    PY
+    """
+    lamports = max(1, int(amount_sol * LAMPORTS_PER_SOL))
+    return await _get_quote(
+        input_mint=SOL_MINT,
+        output_mint=USDC_MINT,
+        amount=lamports,
+        slippage_bps=slippage_bps,
+    )
+
+
+async def debug_build_only_sol_to_usdc(
+    amount_sol: float = 0.002,
+    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+) -> Tuple[int, int]:
     """
     Returns (inAmount_lamports, swap_tx_b64_len). Does NOT send the tx.
+    Useful for verifying /swap wiring without spending SOL.
     """
     lamports = max(1, int(amount_sol * LAMPORTS_PER_SOL))
-    q = await _get_quote(input_mint=SOL_MINT, output_mint=USDC_MINT, amount=lamports, slippage_bps=slippage_bps)
+    q = await _get_quote(
+        input_mint=SOL_MINT,
+        output_mint=USDC_MINT,
+        amount=lamports,
+        slippage_bps=slippage_bps,
+    )
     user_pk = get_pubkey_str(load_keypair())
     tx_b64 = await _build_swap_tx(user_pubkey=user_pk, quote=q)
     return int(q.get("inAmount", lamports)), len(tx_b64)

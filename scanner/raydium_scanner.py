@@ -1,5 +1,5 @@
 # scanner/raydium_scanner.py
-# Finds Raydium pairs via Dexscreener (stable public JSON) — runner-focused edition.
+# Raydium scanner via Dexscreener — runner-focused + MOMO alerts.
 from __future__ import annotations
 
 import os
@@ -28,16 +28,35 @@ from config import (
     SCANNER_MIN_HOLDERS,
 )
 
+from utils_pkg.alert_manager import AlertManager
+
 logger = logging.getLogger("scanner.raydium")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Env helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _b(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def _s(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else v.strip()
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config / env (Raydium overrides on top of global scanner defaults)
 # ──────────────────────────────────────────────────────────────────────────────
-UA = os.getenv(
+
+UA = _s(
     "SCANNER_UA",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SniperBot/1.0 (+raydium)"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SniperBot/1.0 (+raydium)",
 )
-BASE = os.getenv("DEXSCREENER_BASE_URL", "https://api.dexscreener.com").rstrip("/")
+BASE = _s("DEXSCREENER_BASE_URL", "https://api.dexscreener.com").rstrip("/")
 
 LIMIT = int(os.getenv("RAYDIUM_LIMIT", "40"))
 
@@ -48,10 +67,10 @@ MIN_BUYS_15M= int(  os.getenv("RAYDIUM_MIN_BUYS_15M",       str(SCANNER_MIN_BUYS
 MIN_VOL_5M_USD  = float(os.getenv("RAYDIUM_MIN_VOLUME_5M_USD",  str(SCANNER_MIN_VOLUME_5M_USD)))
 MIN_VOL_15M_USD = float(os.getenv("RAYDIUM_MIN_VOLUME_15M_USD", str(SCANNER_MIN_VOLUME_15M_USD)))
 MIN_BUY_RATIO   = float(os.getenv("RAYDIUM_MIN_BUY_RATIO",  str(SCANNER_MIN_BUY_RATIO)))
-REQUIRE_BUY_PRESSURE = os.getenv(
+REQUIRE_BUY_PRESSURE = _b(
     "RAYDIUM_REQUIRE_BUY_PRESSURE",
-    "1" if SCANNER_REQUIRE_BUY_PRESSURE else "0",
-).strip().lower() in {"1", "true", "yes", "y"}
+    SCANNER_REQUIRE_BUY_PRESSURE,
+)
 MIN_CHG_5M  = float(os.getenv("RAYDIUM_MIN_PRICE_CHANGE_5M",  str(SCANNER_MIN_PRICE_CHANGE_5M)))
 MIN_CHG_15M = float(os.getenv("RAYDIUM_MIN_PRICE_CHANGE_15M", str(SCANNER_MIN_PRICE_CHANGE_15M)))
 MAX_AGE_MIN = int(os.getenv("RAYDIUM_MAX_AGE_MIN",            str(SCANNER_MAX_AGE_MIN)))
@@ -61,7 +80,11 @@ MIN_HOLDERS = int(os.getenv("RAYDIUM_MIN_HOLDERS",            str(SCANNER_MIN_HO
 TIMEOUT_S = float(os.getenv("RAYDIUM_HTTP_TIMEOUT_SEC", "12"))
 RETRIES = max(1, int(os.getenv("RAYDIUM_HTTP_RETRIES", "3")))
 BACKOFF_S = max(0.1, float(os.getenv("RAYDIUM_HTTP_BACKOFF_SEC", "0.6")))
-TRUST_ENV = (os.getenv("RAYDIUM_TRUST_ENV", "1").strip().lower() in {"1", "true", "yes", "y"})
+TRUST_ENV = _b("RAYDIUM_TRUST_ENV", True)
+
+# MOMO / alert behaviour
+SEND_MOMO_ALERTS = _b("RAYDIUM_SEND_MOMO_ALERTS", True)
+MAX_ALERTS_PER_SCAN = int(os.getenv("RAYDIUM_MAX_ALERTS_PER_SCAN", "3"))
 
 # You can override the search queries; all results are filtered to dexId=raydium anyway.
 SEARCH_QUERIES = [
@@ -73,6 +96,7 @@ SEARCH_QUERIES = [
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
 def _headers() -> Dict[str, str]:
     return {
         "User-Agent": UA,
@@ -81,6 +105,7 @@ def _headers() -> Dict[str, str]:
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
+
 
 def _nz_float(v: Any, d: float = 0.0) -> float:
     try:
@@ -91,11 +116,13 @@ def _nz_float(v: Any, d: float = 0.0) -> float:
     except Exception:
         return d
 
+
 def _safe_int(v: Any, d: int = 0) -> int:
     try:
         return int(v)
     except Exception:
         return d
+
 
 def _age_min(pair_created_ms: Optional[int]) -> Optional[float]:
     try:
@@ -110,13 +137,16 @@ def _age_min(pair_created_ms: Optional[int]) -> Optional[float]:
     except Exception:
         return None
 
+
 def _runner_buy_ratio(buys: int, sells: int) -> float:
     total = max(1, buys + sells)
     return float(buys) / float(total)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP
 # ──────────────────────────────────────────────────────────────────────────────
+
 async def _fetch_json(
     session: aiohttp.ClientSession,
     url: str,
@@ -140,9 +170,9 @@ async def _fetch_json(
                     try:
                         return await r.json(content_type=None), status, first
                     except Exception:
-                        import json
+                        import json as _json
                         try:
-                            return json.loads(text), status, first
+                            return _json.loads(text), status, first
                         except Exception:
                             logger.warning("Raydium: non-JSON 200 at %s (first=%r)", url, first)
                             return None, status, first
@@ -162,6 +192,7 @@ async def _fetch_json(
 
     return None, status, first
 
+
 async def _fetch_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     url = f"{BASE}/latest/dex/search"
     out: List[Dict[str, Any]] = []
@@ -179,13 +210,20 @@ async def _fetch_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
                 out.append(p)
     return out
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Metric extraction & normalization
 # ──────────────────────────────────────────────────────────────────────────────
+
 def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
     liq_usd = _nz_float((pair.get("liquidity") or {}).get("usd"), 0.0)
 
-    fdv = _nz_float(pair.get("fdv") or pair.get("fdvUsd") or pair.get("fullyDilutedValuation"), 0.0)
+    fdv = _nz_float(
+        pair.get("fdv")
+        or pair.get("fdvUsd")
+        or pair.get("fullyDilutedValuation"),
+        0.0,
+    )
     mc  = _nz_float(
         pair.get("marketCap")
         or pair.get("marketCapUsd")
@@ -265,6 +303,7 @@ def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
         "holders": holders,
     }
 
+
 def _normalize(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         if (pair.get("chainId") or "").lower() != "solana":
@@ -322,9 +361,11 @@ def _normalize(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Runner filters & scoring
 # ──────────────────────────────────────────────────────────────────────────────
+
 def _passes_runner_filters(c: Dict[str, Any]) -> bool:
     if c.get("liq_usd", 0.0) < MIN_LIQ_USD:
         return False
@@ -372,6 +413,7 @@ def _passes_runner_filters(c: Dict[str, Any]) -> bool:
 
     return True
 
+
 def _runner_score(c: Dict[str, Any]) -> float:
     """
     Heuristic score:
@@ -393,6 +435,7 @@ def _runner_score(c: Dict[str, Any]) -> float:
 
     return buy_component + price_component + vol_component + liq_component
 
+
 def _filter_and_rank(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for c in candidates:
@@ -405,9 +448,51 @@ def _filter_and_rank(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out.sort(key=lambda x: x.get("runner_score", 0.0), reverse=True)
     return out[:LIMIT]
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MOMO event wiring
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
+    """
+    Send MOMO_OK alerts for the top N runner candidates.
+    Anti-spam: capped by MAX_ALERTS_PER_SCAN and further filtered in AlertManager.
+    """
+    if not SEND_MOMO_ALERTS:
+        return
+    if not runners:
+        return
+
+    try:
+        am = AlertManager()
+    except Exception as e:
+        logger.warning("Raydium: failed to init AlertManager for MOMO: %s", e)
+        return
+
+    max_n = max(0, min(MAX_ALERTS_PER_SCAN, len(runners)))
+    for c in runners[:max_n]:
+        try:
+            age_min = c.get("pool_age_min")
+            age_sec = age_min * 60.0 if isinstance(age_min, (int, float)) else None
+            ctx: Dict[str, Any] = {
+                "symbol": c.get("symbol") or c.get("mint"),
+                "mint": c.get("mint"),
+                "pool": c.get("pair_url"),
+                "age_sec": age_sec,
+                "liq_usd": c.get("liq_usd"),
+                "vol_5m": c.get("volume_5m_usd"),
+                "up_pct": c.get("price_change_5m"),
+                "reason": f"raydium runner score={c.get('runner_score', 0.0):.2f}",
+            }
+            await am.send_momo_event("MOMO_OK", ctx)
+        except Exception as e:
+            logger.warning("Raydium: MOMO send error for %s: %s", c.get("mint"), e)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Public entry
 # ──────────────────────────────────────────────────────────────────────────────
+
 async def scan_raydium(*args):
     """
     Flexible signature:
@@ -417,6 +502,7 @@ async def scan_raydium(*args):
       - scan_raydium(session)
 
     Only an aiohttp.ClientSession (if provided) is used.
+    Returns a list of runner candidates.
     """
     sess: Optional[aiohttp.ClientSession] = None
     if len(args) >= 2 and isinstance(args[1], aiohttp.ClientSession):
@@ -462,10 +548,15 @@ async def scan_raydium(*args):
 
         runners = _filter_and_rank(normalized)
         logger.info(
-            "scanner.raydium: %s runner candidates (from %s raw pairs)",
+            "scanner.raydium: %s runner candidates (from %s normalized, %s raw pairs)",
             len(runners),
             len(normalized),
+            len(pairs),
         )
+
+        # MOMO alerts (non-blocking logic-wise, but awaited so errors get logged)
+        await _send_momo_for_runners(runners)
+
         return runners
     except Exception as e:
         logger.warning("Raydium scan error: %s", e)

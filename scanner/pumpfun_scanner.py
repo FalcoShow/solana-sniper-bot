@@ -1,9 +1,5 @@
 # scanner/pumpfun_scanner.py
-# Robust Pump.fun scanner focused on *runners*:
-# 1) JSON API (mirror → primary)
-# 2) Next.js data via Playwright (/_next/data) [optional]
-# 3) Apex DOM via Playwright [optional]
-# 4) HTML __NEXT_DATA__ fallback (no Playwright)
+# Robust Pump.fun scanner focused on *runners* + MOMO alerts.
 from __future__ import annotations
 
 import os
@@ -33,6 +29,8 @@ from config import (
     SCANNER_MAX_MC_USD,
     SCANNER_MIN_HOLDERS,
 )
+
+from utils_pkg.alert_manager import AlertManager
 
 LOG = logging.getLogger("scanner.pumpfun")
 
@@ -74,25 +72,47 @@ except Exception:  # pragma: no cover
         return None
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Env helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _b(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def _s(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else v.strip()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Config / flags (with Pump-specific overrides on top of config defaults)
 # ──────────────────────────────────────────────────────────────────────────────
-UA = os.getenv("PUMPFUN_UA") or (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126 Safari/537.36"
+
+UA = _s(
+    "PUMPFUN_UA",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
 )
 
 # Optional override *full URL* for debugging a single endpoint
-OVERRIDE_URL = os.getenv("PUMPFUN_OVERRIDE_URL", "").strip()
+OVERRIDE_URL = _s("PUMPFUN_OVERRIDE_URL", "")
 
 # Optional HTTP proxy specifically for Pump.fun requests (aiohttp-compatible URI)
-PUMPFUN_HTTP_PROXY = (os.getenv("PUMPFUN_HTTP_PROXY") or "").strip()
+PUMPFUN_HTTP_PROXY = _s("PUMPFUN_HTTP_PROXY", "")
 
 REQ_TIMEOUT_S  = int(os.getenv("PUMPFUN_HTTP_TIMEOUT_S", "15"))
 SESSION_LIMIT  = int(os.getenv("PUMPFUN_HTTP_CONN_LIMIT", "30"))
 API_LIMIT      = int(os.getenv("PUMPFUN_API_LIMIT", "20"))
 DOM_LIMIT      = int(os.getenv("PUMPFUN_DOM_LIMIT", str(API_LIMIT)))
-SKIP_NEXT      = os.getenv("PUMPFUN_SKIP_NEXT", "0").strip().lower() in {"1","true","yes","y"}
-SKIP_HTML_NEXT = os.getenv("PUMPFUN_SKIP_HTMLNEXT", "0").strip().lower() in {"1","true","yes","y"}
+SKIP_NEXT      = _b("PUMPFUN_SKIP_NEXT", False)
+SKIP_HTML_NEXT = _b("PUMPFUN_SKIP_HTMLNEXT", False)
+
+# MOMO / alert behaviour
+SEND_MOMO_ALERTS      = _b("PUMP_SEND_MOMO_ALERTS", True)
+MAX_ALERTS_PER_SCAN   = int(os.getenv("PUMP_MAX_ALERTS_PER_SCAN", "3"))
 
 # Pump.fun HTML routes to try for __NEXT_DATA__ fallback
 FALLBACK_HTML_URLS = [
@@ -108,15 +128,15 @@ _PROXY_BREAK_CODES  = {522, 523, 524, 525, 526, 530}
 # Runner thresholds (env overrides → config defaults)
 MIN_LIQ_USD = float(os.getenv("PUMP_MIN_LIQ_USD",        str(SCANNER_MIN_LIQ_USD)))
 MIN_FDV_USD = float(os.getenv("PUMP_MIN_FDV_USD",        str(SCANNER_MIN_FDV_USD)))
-MIN_BUYS_5M = int(  os.getenv("PUMP_MIN_BUYS_5M",       str(SCANNER_MIN_BUYS_5M)))
-MIN_BUYS_15M= int(  os.getenv("PUMP_MIN_BUYS_15M",      str(SCANNER_MIN_BUYS_15M)))
+MIN_BUYS_5M = int(  os.getenv("PUMP_MIN_BUYS_5M",        str(SCANNER_MIN_BUYS_5M)))
+MIN_BUYS_15M= int(  os.getenv("PUMP_MIN_BUYS_15M",       str(SCANNER_MIN_BUYS_15M)))
 MIN_VOL_5M_USD = float(os.getenv("PUMP_MIN_VOLUME_5M_USD",  str(SCANNER_MIN_VOLUME_5M_USD)))
 MIN_VOL_15M_USD= float(os.getenv("PUMP_MIN_VOLUME_15M_USD", str(SCANNER_MIN_VOLUME_15M_USD)))
-MIN_BUY_RATIO   = float(os.getenv("PUMP_MIN_BUY_RATIO", str(SCANNER_MIN_BUY_RATIO)))
-REQUIRE_BUY_PRESSURE = os.getenv(
+MIN_BUY_RATIO   = float(os.getenv("PUMP_MIN_BUY_RATIO",  str(SCANNER_MIN_BUY_RATIO)))
+REQUIRE_BUY_PRESSURE = _b(
     "PUMP_REQUIRE_BUY_PRESSURE",
-    "1" if SCANNER_REQUIRE_BUY_PRESSURE else "0",
-).strip().lower() in {"1", "true", "yes", "y"}
+    SCANNER_REQUIRE_BUY_PRESSURE,
+)
 MIN_CHG_5M = float(os.getenv("PUMP_MIN_PRICE_CHANGE_5M",  str(SCANNER_MIN_PRICE_CHANGE_5M)))
 MIN_CHG_15M= float(os.getenv("PUMP_MIN_PRICE_CHANGE_15M", str(SCANNER_MIN_PRICE_CHANGE_15M)))
 MAX_AGE_MIN = int(os.getenv("PUMP_MAX_AGE_MIN",           str(SCANNER_MAX_AGE_MIN)))
@@ -126,21 +146,24 @@ MIN_HOLDERS = int(os.getenv("PUMP_MIN_HOLDERS",           str(SCANNER_MIN_HOLDER
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers: API bases & headers
 # ──────────────────────────────────────────────────────────────────────────────
+
 def _api_bases() -> List[str]:
     bases: List[str] = []
-    env_base = os.getenv("PUMPFUN_API_BASE", "").strip().rstrip("/")
+    env_base = _s("PUMPFUN_API_BASE", "").rstrip("/")
     if env_base:
         bases.append(env_base)
     bases += [
         "https://frontend-api.pump-mirror.fun",
         "https://frontend-api.pump.fun",
     ]
-    seen, out = set(), []
+    seen: set[str] = set()
+    out: List[str] = []
     for b in bases:
         if b and b not in seen:
             seen.add(b)
             out.append(b)
     return out
+
 
 def _hdrs(url: str) -> Dict[str, str]:
     h = {
@@ -160,12 +183,14 @@ def _hdrs(url: str) -> Dict[str, str]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilities & normalization
 # ──────────────────────────────────────────────────────────────────────────────
+
 BASE58_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
 
 def _now() -> float:
     return time.time()
 
-def _nz(x, d=0.0) -> float:
+
+def _nz(x: Any, d: float = 0.0) -> float:
     try:
         fx = float(x)
         if fx != fx:  # NaN
@@ -174,11 +199,13 @@ def _nz(x, d=0.0) -> float:
     except Exception:
         return float(d)
 
+
 def _safe_int(x: Any, d: int = 0) -> int:
     try:
         return int(x)
     except Exception:
         return d
+
 
 def _age_min(created_ts: Optional[float]) -> Optional[float]:
     try:
@@ -191,12 +218,14 @@ def _age_min(created_ts: Optional[float]) -> Optional[float]:
     except Exception:
         return None
 
+
 def _norm_mint(val: Any) -> str:
     if not isinstance(val, str):
         return ""
     val = val.strip().replace(" ", "")
     m = BASE58_RE.search(val)
     return m.group(0) if m else ""
+
 
 def _extract_metrics_from_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -334,9 +363,11 @@ def _extract_metrics_from_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
         "impact_1k_bps": _nz(impact_bps, 0.0),
     }
 
+
 def _runner_buy_ratio(buys: int, sells: int) -> float:
     total = max(1, buys + sells)
     return float(buys) / float(total)
+
 
 def _map_coin(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
@@ -398,13 +429,14 @@ def _map_coin(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
+
 def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
 
     if isinstance(payload, list):
         src = payload
     elif isinstance(payload, dict):
-        src: List[Dict[str, Any]] | None = None
+        src: Optional[List[Dict[str, Any]]] = None
         for k in ("trending", "coins", "items", "projects", "data"):
             v = payload.get(k)
             if isinstance(v, list):
@@ -431,10 +463,12 @@ def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
 # ──────────────────────────────────────────────────────────────────────────────
 # HTML __NEXT_DATA__ extraction (no Playwright required)
 # ──────────────────────────────────────────────────────────────────────────────
+
 _NEXT_RE = re.compile(
     r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>\s*({.*?})\s*</script>',
     re.DOTALL | re.IGNORECASE,
 )
+
 
 def _html_next_data(html: str):
     try:
@@ -448,6 +482,7 @@ def _html_next_data(html: str):
 # ──────────────────────────────────────────────────────────────────────────────
 # Runner filters & scoring
 # ──────────────────────────────────────────────────────────────────────────────
+
 def _passes_runner_filters(c: Dict[str, Any]) -> bool:
     if c.get("liq_usd", 0.0) < MIN_LIQ_USD:
         return False
@@ -495,6 +530,7 @@ def _passes_runner_filters(c: Dict[str, Any]) -> bool:
 
     return True
 
+
 def _runner_score(c: Dict[str, Any]) -> float:
     """
     Heuristic score:
@@ -516,6 +552,7 @@ def _runner_score(c: Dict[str, Any]) -> float:
 
     return buy_component + price_component + vol_component + liq_component
 
+
 def _filter_and_rank(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for c in candidates:
@@ -531,6 +568,7 @@ def _filter_and_rank(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
 async def _fetch_text(session: aiohttp.ClientSession, url: str) -> Tuple[str, int, Dict[str, str]]:
     headers = {
         "User-Agent": UA,
@@ -555,6 +593,7 @@ async def _fetch_text(session: aiohttp.ClientSession, url: str) -> Tuple[str, in
             return text, r.status, dict(r.headers)
     except Exception:
         return "", 0, {}
+
 
 async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[Any], int, str]:
     """
@@ -592,6 +631,9 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
                             data = json.loads(text)
                     except Exception:
                         data = None
+            # flag cookie if definitely CF blocked
+            if status in _BAD_CF_CODES:
+                flag_cookie_bad()
             return data, status, first
     except (
         aiohttp.ClientProxyConnectionError,
@@ -606,6 +648,7 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
         LOG.warning("Pump.fun request unexpected error at %s: %s", url, e)
         return None, status, first
 
+
 def _join_url(base: str, path: str) -> str:
     base = base.rstrip("/")
     path = path.lstrip("/")
@@ -614,6 +657,7 @@ def _join_url(base: str, path: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 # Fallback: HTML __NEXT_DATA__ from apex pages
 # ──────────────────────────────────────────────────────────────────────────────
+
 async def _html_next_fallback(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
 
@@ -681,6 +725,7 @@ async def _html_next_fallback(session: aiohttp.ClientSession) -> List[Dict[str, 
 # ──────────────────────────────────────────────────────────────────────────────
 # Core scanning logic
 # ──────────────────────────────────────────────────────────────────────────────
+
 async def _fetch_api_json_with_fallback(
     session: aiohttp.ClientSession,
     path: str,
@@ -712,6 +757,7 @@ async def _fetch_api_json_with_fallback(
             return items
 
     return None
+
 
 async def _collect_pumpfun_items(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     """
@@ -780,6 +826,7 @@ async def _collect_pumpfun_items(session: aiohttp.ClientSession) -> List[Dict[st
 
     return []
 
+
 async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     apply_cookies_to_session(session)
 
@@ -833,8 +880,49 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     return filtered
 
 # ──────────────────────────────────────────────────────────────────────────────
+# MOMO event wiring
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
+    """
+    Send MOMO_OK alerts for the top N runner candidates.
+    Anti-spam: capped by MAX_ALERTS_PER_SCAN and further filtered in AlertManager.
+    """
+    if not SEND_MOMO_ALERTS:
+        return
+    if not runners:
+        return
+
+    try:
+        am = AlertManager()
+    except Exception as e:
+        LOG.warning("Pump.fun: failed to init AlertManager for MOMO: %s", e)
+        return
+
+    max_n = max(0, min(MAX_ALERTS_PER_SCAN, len(runners)))
+    for c in runners[:max_n]:
+        try:
+            age_min = c.get("pool_age_min")
+            age_sec = age_min * 60.0 if isinstance(age_min, (int, float)) else None
+            pool_url = f"https://pump.fun/coin/{c.get('mint')}" if c.get("mint") else None
+            ctx: Dict[str, Any] = {
+                "symbol": c.get("symbol") or c.get("mint"),
+                "mint": c.get("mint"),
+                "pool": pool_url,
+                "age_sec": age_sec,
+                "liq_usd": c.get("liq_usd"),
+                "vol_5m": c.get("volume_5m_usd"),
+                "up_pct": c.get("price_change_5m"),
+                "reason": f"pumpfun runner score={c.get('runner_score', 0.0):.2f}",
+            }
+            await am.send_momo_event("MOMO_OK", ctx)
+        except Exception as e:
+            LOG.warning("Pump.fun: MOMO send error for %s: %s", c.get("mint"), e)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Public entrypoint
 # ──────────────────────────────────────────────────────────────────────────────
+
 HEADERS = {"User-Agent": "pumpfun-scanner/1.0"}
 
 async def scan_pumpfun(*args):
@@ -844,7 +932,9 @@ async def scan_pumpfun(*args):
       - scan_pumpfun(redis)
       - scan_pumpfun(redis, session)
       - scan_pumpfun(session)
+
     Only the aiohttp.ClientSession (if provided) is used.
+    Returns a list of runner candidates.
     """
     sess: Optional[aiohttp.ClientSession] = None
     if len(args) >= 2 and isinstance(args[1], aiohttp.ClientSession):
@@ -852,11 +942,13 @@ async def scan_pumpfun(*args):
     elif len(args) == 1 and isinstance(args[0], aiohttp.ClientSession):
         sess = args[0]
 
+    # If a shared session is provided, just use it
     if sess is not None:
         try:
-            items = await _scan_inner(sess) or []
-            LOG.info("scanner.pumpfun: %s final runner candidates", len(items))
-            return items
+            runners = await _scan_inner(sess) or []
+            await _send_momo_for_runners(runners)
+            LOG.info("scanner.pumpfun: %s final runner candidates", len(runners))
+            return runners
         except Exception as e:
             LOG.warning("Pump.fun scan error (session): %s", e)
             return []
@@ -873,9 +965,10 @@ async def scan_pumpfun(*args):
         timeout=timeout,
     ) as session:
         try:
-            items = await _scan_inner(session) or []
-            LOG.info("scanner.pumpfun: %s final runner candidates", len(items))
-            return items
+            runners = await _scan_inner(session) or []
+            await _send_momo_for_runners(runners)
+            LOG.info("scanner.pumpfun: %s final runner candidates", len(runners))
+            return runners
         except Exception as e:
             LOG.warning("Pump.fun scan error: %s", e)
             return []
