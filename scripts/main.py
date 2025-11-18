@@ -633,13 +633,13 @@ async def _confirm_sig(sig: str) -> Tuple[bool, Optional[str]]:
 
 def _as_bool(s: str, default: bool = False) -> bool:
     try:
-        return str(s).strip().lower() in ("1", "true", "yes", "on")
+        return s.strip().lower() in ("1", "true", "yes", "on")
     except Exception:
         return default
 
 CANDIDATE_DEBUG_ENABLED = _as_bool(os.getenv("CANDIDATE_DEBUG_ENABLED", "0"), False)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("ALERTS_TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_DEBUG_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_DEBUG_CHAT_ID = os.getenv("TELEGRAM_DEBUG_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
 
 async def _send_telegram_debug(msg: str) -> None:
     # fire-and-forget tiny debug message to Telegram
@@ -654,7 +654,7 @@ async def _send_telegram_debug(msg: str) -> None:
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": TELEGRAM_DEBUG_CHAT_ID,  # use the debug channel
             "text": msg[:1000],  # hard cap to avoid crazy-long messages
             "disable_web_page_preview": True,
         }
