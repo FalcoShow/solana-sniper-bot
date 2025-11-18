@@ -12,6 +12,11 @@ import traceback
 from typing import Any, Dict, Optional, Tuple
 from asyncio import create_task
 
+try:
+    import aiohttp  # type: ignore
+except Exception:  # pragma: no cover
+    aiohttp = None  # type: ignore
+
 # Core utils (alerts + shared Redis client)
 from utils_pkg.core_utils import AlertManager, redis
 
@@ -624,11 +629,44 @@ async def _confirm_sig(sig: str) -> Tuple[bool, Optional[str]]:
 # ---------------------------
 # ENV helpers
 # ---------------------------
-def _as_bool(val: Optional[str], default: bool = False) -> bool:
-    if val is None:
-        return default
-    return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
+# --- Telegram debug for momentum skips ---------------------------------
 
+def _as_bool(s: str, default: bool = False) -> bool:
+    try:
+        return str(s).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return default
+
+CANDIDATE_DEBUG_ENABLED = _as_bool(os.getenv("CANDIDATE_DEBUG_ENABLED", "0"), False)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("ALERTS_TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_DEBUG_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+
+async def _send_telegram_debug(msg: str) -> None:
+    # fire-and-forget tiny debug message to Telegram
+    if not CANDIDATE_DEBUG_ENABLED:
+        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_DEBUG_CHAT_ID:
+        return
+    if aiohttp is None:
+        # library not available; silently skip
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg[:1000],  # hard cap to avoid crazy-long messages
+            "disable_web_page_preview": True,
+        }
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await session.post(url, json=payload)
+    except Exception:
+        # Debug only – never crash on failure
+        try:
+            print("[telegram-debug] failed to send message", file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
 def _as_float(val: Any, default: float) -> float:
     try:
@@ -1420,6 +1458,17 @@ class Strategy:
                     min_trades=ENTRY_MOMO_MIN_TRADES,
                     min_up_pct=ENTRY_MOMO_MIN_UP_PCT,
                 )
+                # Telegram candidate debug (no-data / dead-coin guard)
+                try:
+                    msg = (
+                        f"[MOMO_SKIP_NO_DATA] mint={mint_norm} "
+                        f"trades={trades} price0={price0:.6g} price1={price1:.6g} "
+                        f"min_trades={ENTRY_MOMO_MIN_TRADES} "
+                        f"min_up={ENTRY_MOMO_MIN_UP_PCT}%"
+                    )
+                    asyncio.create_task(_send_telegram_debug(msg))
+                except Exception:
+                    pass
                 record_buy_result(ok=False, reason="momo_no_data")
                 self._diag["rejected_momo"] += 1
                 return
@@ -1445,6 +1494,22 @@ class Strategy:
 
             # If it doesn't meet momentum conditions, bail out
             if not (up_ok and trades_ok):
+                try:
+                    reasons = []
+                    if not up_ok:
+                        reasons.append(f"up {pct_up:.2f}% < {ENTRY_MOMO_MIN_UP_PCT}%")
+                    if not trades_ok:
+                        reasons.append(f"trades {trades} < {ENTRY_MOMO_MIN_TRADES}")
+                    msg = (
+                        f"[MOMO_REJECT] mint={mint_norm} "
+                        f"price0={price0:.6g} price1={price1:.6g} "
+                        f"pct_up={pct_up:.2f}% "
+                        f"reasons={'; '.join(reasons) or 'unknown'}"
+                    )
+                    asyncio.create_task(_send_telegram_debug(msg))
+                except Exception:
+                    pass
+
                 record_buy_result(ok=False, reason="momo_reject")
                 self._diag["rejected_momo"] += 1
                 return
