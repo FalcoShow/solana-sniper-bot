@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover
     aioredis = None  # type: ignore[assignment]
 
 # Local positions / strategy helpers (your existing modules)
-from positions import load_positions, save_position, remove_position
+from positions import load_positions, save_position, close_position as remove_position
 from reinvestor import queue_reinvest
 from self_learning_ai_strategy import get_strategy_params, process_trade_closure
 
