@@ -88,6 +88,7 @@ BASE: str = (
 
 # Telemetry only; quote forces non-legacy
 AS_LEGACY_ENV: bool = _env_bool("JUP_AS_LEGACY", False)
+AS_LEGACY = AS_LEGACY_ENV
 ONLY_DIRECT: bool = _env_bool("JUP_ONLY_DIRECT", False)
 
 # Variant toggles (swap will still enforce useSharedAccounts=False)
