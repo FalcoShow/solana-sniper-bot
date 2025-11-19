@@ -1,6 +1,5 @@
-# risk_manager.py
 """
-Risk manager — tiered sizing, governance & metrics (v2)
+Risk manager — tiered sizing, governance & metrics (v3, wired for main)
 
 Adds/updates:
 - Equity-aware tier schedule (ticket size, pos% cap, max concurrency, daily spend cap)
@@ -8,8 +7,9 @@ Adds/updates:
 - Stop-after-profit + daily spend budget via Redis (resets at UTC midnight)
 - Infra-halt gate (honors infra_guard's redis flag)
 - Metrics: daily realized PnL, winrate-20, rolling drawdown vs equity HWM
+- Exported risk_manager_loop(stop_evt) for scripts/main.py
 
-Public helpers you can import:
+Public helpers:
     await current_limits(redis) -> dict(ticket_usd, pos_pct_cap, max_concurrent, daily_spend_usd, equity_usd)
     await should_allow_new_entry(redis) -> bool
     await note_spend(redis, usd)
@@ -23,14 +23,18 @@ import logging
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
 
+# Optional standalone redis client (fallback if core_utils.redis is None)
 try:
     import redis.asyncio as aioredis
 except Exception:  # pragma: no cover
-    aioredis = None
+    aioredis = None  # type: ignore[assignment]
 
+# Local positions / strategy helpers (your existing modules)
 from positions import load_positions, save_position, remove_position
 from reinvestor import queue_reinvest
 from self_learning_ai_strategy import get_strategy_params, process_trade_closure
+
+# Core utils (shared Redis client + infra)
 from utils_pkg.core_utils import (
     get_token_price,
     get_wallet_tokens,
@@ -38,6 +42,7 @@ from utils_pkg.core_utils import (
     convert_sol_to_usd,
     send_telegram,
     log_to_notion,
+    redis as shared_redis,
 )
 
 logger = logging.getLogger("risk_manager")
@@ -57,7 +62,11 @@ DEFAULT_SLIPPAGE = float(os.getenv("JUPITER_MAX_SLIPPAGE", "0.005"))  # fraction
 POSITION_CHECK_INTERVAL = int(os.getenv("POSITION_MONITOR_INTERVAL", "20"))
 ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "900"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-WALLET_PUBKEY = os.getenv("WALLET_PUBKEY") or os.getenv("WALLET_PUBLIC_KEY") or os.getenv("WALLET_ADDRESS")
+WALLET_PUBKEY = (
+    os.getenv("WALLET_PUBKEY")
+    or os.getenv("WALLET_PUBLIC_KEY")
+    or os.getenv("WALLET_ADDRESS")
+)
 
 # Daily governance
 STOP_AFTER_DAILY_PROFIT_PCT = float(os.getenv("STOP_AFTER_DAILY_PROFIT_PCT", "4"))   # % of equity
@@ -73,7 +82,7 @@ THROTTLE_DD_FLOOR = 0.08          # or rolling drawdown > 8%
 THROTTLE_TICKET_CUT = 0.40        # cut ticket by 40%
 THROTTLE_CONC_DEC = 1             # minus one slot
 
-# Tier schedule (targets 16.5–18%/mo with discipline)
+# Tier schedule (targets ~16.5–18%/mo with discipline)
 TIER_SCHEDULE: List[Dict[str, Any]] = [
     {"equity_to": 2500,   "ticket": 50,   "pos_pct": 0.025, "max_conc": 3,  "spend_pct": 0.10},
     {"equity_to": 5000,   "ticket": 100,  "pos_pct": 0.030, "max_conc": 4,  "spend_pct": 0.12},
@@ -109,6 +118,12 @@ EQUITY_HWM_KEY = "metrics:equity_hwm_usd"
 _COOLDOWNS: Dict[str, float] = {}
 
 async def _get_redis(url: Optional[str] = None):
+    """
+    Prefer the shared Redis client from core_utils; fallback to a local aioredis
+    client if needed, or return None if Redis is unavailable.
+    """
+    if shared_redis is not None:
+        return shared_redis
     if aioredis is None:
         logger.warning("redis (async) not installed; running without Redis-backed budgets/metrics.")
         return None
@@ -304,8 +319,6 @@ async def note_spend(redis, usd: float):
 # -------------------------
 # Sell-side logic (kept; adds metrics & realized PnL)
 # -------------------------
-_COOLDOWNS: Dict[str, float] = {}
-
 def _cooldown_ok(mint: str) -> bool:
     last = _COOLDOWNS.get(mint, 0.0)
     if _now_ts() - last >= ALERT_COOLDOWN_SECONDS:
@@ -340,16 +353,30 @@ async def _sell_all_token(mint: str, token_balance: float, slippage: float) -> t
     if token_balance <= 0:
         return False, ""
     try:
-        ok, tx_sig = await swap_token_jupiter(mint, SOL_MINT, amount_float=token_balance, buy=False, slippage=slippage)
+        ok, tx_sig = await swap_token_jupiter(
+            mint,
+            SOL_MINT,
+            amount_float=token_balance,
+            buy=False,
+            slippage=slippage,
+        )
         return ok, tx_sig
     except TypeError:
         ok, tx_sig = await swap_token_jupiter(mint, SOL_MINT, token_balance, False, slippage)
         return ok, tx_sig
 
 async def handle_position(token_address: str, position: Dict[str, Any], redis=None) -> None:
+    """
+    Core per-position risk logic:
+      - trailing stop maintenance
+      - stop-loss / target-profit / max-hold exits
+      - sell via Jupiter
+      - metrics + PnL logging + reinvest queue
+    """
     try:
         if redis is None:
             redis = await _get_redis()
+
         params = await get_strategy_params(redis)
         stop_loss_pct = float(params.get("STOP_LOSS_PERCENT", DEFAULT_STOP_LOSS_PERCENT))
         target_profit_pct = float(params.get("TARGET_PROFIT_PERCENT", DEFAULT_TARGET_PROFIT_PERCENT))
@@ -366,7 +393,9 @@ async def handle_position(token_address: str, position: Dict[str, Any], redis=No
             return
 
         # Maintain trailing stop on new highs
-        trailing_stop = float(position.get("trailing_stop", buy_price * (1 - stop_loss_pct / 100)))
+        trailing_stop = float(
+            position.get("trailing_stop", buy_price * (1 - stop_loss_pct / 100))
+        )
         if trailing_on and current_price > buy_price:
             new_trailing = current_price * (1 - stop_loss_pct / 100)
             if new_trailing > trailing_stop:
@@ -435,6 +464,7 @@ async def handle_position(token_address: str, position: Dict[str, Any], redis=No
         except Exception:
             pass
 
+        # Self-learning strategy closure hook
         try:
             sell_time = datetime.now(timezone.utc)
             await process_trade_closure(
@@ -460,27 +490,76 @@ async def handle_position(token_address: str, position: Dict[str, Any], redis=No
 
         remove_position(token_address)
 
+        # Queue reinvestment
         try:
-            await queue_reinvest(proceeds_sol, meta={"from": "risk_manager", "reason": reason}, redis=redis)
+            await queue_reinvest(
+                proceeds_sol,
+                meta={"from": "risk_manager", "reason": reason},
+                redis=redis,
+            )
         except Exception as e:
             logger.warning(f"Queue reinvest failed: {e}")
 
     except Exception as e:
         logger.error(f"[RISK] Error handling {token_address}: {e}", exc_info=True)
 
-async def monitor_positions_loop(redis=None, interval: Optional[int] = None):
+# -------------------------
+# Loops
+# -------------------------
+async def monitor_positions_loop(redis=None, interval: Optional[int] = None, stop_evt: Optional[asyncio.Event] = None):
+    """
+    Generic monitor loop (can be used standalone).
+    If stop_evt is provided, exits when stop_evt.is_set().
+    """
     if redis is None:
         redis = await _get_redis()
     sleep_s = int(interval or POSITION_CHECK_INTERVAL)
     logger.info(f"📊 Risk monitor started (interval={sleep_s}s)")
     while True:
+        if stop_evt is not None and stop_evt.is_set():
+            logger.info("📊 Risk monitor stopping on stop_evt.")
+            break
         try:
             positions = load_positions()
             if positions:
-                await asyncio.gather(*(handle_position(mint, pos, redis=redis) for mint, pos in positions.items()))
+                await asyncio.gather(
+                    *(handle_position(mint, pos, redis=redis) for mint, pos in positions.items())
+                )
         except Exception as e:
             logger.error(f"[RISK] monitor loop error: {e}", exc_info=True)
         await asyncio.sleep(sleep_s)
 
+async def risk_manager_loop(stop_evt: asyncio.Event) -> None:
+    """
+    Entry point used by scripts/main.py:
+      from utils_pkg.risk_manager import risk_manager_loop
+      ...
+      asyncio.create_task(risk_manager_loop(stop_evt), name="risk.manager")
+    """
+    # Use RISK_MANAGER_POLL_SEC if present, else POSITION_CHECK_INTERVAL
+    poll = float(os.getenv("RISK_MANAGER_POLL_SEC", str(POSITION_CHECK_INTERVAL)))
+    redis = await _get_redis()
+    logger.info(f"📊 risk_manager_loop started (poll={poll}s)")
+    while not stop_evt.is_set():
+        try:
+            positions = load_positions()
+            if positions:
+                await asyncio.gather(
+                    *(handle_position(mint, pos, redis=redis) for mint, pos in positions.items())
+                )
+        except Exception as e:
+            logger.error(f"[RISK] risk_manager_loop error: {e}", exc_info=True)
+        # Sleep in small chunks so we respond promptly to stop_evt
+        remaining = poll
+        while remaining > 0 and not stop_evt.is_set():
+            step = min(remaining, 1.0)
+            await asyncio.sleep(step)
+            remaining -= step
+    logger.info("📊 risk_manager_loop exiting (stop_evt set).")
+
+# -------------------------
+# CLI / manual run
+# -------------------------
 if __name__ == "__main__":
+    # Standalone: python utils_pkg/risk_manager.py
     asyncio.run(monitor_positions_loop())

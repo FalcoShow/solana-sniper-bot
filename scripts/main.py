@@ -306,6 +306,7 @@ def _safe_log_router_state(event: str, **fields: Any) -> None:
     try:
         log.event(event, **fields)
     except Exception:
+        # logging must never break routing
         pass
 
 
@@ -327,12 +328,20 @@ def _candidate_buy_names() -> list[str]:
 
 
 def _pick_router_buy_callable() -> Optional[tuple[str, Any]]:
+    """
+    Try to discover a buy-capable function on utils_pkg.router.
+    Prefer well-known names, then fall back to anything with 'buy' in the name.
+    """
     if router is None:
         return None
+
+    # 1) Preferred names
     for name in _candidate_buy_names():
         fn = getattr(router, name, None)
         if callable(fn):
             return name, fn
+
+    # 2) Fallback: anything with 'buy' in its name (excluding sell/quote helpers)
     try:
         names = [n for n in dir(router) if "buy" in n.lower()]
         for n in names:
@@ -348,21 +357,30 @@ def _pick_router_buy_callable() -> Optional[tuple[str, Any]]:
 
 
 def _compute_spend_sol(ui: Dict[str, Any]) -> float:
+    """
+    Decide how much SOL to spend for a buy, preferring explicit UI overrides,
+    then env hints, then a tiny default.
+    """
     for k in ("spend_sol", "buy_size_sol", "amount_sol"):
         try:
-            v = float(ui.get(k)) if ui.get(k) is not None else None
-            if v and v > 0:
-                return v
+            v = ui.get(k)
+            if v is None:
+                continue
+            f = float(v)
+            if f > 0:
+                return f
         except Exception:
-            pass
+            continue
+
     for envk in ("ENTRY_BUY_SOL", "ENTRY_SPEND_SOL", "INITIAL_BUY_SOL"):
         try:
             v = float(os.getenv(envk, "0"))
             if v > 0:
                 return v
         except Exception:
-            pass
-    return 0.02
+            continue
+
+    return 0.02  # ultra-safe default if nothing else is configured
 
 
 def _env_slippage_bps() -> int:
@@ -380,6 +398,10 @@ def _build_kwargs_for_router(
     on_buy_filled,
     on_buy_failed,
 ) -> Dict[str, Any]:
+    """
+    Introspect the router buy function and pass only parameters it expects.
+    This lets us remain compatible across refactors of utils_pkg.router.
+    """
     kwargs: Dict[str, Any] = {}
     try:
         sig = inspect.signature(fn)
@@ -413,6 +435,7 @@ def _build_kwargs_for_router(
         if "on_buy_failed" in names:
             kwargs["on_buy_failed"] = on_buy_failed
     except Exception:
+        # If introspection fails, fall back to the safest minimal call
         kwargs = {"mint": mint, "ui": ui}
     return kwargs
 
@@ -426,6 +449,11 @@ async def _call_with_variants(
     on_buy_filled,
     on_buy_failed,
 ):
+    """
+    Call the router buy function with best-effort kwargs, falling back through
+    multiple signatures until one succeeds.
+    """
+    # Variant 1: full introspected kwargs
     try:
         kw_sig = _build_kwargs_for_router(
             fn, mint, ui, on_buy_submitted, on_buy_filled, on_buy_failed
@@ -452,6 +480,7 @@ async def _call_with_variants(
             err=str(e),
         )
 
+    # Variant 2: minimal mint+ui
     try:
         res = fn(mint=mint, ui=ui)
         if inspect.isawaitable(res):
@@ -465,6 +494,7 @@ async def _call_with_variants(
             err=str(e),
         )
 
+    # Variant 3: mint only
     try:
         res = fn(mint=mint)
         if inspect.isawaitable(res):
@@ -493,6 +523,16 @@ async def maybe_buy(
     on_buy_filled=None,
     on_buy_failed=None,
 ) -> Optional[str]:
+    """
+    Unified buy entrypoint for the rest of the script.
+    Picks the best buy-capable function from utils_pkg.router and calls it
+    with hooks for:
+      - on_buy_submitted
+      - on_buy_filled
+      - on_buy_failed
+
+    Returns a tx signature string if one can be extracted, otherwise None.
+    """
     if router is None:
         _safe_log_router_state("ROUTER_UNAVAILABLE_FOR_BUY")
         raise RuntimeError("router unavailable")
@@ -686,11 +726,17 @@ def _as_int(val: Any, default: int) -> int:
 # DSN normalizer
 # ---------------------------
 def _dsn_to_asyncpg(dsn: str | None) -> str:
+    """
+    Normalize a DSN into something asyncpg understands:
+      - strip +asyncpg driver suffixes
+      - keep postgres:// / postgresql:// prefixes
+    """
     if not dsn:
         return ""
     s = dsn.strip()
     if not s:
         return ""
+    # Normalize common prefixes
     s = s.replace("postgres+asyncpg://", "postgres://")
     s = s.replace("postgresql+asyncpg://", "postgresql://")
     if s.lower().startswith("postgresql+asyncpg://"):
@@ -701,6 +747,10 @@ def _dsn_to_asyncpg(dsn: str | None) -> str:
 
 
 def _pick_env_dsn() -> Tuple[str, str, str]:
+    """
+    Choose PnL and generic PG DSNs from env, normalize both for asyncpg, and
+    return (pnl_dsn_asyncpg, pg_dsn_asyncpg, masked_host_db).
+    """
     raw_candidates = [
         os.getenv("PNL_DSN"),
         os.getenv("TELEMETRY_PG_DSN"),
@@ -890,9 +940,14 @@ def utc_today_iso() -> str:
 # Basic filters
 # ---------------------------
 def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
+    """
+    Very early guardrail filter before we do any heavy work.
+    Uses global env-derived thresholds so behaviour is consistent across runtime.
+    """
     pool = str((_get_first(msg, "pool", default="") or "")).strip().lower()
     is_raydium = pool == "raydium"
 
+    # Pool allow-list (PF_POOLS)
     if POOLS_FILTER and pool and pool not in POOLS_FILTER:
         if DEBUG_TX:
             print(
@@ -901,51 +956,47 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
             )
         return False
 
+    # For non-Raydium, require "create" events
     typ = str(_get_first(msg, "txType", "type", default="")).strip().lower()
     if not is_raydium and typ != "create":
         return False
 
+    # Minimum initial buy (Sol) for non-Raydium events
     init_buy = _as_float(
         _get_first(msg, "initialBuy", "initial_buy", default=0.0),
         0.0,
     )
-    if (
-        not is_raydium
-        and init_buy < _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
-    ):
+    if (not is_raydium) and MIN_INITIAL_BUY_SOL > 0 and init_buy < MIN_INITIAL_BUY_SOL:
         if DEBUG_TX:
             print(
-                f".[filter] initialBuy {init_buy} < min — skip",
+                f".[filter] initialBuy {init_buy} < min {MIN_INITIAL_BUY_SOL} — skip",
                 flush=True,
             )
         return False
 
+    # Symbol blacklist (SCAM / RUG etc.)
     sym = _extract_symbol(msg).upper()
-    if any(
-        bad and bad in sym
-        for bad in {
-            s.strip().upper()
-            for s in os.getenv("ENTRY_SYMBOL_BLACKLIST", "RUG,SCAM").split(",")
-            if s.strip()
-        }
+    if SYMBOL_BLACKLIST and any(
+        bad and bad in sym for bad in SYMBOL_BLACKLIST
     ):
         if DEBUG_TX:
             print(
-                f".[filter] symbol '{sym}' hits blacklist — skip",
+                f".[filter] symbol '{sym}' hits blacklist {sorted(SYMBOL_BLACKLIST)} — skip",
                 flush=True,
             )
         return False
 
+    # Name length sanity check
     nm = _extract_name(msg)
-    max_name = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
-    if max_name > 0 and len(nm) > max_name:
+    if MAX_NAME_LEN > 0 and len(nm) > MAX_NAME_LEN:
         if DEBUG_TX:
             print(
-                f".[filter] name too long ({len(nm)} > {max_name}) — skip",
+                f".[filter] name too long ({len(nm)} > {MAX_NAME_LEN}) — skip",
                 flush=True,
             )
         return False
 
+    # Token age (ENTRY_MAX_AGE_MIN)
     mins_since_token = _approx_minutes_since(
         _get_first(
             msg,
@@ -956,31 +1007,30 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
             default=None,
         )
     )
-    max_age = _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20)
     if (
         mins_since_token is not None
-        and max_age > 0
-        and mins_since_token > max_age
+        and ENTRY_MAX_AGE_MIN > 0
+        and mins_since_token > ENTRY_MAX_AGE_MIN
     ):
         if DEBUG_TX:
             print(
-                f".[filter] token age {mins_since_token:.1f}m — skip",
+                f".[filter] token age {mins_since_token:.1f}m > {ENTRY_MAX_AGE_MIN}m — skip",
                 flush=True,
             )
         return False
 
+    # Pool age (MIN_POOL_AGE_MIN)
     mins_since_pool = _approx_minutes_since(
         _get_first(msg, "poolCreatedAt", "pool_created_at", default=None)
     )
-    min_pool_age = _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3)
     if (
         mins_since_pool is not None
-        and min_pool_age > 0
-        and mins_since_pool < min_pool_age
+        and MIN_POOL_AGE_MIN > 0
+        and mins_since_pool < MIN_POOL_AGE_MIN
     ):
         if DEBUG_TX:
             print(
-                f".[filter] pool age {mins_since_pool:.1f}m — skip",
+                f".[filter] pool age {mins_since_pool:.1f}m < {MIN_POOL_AGE_MIN}m — skip",
                 flush=True,
             )
         return False
@@ -1010,6 +1060,10 @@ async def _screen_with_retry(
     tries: int = 3,
     first_wait: float = 0.8,
 ):
+    """
+    Re-try the liquidity screen a few times for "no_account" race conditions
+    when a pool is just spinning up.
+    """
     wait = first_wait
     last = None
     for i in range(tries):
@@ -1035,6 +1089,10 @@ async def _await_mint_ready(
     max_wait_s: int = 45,
     step_s: float = 3.0,
 ) -> Optional[int]:
+    """
+    Wait for router.get_decimals() to succeed for a new mint, up to max_wait_s.
+    This is mainly a UX helper to avoid insta-failing brand new pools.
+    """
     if _route_get_decimals is None:
         return None
     waited = 0.0
@@ -1300,23 +1358,17 @@ async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
 # ---------------------------
 class Strategy:
     def __init__(self) -> None:
-        # How many buys can run in parallel
-        self._sema = asyncio.Semaphore(
-            max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2))
-        )
+        # How many buys can run in parallel (use global MAX_CONCURRENCY)
+        self._sema = asyncio.Semaphore(MAX_CONCURRENCY)
+
         # How many momentum gates can run in parallel
-        self._gate_sema = asyncio.Semaphore(
-            max(
-                1,
-                _as_int(
-                    os.getenv(
-                        "ENTRY_MOMENTUM_MAX_PARALLEL",
-                        os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"),
-                    ),
-                    6,
-                ),
-            )
+        # honour ENTRY_MOMENTUM_MAX_PARALLEL if set, else fallback to ENTRY_MOMO_MAX_PARALLEL
+        gate_max = _as_int(
+            os.getenv("ENTRY_MOMENTUM_MAX_PARALLEL", str(ENTRY_MOMO_MAX_PARALLEL)),
+            ENTRY_MOMO_MAX_PARALLEL,
         )
+        self._gate_sema = asyncio.Semaphore(max(1, gate_max))
+
         # Per-mint state while we observe trades/prices in the window
         self._gate_state: Dict[str, Dict[str, Any]] = {}
 
@@ -1385,21 +1437,14 @@ class Strategy:
 
     # --- MOMENTUM GATE ---------------------------------------------------
     async def _gate_candidate(self, ui: Dict[str, Any], mint_raw: str, mint_norm: str) -> None:
-        DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
-        PF_GATE_TTL_SEC = _as_int(os.getenv("PF_GATE_TTL_SEC", "60"), 60)
-
-        ENTRY_MOMO_WINDOW_SEC = _as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10)
-        ENTRY_MOMO_PRICE_TRIES = _as_int(os.getenv("ENTRY_MOMO_PRICE_TRIES", "4"), 4)
-        ENTRY_MOMO_PRICE_DELAY_S = _as_float(
-            os.getenv("ENTRY_MOMO_PRICE_DELAY_S", "0.7"), 0.7
-        )
-        ENTRY_MOMO_MIN_TRADES = _as_int(
-            os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6
-        )
-        ENTRY_MOMO_MIN_UP_PCT = _as_float(
-            os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0
-        )
-
+        """
+        Momentum gate that:
+          - waits for a short window
+          - counts trades + price move
+          - enforces momentum thresholds
+          - runs guardrails
+          - finally calls maybe_buy()
+        """
         IS_DRYRUN = (_dryrun_env_on() or _pkg_is_dryrun)
 
         async with self._gate_sema:
@@ -1413,7 +1458,7 @@ class Strategy:
                         )
                     return
 
-            # Initialise gate state for this mint
+            # Initialise gate state for this mint (keyed by raw mint so it matches on_trade)
             self._gate_state[mint_raw] = {"trades": 0, "price0": 0.0}
 
             # First price sample (price0)
@@ -1469,7 +1514,10 @@ class Strategy:
                     asyncio.create_task(_send_telegram_debug(msg))
                 except Exception:
                     pass
-                record_buy_result(ok=False, reason="momo_no_data")
+                try:
+                    record_buy_result(ok=False, reason="momo_no_data")
+                except Exception:
+                    pass
                 self._diag["rejected_momo"] += 1
                 return
 
@@ -1510,7 +1558,10 @@ class Strategy:
                 except Exception:
                     pass
 
-                record_buy_result(ok=False, reason="momo_reject")
+                try:
+                    record_buy_result(ok=False, reason="momo_reject")
+                except Exception:
+                    pass
                 self._diag["rejected_momo"] += 1
                 return
 
@@ -1521,7 +1572,10 @@ class Strategy:
                         "[guardrails] buys not allowed at gate decision — skip",
                         flush=True,
                     )
-                record_buy_result(ok=False, reason="guardrails_halt")
+                try:
+                    record_buy_result(ok=False, reason="guardrails_halt")
+                except Exception:
+                    pass
                 self._diag["rejected_guardrails"] += 1
                 return
 
@@ -1530,7 +1584,10 @@ class Strategy:
                 try:
                     if len(list(all_positions())) >= max_tradeable:
                         log.event("BUY_BLOCK_MAX_TRADEABLE", cap=max_tradeable)
-                        record_buy_result(ok=False, reason="max_tradeable")
+                        try:
+                            record_buy_result(ok=False, reason="max_tradeable")
+                        except Exception:
+                            pass
                         self._diag["rejected_guardrails"] += 1
                         return
                 except Exception:
@@ -1547,7 +1604,10 @@ class Strategy:
                             f".[dedupe] buy already claimed for {mint_norm} — skip",
                             flush=True,
                         )
-                    record_buy_result(ok=False, reason="buy_claimed_elsewhere")
+                    try:
+                        record_buy_result(ok=False, reason="buy_claimed_elsewhere")
+                    except Exception:
+                        pass
                     return
 
             # ---- Execute buy via router / maybe_buy ---------------------
@@ -1611,7 +1671,10 @@ class Strategy:
                                     traceback.print_exc()
 
                         self._diag["buys_filled"] += 1
-                        record_buy_result(ok=True, reason="executed", sig=tx_sig)
+                        try:
+                            record_buy_result(ok=True, reason="executed", sig=tx_sig)
+                        except Exception:
+                            pass
                         asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
                     else:
                         log.error(
@@ -1624,22 +1687,34 @@ class Strategy:
                             )
                         except Exception:
                             pass
-                        record_buy_result(ok=False, reason=str(info))
+                        try:
+                            record_buy_result(ok=False, reason=str(info))
+                        except Exception:
+                            pass
                 else:
                     # DRYRUN path usually returns None
                     if IS_DRYRUN:
                         log.event("BUY_DRYRUN_EXIT", mint=mint_norm)
-                        record_buy_result(ok=False, reason="dryrun_exit")
+                        try:
+                            record_buy_result(ok=False, reason="dryrun_exit")
+                        except Exception:
+                            pass
                     else:
-                        record_buy_result(ok=False, reason="no_tx_sig")
+                        try:
+                            record_buy_result(ok=False, reason="no_tx_sig")
+                        except Exception:
+                            pass
 
             except Exception:
                 traceback.print_exc()
-                record_buy_result(ok=False, reason="exception")
+                try:
+                    record_buy_result(ok=False, reason="exception")
+                except Exception:
+                    pass
 
     # --- NEW TOKENS (entry point for gating) -----------------------------
     async def on_new_token(self, raw_event: Dict[str, Any]) -> None:
-        DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
+        DEBUG_LOCAL = DEBUG_TX  # just an alias for readability
         IS_DRYRUN = (_dryrun_env_on() or _pkg_is_dryrun)
 
         self._diag["events_total"] += 1
@@ -1647,7 +1722,7 @@ class Strategy:
 
         # Top-level guardrails
         if PAUSE_TRADING or not buys_allowed():
-            if DEBUG_TX:
+            if DEBUG_LOCAL:
                 print("[guardrails] buys not allowed now — skip", flush=True)
             self._diag["rejected_guardrails"] += 1
             return
@@ -1665,13 +1740,13 @@ class Strategy:
         # Extract and normalise mint
         mint_source = _extract_raw_mint(raw_event)
         if not mint_source:
-            if DEBUG_TX:
+            if DEBUG_LOCAL:
                 print("[strategy] missing mint — skip", flush=True)
             return
 
         mint_norm = _normalize_from_source(mint_source)
         if not _is_probable_mint(mint_norm):
-            if DEBUG_TX:
+            if DEBUG_LOCAL:
                 print(
                     f"[strategy] implausible mint after normalize => skip ({mint_source})",
                     flush=True,
@@ -1701,7 +1776,7 @@ class Strategy:
                     }
 
             if not ok:
-                if DEBUG_TX:
+                if DEBUG_LOCAL:
                     print(f"[liquidity] screen failed for {mint_norm}: {rep}", flush=True)
                 self._diag["rejected_filters"] += 1
                 return
@@ -1739,7 +1814,7 @@ class Strategy:
                 f"gate-propose:{mint_norm}",
                 ttl=int(PF_GATE_TTL_SEC),
             ):
-                if DEBUG_TX:
+                if DEBUG_LOCAL:
                     print(
                         f".[dedupe] gate-propose taken for {mint_norm} — skip",
                         flush=True,
@@ -1755,7 +1830,7 @@ class Strategy:
                 f"buy:{mint_norm}",
                 ttl=int(PF_BUY_TTL_SEC),
             ):
-                if DEBUG_TX:
+                if DEBUG_LOCAL:
                     print(
                         f".[dedupe] buy already claimed for {mint_norm} — skip",
                         flush=True,
@@ -1765,7 +1840,7 @@ class Strategy:
             async with self._sema:
                 try:
                     if PAUSE_TRADING or not buys_allowed():
-                        if DEBUG_TX:
+                        if DEBUG_LOCAL:
                             print(
                                 "[guardrails] buys not allowed at execution — skip",
                                 flush=True,
@@ -1835,11 +1910,14 @@ class Strategy:
                                     }
                                     await exit_engine.on_buy_filled(ev)
                                 except Exception:
-                                    if DEBUG_TX:
+                                    if DEBUG_LOCAL:
                                         traceback.print_exc()
 
                             self._diag["buys_filled"] += 1
-                            record_buy_result(ok=True, reason="executed", sig=tx_sig)
+                            try:
+                                record_buy_result(ok=True, reason="executed", sig=tx_sig)
+                            except Exception:
+                                pass
                             asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
                         else:
                             log.error(
@@ -1852,17 +1930,29 @@ class Strategy:
                                 )
                             except Exception:
                                 pass
-                            record_buy_result(ok=False, reason=str(info))
+                            try:
+                                record_buy_result(ok=False, reason=str(info))
+                            except Exception:
+                                pass
                     else:
                         if IS_DRYRUN:
                             log.event("BUY_DRYRUN_EXIT", mint=mint_norm)
-                            record_buy_result(ok=False, reason="dryrun_exit")
+                            try:
+                                record_buy_result(ok=False, reason="dryrun_exit")
+                            except Exception:
+                                pass
                         else:
-                            record_buy_result(ok=False, reason="no_tx_sig")
+                            try:
+                                record_buy_result(ok=False, reason="no_tx_sig")
+                            except Exception:
+                                pass
                 except Exception:
                     print("[strategy] maybe_buy exception:", flush=True)
                     traceback.print_exc()
-                    record_buy_result(ok=False, reason="exception")
+                    try:
+                        record_buy_result(ok=False, reason="exception")
+                    except Exception:
+                        pass
 
         # Cooldown between processing new tokens
         await asyncio.sleep(LOOP_COOLDOWN_SEC)
@@ -2468,10 +2558,10 @@ def _boot_banner() -> None:
         "\n=== 🟢 sniper main boot ===\n"
         f"DRYRUN={effective_dryrun}\n"
         f"PF_DEBUG_TX={int(DEBUG_TX)} | "
-        f"PF_MAX_CONCURRENT={_as_int(os.getenv('PF_MAX_CONCURRENT','2'), 2)} | "
+        f"PF_MAX_CONCURRENT={MAX_CONCURRENCY} | "
         f"PF_COOLDOWN_SEC={LOOP_COOLDOWN_SEC}\n"
         f"MOMO: on={int(ENTRY_MOMENTUM_ENABLED)} "
-        f"window={_as_int(os.getenv('ENTRY_MOMENTUM_WINDOW_SEC', os.getenv('ENTRY_MOMO_WINDOW_SEC','10')),10)}s "
+        f"window={ENTRY_MOMO_WINDOW_SEC}s "
         f"min_trades={ENTRY_MOMO_MIN_TRADES} "
         f"min_up={ENTRY_MOMO_MIN_UP_PCT}%\n"
         f"LIQ_FILTER={int(LIQ_FILTER_ENABLED)} | "

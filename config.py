@@ -4,7 +4,6 @@
 # - Backward-compat aliases (PG_DSN*, NOTION_* aliases, RAYDIUM_PAIRS_API, etc.)
 # - Switches for AI scoring, adaptive sell, scanners, social, whale filters, daytrader
 # - Storage: Redis + SQLite + optional Postgres
-
 from __future__ import annotations
 
 import os
@@ -331,7 +330,7 @@ MOONSHOT_IMPACT_CUTOFF_BPS = _get_float("MOONSHOT_IMPACT_CUTOFF_BPS", 150.0)
 
 
 # ---------------------------------------------------------------------------
-# Scanners / arbitrage
+# Scanners / arbitrage (legacy, still used by some scripts)
 # ---------------------------------------------------------------------------
 
 ENABLE_RAYDIUM_SCANNER = _get_bool("ENABLE_RAYDIUM_SCANNER", True)
@@ -340,12 +339,11 @@ ENABLE_PUMPFUN_SCANNER = _get_bool("ENABLE_PUMPFUN_SCANNER", True)
 ENABLE_ARBITRAGE = _get_bool("ENABLE_ARBITRAGE", True)
 DEXES: List[str] = _get_list("DEXES", ["jupiter", "raydium", "orca"])
 
-# Base scanner thresholds
+# Base scanner thresholds (older system – kept for compatibility)
 SCANNER_MIN_FDV_USD = _get_float("SCANNER_MIN_FDV_USD", 10_000.0)
 SCANNER_MIN_FRAUD_SCORE = _get_float("SCANNER_MIN_FRAUD_SCORE", 70.0)  # 0..100
 SCANNER_ALERTS_ENABLED = _get_bool("SCANNER_ALERTS_ENABLED", True)
 
-# Runner-focused activity thresholds (Dexscreener/Raydium)
 SCANNER_MIN_BUYS_5M = _get_int("SCANNER_MIN_BUYS_5M", 5)
 SCANNER_MIN_BUYS_15M = _get_int("SCANNER_MIN_BUYS_15M", 8)
 SCANNER_MIN_VOLUME_5M_USD = _get_float("SCANNER_MIN_VOLUME_5M_USD", 2_500.0)
@@ -366,12 +364,56 @@ ALERT_COOLDOWN_SECONDS = _get_int("ALERT_COOLDOWN_SECONDS", 900)
 POSITION_MONITOR_INTERVAL = _get_int("POSITION_MONITOR_INTERVAL", 20)
 REINVESTMENT_CHECK_INTERVAL = _get_int("REINVESTMENT_CHECK_INTERVAL", 60)
 
+
+# ---------------------------------------------------------------------------
+# NEW: PairFilter-centric thresholds (used by utils_pkg.pair_filters)
+# These are the knobs that directly control which coins are considered
+# "viable" and how momentum / risk scoring behaves.
+# ---------------------------------------------------------------------------
+
+# Hard ranges for liquidity / mcap / age
+PF_SCAN_MIN_LIQ_USD = _get_float("PF_SCAN_MIN_LIQ_USD", SCANNER_MIN_LIQ_USD)
+PF_SCAN_MAX_LIQ_USD = _get_float("PF_SCAN_MAX_LIQ_USD", 250_000.0)
+
+PF_SCAN_MIN_MCAP_USD = _get_float("PF_SCAN_MIN_MCAP_USD", 3_000.0)
+PF_SCAN_MAX_MCAP_USD = _get_float("PF_SCAN_MAX_MCAP_USD", 750_000.0)
+
+# Max age (minutes) for a token to even be considered
+PF_SCAN_MAX_TOKEN_AGE_MIN = _get_float("PF_SCAN_MAX_TOKEN_AGE_MIN", 240.0)  # 4h
+
+# Recent activity thresholds (5m window)
+PF_SCAN_MIN_5M_VOL_USD = _get_float("PF_SCAN_MIN_5M_VOL_USD", 1_000.0)
+PF_SCAN_MIN_5M_BUYS = _get_int("PF_SCAN_MIN_5M_BUYS", 8)
+PF_SCAN_MIN_BUY_TO_SELL_RATIO = _get_float("PF_SCAN_MIN_BUY_TO_SELL_RATIO", 1.2)
+
+# Whale presence
+PF_SCAN_MIN_WHALE_SIZE_SOL = _get_float("PF_SCAN_MIN_WHALE_SIZE_SOL", 3.0)
+PF_SCAN_MIN_WHALE_COUNT_5M = _get_int("PF_SCAN_MIN_WHALE_COUNT_5M", 1)
+
+# AI rug-risk + scoring thresholds
+PF_MAX_RUG_RISK_SCORE = _get_float("PF_MAX_RUG_RISK_SCORE", 0.65)  # 0..1
+
+# Minimum scores to pass filter
+PF_MIN_MOMENTUM_SCORE = _get_float("PF_MIN_MOMENTUM_SCORE", 0.25)  # 0..1
+PF_MIN_FINAL_SCORE = _get_float("PF_MIN_FINAL_SCORE", 0.20)        # 0..1
+
+# How strongly AI rug score penalizes the final score (0..1)
+PF_RISK_PENALTY_WEIGHT = _get_float("PF_RISK_PENALTY_WEIGHT", 0.7)
+
+
+# ---------------------------------------------------------------------------
 # AI strategy loop
+# ---------------------------------------------------------------------------
+
 AI_ADAPTIVE_SELL = _get_bool("AI_ADAPTIVE_SELL", True)
 STRATEGY_REDIS_PREFIX = os.getenv("STRATEGY_REDIS_PREFIX", "strategy:v1")
 STRATEGY_UPDATE_INTERVAL = _get_int("STRATEGY_UPDATE_INTERVAL", 1800)  # 30 min
 
+
+# ---------------------------------------------------------------------------
 # Whale watch
+# ---------------------------------------------------------------------------
+
 ENABLE_WHALE_FILTERS = _get_bool("ENABLE_WHALE_FILTERS", True)
 DYNAMIC_WHALE_DISCOVERY = _get_bool("DYNAMIC_WHALE_DISCOVERY", True)
 
@@ -479,37 +521,42 @@ def summarize():
             "moonshot_daily_usd": MOONSHOT_DAILY_USD,
         },
 
-        "scanners": {
+        "scanners_legacy": {
             "raydium": ENABLE_RAYDIUM_SCANNER,
             "dexscreener": ENABLE_DEXSCREENER_SCANNER,
             "pumpfun": ENABLE_PUMPFUN_SCANNER,
             "arbitrage": ENABLE_ARBITRAGE,
-
-            # core safety rails
             "min_liq_usd": SCANNER_MIN_LIQ_USD,
             "min_fdv_usd": SCANNER_MIN_FDV_USD,
             "min_fraud_score": SCANNER_MIN_FRAUD_SCORE,
             "alerts": SCANNER_ALERTS_ENABLED,
+            "min_buys_5m": SCANNER_MIN_BUYS_5M,
+            "min_buys_15m": SCANNER_MIN_BUYS_15M,
+            "min_vol_5m": SCANNER_MIN_VOLUME_5M_USD,
+            "min_vol_15m": SCANNER_MIN_VOLUME_15M_USD,
+            "min_buy_ratio": SCANNER_MIN_BUY_RATIO,
+            "require_buy_pressure": SCANNER_REQUIRE_BUY_PRESSURE,
+            "min_chg_5m": SCANNER_MIN_PRICE_CHANGE_5M,
+            "min_chg_15m": SCANNER_MIN_PRICE_CHANGE_15M,
+            "max_age_min": SCANNER_MAX_AGE_MIN,
+            "max_mc_usd": SCANNER_MAX_MC_USD,
+            "min_holders": SCANNER_MIN_HOLDERS,
+        },
 
-            # volume & buys – loosened defaults can be overridden via env
-            "min_buys_5m": int(os.getenv("SCANNER_MIN_BUYS_5M", "3")),        # default 3
-            "min_buys_15m": int(os.getenv("SCANNER_MIN_BUYS_15M", "5")),      # default 5
-            "min_vol_5m": float(os.getenv("SCANNER_MIN_VOLUME_5M_USD", "1000")),   # default 1000
-            "min_vol_15m": float(os.getenv("SCANNER_MIN_VOLUME_15M_USD", "2000")), # default 2000
-
-            # buy pressure – still requires buyers > sellers
-            "min_buy_ratio": float(os.getenv("SCANNER_MIN_BUY_RATIO", "0.55")),
-            "require_buy_pressure": os.getenv(
-                "SCANNER_REQUIRE_BUY_PRESSURE", "true"
-            ).lower() in {"1", "true", "yes", "on"},
-
-            # price change filters
-            "min_chg_5m": float(os.getenv("SCANNER_MIN_PRICE_CHANGE_5M", "5.0")),
-            "min_chg_15m": float(os.getenv("SCANNER_MIN_PRICE_CHANGE_15M", "10.0")),
-
-            # age / holders
-            "max_age_min": int(os.getenv("SCANNER_MAX_AGE_MIN", "120")),      # default 120
-            "max_mc_usd": float(os.getenv("SCANNER_MAX_MC_USD", "2000000")),
-            "min_holders": int(os.getenv("SCANNER_MIN_HOLDERS", "20")),       # default 20
+        "pair_filters": {
+            "pf_scan_min_liq_usd": PF_SCAN_MIN_LIQ_USD,
+            "pf_scan_max_liq_usd": PF_SCAN_MAX_LIQ_USD,
+            "pf_scan_min_mcap_usd": PF_SCAN_MIN_MCAP_USD,
+            "pf_scan_max_mcap_usd": PF_SCAN_MAX_MCAP_USD,
+            "pf_scan_max_token_age_min": PF_SCAN_MAX_TOKEN_AGE_MIN,
+            "pf_scan_min_5m_vol_usd": PF_SCAN_MIN_5M_VOL_USD,
+            "pf_scan_min_5m_buys": PF_SCAN_MIN_5M_BUYS,
+            "pf_scan_min_buy_to_sell_ratio": PF_SCAN_MIN_BUY_TO_SELL_RATIO,
+            "pf_scan_min_whale_size_sol": PF_SCAN_MIN_WHALE_SIZE_SOL,
+            "pf_scan_min_whale_count_5m": PF_SCAN_MIN_WHALE_COUNT_5M,
+            "pf_max_rug_risk_score": PF_MAX_RUG_RISK_SCORE,
+            "pf_min_momentum_score": PF_MIN_MOMENTUM_SCORE,
+            "pf_min_final_score": PF_MIN_FINAL_SCORE,
+            "pf_risk_penalty_weight": PF_RISK_PENALTY_WEIGHT,
         },
     }
