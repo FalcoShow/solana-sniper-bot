@@ -63,7 +63,6 @@ Expected `meta` keys (all optional, but the more you provide the smarter it gets
 """
 
 from typing import Any, Dict, Tuple
-
 import math
 
 from logging_setup import get_logger
@@ -100,6 +99,10 @@ except Exception:  # pragma: no cover
 
         PF_RISK_PENALTY_WEIGHT = 0.7  # how strongly AI rug score reduces final score
 
+        # Soft guardrails for centralization (used as hints, not hard env)
+        PF_SCAN_MAX_TOP10_HOLD_PCT = 90.0
+        PF_SCAN_MAX_DEV_HOLD_PCT = 40.0
+
     C = _C()  # type: ignore
 
 
@@ -113,7 +116,10 @@ Meta = Dict[str, Any]
 def _to_float(meta: Meta, key: str, default: float = 0.0) -> float:
     v = meta.get(key, default)
     try:
-        return float(v)
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):  # defensive
+            return default
+        return f
     except (TypeError, ValueError):
         return default
 
@@ -131,7 +137,7 @@ def _to_bool(meta: Meta, key: str, default: bool = False) -> bool:
     if isinstance(v, bool):
         return v
     if isinstance(v, str):
-        return v.lower() in {"1", "true", "yes", "y"}
+        return v.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(v)
 
 
@@ -153,6 +159,7 @@ def _soft_scale(x: float, lo: float, hi: float) -> float:
 def _sigmoid(x: float, k: float = 1.0) -> float:
     """
     Standard logistic squashing into (0,1). k controls steepness.
+    Currently unused but kept for future shaping.
     """
     try:
         return 1.0 / (1.0 + math.exp(-k * x))
@@ -190,7 +197,7 @@ def _compute_scores(meta: Meta) -> Tuple[float, float, float]:
 
     # Whales
     whales_5m = _to_int(meta, "whales_5m", 0)
-    whale_vol_5m = _to_float(meta, "whale_vol_5m_usd", 0.0)
+    whale_vol_5m = _to_float(meta, "whale_vol_5m_usd", 0.0)  # not directly used yet
     largest_buy_5m_sol = _to_float(meta, "largest_buy_5m_sol", 0.0)
 
     # Age
@@ -209,8 +216,10 @@ def _compute_scores(meta: Meta) -> Tuple[float, float, float]:
 
     # We like strong but not completely insane 5m move
     comp_price_5m = _soft_scale(p5, 10.0, 120.0)  # 0 below +10%, 1 at +120%+
+
     # 15m can be flat or moderately up; small negative is ok early
     comp_price_15m = _soft_scale(p15 + 20.0, 0.0, 180.0)  # allow some red startup
+
     # 1h we mostly care when it's already trending
     comp_price_1h = _soft_scale(p1h, 0.0, 250.0)
 
@@ -228,7 +237,11 @@ def _compute_scores(meta: Meta) -> Tuple[float, float, float]:
     # Whales: more whales + larger buys
     min_whale_size_sol = getattr(C, "PF_SCAN_MIN_WHALE_SIZE_SOL", 3.0)
     comp_whale_count = _soft_scale(float(whales_5m), 0.0, 3.0)
-    comp_whale_size = _soft_scale(largest_buy_5m_sol, min_whale_size_sol, min_whale_size_sol * 4)
+    comp_whale_size = _soft_scale(
+        largest_buy_5m_sol,
+        min_whale_size_sol,
+        min_whale_size_sol * 4,
+    )
     comp_whales = 0.5 * comp_whale_count + 0.5 * comp_whale_size
 
     # Age: newer is better; beyond PF_SCAN_MAX_TOKEN_AGE_MIN we fade to 0
@@ -342,24 +355,30 @@ def is_viable_pair(meta: Meta) -> bool:
     min_momentum = getattr(C, "PF_MIN_MOMENTUM_SCORE", 0.25)
     min_final = getattr(C, "PF_MIN_FINAL_SCORE", 0.20)
 
+    max_top10 = getattr(C, "PF_SCAN_MAX_TOP10_HOLD_PCT", 90.0)
+    max_dev_hold = getattr(C, "PF_SCAN_MAX_DEV_HOLD_PCT", 40.0)
+
     # ------------------------------------------------------------------
     # Hard filters
     # ------------------------------------------------------------------
     reasons = []
 
+    # Liquidity / mcap window
     if liq < min_liq:
         reasons.append(f"liq {liq:.0f} < min {min_liq:.0f}")
-    if liq > max_liq > 0:
+    if max_liq > 0 and liq > max_liq:
         reasons.append(f"liq {liq:.0f} > max {max_liq:.0f}")
 
     if mcap < min_mcap:
         reasons.append(f"mcap {mcap:.0f} < min {min_mcap:.0f}")
-    if mcap > max_mcap > 0:
+    if max_mcap > 0 and mcap > max_mcap:
         reasons.append(f"mcap {mcap:.0f} > max {max_mcap:.0f}")
 
+    # Age
     if age_min > max_age_min:
         reasons.append(f"age {age_min:.1f}m > max {max_age_min:.1f}m")
 
+    # Obvious safety flags
     if is_honeypot:
         reasons.append("honeypot flagged")
     if trading_paused:
@@ -367,10 +386,10 @@ def is_viable_pair(meta: Meta) -> bool:
     if blacklisted:
         reasons.append("token blacklisted")
 
-    # Basic decentralization / safety (soft caps, not absolute, but useful)
-    if top10_hold_pct > 90.0:
+    # Basic decentralization / safety (soft caps, but treated as hard rejects here)
+    if top10_hold_pct > max_top10:
         reasons.append(f"top10 too concentrated ({top10_hold_pct:.1f}%)")
-    if dev_hold_pct > 40.0:
+    if dev_hold_pct > max_dev_hold:
         reasons.append(f"dev holds too much ({dev_hold_pct:.1f}%)")
     if not mint_auth_disabled:
         reasons.append("mint authority still enabled")
@@ -428,14 +447,16 @@ def is_viable_pair(meta: Meta) -> bool:
     )
 
     if not ok:
-        # Use .every if available to avoid spam
+        # Use .every if available to avoid log spam
         msg = (
             f"[FILTER-REJECT] mint={meta.get('mint')} symbol={meta.get('symbol')} "
             f"dex={meta.get('dex')} reasons={'; '.join(reasons)} "
             f"momentum={momentum_score:.2f} final={final_score:.2f}"
         )
+        key = f"pair_filters.reject.{meta.get('mint', 'unknown')}"
         if hasattr(log, "every"):
-            log.every(f"pair_filters.reject.{meta.get('mint', 'unknown')}", 60, msg)  # type: ignore[attr-defined]
+            # type: ignore[attr-defined]
+            log.every(key, 60, msg)
         else:
             log.debug(msg)
 

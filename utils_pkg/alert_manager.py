@@ -29,7 +29,7 @@ def _s(name: str, default: str = "") -> str:
 
 
 def _dryrun_env_on() -> bool:
-    return _b("DRYRUN", False)
+    return _b("DRYRUN", False) or _b("DRY_RUN", False) or _b("IS_DRYRUN", False)
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -46,7 +46,7 @@ GOOD_MOMO_EVENTS = {
 }
 
 # Optional: friendly labels for a few common ones
-MOMO_LABELS = {
+MOMO_LABELS: Dict[str, str] = {
     "MOMO_OK": "Momentum OK",
     "MOMO_TAKE": "Momentum TAKE",
     "MOMO_LONG": "Momentum LONG",
@@ -90,23 +90,27 @@ class AlertManager:
         # Telegram config
         self.tg_token = _s("TELEGRAM_BOT_TOKEN")
         self.tg_chat  = _s("TELEGRAM_CHAT_ID")
+        self.tg_parse_mode = _s("TELEGRAM_PARSE_MODE", "")  # e.g. "HTML" if you want formatting
 
         # Discord (optional, via simple webhook)
         self.discord_enabled = _b("ALERTS_DISCORD_ENABLED", False)
         self.discord_webhook = _s("DISCORD_WEBHOOK_URL")
 
         # Notion config (separate DBs for PnL and Trades; we use TRADES here)
+        # Uses NOTION_API_KEY / NOTION_TRADES_DB_ID so it does not conflict
+        # with any other Notion usage for daily PnL, etc.
         self.notion_token     = _s("NOTION_API_KEY")
-        self.notion_trades_db = _s("NOTION_TRADES_DB_ID")  # <- your Sniper Trades DB
+        self.notion_trades_db = _s("NOTION_TRADES_DB_ID")
 
         if self.debug:
             log.info(
                 "ALERTS_READY",
                 extra={
                     "enabled": self.enabled,
-                    "tg": self.tg_enabled and bool(self.tg_token and self.tg_chat),
-                    "discord": self.discord_enabled and bool(self.discord_webhook),
-                    "notion": self.notion_enabled and bool(self.notion_token and self.notion_trades_db),
+                    "tg": self._tg_ok(),
+                    "discord": self._discord_ok(),
+                    "notion": self._notion_ok(),
+                    "dryrun": _dryrun_env_on(),
                 },
             )
 
@@ -115,13 +119,56 @@ class AlertManager:
     # ────────────────────────────────────────────────────────────────────
 
     def _tg_ok(self) -> bool:
-        return self.enabled and self.tg_enabled and bool(self.tg_token and self.tg_chat)
+        return (
+            self.enabled
+            and self.tg_enabled
+            and bool(self.tg_token and self.tg_chat)
+        )
 
     def _discord_ok(self) -> bool:
-        return self.enabled and self.discord_enabled and bool(self.discord_webhook)
+        return (
+            self.enabled
+            and self.discord_enabled
+            and bool(self.discord_webhook)
+        )
 
     def _notion_ok(self) -> bool:
-        return self.enabled and self.notion_enabled and bool(self.notion_token and self.notion_trades_db)
+        return (
+            self.enabled
+            and self.notion_enabled
+            and bool(self.notion_token and self.notion_trades_db)
+        )
+
+    # ────────────────────────────────────────────────────────────────────
+    # Low-level HTTP helpers
+    # ────────────────────────────────────────────────────────────────────
+
+    async def _http_post_json(
+        self,
+        url: str,
+        *,
+        json_body: Any | None = None,
+        data: Any | None = None,
+        headers: Optional[Dict[str, str]] = None,
+        timeout: float = 15.0,
+    ) -> Optional[httpx.Response]:
+        """
+        Small wrapper to reduce duplication and give consistent logging.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as c:
+                if json_body is not None:
+                    r = await c.post(url, headers=headers, json=json_body)
+                else:
+                    r = await c.post(url, headers=headers, data=data)
+            return r
+        except Exception as e:
+            if self.debug:
+                log.warning(
+                    "ALERT_HTTP_POST_EXC",
+                    extra={"url": url, "err": str(e)[:300]},
+                )
+            return None
 
     # ────────────────────────────────────────────────────────────────────
     # Telegram
@@ -132,20 +179,25 @@ class AlertManager:
             return
 
         url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
-        data = {"chat_id": self.tg_chat, "text": text, "disable_web_page_preview": True}
+        payload: Dict[str, Any] = {
+            "chat_id": self.tg_chat,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if self.tg_parse_mode:
+            payload["parse_mode"] = self.tg_parse_mode
 
-        try:
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.post(url, data=data)
-            if r.status_code != 200:
-                log.warning(
-                    "ALERT_TG_SEND_FAIL",
-                    extra={"status": r.status_code, "body": r.text[:400]},
-                )
-            elif self.debug:
-                log.info("ALERT_TG_SEND_OK")
-        except Exception as e:
-            log.warning("ALERT_TG_SEND_EXC", extra={"err": str(e)})
+        r = await self._http_post_json(url, data=payload, timeout=10.0)
+        if r is None:
+            return
+
+        if r.status_code != 200:
+            log.warning(
+                "ALERT_TG_SEND_FAIL",
+                extra={"status": r.status_code, "body": r.text[:400]},
+            )
+        elif self.debug:
+            log.info("ALERT_TG_SEND_OK")
 
     # ────────────────────────────────────────────────────────────────────
     # Discord (optional)
@@ -157,18 +209,21 @@ class AlertManager:
 
         payload = {"content": text}
 
-        try:
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.post(self.discord_webhook, json=payload)
-            if r.status_code >= 300:
-                log.warning(
-                    "ALERT_DISCORD_SEND_FAIL",
-                    extra={"status": r.status_code, "body": r.text[:400]},
-                )
-            elif self.debug:
-                log.info("ALERT_DISCORD_SEND_OK")
-        except Exception as e:
-            log.warning("ALERT_DISCORD_SEND_EXC", extra={"err": str(e)})
+        r = await self._http_post_json(
+            self.discord_webhook,
+            json_body=payload,
+            timeout=10.0,
+        )
+        if r is None:
+            return
+
+        if r.status_code >= 300:
+            log.warning(
+                "ALERT_DISCORD_SEND_FAIL",
+                extra={"status": r.status_code, "body": r.text[:400]},
+            )
+        elif self.debug:
+            log.info("ALERT_DISCORD_SEND_OK")
 
     # ────────────────────────────────────────────────────────────────────
     # Notion (Trades DB — per-fill rows)
@@ -193,20 +248,27 @@ class AlertManager:
             "Notion-Version": self._NOTION_VERSION,
             "Content-Type": "application/json",
         }
-        body = {"parent": {"database_id": self.notion_trades_db}, "properties": props}
+        body = {
+            "parent": {"database_id": self.notion_trades_db},
+            "properties": props,
+        }
 
-        try:
-            async with httpx.AsyncClient(timeout=15) as c:
-                r = await c.post("https://api.notion.com/v1/pages", headers=headers, content=json.dumps(body))
-            if r.status_code >= 300:
-                log.warning(
-                    "ALERT_NOTION_FAIL",
-                    extra={"status": r.status_code, "body": r.text[:600]},
-                )
-            elif self.debug:
-                log.info("ALERT_NOTION_OK")
-        except Exception as e:
-            log.warning("ALERT_NOTION_EXC", extra={"err": str(e)})
+        r = await self._http_post_json(
+            "https://api.notion.com/v1/pages",
+            headers=headers,
+            json_body=body,
+            timeout=15.0,
+        )
+        if r is None:
+            return
+
+        if r.status_code >= 300:
+            log.warning(
+                "ALERT_NOTION_FAIL",
+                extra={"status": r.status_code, "body": r.text[:600]},
+            )
+        elif self.debug:
+            log.info("ALERT_NOTION_OK")
 
     # ────────────────────────────────────────────────────────────────────
     # Public helpers: generic text / errors
@@ -262,7 +324,7 @@ class AlertManager:
         if sig:
             tx_url = sig if sig.startswith("http") else f"https://solscan.io/tx/{sig}"
 
-        side_upper = str(side).strip().upper()
+        side_upper = str(side or "").strip().upper() or "BUY"
         side_select = "Buy" if side_upper.startswith("B") else "Sell"
 
         human = (
@@ -282,12 +344,26 @@ class AlertManager:
         now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
         props: Dict[str, Any] = {
-            "Name":   {"title": [{"text": {"content": f"{side_select} {symbol or mint[:6]}…"}}]},
-            "Side":   {"select": {"name": side_select}},
-            "Symbol": {"rich_text": [{"text": {"content": symbol or ""}}]},
-            "Pool":   {"rich_text": [{"text": {"content": pool}}]},
-            "Mint":   {"rich_text": [{"text": {"content": mint}}]},
-            "Time":   {"date": {"start": now_iso}},
+            "Name": {
+                "title": [
+                    {
+                        "text": {
+                            "content": f"{side_select} {symbol or mint[:6]}…"
+                        }
+                    }
+                ]
+            },
+            "Side": {"select": {"name": side_select}},
+            "Symbol": {
+                "rich_text": [{"text": {"content": symbol or ""}}]
+            },
+            "Pool": {
+                "rich_text": [{"text": {"content": pool}}]
+            },
+            "Mint": {
+                "rich_text": [{"text": {"content": mint}}]
+            },
+            "Time": {"date": {"start": now_iso}},
         }
         if spend_sol is not None:
             props["SpendSOL"] = {"number": float(spend_sol)}
@@ -297,13 +373,18 @@ class AlertManager:
             props["TxSig"] = {"url": tx_url}
 
         # Allow Notion even in DRYRUN if ALERTS_NOTION_ALLOW_DRYRUN=1
-        if self.notion_enabled and (self.allow_dryrun_notion or not _dryrun_env_on()):
+        if self.notion_enabled and (
+            self.allow_dryrun_notion or not _dryrun_env_on()
+        ):
             await self._notion_insert_trade(props)
         else:
-            if self.debug:
+            if self.debug and self.notion_enabled:
                 log.info(
                     "ALERT_NOTION_SKIPPED",
-                    extra={"dryrun": _dryrun_env_on(), "allow_dryrun": self.allow_dryrun_notion},
+                    extra={
+                        "dryrun": _dryrun_env_on(),
+                        "allow_dryrun": self.allow_dryrun_notion,
+                    },
                 )
 
     # ────────────────────────────────────────────────────────────────────
@@ -316,8 +397,12 @@ class AlertManager:
 
         Behaviour:
           - Completely ignore skip events (MOMO_SKIP_*)
-          - Optionally only allow an explicit whitelist of "good" events.
+          - Only allow an explicit whitelist of "good" events (GOOD_MOMO_EVENTS)
         """
+
+        event = str(event or "").strip().upper()
+        if not event:
+            return
 
         # 1) Ignore everything that is clearly a skip (these caused the spam)
         if event.startswith("MOMO_SKIP"):
@@ -331,7 +416,12 @@ class AlertManager:
                 log.debug("Ignoring non-whitelisted MOMO event: %s", event)
             return
 
-        symbol = ctx.get("symbol") or ctx.get("mint") or ctx.get("name") or "?"
+        symbol = (
+            ctx.get("symbol")
+            or ctx.get("mint")
+            or ctx.get("name")
+            or "?"
+        )
         pool   = ctx.get("pool") or ctx.get("pair") or "-"
         reason = ctx.get("reason") or ""
 
@@ -348,8 +438,16 @@ class AlertManager:
             body_lines.append(f"vol_5m≈${ctx['vol_5m']}")
         if "up_pct" in ctx:
             body_lines.append(f"up={ctx['up_pct']}%")
+        if "fraud_score" in ctx:
+            body_lines.append(f"fraudScore={ctx['fraud_score']}")
         if reason:
             body_lines.append(f"reason={reason}")
+
+        # Optional: tx link if present in ctx
+        sig = ctx.get("signature") or ctx.get("tx") or ctx.get("tx_sig")
+        if isinstance(sig, str) and sig:
+            tx_url = sig if sig.startswith("http") else f"https://solscan.io/tx/{sig}"
+            body_lines.append(f"tx={tx_url}")
 
         text = "\n".join(body_lines)
 
