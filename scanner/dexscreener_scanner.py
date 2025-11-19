@@ -1,5 +1,6 @@
 # scanner/dexscreener_scanner.py
-# Pulls active Solana "runner" pairs from Dexscreener's public JSON API.
+# Pulls active Solana "runner" pairs from Dexscreener and feeds them into
+# utils_pkg.pair_filters for shared filtering & scoring.
 from __future__ import annotations
 
 import os
@@ -13,39 +14,74 @@ import aiohttp
 import certifi
 
 from config import (
-    SCANNER_MIN_LIQ_USD,
-    SCANNER_MIN_FDV_USD,
-    SCANNER_MIN_BUYS_5M,
-    SCANNER_MIN_BUYS_15M,
-    SCANNER_MIN_VOLUME_5M_USD,
-    SCANNER_MIN_VOLUME_15M_USD,
-    SCANNER_MIN_BUY_RATIO,
-    SCANNER_REQUIRE_BUY_PRESSURE,
-    SCANNER_MIN_PRICE_CHANGE_5M,
-    SCANNER_MIN_PRICE_CHANGE_15M,
-    SCANNER_MAX_AGE_MIN,
-    SCANNER_MAX_MC_USD,
-    SCANNER_MIN_HOLDERS,
+    PF_SCAN_MIN_LIQ_USD,
+    PF_SCAN_MIN_MCAP_USD,
+    PF_SCAN_MAX_TOKEN_AGE_MIN,
+)
+
+# Optional whale-size hint; safe fallback if not present
+try:
+    from config import PF_SCAN_MIN_WHALE_SIZE_SOL  # type: ignore
+except Exception:  # pragma: no cover
+    PF_SCAN_MIN_WHALE_SIZE_SOL = 3.0  # reasonable default
+
+from utils_pkg.alert_manager import AlertManager
+from utils_pkg.pair_filters import (
+    is_viable_pair,
+    compute_momentum_score,
+    compute_final_score,
 )
 
 logger = logging.getLogger("scanner.dexscreener")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Config / env
+# Env helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-UA = os.getenv(
+def _b(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def _s(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else v.strip()
+
+
+def _i(name: str, default: int) -> int:
+    v = os.getenv(name)
+    try:
+        return int(v) if v not in (None, "") else default
+    except Exception:
+        return default
+
+
+def _f(name: str, default: float) -> float:
+    v = os.getenv(name)
+    try:
+        return float(v) if v not in (None, "") else default
+    except Exception:
+        return default
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config / env (Dexscreener-specific on top of PF_* defaults)
+# ──────────────────────────────────────────────────────────────────────────────
+
+UA = _s(
     "SCANNER_UA",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SniperBot/1.0 (+dexscreener)",
 )
 
-BASE = os.getenv("DEXSCREENER_BASE_URL", "https://api.dexscreener.com").rstrip("/")
-LIMIT = int(os.getenv("DEX_LIMIT", "40"))
-TIMEOUT_S = float(os.getenv("DEX_HTTP_TIMEOUT_SEC", "12"))
-RETRIES = max(1, int(os.getenv("DEX_HTTP_RETRIES", "3")))
-BACKOFF_S = max(0.1, float(os.getenv("DEX_HTTP_BACKOFF_SEC", "0.6")))
+BASE = _s("DEXSCREENER_BASE_URL", "https://api.dexscreener.com").rstrip("/")
+LIMIT = _i("DEX_LIMIT", 40)
+TIMEOUT_S = _f("DEX_HTTP_TIMEOUT_SEC", 12.0)
+RETRIES = max(1, _i("DEX_HTTP_RETRIES", 3))
+BACKOFF_S = max(0.1, _f("DEX_HTTP_BACKOFF_SEC", 0.6))
 
-# Comma-separated search queries; first should be "solana" to keep scope tight.
+# Comma-separated search queries; default "solana".
 SEARCH_QUERIES = [
     q.strip()
     for q in os.getenv("DEX_SEARCH_QUERIES", "solana").split(",")
@@ -53,41 +89,26 @@ SEARCH_QUERIES = [
 ]
 
 # Honor system proxy variables if present (aiohttp trust_env)
-TRUST_ENV = os.getenv("DEX_TRUST_ENV", "1").strip().lower() in {"1", "true", "yes", "y"}
+TRUST_ENV = _b("DEX_TRUST_ENV", True)
 
-# Thresholds (default to config values, but allow scanner-specific overrides)
-MIN_LIQ_USD = float(os.getenv("DEX_MIN_LIQ_USD", str(SCANNER_MIN_LIQ_USD)))
-MIN_FDV_USD = float(os.getenv("DEX_MIN_FDV_USD", str(SCANNER_MIN_FDV_USD)))
-MIN_BUYS_5M = int(os.getenv("DEX_MIN_BUYS_5M", str(SCANNER_MIN_BUYS_5M)))
-MIN_BUYS_15M = int(os.getenv("DEX_MIN_BUYS_15M", str(SCANNER_MIN_BUYS_15M)))
-MIN_VOL_5M_USD = float(
-    os.getenv("DEX_MIN_VOLUME_5M_USD", str(SCANNER_MIN_VOLUME_5M_USD))
-)
-MIN_VOL_15M_USD = float(
-    os.getenv("DEX_MIN_VOLUME_15M_USD", str(SCANNER_MIN_VOLUME_15M_USD))
-)
-MIN_BUY_RATIO = float(
-    os.getenv("DEX_MIN_BUY_RATIO", str(SCANNER_MIN_BUY_RATIO))
-)  # 0..1
-REQUIRE_BUY_PRESSURE = os.getenv(
-    "DEX_REQUIRE_BUY_PRESSURE", "1" if SCANNER_REQUIRE_BUY_PRESSURE else "0"
-).strip().lower() in {"1", "true", "yes", "y"}
+# Soft prefilters BEFORE PF logic (we still use PF for final viability)
+SOFT_MIN_LIQ_USD = _f("DEX_SOFT_MIN_LIQ_USD", PF_SCAN_MIN_LIQ_USD * 0.4)
+SOFT_MIN_MCAP_USD = _f("DEX_SOFT_MIN_MCAP_USD", PF_SCAN_MIN_MCAP_USD * 0.4)
+SOFT_MAX_AGE_MIN = _f("DEX_SOFT_MAX_AGE_MIN", PF_SCAN_MAX_TOKEN_AGE_MIN * 1.2)
 
-MIN_CHG_5M = float(
-    os.getenv("DEX_MIN_PRICE_CHANGE_5M", str(SCANNER_MIN_PRICE_CHANGE_5M))
-)
-MIN_CHG_15M = float(
-    os.getenv("DEX_MIN_PRICE_CHANGE_15M", str(SCANNER_MIN_PRICE_CHANGE_15M))
-)
+# MOMO / alert behaviour
+SEND_MOMO_ALERTS = _b("DEX_SEND_MOMO_ALERTS", True)
+MAX_ALERTS_PER_SCAN = _i("DEX_MAX_ALERTS_PER_SCAN", 3)
 
-MAX_AGE_MIN = int(os.getenv("DEX_MAX_AGE_MIN", str(SCANNER_MAX_AGE_MIN)))
-MAX_MC_USD = float(os.getenv("DEX_MAX_MC_USD", str(SCANNER_MAX_MC_USD)))
-MIN_HOLDERS = int(os.getenv("DEX_MIN_HOLDERS", str(SCANNER_MIN_HOLDERS)))
+# Optional AI / whales enrichment toggles (off by default, safe if not configured)
+DEX_AI_RUG_ENABLED = _b("DEX_AI_RUG_ENABLED", False)
+DEX_AI_RUG_MAX_PER_SCAN = _i("DEX_AI_RUG_MAX_PER_SCAN", 20)
+DEX_WHALES_ENABLED = _b("DEX_WHALES_ENABLED", False)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
 
 def _nz_float(v: Any, d: float = 0.0) -> float:
     try:
@@ -118,7 +139,6 @@ def _age_min(pair_created_ms: Optional[int]) -> Optional[float]:
         if t_ms <= 0:
             return None
         import time as _time
-
         diff_s = max(0.0, (_time.time() - (t_ms / 1000.0)))
         return diff_s / 60.0
     except Exception:
@@ -138,6 +158,7 @@ def _headers() -> Dict[str, str]:
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP
 # ──────────────────────────────────────────────────────────────────────────────
+
 async def _fetch_json(
     session: aiohttp.ClientSession,
     url: str,
@@ -167,10 +188,9 @@ async def _fetch_json(
                         return data, status, body_first
                     except Exception:
                         # Try manual parse to be extra tolerant
-                        import json
-
+                        import json as _json
                         try:
-                            data = json.loads(text)
+                            data = _json.loads(text)
                             return data, status, body_first
                         except Exception:
                             logger.warning(
@@ -210,7 +230,6 @@ async def _fetch_json(
             logger.warning("Dexscreener: unexpected error at %s: %s", url, e)
 
         if attempt < RETRIES:
-            # backoff with small jitter
             await asyncio.sleep(BACKOFF_S * attempt)
 
     return None, status, body_first
@@ -225,7 +244,7 @@ async def _fetch_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     seen_ids: set = set()
 
     for q in SEARCH_QUERIES:
-        data, status, first = await _fetch_json(session, url, params={"q": q})
+        data, _status, _first = await _fetch_json(session, url, params={"q": q})
         if not data:
             continue
         pairs = data.get("pairs") or []
@@ -239,40 +258,97 @@ async def _fetch_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Metrics / filtering / normalization
+# Metrics / normalization → PF meta shape
 # ──────────────────────────────────────────────────────────────────────────────
+
 def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
-    """Pulls out all the numbers we care about for runner detection."""
+    """
+    Pull out metrics in the shape that utils_pkg.pair_filters expects.
+
+    We produce:
+      - liq_usd, mcap_usd, fdv_usd
+      - token_age_min
+      - vol_5m_usd, vol_1h_usd, vol_24h_usd
+      - buys_5m, sells_5m, buys_24h, sells_24h
+      - price_change_5m_pct, price_change_15m_pct, price_change_1h_pct
+      - holders, holders_5m_change
+      - whales_5m, whale_vol_5m_usd, largest_buy_5m_sol (heuristic)
+      - price_usd
+    """
     base = pair.get("baseToken") or {}
     quote = pair.get("quoteToken") or {}
 
-    liq = _nz_float((pair.get("liquidity") or {}).get("usd"), 0.0)
-    fdv = _nz_float(pair.get("fdv"), 0.0)
-    mc = _nz_float(pair.get("marketCap"), fdv or 0.0)
+    liq_usd = _nz_float((pair.get("liquidity") or {}).get("usd"), 0.0)
+    fdv_usd = _nz_float(
+        pair.get("fdv")
+        or pair.get("fdvUsd")
+        or pair.get("fullyDilutedValuation")
+        or pair.get("fullyDilutedMcUsd"),
+        0.0,
+    )
+    mcap_usd = _nz_float(
+        pair.get("marketCap")
+        or pair.get("marketCapUsd")
+        or pair.get("mcap")
+        or fdv_usd,
+        0.0,
+    )
 
     txns = pair.get("txns") or {}
     m5 = txns.get("m5") or {}
-    m15 = txns.get("m15") or {}
+    h1 = txns.get("h1") or {}
+    h24 = txns.get("h24") or {}
 
-    buys5 = _safe_int(m5.get("buys"))
-    sells5 = _safe_int(m5.get("sells"))
-    buys15 = _safe_int(m15.get("buys"))
-    sells15 = _safe_int(m15.get("sells"))
+    buys_5m = _safe_int(m5.get("buys"))
+    sells_5m = _safe_int(m5.get("sells"))
 
-    buy_total5 = max(1, buys5 + sells5)
-    buy_total15 = max(1, buys15 + sells15)
+    buys_1h = _safe_int(h1.get("buys"))
+    sells_1h = _safe_int(h1.get("sells"))
 
-    buy_ratio5 = buys5 / buy_total5
-    buy_ratio15 = buys15 / buy_total15
+    buys_24h = _safe_int(h24.get("buys"))
+    sells_24h = _safe_int(h24.get("sells"))
+
+    # If 5m buys are zero but 1h/24h exist, approximate
+    if buys_5m == 0 and buys_1h > 0:
+        buys_5m = max(1, buys_1h // 12)
+    if buys_5m == 0 and buys_24h > 0:
+        buys_5m = max(1, buys_24h // 288)
+
+    if sells_5m == 0 and sells_1h > 0:
+        sells_5m = max(0, sells_1h // 12)
+    if sells_5m == 0 and sells_24h > 0:
+        sells_5m = max(0, sells_24h // 288)
 
     vol = pair.get("volume") or {}
-    vol5 = _nz_float(vol.get("m5"), 0.0)
-    vol15 = _nz_float(vol.get("m15"), 0.0)
-    vol24 = _nz_float(vol.get("h24"), 0.0)
+    vol_5m_usd = _nz_float(vol.get("m5"), 0.0)
+    vol_1h_usd = _nz_float(vol.get("h1"), 0.0)
+    vol_24h_usd = _nz_float(vol.get("h24"), 0.0)
+
+    # Approximate missing windows from 24h
+    if vol_1h_usd <= 0 and vol_24h_usd > 0:
+        vol_1h_usd = vol_24h_usd / 24.0
+    if vol_5m_usd <= 0 and vol_1h_usd > 0:
+        vol_5m_usd = vol_1h_usd / 12.0
+    if vol_5m_usd <= 0 and vol_24h_usd > 0:
+        vol_5m_usd = vol_24h_usd / 288.0
 
     chg = pair.get("priceChange") or {}
-    chg5 = _nz_float(chg.get("m5"), 0.0)
-    chg15 = _nz_float(chg.get("m15"), 0.0)
+    chg_5m_pct = _nz_float(chg.get("m5"), 0.0)
+    chg_1h_pct = _nz_float(chg.get("h1"), 0.0)
+    chg_24h_pct = _nz_float(chg.get("h24"), 0.0)
+
+    # Dexscreener usually does not expose 15m; approximate from 1h or 24h
+    chg_15m_pct = 0.0
+    if chg_1h_pct != 0.0:
+        chg_15m_pct = chg_1h_pct / 4.0
+    elif chg_24h_pct != 0.0:
+        chg_15m_pct = chg_24h_pct / 96.0
+
+    # If no 5m, approximate from 1h/24h as last resort
+    if chg_5m_pct == 0.0 and chg_1h_pct != 0.0:
+        chg_5m_pct = chg_1h_pct / 12.0
+    if chg_5m_pct == 0.0 and chg_24h_pct != 0.0:
+        chg_5m_pct = chg_24h_pct / 288.0
 
     age_ms = (
         pair.get("pairCreatedAt")
@@ -280,104 +356,79 @@ def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
         or pair.get("pairCreatedAtTs")
     )
     age_min = _age_min(age_ms)
+    token_age_min = age_min if age_min is not None else 9999.0
 
     holders = _safe_int(pair.get("holders") or 0)
+    holders_5m_change = 0  # Dexscreener doesn't give short-interval holder deltas
 
     price_usd = _nz_float(pair.get("priceUsd"), 0.0)
 
+    # Whales: Dexscreener doesn't give per-wallets; approximate from 5m volume + price.
+    whales_5m = 0
+    whale_vol_5m_usd = 0.0
+    largest_buy_5m_sol = 0.0
+    if price_usd > 0 and vol_5m_usd > 0:
+        approx_largest_buy_usd = vol_5m_usd * 0.25
+        approx_largest_buy_sol = approx_largest_buy_usd / price_usd
+        largest_buy_5m_sol = approx_largest_buy_sol
+        if approx_largest_buy_sol >= float(PF_SCAN_MIN_WHALE_SIZE_SOL):
+            whales_5m = 1
+            whale_vol_5m_usd = approx_largest_buy_usd
+
     return {
-        "liq_usd": liq,
-        "fdv_usd": fdv,
-        "mc_usd": mc,
-        "buys_5m": buys5,
-        "sells_5m": sells5,
-        "buys_15m": buys15,
-        "sells_15m": sells15,
-        "buy_ratio_5m": buy_ratio5,
-        "buy_ratio_15m": buy_ratio15,
-        "volume_5m_usd": vol5,
-        "volume_15m_usd": vol15,
-        "volume_24h_usd": vol24,
-        "price_change_5m": chg5,
-        "price_change_15m": chg15,
-        "age_min": age_min,
+        "liq_usd": liq_usd,
+        "mcap_usd": mcap_usd,
+        "fdv_usd": fdv_usd,
+        "token_age_min": token_age_min,
+        "vol_5m_usd": vol_5m_usd,
+        "vol_1h_usd": vol_1h_usd,
+        "vol_24h_usd": vol_24h_usd,
+        "buys_5m": buys_5m,
+        "sells_5m": sells_5m,
+        "buys_1h": buys_1h,
+        "sells_1h": sells_1h,
+        "buys_24h": buys_24h,
+        "sells_24h": sells_24h,
+        "price_change_5m_pct": chg_5m_pct,
+        "price_change_15m_pct": chg_15m_pct,
+        "price_change_1h_pct": chg_1h_pct,
         "holders": holders,
+        "holders_5m_change": holders_5m_change,
         "price_usd": price_usd,
+        "whales_5m": whales_5m,
+        "whale_vol_5m_usd": whale_vol_5m_usd,
+        "largest_buy_5m_sol": largest_buy_5m_sol,
         "base_symbol": (base.get("symbol") or "").strip(),
         "base_mint": (base.get("address") or "").strip(),
         "quote_symbol": (quote.get("symbol") or "").strip(),
     }
 
 
-def _passes_filters(pair: Dict[str, Any], m: Dict[str, Any]) -> bool:
-    """Apply all runner-focused filters using config thresholds."""
-    if (pair.get("chainId") or "").lower() != "solana":
-        return False
-
-    # Liquidity / size
-    if m["liq_usd"] < MIN_LIQ_USD:
-        return False
-
-    if m["fdv_usd"] and m["fdv_usd"] < MIN_FDV_USD:
-        return False
-
-    if MAX_MC_USD > 0 and m["mc_usd"] and m["mc_usd"] > MAX_MC_USD:
-        return False
-
-    # Age – keep reasonably fresh charts
-    if m["age_min"] is not None and m["age_min"] > MAX_AGE_MIN:
-        return False
-
-    # Holders – avoid total ghosts when Dexscreener exposes this
-    if MIN_HOLDERS > 0 and m["holders"] and m["holders"] < MIN_HOLDERS:
-        return False
-
-    # Activity – buys and volume in 5m/15m
-    if m["buys_5m"] < MIN_BUYS_5M:
-        return False
-    if m["buys_15m"] < MIN_BUYS_15M:
-        return False
-
-    if m["volume_5m_usd"] < MIN_VOL_5M_USD:
-        return False
-    if m["volume_15m_usd"] < MIN_VOL_15M_USD:
-        return False
-
-    # Price action – we want actual runners, not flat lines
-    if m["price_change_5m"] < MIN_CHG_5M:
-        return False
-    if m["price_change_15m"] < MIN_CHG_15M:
-        return False
-
-    # Buy pressure – more buys than sells over last 5m
-    if REQUIRE_BUY_PRESSURE and m["buy_ratio_5m"] < MIN_BUY_RATIO:
-        return False
-
-    return True
-
-
-def _runner_score(m: Dict[str, Any]) -> float:
+def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Heuristic score for ranking:
-    - prefer strong buy pressure
-    - decent recent price appreciation
-    - solid recent volume
-    - enough liquidity
+    Normalize a Dexscreener pair → PF-compatible "meta" dict.
+
+    Applies:
+      - chainId == solana
+      - soft prefilters using SOFT_MIN_LIQ_USD / SOFT_MIN_MCAP_USD / SOFT_MAX_AGE_MIN
+      - meta fields matching utils_pkg.pair_filters expectations
     """
-    buy_component = m["buy_ratio_5m"] * 3.0
-    price_component = max(0.0, m["price_change_5m"]) / 10.0 + max(
-        0.0, m["price_change_15m"]
-    ) / 15.0
-    vol_component = min(m["volume_5m_usd"], 50_000.0) / 10_000.0
-    liq_component = min(m["liq_usd"], 200_000.0) / 50_000.0
-
-    return buy_component + price_component + vol_component + liq_component
-
-
-def _normalize(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
+        if (pair.get("chainId") or "").lower() != "solana":
+            return None
+
         metrics = _extract_metrics(pair)
-        if not _passes_filters(pair, metrics):
+
+        # Soft prefilters
+        liq_usd = metrics["liq_usd"]
+        mcap_usd = metrics["mcap_usd"]
+        token_age_min = metrics["token_age_min"]
+
+        if liq_usd < SOFT_MIN_LIQ_USD:
+            return None
+        if mcap_usd < SOFT_MIN_MCAP_USD:
+            return None
+        if token_age_min > SOFT_MAX_AGE_MIN:
             return None
 
         mint = metrics["base_mint"]
@@ -385,48 +436,248 @@ def _normalize(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return None
 
         symbol = metrics["base_symbol"] or mint[:6]
+        dex_id = (pair.get("dexId") or "").lower() or "unknown"
+
         url = (
             pair.get("url")
             or pair.get("pairUrl")
             or f"https://dexscreener.com/solana/{mint}"
         )
 
-        out = {
+        # We only have direct 5m trades; 1h txns approximated from 5m
+        txns_5m = metrics["buys_5m"] + metrics["sells_5m"]
+        txns_1h = txns_5m * 12
+
+        buy_ratio_5m = (
+            metrics["buys_5m"] / max(1, metrics["buys_5m"] + metrics["sells_5m"])
+        )
+
+        meta: Dict[str, Any] = {
+            # identity
             "source": "dexscreener",
-            "dex": pair.get("dexId") or "unknown",
+            "dex": dex_id,
+            "chain": "solana",
             "pair_address": pair.get("pairAddress"),
             "mint": mint,
             "symbol": symbol,
-            "price_usd": metrics["price_usd"],
+            "pair_url": url,
+
+            # core liquidity / size
             "liq_usd": metrics["liq_usd"],
+            "mcap_usd": metrics["mcap_usd"],
             "fdv_usd": metrics["fdv_usd"],
-            "mc_usd": metrics["mc_usd"],
-            "volume_5m_usd": metrics["volume_5m_usd"],
-            "volume_15m_usd": metrics["volume_15m_usd"],
-            "volume_24h_usd": metrics["volume_24h_usd"],
+
+            # time
+            "token_age_min": metrics["token_age_min"],
+
+            # recent activity
+            "vol_5m_usd": metrics["vol_5m_usd"],
+            "vol_1h_usd": metrics["vol_1h_usd"],
+            "vol_24h_usd": metrics["vol_24h_usd"],
             "buys_5m": metrics["buys_5m"],
             "sells_5m": metrics["sells_5m"],
-            "buys_15m": metrics["buys_15m"],
-            "sells_15m": metrics["sells_15m"],
-            "buy_ratio_5m": metrics["buy_ratio_5m"],
-            "buy_ratio_15m": metrics["buy_ratio_15m"],
-            "price_change_5m": metrics["price_change_5m"],
-            "price_change_15m": metrics["price_change_15m"],
-            "age_min": metrics["age_min"],
+            "txns_5m": txns_5m,
+            "txns_1h": txns_1h,
+            "buy_ratio_5m": buy_ratio_5m,
+
+            # price action
+            "price_usd": metrics["price_usd"],
+            "price_change_5m_pct": metrics["price_change_5m_pct"],
+            "price_change_15m_pct": metrics["price_change_15m_pct"],
+            "price_change_1h_pct": metrics["price_change_1h_pct"],
+
+            # holders
             "holders": metrics["holders"],
-            "pair_url": url,
+            "holders_5m_change": metrics["holders_5m_change"],
+
+            # whale + AI fields
+            "whales_5m": metrics["whales_5m"],
+            "whale_vol_5m_usd": metrics["whale_vol_5m_usd"],
+            "largest_buy_5m_sol": metrics["largest_buy_5m_sol"],
+            "ai_rug_score": 0.0,  # neutral by default
+
+            # security flags (we don't have direct info here, so defaults are safe-ish)
+            "is_honeypot": False,
+            "trading_paused": False,
+            "blacklisted": False,
+            "top10_hold_pct": 0.0,
+            "dev_hold_pct": 0.0,
+            "mint_authority_disabled": True,
+            "freeze_authority_disabled": True,
         }
 
-        out["runner_score"] = _runner_score(metrics)
-        return out
+        return meta
     except Exception as e:
         logger.debug("Dexscreener normalize error: %s", e)
         return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Optional AI / whales enrichment
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _enrich_ai_and_whales(metas: List[Dict[str, Any]]) -> None:
+    """
+    Best-effort enrichment of meta with:
+      - ai_rug_score (0–1) via utils_pkg.core_utils.ai_fraud_score
+      - additional whale presence via utils_pkg.core_utils.is_whale_wallet
+
+    Fully optional:
+      - If imports fail, metas stay usable.
+      - Concurrency + per-scan cap to avoid rate-limit issues.
+    """
+    if not metas:
+        return
+
+    try:
+        from utils_pkg.core_utils import ai_fraud_score, is_whale_wallet  # type: ignore
+    except Exception:
+        return
+
+    sem = asyncio.Semaphore(_i("DEX_AI_CONCURRENCY", 5))
+    to_process = metas[: DEX_AI_RUG_MAX_PER_SCAN] if DEX_AI_RUG_ENABLED else []
+
+    async def _handle(meta: Dict[str, Any]) -> None:
+        mint = meta.get("mint")
+        if not isinstance(mint, str) or not mint:
+            return
+        async with sem:
+            if DEX_AI_RUG_ENABLED:
+                try:
+                    s01 = await ai_fraud_score(mint)
+                    meta["ai_rug_score"] = max(0.0, min(1.0, float(s01)))
+                except Exception:
+                    pass
+            if DEX_WHALES_ENABLED:
+                try:
+                    px = float(meta.get("price_usd") or 0.0)
+                    thresh_usd = float(PF_SCAN_MIN_WHALE_SIZE_SOL) * px if px > 0 else 50_000.0
+                    has_whale = await is_whale_wallet(mint, usd_threshold=thresh_usd)
+                    if has_whale:
+                        meta["whales_5m"] = max(1, int(meta.get("whales_5m") or 0))
+                except Exception:
+                    pass
+
+    tasks = [asyncio.create_task(_handle(m)) for m in to_process]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PF-based filtering & ranking
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _pf_filter_and_rank(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Take normalized meta entries, apply is_viable_pair and PF scoring, and
+    return the top LIMIT candidates ranked by final_score.
+    """
+    out: List[Dict[str, Any]] = []
+
+    for meta in metas:
+        try:
+            if not is_viable_pair(meta):
+                continue
+
+            momentum = compute_momentum_score(meta)
+            final = compute_final_score(meta)
+
+            m = dict(meta)
+            m["momentum_score"] = momentum
+            m["final_score"] = final
+            out.append(m)
+        except Exception as e:
+            logger.debug("Dexscreener PF filter error for %s: %s", meta.get("mint"), e)
+
+    out.sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
+    return out[:LIMIT]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MOMO event wiring
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
+    """
+    Send MOMO_OK alerts for the top N runner candidates.
+    Anti-spam: capped by MAX_ALERTS_PER_SCAN and further filtered in AlertManager.
+    """
+    if not SEND_MOMO_ALERTS or not runners:
+        return
+
+    try:
+        am = AlertManager()
+    except Exception as e:
+        logger.warning("Dexscreener: failed to init AlertManager for MOMO: %s", e)
+        return
+
+    max_n = max(0, min(MAX_ALERTS_PER_SCAN, len(runners)))
+    for c in runners[:max_n]:
+        try:
+            age_min = c.get("token_age_min")
+            age_sec = age_min * 60.0 if isinstance(age_min, (int, float)) else None
+            ctx: Dict[str, Any] = {
+                "symbol": c.get("symbol") or c.get("mint"),
+                "mint": c.get("mint"),
+                "pool": c.get("pair_url"),
+                "age_sec": age_sec,
+                "liq_usd": c.get("liq_usd"),
+                "vol_5m": c.get("vol_5m_usd"),
+                "up_pct": c.get("price_change_5m_pct"),
+                "reason": (
+                    f"dexscreener PF runner final={c.get('final_score', 0.0):.3f} "
+                    f"momentum={c.get('momentum_score', 0.0):.3f}"
+                ),
+            }
+            await am.send_momo_event("MOMO_OK", ctx)
+        except Exception as e:
+            logger.warning("Dexscreener: MOMO send error for %s: %s", c.get("mint"), e)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Public entry
 # ──────────────────────────────────────────────────────────────────────────────
+
+async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+    logger.info(
+        "🔎 Dexscreener scan: queries=%s soft_min_liq=$%.0f pf_min_liq=$%.0f limit=%d",
+        ",".join(SEARCH_QUERIES),
+        SOFT_MIN_LIQ_USD,
+        PF_SCAN_MIN_LIQ_USD,
+        LIMIT,
+    )
+
+    pairs = await _fetch_pairs(session)
+    logger.info("Dexscreener: fetched %d raw pairs", len(pairs))
+
+    metas: List[Dict[str, Any]] = []
+    for p in pairs:
+        m = _normalize_to_meta(p)
+        if m:
+            metas.append(m)
+
+    if not metas:
+        logger.info("Dexscreener: no metas after normalization")
+        return []
+
+    # Optional AI / whales enrichment
+    try:
+        coro = _enrich_ai_and_whales(metas)
+        if asyncio.iscoroutine(coro):
+            await coro
+    except Exception:
+        pass
+
+    runners = _pf_filter_and_rank(metas)
+    logger.info(
+        "Dexscreener: %d PF runners (from %d metas, %d raw pairs)",
+        len(runners),
+        len(metas),
+        len(pairs),
+    )
+    return runners
+
+
 async def scan_dexscreener(*args):
     """
     Flexible signature (compatible with other scanners):
@@ -436,6 +687,7 @@ async def scan_dexscreener(*args):
       - scan_dexscreener(session)
 
     Only an aiohttp.ClientSession (if provided) is used.
+    Returns a list of PF-scored runner candidates (each is a meta dict).
     """
     sess: Optional[aiohttp.ClientSession] = None
     if len(args) >= 2 and isinstance(args[1], aiohttp.ClientSession):
@@ -447,13 +699,11 @@ async def scan_dexscreener(*args):
     if sess is None:
         try:
             from utils_pkg.core_utils import session as core_session  # type: ignore
-
             if isinstance(core_session, aiohttp.ClientSession):
                 sess = core_session
         except Exception:
             sess = None
 
-    # If still none, spin up a short-lived, TLS-verified session (trust_env for proxies)
     own_session = False
     if sess is None:
         sslctx = ssl.create_default_context(cafile=certifi.where())
@@ -465,35 +715,10 @@ async def scan_dexscreener(*args):
         own_session = True
 
     try:
-        logger.info(
-            "🔎 Dexscreener scan: queries=%s liq>=$%.0f buys5m>=%d buys15m>=%d "
-            "vol5m>=$%.0f vol15m>=$%.0f buy_ratio>=%.2f chg5m>=%s%% chg15m>=%s%% age<=%dmin",
-            ",".join(SEARCH_QUERIES),
-            MIN_LIQ_USD,
-            MIN_BUYS_5M,
-            MIN_BUYS_15M,
-            MIN_VOL_5M_USD,
-            MIN_VOL_15M_USD,
-            MIN_BUY_RATIO,
-            MIN_CHG_5M,
-            MIN_CHG_15M,
-            MAX_AGE_MIN,
-        )
-
-        pairs = await _fetch_pairs(sess)
-        logger.info("Dexscreener: fetched %d raw pairs", len(pairs))
-
-        rows: List[Dict[str, Any]] = []
-        for p in pairs:
-            r = _normalize(p)
-            if r:
-                rows.append(r)
-
-        logger.info("Dexscreener: %d pairs passed runner filters", len(rows))
-
-        # Rank: highest runner_score first
-        rows.sort(key=lambda x: x.get("runner_score", 0.0), reverse=True)
-        return rows[:LIMIT]
+        runners = await _scan_inner(sess) or []
+        await _send_momo_for_runners(runners)
+        logger.info("Dexscreener: %d final PF runner candidates", len(runners))
+        return runners
     except Exception as e:
         logger.warning("Dexscreener scan error: %s", e)
         return []

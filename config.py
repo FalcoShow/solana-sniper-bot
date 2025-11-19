@@ -275,6 +275,11 @@ REINVESTMENT_VOLUME_MIN = _get_float("REINVESTMENT_VOLUME_MIN", 5_000.0)
 REINVESTMENT_MIN_PROFIT_SOL = _get_float("REINVESTMENT_MIN_PROFIT_SOL", 0.01)
 REINVESTMENT_HONEYPOT_CHECK = _get_bool("REINVESTMENT_HONEYPOT_CHECK", True)
 
+# Entry momentum guard (Track A / Track B)
+ENTRY_MOMO_MIN_TRADES = _get_int("ENTRY_MOMO_MIN_TRADES", 3)
+ENTRY_MOMO_MIN_UP_PCT = _get_float("ENTRY_MOMO_MIN_UP_PCT", 2.5)
+ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP = _get_bool("ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP", False)
+
 
 # ---------------------------------------------------------------------------
 # Sniper loop / scanners tuning (matches sniper/sniper.py)
@@ -519,6 +524,10 @@ def summarize():
             "route_blocks_notify": TELEGRAM_NOTIFY_ROUTE_BLOCKS,
             "moonshot_enabled": MOONSHOT_ENABLED,
             "moonshot_daily_usd": MOONSHOT_DAILY_USD,
+            # entry momentum guard
+            "entry_momo_min_trades": ENTRY_MOMO_MIN_TRADES,
+            "entry_momo_min_up_pct": ENTRY_MOMO_MIN_UP_PCT,
+            "entry_momo_allow_no_data_for_pump": ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP,
         },
 
         "scanners_legacy": {

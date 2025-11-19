@@ -9,8 +9,8 @@ import os
 import signal
 import sys
 import traceback
-from typing import Any, Dict, Optional, Tuple
 from asyncio import create_task
+from typing import Any, Dict, Optional, Tuple
 
 try:
     import aiohttp  # type: ignore
@@ -21,30 +21,24 @@ except Exception:  # pragma: no cover
 from utils_pkg.core_utils import AlertManager, redis
 
 """
-scripts/main.py (vNext + DSN-normalizer + full buy hooks + healthcheck + sentry)
+scripts/main.py (vNext)
 
-- Hardens startup, logging, and shutdown.
-- Adds event-rate diagnostics + momentum gate + guardrails.
-- Enforces PF_POOLS filter and supervises the Raydium scanner with backoff+jitter.
-- Local Jupiter relay compatible (removes Brotli decode issues upstream).
-- Daily PnL rollup + Notion integration.
-- DRYRUN enforcement before any buy (IS_DRYRUN/DRYRUN + package flag).
-- DSN normalizer so asyncpg always gets postgresql:// (never postgresql+asyncpg://).
-- BUY HOOKS: passes coroutines to maybe_buy:
-      - on_buy_submitted   (fires when swap submitted)
-      - on_buy_filled      (fires when swap confirmed)  -> forwards to exit engine
-      - on_buy_failed      (fires when swap fails)
-- Optional /health endpoint (aiohttp present + HEALTH_PORT set).
-- Optional Sentry init (SENTRY_DSN).
-- Degrades gracefully if optional dependencies are missing.
-
-This build also wires:
-- auto_exit_worker.exit_engine for on_buy_filled → Redis exit_request:* keys.
-- risk_manager loop + exit_worker loop (scheduled later in main()).
+High-level responsibilities:
+- Hardened startup, logging, and shutdown.
+- DSN normalizer -> asyncpg-safe DSNs from any Render/PG env.
+- Global env config for entry filters, momentum, pools, & cooldowns.
+- Unified router buy wrapper (maybe_buy) with rich buy hooks:
+      - on_buy_submitted (logs + alerts)
+      - on_buy_filled    (alerts + exit_engine + Notion snapshot)
+      - on_buy_failed    (alerts + guardrail telemetry)
+- Momentum/entry env, including ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP.
+- Optional health endpoint (/health) if aiohttp & HEALTH_PORT present.
+- Optional Sentry initialisation when SENTRY_DSN is set.
+- Wires exit_engine + risk_manager + legacy sell_loop (actual loops in part 2).
 """
 
 # ---------------------------
-# Optional deps (Telegram / PG / Sentry / Health)
+# Optional deps (HTTP / PG / Sentry / Health)
 # ---------------------------
 try:
     import httpx
@@ -74,10 +68,11 @@ try:
 except Exception:  # pragma: no cover
     class _C:
         ENABLE_RAYDIUM_SCANNER = True
+
     C = _C()  # type: ignore
 
 # ---------------------------
-# Logging (robust + collision-safe)
+# Logging (robust + collision-safe helpers)
 # ---------------------------
 import logging
 import threading
@@ -85,10 +80,26 @@ import time
 
 # Reserved LogRecord keys we must NOT place inside `extra`
 _RESERVED: set[str] = {
-    "name", "msg", "message", "levelname", "levelno", "pathname",
-    "filename", "module", "exc_info", "exc_text", "stack_info",
-    "lineno", "funcName", "created", "msecs", "relativeCreated",
-    "thread", "threadName", "process", "processName",
+    "name",
+    "msg",
+    "message",
+    "levelname",
+    "levelno",
+    "pathname",
+    "filename",
+    "module",
+    "exc_info",
+    "exc_text",
+    "stack_info",
+    "lineno",
+    "funcName",
+    "created",
+    "msecs",
+    "relativeCreated",
+    "thread",
+    "threadName",
+    "process",
+    "processName",
 }
 
 _last_every: Dict[str, float] = {}
@@ -98,7 +109,7 @@ _every_lock = threading.Lock()
 def _add_safe_extra(fields: Dict[str, Any]) -> Dict[str, Any]:
     """
     Copy fields, but rename any reserved logging keys so we never get:
-      KeyError: "Attempt to overwrite 'msg' in LogRecord"
+        KeyError: "Attempt to overwrite 'msg' in LogRecord"
     """
     safe: Dict[str, Any] = {}
     for k, v in fields.items():
@@ -127,7 +138,6 @@ def _attach_log_helpers_base(_log: logging.Logger):
             _last_every[_key] = now
         _log.info(f"[every {n}s] {_key}", extra=_add_safe_extra(fields))
 
-    # Only attach if not already present
     if not hasattr(_log, "event"):
         _log.event = event  # type: ignore[attr-defined]
     if not hasattr(_log, "every"):
@@ -136,12 +146,12 @@ def _attach_log_helpers_base(_log: logging.Logger):
 
 
 try:
-    # Use real logging if available
+    # Preferred logging setup from logging_setup
     from logging_setup import get_logger, bump, start_global_heartbeat
 
     _base_log = get_logger()
 except Exception:  # pragma: no cover
-    # Emergency fallback: simple stdout logger
+    # Emergency fallback: stdout logger
     class DummyLogger(logging.Logger):
         def __init__(self):
             super().__init__("dummy")
@@ -172,7 +182,7 @@ except Exception:  # pragma: no cover
 
     _base_log = DummyLogger()
 
-# Final logger object used everywhere
+# Final logger used everywhere
 log = _attach_log_helpers_base(_base_log)
 
 # ---------------------------
@@ -183,6 +193,7 @@ try:
 except Exception:  # pragma: no cover
     def _pp_normalize(s: str) -> str:  # type: ignore
         return s.strip()
+
 
 try:
     from utils_pkg.mint_guard import (
@@ -202,7 +213,7 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 
 def _dryrun_env_on() -> bool:
-    # honour any of these
+    # honour any of these flags
     return _env_bool("DRYRUN") or _env_bool("DRY_RUN") or _env_bool("IS_DRYRUN")
 
 
@@ -227,8 +238,8 @@ except Exception:  # pragma: no cover
 
     _pkg_is_dryrun = True  # type: ignore[assignment]
 
-# Exit engine + worker come from auto_exit_worker (this is the thing that enqueues
-# exit_request:* keys into Redis, which the worker consumes).
+# Exit engine + worker: the engine enqueues exit_request:* in Redis,
+# and the worker consumes them. (Loops wired in part 2.)
 try:
     from utils_pkg.auto_exit_worker import exit_worker_loop, exit_engine  # type: ignore
 except Exception:  # pragma: no cover
@@ -249,6 +260,7 @@ except Exception:  # pragma: no cover
     def claim_once(_key: str, _ttl: int = 3600) -> bool:  # type: ignore
         return True
 
+
 try:
     from utils_pkg.guardrails import buys_allowed, record_buy_result
 except Exception:  # pragma: no cover
@@ -258,29 +270,31 @@ except Exception:  # pragma: no cover
     def record_buy_result(*_args, **_kwargs):  # type: ignore
         return None
 
+
 try:
     from utils_pkg.positions import all as all_positions
 except Exception:  # pragma: no cover
     def all_positions():  # type: ignore
         return []
 
+
 # Optional extra risk loop (separate from auto_exit_worker)
 try:
     from utils_pkg.risk_manager import risk_manager_loop  # type: ignore
 except Exception:  # pragma: no cover
     async def risk_manager_loop(stop_evt: asyncio.Event) -> None:  # type: ignore
-        # No-op if risk manager is not present
         while not stop_evt.is_set():
             await asyncio.sleep(10)
+
 
 # Optional legacy sell-loop worker
 try:
     from utils_pkg.sell_loop import run_sell_loop  # type: ignore
 except Exception:  # pragma: no cover
-    async def run_sell_loop(stop_evt):  # type: ignore
-        # Legacy no-op fallback so main never crashes if module is absent
+    async def run_sell_loop(stop_evt: asyncio.Event) -> None:  # type: ignore
         while not stop_evt.is_set():
             await asyncio.sleep(10)
+
 
 # Router + price helpers
 try:
@@ -298,7 +312,7 @@ except Exception:  # pragma: no cover
 
     _route_get_decimals = None  # type: ignore
 
-# ---------- HOTFIX: wire maybe_buy to router ----------
+# ---------- ROUTER BUY WRAPPER ----------
 import inspect
 
 
@@ -311,6 +325,7 @@ def _safe_log_router_state(event: str, **fields: Any) -> None:
 
 
 def _candidate_buy_names() -> list[str]:
+    # Preferred stable names first, then common variants.
     return [
         "maybe_buy",
         "buy",
@@ -330,7 +345,8 @@ def _candidate_buy_names() -> list[str]:
 def _pick_router_buy_callable() -> Optional[tuple[str, Any]]:
     """
     Try to discover a buy-capable function on utils_pkg.router.
-    Prefer well-known names, then fall back to anything with 'buy' in the name.
+    Prefer well-known names, then fall back to any function with 'buy'
+    in its name (excluding sell/quote helpers).
     """
     if router is None:
         return None
@@ -341,10 +357,11 @@ def _pick_router_buy_callable() -> Optional[tuple[str, Any]]:
         if callable(fn):
             return name, fn
 
-    # 2) Fallback: anything with 'buy' in its name (excluding sell/quote helpers)
+    # 2) Fallback: any function with 'buy' in name, excluding sell/quote.
     try:
-        names = [n for n in dir(router) if "buy" in n.lower()]
-        for n in names:
+        for n in dir(router):
+            if "buy" not in n.lower():
+                continue
             low = n.lower()
             if any(bad in low for bad in ("sell", "quote")):
                 continue
@@ -361,6 +378,7 @@ def _compute_spend_sol(ui: Dict[str, Any]) -> float:
     Decide how much SOL to spend for a buy, preferring explicit UI overrides,
     then env hints, then a tiny default.
     """
+    # 1) UI overrides from scanner/strategy
     for k in ("spend_sol", "buy_size_sol", "amount_sol"):
         try:
             v = ui.get(k)
@@ -372,6 +390,7 @@ def _compute_spend_sol(ui: Dict[str, Any]) -> float:
         except Exception:
             continue
 
+    # 2) Env hints
     for envk in ("ENTRY_BUY_SOL", "ENTRY_SPEND_SOL", "INITIAL_BUY_SOL"):
         try:
             v = float(os.getenv(envk, "0"))
@@ -380,7 +399,8 @@ def _compute_spend_sol(ui: Dict[str, Any]) -> float:
         except Exception:
             continue
 
-    return 0.02  # ultra-safe default if nothing else is configured
+    # 3) Fallback: ultra-safe tiny default
+    return 0.02
 
 
 def _env_slippage_bps() -> int:
@@ -400,7 +420,7 @@ def _build_kwargs_for_router(
 ) -> Dict[str, Any]:
     """
     Introspect the router buy function and pass only parameters it expects.
-    This lets us remain compatible across refactors of utils_pkg.router.
+    This keeps us forwards-compatible across refactors of utils_pkg.router.
     """
     kwargs: Dict[str, Any] = {}
     try:
@@ -525,6 +545,7 @@ async def maybe_buy(
 ) -> Optional[str]:
     """
     Unified buy entrypoint for the rest of the script.
+
     Picks the best buy-capable function from utils_pkg.router and calls it
     with hooks for:
       - on_buy_submitted
@@ -574,7 +595,7 @@ async def maybe_buy(
                 return v
     return None
 
-# ---------- /HOTFIX ----------
+# ---------- /ROUTER BUY WRAPPER ----------
 
 # Liquidity screen (optional fallback)
 try:
@@ -583,26 +604,30 @@ except Exception:  # pragma: no cover
     async def screen_token(_mint: str):  # type: ignore
         return True, {"ok": True}
 
+
 # Optional price feed tidy shutdown
 try:
     from utils_pkg.price_feed import close as pricefeed_close
 except Exception:  # pragma: no cover
-    async def pricefeed_close():
+    async def pricefeed_close() -> None:
         return None
 
-# Optional Telegram text sender (for buy hooks)
+
+# Optional Telegram text sender (for debug paths)
 try:
     from utils_pkg.telegram_utils import send_text as _tg_send_text  # type: ignore
 except Exception:  # pragma: no cover
     _tg_send_text = None  # type: ignore
 
-# Raydium scanner (lazy import)
+
+# Raydium scanner (lazy import – actual usage in part 2)
 def _get_raydium_scanner():
     try:
         from scanner.raydium_scanner import scan_raydium  # type: ignore
         return scan_raydium
     except Exception:
         return None
+
 
 # --- Solana tx confirmation helpers ---
 def _rpc_url() -> str:
@@ -669,33 +694,39 @@ async def _confirm_sig(sig: str) -> Tuple[bool, Optional[str]]:
 # ---------------------------
 # ENV helpers
 # ---------------------------
-# --- Telegram debug for momentum skips ---------------------------------
-
 def _as_bool(s: str, default: bool = False) -> bool:
     try:
         return s.strip().lower() in ("1", "true", "yes", "on")
     except Exception:
         return default
 
+
 CANDIDATE_DEBUG_ENABLED = _as_bool(os.getenv("CANDIDATE_DEBUG_ENABLED", "0"), False)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("ALERTS_TELEGRAM_BOT_TOKEN")
-TELEGRAM_DEBUG_CHAT_ID = os.getenv("TELEGRAM_DEBUG_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv(
+    "ALERTS_TELEGRAM_BOT_TOKEN"
+)
+TELEGRAM_DEBUG_CHAT_ID = os.getenv("TELEGRAM_DEBUG_CHAT_ID") or os.getenv(
+    "TELEGRAM_CHAT_ID"
+)
+
 
 async def _send_telegram_debug(msg: str) -> None:
-    # fire-and-forget tiny debug message to Telegram
+    """
+    Fire-and-forget tiny debug message to Telegram (for candidate / momentum
+    debugging). Completely optional and never allowed to crash the process.
+    """
     if not CANDIDATE_DEBUG_ENABLED:
         return
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_DEBUG_CHAT_ID:
         return
     if aiohttp is None:
-        # library not available; silently skip
         return
 
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
-            "chat_id": TELEGRAM_DEBUG_CHAT_ID,  # use the debug channel
-            "text": msg[:1000],  # hard cap to avoid crazy-long messages
+            "chat_id": TELEGRAM_DEBUG_CHAT_ID,
+            "text": msg[:1000],
             "disable_web_page_preview": True,
         }
         timeout = aiohttp.ClientTimeout(total=5)
@@ -703,10 +734,13 @@ async def _send_telegram_debug(msg: str) -> None:
             await session.post(url, json=payload)
     except Exception:
         # Debug only – never crash on failure
-        try:
-            print("[telegram-debug] failed to send message", file=sys.stderr, flush=True)
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            print(
+                "[telegram-debug] failed to send message",
+                file=sys.stderr,
+                flush=True,
+            )
+
 
 def _as_float(val: Any, default: float) -> float:
     try:
@@ -797,13 +831,28 @@ DEDUPE_ENABLED = _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True)
 DEDUPE_TTL_SEC = _as_int(os.getenv("PF_DEDUPE_TTL_SEC", "3600"), 3600)
 LIQ_FILTER_ENABLED = _as_bool(os.getenv("ENTRY_LIQ_FILTER", "1"), True)
 
+# Momentum / entry window (Strategy wiring is in part 2)
 ENTRY_MOMENTUM_ENABLED = _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True)
 ENTRY_MOMO_WINDOW_SEC = _as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10)
 ENTRY_MOMO_MIN_TRADES = _as_int(os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6)
 ENTRY_MOMO_MIN_UP_PCT = _as_float(os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0)
 ENTRY_MOMO_PRICE_TRIES = _as_int(os.getenv("ENTRY_MOMO_PRICE_TRIES", "4"), 4)
-ENTRY_MOMO_PRICE_DELAY_S = _as_float(os.getenv("ENTRY_MOMO_PRICE_DELAY_S", "0.7"), 0.7)
-ENTRY_MOMO_MAX_PARALLEL = max(1, _as_int(os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"), 6))
+ENTRY_MOMO_PRICE_DELAY_S = _as_float(
+    os.getenv("ENTRY_MOMO_PRICE_DELAY_S", "0.7"), 0.7
+)
+ENTRY_MOMO_MAX_PARALLEL = max(
+    1, _as_int(os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"), 6)
+)
+
+# NEW: allow momentum gate to proceed even if we don't have full data for pump.fun
+# backfill / low-liquidity cases (default false for safety).
+ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP = _as_bool(
+    os.getenv(
+        "ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP",
+        os.getenv("ENTRY_MOMO_ALLOW_NO_DATA", "0"),
+    ),
+    False,
+)
 
 MIN_INITIAL_BUY_SOL = _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
 MAX_NAME_LEN = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
@@ -853,7 +902,7 @@ PF_GATE_TTL_SEC = _as_int(
 )
 PF_BUY_TTL_SEC = _as_int(os.getenv("PF_BUY_TTL_SEC", "600"), 600)
 
-# Buy-hook Telegram toggles (optional) – keep defaults to ON for visibility
+# Buy-hook Telegram toggles (optional) – defaults ON for visibility
 NOTIFY_BUY_SUBMITTED = _as_bool(os.getenv("NOTIFY_BUY_SUBMITTED", "1"), True)
 NOTIFY_BUY_FAILED = _as_bool(os.getenv("NOTIFY_BUY_FAILED", "1"), True)
 NOTIFY_BUY_FILLED = _as_bool(os.getenv("NOTIFY_BUY_FILLED", "1"), True)
@@ -862,7 +911,7 @@ NOTIFY_BUY_FILLED = _as_bool(os.getenv("NOTIFY_BUY_FILLED", "1"), True)
 HEALTH_PORT = _as_int(os.getenv("HEALTH_PORT", "0"), 0)
 SENTRY_DSN = (os.getenv("SENTRY_DSN") or "").strip()
 
-# Risk manager toggles (loop wired in part 2)
+# Risk manager toggles (loop wired later in part 2)
 RISK_MANAGER_ENABLED = _as_bool(os.getenv("RISK_MANAGER_ENABLED", "1"), True)
 RISK_MANAGER_POLL_SEC = _as_float(
     os.getenv("RISK_MANAGER_POLL_SEC", "60"), 60.0
@@ -937,7 +986,7 @@ def utc_today_iso() -> str:
 
 
 # ---------------------------
-# Basic filters
+# Basic filters (pre-momentum / pre-expensive work)
 # ---------------------------
 def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
     """
@@ -961,7 +1010,7 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
     if not is_raydium and typ != "create":
         return False
 
-    # Minimum initial buy (Sol) for non-Raydium events
+    # Minimum initial buy (SOL) for non-Raydium events
     init_buy = _as_float(
         _get_first(msg, "initialBuy", "initial_buy", default=0.0),
         0.0,
@@ -1042,6 +1091,11 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
 # Post-buy optional immediate sell test
 # ---------------------------
 async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
+    """
+    Optional post-buy path: if POSTBUY_MODE=immediate_sell_test, do a
+    quick Jupiter sell to verify routing & slippage behaviour in DRYRUN
+    environments. No-op in live mode.
+    """
     if str(os.getenv("POSTBUY_MODE", "")).strip().lower() != "immediate_sell_test":
         return
     await asyncio.sleep(5)
@@ -1112,6 +1166,10 @@ async def _await_mint_ready(
 # Boot: ensure keypair file
 # ---------------------------
 def _ensure_keypair_file() -> None:
+    """
+    Make sure ~/.config/solana/id.json exists. If not, and KEYPAIR_JSON /
+    SOLANA_KEYPAIR_JSON is provided, write it with chmod 600.
+    """
     import pathlib
     import stat
 
@@ -1214,7 +1272,10 @@ _LAST_NOTION_PUSH_TS: float = 0.0
 
 
 async def _notion_intraday_snapshot_push(note: str = "") -> None:
-    """Lightweight intraday push to Notion after a buy fill (debounced)."""
+    """
+    Lightweight intraday PnL snapshot push to Notion after a buy fill.
+    Debounced via DAILY_PNL_DEBOUNCE_MIN.
+    """
     import time as _time
 
     global _LAST_NOTION_PUSH_TS
@@ -1227,6 +1288,7 @@ async def _notion_intraday_snapshot_push(note: str = "") -> None:
             return
 
         # very small snapshot (no price walk); safe + fast
+        # These helper functions are defined later in this file (part 2).
         unrl, open_n, _ = await _estimate_unrealized_from_positions()
         realized, _ = await _estimate_realized_today()
         wallet = await _get_wallet_sol_balance()
@@ -1343,7 +1405,7 @@ async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
                 extra={"err": str(_e)[:200]},
             )
 
-    # Optional telemetry
+    # Optional telemetry for guardrails / analytics
     try:
         record_buy_result(
             ok=False,
@@ -1379,13 +1441,20 @@ class Strategy:
             "events_new_token": 0,
             "rejected_filters": 0,
             "rejected_guardrails": 0,
-            "rejected_momo": 0,          # includes no-data skips
+            "rejected_momo": 0,  # includes strict momentum rejections
             "buys_submitted": 0,
             "buys_filled": 0,
         }
 
     # --- DIAGNOSTICS -----------------------------------------------------
-    async def diag_loop(self, stop_evt: asyncio.Event, interval_s: float = 60.0) -> None:
+    async def diag_loop(
+        self,
+        stop_evt: asyncio.Event,
+        interval_s: float = 60.0,
+    ) -> None:
+        """
+        Periodic diagnostics emitter: logs event rate and rejection counts.
+        """
         last_total = 0
         while not stop_evt.is_set():
             await asyncio.sleep(interval_s)
@@ -1407,6 +1476,11 @@ class Strategy:
 
     # --- TRADE TICKS (for momo counts + exit engine) --------------------
     async def on_trade(self, raw_event: Dict[str, Any]) -> None:
+        """
+        Trade ticks:
+          - feed exit_engine for follow-through logic
+          - increment trade counts for momentum windows per mint
+        """
         self._diag["events_total"] += 1
         self._diag["events_trade"] += 1
 
@@ -1436,12 +1510,18 @@ class Strategy:
             st["trades"] = int(st.get("trades", 0)) + 1
 
     # --- MOMENTUM GATE ---------------------------------------------------
-    async def _gate_candidate(self, ui: Dict[str, Any], mint_raw: str, mint_norm: str) -> None:
+    async def _gate_candidate(
+        self,
+        ui: Dict[str, Any],
+        mint_raw: str,
+        mint_norm: str,
+    ) -> None:
         """
         Momentum gate that:
           - waits for a short window
           - counts trades + price move
-          - enforces momentum thresholds
+          - enforces momentum thresholds (Track A)
+          - can optionally bypass strict checks for pump.fun with no data (Track B)
           - runs guardrails
           - finally calls maybe_buy()
         """
@@ -1457,6 +1537,10 @@ class Strategy:
                             flush=True,
                         )
                     return
+
+            # Identify pool for Track B logic
+            pool = str(ui.get("pool") or "").lower()
+            is_pump_pool = pool in ("pump", "pumpfun", "pump.fun")
 
             # Initialise gate state for this mint (keyed by raw mint so it matches on_trade)
             self._gate_state[mint_raw] = {"trades": 0, "price0": 0.0}
@@ -1492,78 +1576,116 @@ class Strategy:
             # Always clear gate state for this mint from here
             self._gate_state.pop(mint_raw, None)
 
-            # ---- STRICT NO-DATA / DEAD-COIN GUARD -----------------------
-            if price0 <= 0.0 or price1 <= 0.0 or trades == 0:
+            # ---- NO-DATA / DEAD-COIN GUARD + TRACK B OVERRIDE -----------
+            no_data = (price0 <= 0.0 or price1 <= 0.0 or trades == 0)
+
+            if no_data:
+                # TRACK B: pump hunter mode – allow no-data for pump.fun when flag is on
+                if is_pump_pool and ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP:
+                    log.event(
+                        "MOMO_BYPASS_NO_DATA_PUMP",
+                        mint=mint_raw,
+                        pool=pool,
+                        trades=trades,
+                        price0=price0,
+                        price1=price1,
+                        min_trades=ENTRY_MOMO_MIN_TRADES,
+                        min_up_pct=ENTRY_MOMO_MIN_UP_PCT,
+                    )
+                    # Telegram debug for visibility
+                    try:
+                        msg = (
+                            f"[MOMO_BYPASS_NO_DATA_PUMP] mint={mint_norm} pool={pool} "
+                            f"trades={trades} price0={price0:.6g} price1={price1:.6g} "
+                            f"min_trades={ENTRY_MOMO_MIN_TRADES} "
+                            f"min_up={ENTRY_MOMO_MIN_UP_PCT}% "
+                            f"flag=ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP"
+                        )
+                        asyncio.create_task(_send_telegram_debug(msg))
+                    except Exception:
+                        pass
+                    # We do NOT increment rejected_momo here — we are explicitly
+                    # choosing to continue and skip strict momentum checks below.
+                    pct_up = 0.0  # just for logging consistency later
+                    up_ok = True
+                    trades_ok = True
+                else:
+                    # TRACK A: strict behaviour (non-pump or flag off) – reject
+                    log.event(
+                        "MOMO_SKIP_NO_DATA",
+                        mint=mint_raw,
+                        pool=pool,
+                        trades=trades,
+                        price0=price0,
+                        price1=price1,
+                        min_trades=ENTRY_MOMO_MIN_TRADES,
+                        min_up_pct=ENTRY_MOMO_MIN_UP_PCT,
+                    )
+                    # Telegram candidate debug (no-data / dead-coin guard)
+                    try:
+                        msg = (
+                            f"[MOMO_SKIP_NO_DATA] mint={mint_norm} pool={pool} "
+                            f"trades={trades} price0={price0:.6g} price1={price1:.6g} "
+                            f"min_trades={ENTRY_MOMO_MIN_TRADES} "
+                            f"min_up={ENTRY_MOMO_MIN_UP_PCT}%"
+                        )
+                        asyncio.create_task(_send_telegram_debug(msg))
+                    except Exception:
+                        pass
+                    try:
+                        record_buy_result(ok=False, reason="momo_no_data")
+                    except Exception:
+                        pass
+                    self._diag["rejected_momo"] += 1
+                    return
+            else:
+                # We have data → use real momentum checks
+                pct_up = ((price1 / max(price0, 1e-12)) - 1.0) * 100.0
+                up_ok = pct_up >= ENTRY_MOMO_MIN_UP_PCT
+                trades_ok = trades >= ENTRY_MOMO_MIN_TRADES
+
                 log.event(
-                    "MOMO_SKIP_NO_DATA",
+                    "MOMO_EVAL",
                     mint=mint_raw,
+                    pool=pool,
                     trades=trades,
                     price0=price0,
                     price1=price1,
+                    pct_up=pct_up,
                     min_trades=ENTRY_MOMO_MIN_TRADES,
                     min_up_pct=ENTRY_MOMO_MIN_UP_PCT,
+                    up_ok=int(up_ok),
+                    trades_ok=int(trades_ok),
                 )
-                # Telegram candidate debug (no-data / dead-coin guard)
-                try:
-                    msg = (
-                        f"[MOMO_SKIP_NO_DATA] mint={mint_norm} "
-                        f"trades={trades} price0={price0:.6g} price1={price1:.6g} "
-                        f"min_trades={ENTRY_MOMO_MIN_TRADES} "
-                        f"min_up={ENTRY_MOMO_MIN_UP_PCT}%"
-                    )
-                    asyncio.create_task(_send_telegram_debug(msg))
-                except Exception:
-                    pass
-                try:
-                    record_buy_result(ok=False, reason="momo_no_data")
-                except Exception:
-                    pass
-                self._diag["rejected_momo"] += 1
-                return
 
-            # Compute percentage move over the window
-            pct_up = ((price1 / price0) - 1.0) * 100.0
+                # If it doesn't meet momentum conditions, bail out
+                if not (up_ok and trades_ok):
+                    try:
+                        reasons = []
+                        if not up_ok:
+                            reasons.append(
+                                f"up {pct_up:.2f}% < {ENTRY_MOMO_MIN_UP_PCT}%"
+                            )
+                        if not trades_ok:
+                            reasons.append(
+                                f"trades {trades} < {ENTRY_MOMO_MIN_TRADES}"
+                            )
+                        msg = (
+                            f"[MOMO_REJECT] mint={mint_norm} pool={pool} "
+                            f"price0={price0:.6g} price1={price1:.6g} "
+                            f"pct_up={pct_up:.2f}% "
+                            f"reasons={'; '.join(reasons) or 'unknown'}"
+                        )
+                        asyncio.create_task(_send_telegram_debug(msg))
+                    except Exception:
+                        pass
 
-            up_ok = pct_up >= ENTRY_MOMO_MIN_UP_PCT
-            trades_ok = trades >= ENTRY_MOMO_MIN_TRADES
-
-            log.event(
-                "MOMO_EVAL",
-                mint=mint_raw,
-                trades=trades,
-                price0=price0,
-                price1=price1,
-                pct_up=pct_up,
-                min_trades=ENTRY_MOMO_MIN_TRADES,
-                min_up_pct=ENTRY_MOMO_MIN_UP_PCT,
-                up_ok=int(up_ok),
-                trades_ok=int(trades_ok),
-            )
-
-            # If it doesn't meet momentum conditions, bail out
-            if not (up_ok and trades_ok):
-                try:
-                    reasons = []
-                    if not up_ok:
-                        reasons.append(f"up {pct_up:.2f}% < {ENTRY_MOMO_MIN_UP_PCT}%")
-                    if not trades_ok:
-                        reasons.append(f"trades {trades} < {ENTRY_MOMO_MIN_TRADES}")
-                    msg = (
-                        f"[MOMO_REJECT] mint={mint_norm} "
-                        f"price0={price0:.6g} price1={price1:.6g} "
-                        f"pct_up={pct_up:.2f}% "
-                        f"reasons={'; '.join(reasons) or 'unknown'}"
-                    )
-                    asyncio.create_task(_send_telegram_debug(msg))
-                except Exception:
-                    pass
-
-                try:
-                    record_buy_result(ok=False, reason="momo_reject")
-                except Exception:
-                    pass
-                self._diag["rejected_momo"] += 1
-                return
+                    try:
+                        record_buy_result(ok=False, reason="momo_reject")
+                    except Exception:
+                        pass
+                    self._diag["rejected_momo"] += 1
+                    return
 
             # ---- Guardrails before executing a buy ----------------------
             if not buys_allowed() or PAUSE_TRADING:
@@ -1623,7 +1745,7 @@ class Strategy:
                 self._diag["buys_submitted"] += 1
 
                 if tx_sig:
-                    # Fire submitted hook again as a safety net
+                    # Fire submitted hook again as a safety net (if router didn't)
                     try:
                         await _buy_hook_submitted({"mint": mint_norm, **ui})
                     except Exception:
@@ -1633,7 +1755,11 @@ class Strategy:
                     if ok:
                         log.info(
                             "BUY_FILLED",
-                            extra={"mint": mint_norm, "tx_sig": tx_sig, "slot": info},
+                            extra={
+                                "mint": mint_norm,
+                                "tx_sig": tx_sig,
+                                "slot": info,
+                            },
                         )
 
                         # Alerts (Telegram/Notion)
@@ -1714,6 +1840,13 @@ class Strategy:
 
     # --- NEW TOKENS (entry point for gating) -----------------------------
     async def on_new_token(self, raw_event: Dict[str, Any]) -> None:
+        """
+        New-token handler from PumpPortal:
+          - top-level guardrails
+          - mint normalization + basic filters
+          - liquidity screening
+          - dedupe & momentum gate (or direct-buy if disabled)
+        """
         DEBUG_LOCAL = DEBUG_TX  # just an alias for readability
         IS_DRYRUN = (_dryrun_env_on() or _pkg_is_dryrun)
 
@@ -1765,7 +1898,9 @@ class Strategy:
             if not ok and str((rep or {}).get("reason")) == "no_account":
                 # Fresh bond curve: wait a bit for mint to become readable
                 dec_from_liq = await _await_mint_ready(
-                    mint_norm, max_wait_s=45, step_s=3.0
+                    mint_norm,
+                    max_wait_s=45,
+                    step_s=3.0,
                 )
                 if dec_from_liq is not None:
                     ok = True
@@ -1777,7 +1912,10 @@ class Strategy:
 
             if not ok:
                 if DEBUG_LOCAL:
-                    print(f"[liquidity] screen failed for {mint_norm}: {rep}", flush=True)
+                    print(
+                        f"[liquidity] screen failed for {mint_norm}: {rep}",
+                        flush=True,
+                    )
                 self._diag["rejected_filters"] += 1
                 return
 
@@ -1852,7 +1990,10 @@ class Strategy:
                     if max_tradeable > 0:
                         try:
                             if len(list(all_positions())) >= max_tradeable:
-                                log.event("BUY_BLOCK_MAX_TRADEABLE", cap=max_tradeable)
+                                log.event(
+                                    "BUY_BLOCK_MAX_TRADEABLE",
+                                    cap=max_tradeable,
+                                )
                                 self._diag["rejected_guardrails"] += 1
                                 return
                         except Exception:
@@ -1877,7 +2018,11 @@ class Strategy:
                         if ok:
                             log.info(
                                 "BUY_FILLED",
-                                extra={"mint": mint_norm, "tx_sig": tx_sig, "slot": info},
+                                extra={
+                                    "mint": mint_norm,
+                                    "tx_sig": tx_sig,
+                                    "slot": info,
+                                },
                             )
 
                             try:
@@ -1957,6 +2102,7 @@ class Strategy:
         # Cooldown between processing new tokens
         await asyncio.sleep(LOOP_COOLDOWN_SEC)
 
+
 # ---------------------------
 # Mint normalization wrappers
 # ---------------------------
@@ -1976,6 +2122,7 @@ def _normalize_from_source(raw: str) -> str:
             pass
     return raw
 
+
 def _is_probable_mint(s: str) -> bool:
     if not s:
         return False
@@ -1985,6 +2132,7 @@ def _is_probable_mint(s: str) -> bool:
         except Exception:
             return False
     return bool(_pp_normalize(s))
+
 
 # ---------------------------
 # Daily PnL helpers  (USES NORMALIZED DSN)
@@ -1997,9 +2145,12 @@ def _fmt_sol(x: Optional[float]) -> str:
     except Exception:
         return str(x)
 
+
 async def _telegram_send(text: str) -> None:
     bot = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-    chat = (os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    chat = (
+        os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or ""
+    ).strip()
     if not (bot and chat and httpx):
         log.event("DAILY_PNL_TG_SKIP", reason="missing_cfg_or_httpx")
         return
@@ -2013,9 +2164,13 @@ async def _telegram_send(text: str) -> None:
         }
         async with httpx.AsyncClient(timeout=15) as cli:  # type: ignore[arg-type]
             r = await cli.post(url, json=payload)
-            log.event("DAILY_PNL_TG_SENT", http_status=getattr(r, "status_code", None))
+            log.event(
+                "DAILY_PNL_TG_SENT",
+                http_status=getattr(r, "status_code", None),
+            )
     except Exception as e:
         log.event("DAILY_PNL_TG_ERROR", error=str(e))
+
 
 async def _pnl_pg_ensure_table() -> None:
     if not asyncpg or not _PNL_DSN_ASYNC:
@@ -2024,7 +2179,8 @@ async def _pnl_pg_ensure_table() -> None:
     try:
         conn = await asyncpg.connect(_PNL_DSN_ASYNC)
         try:
-            await conn.execute("""
+            await conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS daily_pnl (
                     id BIGSERIAL PRIMARY KEY,
                     at_utc TIMESTAMPTZ NOT NULL,
@@ -2035,7 +2191,8 @@ async def _pnl_pg_ensure_table() -> None:
                     notes JSONB,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
-            """)
+            """
+            )
             log.event("DAILY_PNL_PG_READY", dsn=_PG_DSN_MASK)
         finally:
             await conn.close()
@@ -2044,9 +2201,15 @@ async def _pnl_pg_ensure_table() -> None:
             traceback.print_exc()
         log.event("DAILY_PNL_PG_ERROR", when="ensure_table", error=str(e))
 
-async def _pnl_pg_insert_row(*, realized_sol: float, unrealized_sol: float,
-                             open_positions: int, wallet_sol: Optional[float],
-                             notes: Dict[str, Any]) -> None:
+
+async def _pnl_pg_insert_row(
+    *,
+    realized_sol: float,
+    unrealized_sol: float,
+    open_positions: int,
+    wallet_sol: Optional[float],
+    notes: Dict[str, Any],
+) -> None:
     if not asyncpg or not _PNL_DSN_ASYNC:
         log.event("DAILY_PNL_PG_SKIP", reason="no_asyncpg_or_dsn")
         return
@@ -2077,13 +2240,16 @@ async def _pnl_pg_insert_row(*, realized_sol: float, unrealized_sol: float,
             traceback.print_exc()
         log.event("DAILY_PNL_PG_ERROR", when="insert_row", error=str(e))
 
+
 async def _get_wallet_sol_balance() -> Optional[float]:
     try:
         from utils_pkg.wallet import get_sol_balance  # type: ignore
+
         bal = await get_sol_balance()
         return float(bal)
     except Exception:
         return None
+
 
 async def _estimate_unrealized_from_positions() -> Tuple[float, int, Dict[str, Any]]:
     total_unrl = 0.0
@@ -2098,7 +2264,12 @@ async def _estimate_unrealized_from_positions() -> Tuple[float, int, Dict[str, A
             mint = str(p.get("mint") or p.get("token") or "")
             if not mint:
                 continue
-            qty = float(p.get("amount") or p.get("qty") or p.get("size") or 0) or 0.0
+            qty = float(
+                p.get("amount")
+                or p.get("qty")
+                or p.get("size")
+                or 0
+            ) or 0.0
             if qty <= 0:
                 continue
             cost = float(
@@ -2132,21 +2303,29 @@ async def _estimate_unrealized_from_positions() -> Tuple[float, int, Dict[str, A
             continue
     return total_unrl, open_n, details
 
+
 async def _estimate_realized_today() -> Tuple[float, Dict[str, Any]]:
     try:
         from utils_pkg.realized import realized_today_sol  # type: ignore
+
         v = await realized_today_sol()
         return float(v or 0.0), {"source": "utils_pkg.realized.realized_today_sol"}
     except Exception:
         pass
     try:
         # NOTE: Postgres-backed realized_from_positions (if implemented)
-        from utils_pkg.positions_pg import realized_today_sol as pg_realized_today_sol  # type: ignore
+        from utils_pkg.positions_pg import (  # type: ignore
+            realized_today_sol as pg_realized_today_sol,
+        )
+
         v = await pg_realized_today_sol()
-        return float(v or 0.0), {"source": "utils_pkg.positions_pg.realized_today_sol"}
+        return float(v or 0.0), {
+            "source": "utils_pkg.positions_pg.realized_today_sol"
+        }
     except Exception:
         pass
     return 0.0, {"source": "fallback_zero"}
+
 
 async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
     if not DAILY_PNL_ENABLED:
@@ -2159,7 +2338,10 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
         nonlocal _last_sent_ts
         now_ts = _dt.datetime.now(_dt.timezone.utc).timestamp()
         if _last_sent_ts and (now_ts - _last_sent_ts) < (DAILY_PNL_DEBOUNCE_MIN * 60):
-            log.event("DAILY_PNL_DEBOUNCE_SKIP", since_sec=int(now_ts - _last_sent_ts))
+            log.event(
+                "DAILY_PNL_DEBOUNCE_SKIP",
+                since_sec=int(now_ts - _last_sent_ts),
+            )
             return
 
         unrl_sol, open_n, unrl_details = await _estimate_unrealized_from_positions()
@@ -2239,10 +2421,13 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
         with contextlib.suppress(Exception):
             await _once()
 
+
 # ---------------------------
 # Health server (optional)
 # ---------------------------
-async def _maybe_start_health_server(stop_evt: asyncio.Event) -> Optional[asyncio.Task]:
+async def _maybe_start_health_server(
+    stop_evt: asyncio.Event,
+) -> Optional[asyncio.Task]:
     if not (web and HEALTH_PORT > 0):
         return None
     app = web.Application()
@@ -2274,6 +2459,7 @@ async def _maybe_start_health_server(stop_evt: asyncio.Event) -> Optional[asynci
 
     return asyncio.create_task(_waiter(), name="health.server")
 
+
 # ---------------------------
 # Streaming loop (PumpPortal)
 # ---------------------------
@@ -2287,7 +2473,10 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
     """
     strat = Strategy()
     local_stop = stop_evt or asyncio.Event()
-    diag_task = asyncio.create_task(strat.diag_loop(local_stop), name="diag.minute")
+    diag_task = asyncio.create_task(
+        strat.diag_loop(local_stop),
+        name="diag.minute",
+    )
 
     def _mask_uri(obj: Any) -> str:
         try:
@@ -2397,6 +2586,7 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
             diag_task.cancel()
             await asyncio.wait_for(diag_task, timeout=1.5)
 
+
 # ---------------------------
 # Raydium scanner supervisor
 # ---------------------------
@@ -2438,10 +2628,13 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 1.7, 30.0)
 
+
 # ---------------------------
 # Background tasks: scanners, PnL, exit worker, risk manager, health
 # ---------------------------
-async def _start_background_tasks(stop_evt: asyncio.Event) -> Dict[str, asyncio.Task]:
+async def _start_background_tasks(
+    stop_evt: asyncio.Event,
+) -> Dict[str, asyncio.Task]:
     tasks: Dict[str, asyncio.Task] = {}
 
     # Raydium scanner
@@ -2509,6 +2702,7 @@ async def _start_background_tasks(stop_evt: asyncio.Event) -> Dict[str, asyncio.
 
     return tasks
 
+
 async def _graceful_shutdown(
     stop_evt: asyncio.Event,
     sell_task: Optional[asyncio.Task],
@@ -2532,6 +2726,7 @@ async def _graceful_shutdown(
     with contextlib.suppress(Exception):
         await pricefeed_close()
 
+
 # ---------------------------
 # Sentry (optional)
 # ---------------------------
@@ -2541,11 +2736,14 @@ def _maybe_init_sentry() -> None:
     try:
         sentry_sdk.init(
             dsn=SENTRY_DSN,
-            traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0")),
+            traces_sample_rate=float(
+                os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0")
+            ),
         )
         log.event("SENTRY_INIT_OK")
     except Exception as e:
         log.event("SENTRY_INIT_FAIL", error=str(e))
+
 
 # ---------------------------
 # Main
@@ -2563,7 +2761,8 @@ def _boot_banner() -> None:
         f"MOMO: on={int(ENTRY_MOMENTUM_ENABLED)} "
         f"window={ENTRY_MOMO_WINDOW_SEC}s "
         f"min_trades={ENTRY_MOMO_MIN_TRADES} "
-        f"min_up={ENTRY_MOMO_MIN_UP_PCT}%\n"
+        f"min_up={ENTRY_MOMO_MIN_UP_PCT}% "
+        f"allow_no_data_pump={int(ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP)}\n"
         f"LIQ_FILTER={int(LIQ_FILTER_ENABLED)} | "
         f"EXIT_ENGINE={int(EXIT_ENGINE_ENABLED)} | "
         f"MAX_TRADEABLE={MAX_TRADEABLE}\n"
@@ -2572,6 +2771,7 @@ def _boot_banner() -> None:
         "===========================\n",
         flush=True,
     )
+
 
 def _env_hints() -> None:
     if not (os.getenv("KEYPAIR_JSON") or os.getenv("SOLANA_KEYPAIR_JSON")):
@@ -2593,7 +2793,9 @@ def _env_hints() -> None:
             note="daily pnl persistence disabled",
         )
 
+
 async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
+    # Heartbeat + boot bump
     with contextlib.suppress(Exception):
         start_global_heartbeat(
             log,
@@ -2606,6 +2808,7 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     _env_hints()
     _ensure_keypair_file()
 
+    # Optional router pre-init
     try:
         if router and hasattr(router, "start"):
             await router.start()
@@ -2667,6 +2870,7 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
         except Exception:
             pass
         await _graceful_shutdown(local_stop, sell_task, bg_tasks)
+
 
 if __name__ == "__main__":
     try:

@@ -12,11 +12,12 @@ log = logging.getLogger("sniper.exit_engine")
 # Env helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def _env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
     if v is None:
         return default
-    return str(v).lower() in ("1", "true", "t", "yes", "y", "on")
+    return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
 
 def _env_int(key: str, default: int) -> int:
@@ -59,11 +60,13 @@ EXIT_FOLLOW_MIN_UP_PCT = _env_float("EXIT_FOLLOW_MIN_UP_PCT", 6.0)
 EXIT_FOLLOW_MAX_DD_PCT = _env_float("EXIT_FOLLOW_MAX_DD_PCT", 5.0)
 EXIT_FOLLOW_DEBUG = _env_bool("EXIT_FOLLOW_DEBUG", False)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional: AI-driven / advanced sell engine hook
 # ──────────────────────────────────────────────────────────────────────────────
 
 try:
+    # ai_sell_logic is where the "brains" of exits live (DCA, trailing stops, etc.)
     from utils_pkg import ai_sell_logic as SELL  # type: ignore
 except Exception:  # pragma: no cover
     SELL = None  # type: ignore
@@ -71,6 +74,9 @@ except Exception:  # pragma: no cover
 
 
 def _get_sell_hook(name: str) -> Optional[Callable[..., Any]]:
+    """
+    Resolve a callable from ai_sell_logic, or None if missing.
+    """
     if SELL is None:
         return None
     fn = getattr(SELL, name, None)
@@ -83,6 +89,7 @@ def _get_sell_hook(name: str) -> Optional[Callable[..., Any]]:
 # Fallback direct Jupiter V6 seller
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 async def _direct_sell_via_jup(
     mint: str,
     amount_raw: int,
@@ -92,6 +99,9 @@ async def _direct_sell_via_jup(
     Minimal direct sell path using the same Lightning / Jupiter V6 plumbing as buys.
     Returns:
         tx signature string on success, or None on failure.
+
+    This is a LAST RESORT fallback – primary exit flow should be controlled by
+    ai_sell_logic + dedicated exit worker.
     """
     try:
         from utils_pkg.lightning_impl import sell_via_lightning
@@ -114,6 +124,7 @@ async def _direct_sell_via_jup(
 # ──────────────────────────────────────────────────────────────────────────────
 # In-memory position state for follow-through logic
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class _Pos:
     __slots__ = (
@@ -186,37 +197,73 @@ def _extract_mint(ev: Dict[str, Any]) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core hook: called when a buy has filled
-# (new signature used by Strategy)
+# Core hook: called when a buy has filled (DICT STYLE, primary API)
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def on_buy_filled(mint: str, ui: Dict[str, Any], tx_sig: str) -> None:
-    """
-    Main entrypoint from Strategy / sniper core.
 
-    Args:
-        mint: normalized mint string.
-        ui:   enriched UI dict for the trade (pool, symbol, spend_sol, amount_raw, etc.).
-        tx_sig: entry transaction signature.
+async def on_buy_filled(ev: Dict[str, Any]) -> None:
+    """
+    Primary entrypoint from Strategy / sniper core (dict-style).
+
+    ev: {
+      mint, signature, symbol?, pool?, spend_sol?, amount_raw?,
+      price_entry_ui?, ...
+    }
+
+    - Registers position in the follow-through tracker.
+    - Delegates to ai_sell_logic.schedule_after_buy(...) if present.
+    - Optional tiny Jup probe when AI engine is not available (non-critical).
     """
     if not EXIT_ENGINE_ACTIVE:
         log.info(
             "EXIT_ENGINE_DISABLED",
-            extra={"mint": mint, "symbol": ui.get("symbol"), "pool": ui.get("pool")},
+            extra={
+                "mint": ev.get("mint"),
+                "symbol": ev.get("symbol"),
+                "pool": ev.get("pool"),
+            },
         )
         return
 
-    symbol = ui.get("symbol") or mint[:4]
-    pool = (ui.get("pool") or "unknown").lower()
-    spend_sol = float(ui.get("spend_sol") or 0.0)
-    amount_raw = ui.get("amount_raw")
-    try:
-        if amount_raw is not None:
-            amount_raw = int(amount_raw)
-    except Exception:
-        amount_raw = None
+    mint = _extract_mint(ev) or ""
+    tx_sig = (
+        ev.get("signature")
+        or ev.get("tx_sig")
+        or ev.get("id")
+        or ev.get("tx")
+        or ""
+    )
+    if not mint or not tx_sig:
+        log.warning(
+            "EXIT_HOOK_BAD_EVENT",
+            extra={"ev_keys": list(ev.keys())[:12]},
+        )
+        return
 
-    price = ui.get("price_entry_ui")
+    symbol = (ev.get("symbol") or mint[:4]).strip()
+    pool = (ev.get("pool") or "unknown").lower()
+
+    spend_sol = 0.0
+    for key in ("spend_sol", "buy_size_sol", "amount_sol", "entry_size_sol"):
+        if key in ev and ev[key] is not None:
+            try:
+                spend_sol = float(ev[key])
+                break
+            except Exception:
+                continue
+
+    amount_raw: Optional[int] = None
+    for key in ("amount_raw", "amount_out", "base_amount_raw"):
+        v = ev.get(key)
+        if v is None:
+            continue
+        try:
+            amount_raw = int(v)
+            break
+        except Exception:
+            continue
+
+    price = ev.get("price_entry_ui")
     try:
         price = float(price) if price is not None else None
     except Exception:
@@ -262,56 +309,71 @@ async def on_buy_filled(mint: str, ui: Dict[str, Any], tx_sig: str) -> None:
     schedule_fn = _get_sell_hook("schedule_after_buy")
     if schedule_fn is not None:
         try:
-            ev = dict(ui)
-            ev.update(
+            payload = dict(ev)
+            payload.update(
                 {
                     "mint": mint,
                     "signature": tx_sig,
                     "ts": time.time(),
+                    "pool": pool,
+                    "symbol": symbol,
+                    "spend_sol": spend_sol,
+                    "amount_raw": amount_raw,
                 }
             )
-            await schedule_fn(ev)
+            await schedule_fn(payload)
             log.info(
                 "EXIT_SCHED_OK",
-                extra={"mint": mint, "symbol": symbol, "engine": "ai_sell_logic.schedule_after_buy"},
+                extra={
+                    "mint": mint,
+                    "symbol": symbol,
+                    "engine": "ai_sell_logic.schedule_after_buy",
+                },
             )
+            return
         except Exception as e:  # pragma: no cover - defensive log
             log.warning(
                 "EXIT_SCHED_FAIL_AI",
-                extra={"mint": mint, "symbol": symbol, "err": str(e)[:200]},
+                extra={
+                    "mint": mint,
+                    "symbol": symbol,
+                    "err": str(e)[:200],
+                },
             )
-    else:
-        # Optional: tiny Jup probe just to confirm sellability (same as old behavior)
-        probe_sol = max(MIN_SELL_SOL, spend_sol * 0.10) if spend_sol > 0 else MIN_SELL_SOL
-        probe_raw = int(probe_sol * LAMPORTS_PER_SOL)
 
-        if DRYRUN:
-            log.info(
-                "EXIT_FALLBACK_DRYRUN",
-                extra={
-                    "mint": mint,
-                    "symbol": symbol,
-                    "probe_sol": probe_sol,
-                    "pool": pool,
-                },
-            )
-        else:
-            sig = await _direct_sell_via_jup(mint=mint, amount_raw=probe_raw)
-            log.info(
-                "EXIT_FALLBACK_RESULT",
-                extra={
-                    "mint": mint,
-                    "symbol": symbol,
-                    "probe_sol": probe_sol,
-                    "pool": pool,
-                    "sig": sig,
-                },
-            )
+    # No AI sell engine available → optional tiny Jup probe to confirm sellability
+    probe_sol = max(MIN_SELL_SOL, spend_sol * 0.10) if spend_sol > 0 else MIN_SELL_SOL
+    probe_raw = int(probe_sol * LAMPORTS_PER_SOL)
+
+    if DRYRUN:
+        log.info(
+            "EXIT_FALLBACK_DRYRUN",
+            extra={
+                "mint": mint,
+                "symbol": symbol,
+                "probe_sol": probe_sol,
+                "pool": pool,
+            },
+        )
+        return
+
+    sig = await _direct_sell_via_jup(mint=mint, amount_raw=probe_raw)
+    log.info(
+        "EXIT_FALLBACK_RESULT",
+        extra={
+            "mint": mint,
+            "symbol": symbol,
+            "probe_sol": probe_sol,
+            "pool": pool,
+            "sig": sig,
+        },
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Trade tick hook: feeds both AI engine and follow-through logic
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 async def on_trade_tick(raw_event: Dict[str, Any]) -> None:
     """
@@ -388,7 +450,8 @@ async def on_trade_tick(raw_event: Dict[str, Any]) -> None:
 
     if pos.entry_price and pos.min_price:
         dd_pct = (pos.min_price / pos.entry_price - 1.0) * 100.0
-        dd_ok = dd_pct >= -EXIT_FOLLOW_MAX_DD_PCT  # dd_pct is negative when down
+        # dd_pct is negative when the price is below entry
+        dd_ok = dd_pct >= -EXIT_FOLLOW_MAX_DD_PCT
 
     follow_pass = trades_ok and up_ok and dd_ok
 
@@ -460,13 +523,22 @@ async def on_trade_tick(raw_event: Dict[str, Any]) -> None:
             )
             log.info(
                 "EXIT_FOLLOW_DELEGATED",
-                extra={"mint": pos.mint, "symbol": pos.symbol, "engine_hook": hook_name},
+                extra={
+                    "mint": pos.mint,
+                    "symbol": pos.symbol,
+                    "engine_hook": hook_name,
+                },
             )
             return
         except Exception as e:  # pragma: no cover
             log.warning(
                 "EXIT_FOLLOW_ENGINE_FAIL",
-                extra={"mint": pos.mint, "symbol": pos.symbol, "hook": hook_name, "err": str(e)[:200]},
+                extra={
+                    "mint": pos.mint,
+                    "symbol": pos.symbol,
+                    "hook": hook_name,
+                    "err": str(e)[:200],
+                },
             )
 
     # Final fallback: tiny direct sell, just like in on_buy_filled.
@@ -475,36 +547,35 @@ async def on_trade_tick(raw_event: Dict[str, Any]) -> None:
     sig = await _direct_sell_via_jup(mint=pos.mint, amount_raw=probe_raw)
     log.info(
         "EXIT_FOLLOW_FALLBACK_SELL",
-        extra={"mint": pos.mint, "symbol": pos.symbol, "probe_sol": probe_sol, "sig": sig},
+        extra={
+            "mint": pos.mint,
+            "symbol": pos.symbol,
+            "probe_sol": probe_sol,
+            "sig": sig,
+        },
     )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Legacy on_buy_filled signature (dict event)
+# Legacy wrappers
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 async def on_buy_filled_event(ev: Dict[str, Any]) -> None:
     """
-    Backwards-compatible wrapper for call sites that pass a single event dict.
-    We adapt it into the (mint, ui, tx_sig) signature used by Strategy.
+    Backwards-compatible name for call sites that already pass a single event dict.
+    Just forwards to on_buy_filled(ev).
     """
-    mint = ev.get("mint") or ""
-    tx_sig = ev.get("signature") or ev.get("tx_sig") or ""
-    if not mint or not tx_sig:
-        log.warning("EXIT_HOOK_BAD_EVENT", extra={"ev_keys": list(ev.keys())[:10]})
-        return
-
-    ui = dict(ev)
-    ui.pop("mint", None)
-    ui.pop("signature", None)
-    ui.setdefault("pool", ui.get("pool") or "legacy")
-    ui.setdefault("symbol", ui.get("symbol") or mint[:4])
-
-    await on_buy_filled(mint=mint, ui=ui, tx_sig=tx_sig)
+    await on_buy_filled(ev)
 
 
-# Old name kept for compatibility with previous versions
 async def on_buy_filled_legacy(raw_id_or_mint: str, tx_sig: str) -> None:
+    """
+    Old positional signature kept for compatibility with previous versions.
+
+    main.py calls this only in a TypeError fallback path, so it's fine if it
+    is rarely used.
+    """
     ev: Dict[str, Any] = {
         "mint": raw_id_or_mint,
         "signature": tx_sig,
@@ -513,4 +584,4 @@ async def on_buy_filled_legacy(raw_id_or_mint: str, tx_sig: str) -> None:
         "pool": "legacy",
         "ts": time.time(),
     }
-    await on_buy_filled_event(ev)
+    await on_buy_filled(ev)

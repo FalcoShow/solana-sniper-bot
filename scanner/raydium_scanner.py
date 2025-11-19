@@ -1,6 +1,6 @@
 # scanner/raydium_scanner.py
-# Raydium scanner via Dexscreener — feeds normalized "meta" into
-# utils_pkg.pair_filters so we only surface live, tradable runners.
+# Raydium scanner via Dexscreener — builds "meta" dicts compatible with
+# utils_pkg.pair_filters and surfaces only high-quality runners.
 from __future__ import annotations
 
 import os
@@ -8,6 +8,7 @@ import ssl
 import asyncio
 import logging
 import contextlib
+import time
 from typing import List, Dict, Any, Optional, Tuple
 
 import aiohttp
@@ -19,6 +20,12 @@ from config import (
     PF_SCAN_MAX_TOKEN_AGE_MIN,
 )
 
+# Optional whale-size hint; safe fallback if not present
+try:
+    from config import PF_SCAN_MIN_WHALE_SIZE_SOL  # type: ignore
+except Exception:  # pragma: no cover
+    PF_SCAN_MIN_WHALE_SIZE_SOL = 3.0  # reasonable default
+
 from utils_pkg.alert_manager import AlertManager
 from utils_pkg.pair_filters import (
     is_viable_pair,
@@ -28,9 +35,9 @@ from utils_pkg.pair_filters import (
 
 logger = logging.getLogger("scanner.raydium")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Env helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _b(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
@@ -60,9 +67,9 @@ def _f(name: str, default: float) -> float:
         return default
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Config / env (Raydium-specific tuning on top of global PF_* thresholds)
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 UA = _s(
     "SCANNER_UA",
@@ -82,6 +89,11 @@ TRUST_ENV = _b("RAYDIUM_TRUST_ENV", True)
 SEND_MOMO_ALERTS = _b("RAYDIUM_SEND_MOMO_ALERTS", True)
 MAX_ALERTS_PER_SCAN = _i("RAYDIUM_MAX_ALERTS_PER_SCAN", 3)
 
+# Optional AI / whales enrichment toggles. Safe to leave off if infra is not ready.
+AI_RUG_ENABLED = _b("RAYDIUM_AI_RUG_ENABLED", False)
+AI_RUG_MAX_PER_SCAN = _i("RAYDIUM_AI_RUG_MAX_PER_SCAN", 15)
+WHALES_ENABLED = _b("RAYDIUM_WHALES_ENABLED", False)
+
 # You can override the search queries; all results are filtered to dexId=raydium anyway.
 SEARCH_QUERIES = [
     q.strip()
@@ -94,10 +106,9 @@ SOFT_MIN_LIQ_USD = _f("RAYDIUM_SOFT_MIN_LIQ_USD", PF_SCAN_MIN_LIQ_USD * 0.4)
 SOFT_MIN_MCAP_USD = _f("RAYDIUM_SOFT_MIN_MCAP_USD", PF_SCAN_MIN_MCAP_USD * 0.4)
 SOFT_MAX_AGE_MIN = _f("RAYDIUM_SOFT_MAX_AGE_MIN", PF_SCAN_MAX_TOKEN_AGE_MIN * 1.2)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _headers() -> Dict[str, str]:
     return {
@@ -133,8 +144,7 @@ def _age_min(pair_created_ms: Optional[int]) -> Optional[float]:
         t_ms = int(pair_created_ms)
         if t_ms <= 0:
             return None
-        import time as _time
-        diff_s = max(0.0, (_time.time() - (t_ms / 1000.0)))
+        diff_s = max(0.0, (time.time() - (t_ms / 1000.0)))
         return diff_s / 60.0
     except Exception:
         return None
@@ -145,9 +155,9 @@ def _buy_ratio(buys: int, sells: int) -> float:
     return float(buys) / float(total)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # HTTP
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 async def _fetch_json(
     session: aiohttp.ClientSession,
@@ -176,11 +186,15 @@ async def _fetch_json(
                         try:
                             return _json.loads(text), status, first
                         except Exception:
-                            logger.warning("Raydium: non-JSON 200 at %s (first=%r)", url, first)
+                            logger.warning(
+                                "Raydium: non-JSON 200 at %s (first=%r)", url, first
+                            )
                             return None, status, first
 
                 if 400 <= r.status < 500 and r.status != 429:
-                    logger.warning("Raydium: HTTP %s at %s (first=%r)", r.status, url, first)
+                    logger.warning(
+                        "Raydium: HTTP %s at %s (first=%r)", r.status, url, first
+                    )
                     return None, status, first
 
                 logger.warning(
@@ -208,6 +222,10 @@ async def _fetch_json(
 
 
 async def _fetch_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+    """
+    Pull recent Raydium pairs from Dexscreener search.
+    We query a few keywords and dedupe by pair address.
+    """
     url = f"{BASE}/latest/dex/search"
     out: List[Dict[str, Any]] = []
     seen_ids: set = set()
@@ -218,6 +236,10 @@ async def _fetch_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
             continue
         pairs = data.get("pairs") or []
         for p in pairs:
+            if (p.get("chainId") or "").lower() != "solana":
+                continue
+            if (p.get("dexId") or "").lower() != "raydium":
+                continue
             pid = p.get("pairAddress") or ((p.get("baseToken") or {}).get("address"))
             if pid and pid not in seen_ids:
                 seen_ids.add(pid)
@@ -225,24 +247,28 @@ async def _fetch_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     return out
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Metric extraction & normalization ⇒ PF meta
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract raw numeric metrics from a Dexscreener Raydium pair and map them
+    into the names expected by utils_pkg.pair_filters.
+    """
     liq_usd = _nz_float((pair.get("liquidity") or {}).get("usd"), 0.0)
 
-    fdv = _nz_float(
+    fdv_usd = _nz_float(
         pair.get("fdv")
         or pair.get("fdvUsd")
         or pair.get("fullyDilutedValuation"),
         0.0,
     )
-    mc = _nz_float(
+    mcap_usd = _nz_float(
         pair.get("marketCap")
         or pair.get("marketCapUsd")
         or pair.get("mcap")
-        or fdv,
+        or fdv_usd,
         0.0,
     )
 
@@ -260,31 +286,20 @@ def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
     buys_24h = _safe_int(h24.get("buys"), 0)
     sells_24h = _safe_int(h24.get("sells"), 0)
 
-    # Approximate 15m from 1h/24h when missing
-    if buys_1h > 0:
-        buys_15m = max(1, buys_1h // 4)
-        sells_15m = max(0, sells_1h // 4)
-    elif buys_24h > 0:
-        buys_15m = max(1, buys_24h // 96)
-        sells_15m = max(0, sells_24h // 96)
-    else:
-        buys_15m = 0
-        sells_15m = 0
-
-    # Volume: Dexscreener mainly has h24
+    # Volume: Dexscreener mainly has h24; approximate lower windows.
     vol = pair.get("volume") or {}
-    vol24 = _nz_float(vol.get("h24"), 0.0)
-    vol5 = vol24 / 288.0 if vol24 > 0 else 0.0
-    vol15 = vol24 / 96.0 if vol24 > 0 else 0.0
+    vol_24h_usd = _nz_float(vol.get("h24"), 0.0)
+    vol_1h_usd = vol_24h_usd / 24.0 if vol_24h_usd > 0 else 0.0
+    vol_5m_usd = vol_1h_usd / 12.0 if vol_1h_usd > 0 else 0.0
 
-    # Price change – Dexscreener usually has h1,h6,h24
+    # Price change – Dexscreener usually has h1, h6, h24; we derive 5m/15m.
     pc = pair.get("priceChange") or {}
-    chg1h = _nz_float(pc.get("h1"), 0.0)
-    chg24h = _nz_float(pc.get("h24"), 0.0)
+    chg_1h_pct = _nz_float(pc.get("h1"), 0.0)
+    chg_24h_pct = _nz_float(pc.get("h24"), 0.0)
 
-    # Rough approximations for 5m / 15m
-    chg5 = chg1h / 12.0 if chg1h else chg24h / 288.0
-    chg15 = chg1h / 4.0 if chg1h else chg24h / 96.0
+    # Rough approximations for 5m / 15m if direct values are missing.
+    chg_5m_pct = chg_1h_pct / 12.0 if chg_1h_pct else chg_24h_pct / 288.0
+    chg_15m_pct = chg_1h_pct / 4.0 if chg_1h_pct else chg_24h_pct / 96.0
 
     price_usd = _nz_float(pair.get("priceUsd"), 0.0)
 
@@ -294,30 +309,48 @@ def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
         or pair.get("pairCreatedAtTs")
     )
     age_min = _age_min(pair_created_ms)
+    token_age_min = age_min if age_min is not None else 9999.0
 
-    # Holders not exposed by Dexscreener; keep 0 (filters only apply when >0)
+    # Holders / holder change are not exposed; we leave at 0 so they do not block.
     holders = 0
+    holders_5m_change = 0
+
+    # Whales: Dexscreener does not expose; approximate from 5m volume + price.
+    whales_5m = 0
+    whale_vol_5m_usd = 0.0
+    largest_buy_5m_sol = 0.0
+    if price_usd > 0 and vol_5m_usd > 0:
+        # Assume largest buy is ~25% of 5m volume for heuristic.
+        approx_largest_buy_usd = vol_5m_usd * 0.25
+        approx_largest_buy_sol = approx_largest_buy_usd / price_usd
+        largest_buy_5m_sol = approx_largest_buy_sol
+        if approx_largest_buy_sol >= float(PF_SCAN_MIN_WHALE_SIZE_SOL):
+            whales_5m = 1
+            whale_vol_5m_usd = approx_largest_buy_usd
 
     return {
         "liq_usd": liq_usd,
-        "fdv_usd": fdv,
-        "mc_usd": mc,
+        "mcap_usd": mcap_usd,
+        "fdv_usd": fdv_usd,
+        "token_age_min": token_age_min,
+        "vol_5m_usd": vol_5m_usd,
+        "vol_1h_usd": vol_1h_usd,
+        "vol_24h_usd": vol_24h_usd,
         "buys_5m": buys_5m,
         "sells_5m": sells_5m,
-        "buys_15m": buys_15m,
-        "sells_15m": sells_15m,
         "buys_1h": buys_1h,
         "sells_1h": sells_1h,
         "buys_24h": buys_24h,
         "sells_24h": sells_24h,
-        "volume_5m_usd": vol5,
-        "volume_15m_usd": vol15,
-        "volume_24h_usd": vol24,
-        "price_change_5m": chg5,
-        "price_change_15m": chg15,
+        "price_change_5m_pct": chg_5m_pct,
+        "price_change_15m_pct": chg_15m_pct,
+        "price_change_1h_pct": chg_1h_pct,
         "price_usd": price_usd,
-        "age_min": age_min,
         "holders": holders,
+        "holders_5m_change": holders_5m_change,
+        "whales_5m": whales_5m,
+        "whale_vol_5m_usd": whale_vol_5m_usd,
+        "largest_buy_5m_sol": largest_buy_5m_sol,
     }
 
 
@@ -336,14 +369,14 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         # Soft prefilter: absolute trash is skipped even before PF logic
         liq_usd = metrics["liq_usd"]
-        mc_usd = metrics["mc_usd"]
-        age_min = metrics["age_min"]
+        mcap_usd = metrics["mcap_usd"]
+        age_min = metrics["token_age_min"]
 
         if liq_usd < SOFT_MIN_LIQ_USD:
             return None
-        if mc_usd < SOFT_MIN_MCAP_USD:
+        if mcap_usd < SOFT_MIN_MCAP_USD:
             return None
-        if age_min is not None and age_min > SOFT_MAX_AGE_MIN:
+        if age_min > SOFT_MAX_AGE_MIN:
             return None
 
         base = pair.get("baseToken") or {}
@@ -355,57 +388,65 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         buys_5m = metrics["buys_5m"]
         sells_5m = metrics["sells_5m"]
-        buys_15m = metrics["buys_15m"]
-        sells_15m = metrics["sells_15m"]
-
         buy_ratio_5m = _buy_ratio(buys_5m, sells_5m)
-        buy_ratio_15m = _buy_ratio(buys_15m, sells_15m)
 
-        url = pair.get("url") or pair.get("pairUrl") or f"https://dexscreener.com/solana/{mint}"
+        url = (
+            pair.get("url")
+            or pair.get("pairUrl")
+            or f"https://dexscreener.com/solana/{mint}"
+        )
 
         meta: Dict[str, Any] = {
             # identity
-            "source": "raydium",
             "dex": "raydium",
             "chain": "solana",
+            "source": "raydium",
             "mint": mint,
             "symbol": symbol,
             "pair_url": url,
 
             # core liquidity / size
             "liq_usd": metrics["liq_usd"],
-            "mc_usd": metrics["mc_usd"],
+            "mcap_usd": metrics["mcap_usd"],
             "fdv_usd": metrics["fdv_usd"],
 
-            # time
-            "pool_age_min": metrics["age_min"],
+            # age
+            "token_age_min": metrics["token_age_min"],
 
             # recent activity
-            "volume_5m_usd": metrics["volume_5m_usd"],
-            "volume_15m_usd": metrics["volume_15m_usd"],
-            "volume_24h_usd": metrics["volume_24h_usd"],
+            "vol_5m_usd": metrics["vol_5m_usd"],
+            "vol_1h_usd": metrics["vol_1h_usd"],
+            "vol_24h_usd": metrics["vol_24h_usd"],
             "buys_5m": buys_5m,
             "sells_5m": sells_5m,
-            "buys_15m": buys_15m,
-            "sells_15m": sells_15m,
-            "buy_ratio_5m": buy_ratio_5m,
-            "buy_ratio_15m": buy_ratio_15m,
             "txns_5m": buys_5m + sells_5m,
             "txns_1h": metrics["buys_1h"] + metrics["sells_1h"],
+            "buy_ratio_5m": buy_ratio_5m,
 
             # price action
-            "price_change_5m": metrics["price_change_5m"],
-            "price_change_15m": metrics["price_change_15m"],
             "price_usd": metrics["price_usd"],
+            "price_change_5m_pct": metrics["price_change_5m_pct"],
+            "price_change_15m_pct": metrics["price_change_15m_pct"],
+            "price_change_1h_pct": metrics["price_change_1h_pct"],
 
-            # holders (Dexscreener doesn’t expose; left as 0)
+            # holders (not available from Dexscreener; left neutral)
             "holders": metrics["holders"],
+            "holders_5m_change": metrics["holders_5m_change"],
 
-            # whale + AI fields (filled by other modules later; defaults are neutral)
-            "whale_buys_5m": 0,
-            "whale_volume_5m_sol": 0.0,
-            "rug_risk_score": None,
-            "ai_notes": "",
+            # whale / AI fields (some filled here, some optional later)
+            "whales_5m": metrics["whales_5m"],
+            "whale_vol_5m_usd": metrics["whale_vol_5m_usd"],
+            "largest_buy_5m_sol": metrics["largest_buy_5m_sol"],
+            "ai_rug_score": 0.0,  # neutral by default
+
+            # security flags (we don't have direct info here, so defaults are safe-ish)
+            "is_honeypot": False,
+            "trading_paused": False,
+            "blacklisted": False,
+            "top10_hold_pct": 0.0,
+            "dev_hold_pct": 0.0,
+            "mint_authority_disabled": True,
+            "freeze_authority_disabled": True,
         }
 
         return meta
@@ -414,9 +455,66 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Optional AI / whales enrichment
+# -----------------------------------------------------------------------------
+
+async def _enrich_ai_and_whales(metas: List[Dict[str, Any]]) -> None:
+    """
+    Best-effort enrichment of meta with:
+      - ai_rug_score (0–1) via utils_pkg.core_utils.ai_fraud_score
+      - basic whale signal via utils_pkg.core_utils.is_whale_wallet
+
+    This is fully optional:
+      - If imports fail, or APIs are down, metas remain usable.
+      - We cap concurrent calls + per-scan count to avoid rate-limit hell.
+    """
+    if not metas:
+        return
+
+    # Lazy imports to avoid hard dependency / cycles.
+    try:
+        from utils_pkg.core_utils import ai_fraud_score, is_whale_wallet  # type: ignore
+    except Exception:
+        # AI / whales not wired; skip silently.
+        return
+
+    sem = asyncio.Semaphore(_i("RAYDIUM_AI_CONCURRENCY", 5))
+    to_process = metas[: AI_RUG_MAX_PER_SCAN] if AI_RUG_ENABLED else []
+
+    async def _handle(meta: Dict[str, Any]) -> None:
+        mint = meta.get("mint")
+        if not isinstance(mint, str) or not mint:
+            return
+        async with sem:
+            # AI rug score
+            if AI_RUG_ENABLED:
+                try:
+                    s01 = await ai_fraud_score(mint)
+                    meta["ai_rug_score"] = max(0.0, min(1.0, float(s01)))
+                except Exception:
+                    pass
+            # Whale presence (coarse)
+            if WHALES_ENABLED:
+                try:
+                    # threshold roughly based on PF_SCAN_MIN_WHALE_SIZE_SOL * price
+                    px = float(meta.get("price_usd") or 0.0)
+                    thresh_usd = float(PF_SCAN_MIN_WHALE_SIZE_SOL) * px if px > 0 else 50_000.0
+                    has_whale = await is_whale_wallet(mint, usd_threshold=thresh_usd)
+                    if has_whale:
+                        # tilt whale metrics upward a bit so filters treat it as "has whales"
+                        meta["whales_5m"] = max(1, int(meta.get("whales_5m") or 0))
+                except Exception:
+                    pass
+
+    tasks = [asyncio.create_task(_handle(m)) for m in to_process]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# -----------------------------------------------------------------------------
 # PF-based filtering & ranking
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _filter_and_rank(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -431,22 +529,24 @@ def _filter_and_rank(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 continue
 
             momentum = compute_momentum_score(meta)
-            final = compute_final_score(meta, momentum=momentum)
+            final = compute_final_score(meta)
 
             m = dict(meta)
             m["momentum_score"] = momentum
             m["final_score"] = final
             out.append(m)
         except Exception as e:
-            logger.debug("Raydium PF filter error for %s: %s", meta.get("mint"), e)
+            logger.debug(
+                "Raydium PF filter error for %s: %s", meta.get("mint"), e
+            )
 
     out.sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
     return out[:LIMIT]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # MOMO event wiring (uses final_score / momentum_score)
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
     """
@@ -465,7 +565,7 @@ async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
     max_n = max(0, min(MAX_ALERTS_PER_SCAN, len(runners)))
     for c in runners[:max_n]:
         try:
-            age_min = c.get("pool_age_min")
+            age_min = c.get("token_age_min")
             age_sec = age_min * 60.0 if isinstance(age_min, (int, float)) else None
             ctx: Dict[str, Any] = {
                 "symbol": c.get("symbol") or c.get("mint"),
@@ -473,8 +573,8 @@ async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
                 "pool": c.get("pair_url"),
                 "age_sec": age_sec,
                 "liq_usd": c.get("liq_usd"),
-                "vol_5m": c.get("volume_5m_usd"),
-                "up_pct": c.get("price_change_5m"),
+                "vol_5m": c.get("vol_5m_usd"),
+                "up_pct": c.get("price_change_5m_pct"),
                 "reason": (
                     f"raydium PF runner final={c.get('final_score', 0.0):.3f} "
                     f"momentum={c.get('momentum_score', 0.0):.3f}"
@@ -482,12 +582,14 @@ async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
             }
             await am.send_momo_event("MOMO_OK", ctx)
         except Exception as e:
-            logger.warning("Raydium: MOMO send error for %s: %s", c.get("mint"), e)
+            logger.warning(
+                "Raydium: MOMO send error for %s: %s", c.get("mint"), e
+            )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Public entry
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 async def scan_raydium(*args):
     """
@@ -530,7 +632,7 @@ async def scan_raydium(*args):
 
     try:
         logger.info(
-            "🔎 Raydium scan via Dexscreener: queries=%s soft_min_liq=$%.0f pf_min_liq=$%.0f limit=%d",
+            "scanner.raydium: starting scan; queries=%s soft_min_liq=$%.0f pf_min_liq=$%.0f limit=%d",
             ",".join(SEARCH_QUERIES),
             SOFT_MIN_LIQ_USD,
             PF_SCAN_MIN_LIQ_USD,
@@ -543,6 +645,10 @@ async def scan_raydium(*args):
             m = _normalize_to_meta(p)
             if m:
                 metas.append(m)
+
+        # Optional AI / whale enrichment (no-op if disabled or imports fail).
+        with contextlib.suppress(Exception):
+            await _enrich_ai_and_whales(metas)
 
         runners = _filter_and_rank(metas)
         logger.info(

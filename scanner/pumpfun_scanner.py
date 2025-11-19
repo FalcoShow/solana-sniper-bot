@@ -20,6 +20,12 @@ from config import (
     PF_SCAN_MAX_TOKEN_AGE_MIN,
 )
 
+# Optional whale-size hint; safe fallback if not present
+try:
+    from config import PF_SCAN_MIN_WHALE_SIZE_SOL  # type: ignore
+except Exception:  # pragma: no cover
+    PF_SCAN_MIN_WHALE_SIZE_SOL = 3.0  # reasonable default
+
 from utils_pkg.alert_manager import AlertManager
 from utils_pkg.pair_filters import (
     is_viable_pair,
@@ -125,6 +131,11 @@ SKIP_HTML_NEXT = _b("PUMPFUN_SKIP_HTMLNEXT", False)
 # MOMO / alert behaviour
 SEND_MOMO_ALERTS = _b("PUMP_SEND_MOMO_ALERTS", True)
 MAX_ALERTS_PER_SCAN = _i("PUMP_MAX_ALERTS_PER_SCAN", 3)
+
+# Optional AI / whales enrichment toggles (off by default, safe if not configured)
+PUMP_AI_RUG_ENABLED = _b("PUMP_AI_RUG_ENABLED", False)
+PUMP_AI_RUG_MAX_PER_SCAN = _i("PUMP_AI_RUG_MAX_PER_SCAN", 15)
+PUMP_WHALES_ENABLED = _b("PUMP_WHALES_ENABLED", False)
 
 # Pump.fun HTML routes to try for __NEXT_DATA__ fallback
 FALLBACK_HTML_URLS = [
@@ -232,7 +243,15 @@ def _norm_mint(val: Any) -> str:
 def _extract_metrics_from_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
     """
     Try to pull out all metrics we care about for runner detection.
-    Uses best-effort heuristics and approximations when only 24h data is present.
+    Produces keys that match utils_pkg.pair_filters expectations:
+      - liq_usd, mcap_usd, fdv_usd
+      - token_age_min
+      - vol_5m_usd, vol_1h_usd, vol_24h_usd
+      - buys_5m, sells_5m, buys_1h, sells_1h, buys_24h, sells_24h
+      - price_change_5m_pct, price_change_15m_pct, price_change_1h_pct
+      - holders, holders_5m_change
+      - whales_5m, whale_vol_5m_usd, largest_buy_5m_sol
+      - price_usd
     """
     liq_usd = None
     for k in ("liquidity", "liquidityUsd", "liqUsd", "lpUsd", "liquidity_usd"):
@@ -244,7 +263,7 @@ def _extract_metrics_from_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-    fdv = _nz(
+    fdv_usd = _nz(
         obj.get("fdv")
         or obj.get("fdvUsd")
         or obj.get("fullyDilutedValuation")
@@ -252,11 +271,11 @@ def _extract_metrics_from_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
         or obj.get("fullyDilutedMarketCap"),
         0.0,
     )
-    mc = _nz(
+    mcap_usd = _nz(
         obj.get("marketCap")
         or obj.get("marketCapUsd")
         or obj.get("mcap_usd")
-        or fdv,
+        or fdv_usd,
         0.0,
     )
 
@@ -267,6 +286,7 @@ def _extract_metrics_from_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
     sells_5m = _safe_int(
         obj.get("sells5m") or obj.get("sells_5m") or obj.get("m5Sells") or obj.get("sellsLast5m")
     )
+
     buys_15m = _safe_int(
         obj.get("buys15m") or obj.get("buys_15m") or obj.get("m15Buys") or obj.get("buysLast15m")
     )
@@ -288,9 +308,13 @@ def _extract_metrics_from_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
     if sells_15m == 0 and sells_24h > 0:
         sells_15m = max(0, sells_24h // 96)
 
-    vol5 = _nz(obj.get("volumeUsd5m") or obj.get("volume5mUsd") or obj.get("vol5mUsd"), 0.0)
-    vol15 = _nz(obj.get("volumeUsd15m") or obj.get("volume15mUsd") or obj.get("vol15mUsd"), 0.0)
-    vol24 = _nz(
+    vol_5m_usd = _nz(
+        obj.get("volumeUsd5m") or obj.get("volume5mUsd") or obj.get("vol5mUsd"), 0.0
+    )
+    vol_15m_usd = _nz(
+        obj.get("volumeUsd15m") or obj.get("volume15mUsd") or obj.get("vol15mUsd"), 0.0
+    )
+    vol_24h_usd = _nz(
         obj.get("volumeUsd24h")
         or obj.get("volume24hUsd")
         or obj.get("usdVolume24Hours")
@@ -299,18 +323,29 @@ def _extract_metrics_from_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # Approximate 5m / 15m volume from 24h if needed
-    if vol5 <= 0 and vol24 > 0:
-        vol5 = vol24 / 288.0
-    if vol15 <= 0 and vol24 > 0:
-        vol15 = vol24 / 96.0
+    if vol_5m_usd <= 0 and vol_24h_usd > 0:
+        vol_5m_usd = vol_24h_usd / 288.0
+    if vol_15m_usd <= 0 and vol_24h_usd > 0:
+        vol_15m_usd = vol_24h_usd / 96.0
 
-    chg5 = _nz(obj.get("priceChange5m") or obj.get("priceChange_5m"), 0.0)
-    chg15 = _nz(obj.get("priceChange15m") or obj.get("priceChange_15m"), 0.0)
+    # Build a rough 1h volume from 24h if direct not present
+    vol_1h_usd = vol_24h_usd / 24.0 if vol_24h_usd > 0 else 0.0
 
-    if chg5 == 0 and "priceChange24h" in obj:
-        chg5 = _nz(obj.get("priceChange24h"), 0.0) / 288.0
-    if chg15 == 0 and "priceChange24h" in obj:
-        chg15 = _nz(obj.get("priceChange24h"), 0.0) / 96.0
+    # Price changes
+    chg_5m_pct = _nz(obj.get("priceChange5m") or obj.get("priceChange_5m"), 0.0)
+    chg_15m_pct = _nz(obj.get("priceChange15m") or obj.get("priceChange_15m"), 0.0)
+
+    # If only 24h change is available, approximate short windows
+    chg_24h_pct = _nz(obj.get("priceChange24h") or obj.get("priceChange_24h"), 0.0)
+    if chg_5m_pct == 0.0 and chg_24h_pct != 0.0:
+        chg_5m_pct = chg_24h_pct / 288.0
+    if chg_15m_pct == 0.0 and chg_24h_pct != 0.0:
+        chg_15m_pct = chg_24h_pct / 96.0
+
+    # Approximate 1h price change from 24h if no direct value is present
+    chg_1h_pct = _nz(obj.get("priceChange1h") or obj.get("priceChange_1h"), 0.0)
+    if chg_1h_pct == 0.0 and chg_24h_pct != 0.0:
+        chg_1h_pct = chg_24h_pct / 24.0
 
     created = (
         obj.get("createdAt")
@@ -319,6 +354,7 @@ def _extract_metrics_from_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
         or obj.get("createdOn")
     )
     age_min = _age_min(created if created is not None else None)
+    token_age_min = age_min if age_min is not None else 9999.0
 
     holders = _safe_int(
         obj.get("holders")
@@ -326,6 +362,7 @@ def _extract_metrics_from_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
         or obj.get("totalHolders")
         or obj.get("holdersCount")
     )
+    holders_5m_change = 0  # Pump.fun doesn't expose differential holder data
 
     price_usd = _nz(
         obj.get("priceUsd")
@@ -335,34 +372,49 @@ def _extract_metrics_from_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
         0.0,
     )
 
-    # impact for 1k order (optional)
-    impact_bps = None
-    for k in ("priceImpact1kBps", "impact1kBps", "impact_bps", "impact_1k_bps"):
-        v = obj.get(k)
-        try:
-            if v is not None:
-                impact_bps = float(v)
-                break
-        except Exception:
-            pass
+    # Whales: we do not have direct per-wallet data; approximate from 5m volume + price.
+    whales_5m = 0
+    whale_vol_5m_usd = 0.0
+    largest_buy_5m_sol = 0.0
+    if price_usd > 0 and vol_5m_usd > 0:
+        # Assume largest buy is ~25% of 5m volume for heuristic.
+        approx_largest_buy_usd = vol_5m_usd * 0.25
+        approx_largest_buy_sol = approx_largest_buy_usd / price_usd
+        largest_buy_5m_sol = approx_largest_buy_sol
+        if approx_largest_buy_sol >= float(PF_SCAN_MIN_WHALE_SIZE_SOL):
+            whales_5m = 1
+            whale_vol_5m_usd = approx_largest_buy_usd
 
     return {
         "liq_usd": _nz(liq_usd, 0.0),
-        "fdv_usd": fdv,
-        "mc_usd": mc,
+        "mcap_usd": mcap_usd,
+        "fdv_usd": fdv_usd,
+        "token_age_min": token_age_min,
+        "vol_5m_usd": vol_5m_usd,
+        "vol_1h_usd": vol_1h_usd,
+        "vol_24h_usd": vol_24h_usd,
         "buys_5m": buys_5m,
         "sells_5m": sells_5m,
-        "buys_15m": buys_15m,
-        "sells_15m": sells_15m,
-        "volume_5m_usd": vol5,
-        "volume_15m_usd": vol15,
-        "volume_24h_usd": vol24,
-        "price_change_5m": chg5,
-        "price_change_15m": chg15,
-        "age_min": age_min,
+        "buys_1h": 0,      # we don't have direct; PF mostly cares about 5m + 1h volume
+        "sells_1h": 0,
+        "buys_24h": buys_24h,
+        "sells_24h": sells_24h,
+        "price_change_5m_pct": chg_5m_pct,
+        "price_change_15m_pct": chg_15m_pct,
+        "price_change_1h_pct": chg_1h_pct,
         "holders": holders,
+        "holders_5m_change": holders_5m_change,
         "price_usd": price_usd,
-        "impact_1k_bps": _nz(impact_bps, 0.0),
+        "whales_5m": whales_5m,
+        "whale_vol_5m_usd": whale_vol_5m_usd,
+        "largest_buy_5m_sol": largest_buy_5m_sol,
+        "impact_1k_bps": _nz(
+            obj.get("priceImpact1kBps")
+            or obj.get("impact1kBps")
+            or obj.get("impact_bps")
+            or obj.get("impact_1k_bps"),
+            0.0,
+        ),
     }
 
 
@@ -373,7 +425,8 @@ def _buy_ratio(buys: int, sells: int) -> float:
 
 def _map_coin_to_meta(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Normalize various Pump.fun shapes → common PF "meta" dict.
+    Normalize various Pump.fun JSON shapes → common PF "meta" dict compatible
+    with utils_pkg.pair_filters.
     """
     try:
         raw_mint = (
@@ -399,25 +452,25 @@ def _map_coin_to_meta(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         # Soft prefilters: skip ultra-dead trash before PF logic
         liq_usd = m["liq_usd"]
-        mc_usd = m["mc_usd"]
-        age_min = m["age_min"]
+        mcap_usd = m["mcap_usd"]
+        token_age_min = m["token_age_min"]
 
         if liq_usd < SOFT_MIN_LIQ_USD:
             return None
-        if mc_usd < SOFT_MIN_MCAP_USD:
+        if mcap_usd < SOFT_MIN_MCAP_USD:
             return None
-        if age_min is not None and age_min > SOFT_MAX_AGE_MIN:
+        if token_age_min > SOFT_MAX_AGE_MIN:
             return None
 
         buys_5m = m["buys_5m"]
         sells_5m = m["sells_5m"]
-        buys_15m = m["buys_15m"]
-        sells_15m = m["sells_15m"]
+        buys_15m = m["buys_5m"] if m.get("buys_15m") is None else m["buys_15m"]
+        sells_15m = m["sells_5m"] if m.get("sells_15m") is None else m["sells_15m"]
 
         buy_ratio_5m = _buy_ratio(buys_5m, sells_5m)
         buy_ratio_15m = _buy_ratio(buys_15m, sells_15m)
 
-        # We don't have explicit 1h txns, approximate from 24h if available
+        # We don't have explicit 1h txns, approximate from 5m
         txns_5m = buys_5m + sells_5m
         txns_1h = txns_5m * 12  # crude but consistent with PF heuristics
 
@@ -434,39 +487,50 @@ def _map_coin_to_meta(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
             # core liquidity / size
             "liq_usd": m["liq_usd"],
-            "mc_usd": m["mc_usd"],
+            "mcap_usd": m["mcap_usd"],
             "fdv_usd": m["fdv_usd"],
 
             # time
-            "pool_age_min": m["age_min"],
+            "token_age_min": m["token_age_min"],
 
             # recent activity
-            "volume_5m_usd": m["volume_5m_usd"],
-            "volume_15m_usd": m["volume_15m_usd"],
-            "volume_24h_usd": m["volume_24h_usd"],
+            "vol_5m_usd": m["vol_5m_usd"],
+            "vol_1h_usd": m["vol_1h_usd"],
+            "vol_24h_usd": m["vol_24h_usd"],
             "buys_5m": buys_5m,
             "sells_5m": sells_5m,
-            "buys_15m": buys_15m,
-            "sells_15m": sells_15m,
-            "buy_ratio_5m": buy_ratio_5m,
-            "buy_ratio_15m": buy_ratio_15m,
             "txns_5m": txns_5m,
             "txns_1h": txns_1h,
+            "buy_ratio_5m": buy_ratio_5m,
+            "buy_ratio_15m": buy_ratio_15m,
 
             # price action
-            "price_change_5m": m["price_change_5m"],
-            "price_change_15m": m["price_change_15m"],
             "price_usd": m["price_usd"],
+            "price_change_5m_pct": m["price_change_5m_pct"],
+            "price_change_15m_pct": m["price_change_15m_pct"],
+            "price_change_1h_pct": m["price_change_1h_pct"],
+
+            # holders
+            "holders": m["holders"],
+            "holders_5m_change": m["holders_5m_change"],
+
+            # whale + AI fields (some filled here, further enriched optionally)
+            "whales_5m": m["whales_5m"],
+            "whale_vol_5m_usd": m["whale_vol_5m_usd"],
+            "largest_buy_5m_sol": m["largest_buy_5m_sol"],
+            "ai_rug_score": 0.0,  # neutral by default
+
+            # security flags (we don't have direct info here, so defaults are safe-ish)
+            "is_honeypot": False,
+            "trading_paused": False,
+            "blacklisted": False,
+            "top10_hold_pct": 0.0,
+            "dev_hold_pct": 0.0,
+            "mint_authority_disabled": True,
+            "freeze_authority_disabled": True,
 
             # misc
             "impact_1k_bps": m["impact_1k_bps"],
-            "holders": m["holders"],
-
-            # whale + AI fields (filled by other modules later; defaults are neutral)
-            "whale_buys_5m": 0,
-            "whale_volume_5m_sol": 0.0,
-            "rug_risk_score": None,
-            "ai_notes": "",
         }
 
         return meta
@@ -530,6 +594,62 @@ def _html_next_data(html: str):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Optional AI / whales enrichment
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _enrich_ai_and_whales(metas: List[Dict[str, Any]]) -> None:
+    """
+    Best-effort enrichment of meta with:
+      - ai_rug_score (0–1) via utils_pkg.core_utils.ai_fraud_score
+      - basic whale signal via utils_pkg.core_utils.is_whale_wallet
+
+    This is fully optional:
+      - If imports fail, or APIs are down, metas remain usable.
+      - We cap concurrent calls + per-scan count to avoid rate-limit hell.
+    """
+    if not metas:
+        return
+
+    # Lazy imports to avoid hard dependency / cycles.
+    try:
+        from utils_pkg.core_utils import ai_fraud_score, is_whale_wallet  # type: ignore
+    except Exception:
+        # AI / whales not wired; skip silently.
+        return
+
+    sem = asyncio.Semaphore(_i("PUMP_AI_CONCURRENCY", 5))
+    to_process = metas[: PUMP_AI_RUG_MAX_PER_SCAN] if PUMP_AI_RUG_ENABLED else []
+
+    async def _handle(meta: Dict[str, Any]) -> None:
+        mint = meta.get("mint")
+        if not isinstance(mint, str) or not mint:
+            return
+        async with sem:
+            # AI rug score
+            if PUMP_AI_RUG_ENABLED:
+                try:
+                    s01 = await ai_fraud_score(mint)
+                    meta["ai_rug_score"] = max(0.0, min(1.0, float(s01)))
+                except Exception:
+                    pass
+            # Whale presence (coarse, beyond volume-based heuristic)
+            if PUMP_WHALES_ENABLED:
+                try:
+                    px = float(meta.get("price_usd") or 0.0)
+                    # threshold roughly based on PF_SCAN_MIN_WHALE_SIZE_SOL * price
+                    thresh_usd = float(PF_SCAN_MIN_WHALE_SIZE_SOL) * px if px > 0 else 50_000.0
+                    has_whale = await is_whale_wallet(mint, usd_threshold=thresh_usd)
+                    if has_whale:
+                        meta["whales_5m"] = max(1, int(meta.get("whales_5m") or 0))
+                except Exception:
+                    pass
+
+    tasks = [asyncio.create_task(_handle(m)) for m in to_process]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # PF-based filtering & ranking
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -545,7 +665,7 @@ def _pf_filter_and_rank(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 continue
 
             momentum = compute_momentum_score(meta)
-            final = compute_final_score(meta, momentum=momentum)
+            final = compute_final_score(meta)
 
             m = dict(meta)
             m["momentum_score"] = momentum
@@ -693,6 +813,16 @@ async def _html_next_fallback(session: aiohttp.ClientSession) -> List[Dict[str, 
                 items = []
 
         if items:
+            # Optional AI / whale enrichment
+            try:
+                # swallow errors so a bad AI call never kills the scan
+                asyncio.get_running_loop()
+                coro = _enrich_ai_and_whales(items)
+                if asyncio.iscoroutine(coro):
+                    await coro
+            except Exception:
+                pass
+
             runners = _pf_filter_and_rank(items)
             out.extend(runners)
             LOG.info(
@@ -835,6 +965,15 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
                         meta = _map_coin_to_meta(it)
                         if meta:
                             metas.append(meta)
+
+                # Optional AI / whales enrichment
+                try:
+                    coro = _enrich_ai_and_whales(metas)
+                    if asyncio.iscoroutine(coro):
+                        await coro
+                except Exception:
+                    pass
+
                 runners = _pf_filter_and_rank(metas)
                 if runners:
                     LOG.info("scanner.pumpfun: next-data apex → %s PF runners", len(runners))
@@ -855,6 +994,15 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
                         meta = _map_coin_to_meta(it)
                         if meta:
                             metas.append(meta)
+
+                # Optional AI / whales enrichment
+                try:
+                    coro = _enrich_ai_and_whales(metas)
+                    if asyncio.iscoroutine(coro):
+                        await coro
+                except Exception:
+                    pass
+
                 runners = _pf_filter_and_rank(metas)
                 if runners:
                     LOG.info("scanner.pumpfun: DOM apex → %s PF runners", len(runners))
@@ -868,6 +1016,14 @@ async def _scan_inner(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     metas = await _collect_pumpfun_items(session)
     if not metas:
         return []
+
+    # Optional AI / whales enrichment
+    try:
+        coro = _enrich_ai_and_whales(metas)
+        if asyncio.iscoroutine(coro):
+            await coro
+    except Exception:
+        pass
 
     runners = _pf_filter_and_rank(metas)
     LOG.info(
@@ -899,7 +1055,7 @@ async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
     max_n = max(0, min(MAX_ALERTS_PER_SCAN, len(runners)))
     for c in runners[:max_n]:
         try:
-            age_min = c.get("pool_age_min")
+            age_min = c.get("token_age_min")
             age_sec = age_min * 60.0 if isinstance(age_min, (int, float)) else None
             ctx: Dict[str, Any] = {
                 "symbol": c.get("symbol") or c.get("mint"),
@@ -907,8 +1063,8 @@ async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
                 "pool": c.get("pair_url"),
                 "age_sec": age_sec,
                 "liq_usd": c.get("liq_usd"),
-                "vol_5m": c.get("volume_5m_usd"),
-                "up_pct": c.get("price_change_5m"),
+                "vol_5m": c.get("vol_5m_usd"),
+                "up_pct": c.get("price_change_5m_pct"),
                 "reason": (
                     f"pumpfun PF runner final={c.get('final_score', 0.0):.3f} "
                     f"momentum={c.get('momentum_score', 0.0):.3f}"
@@ -942,6 +1098,15 @@ async def scan_pumpfun(*args):
         sess = args[1]
     elif len(args) == 1 and isinstance(args[0], aiohttp.ClientSession):
         sess = args[0]
+
+    # Try borrowing a shared session from core utils (best-effort)
+    if sess is None:
+        try:
+            from utils_pkg.core_utils import session as core_session  # type: ignore
+            if isinstance(core_session, aiohttp.ClientSession):
+                sess = core_session
+        except Exception:
+            sess = None
 
     # If a shared session is provided, just use it
     if sess is not None:
