@@ -238,6 +238,8 @@ PAPER_TRADING = _get_bool("PAPER_TRADING", False)  # sniper-level paper trading
 # Global safety toggles used by sniper/sniper.py
 PAUSE_TRADING = _get_bool("PAUSE_TRADING", False)
 DRY_RUN = _get_bool("DRY_RUN", False)
+# Back-compat: some modules import DRYRUN instead of DRY_RUN
+DRYRUN = DRY_RUN
 
 # Slippage for Jupiter routes
 JUPITER_MAX_SLIPPAGE = _get_float("JUPITER_MAX_SLIPPAGE", 0.005)  # 0.5%
@@ -275,10 +277,38 @@ REINVESTMENT_VOLUME_MIN = _get_float("REINVESTMENT_VOLUME_MIN", 5_000.0)
 REINVESTMENT_MIN_PROFIT_SOL = _get_float("REINVESTMENT_MIN_PROFIT_SOL", 0.01)
 REINVESTMENT_HONEYPOT_CHECK = _get_bool("REINVESTMENT_HONEYPOT_CHECK", True)
 
-# Entry momentum guard (Track A / Track B)
-ENTRY_MOMO_MIN_TRADES = _get_int("ENTRY_MOMO_MIN_TRADES", 3)
-ENTRY_MOMO_MIN_UP_PCT = _get_float("ENTRY_MOMO_MIN_UP_PCT", 2.5)
-ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP = _get_bool("ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP", False)
+# ---------------------------------------------------------------------------
+# Entry momentum guard (Strategy uses these directly)
+# ---------------------------------------------------------------------------
+
+# Master ON/OFF for momentum filter
+# Default: follow AI_MOMO_FILTER if present, else enabled.
+ENTRY_MOMENTUM_ENABLED = _get_bool(
+    "ENTRY_MOMENTUM_ENABLED",
+    _get_bool("AI_MOMO_FILTER", True),
+)
+
+# Momentum window: prefer ENTRY_MOMO_WINDOW_SEC, fall back to MOMO_WINDOW_SEC, then 25
+ENTRY_MOMO_WINDOW_SEC = _get_int(
+    "ENTRY_MOMO_WINDOW_SEC",
+    _get_int("MOMO_WINDOW_SEC", 25),
+)
+
+# Trades / up-percent thresholds:
+ENTRY_MOMO_MIN_TRADES = _get_int(
+    "ENTRY_MOMO_MIN_TRADES",
+    _get_int("MOMO_MIN_TRADES", 2),
+)
+ENTRY_MOMO_MIN_UP_PCT = _get_float(
+    "ENTRY_MOMO_MIN_UP_PCT",
+    _get_float("MOMO_MIN_UP_PCT", 2.0),
+)
+
+# Allow pump.fun to bypass momentum data gaps?
+ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP = _get_bool(
+    "ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP",
+    _get_bool("MOMO_ALLOW_NO_DATA_FOR_PUMP", True),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -372,8 +402,6 @@ REINVESTMENT_CHECK_INTERVAL = _get_int("REINVESTMENT_CHECK_INTERVAL", 60)
 
 # ---------------------------------------------------------------------------
 # NEW: PairFilter-centric thresholds (used by utils_pkg.pair_filters)
-# These are the knobs that directly control which coins are considered
-# "viable" and how momentum / risk scoring behaves.
 # ---------------------------------------------------------------------------
 
 # Hard ranges for liquidity / mcap / age
@@ -525,6 +553,8 @@ def summarize():
             "moonshot_enabled": MOONSHOT_ENABLED,
             "moonshot_daily_usd": MOONSHOT_DAILY_USD,
             # entry momentum guard
+            "entry_momo_enabled": ENTRY_MOMENTUM_ENABLED,
+            "entry_momo_window_sec": ENTRY_MOMO_WINDOW_SEC,
             "entry_momo_min_trades": ENTRY_MOMO_MIN_TRADES,
             "entry_momo_min_up_pct": ENTRY_MOMO_MIN_UP_PCT,
             "entry_momo_allow_no_data_for_pump": ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP,
