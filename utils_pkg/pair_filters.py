@@ -69,49 +69,48 @@ from logging_setup import get_logger
 
 log = get_logger()
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Config helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 try:
     import config as C  # type: ignore
 except Exception:  # pragma: no cover
-    class _C:  # ultra-minimal fallback; real values live in config.py
-        PF_SCAN_MIN_LIQ_USD = 3_000.0
-        PF_SCAN_MAX_LIQ_USD = 250_000.0
+    # Fallback if config import ever fails (tests / notebooks)
+    class _C:
+        PF_SCAN_MIN_LIQ_USD = 150.0
+        PF_SCAN_MAX_LIQ_USD = 0.0          # 0 = no max cap
+        PF_SCAN_MIN_MCAP_USD = 500.0
+        PF_SCAN_MAX_MCAP_USD = 0.0         # 0 = no max cap
+        PF_SCAN_MAX_TOKEN_AGE_MIN = 720.0  # 12h default
 
-        PF_SCAN_MIN_MCAP_USD = 3_000.0
-        PF_SCAN_MAX_MCAP_USD = 750_000.0
+        PF_SCAN_MIN_5M_VOL_USD = 30.0
+        PF_SCAN_MIN_5M_BUYS = 1
+        PF_SCAN_MIN_BUY_TO_SELL_RATIO = 1.05
 
-        PF_SCAN_MAX_TOKEN_AGE_MIN = 240.0  # 4 hours
+        PF_SCAN_MIN_WHALE_SIZE_SOL = 1.5
+        PF_SCAN_MIN_WHALE_COUNT_5M = 0
 
-        PF_SCAN_MIN_5M_VOL_USD = 1_000.0
-        PF_SCAN_MIN_5M_BUYS = 8
-        PF_SCAN_MIN_BUY_TO_SELL_RATIO = 1.2
+        PF_MAX_RUG_RISK_SCORE = 0.80  # > this is too risky
 
-        PF_SCAN_MIN_WHALE_SIZE_SOL = 3.0
-        PF_SCAN_MIN_WHALE_COUNT_5M = 1
+        PF_MIN_MOMENTUM_SCORE = 0.14
+        PF_MIN_FINAL_SCORE = 0.10
 
-        PF_MAX_RUG_RISK_SCORE = 0.65  # > this is too risky
+        PF_RISK_PENALTY_WEIGHT = 0.6  # how strongly AI rug score reduces final score
 
-        PF_MIN_MOMENTUM_SCORE = 0.25
-        PF_MIN_FINAL_SCORE = 0.20
-
-        PF_RISK_PENALTY_WEIGHT = 0.7  # how strongly AI rug score reduces final score
-
-        # Soft guardrails for centralization (used as hints, not hard env)
-        PF_SCAN_MAX_TOP10_HOLD_PCT = 90.0
-        PF_SCAN_MAX_DEV_HOLD_PCT = 40.0
+        # Soft guardrails for centralization (used as hints)
+        PF_SCAN_MAX_TOP10_HOLD_PCT = 95.0
+        PF_SCAN_MAX_DEV_HOLD_PCT = 60.0
 
     C = _C()  # type: ignore
 
 
-# -----------------------------------------------------------------------------
-# Small numeric helpers
-# -----------------------------------------------------------------------------
-
 Meta = Dict[str, Any]
 
+
+# =============================================================================
+# Small numeric helpers
+# =============================================================================
 
 def _to_float(meta: Meta, key: str, default: float = 0.0) -> float:
     v = meta.get(key, default)
@@ -167,9 +166,9 @@ def _sigmoid(x: float, k: float = 1.0) -> float:
         return 0.0 if x < 0 else 1.0
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Core scoring
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 def _compute_scores(meta: Meta) -> Tuple[float, float, float]:
     """
@@ -197,7 +196,7 @@ def _compute_scores(meta: Meta) -> Tuple[float, float, float]:
 
     # Whales
     whales_5m = _to_int(meta, "whales_5m", 0)
-    whale_vol_5m = _to_float(meta, "whale_vol_5m_usd", 0.0)  # not directly used yet
+    whale_vol_5m = _to_float(meta, "whale_vol_5m_usd", 0.0)  # reserved for future use
     largest_buy_5m_sol = _to_float(meta, "largest_buy_5m_sol", 0.0)
 
     # Age
@@ -214,28 +213,28 @@ def _compute_scores(meta: Meta) -> Tuple[float, float, float]:
     # Individual components mapped to 0–1
     # ------------------------------------------------------------------
 
-    # We like strong but not completely insane 5m move
-    comp_price_5m = _soft_scale(p5, 10.0, 120.0)  # 0 below +10%, 1 at +120%+
+    # We like decent 5m move, but not necessarily face-melters only.
+    comp_price_5m = _soft_scale(p5, 5.0, 90.0)  # 0 below +5%, 1 at +90%+
 
-    # 15m can be flat or moderately up; small negative is ok early
-    comp_price_15m = _soft_scale(p15 + 20.0, 0.0, 180.0)  # allow some red startup
+    # 15m can be flat or moderately up; small negative is ok early.
+    comp_price_15m = _soft_scale(p15 + 20.0, 0.0, 180.0)
 
-    # 1h we mostly care when it's already trending
-    comp_price_1h = _soft_scale(p1h, 0.0, 250.0)
+    # 1h we mostly care once already trending.
+    comp_price_1h = _soft_scale(p1h, -20.0, 250.0)
 
-    # Volume: stronger if 5m is big relative to 1h (breakout)
-    min_5m = getattr(C, "PF_SCAN_MIN_5M_VOL_USD", 1_000.0)
-    comp_vol_5m_abs = _soft_scale(vol_5m, min_5m, min_5m * 5)
+    # Volume: stronger if 5m is big relative to 1h (breakout).
+    min_5m = getattr(C, "PF_SCAN_MIN_5M_VOL_USD", 50.0)
+    comp_vol_5m_abs = _soft_scale(vol_5m, min_5m, min_5m * 6)
     vol_ratio = vol_5m / max(vol_1h, 1.0)
     comp_vol_ratio = _soft_scale(vol_ratio, 0.1, 0.7)  # >70% of 1h in last 5m is strong
     comp_volume = 0.6 * comp_vol_5m_abs + 0.4 * comp_vol_ratio
 
     # Buy pressure
-    comp_buy_pressure = _soft_scale(buy_ratio, 0.5, 0.8)  # >80% buys very bullish
-    comp_trades_count = _soft_scale(total_trades_5m, 10.0, 80.0)
+    comp_buy_pressure = _soft_scale(buy_ratio, 0.45, 0.8)  # allow more chop
+    comp_trades_count = _soft_scale(total_trades_5m, 6.0, 60.0)
 
-    # Whales: more whales + larger buys
-    min_whale_size_sol = getattr(C, "PF_SCAN_MIN_WHALE_SIZE_SOL", 3.0)
+    # Whales: more whales + larger buys.
+    min_whale_size_sol = getattr(C, "PF_SCAN_MIN_WHALE_SIZE_SOL", 1.5)
     comp_whale_count = _soft_scale(float(whales_5m), 0.0, 3.0)
     comp_whale_size = _soft_scale(
         largest_buy_5m_sol,
@@ -244,15 +243,15 @@ def _compute_scores(meta: Meta) -> Tuple[float, float, float]:
     )
     comp_whales = 0.5 * comp_whale_count + 0.5 * comp_whale_size
 
-    # Age: newer is better; beyond PF_SCAN_MAX_TOKEN_AGE_MIN we fade to 0
-    max_age_min = getattr(C, "PF_SCAN_MAX_TOKEN_AGE_MIN", 240.0)
+    # Age: newer is better; beyond PF_SCAN_MAX_TOKEN_AGE_MIN we fade to 0.
+    max_age_min = getattr(C, "PF_SCAN_MAX_TOKEN_AGE_MIN", 720.0)
     # Map age 0–max_age_min -> 1–0
     comp_age = 1.0 - _soft_scale(age_min, 5.0, max_age_min)
 
     # Holder growth
-    comp_holders_growth = _soft_scale(float(holders_change_5m), 2.0, 40.0)
+    comp_holders_growth = _soft_scale(float(holders_change_5m), 1.0, 30.0)
 
-    # Combine into a single momentum score
+    # Combine into a single momentum score.
     momentum_score = (
         0.25 * comp_price_5m +
         0.10 * comp_price_15m +
@@ -265,11 +264,10 @@ def _compute_scores(meta: Meta) -> Tuple[float, float, float]:
         0.05 * comp_holders_growth
     )
 
-    # Squash and clamp
     momentum_score = max(0.0, min(1.0, momentum_score))
 
-    # Risk penalty from AI rug score
-    risk_weight = getattr(C, "PF_RISK_PENALTY_WEIGHT", 0.7)
+    # Risk penalty from AI rug score.
+    risk_weight = getattr(C, "PF_RISK_PENALTY_WEIGHT", 0.6)
     risk_penalty = max(0.0, 1.0 - risk_weight * ai_rug_score)
 
     final_score = momentum_score * risk_penalty
@@ -278,27 +276,25 @@ def _compute_scores(meta: Meta) -> Tuple[float, float, float]:
     return momentum_score, final_score, ai_rug_score
 
 
-# -----------------------------------------------------------------------------
-# Public APIs
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Public scoring helpers
+# =============================================================================
 
 def compute_momentum_score(meta: Meta) -> float:
-    """
-    Compute a 0.0–1.0 "trending / momentum" score based on the recent
-    price action, volume, buy pressure, whale activity, age, and holder growth.
-    """
+    """Return 0.0–1.0 "trending / momentum" score."""
     momentum, _, _ = _compute_scores(meta)
     return momentum
 
 
 def compute_final_score(meta: Meta) -> float:
-    """
-    Compute a 0.0–1.0 final score that penalizes high AI rug-risk.
-    Use this if you want a single number to rank opportunities.
-    """
+    """Return 0.0–1.0 final score (momentum adjusted by AI rug-risk)."""
     _, final, _ = _compute_scores(meta)
     return final
 
+
+# =============================================================================
+# Hard filter
+# =============================================================================
 
 def is_viable_pair(meta: Meta) -> bool:
     """
@@ -308,11 +304,11 @@ def is_viable_pair(meta: Meta) -> bool:
       - Liquidity & market cap ranges
       - Age
       - Minimum recent volume & trades
-      - Buy/sell balance
-      - Whale presence
+      - Buy/sell balance (looser than before)
+      - Whale presence (configurable)
       - Honeypot / paused / blacklisted flags
       - AI rug risk
-      - Minimum momentum & final scores
+      - Minimum *final* score (momentum is advisory, not a hard kill)
 
     Returns:
         bool: True if the pair passes all filters, False otherwise.
@@ -332,31 +328,31 @@ def is_viable_pair(meta: Meta) -> bool:
     trading_paused = _to_bool(meta, "trading_paused", False)
     blacklisted = _to_bool(meta, "blacklisted", False)
 
-    # Security / centralization
+    # Security / centralization.
     top10_hold_pct = _to_float(meta, "top10_hold_pct", 0.0)
     dev_hold_pct = _to_float(meta, "dev_hold_pct", 0.0)
     mint_auth_disabled = _to_bool(meta, "mint_authority_disabled", True)
     freeze_auth_disabled = _to_bool(meta, "freeze_authority_disabled", True)
 
-    min_liq = getattr(C, "PF_SCAN_MIN_LIQ_USD", 3_000.0)
-    max_liq = getattr(C, "PF_SCAN_MAX_LIQ_USD", 250_000.0)
-    min_mcap = getattr(C, "PF_SCAN_MIN_MCAP_USD", 3_000.0)
-    max_mcap = getattr(C, "PF_SCAN_MAX_MCAP_USD", 750_000.0)
-    max_age_min = getattr(C, "PF_SCAN_MAX_TOKEN_AGE_MIN", 240.0)
+    min_liq = getattr(C, "PF_SCAN_MIN_LIQ_USD", 150.0)
+    max_liq = getattr(C, "PF_SCAN_MAX_LIQ_USD", 0.0)  # 0 => no max
+    min_mcap = getattr(C, "PF_SCAN_MIN_MCAP_USD", 500.0)
+    max_mcap = getattr(C, "PF_SCAN_MAX_MCAP_USD", 0.0)  # 0 => no max
+    max_age_min = getattr(C, "PF_SCAN_MAX_TOKEN_AGE_MIN", 720.0)
 
-    min_5m_vol = getattr(C, "PF_SCAN_MIN_5M_VOL_USD", 1_000.0)
-    min_5m_buys = getattr(C, "PF_SCAN_MIN_5M_BUYS", 8)
-    min_buy_sell_ratio = getattr(C, "PF_SCAN_MIN_BUY_TO_SELL_RATIO", 1.2)
+    min_5m_vol = getattr(C, "PF_SCAN_MIN_5M_VOL_USD", 50.0)
+    min_5m_buys = getattr(C, "PF_SCAN_MIN_5M_BUYS", 1)
+    min_buy_sell_ratio = getattr(C, "PF_SCAN_MIN_BUY_TO_SELL_RATIO", 1.05)
 
-    min_whale_size_sol = getattr(C, "PF_SCAN_MIN_WHALE_SIZE_SOL", 3.0)
-    min_whale_count_5m = getattr(C, "PF_SCAN_MIN_WHALE_COUNT_5M", 1)
+    min_whale_size_sol = getattr(C, "PF_SCAN_MIN_WHALE_SIZE_SOL", 1.5)
+    min_whale_count_5m = getattr(C, "PF_SCAN_MIN_WHALE_COUNT_5M", 0)
 
-    max_rug_score = getattr(C, "PF_MAX_RUG_RISK_SCORE", 0.65)
-    min_momentum = getattr(C, "PF_MIN_MOMENTUM_SCORE", 0.25)
-    min_final = getattr(C, "PF_MIN_FINAL_SCORE", 0.20)
+    max_rug_score = getattr(C, "PF_MAX_RUG_RISK_SCORE", 0.80)
+    min_momentum = getattr(C, "PF_MIN_MOMENTUM_SCORE", 0.14)
+    min_final = getattr(C, "PF_MIN_FINAL_SCORE", 0.10)
 
-    max_top10 = getattr(C, "PF_SCAN_MAX_TOP10_HOLD_PCT", 90.0)
-    max_dev_hold = getattr(C, "PF_SCAN_MAX_DEV_HOLD_PCT", 40.0)
+    max_top10 = getattr(C, "PF_SCAN_MAX_TOP10_HOLD_PCT", 95.0)
+    max_dev_hold = getattr(C, "PF_SCAN_MAX_DEV_HOLD_PCT", 60.0)
 
     # ------------------------------------------------------------------
     # Hard filters
@@ -386,7 +382,7 @@ def is_viable_pair(meta: Meta) -> bool:
     if blacklisted:
         reasons.append("token blacklisted")
 
-    # Basic decentralization / safety (soft caps, but treated as hard rejects here)
+    # Basic decentralization / safety (still treated as hard rejects).
     if top10_hold_pct > max_top10:
         reasons.append(f"top10 too concentrated ({top10_hold_pct:.1f}%)")
     if dev_hold_pct > max_dev_hold:
@@ -403,32 +399,47 @@ def is_viable_pair(meta: Meta) -> bool:
         reasons.append(f"buys_5m {buys_5m} < min {min_5m_buys}")
 
     total_trades_5m = max(1, buys_5m + sells_5m)
+    # Avoid divide-by-zero for sell-heavy coins.
     buy_sell_ratio = buys_5m / float(max(1, sells_5m))
     buy_share = buys_5m / float(total_trades_5m)
-    if sells_5m > 0 and buy_sell_ratio < min_buy_sell_ratio:
-        reasons.append(f"buy/sell ratio {buy_sell_ratio:.2f} < {min_buy_sell_ratio:.2f}")
-    if buy_share < 0.5:
-        reasons.append(f"buy share {buy_share:.2f} < 0.5")
 
-    # Whales
-    if whales_5m < min_whale_count_5m and largest_buy_5m_sol < min_whale_size_sol:
-        reasons.append("no meaningful whales in last 5m")
+    # Only enforce buy pressure when there is at least a bit of trade flow.
+    if sells_5m > 0 and total_trades_5m >= 3:
+        if buy_sell_ratio < min_buy_sell_ratio:
+            reasons.append(
+                f"buy/sell ratio {buy_sell_ratio:.2f} < {min_buy_sell_ratio:.2f}"
+            )
+        # This used to be 0.50; loosen it so we don't nuke borderline runners.
+        if buy_share < 0.35:
+            reasons.append(f"buy share {buy_share:.2f} < 0.35")
+
+    # Whales: only require if config actually asks for whales.
+    if min_whale_count_5m > 0 or min_whale_size_sol > 0:
+        if whales_5m < min_whale_count_5m and largest_buy_5m_sol < min_whale_size_sol:
+            reasons.append("no meaningful whales in last 5m")
 
     # AI / momentum scores
     momentum_score, final_score, ai_rug_score = _compute_scores(meta)
 
     if ai_rug_score > max_rug_score:
         reasons.append(f"AI rug score {ai_rug_score:.2f} > max {max_rug_score:.2f}")
-    if momentum_score < min_momentum:
-        reasons.append(f"momentum {momentum_score:.2f} < min {min_momentum:.2f}")
+
+    # LOOSENED: we don't hard-reject purely on momentum anymore.
+    # We only require *final* score to clear the bar. Momentum is still
+    # attached for debug & strategy, but won't zero out every coin.
     if final_score < min_final:
         reasons.append(f"final score {final_score:.2f} < min {min_final:.2f}")
+    # If momentum is *way* below the bar (e.g. completely dead), still flag.
+    elif momentum_score < (min_momentum * 0.6):
+        reasons.append(
+            f"momentum {momentum_score:.2f} << min {min_momentum:.2f} (dead trend)"
+        )
 
     ok = len(reasons) == 0
 
     # Attach decision for downstream / debugging
-    meta.setdefault("_filter_debug", {})
-    meta["_filter_debug"].update(
+    dbg = meta.setdefault("_filter_debug", {})
+    dbg.update(
         {
             "ok": ok,
             "reasons": reasons,
@@ -447,7 +458,6 @@ def is_viable_pair(meta: Meta) -> bool:
     )
 
     if not ok:
-        # Use .every if available to avoid log spam
         msg = (
             f"[FILTER-REJECT] mint={meta.get('mint')} symbol={meta.get('symbol')} "
             f"dex={meta.get('dex')} reasons={'; '.join(reasons)} "
