@@ -277,11 +277,12 @@ REINVESTMENT_VOLUME_MIN = _get_float("REINVESTMENT_VOLUME_MIN", 5_000.0)
 REINVESTMENT_MIN_PROFIT_SOL = _get_float("REINVESTMENT_MIN_PROFIT_SOL", 0.01)
 REINVESTMENT_HONEYPOT_CHECK = _get_bool("REINVESTMENT_HONEYPOT_CHECK", True)
 
+
 # ---------------------------------------------------------------------------
 # Entry momentum guard (Strategy uses these directly)
 # ---------------------------------------------------------------------------
 
-# Master ON/OFF for momentum filter
+# Master ON/OFF for momentum filter.
 # Default: follow AI_MOMO_FILTER if present, else enabled.
 ENTRY_MOMENTUM_ENABLED = _get_bool(
     "ENTRY_MOMENTUM_ENABLED",
@@ -328,7 +329,8 @@ PF_MAX_CONCURRENT = _get_int("PF_MAX_CONCURRENT", MAX_CONCURRENT_BUYS)
 PREWARM_TOP_N = _get_int("PREWARM_TOP_N", 5)
 
 # Global min-liquidity filter used by scanners + sniper basic filters
-SCANNER_MIN_LIQ_USD = _get_float("SCANNER_MIN_LIQ_USD", 3_500.0)
+# (This is a soft scanner-level hint; PF_* below does the real gating.)
+SCANNER_MIN_LIQ_USD = _get_float("SCANNER_MIN_LIQ_USD", 150.0)
 # Local per-sniper filter (defaults to scanner min-liq)
 MIN_LIQ_USD = _get_float("MIN_LIQ_USD", SCANNER_MIN_LIQ_USD)
 # Alias for old typo used in summarize()
@@ -375,24 +377,25 @@ ENABLE_ARBITRAGE = _get_bool("ENABLE_ARBITRAGE", True)
 DEXES: List[str] = _get_list("DEXES", ["jupiter", "raydium", "orca"])
 
 # Base scanner thresholds (older system – kept for compatibility)
-SCANNER_MIN_FDV_USD = _get_float("SCANNER_MIN_FDV_USD", 10_000.0)
-SCANNER_MIN_FRAUD_SCORE = _get_float("SCANNER_MIN_FRAUD_SCORE", 70.0)  # 0..100
+# These are now VERY PERMISSIVE. PairFilter (PF_*) below does the real work.
+SCANNER_MIN_FDV_USD = _get_float("SCANNER_MIN_FDV_USD", 0.0)
+SCANNER_MIN_FRAUD_SCORE = _get_float("SCANNER_MIN_FRAUD_SCORE", 0.0)  # 0..100
 SCANNER_ALERTS_ENABLED = _get_bool("SCANNER_ALERTS_ENABLED", True)
 
-SCANNER_MIN_BUYS_5M = _get_int("SCANNER_MIN_BUYS_5M", 5)
-SCANNER_MIN_BUYS_15M = _get_int("SCANNER_MIN_BUYS_15M", 8)
-SCANNER_MIN_VOLUME_5M_USD = _get_float("SCANNER_MIN_VOLUME_5M_USD", 2_500.0)
-SCANNER_MIN_VOLUME_15M_USD = _get_float("SCANNER_MIN_VOLUME_15M_USD", 5_000.0)
+SCANNER_MIN_BUYS_5M = _get_int("SCANNER_MIN_BUYS_5M", 0)
+SCANNER_MIN_BUYS_15M = _get_int("SCANNER_MIN_BUYS_15M", 0)
+SCANNER_MIN_VOLUME_5M_USD = _get_float("SCANNER_MIN_VOLUME_5M_USD", 20.0)
+SCANNER_MIN_VOLUME_15M_USD = _get_float("SCANNER_MIN_VOLUME_15M_USD", 60.0)
 
-SCANNER_REQUIRE_BUY_PRESSURE = _get_bool("SCANNER_REQUIRE_BUY_PRESSURE", True)
-SCANNER_MIN_BUY_RATIO = _get_float("SCANNER_MIN_BUY_RATIO", 0.60)  # buys / (buys+sells)
+SCANNER_REQUIRE_BUY_PRESSURE = _get_bool("SCANNER_REQUIRE_BUY_PRESSURE", False)
+SCANNER_MIN_BUY_RATIO = _get_float("SCANNER_MIN_BUY_RATIO", 0.0)  # buys / (buys+sells)
 
-SCANNER_MIN_PRICE_CHANGE_5M = _get_float("SCANNER_MIN_PRICE_CHANGE_5M", 5.0)    # %
-SCANNER_MIN_PRICE_CHANGE_15M = _get_float("SCANNER_MIN_PRICE_CHANGE_15M", 10.0)  # %
+SCANNER_MIN_PRICE_CHANGE_5M = _get_float("SCANNER_MIN_PRICE_CHANGE_5M", 0.0)    # %
+SCANNER_MIN_PRICE_CHANGE_15M = _get_float("SCANNER_MIN_PRICE_CHANGE_15M", 0.0)  # %
 
-SCANNER_MAX_AGE_MIN = _get_int("SCANNER_MAX_AGE_MIN", 90)
-SCANNER_MAX_MC_USD = _get_float("SCANNER_MAX_MC_USD", 2_000_000.0)
-SCANNER_MIN_HOLDERS = _get_int("SCANNER_MIN_HOLDERS", 50)
+SCANNER_MAX_AGE_MIN = _get_int("SCANNER_MAX_AGE_MIN", 720)          # up to 12h
+SCANNER_MAX_MC_USD = _get_float("SCANNER_MAX_MC_USD", 50_000_000.0) # 50M
+SCANNER_MIN_HOLDERS = _get_int("SCANNER_MIN_HOLDERS", 0)
 
 # Loops / cooldowns for aux scanners
 ALERT_COOLDOWN_SECONDS = _get_int("ALERT_COOLDOWN_SECONDS", 900)
@@ -402,36 +405,38 @@ REINVESTMENT_CHECK_INTERVAL = _get_int("REINVESTMENT_CHECK_INTERVAL", 60)
 
 # ---------------------------------------------------------------------------
 # NEW: PairFilter-centric thresholds (used by utils_pkg.pair_filters)
+# These are the knobs that directly control which coins are considered
+# "viable" and how momentum / risk scoring behaves.
 # ---------------------------------------------------------------------------
 
 # Hard ranges for liquidity / mcap / age
-PF_SCAN_MIN_LIQ_USD = _get_float("PF_SCAN_MIN_LIQ_USD", SCANNER_MIN_LIQ_USD)
-PF_SCAN_MAX_LIQ_USD = _get_float("PF_SCAN_MAX_LIQ_USD", 250_000.0)
+PF_SCAN_MIN_LIQ_USD = _get_float("PF_SCAN_MIN_LIQ_USD", 400.0)
+PF_SCAN_MAX_LIQ_USD = _get_float("PF_SCAN_MAX_LIQ_USD", 300_000.0)
 
-PF_SCAN_MIN_MCAP_USD = _get_float("PF_SCAN_MIN_MCAP_USD", 3_000.0)
-PF_SCAN_MAX_MCAP_USD = _get_float("PF_SCAN_MAX_MCAP_USD", 750_000.0)
+PF_SCAN_MIN_MCAP_USD = _get_float("PF_SCAN_MIN_MCAP_USD", 800.0)
+PF_SCAN_MAX_MCAP_USD = _get_float("PF_SCAN_MAX_MCAP_USD", 1_500_000.0)
 
 # Max age (minutes) for a token to even be considered
-PF_SCAN_MAX_TOKEN_AGE_MIN = _get_float("PF_SCAN_MAX_TOKEN_AGE_MIN", 240.0)  # 4h
+PF_SCAN_MAX_TOKEN_AGE_MIN = _get_float("PF_SCAN_MAX_TOKEN_AGE_MIN", 180.0)  # 3h
 
 # Recent activity thresholds (5m window)
-PF_SCAN_MIN_5M_VOL_USD = _get_float("PF_SCAN_MIN_5M_VOL_USD", 1_000.0)
-PF_SCAN_MIN_5M_BUYS = _get_int("PF_SCAN_MIN_5M_BUYS", 8)
-PF_SCAN_MIN_BUY_TO_SELL_RATIO = _get_float("PF_SCAN_MIN_BUY_TO_SELL_RATIO", 1.2)
+PF_SCAN_MIN_5M_VOL_USD = _get_float("PF_SCAN_MIN_5M_VOL_USD", 50.0)
+PF_SCAN_MIN_5M_BUYS = _get_int("PF_SCAN_MIN_5M_BUYS", 1)
+PF_SCAN_MIN_BUY_TO_SELL_RATIO = _get_float("PF_SCAN_MIN_BUY_TO_SELL_RATIO", 1.02)
 
 # Whale presence
-PF_SCAN_MIN_WHALE_SIZE_SOL = _get_float("PF_SCAN_MIN_WHALE_SIZE_SOL", 3.0)
-PF_SCAN_MIN_WHALE_COUNT_5M = _get_int("PF_SCAN_MIN_WHALE_COUNT_5M", 1)
+PF_SCAN_MIN_WHALE_SIZE_SOL = _get_float("PF_SCAN_MIN_WHALE_SIZE_SOL", 1.5)
+PF_SCAN_MIN_WHALE_COUNT_5M = _get_int("PF_SCAN_MIN_WHALE_COUNT_5M", 0)
 
 # AI rug-risk + scoring thresholds
-PF_MAX_RUG_RISK_SCORE = _get_float("PF_MAX_RUG_RISK_SCORE", 0.65)  # 0..1
+PF_MAX_RUG_RISK_SCORE = _get_float("PF_MAX_RUG_RISK_SCORE", 0.80)  # 0..1
 
 # Minimum scores to pass filter
-PF_MIN_MOMENTUM_SCORE = _get_float("PF_MIN_MOMENTUM_SCORE", 0.25)  # 0..1
-PF_MIN_FINAL_SCORE = _get_float("PF_MIN_FINAL_SCORE", 0.20)        # 0..1
+PF_MIN_MOMENTUM_SCORE = _get_float("PF_MIN_MOMENTUM_SCORE", 0.14)  # 0..1
+PF_MIN_FINAL_SCORE = _get_float("PF_MIN_FINAL_SCORE", 0.10)        # 0..1
 
 # How strongly AI rug score penalizes the final score (0..1)
-PF_RISK_PENALTY_WEIGHT = _get_float("PF_RISK_PENALTY_WEIGHT", 0.7)
+PF_RISK_PENALTY_WEIGHT = _get_float("PF_RISK_PENALTY_WEIGHT", 0.6)
 
 
 # ---------------------------------------------------------------------------
