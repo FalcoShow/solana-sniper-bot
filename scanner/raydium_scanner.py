@@ -77,6 +77,9 @@ UA = _s(
 )
 BASE = _s("DEXSCREENER_BASE_URL", "https://api.dexscreener.com").rstrip("/")
 
+# Dexscreener search limit per query (higher = more raw pairs to evaluate)
+SEARCH_LIMIT = max(50, _i("RAYDIUM_SEARCH_LIMIT", 250))
+
 # How many top candidates we keep per scan (after PF filtering + scoring)
 LIMIT = _i("RAYDIUM_LIMIT", 40)
 
@@ -101,10 +104,17 @@ SEARCH_QUERIES = [
     if q.strip()
 ]
 
-# Optional soft prefilters BEFORE PF_* (so we don’t waste AI/logic on absolute dust)
-SOFT_MIN_LIQ_USD = _f("RAYDIUM_SOFT_MIN_LIQ_USD", PF_SCAN_MIN_LIQ_USD * 0.4)
-SOFT_MIN_MCAP_USD = _f("RAYDIUM_SOFT_MIN_MCAP_USD", PF_SCAN_MIN_MCAP_USD * 0.4)
-SOFT_MAX_AGE_MIN = _f("RAYDIUM_SOFT_MAX_AGE_MIN", PF_SCAN_MAX_TOKEN_AGE_MIN * 1.2)
+# -------------------------------------------------------------------------
+# Soft prefilters BEFORE PF_* (to cut truly dead dust but let more pass)
+# -------------------------------------------------------------------------
+# We base these on PF_SCAN_* but loosen them, with floors so they never go crazy.
+_BASE_SOFT_LIQ_DEFAULT = max(40.0, PF_SCAN_MIN_LIQ_USD * 0.3)
+_BASE_SOFT_MCAP_DEFAULT = max(40.0, PF_SCAN_MIN_MCAP_USD * 0.25)
+_BASE_SOFT_MAX_AGE_DEFAULT = max(30.0, PF_SCAN_MAX_TOKEN_AGE_MIN * 1.5)
+
+SOFT_MIN_LIQ_USD = _f("RAYDIUM_SOFT_MIN_LIQ_USD", _BASE_SOFT_LIQ_DEFAULT)
+SOFT_MIN_MCAP_USD = _f("RAYDIUM_SOFT_MIN_MCAP_USD", _BASE_SOFT_MCAP_DEFAULT)
+SOFT_MAX_AGE_MIN = _f("RAYDIUM_SOFT_MAX_AGE_MIN", _BASE_SOFT_MAX_AGE_DEFAULT)
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -231,7 +241,8 @@ async def _fetch_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     seen_ids: set = set()
 
     for q in SEARCH_QUERIES:
-        data, _status, _first = await _fetch_json(session, url, params={"q": q})
+        params = {"q": q, "limit": SEARCH_LIMIT}
+        data, _status, _first = await _fetch_json(session, url, params=params)
         if not data:
             continue
         pairs = data.get("pairs") or []
@@ -240,6 +251,7 @@ async def _fetch_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
                 continue
             if (p.get("dexId") or "").lower() != "raydium":
                 continue
+            # Prefer pairAddress for uniqueness, fall back to baseToken address
             pid = p.get("pairAddress") or ((p.get("baseToken") or {}).get("address"))
             if pid and pid not in seen_ids:
                 seen_ids.add(pid)
@@ -632,11 +644,12 @@ async def scan_raydium(*args):
 
     try:
         logger.info(
-            "scanner.raydium: starting scan; queries=%s soft_min_liq=$%.0f pf_min_liq=$%.0f limit=%d",
+            "scanner.raydium: starting scan; queries=%s soft_min_liq=$%.0f pf_min_liq=$%.0f limit=%d search_limit=%d",
             ",".join(SEARCH_QUERIES),
             SOFT_MIN_LIQ_USD,
             PF_SCAN_MIN_LIQ_USD,
             LIMIT,
+            SEARCH_LIMIT,
         )
         pairs = await _fetch_pairs(sess)
 
