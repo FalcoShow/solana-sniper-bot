@@ -2696,13 +2696,6 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
     """
     Periodically run the Raydium scanner and feed its candidates into the
     Strategy.new_token pipeline as synthetic 'raydium' events.
-
-    This lets Raydium runners go through:
-      - basic filters
-      - liquidity screen
-      - momentum gate
-      - guardrails & dedupe
-      - maybe_buy() + exit engine hooks
     """
     scan_raydium = _get_raydium_scanner()
     if scan_raydium is None:
@@ -2713,12 +2706,6 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
     jitter_seed = (os.getpid() % 7) / 6.0  # 0.0–1.0
     backoff = 2.0
     first_log = True
-
-    # Try to grab the global strategy instance, but don't crash if missing.
-    try:
-        s = strat  # type: ignore[name-defined]
-    except NameError:  # pragma: no cover - ultra defensive
-        s = None
 
     while not stop_evt.is_set():
         try:
@@ -2731,10 +2718,6 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                 )
                 first_log = False
 
-            # Run the scanner. It may return:
-            #   - list/tuple of candidate dicts
-            #   - dict with a "runners" key
-            #   - None (side-effect only)
             runners_raw = await scan_raydium()
 
             candidates: list[dict] = []
@@ -2742,7 +2725,6 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                 if isinstance(runners_raw.get("runners"), (list, tuple)):
                     candidates = list(runners_raw["runners"])  # type: ignore[arg-type]
                 else:
-                    # Some variants may return {"pf": [...], "fb": [...]}
                     pf = runners_raw.get("pf") or []
                     fb = runners_raw.get("fb") or []
                     if isinstance(pf, (list, tuple)):
@@ -2757,10 +2739,13 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                 candidates=len(candidates),
             )
 
-            # Feed candidates into strategy as synthetic new-token events
-            if s is not None and candidates:
+            # 🔑 get the current Strategy instance each loop
+            s = globals().get("strat")
+            if s is None:
+                if DEBUG_TX:
+                    print("[raydium] strat not ready yet; skipping batch", flush=True)
+            elif candidates:
                 for cand in candidates:
-                    # Extremely defensive: each cand should be a mapping
                     if not isinstance(cand, dict):
                         continue
 
@@ -2800,7 +2785,6 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                             "age_min": float(age_min),
                         }
 
-                        # Extra Raydium / Dexscreener metadata when present
                         pair_addr = cand.get("pairAddress") or cand.get("pair")
                         if pair_addr:
                             raw_event["raydium_pair"] = pair_addr
@@ -2808,7 +2792,7 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                         if ds_url:
                             raw_event["dexscreener_url"] = ds_url
 
-                        # Let Strategy decide filters / momentum / buys
+                        # async fire-and-forget into Strategy
                         asyncio.create_task(s.on_new_token(raw_event))
                     except Exception as e:
                         if DEBUG_TX:
@@ -2820,7 +2804,7 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                 jitter = 0.15 * base_interval * jitter_seed
                 await asyncio.sleep(base_interval + jitter)
 
-            backoff = 2.0  # reset backoff after a successful loop
+            backoff = 2.0
 
         except asyncio.CancelledError:
             log.event("SCAN_RAYDIUM_CANCELLED")
