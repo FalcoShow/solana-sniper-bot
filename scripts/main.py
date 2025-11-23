@@ -1424,7 +1424,6 @@ class Strategy:
         self._sema = asyncio.Semaphore(MAX_CONCURRENCY)
 
         # How many momentum gates can run in parallel
-        # honour ENTRY_MOMENTUM_MAX_PARALLEL if set, else fallback to ENTRY_MOMO_MAX_PARALLEL
         gate_max = _as_int(
             os.getenv("ENTRY_MOMENTUM_MAX_PARALLEL", str(ENTRY_MOMO_MAX_PARALLEL)),
             ENTRY_MOMO_MAX_PARALLEL,
@@ -1432,7 +1431,17 @@ class Strategy:
         self._gate_sema = asyncio.Semaphore(max(1, gate_max))
 
         # Per-mint state while we observe trades/prices in the window
+        # keyed by *raw mint* so on_trade() can update counts
         self._gate_state: Dict[str, Dict[str, Any]] = {}
+
+        # Momentum config (mirrors env/constants)
+        self.momo_enabled: bool = bool(ENTRY_MOMENTUM_ENABLED)
+        self.momo_min_trades: int = int(ENTRY_MOMO_MIN_TRADES)
+        self.momo_min_up_pct: float = float(ENTRY_MOMO_MIN_UP_PCT)
+        self.momo_window_sec: int = int(ENTRY_MOMO_WINDOW_SEC)
+        self.momo_price_tries: int = int(ENTRY_MOMO_PRICE_TRIES)
+        self.momo_price_delay_s: float = float(ENTRY_MOMO_PRICE_DELAY_S)
+        self.momo_allow_no_data_pump: bool = bool(ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP)
 
         # Diagnostics (mirrored into DIAG_MINUTE)
         self._diag = {
@@ -1441,7 +1450,7 @@ class Strategy:
             "events_new_token": 0,
             "rejected_filters": 0,
             "rejected_guardrails": 0,
-            "rejected_momo": 0,  # includes strict momentum rejections
+            "rejected_momo": 0,  # strict momentum rejections only
             "buys_submitted": 0,
             "buys_filled": 0,
         }
@@ -1492,6 +1501,7 @@ class Strategy:
                 if DEBUG_TX:
                     traceback.print_exc()
 
+        # Update momentum trade count for this mint (if it's being gated)
         m = str(
             _get_first(
                 raw_event,
@@ -1509,6 +1519,167 @@ class Strategy:
         if st is not None:
             st["trades"] = int(st.get("trades", 0)) + 1
 
+    # --- MOMENTUM DECISION (pool-aware) ---------------------------------
+    def _momentum_decision(
+        self,
+        *,
+        pool: str,
+        mint: str,
+        symbol: str,
+        trades: int,
+        price0: float,
+        price1: float,
+    ) -> bool:
+        """
+        Returns True = momentum OK / not blocking
+                False = block entry
+
+        Behaviour:
+          - For pump:
+              * if no data and momo_allow_no_data_pump=1 → bypass (log only)
+              * else: strict → reject on no-data or weak momentum
+          - For raydium:
+              * if no data → advisory only (log, but do NOT block)
+              * if data but not up enough / no trades → reject
+          - For other pools:
+              * strict (like pump with allow_no_data_pump=0)
+        """
+        if not self.momo_enabled:
+            return True
+
+        pool = (pool or "").lower()
+        no_trades = trades < self.momo_min_trades
+        no_price_data = (price0 <= 0.0 or price1 <= 0.0)
+        no_data = no_trades or no_price_data
+
+        # --- NO DATA CASE ------------------------------------------------
+        if no_data:
+            # Pump: optionally bypass no-data check
+            if pool in ("pump", "pumpfun", "pump.fun"):
+                if self.momo_allow_no_data_pump:
+                    log.event(
+                        "MOMO_BYPASS_NO_DATA_PUMP",
+                        pool=pool,
+                        mint=mint,
+                        symbol=symbol,
+                        trades=trades,
+                        price0=price0,
+                        price1=price1,
+                        min_trades=self.momo_min_trades,
+                        min_up_pct=self.momo_min_up_pct,
+                    )
+                    return True
+
+                # Strict pump dead-coin protection
+                log.event(
+                    "MOMO_SKIP_NO_DATA",
+                    pool=pool,
+                    mint=mint,
+                    symbol=symbol,
+                    trades=trades,
+                    price0=price0,
+                    price1=price1,
+                    min_trades=self.momo_min_trades,
+                    min_up_pct=self.momo_min_up_pct,
+                )
+                try:
+                    record_buy_result(ok=False, reason="momo_no_data")
+                except Exception:
+                    pass
+                self._diag["rejected_momo"] += 1
+                return False
+
+            # Raydium: advisory only on no-data (do NOT block)
+            if pool == "raydium":
+                log.event(
+                    "MOMO_SKIP_NO_DATA",
+                    pool=pool,
+                    mint=mint,
+                    symbol=symbol,
+                    trades=trades,
+                    price0=price0,
+                    price1=price1,
+                    min_trades=self.momo_min_trades,
+                    min_up_pct=self.momo_min_up_pct,
+                )
+                # Let other filters + liq screen decide; we don't block here.
+                return True
+
+            # Other pools: strict
+            log.event(
+                "MOMO_SKIP_NO_DATA",
+                pool=pool,
+                mint=mint,
+                symbol=symbol,
+                trades=trades,
+                price0=price0,
+                price1=price1,
+                min_trades=self.momo_min_trades,
+                min_up_pct=self.momo_min_up_pct,
+            )
+            try:
+                record_buy_result(ok=False, reason="momo_no_data")
+            except Exception:
+                pass
+            self._diag["rejected_momo"] += 1
+            return False
+
+        # --- HAVE DATA: evaluate real momentum --------------------------
+        pct_up = ((price1 / max(price0, 1e-12)) - 1.0) * 100.0
+        up_ok = pct_up >= self.momo_min_up_pct
+        trades_ok = trades >= self.momo_min_trades
+
+        log.event(
+            "MOMO_EVAL",
+            pool=pool,
+            mint=mint,
+            symbol=symbol,
+            trades=trades,
+            price0=price0,
+            price1=price1,
+            pct_up=pct_up,
+            min_trades=self.momo_min_trades,
+            min_up_pct=self.momo_min_up_pct,
+            up_ok=int(up_ok),
+            trades_ok=int(trades_ok),
+        )
+
+        if not (up_ok and trades_ok):
+            # For all pools (pump + raydium): weak / down-only momentum → reject
+            reasons = []
+            if not up_ok:
+                reasons.append(f"up {pct_up:.2f}% < {self.momo_min_up_pct}%")
+            if not trades_ok:
+                reasons.append(f"trades {trades} < {self.momo_min_trades}")
+
+            log.event(
+                "MOMO_REJECT",
+                pool=pool,
+                mint=mint,
+                symbol=symbol,
+                pct_up=pct_up,
+                trades=trades,
+                reasons="; ".join(reasons) or "unknown",
+            )
+            try:
+                record_buy_result(ok=False, reason="momo_reject")
+            except Exception:
+                pass
+            self._diag["rejected_momo"] += 1
+            return False
+
+        log.event(
+            "MOMO_OK",
+            pool=pool,
+            mint=mint,
+            symbol=symbol,
+            pct_up=pct_up,
+            trades=trades,
+            min_trades=self.momo_min_trades,
+            min_up_pct=self.momo_min_up_pct,
+        )
+        return True
+
     # --- MOMENTUM GATE ---------------------------------------------------
     async def _gate_candidate(
         self,
@@ -1520,8 +1691,7 @@ class Strategy:
         Momentum gate that:
           - waits for a short window
           - counts trades + price move
-          - enforces momentum thresholds (Track A)
-          - can optionally bypass strict checks for pump.fun with no data (Track B)
+          - enforces pool-aware momentum thresholds
           - runs guardrails
           - finally calls maybe_buy()
         """
@@ -1538,29 +1708,27 @@ class Strategy:
                         )
                     return
 
-            # Identify pool for Track B logic
             pool = str(ui.get("pool") or "").lower()
-            is_pump_pool = pool in ("pump", "pumpfun", "pump.fun")
 
-            # Initialise gate state for this mint (keyed by raw mint so it matches on_trade)
+            # Initialise gate state (keyed by raw mint so on_trade() updates)
             self._gate_state[mint_raw] = {"trades": 0, "price0": 0.0}
 
             # First price sample (price0)
             price0 = 0.0
             if _is_probable_mint(mint_norm):
-                for _ in range(max(1, ENTRY_MOMO_PRICE_TRIES)):
+                for _ in range(max(1, self.momo_price_tries)):
                     try:
                         price0 = await _route_price_ui(mint_norm)
                     except Exception:
                         price0 = 0.0
                     if price0 > 0:
                         break
-                    await asyncio.sleep(ENTRY_MOMO_PRICE_DELAY_S)
+                    await asyncio.sleep(self.momo_price_delay_s)
 
             self._gate_state[mint_raw]["price0"] = price0
 
             # Wait the momentum window
-            await asyncio.sleep(max(1, ENTRY_MOMO_WINDOW_SEC))
+            await asyncio.sleep(max(1, self.momo_window_sec))
 
             # Snapshot state after the window
             st = self._gate_state.get(mint_raw, {})
@@ -1573,118 +1741,25 @@ class Strategy:
                 except Exception:
                     price1 = 0.0
 
-            # Always clear gate state for this mint from here
+            # Clear gate state
             self._gate_state.pop(mint_raw, None)
 
-            # ---- NO-DATA / DEAD-COIN GUARD + TRACK B OVERRIDE -----------
-            no_data = (price0 <= 0.0 or price1 <= 0.0 or trades == 0)
-
-            if no_data:
-                # TRACK B: pump hunter mode – allow no-data for pump.fun when flag is on
-                if is_pump_pool and ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP:
-                    log.event(
-                        "MOMO_BYPASS_NO_DATA_PUMP",
-                        mint=mint_raw,
-                        pool=pool,
-                        trades=trades,
-                        price0=price0,
-                        price1=price1,
-                        min_trades=ENTRY_MOMO_MIN_TRADES,
-                        min_up_pct=ENTRY_MOMO_MIN_UP_PCT,
-                    )
-                    try:
-                        msg = (
-                            f"[MOMO_BYPASS_NO_DATA_PUMP] mint={mint_norm} pool={pool} "
-                            f"trades={trades} price0={price0:.6g} price1={price1:.6g} "
-                            f"min_trades={ENTRY_MOMO_MIN_TRADES} "
-                            f"min_up={ENTRY_MOMO_MIN_UP_PCT}% "
-                            f"flag=ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP"
-                        )
-                        asyncio.create_task(_send_telegram_debug(msg))
-                    except Exception:
-                        pass
-                    # Skip strict momentum checks below
-                    pct_up = 0.0
-                    up_ok = True
-                    trades_ok = True
-                else:
-                    # TRACK A: strict behaviour (non-pump or flag off) – reject
-                    log.event(
-                        "MOMO_SKIP_NO_DATA",
-                        mint=mint_raw,
-                        pool=pool,
-                        trades=trades,
-                        price0=price0,
-                        price1=price1,
-                        min_trades=ENTRY_MOMO_MIN_TRADES,
-                        min_up_pct=ENTRY_MOMO_MIN_UP_PCT,
-                    )
-                    try:
-                        msg = (
-                            f"[MOMO_SKIP_NO_DATA] mint={mint_norm} pool={pool} "
-                            f"trades={trades} price0={price0:.6g} price1={price1:.6g} "
-                            f"min_trades={ENTRY_MOMO_MIN_TRADES} "
-                            f"min_up={ENTRY_MOMO_MIN_UP_PCT}%"
-                        )
-                        asyncio.create_task(_send_telegram_debug(msg))
-                    except Exception:
-                        pass
-                    try:
-                        record_buy_result(ok=False, reason="momo_no_data")
-                    except Exception:
-                        pass
-                    self._diag["rejected_momo"] += 1
-                    return
-            else:
-                # We have data → use real momentum checks
-                pct_up = ((price1 / max(price0, 1e-12)) - 1.0) * 100.0
-                up_ok = pct_up >= ENTRY_MOMO_MIN_UP_PCT
-                trades_ok = trades >= ENTRY_MOMO_MIN_TRADES
-
-                log.event(
-                    "MOMO_EVAL",
-                    mint=mint_raw,
-                    pool=pool,
-                    trades=trades,
-                    price0=price0,
-                    price1=price1,
-                    pct_up=pct_up,
-                    min_trades=ENTRY_MOMO_MIN_TRADES,
-                    min_up_pct=ENTRY_MOMO_MIN_UP_PCT,
-                    up_ok=int(up_ok),
-                    trades_ok=int(trades_ok),
-                )
-
-                if not (up_ok and trades_ok):
-                    try:
-                        reasons = []
-                        if not up_ok:
-                            reasons.append(
-                                f"up {pct_up:.2f}% < {ENTRY_MOMO_MIN_UP_PCT}%"
-                            )
-                        if not trades_ok:
-                            reasons.append(
-                                f"trades {trades} < {ENTRY_MOMO_MIN_TRADES}"
-                            )
-                        msg = (
-                            f"[MOMO_REJECT] mint={mint_norm} pool={pool} "
-                            f"price0={price0:.6g} price1={price1:.6g} "
-                            f"pct_up={pct_up:.2f}% "
-                            f"reasons={'; '.join(reasons) or 'unknown'}"
-                        )
-                        asyncio.create_task(_send_telegram_debug(msg))
-                    except Exception:
-                        pass
-
-                    try:
-                        record_buy_result(ok=False, reason="momo_reject")
-                    except Exception:
-                        pass
-                    self._diag["rejected_momo"] += 1
-                    return
+            # --- MOMENTUM DECISION (pool-aware) -------------------------
+            symbol = ui.get("symbol") or ui.get("name") or "?"
+            momo_ok = self._momentum_decision(
+                pool=pool,
+                mint=mint_norm,
+                symbol=symbol,
+                trades=trades,
+                price0=price0,
+                price1=price1,
+            )
+            if not momo_ok:
+                # strict momentum rejections already logged + diag updated
+                return
 
             # ---- Guardrails before executing a buy ----------------------
-            if not buys_allowed() or PAUSE_TRADING:
+            if PAUSE_TRADING or not buys_allowed():
                 if DEBUG_TX:
                     print(
                         "[guardrails] buys not allowed at gate decision — skip",
@@ -1777,7 +1852,7 @@ class Strategy:
                                 extra={"err": str(_e)[:200]},
                             )
 
-                        # Exit engine hook (dict-style API) — now passes tx_sig
+                        # Exit engine hook
                         if EXIT_ENGINE_ENABLED:
                             try:
                                 ev = {
@@ -1849,7 +1924,7 @@ class Strategy:
         self._diag["events_total"] += 1
         self._diag["events_new_token"] += 1
 
-        # Pool + force-buy flag (for Raydium DRYRUN debug / aggression)
+        # Pool + force-buy flag (for Raydium debug / aggression)
         pool = str(raw_event.get("pool") or "pump").lower()
         force_ray = (
             os.getenv("ENTRY_FORCE_BUY_RAYDIUM", "0") == "1"
@@ -1904,7 +1979,6 @@ class Strategy:
             # hard reject
             self._diag["rejected_filters"] += 1
 
-            # rich debug for *why* it's failing (as much as we can infer from raw_event)
             liq = float(
                 raw_event.get("liq_usd")
                 or raw_event.get("liq")
@@ -2043,7 +2117,7 @@ class Strategy:
         )
 
         # Dedupe gate proposals
-        if DEDUPE_ENABLED and ENTRY_MOMENTUM_ENABLED:
+        if DEDUPE_ENABLED and self.momo_enabled:
             if not claim_once(
                 f"gate-propose:{mint_norm}",
                 ttl=int(PF_GATE_TTL_SEC),
@@ -2056,7 +2130,7 @@ class Strategy:
                 return
 
         # Momentum enabled → send into gate; otherwise buy immediately
-        if ENTRY_MOMENTUM_ENABLED:
+        if self.momo_enabled:
             asyncio.create_task(self._gate_candidate(ui, mint_source, mint_norm))
         else:
             # Direct-buy path, still respecting dedupe/guardrails
@@ -2147,7 +2221,7 @@ class Strategy:
                                     extra={"err": str(_e)[:200]},
                                 )
 
-                            # Exit engine hook (dict-style API)
+                            # Exit engine hook
                             if EXIT_ENGINE_ENABLED:
                                 try:
                                     ev = {
