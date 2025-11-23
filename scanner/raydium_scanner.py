@@ -504,19 +504,12 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "freeze_authority_disabled": True,
         }
 
-        # Soft prefilters (very gentle)
-        liq = float(meta["liq_usd"])
-        age = float(meta["token_age_min"])
-        if SOFT_MIN_LIQ_USD > 0.0 and liq < SOFT_MIN_LIQ_USD:
-            return None
-        if SOFT_MAX_AGE_MIN > 0.0 and age > SOFT_MAX_AGE_MIN:
-            return None
-
+# NOTE: do NOT hard-filter here. Let PF and fallback handle liq/age/etc
+        # so we can tune behavior via env vars without losing all pairs.
         return meta
     except Exception as e:
         logger.debug("Raydium normalize error: %s", e)
         return None
-
 
 # -----------------------------------------------------------------------------
 # Optional AI / whales enrichment
