@@ -2706,6 +2706,7 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
     jitter_seed = (os.getpid() % 7) / 6.0  # 0.0–1.0
     backoff = 2.0
     first_log = True
+    warned_no_strat = False  # avoid spamming logs
 
     while not stop_evt.is_set():
         try:
@@ -2722,6 +2723,7 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
 
             candidates: list[dict] = []
             if isinstance(runners_raw, dict):
+                # Normal shape: {"pf":[...], "fb":[...]} or {"runners":[...]}
                 if isinstance(runners_raw.get("runners"), (list, tuple)):
                     candidates = list(runners_raw["runners"])  # type: ignore[arg-type]
                 else:
@@ -2732,6 +2734,7 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                     if isinstance(fb, (list, tuple)):
                         candidates.extend(x for x in fb)
             elif isinstance(runners_raw, (list, tuple)):
+                # Already a flat list of runner dicts
                 candidates = list(runners_raw)
 
             log.event(
@@ -2739,11 +2742,28 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                 candidates=len(candidates),
             )
 
-            # 🔑 get the current Strategy instance each loop
+            # 🔑 Get or create a Strategy instance for Raydium
             s = globals().get("strat")
             if s is None:
+                try:
+                    # Strategy is defined earlier in this module
+                    s = Strategy()  # type: ignore[name-defined]
+                    globals()["strat"] = s
+                    log.event("STRATEGY_INIT_RAYDIUM")
+                except NameError:
+                    # Strategy class not visible yet – just warn (once) and skip
+                    if DEBUG_TX and not warned_no_strat:
+                        print(
+                            "[raydium] Strategy not defined yet; skipping batch",
+                            flush=True,
+                        )
+                        warned_no_strat = True
+                    s = None
+
+            if s is None:
+                # Nothing we can do this loop
                 if DEBUG_TX:
-                    print("[raydium] strat not ready yet; skipping batch", flush=True)
+                    print("[raydium] strat still not ready; skipping batch", flush=True)
             elif candidates:
                 for cand in candidates:
                     if not isinstance(cand, dict):
