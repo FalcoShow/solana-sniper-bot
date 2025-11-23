@@ -129,9 +129,10 @@ SCANNER_MAX_AGE_MIN = _f("SCANNER_MAX_AGE_MIN", DEFAULT_AGE_CAP)
 # -------------------------------------------------------------------------
 # Soft prefilters BEFORE PF_* (to cut truly dead dust but let more pass)
 # -------------------------------------------------------------------------
-# We base these on PF_SCAN_* but loosen them, with floors so they never go crazy.
 _BASE_SOFT_LIQ_DEFAULT = max(0.0, PF_SCAN_MIN_LIQ_USD * 0.25)
-_BASE_SOFT_MAX_AGE_DEFAULT = PF_SCAN_MAX_TOKEN_AGE_MIN * 1.5 if PF_SCAN_MAX_TOKEN_AGE_MIN > 0 else 0.0
+_BASE_SOFT_MAX_AGE_DEFAULT = (
+    PF_SCAN_MAX_TOKEN_AGE_MIN * 1.5 if PF_SCAN_MAX_TOKEN_AGE_MIN > 0 else 0.0
+)
 
 SOFT_MIN_LIQ_USD = _f("RAYDIUM_SOFT_MIN_LIQ_USD", _BASE_SOFT_LIQ_DEFAULT)
 # NOTE: we do NOT soft-filter on mcap anymore; too many SOL/RAY new tokens have 0 mcap in Dexscreener.
@@ -433,9 +434,6 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         metrics = _extract_metrics(pair)
 
-        # We intentionally avoid hard soft-filters here; let PF + fallback
-        # handle thresholds so we can debug behaviour via envs.
-
         base = pair.get("baseToken") or {}
         mint = (base.get("address") or "").strip()
         if not mint:
@@ -486,11 +484,11 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "price_change_15m_pct": metrics["price_change_15m_pct"],
             "price_change_1h_pct": metrics["price_change_1h_pct"],
 
-            # holders (not available from Dexscreener; left neutral)
+            # holders
             "holders": metrics["holders"],
             "holders_5m_change": metrics["holders_5m_change"],
 
-            # whale / AI fields (some filled here, some optional later)
+            # whale / AI fields
             "whales_5m": metrics["whales_5m"],
             "whale_vol_5m_usd": metrics["whale_vol_5m_usd"],
             "largest_buy_5m_sol": metrics["largest_buy_5m_sol"],
@@ -505,6 +503,14 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "mint_authority_disabled": True,
             "freeze_authority_disabled": True,
         }
+
+        # Soft prefilters (very gentle)
+        liq = float(meta["liq_usd"])
+        age = float(meta["token_age_min"])
+        if SOFT_MIN_LIQ_USD > 0.0 and liq < SOFT_MIN_LIQ_USD:
+            return None
+        if SOFT_MAX_AGE_MIN > 0.0 and age > SOFT_MAX_AGE_MIN:
+            return None
 
         return meta
     except Exception as e:
@@ -606,7 +612,11 @@ def _fallback_candidates(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     # Effective thresholds (respect 0 = disabled)
     liq_min = max(0.0, float(RAYDIUM_FALLBACK_MIN_LIQ_USD))
-    chg_min = max(0.0, float(RAYDIUM_FALLBACK_MIN_CHANGE_5M), float(SCANNER_MIN_PRICE_CHANGE_5M))
+    chg_min = max(
+        0.0,
+        float(RAYDIUM_FALLBACK_MIN_CHANGE_5M),
+        float(SCANNER_MIN_PRICE_CHANGE_5M),
+    )
     buys_min = max(0, int(SCANNER_MIN_BUYS_5M))
     vol_min = max(0.0, float(SCANNER_MIN_VOLUME_5M_USD))
     ratio_min = max(0.0, float(SCANNER_MIN_BUY_RATIO))
@@ -648,7 +658,7 @@ def _fallback_candidates(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------------
-# MOMO event wiring (uses final_score / momentum_score)
+# MOMO event wiring (uses runners list)
 # -----------------------------------------------------------------------------
 
 async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
@@ -673,14 +683,17 @@ async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
             ctx: Dict[str, Any] = {
                 "symbol": c.get("symbol") or c.get("mint"),
                 "mint": c.get("mint"),
-                "pool": c.get("pair_url"),
+                # pool id used by filters / POOLS env
+                "pool": "raydium",
+                # separate URL for alerts
+                "pool_url": c.get("pair_url"),
                 "age_sec": age_sec,
                 "liq_usd": c.get("liq_usd"),
                 "vol_5m": c.get("vol_5m_usd"),
                 "up_pct": c.get("price_change_5m_pct"),
                 "reason": (
-                    f"raydium PF runner final={c.get('final_score', 0.0):.3f} "
-                    f"momentum={c.get('momentum_score', 0.0):.3f}"
+                    f"raydium runner liq=${c.get('liq_usd', 0):.0f} "
+                    f"vol5=${c.get('vol_5m_usd', 0):.0f} up5={c.get('price_change_5m_pct', 0):.2f}%"
                 ),
             }
             await am.send_momo_event("MOMO_OK", ctx)
@@ -703,7 +716,7 @@ async def scan_raydium(*args):
       - scan_raydium(session)
 
     Only an aiohttp.ClientSession (if provided) is used.
-    Returns a list of PF-scored runner candidates (each is a meta dict).
+    Returns a list of runner candidates (each is a meta dict).
     """
     sess: Optional[aiohttp.ClientSession] = None
     if len(args) >= 2 and isinstance(args[1], aiohttp.ClientSession):
@@ -783,9 +796,7 @@ async def scan_raydium(*args):
         if not RAYDIUM_BYPASS_PF:
             pf_runners = _apply_pf(metas)
 
-        runners: List[Dict[str, Any]]
         fb: List[Dict[str, Any]] = []
-
         if pf_runners:
             runners = pf_runners
         else:
@@ -813,10 +824,9 @@ async def scan_raydium(*args):
             len(pairs),
         )
 
-        # MOMO alerts only make sense for PF-scored ones; if we are using fallback-only,
-        # they won't have momentum/final_score, so we skip MOMO there.
-        if pf_runners:
-            await _send_momo_for_runners(pf_runners)
+        # 🔥 Key change: send MOMO for whatever runners we're actually using
+        if runners:
+            await _send_momo_for_runners(runners)
 
         return runners
     except Exception as e:
