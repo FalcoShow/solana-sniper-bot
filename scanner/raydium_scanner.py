@@ -1,8 +1,6 @@
 # scanner/raydium_scanner.py
 # Raydium scanner via Dexscreener — builds "meta" dicts compatible with
-# utils_pkg.pair_filters and surfaces PF-scored runners, with a safe
-# heuristic fallback so we NEVER sit at 0 runners if there are usable pools.
-
+# utils_pkg.pair_filters and surfaces only high-quality runners.
 from __future__ import annotations
 
 import os
@@ -37,16 +35,9 @@ from utils_pkg.pair_filters import (
 
 logger = logging.getLogger("scanner.raydium")
 
-# Optional: detailed PF debug if available
-try:  # pragma: no cover - best-effort
-    from utils_pkg.pair_filters import debug_viability  # type: ignore
-except Exception:  # pragma: no cover
-    debug_viability = None  # type: ignore
-
-
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Env helpers
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 def _b(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
@@ -76,9 +67,9 @@ def _f(name: str, default: float) -> float:
         return default
 
 
-# =============================================================================
-# Config / env (Raydium-specific tuning)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Config / env (Raydium-specific tuning on top of global PF_* thresholds)
+# -----------------------------------------------------------------------------
 
 UA = _s(
     "SCANNER_UA",
@@ -106,13 +97,6 @@ AI_RUG_ENABLED = _b("RAYDIUM_AI_RUG_ENABLED", False)
 AI_RUG_MAX_PER_SCAN = _i("RAYDIUM_AI_RUG_MAX_PER_SCAN", 15)
 WHALES_ENABLED = _b("RAYDIUM_WHALES_ENABLED", False)
 
-# PF bypass / fallback behaviour (this is the big one for “0 PF runners”)
-BYPASS_PF = _b("RAYDIUM_BYPASS_PF", False)
-ENABLE_FALLBACK = _b("RAYDIUM_ENABLE_FALLBACK", True)
-FALLBACK_MIN_LIQ_USD = _f("RAYDIUM_FALLBACK_MIN_LIQ_USD", 150.0)
-FALLBACK_MIN_CHANGE_5M = _f("RAYDIUM_FALLBACK_MIN_CHANGE_5M", 0.0)
-FALLBACK_LIMIT = _i("RAYDIUM_FALLBACK_LIMIT", 8)
-
 # You can override the search queries; all results are filtered to dexId=raydium anyway.
 SEARCH_QUERIES = [
     q.strip()
@@ -120,23 +104,35 @@ SEARCH_QUERIES = [
     if q.strip()
 ]
 
-# -----------------------------------------------------------------------------
-# Soft prefilters BEFORE PF_* (to cut truly dead dust but let more pass)
-# -----------------------------------------------------------------------------
-# We base these on PF_SCAN_* but loosen them, with floors so they never go crazy.
+# Raydium ↔ PF interaction flags
+RAYDIUM_BYPASS_PF = _b("RAYDIUM_BYPASS_PF", False)
+RAYDIUM_ENABLE_FALLBACK = _b("RAYDIUM_ENABLE_FALLBACK", True)
+RAYDIUM_FALLBACK_MIN_LIQ_USD = _f("RAYDIUM_FALLBACK_MIN_LIQ_USD", 150.0)
+RAYDIUM_FALLBACK_MIN_CHANGE_5M = _f("RAYDIUM_FALLBACK_MIN_CHANGE_5M", 0.0)
+RAYDIUM_FALLBACK_LIMIT = max(1, _i("RAYDIUM_FALLBACK_LIMIT", 8))
 
-_BASE_SOFT_LIQ_DEFAULT = max(30.0, PF_SCAN_MIN_LIQ_USD * 0.25)
-_BASE_SOFT_MCAP_DEFAULT = max(30.0, PF_SCAN_MIN_MCAP_USD * 0.20)
-_BASE_SOFT_MAX_AGE_DEFAULT = max(20.0, PF_SCAN_MAX_TOKEN_AGE_MIN * 1.5)
+# Global scanner-level envs (used inside fallback)
+SCANNER_MIN_BUYS_5M = _i("SCANNER_MIN_BUYS_5M", 1)
+SCANNER_MIN_VOLUME_5M_USD = _f("SCANNER_MIN_VOLUME_5M_USD", 20.0)
+SCANNER_REQUIRE_BUY_PRESSURE = _b("SCANNER_REQUIRE_BUY_PRESSURE", True)
+SCANNER_MIN_BUY_RATIO = _f("SCANNER_MIN_BUY_RATIO", 0.50)
+SCANNER_MIN_PRICE_CHANGE_5M = _f("SCANNER_MIN_PRICE_CHANGE_5M", 1.0)
+SCANNER_MAX_AGE_MIN = _f("SCANNER_MAX_AGE_MIN", PF_SCAN_MAX_TOKEN_AGE_MIN)
+
+# -------------------------------------------------------------------------
+# Soft prefilters BEFORE PF_* (to cut truly dead dust but let more pass)
+# -------------------------------------------------------------------------
+# We base these on PF_SCAN_* but loosen them, with floors so they never go crazy.
+_BASE_SOFT_LIQ_DEFAULT = max(40.0, PF_SCAN_MIN_LIQ_USD * 0.25)
+_BASE_SOFT_MAX_AGE_DEFAULT = max(60.0, PF_SCAN_MAX_TOKEN_AGE_MIN * 1.5)
 
 SOFT_MIN_LIQ_USD = _f("RAYDIUM_SOFT_MIN_LIQ_USD", _BASE_SOFT_LIQ_DEFAULT)
-SOFT_MIN_MCAP_USD = _f("RAYDIUM_SOFT_MIN_MCAP_USD", _BASE_SOFT_MCAP_DEFAULT)
+# NOTE: we do NOT soft-filter on mcap anymore; too many SOL/RAY new tokens have 0 mcap in Dexscreener.
 SOFT_MAX_AGE_MIN = _f("RAYDIUM_SOFT_MAX_AGE_MIN", _BASE_SOFT_MAX_AGE_DEFAULT)
 
-
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Helpers
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 def _headers() -> Dict[str, str]:
     return {
@@ -166,9 +162,6 @@ def _safe_int(v: Any, d: int = 0) -> int:
 
 
 def _age_min(pair_created_ms: Optional[int]) -> Optional[float]:
-    """
-    Dexscreener uses ms timestamps. Convert to minutes since creation.
-    """
     try:
         if pair_created_ms is None:
             return None
@@ -186,9 +179,9 @@ def _buy_ratio(buys: int, sells: int) -> float:
     return float(buys) / float(total)
 
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # HTTP
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 async def _fetch_json(
     session: aiohttp.ClientSession,
@@ -272,35 +265,32 @@ async def _fetch_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
                 continue
             if (p.get("dexId") or "").lower() != "raydium":
                 continue
-            # Prefer pairAddress for uniqueness, fall back to baseToken address
             pid = p.get("pairAddress") or ((p.get("baseToken") or {}).get("address"))
-            if not pid:
-                continue
-            if pid in seen_ids:
-                continue
-            seen_ids.add(pid)
-            out.append(p)
-
+            if pid and pid not in seen_ids:
+                seen_ids.add(pid)
+                out.append(p)
     return out
 
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Metric extraction & normalization ⇒ PF meta
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
     """
     Extract raw numeric metrics from a Dexscreener Raydium pair and map them
     into the names expected by utils_pkg.pair_filters.
-    """
-    liq_usd = _nz_float((pair.get("liquidity") or {}).get("usd"), 0.0)
 
-    fdv_usd = _nz_float(
-        pair.get("fdv")
-        or pair.get("fdvUsd")
-        or pair.get("fullyDilutedValuation"),
-        0.0,
-    )
+    IMPORTANT: we now use the real Dexscreener fields:
+      - txns.m5 / h1 / h24
+      - volume.m5 / h1 / h24
+      - priceChange.m5 / h1 / h24
+    """
+    liq = pair.get("liquidity") or {}
+    liq_usd = _nz_float(liq.get("usd"), 0.0)
+
+    fdv_usd = _nz_float(pair.get("fdv"), 0.0)
+    # Market cap is often missing for fresh SOL/RAY pools; don't be strict here.
     mcap_usd = _nz_float(
         pair.get("marketCap")
         or pair.get("marketCapUsd")
@@ -310,33 +300,48 @@ def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     txs = (pair.get("txns") or {})
-    m5 = txs.get("m5") or {}
-    h1 = txs.get("h1") or {}
-    h24 = txs.get("h24") or {}
+    m5_tx = txs.get("m5") or {}
+    h1_tx = txs.get("h1") or {}
+    h24_tx = txs.get("h24") or {}
 
-    buys_5m = _safe_int(m5.get("buys"), 0)
-    sells_5m = _safe_int(m5.get("sells"), 0)
+    buys_5m = _safe_int(m5_tx.get("buys"), 0)
+    sells_5m = _safe_int(m5_tx.get("sells"), 0)
 
-    buys_1h = _safe_int(h1.get("buys"), 0)
-    sells_1h = _safe_int(h1.get("sells"), 0)
+    buys_1h = _safe_int(h1_tx.get("buys"), 0)
+    sells_1h = _safe_int(h1_tx.get("sells"), 0)
 
-    buys_24h = _safe_int(h24.get("buys"), 0)
-    sells_24h = _safe_int(h24.get("sells"), 0)
+    buys_24h = _safe_int(h24_tx.get("buys"), 0)
+    sells_24h = _safe_int(h24_tx.get("sells"), 0)
 
-    # Volume: Dexscreener mainly has h24; approximate lower windows.
     vol = pair.get("volume") or {}
+    vol_5m_usd = _nz_float(vol.get("m5"), 0.0)
+    vol_1h_usd = _nz_float(vol.get("h1"), 0.0)
     vol_24h_usd = _nz_float(vol.get("h24"), 0.0)
-    vol_1h_usd = vol_24h_usd / 24.0 if vol_24h_usd > 0 else 0.0
-    vol_5m_usd = vol_1h_usd / 12.0 if vol_1h_usd > 0 else 0.0
 
-    # Price change – Dexscreener usually has h1, h6, h24; we derive 5m/15m.
+    # Fallbacks if only longer timeframes exist
+    if vol_5m_usd <= 0.0 and vol_1h_usd > 0.0:
+        vol_5m_usd = vol_1h_usd / 12.0
+    if vol_1h_usd <= 0.0 and vol_24h_usd > 0.0:
+        vol_1h_usd = vol_24h_usd / 24.0
+    if vol_5m_usd <= 0.0 and vol_24h_usd > 0.0:
+        vol_5m_usd = vol_24h_usd / 288.0
+
     pc = pair.get("priceChange") or {}
+    chg_5m_pct = _nz_float(pc.get("m5"), 0.0)
     chg_1h_pct = _nz_float(pc.get("h1"), 0.0)
     chg_24h_pct = _nz_float(pc.get("h24"), 0.0)
 
-    # Rough approximations for 5m / 15m if direct values are missing.
-    chg_5m_pct = chg_1h_pct / 12.0 if chg_1h_pct else chg_24h_pct / 288.0
-    chg_15m_pct = chg_1h_pct / 4.0 if chg_1h_pct else chg_24h_pct / 96.0
+    # Fallbacks if 5m missing
+    if chg_5m_pct == 0.0 and chg_1h_pct != 0.0:
+        chg_5m_pct = chg_1h_pct / 12.0
+    if chg_5m_pct == 0.0 and chg_24h_pct != 0.0:
+        chg_5m_pct = chg_24h_pct / 288.0
+
+    # 15m ≈ between 5m and 1h
+    if chg_1h_pct != 0.0:
+        chg_15m_pct = chg_1h_pct / 4.0
+    else:
+        chg_15m_pct = chg_24h_pct / 96.0 if chg_24h_pct != 0.0 else chg_5m_pct
 
     price_usd = _nz_float(pair.get("priceUsd"), 0.0)
 
@@ -348,7 +353,7 @@ def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
     age_min = _age_min(pair_created_ms)
     token_age_min = age_min if age_min is not None else 9999.0
 
-    # Holders / holder change are not exposed; we leave at 0 so they do not block.
+    # Holders not exposed; neutral
     holders = 0
     holders_5m_change = 0
 
@@ -357,7 +362,6 @@ def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
     whale_vol_5m_usd = 0.0
     largest_buy_5m_sol = 0.0
     if price_usd > 0 and vol_5m_usd > 0:
-        # Assume largest buy is ~25% of 5m volume for heuristic.
         approx_largest_buy_usd = vol_5m_usd * 0.25
         approx_largest_buy_sol = approx_largest_buy_usd / price_usd
         largest_buy_5m_sol = approx_largest_buy_sol
@@ -404,14 +408,11 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         metrics = _extract_metrics(pair)
 
-        # Soft prefilter: absolute trash is skipped even before PF logic
         liq_usd = metrics["liq_usd"]
-        mcap_usd = metrics["mcap_usd"]
         age_min = metrics["token_age_min"]
 
+        # Soft prefilter: cut only the absolute trash here
         if liq_usd < SOFT_MIN_LIQ_USD:
-            return None
-        if mcap_usd < SOFT_MIN_MCAP_USD:
             return None
         if age_min > SOFT_MAX_AGE_MIN:
             return None
@@ -492,9 +493,9 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Optional AI / whales enrichment
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 async def _enrich_ai_and_whales(metas: List[Dict[str, Any]]) -> None:
     """
@@ -534,14 +535,10 @@ async def _enrich_ai_and_whales(metas: List[Dict[str, Any]]) -> None:
             # Whale presence (coarse)
             if WHALES_ENABLED:
                 try:
-                    # threshold roughly based on PF_SCAN_MIN_WHALE_SIZE_SOL * price
                     px = float(meta.get("price_usd") or 0.0)
-                    thresh_usd = (
-                        float(PF_SCAN_MIN_WHALE_SIZE_SOL) * px if px > 0 else 50_000.0
-                    )
+                    thresh_usd = float(PF_SCAN_MIN_WHALE_SIZE_SOL) * px if px > 0 else 50_000.0
                     has_whale = await is_whale_wallet(mint, usd_threshold=thresh_usd)
                     if has_whale:
-                        # tilt whale metrics upward a bit so filters treat it as "has whales"
                         meta["whales_5m"] = max(1, int(meta.get("whales_5m") or 0))
                 except Exception:
                     pass
@@ -551,95 +548,19 @@ async def _enrich_ai_and_whales(metas: List[Dict[str, Any]]) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # PF-based filtering & ranking + fallback
-# =============================================================================
+# -----------------------------------------------------------------------------
 
-def _heuristic_rank(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _apply_pf(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Heuristic fallback ranking when PF logic rejects everything.
-    This is intentionally simple: reward liq + short-term move + some volume.
+    Apply PF filters & scoring and return top LIMIT by final_score.
     """
-    if not metas:
-        return []
-
-    scored: List[Dict[str, Any]] = []
-    for m in metas:
-        try:
-            liq = float(m.get("liq_usd") or 0.0)
-            up5 = float(m.get("price_change_5m_pct") or 0.0)
-            vol5 = float(m.get("vol_5m_usd") or 0.0)
-            age_min = float(m.get("token_age_min") or 9999.0)
-
-            # basic floors so we don't pick literal dust
-            if liq < max(SOFT_MIN_LIQ_USD, FALLBACK_MIN_LIQ_USD):
-                continue
-            if age_min > PF_SCAN_MAX_TOKEN_AGE_MIN:
-                continue
-            if up5 < FALLBACK_MIN_CHANGE_5M:
-                # allow flat if there is decent volume, otherwise skip
-                if vol5 < 10.0:
-                    continue
-
-            # log-scale liquidity and volume to avoid stupid extremes
-            import math
-
-            liq_score = math.log10(liq + 1.0)
-            vol_score = math.log10(vol5 + 1.0)
-
-            score = liq_score * 1.4 + up5 * 0.4 + vol_score * 0.6
-            mm = dict(m)
-            mm.setdefault("momentum_score", 0.0)
-            mm.setdefault("final_score", 0.0)
-            mm["fallback_score"] = score
-            scored.append(mm)
-        except Exception:
-            continue
-
-    scored.sort(key=lambda x: x.get("fallback_score", 0.0), reverse=True)
-    return scored[: min(FALLBACK_LIMIT, LIMIT)]
-
-
-def _filter_and_rank(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Take normalized meta entries, apply is_viable_pair and scoring, and
-    return the top LIMIT candidates ranked by final_score.
-
-    If PF rejects *everything* but we still have metas, we fall back to a
-    heuristic ranking so the bot never sits at 0 PF runners forever when
-    there are clearly tradeable pools on Raydium.
-    """
-    if not metas:
-        return []
-
-    # Optional full PF bypass (pure heuristic mode)
-    if BYPASS_PF:
-        runners = _heuristic_rank(metas)
-        if runners:
-            logger.warning(
-                "Raydium: BYPASS_PF=1 — returning %d heuristic runners (no PF gating)",
-                len(runners),
-            )
-        return runners
-
-    pf_runners: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
 
     for meta in metas:
         try:
-            ok = is_viable_pair(meta)
-            if not ok:
-                # optional detailed reason if debug helper exists
-                if debug_viability is not None:
-                    try:
-                        ok2, reason = debug_viability(meta)  # type: ignore
-                        if not ok2:
-                            logger.debug(
-                                "Raydium PF reject %s: %s",
-                                meta.get("mint"),
-                                reason,
-                            )
-                    except Exception:
-                        pass
+            if not is_viable_pair(meta):
                 continue
 
             momentum = compute_momentum_score(meta)
@@ -648,43 +569,63 @@ def _filter_and_rank(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             m = dict(meta)
             m["momentum_score"] = momentum
             m["final_score"] = final
-            pf_runners.append(m)
+            out.append(m)
         except Exception as e:
             logger.debug(
                 "Raydium PF filter error for %s: %s", meta.get("mint"), e
             )
 
-    if pf_runners:
-        pf_runners.sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
-        return pf_runners[:LIMIT]
+    out.sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
+    return out[:LIMIT]
 
-    # No PF runners but we *do* have metas → use fallback
-    if ENABLE_FALLBACK:
-        fb = _heuristic_rank(metas)
-        if fb:
-            logger.warning(
-                "Raydium: PF produced 0 runners from %d metas — using %d heuristic fallback runners",
-                len(metas),
-                len(fb),
-            )
-        else:
-            logger.warning(
-                "Raydium: PF produced 0 runners and fallback found nothing from %d metas",
-                len(metas),
-            )
-        return fb
 
-    # Fallback disabled and PF had nothing
-    logger.warning(
-        "Raydium: PF produced 0 runners from %d metas and fallback disabled",
-        len(metas),
+def _fallback_candidates(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    When PF returns nothing but we still have metas, pick some "good enough"
+    runners using scanner-style rules (liq + 5m up + buy pressure).
+    """
+    if not RAYDIUM_ENABLE_FALLBACK or not metas:
+        return []
+
+    cands: List[Dict[str, Any]] = []
+    for m in metas:
+        try:
+            liq = float(m.get("liq_usd") or 0.0)
+            age = float(m.get("token_age_min") or 9999.0)
+            chg5 = float(m.get("price_change_5m_pct") or 0.0)
+            buys5 = int(m.get("buys_5m") or 0)
+            vol5 = float(m.get("vol_5m_usd") or 0.0)
+            ratio = float(m.get("buy_ratio_5m") or 0.0)
+
+            if liq < RAYDIUM_FALLBACK_MIN_LIQ_USD:
+                continue
+            if age > SCANNER_MAX_AGE_MIN:
+                continue
+            if chg5 < max(RAYDIUM_FALLBACK_MIN_CHANGE_5M, SCANNER_MIN_PRICE_CHANGE_5M):
+                continue
+            if buys5 < SCANNER_MIN_BUYS_5M and vol5 < SCANNER_MIN_VOLUME_5M_USD:
+                continue
+            if SCANNER_REQUIRE_BUY_PRESSURE and ratio < SCANNER_MIN_BUY_RATIO:
+                continue
+
+            cands.append(m)
+        except Exception:
+            continue
+
+    # Rank fallback by a combo of 5m change + 5m volume
+    cands.sort(
+        key=lambda x: (
+            float(x.get("price_change_5m_pct") or 0.0),
+            float(x.get("vol_5m_usd") or 0.0),
+        ),
+        reverse=True,
     )
-    return []
+    return cands[:RAYDIUM_FALLBACK_LIMIT]
 
 
-# =============================================================================
-# MOMO event wiring (uses final_score / momentum_score / fallback_score)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# MOMO event wiring (uses final_score / momentum_score)
+# -----------------------------------------------------------------------------
 
 async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
     """
@@ -705,20 +646,6 @@ async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
         try:
             age_min = c.get("token_age_min")
             age_sec = age_min * 60.0 if isinstance(age_min, (int, float)) else None
-
-            reason_parts = []
-            if "final_score" in c:
-                reason_parts.append(f"final={c.get('final_score', 0.0):.3f}")
-            if "momentum_score" in c:
-                reason_parts.append(
-                    f"momentum={c.get('momentum_score', 0.0):.3f}"
-                )
-            if "fallback_score" in c:
-                reason_parts.append(
-                    f"fallback={c.get('fallback_score', 0.0):.3f}"
-                )
-            reason = "raydium runner " + " ".join(reason_parts)
-
             ctx: Dict[str, Any] = {
                 "symbol": c.get("symbol") or c.get("mint"),
                 "mint": c.get("mint"),
@@ -727,7 +654,10 @@ async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
                 "liq_usd": c.get("liq_usd"),
                 "vol_5m": c.get("vol_5m_usd"),
                 "up_pct": c.get("price_change_5m_pct"),
-                "reason": reason,
+                "reason": (
+                    f"raydium PF runner final={c.get('final_score', 0.0):.3f} "
+                    f"momentum={c.get('momentum_score', 0.0):.3f}"
+                ),
             }
             await am.send_momo_event("MOMO_OK", ctx)
         except Exception as e:
@@ -736,9 +666,9 @@ async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
             )
 
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Public entry
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 async def scan_raydium(*args):
     """
@@ -749,7 +679,7 @@ async def scan_raydium(*args):
       - scan_raydium(session)
 
     Only an aiohttp.ClientSession (if provided) is used.
-    Returns a list of runner candidates (each is a meta dict).
+    Returns a list of PF-scored runner candidates (each is a meta dict).
     """
     sess: Optional[aiohttp.ClientSession] = None
     if len(args) >= 2 and isinstance(args[1], aiohttp.ClientSession):
@@ -781,14 +711,15 @@ async def scan_raydium(*args):
 
     try:
         logger.info(
-            "scanner.raydium: starting scan; queries=%s soft_min_liq=$%.0f pf_min_liq=$%.0f limit=%d search_limit=%d bypass_pf=%s fallback=%s",
+            "scanner.raydium: starting scan; queries=%s soft_min_liq=$%.0f pf_min_liq=$%.0f "
+            "limit=%d search_limit=%d bypass_pf=%s fallback=%s",
             ",".join(SEARCH_QUERIES),
             SOFT_MIN_LIQ_USD,
             PF_SCAN_MIN_LIQ_USD,
             LIMIT,
             SEARCH_LIMIT,
-            BYPASS_PF,
-            ENABLE_FALLBACK,
+            RAYDIUM_BYPASS_PF,
+            RAYDIUM_ENABLE_FALLBACK,
         )
         pairs = await _fetch_pairs(sess)
 
@@ -802,7 +733,22 @@ async def scan_raydium(*args):
         with contextlib.suppress(Exception):
             await _enrich_ai_and_whales(metas)
 
-        runners = _filter_and_rank(metas)
+        pf_runners: List[Dict[str, Any]] = []
+        if not RAYDIUM_BYPASS_PF:
+            pf_runners = _apply_pf(metas)
+
+        runners: List[Dict[str, Any]]
+        if pf_runners:
+            runners = pf_runners
+        else:
+            fb = _fallback_candidates(metas)
+            if not pf_runners and not fb and metas:
+                logger.warning(
+                    "Raydium: PF produced 0 runners and fallback found nothing from %d metas",
+                    len(metas),
+                )
+            runners = fb
+
         logger.info(
             "scanner.raydium: %s runners returned (from %s metas, %s raw pairs)",
             len(runners),
@@ -810,8 +756,10 @@ async def scan_raydium(*args):
             len(pairs),
         )
 
-        # MOMO alerts (awaited so errors get logged)
-        await _send_momo_for_runners(runners)
+        # MOMO alerts only make sense for PF-scored ones; if we are using fallback-only,
+        # they won't have momentum/final_score, so we skip MOMO there.
+        if pf_runners:
+            await _send_momo_for_runners(pf_runners)
 
         return runners
     except Exception as e:
