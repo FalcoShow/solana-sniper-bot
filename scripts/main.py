@@ -1434,7 +1434,7 @@ class Strategy:
         # Per-mint state while we observe trades/prices in the window
         self._gate_state: Dict[str, Dict[str, Any]] = {}
 
-        # Diagnostics
+        # Diagnostics (mirrored into DIAG_MINUTE)
         self._diag = {
             "events_total": 0,
             "events_trade": 0,
@@ -1592,7 +1592,6 @@ class Strategy:
                         min_trades=ENTRY_MOMO_MIN_TRADES,
                         min_up_pct=ENTRY_MOMO_MIN_UP_PCT,
                     )
-                    # Telegram debug for visibility
                     try:
                         msg = (
                             f"[MOMO_BYPASS_NO_DATA_PUMP] mint={mint_norm} pool={pool} "
@@ -1604,9 +1603,8 @@ class Strategy:
                         asyncio.create_task(_send_telegram_debug(msg))
                     except Exception:
                         pass
-                    # We do NOT increment rejected_momo here — we are explicitly
-                    # choosing to continue and skip strict momentum checks below.
-                    pct_up = 0.0  # just for logging consistency later
+                    # Skip strict momentum checks below
+                    pct_up = 0.0
                     up_ok = True
                     trades_ok = True
                 else:
@@ -1621,7 +1619,6 @@ class Strategy:
                         min_trades=ENTRY_MOMO_MIN_TRADES,
                         min_up_pct=ENTRY_MOMO_MIN_UP_PCT,
                     )
-                    # Telegram candidate debug (no-data / dead-coin guard)
                     try:
                         msg = (
                             f"[MOMO_SKIP_NO_DATA] mint={mint_norm} pool={pool} "
@@ -1658,7 +1655,6 @@ class Strategy:
                     trades_ok=int(trades_ok),
                 )
 
-                # If it doesn't meet momentum conditions, bail out
                 if not (up_ok and trades_ok):
                     try:
                         reasons = []
@@ -1841,7 +1837,7 @@ class Strategy:
     # --- NEW TOKENS (entry point for gating) -----------------------------
     async def on_new_token(self, raw_event: Dict[str, Any]) -> None:
         """
-        New-token handler from PumpPortal:
+        New-token handler from scanners (PumpPortal / Raydium):
           - top-level guardrails
           - mint normalization + basic filters
           - liquidity screening
@@ -1853,11 +1849,22 @@ class Strategy:
         self._diag["events_total"] += 1
         self._diag["events_new_token"] += 1
 
+        # Pool + force-buy flag (for Raydium DRYRUN debug / aggression)
+        pool = str(raw_event.get("pool") or "pump").lower()
+        force_ray = (
+            os.getenv("ENTRY_FORCE_BUY_RAYDIUM", "0") == "1"
+            and pool == "raydium"
+        )
+
         # Top-level guardrails
         if PAUSE_TRADING or not buys_allowed():
             if DEBUG_LOCAL:
                 print("[guardrails] buys not allowed now — skip", flush=True)
             self._diag["rejected_guardrails"] += 1
+            try:
+                record_buy_result(ok=False, reason="guardrails_top")
+            except Exception:
+                pass
             return
 
         max_tradeable = MAX_TRADEABLE
@@ -1866,6 +1873,10 @@ class Strategy:
                 if len(list(all_positions())) >= max_tradeable:
                     log.event("BUY_BLOCK_MAX_TRADEABLE", cap=max_tradeable)
                     self._diag["rejected_guardrails"] += 1
+                    try:
+                        record_buy_result(ok=False, reason="max_tradeable_top")
+                    except Exception:
+                        pass
                     return
             except Exception:
                 pass
@@ -1886,14 +1897,75 @@ class Strategy:
                 )
             return
 
-        # Static filters (age, name, blacklist, etc.)
-        if not _passes_basic_filters(raw_event):
+        # ---------- BASIC FILTERS (age / name / blacklist / scanner metrics)
+        basic_ok = _passes_basic_filters(raw_event)
+
+        if not basic_ok and not force_ray:
+            # hard reject
             self._diag["rejected_filters"] += 1
+
+            # rich debug for *why* it's failing (as much as we can infer from raw_event)
+            liq = float(
+                raw_event.get("liq_usd")
+                or raw_event.get("liq")
+                or 0.0
+            )
+            vol5 = float(
+                raw_event.get("vol_5m_usd")
+                or raw_event.get("vol5")
+                or 0.0
+            )
+            up5 = float(
+                raw_event.get("price_change_5m_pct")
+                or raw_event.get("chg5")
+                or 0.0
+            )
+            buys5 = int(raw_event.get("buys_5m") or raw_event.get("buys5") or 0)
+            sells5 = int(raw_event.get("sells_5m") or raw_event.get("sells5") or 0)
+            age_min = float(raw_event.get("token_age_min") or raw_event.get("age_min") or 0.0)
+
+            log.event(
+                "ENTRY_FILTER_REJECT",
+                pool=pool,
+                mint=mint_norm,
+                symbol=_extract_symbol(raw_event),
+                liq_usd=liq,
+                vol_5m_usd=vol5,
+                up_5m_pct=up5,
+                buys5=buys5,
+                sells5=sells5,
+                age_min=age_min,
+            )
+            if DEBUG_LOCAL:
+                print(
+                    f"[ENTRY_FILTER_REJECT] pool={pool} sym={_extract_symbol(raw_event)} "
+                    f"liq={liq:.1f} vol5={vol5:.1f} up5={up5:.2f}% "
+                    f"buys5={buys5} sells5={sells5} age={age_min:.1f}m",
+                    flush=True,
+                )
+            try:
+                record_buy_result(ok=False, reason="basic_filters")
+            except Exception:
+                pass
             return
 
-        # Liquidity screen
+        if not basic_ok and force_ray:
+            # We *bypass* the basic filters for Raydium when the flag is set
+            log.event(
+                "ENTRY_FILTER_BYPASS_FORCE_RAYDIUM",
+                pool=pool,
+                mint=mint_norm,
+                symbol=_extract_symbol(raw_event),
+            )
+            if DEBUG_LOCAL:
+                print(
+                    f"[ENTRY_FILTER_BYPASS_FORCE_RAYDIUM] sym={_extract_symbol(raw_event)} mint={mint_norm}",
+                    flush=True,
+                )
+
+        # ---------- LIQUIDITY SCREEN -----------------------------------
         dec_from_liq: Optional[int] = None
-        if LIQ_FILTER_ENABLED:
+        if LIQ_FILTER_ENABLED and not force_ray:
             ok, rep = await _screen_with_retry(mint_norm, tries=3, first_wait=0.8)
             if not ok and str((rep or {}).get("reason")) == "no_account":
                 # Fresh bond curve: wait a bit for mint to become readable
@@ -1917,6 +1989,16 @@ class Strategy:
                         flush=True,
                     )
                 self._diag["rejected_filters"] += 1
+                log.event(
+                    "ENTRY_LIQ_REJECT",
+                    pool=pool,
+                    mint=mint_norm,
+                    reason=str((rep or {}).get("reason")),
+                )
+                try:
+                    record_buy_result(ok=False, reason="liquidity_reject")
+                except Exception:
+                    pass
                 return
 
             if dec_from_liq is None:
@@ -1929,9 +2011,23 @@ class Strategy:
                 dec=dec_from_liq,
             )
 
+        elif LIQ_FILTER_ENABLED and force_ray:
+            # Skip liq screen entirely in force-ray mode
+            log.event(
+                "ENTRY_LIQ_BYPASS_FORCE_RAYDIUM",
+                pool=pool,
+                mint=mint_norm,
+                symbol=_extract_symbol(raw_event),
+            )
+            if DEBUG_LOCAL:
+                print(
+                    f"[ENTRY_LIQ_BYPASS_FORCE_RAYDIUM] sym={_extract_symbol(raw_event)} mint={mint_norm}",
+                    flush=True,
+                )
+
         # Build UI payload / context for downstream
         ui: Dict[str, Any] = dict(raw_event)
-        ui.setdefault("pool", (raw_event.get("pool") or "pump").lower())
+        ui.setdefault("pool", pool)
         ui.setdefault("symbol", _extract_symbol(raw_event))
         ui.setdefault("name", _extract_name(raw_event))
         ui["rawMint"] = mint_source
@@ -1984,6 +2080,10 @@ class Strategy:
                                 flush=True,
                             )
                         self._diag["rejected_guardrails"] += 1
+                        try:
+                            record_buy_result(ok=False, reason="guardrails_exec")
+                        except Exception:
+                            pass
                         return
 
                     max_tradeable = MAX_TRADEABLE
@@ -1995,6 +2095,10 @@ class Strategy:
                                     cap=max_tradeable,
                                 )
                                 self._diag["rejected_guardrails"] += 1
+                                try:
+                                    record_buy_result(ok=False, reason="max_tradeable_exec")
+                                except Exception:
+                                    pass
                                 return
                         except Exception:
                             pass
@@ -2101,37 +2205,6 @@ class Strategy:
 
         # Cooldown between processing new tokens
         await asyncio.sleep(LOOP_COOLDOWN_SEC)
-
-
-# ---------------------------
-# Mint normalization wrappers
-# ---------------------------
-def _normalize_from_source(raw: str) -> str:
-    if raw is None:
-        return ""
-    raw = str(raw).strip()
-    m = _pp_normalize(raw)
-    if m:
-        return m
-    if _mg_normalize:
-        try:
-            m2 = _mg_normalize(raw)
-            if isinstance(m2, str) and m2:
-                return m2
-        except Exception:
-            pass
-    return raw
-
-
-def _is_probable_mint(s: str) -> bool:
-    if not s:
-        return False
-    if _mg_prob:
-        try:
-            return bool(_mg_prob(s))
-        except Exception:
-            return False
-    return bool(_pp_normalize(s))
 
 
 # ---------------------------
