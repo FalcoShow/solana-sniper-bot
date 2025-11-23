@@ -254,30 +254,40 @@ async def _fetch_json(
 
 async def _fetch_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
     """
-    Pull recent Raydium pairs from Dexscreener search.
-    We query a few keywords and dedupe by pair address.
+    Pull recent Raydium pairs from Dexscreener "latest pairs" feed
+    instead of global search, so we actually see fresh launches.
+
+    Endpoint shape:
+      GET /latest/dex/pairs/solana
+
+    We still dedupe by pairAddress just in case.
     """
-    url = f"{BASE}/latest/dex/search"
+    # Use the dedicated latest-pairs endpoint for Solana
+    url = f"{BASE}/latest/dex/pairs/solana"
+    params = None
+    # If Dexscreener ever supports limit here, we can pass it:
+    # params = {"limit": SEARCH_LIMIT}
+
+    data, _status, _first = await _fetch_json(session, url, params=params)
     out: List[Dict[str, Any]] = []
     seen_ids: Set[str] = set()
 
-    for q in SEARCH_QUERIES:
-        params = {"q": q, "limit": SEARCH_LIMIT}
-        data, _status, _first = await _fetch_json(session, url, params=params)
-        if not data:
-            continue
-        pairs = data.get("pairs") or []
-        for p in pairs:
-            if (p.get("chainId") or "").lower() != "solana":
-                continue
-            if (p.get("dexId") or "").lower() != "raydium":
-                continue
-            pid = p.get("pairAddress") or ((p.get("baseToken") or {}).get("address"))
-            if pid and pid not in seen_ids:
-                seen_ids.add(pid)
-                out.append(p)
+    if not data:
+        logger.warning("Raydium: no data returned from latest/dex/pairs/solana")
+        return out
 
-    logger.info("Raydium: fetched %d raw Raydium pairs from Dexscreener", len(out))
+    pairs = data.get("pairs") or []
+    for p in pairs:
+        if (p.get("chainId") or "").lower() != "solana":
+            continue
+        if (p.get("dexId") or "").lower() != "raydium":
+            continue
+        pid = p.get("pairAddress") or ((p.get("baseToken") or {}).get("address"))
+        if pid and pid not in seen_ids:
+            seen_ids.add(pid)
+            out.append(p)
+
+    logger.info("Raydium: fetched %d raw Raydium pairs from latest/pairs", len(out))
     return out
 
 
