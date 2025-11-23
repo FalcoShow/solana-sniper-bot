@@ -408,14 +408,14 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         metrics = _extract_metrics(pair)
 
-        liq_usd = metrics["liq_usd"]
-        age_min = metrics["token_age_min"]
-
-        # Soft prefilter: cut only the absolute trash here
-        if liq_usd < SOFT_MIN_LIQ_USD:
-            return None
-        if age_min > SOFT_MAX_AGE_MIN:
-            return None
+        # ❌ DO NOT soft-filter on liq/age here; Dexscreener often has liq_usd=0
+        # for fresh pools. Let PF + fallback handle all thresholds.
+        # liq_usd = metrics["liq_usd"]
+        # age_min = metrics["token_age_min"]
+        # if liq_usd < SOFT_MIN_LIQ_USD:
+        #     return None
+        # if age_min > SOFT_MAX_AGE_MIN:
+        #     return None
 
         base = pair.get("baseToken") or {}
         mint = (base.get("address") or "").strip()
