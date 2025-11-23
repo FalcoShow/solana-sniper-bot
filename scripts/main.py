@@ -2206,6 +2206,35 @@ class Strategy:
         # Cooldown between processing new tokens
         await asyncio.sleep(LOOP_COOLDOWN_SEC)
 
+# ---------------------------
+# Mint normalization wrappers
+# ---------------------------
+def _normalize_from_source(raw: str) -> str:
+    if raw is None:
+        return ""
+    raw = str(raw).strip()
+    m = _pp_normalize(raw)
+    if m:
+        return m
+    if _mg_normalize:
+        try:
+            m2 = _mg_normalize(raw)
+            if isinstance(m2, str) and m2:
+                return m2
+        except Exception:
+            pass
+    return raw
+
+
+def _is_probable_mint(s: str) -> bool:
+    if not s:
+        return False
+    if _mg_prob:
+        try:
+            return bool(_mg_prob(s))
+        except Exception:
+            return False
+    return bool(_pp_normalize(s))
 
 # ---------------------------
 # Daily PnL helpers  (USES NORMALIZED DSN)
