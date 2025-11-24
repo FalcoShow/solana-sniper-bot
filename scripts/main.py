@@ -1446,6 +1446,22 @@ class Strategy:
             "buys_filled": 0,
         }
 
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
+    def _get_gate_state(self, mint_raw: str) -> Dict[str, Any]:
+        """
+        Safely get/create gate state for a raw mint.
+
+        This is critical to avoid KeyError races when gate-state is cleared
+        or was never initialised for some reason (e.g. dedupe / early return).
+        """
+        st = self._gate_state.get(mint_raw)
+        if st is None:
+            st = {}
+            self._gate_state[mint_raw] = st
+        return st
+
     # --- DIAGNOSTICS -----------------------------------------------------
     async def diag_loop(
         self,
@@ -1702,7 +1718,9 @@ class Strategy:
             pool = str(ui.get("pool") or "").lower()
 
             # Initialise gate state (keyed by raw mint so on_trade() updates)
-            self._gate_state[mint_raw] = {"trades": 0, "price0": 0.0}
+            st = self._get_gate_state(mint_raw)
+            st["trades"] = 0
+            st["price0"] = 0.0
 
             # First price sample (price0)
             price0 = 0.0
@@ -1716,7 +1734,9 @@ class Strategy:
                         break
                     await asyncio.sleep(self.momo_price_delay_s)
 
-            self._gate_state[mint_raw]["price0"] = price0
+            # Safely persist price0 back into gate-state
+            st = self._get_gate_state(mint_raw)
+            st["price0"] = price0
 
             # Wait the momentum window
             await asyncio.sleep(max(1, self.momo_window_sec))
@@ -1732,7 +1752,7 @@ class Strategy:
                 except Exception:
                     price1 = 0.0
 
-            # Clear gate state
+            # Clear gate state (best-effort)
             self._gate_state.pop(mint_raw, None)
 
             # --- MOMENTUM DECISION (pool-aware) -------------------------
@@ -2011,7 +2031,11 @@ class Strategy:
             )
             buys5 = int(raw_event.get("buys_5m") or raw_event.get("buys5") or 0)
             sells5 = int(raw_event.get("sells_5m") or raw_event.get("sells5") or 0)
-            age_min = float(raw_event.get("token_age_min") or raw_event.get("age_min") or 0.0)
+            age_min = float(
+                raw_event.get("token_age_min")
+                or raw_event.get("age_min")
+                or 0.0
+            )
 
             log.event(
                 "ENTRY_FILTER_REJECT",
