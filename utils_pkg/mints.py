@@ -1,3 +1,4 @@
+# utils_pkg/mints.py
 from __future__ import annotations
 
 import re
@@ -10,7 +11,7 @@ from typing import Optional
 SOL_MINT = "So11111111111111111111111111111111111111112"  # wSOL "pseudo-mint"
 USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"  # USDT
 USDC_MINT = "EPjFWdd5AufqSSqeMzQ1NzxypaC8G4weEGKzwyTDt1v"  # USDC (native/CCTP)
-BONK_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"  # BONK (common gotcha)
+BONK_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"  # BONK
 
 # Common symbol aliases (case-insensitive). We resolve "USDC" to native/CCTP.
 _SYM_TO_MINT = {
@@ -30,14 +31,10 @@ _SYM_TO_MINT = {
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58_IDX = {c: i for i, c in enumerate(_B58)}
 
-# Typical Solana pubkey length in base58 is ~32–44 chars.
-# We allow a bit wider window to be lenient for salted strings.
-_MINT_STR_MAX = 44          # max length of the *actual* mint string
-_BLOB_STR_MAX = 70          # max length of entire blob we consider
-_MINT_DECODE_MIN = 28       # some real-world mints decode to 30 bytes
-_MINT_DECODE_MAX = 40       # small safety window around 32 bytes
+# Up to 44 base58 chars for a 32-byte key (depending on leading zeros)
+_MAX_B58_LEN = 44
 
-# Some feeds append suffix-y words (pump.fun etc.)
+# Some feeds append suffix-y words (pump.fun, raydium, etc.)
 _SUS_SUFFIXES = ("pump", "bonk", "raydium", "rayd", "dex", "sol", "solana")
 
 # Broad base58-looking finder for URLs/blobs
@@ -45,15 +42,11 @@ _B58_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{20,90}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Minimal base58 decode (no checksum)
+# Minimal base58 decode (no checksum) and strict 32-byte check
 # ──────────────────────────────────────────────────────────────────────────────
 def _b58decode(s: str) -> bytes:
     """
-    Minimal base58 decode.
-
-    We *do not* require exactly 32 bytes anymore – some valid live mints as
-    seen via Dexscreener / Jupiter decode to ~30 bytes, so we accept a small
-    band around 32 instead of rejecting them.
+    Minimal base58 decode (Bitcoin alphabet), used only for length=32 sanity.
     """
     s = (s or "").strip()
     if not s:
@@ -70,56 +63,18 @@ def _b58decode(s: str) -> bytes:
     return (b"\x00" * pad) + raw
 
 
-def _is_base58_32ish(s: str) -> bool:
-    """
-    "32-ish" check for mints:
-
-      • all chars in base58 alphabet
-      • base58-decoded length between MINT_DECODE_MIN and MINT_DECODE_MAX
-
-    This is strict enough to filter garbage but lenient enough to keep real
-    mints like FeR8V… that decode to 30 bytes.
-    """
-    if not s:
-        return False
-    s = s.strip()
-    if not (20 <= len(s) <= _BLOB_STR_MAX):
-        return False
+def _is_base58_32(s: str) -> bool:
+    """Return True iff `s` decodes to exactly 32 bytes of base58."""
     try:
-        for ch in s:
-            if ch not in _B58_IDX:
-                return False
-        raw = _b58decode(s)
-        return _MINT_DECODE_MIN <= len(raw) <= _MINT_DECODE_MAX
+        return len(_b58decode(s)) == 32
     except Exception:
         return False
 
 
-def _looks_base58ish(s: str) -> bool:
-    """
-    Fast lenient check: only charset + basic length.
-
-    Used for helpers like is_base58_mint(); normalize_mint() goes through
-    the stricter _is_base58_32ish() path.
-    """
-    if not s:
-        return False
-    s = s.strip()
-    if not (20 <= len(s) <= _BLOB_STR_MAX):
-        return False
-    for ch in s:
-        if ch not in _B58_IDX:
-            return False
-    return True
-
-
 def _strip_suffixes_and_clip(s: str) -> str:
     """
-    Remove known suffix words (pump, raydium, etc.) and hard-cap to
-    MINT_STR_MAX characters.
-
-    This is the key tweak that lets us handle things like:
-      https://dexscreener.com/solana/<mint>raydium
+    Remove known suffix words ('pump', 'raydium', etc.); then hard-cap to 44
+    chars (max base58 length for a 32-byte pubkey).
     """
     low = s.lower()
     changed = True
@@ -131,59 +86,51 @@ def _strip_suffixes_and_clip(s: str) -> str:
                 low = s.lower()
                 changed = True
                 break
-    if len(s) > _MINT_STR_MAX:
-        s = s[:_MINT_STR_MAX]
+
+    if len(s) > _MAX_B58_LEN:
+        s = s[:_MAX_B58_LEN]
     return s
 
 
 def _extract_base58_32(blob: str) -> Optional[str]:
     """
-    Recover a base58 *mint-like* string from arbitrary text/URL.
+    Recover a *real* 32-byte base58 key from arbitrary text/URL.
 
     Strategy:
-      1) If the whole blob looks like a mint:
-         - if length <= MINT_STR_MAX -> accept
-         - if longer -> strip suffixes + clip, then re-check.
-      2) Try last path segment from URL-ish strings (…/coin/<mint>).
-      3) Scan for base58-looking chunks; strip suffixes; validate; or clip.
-
-    Returns:
-      canonical-looking mint string, or None if we can't confidently recover one.
+      - Direct exact check.
+      - Try last path segment from URL-ish strings.
+      - Scan for base58-looking chunks; strip suffixes; validate len==32 bytes;
+        if overly long, try first 44 chars and re-check.
     """
     if not blob:
         return None
 
     t = blob.strip()
 
-    # 1) Entire blob as a candidate
-    if _looks_base58ish(t):
-        if len(t) <= _MINT_STR_MAX and _is_base58_32ish(t):
-            return t
-        # Likely salted (e.g. <mint>raydium)
-        clean = _strip_suffixes_and_clip(t)
-        if _is_base58_32ish(clean):
-            return clean
+    # Direct exact check
+    if _is_base58_32(t):
+        return t
 
-    # 2) Last path segment of a URL-ish string
+    # Try last path segment for URLs like .../coin/<mint>
     try:
         parts = re.split(r"[/?#]", t)
         if parts:
             last = parts[-1]
-            if last:
-                clean = _strip_suffixes_and_clip(last)
-                if _is_base58_32ish(clean):
-                    return clean
+            if _is_base58_32(last):
+                return last
     except Exception:
         pass
 
-    # 3) Scan for base58-looking segments inside the blob
+    # Scan for base58-looking segments inside the blob
     for cand in _B58_RE.findall(t):
         clean = _strip_suffixes_and_clip(cand)
-        if _is_base58_32ish(clean):
+        if _is_base58_32(clean):
             return clean
-        if len(cand) > _MINT_STR_MAX:
-            clipped = cand[:_MINT_STR_MAX]
-            if _is_base58_32ish(clipped):
+
+        # If original candidate is longer than 44 chars, try the first 44
+        if len(cand) > _MAX_B58_LEN:
+            clipped = cand[:_MAX_B58_LEN]
+            if _is_base58_32(clipped):
                 return clipped
 
     return None
@@ -194,43 +141,44 @@ def _extract_base58_32(blob: str) -> Optional[str]:
 # ──────────────────────────────────────────────────────────────────────────────
 def normalize_mint(m: str) -> str:
     """
-    Return a canonical mint address suitable for router / Jupiter / Solana RPC.
+    Return a canonical, 32-byte base58 mint address.
 
     Accepts:
       - Symbols: SOL, WSOL, USDT, USDC, BONK, etc.
-      - Exact base58-ish address (lenient: 28–40 decoded bytes).
+      - Exact base58 address (must decode to 32 bytes).
       - Pump.fun / dexscreener-style URLs or strings with a mint inside.
-      - Salted IDs where someone tacked on words like '...bonk'/'...pump'
-        or '...raydium' to the end.
+      - Salted IDs where someone tacked on words like '...bonk'/'...pump'/
+        '...raydium' that are still pure base58.
 
-    If we cannot confidently recover a base58-ish mint, we raise ValueError.
+    This is intentionally *strict*: if it doesn't decode to 32 bytes,
+    we treat it as invalid so we *never* send bad mints to Jupiter.
     """
     if not m or not str(m).strip():
         raise ValueError("empty mint")
 
     s = str(m).strip()
 
-    # 1) Symbol alias
+    # 1) Symbol alias?
     sym = s.upper()
-    if sym in _SYM_TO_MINT:
-        return _SYM_TO_MINT[sym]
+    aliased = _SYM_TO_MINT.get(sym)
+    if aliased:
+        return aliased
 
-    # 2) Try to recover a base58-ish mint from the blob
+    # 2) Try to recover a real 32-byte mint from the blob/URL/string.
     cand = _extract_base58_32(s)
-    if not cand:
-        raise ValueError(f"cannot normalize mint from input: {s!r}")
+    if cand and _is_base58_32(cand):
+        return cand
 
-    return cand
+    # If we got here, it's garbage for our purposes.
+    raise ValueError(f"cannot normalize mint from input: {s!r}")
 
 
 def is_base58_mint(s: str) -> bool:
     """
     Public helper for quick validation.
-
-    Uses lenient charset+length rules; anything this returns True for will
-    *likely* be accepted by normalize_mint().
+    True iff the string decodes to exactly 32 bytes of base58.
     """
-    return _looks_base58ish((s or "").strip())
+    return _is_base58_32((s or "").strip())
 
 
 __all__ = [
