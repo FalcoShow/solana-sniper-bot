@@ -1,3 +1,21 @@
+# utils_pkg/exit_engine.py
+# Unified exit engine:
+#   - Tracks new positions after BUY fills (in-memory follow-through state)
+#   - Feeds AI sell logic (ai_sell_logic.schedule_after_buy / on_trade_tick / schedule_force_exit)
+#   - Optionally triggers "dead coin" exits when there is no follow-through
+#   - Provides a last-resort direct Jupiter sell fallback if AI engine is unavailable
+#
+# Public API (unchanged):
+#   async def on_buy_filled(ev: Dict[str, Any]) -> None
+#   async def on_trade_tick(raw_event: Dict[str, Any]) -> None
+#   async def on_buy_filled_event(ev: Dict[str, Any]) -> None
+#   async def on_buy_filled_legacy(raw_id_or_mint: str, tx_sig: str) -> None
+#
+# This module is intentionally self-contained and safe:
+#   - If ai_sell_logic is missing, it still runs (but exits are simpler).
+#   - If Redis or auto_exit_worker is misconfigured, we default to HOLD / no-op,
+#     except for the last-resort direct Jup fallback when safe to do so.
+
 from __future__ import annotations
 
 import asyncio
@@ -8,9 +26,9 @@ from typing import Any, Dict, Optional, Callable
 
 log = logging.getLogger("sniper.exit_engine")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 # Env helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
@@ -34,9 +52,9 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 # Global config from env
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 
 DRYRUN = (
     _env_bool("DRYRUN", False)
@@ -48,8 +66,8 @@ EXIT_ENGINE_FLAG = _env_bool("EXIT_ENGINE", True)
 EXIT_ENGINE_ENABLED = _env_bool("EXIT_ENGINE_ENABLED", True)
 EXIT_ENGINE_ACTIVE = EXIT_ENGINE_FLAG and EXIT_ENGINE_ENABLED
 
-MIN_SELL_SOL = _env_float("PF_MIN_SELL_SOL", 0.001)
 LAMPORTS_PER_SOL = 1_000_000_000
+MIN_SELL_SOL = _env_float("PF_MIN_SELL_SOL", 0.001)
 DEFAULT_SLIPPAGE_BPS = _env_int("PF_SLIPPAGE_BPS", 200)
 
 # Follow-through / "dead coin" config
@@ -60,17 +78,16 @@ EXIT_FOLLOW_MIN_UP_PCT = _env_float("EXIT_FOLLOW_MIN_UP_PCT", 6.0)
 EXIT_FOLLOW_MAX_DD_PCT = _env_float("EXIT_FOLLOW_MAX_DD_PCT", 5.0)
 EXIT_FOLLOW_DEBUG = _env_bool("EXIT_FOLLOW_DEBUG", False)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional: AI-driven / advanced sell engine hook
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
+# Optional: AI-driven / advanced sell engine hook (ai_sell_logic)
+# ============================================================================
 
 try:
-    # ai_sell_logic is where the "brains" of exits live (DCA, trailing stops, etc.)
-    from utils_pkg import ai_sell_logic as SELL  # type: ignore
+    # ai_sell_logic contains the "brains" for exits and Redis wiring.
+    from utils_pkg import ai_sell_logic as SELL  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover
-    SELL = None  # type: ignore
-    log.debug("ai_sell_logic not available; will use direct Jup fallback only")
+    SELL = None  # type: ignore[assignment]
+    log.debug("ai_sell_logic not available; exit_engine will use simple follow-through + fallback only")
 
 
 def _get_sell_hook(name: str) -> Optional[Callable[..., Any]]:
@@ -85,9 +102,9 @@ def _get_sell_hook(name: str) -> Optional[Callable[..., Any]]:
     return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Fallback direct Jupiter V6 seller
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
+# Fallback direct Jupiter V6 seller (LAST RESORT ONLY)
+# ============================================================================
 
 
 async def _direct_sell_via_jup(
@@ -96,12 +113,10 @@ async def _direct_sell_via_jup(
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
 ) -> Optional[str]:
     """
-    Minimal direct sell path using the same Lightning / Jupiter V6 plumbing as buys.
-    Returns:
-        tx signature string on success, or None on failure.
-
-    This is a LAST RESORT fallback – primary exit flow should be controlled by
-    ai_sell_logic + dedicated exit worker.
+    Minimal direct sell path using Lightning / Jupiter V6 plumbing.
+    Only used when:
+      - AI engine is unavailable, AND
+      - we have a clear "dead coin" or test condition.
     """
     try:
         from utils_pkg.lightning_impl import sell_via_lightning
@@ -121,9 +136,9 @@ async def _direct_sell_via_jup(
         return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 # In-memory position state for follow-through logic
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 
 
 class _Pos:
@@ -152,10 +167,11 @@ class _Pos:
         amount_raw: Optional[int] = None,
         entry_price: Optional[float] = None,
     ) -> None:
+        now = time.time()
         self.mint = mint
         self.symbol = symbol
         self.pool = pool
-        self.entry_ts = time.time()
+        self.entry_ts = now
         self.entry_sig = entry_sig
         self.spend_sol = float(spend_sol or 0.0)
         self.amount_raw = amount_raw
@@ -172,10 +188,17 @@ _OPEN_LOCK = asyncio.Lock()
 
 def _extract_price(ev: Dict[str, Any]) -> Optional[float]:
     """
-    Try to pull a float price (in SOL terms) from a trade tick.
-    We keep this intentionally forgiving – if nothing looks like a price, return None.
+    Try to pull a float price (in SOL terms or any consistent quote) from a trade tick.
+    If nothing looks like a price, return None.
     """
-    for key in ("priceUi", "price_ui", "price", "priceInSol", "price_in_sol"):
+    for key in (
+        "priceUi",
+        "price_ui",
+        "price",
+        "priceInSol",
+        "price_in_sol",
+        "ui_price",
+    ):
         v = ev.get(key)
         if v is None:
             continue
@@ -196,9 +219,9 @@ def _extract_mint(ev: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Core hook: called when a buy has filled (DICT STYLE, primary API)
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
+# Core hook: called when a BUY has filled (DICT STYLE, primary API)
+# ============================================================================
 
 
 async def on_buy_filled(ev: Dict[str, Any]) -> None:
@@ -210,9 +233,11 @@ async def on_buy_filled(ev: Dict[str, Any]) -> None:
       price_entry_ui?, ...
     }
 
-    - Registers position in the follow-through tracker.
-    - Delegates to ai_sell_logic.schedule_after_buy(...) if present.
-    - Optional tiny Jup probe when AI engine is not available (non-critical).
+    Responsibilities:
+      - Registers a follow-through position in memory.
+      - Delegates to ai_sell_logic.schedule_after_buy(...) if available
+        (this writes buy_time, entry price, and snapshots into Redis).
+      - In DRYRUN mode, still updates internal state but never sells.
     """
     if not EXIT_ENGINE_ACTIVE:
         log.info(
@@ -243,6 +268,7 @@ async def on_buy_filled(ev: Dict[str, Any]) -> None:
     symbol = (ev.get("symbol") or mint[:4]).strip()
     pool = (ev.get("pool") or "unknown").lower()
 
+    # Spend size (in SOL) if provided
     spend_sol = 0.0
     for key in ("spend_sol", "buy_size_sol", "amount_sol", "entry_size_sol"):
         if key in ev and ev[key] is not None:
@@ -252,6 +278,7 @@ async def on_buy_filled(ev: Dict[str, Any]) -> None:
             except Exception:
                 continue
 
+    # Token amount in base units (lamports, etc.)
     amount_raw: Optional[int] = None
     for key in ("amount_raw", "amount_out", "base_amount_raw"):
         v = ev.get(key)
@@ -263,6 +290,7 @@ async def on_buy_filled(ev: Dict[str, Any]) -> None:
         except Exception:
             continue
 
+    # Entry price (if scanner provided one)
     price = ev.get("price_entry_ui")
     try:
         price = float(price) if price is not None else None
@@ -341,47 +369,38 @@ async def on_buy_filled(ev: Dict[str, Any]) -> None:
                 },
             )
 
-    # No AI sell engine available → optional tiny Jup probe to confirm sellability
-    probe_sol = max(MIN_SELL_SOL, spend_sol * 0.10) if spend_sol > 0 else MIN_SELL_SOL
-    probe_raw = int(probe_sol * LAMPORTS_PER_SOL)
-
+    # If we reach here, AI engine isn't available or failed.
+    # We do NOT exit immediately; follow-through logic + DRYRUN protects us.
     if DRYRUN:
         log.info(
             "EXIT_FALLBACK_DRYRUN",
-            extra={
-                "mint": mint,
-                "symbol": symbol,
-                "probe_sol": probe_sol,
-                "pool": pool,
-            },
+            extra={"mint": mint, "symbol": symbol, "pool": pool},
         )
         return
 
-    sig = await _direct_sell_via_jup(mint=mint, amount_raw=probe_raw)
+    # No AI sell engine: we simply keep the follow-through state alive and
+    # rely on on_trade_tick() to eventually decide if a direct sell is needed.
     log.info(
-        "EXIT_FALLBACK_RESULT",
-        extra={
-            "mint": mint,
-            "symbol": symbol,
-            "probe_sol": probe_sol,
-            "pool": pool,
-            "sig": sig,
-        },
+        "EXIT_NO_AI_ENGINE",
+        extra={"mint": mint, "symbol": symbol, "pool": pool},
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 # Trade tick hook: feeds both AI engine and follow-through logic
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 
 
 async def on_trade_tick(raw_event: Dict[str, Any]) -> None:
     """
     Called for every trade tick the Strategy sees.
-    Used to:
-      - Update AI sell engine, if present;
-      - Maintain 'follow-through' counters (trades_after_entry, max_up, drawdown);
-      - Trigger forced exits on dead coins.
+
+    Responsibilities:
+      - Forward tick to AI sell engine (ai_sell_logic.on_trade_tick) if present;
+      - Maintain follow-through counters (trades_after_entry, max_up, drawdown);
+      - After EXIT_FOLLOW_WINDOW_SEC, if follow-through failed:
+          * ask AI engine to schedule a force exit (schedule_force_exit / request_exit);
+          * or, if AI is missing, optionally do a tiny direct Jupiter sell as fallback.
     """
     if not EXIT_ENGINE_ACTIVE:
         return
@@ -393,7 +412,7 @@ async def on_trade_tick(raw_event: Dict[str, Any]) -> None:
     now = time.time()
     price = _extract_price(raw_event)
 
-    # ─── Forward to AI engine first (non-blocking best effort) ───────────────
+    # ---- Forward to AI engine first (best-effort) -------------------------
     ai_tick = _get_sell_hook("on_trade_tick")
     if ai_tick is not None:
         try:
@@ -407,14 +426,14 @@ async def on_trade_tick(raw_event: Dict[str, Any]) -> None:
     if not EXIT_FOLLOW_ENABLED:
         return
 
-    pos: Optional[_Pos]
+    # ---- Follow-through state lookup -------------------------------------
     async with _OPEN_LOCK:
         pos = _OPEN.get(mint)
 
     if pos is None or pos.closed:
         return
 
-    # Update basic counters
+    # Update tick counters
     pos.trades_after_entry += 1
 
     if price is not None:
@@ -473,13 +492,12 @@ async def on_trade_tick(raw_event: Dict[str, Any]) -> None:
         )
 
     if follow_pass:
-        # Keep position live; do not enforce exit here.
+        # Good follow-through → stop evaluating; AI / DCA can manage the rest.
         async with _OPEN_LOCK:
-            pos.closed = True  # stop re-evaluating; AI engine takes over from here
+            pos.closed = True
         return
 
-    # At this point, we consider the coin "dead" or failed follow-through.
-    # Try to trigger an immediate exit via AI engine; otherwise log and (optionally) direct-sell.
+    # At this point we consider the coin "dead" / failed follow-through.
     log.info(
         "EXIT_FOLLOW_TRIGGER",
         extra={
@@ -503,7 +521,7 @@ async def on_trade_tick(raw_event: Dict[str, Any]) -> None:
         )
         return
 
-    # Preferred: ask AI engine to force-exit if it exposes such an API.
+    # Preferred path: ask AI engine to schedule a forced exit.
     for hook_name in ("schedule_force_exit", "force_exit", "request_exit", "exit_now"):
         hook = _get_sell_hook(hook_name)
         if hook is None:
@@ -541,7 +559,7 @@ async def on_trade_tick(raw_event: Dict[str, Any]) -> None:
                 },
             )
 
-    # Final fallback: tiny direct sell, just like in on_buy_filled.
+    # Final fallback: tiny direct sell via Jupiter.
     probe_sol = max(MIN_SELL_SOL, pos.spend_sol * 0.10) if pos.spend_sol > 0 else MIN_SELL_SOL
     probe_raw = int(probe_sol * LAMPORTS_PER_SOL)
     sig = await _direct_sell_via_jup(mint=pos.mint, amount_raw=probe_raw)
@@ -556,9 +574,9 @@ async def on_trade_tick(raw_event: Dict[str, Any]) -> None:
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Legacy wrappers
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
+# Legacy wrappers (kept for backwards compatibility)
+# ============================================================================
 
 
 async def on_buy_filled_event(ev: Dict[str, Any]) -> None:
@@ -573,8 +591,10 @@ async def on_buy_filled_legacy(raw_id_or_mint: str, tx_sig: str) -> None:
     """
     Old positional signature kept for compatibility with previous versions.
 
-    main.py calls this only in a TypeError fallback path, so it's fine if it
-    is rarely used.
+    Some old call sites may still call:
+        await exit_engine.on_buy_filled_legacy(mint, tx_sig)
+
+    We synthesize a minimal event and feed it into the main handler.
     """
     ev: Dict[str, Any] = {
         "mint": raw_id_or_mint,

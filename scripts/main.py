@@ -1313,6 +1313,12 @@ async def _notion_intraday_snapshot_push(note: str = "") -> None:
 async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
     """
     ev: { mint, signature, symbol, spend_sol, pool, amount_raw? }
+
+    NOTE:
+      - This hook handles logging + alerts + Notion snapshot.
+      - Exit logic is handled *after RPC confirmation* in Strategy
+        (_gate_candidate / direct-buy path), which calls
+        exit_engine.on_buy_filled(ev) exactly once per real fill.
     """
     if _dryrun_env_on() or _pkg_is_dryrun:
         return
@@ -1356,21 +1362,6 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
 
     # Kick an intraday Notion push (debounced)
     asyncio.create_task(_notion_intraday_snapshot_push())
-
-    # Forward to exit engine (supports both new and legacy signatures)
-    if not EXIT_ENGINE_ENABLED:
-        return
-    try:
-        await exit_engine.on_buy_filled(ev)  # type: ignore[arg-type]
-        return
-    except TypeError:
-        with contextlib.suppress(Exception):
-            await exit_engine.on_buy_filled(  # type: ignore[misc]
-                raw_id_or_mint=ev.get("mint"),
-                tx_sig=ev.get("signature"),
-            )
-    except Exception as e:
-        log.warning("EXIT_ENGINE_FILL_HOOK_FAIL %s", e)
 
 
 async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
@@ -1833,7 +1824,7 @@ class Strategy:
                             },
                         )
 
-                        # Alerts (Telegram/Notion)
+                        # Alerts (Telegram/Notion) – secondary path, primary is _buy_hook_filled
                         try:
                             create_task(
                                 _am().notify_trade_fill(
@@ -1852,7 +1843,7 @@ class Strategy:
                                 extra={"err": str(_e)[:200]},
                             )
 
-                        # Exit engine hook
+                        # Exit engine hook (fallback; primary wiring is _buy_hook_filled)
                         if EXIT_ENGINE_ENABLED:
                             try:
                                 ev = {
@@ -1862,7 +1853,31 @@ class Strategy:
                                     "spend_sol": ui.get("spend_sol") or 0.0,
                                     "pool": ui.get("pool") or "unknown",
                                 }
-                                await exit_engine.on_buy_filled(ev)
+
+                                # best-effort amount_raw extraction from UI context
+                                amount_raw: Optional[int] = None
+                                for k in (
+                                    "amount_raw",
+                                    "position_raw",
+                                    "size_raw",
+                                    "raw_out",
+                                    "raw_amount_out",
+                                    "out_amount",
+                                    "token_amount_raw",
+                                ):
+                                    v = ui.get(k)
+                                    if isinstance(v, int) and v > 0:
+                                        amount_raw = v
+                                        break
+                                    if isinstance(v, float) and v > 0:
+                                        amount_raw = int(v)
+                                        break
+
+                                await exit_engine.on_buy_filled(
+                                    ev,
+                                    tx_sig=tx_sig,
+                                    amount_raw=amount_raw,
+                                )
                             except Exception:
                                 if DEBUG_TX:
                                     traceback.print_exc()
@@ -2221,7 +2236,7 @@ class Strategy:
                                     extra={"err": str(_e)[:200]},
                                 )
 
-                            # Exit engine hook
+                            # Exit engine hook (fallback; primary wiring is _buy_hook_filled)
                             if EXIT_ENGINE_ENABLED:
                                 try:
                                     ev = {
@@ -2231,7 +2246,30 @@ class Strategy:
                                         "spend_sol": ui.get("spend_sol") or 0.0,
                                         "pool": ui.get("pool") or "legacy",
                                     }
-                                    await exit_engine.on_buy_filled(ev)
+
+                                    amount_raw: Optional[int] = None
+                                    for k in (
+                                        "amount_raw",
+                                        "position_raw",
+                                        "size_raw",
+                                        "raw_out",
+                                        "raw_amount_out",
+                                        "out_amount",
+                                        "token_amount_raw",
+                                    ):
+                                        v = ui.get(k)
+                                        if isinstance(v, int) and v > 0:
+                                            amount_raw = v
+                                            break
+                                        if isinstance(v, float) and v > 0:
+                                            amount_raw = int(v)
+                                            break
+
+                                    await exit_engine.on_buy_filled(
+                                        ev,
+                                        tx_sig=tx_sig,
+                                        amount_raw=amount_raw,
+                                    )
                                 except Exception:
                                     if DEBUG_LOCAL:
                                         traceback.print_exc()
