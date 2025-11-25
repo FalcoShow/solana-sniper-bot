@@ -14,9 +14,9 @@ log = logging.getLogger("sniper.exit_worker")
 # Type alias for readability
 ExitRequest = Dict[str, Any]
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 # Env helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
@@ -40,9 +40,9 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 # Global config
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 
 # Legacy aliases – any of these turn dryrun on
 DRYRUN: bool = (
@@ -79,12 +79,13 @@ EXIT_REQUEST_TTL_SEC: int = _env_int("EXIT_REQUEST_TTL_SEC", 600)
 # Optional dust guard – if >0, we skip sells that are smaller than this.
 EXIT_WORKER_MIN_RAW: int = _env_int("EXIT_WORKER_MIN_RAW", 0)
 
-LAMPORTS_PER_SOL = 1_000_000_000  # only used for logging / sanity
+# Only used for logging / sanity checks
+LAMPORTS_PER_SOL = 1_000_000_000
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 # Redis helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 
 
 async def _scan_exit_requests(limit: int) -> List[str]:
@@ -138,7 +139,6 @@ async def _load_exit_request(key: str) -> Optional[ExitRequest]:
         if not isinstance(data, dict):
             return None
 
-        # ensure mint present
         mint = str(data.get("mint", "")).strip()
         if not mint:
             return None
@@ -159,16 +159,15 @@ async def _delete_exit_request(key: str) -> None:
     try:
         await redis.delete(key)
     except Exception:  # noqa: BLE001
-        # non-fatal
         log.debug("EXIT_WORKER_DELETE_ERROR key=%s", key, exc_info=True)
 
 
 async def _store_exit_request(payload: ExitRequest) -> Optional[str]:
     """
-    Internal helper to persist an exit_request to Redis, returning the key.
+    Persist an exit_request to Redis, returning the key.
 
     Key format: exit_request:{mint}
-    We stick to per-mint keys for idempotency: multiple modules that try
+    We use per-mint keys for idempotency: multiple modules that try
     to enqueue for the same mint will just clobber the previous request.
     """
     if redis is None:
@@ -192,9 +191,9 @@ async def _store_exit_request(payload: ExitRequest) -> Optional[str]:
         return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 # Amount helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 
 
 def _derive_raw_from_ui(req: ExitRequest) -> Optional[int]:
@@ -203,7 +202,6 @@ def _derive_raw_from_ui(req: ExitRequest) -> Optional[int]:
 
     Supports a bunch of common key shapes used across the codebase.
     """
-    # any ui-style size
     ui_keys = (
         "position_ui",
         "amount_ui",
@@ -251,7 +249,7 @@ def _derive_raw_from_ui(req: ExitRequest) -> Optional[int]:
         return None
 
     try:
-        scale = 10 ** int(dec)
+        scale = 10**int(dec)
         raw = int(ui * scale)
         if raw > 0:
             return raw
@@ -268,13 +266,12 @@ def _extract_amount_raw_from_req(req: ExitRequest) -> Optional[int]:
     Preferred field:
         "position_raw": int
 
-    We also handle a bunch of alternative shapes and derive from ui+decimals
+    We also handle alternative shapes and derive from ui+decimals
     when possible.
 
     Returns:
         amount_raw: int or None if we can't determine.
     """
-    # 1) direct raw fields
     raw_keys = (
         "position_raw",
         "amount_raw",
@@ -294,28 +291,25 @@ def _extract_amount_raw_from_req(req: ExitRequest) -> Optional[int]:
             amt = int(v)
             break
 
-    # 2) if no direct raw, try deriving from ui+dec
     if amt is None or amt <= 0:
         amt = _derive_raw_from_ui(req)
 
     if amt is None or amt <= 0:
         return None
 
-    # Apply sell_pct if present
     sell_pct = float(req.get("sell_pct", EXIT_WORKER_SELL_PCT))
     sell_pct = max(0.01, min(1.0, sell_pct))
     amt_final = int(int(amt) * sell_pct)
 
-    # Optional dust guard
     if EXIT_WORKER_MIN_RAW > 0 and amt_final < EXIT_WORKER_MIN_RAW:
         return None
 
     return amt_final if amt_final > 0 else None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 # Exit engine – logic side (front-end API)
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 
 
 class _ExitEngine:
@@ -327,8 +321,10 @@ class _ExitEngine:
     - enqueue_exit_request: generic way for risk manager / manual controls
       to schedule exits.
 
-    It is deliberately conservative: if we can't determine mint or size,
-    we just log and skip instead of throwing.
+    If we truly cannot infer size in on_buy_filled, we log
+    EXIT_ENGINE_SKIP_NO_SIZE – *this is what you saw in logs*.
+    After we patch main.py to always pass `amount_raw`, this should
+    basically never happen again.
     """
 
     def __init__(self) -> None:
@@ -346,7 +342,6 @@ class _ExitEngine:
         """
         if not self.enabled:
             return
-        # Could accumulate per-mint stats here later.
         return
 
     async def on_buy_filled(
@@ -361,17 +356,16 @@ class _ExitEngine:
 
         Tolerant signature:
 
-            await exit_engine.on_buy_filled(ev)                         # legacy
-            await exit_engine.on_buy_filled(ev, tx_sig)                 # legacy
-            await exit_engine.on_buy_filled(ev, tx_sig, amount_raw=..)  # preferred
+            await exit_engine.on_buy_filled(ev)
+            await exit_engine.on_buy_filled(ev, tx_sig)
+            await exit_engine.on_buy_filled(ev, tx_sig, amount_raw=..)
 
         We pull what we can from `ev`, construct an exit_request payload,
-        and store it in Redis. The background worker will perform the
-        actual sell if/when the request should be honored.
+        and store it in Redis. The background worker performs the actual sell.
 
-        If we truly cannot infer size, we log EXIT_ENGINE_SKIP_NO_SIZE and
-        return. Upstream code (main/strategy) *must* pass in a size
-        (`amount_raw` or ui+decimals) for exits to be actionable.
+        If we *cannot* infer a size, we log EXIT_ENGINE_SKIP_NO_SIZE and
+        return. The fix for that is to make sure main.py calls this with
+        a real amount_raw / ui+dec – which we’ll handle in the next step.
         """
         if not self.enabled:
             return
@@ -409,9 +403,7 @@ class _ExitEngine:
                 tx_sig = str(tx_sig)
 
         # --- Position size ----------------------------------------------
-        # Preferred: explicit amount_raw argument from caller (main.py).
         if amount_raw is None:
-            # Raw-ish fields from event
             for k in (
                 "position_raw",
                 "amount_raw",
@@ -425,15 +417,12 @@ class _ExitEngine:
                     amount_raw = int(v)
                     break
 
-        # Derive from ui+dec if still missing
         if amount_raw is None or amount_raw <= 0:
             derived = _derive_raw_from_ui(ev)
             if derived is not None and derived > 0:
                 amount_raw = derived
 
         if amount_raw is None or amount_raw <= 0:
-            # This is the behavior you saw in logs: without size information
-            # we cannot schedule a meaningful exit.
             log.info(
                 "EXIT_ENGINE_SKIP_NO_SIZE",
                 extra={
@@ -473,7 +462,7 @@ class _ExitEngine:
         if tx_sig:
             payload["tx_sig"] = tx_sig
 
-        # Option A: enqueue to worker (default / recommended)
+        # Enqueue to worker
         key = await _store_exit_request(payload)
         if key:
             log.info(
@@ -488,7 +477,7 @@ class _ExitEngine:
                 },
             )
 
-        # Option B: immediate execution if explicitly enabled
+        # Optional: immediate execution
         if EXIT_ON_BUY_FILLED:
             log.info(
                 "EXIT_ENGINE_IMMEDIATE_ON_BUY_FILLED",
@@ -578,9 +567,9 @@ class _ExitEngine:
 exit_engine = _ExitEngine()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 # Core exit execution (worker)
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 
 
 async def _execute_exit(req: ExitRequest) -> None:
@@ -592,10 +581,6 @@ async def _execute_exit(req: ExitRequest) -> None:
     source = str(req.get("source", "unknown"))
     follow = req.get("follow_stats", {}) or {}
 
-    # If this request is just the placeholder from on_buy_filled() and the
-    # operator has not enabled EXIT_ON_BUY_FILLED, we still treat it as a
-    # real request, but only if a size is present. If size is missing,
-    # the earlier stage (on_buy_filled) should have skipped it entirely.
     amount_raw = _extract_amount_raw_from_req(req)
     if amount_raw is None or amount_raw <= 0:
         log.info(
@@ -695,9 +680,9 @@ async def _process_once() -> None:
         await _delete_exit_request(key)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 # Public loop entrypoint
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 
 
 async def exit_worker_loop(stop_evt: asyncio.Event) -> None:

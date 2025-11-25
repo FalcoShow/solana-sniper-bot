@@ -1215,6 +1215,9 @@ _AM_SINGLETON: Optional[AlertManager] = None
 
 
 def _am() -> AlertManager:
+    """
+    Global AlertManager singleton so we don't recreate clients/sessions.
+    """
     global _AM_SINGLETON
     if _AM_SINGLETON is None:
         _AM_SINGLETON = AlertManager()
@@ -1223,13 +1226,17 @@ def _am() -> AlertManager:
 
 async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
     """
+    Called when a BUY has been submitted to the router.
+
     payload: {mint, pool, symbol, spend_sol, route, hint}
     """
+    # metrics
     try:
         bump("buys_submitted")
     except Exception:
         pass
 
+    # structured log
     try:
         log.event(
             "BUY_SUBMITTED",
@@ -1261,7 +1268,8 @@ async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
 
 # --- Notion (optional daily PnL sync) ---
 try:
-    from utils_pkg.notion_pnl import push_daily_pnl  # safe no-op if NOTION_ENABLED!=1
+    # safe no-op if NOTION_ENABLED != 1 inside this helper
+    from utils_pkg.notion_pnl import push_daily_pnl
 except Exception:  # pragma: no cover
     def push_daily_pnl(_snapshot):  # type: ignore[override]
         return None
@@ -1282,13 +1290,14 @@ async def _notion_intraday_snapshot_push(note: str = "") -> None:
     try:
         if os.getenv("NOTION_ENABLED", "0") != "1":
             return
+
         debounce_sec = int(os.getenv("DAILY_PNL_DEBOUNCE_MIN", "10")) * 60
         now = _time.time()
         if (now - _LAST_NOTION_PUSH_TS) < debounce_sec:
             return
 
         # very small snapshot (no price walk); safe + fast
-        # These helper functions are defined later in this file (part 2).
+        # Helpers are defined later in this file.
         unrl, open_n, _ = await _estimate_unrealized_from_positions()
         realized, _ = await _estimate_realized_today()
         wallet = await _get_wallet_sol_balance()
@@ -1312,22 +1321,32 @@ async def _notion_intraday_snapshot_push(note: str = "") -> None:
 
 async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
     """
+    Called when the router reports a BUY fill.
+
     ev: { mint, signature, symbol, spend_sol, pool, amount_raw? }
 
+    Responsibilities:
+      - bump metrics
+      - structured logs
+      - primary alert (Telegram / AlertManager)
+      - optional intraday Notion snapshot
+
     NOTE:
-      - This hook handles logging + alerts + Notion snapshot.
-      - Exit logic is handled *after RPC confirmation* in Strategy
-        (_gate_candidate / direct-buy path), which calls
-        exit_engine.on_buy_filled(ev) exactly once per real fill.
+      Exit / auto-sell logic is handled *after RPC confirmation* inside
+      Strategy (_gate_candidate / direct-buy path), which calls
+      exit_engine.on_buy_filled(ev, ...) exactly once per real fill.
     """
+    # No-op in DRYRUN / package-dryrun environments
     if _dryrun_env_on() or _pkg_is_dryrun:
         return
 
+    # metrics
     try:
         bump("buys_filled")
     except Exception:
         pass
 
+    # structured log
     try:
         log.event(
             "BUY_FILLED",
@@ -1366,8 +1385,11 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
 
 async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
     """
+    Called when a BUY fails in the router.
+
     payload: {mint, pool, symbol, spend_sol, route, hint, reason, error}
     """
+    # structured log
     try:
         log.event(
             "BUY_FAILED",
@@ -1382,6 +1404,7 @@ async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
     except Exception:
         pass
 
+    # Alert
     if NOTIFY_BUY_FAILED:
         try:
             txt = (
