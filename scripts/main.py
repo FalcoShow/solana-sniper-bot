@@ -1271,24 +1271,48 @@ def _normalize_spend_sol(d: Dict[str, Any]) -> float:
     Ensure we always have a numeric 'spend_sol' field on buy payloads/events.
 
     Priority:
-      1) existing d["spend_sol"]
-      2) d["amount_sol"] (common param name)
-      3) d["size_sol"] / d["size"] if present
-      4) 0.0 (last resort – but we really expect one of the above)
+      1) explicit SOL-sized fields:
+         - d["spend_sol"]
+         - d["amount_sol"]
+         - d["size_sol"]
+         - d["size"]
+      2) lamport-sized fields (converted to SOL):
+         - d["lamports_in"]
+         - d["in_amount_raw"]
+         - d["amount_raw"]
+      3) 0.0 (last resort – but normally one of the above exists)
 
     The normalized value is also written back into d["spend_sol"] so any
     downstream consumers (exit engine, PnL, alerts) see the same value.
     """
     cand = d.get("spend_sol", None)
 
+    # --- SOL-sized candidates first ---
     if cand in (None, "", 0, 0.0):
-        # common alternative keys the strategy/router may have set
         for k in ("amount_sol", "size_sol", "size"):
             v = d.get(k, None)
             if v not in (None, ""):
                 cand = v
                 break
 
+    # --- If still empty, try lamport-sized keys and convert to SOL ---
+    if cand in (None, "", 0, 0.0):
+        lamports_val = None
+        for k in ("lamports_in", "in_amount_raw", "amount_raw"):
+            v = d.get(k, None)
+            if v not in (None, ""):
+                lamports_val = v
+                break
+
+        if lamports_val is not None:
+            try:
+                lamports_f = float(lamports_val)
+                lps = float(globals().get("LAMPORTS_PER_SOL", 1_000_000_000))
+                cand = lamports_f / lps
+            except Exception:
+                cand = 0.0
+
+    # --- Final numeric normalization ---
     try:
         spend = float(cand) if cand not in (None, "") else 0.0
     except Exception:
@@ -1305,7 +1329,7 @@ async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
     """
     Called when a BUY has been submitted to the router.
 
-    payload: {mint, pool, symbol, spend_sol?, amount_sol?, route, hint}
+    payload: {mint, pool, symbol, spend_sol?, amount_sol?, route, hint, ...}
     """
     # normalize size so everything downstream (logs, alerts, exit) sees a number
     spend_sol = _normalize_spend_sol(payload)
@@ -1326,6 +1350,16 @@ async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
             route=payload.get("route"),
             spend_sol=spend_sol,
             hint=payload.get("hint"),
+        )
+    except Exception:
+        pass
+
+    # lightweight analytics hook (non-fatal)
+    try:
+        record_buy_result(
+            ok=True,
+            reason="submitted",
+            spend_sol=spend_sol,
         )
     except Exception:
         pass
@@ -1403,7 +1437,7 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
     """
     Called when the router reports a BUY fill.
 
-    ev: { mint, signature, symbol, spend_sol?, amount_sol?, pool, amount_raw? }
+    ev: { mint, signature, symbol, spend_sol?, amount_sol?, pool, amount_raw?, ... }
 
     Responsibilities:
       - bump metrics
@@ -1423,7 +1457,7 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
     if _dryrun_env_on() or _pkg_is_dryrun:
         return
 
-    # normalize size
+    # normalize size (this is the value the exit engine + PnL will see)
     spend_sol = _normalize_spend_sol(ev)
 
     # metrics
@@ -1441,6 +1475,16 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
             pool=ev.get("pool"),
             spend_sol=spend_sol,
             sig=ev.get("signature"),
+        )
+    except Exception:
+        pass
+
+    # analytics hook (success)
+    try:
+        record_buy_result(
+            ok=True,
+            reason="filled",
+            spend_sol=spend_sol,
         )
     except Exception:
         pass
@@ -1465,7 +1509,7 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
                 extra={"err": str(_e)[:200]},
             )
 
-    # Kick an intraday Notion push (debounced)
+    # Kick an intraday Notion push (debounced, safe if disabled)
     asyncio.create_task(_notion_intraday_snapshot_push())
 
 
@@ -1515,6 +1559,7 @@ async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
             ok=False,
             reason=str(payload.get("reason") or "failed"),
             error=payload.get("error"),
+            spend_sol=spend_sol,
         )
     except Exception:
         pass

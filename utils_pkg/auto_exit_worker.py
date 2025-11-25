@@ -87,6 +87,63 @@ LAMPORTS_PER_SOL = 1_000_000_000
 
 
 # ============================================================================
+# Size helpers
+# ============================================================================
+
+
+def _job_spend_sol(job: Dict[str, Any]) -> float:
+    """
+    Normalize exit job size into SOL and write back job['spend_sol'].
+
+    We will try, in order:
+      1) job['spend_sol'], job['amount_sol'], job['size_sol'], job['size']
+      2) lamport fields -> convert to SOL:
+         job['lamports_in'], job['in_amount_raw'], job['amount_raw'], job['base_size_raw']
+      3) fallback to 0.0
+
+    This mirrors the _normalize_spend_sol logic in main.py so exit
+    engine + alerts always see a consistent spend_sol when possible.
+    """
+    cand = job.get("spend_sol", None)
+
+    # --- SOL-sized candidates first ---
+    if cand in (None, "", 0, 0.0):
+        for k in ("amount_sol", "size_sol", "size"):
+            v = job.get(k, None)
+            if v not in (None, ""):
+                cand = v
+                break
+
+    # --- Lamports -> SOL ---
+    if cand in (None, "", 0, 0.0):
+        lamports_val = None
+        for k in ("lamports_in", "in_amount_raw", "amount_raw", "base_size_raw"):
+            v = job.get(k, None)
+            if v not in (None, ""):
+                lamports_val = v
+                break
+
+        if lamports_val is not None:
+            try:
+                lamports_f = float(lamports_val)
+                cand = lamports_f / float(LAMPORTS_PER_SOL)
+            except Exception:
+                cand = 0.0
+
+    # --- Final numeric cleanup ---
+    try:
+        size_sol = float(cand) if cand not in (None, "") else 0.0
+    except Exception:
+        size_sol = 0.0
+
+    if size_sol < 0:
+        size_sol = 0.0
+
+    job["spend_sol"] = size_sol
+    return size_sol
+
+
+# ============================================================================
 # Redis helpers (exit_request storage)
 # ============================================================================
 
@@ -198,7 +255,7 @@ async def _store_exit_request(payload: ExitRequest) -> Optional[str]:
 
 
 # ============================================================================
-# Amount helpers
+# Amount helpers (token raw, not SOL)
 # ============================================================================
 
 
@@ -377,7 +434,7 @@ class _ExitEngine:
         A separate worker loop later executes the sell.
 
         If we *cannot* infer a position size, we log EXIT_ENGINE_SKIP_NO_SIZE
-        and return – this is exactly the log you saw earlier.
+        and return – this is the guard that previously fired.
         """
         if not self.enabled:
             return
@@ -414,9 +471,8 @@ class _ExitEngine:
         if tx_sig:
             tx_sig = str(tx_sig)
 
-        # --- Position size ----------------------------------------------
+        # --- Position size (raw tokens) ---------------------------------
         if amount_raw is None:
-            # Try common raw keys directly on the event
             for k in (
                 "position_raw",
                 "amount_raw",
@@ -432,13 +488,12 @@ class _ExitEngine:
                     break
 
         if amount_raw is None or amount_raw <= 0:
-            # Try to infer from ui + decimals on the event itself
             derived = _derive_raw_from_ui(ev)
             if derived is not None and derived > 0:
                 amount_raw = derived
 
         if amount_raw is None or amount_raw <= 0:
-            # Still nothing – we cannot safely create an exit
+            # This is the only place we should log EXIT_ENGINE_SKIP_NO_SIZE now.
             log.info(
                 "EXIT_ENGINE_SKIP_NO_SIZE",
                 extra={
@@ -598,11 +653,19 @@ async def _execute_exit(req: ExitRequest) -> None:
     source = str(req.get("source", "unknown"))
     follow = req.get("follow_stats", {}) or {}
 
+    # Normalise spend_sol for diagnostics; we do NOT gate on this.
+    spend_sol = _job_spend_sol(req)
+
     amount_raw = _extract_amount_raw_from_req(req)
     if amount_raw is None or amount_raw <= 0:
         log.info(
             "EXIT_WORKER_SKIP_NO_AMOUNT",
-            extra={"mint": mint, "reason": reason, "source": source},
+            extra={
+                "mint": mint,
+                "reason": reason,
+                "source": source,
+                "spend_sol": spend_sol,
+            },
         )
         return
 
@@ -615,6 +678,7 @@ async def _execute_exit(req: ExitRequest) -> None:
                 "reason": reason,
                 "source": source,
                 "follow": follow,
+                "spend_sol": spend_sol,
             },
         )
         return
@@ -627,6 +691,7 @@ async def _execute_exit(req: ExitRequest) -> None:
             "slippage_bps": EXIT_WORKER_SLIPPAGE_BPS,
             "reason": reason,
             "source": source,
+            "spend_sol": spend_sol,
         },
     )
 
@@ -640,7 +705,13 @@ async def _execute_exit(req: ExitRequest) -> None:
     except Exception as e:  # noqa: BLE001
         log.warning(
             "EXIT_WORKER_SELL_ERROR",
-            extra={"mint": mint, "err": str(e)[:200], "reason": reason},
+            extra={
+                "mint": mint,
+                "err": str(e)[:200],
+                "reason": reason,
+                "source": source,
+                "spend_sol": spend_sol,
+            },
         )
         return
 
@@ -652,6 +723,7 @@ async def _execute_exit(req: ExitRequest) -> None:
             "sig": sig,
             "reason": reason,
             "source": source,
+            "spend_sol": spend_sol,
         },
     )
 
