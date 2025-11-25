@@ -1,45 +1,34 @@
 from __future__ import annotations
 
 """
-utils_pkg/router.py — Clean, end-to-end rewrite (delegates swaps to lightning_impl)
+utils_pkg/router.py — Central routing + quoting + price helper
 
-Additions in this rewrite
-- BUY/SELL wrappers that catch Jupiter "no route" and cleanly fall back to Raydium.
-- Pump.fun-specific BUY wrapper that falls back to direct Pump.fun buy when Jupiter has no route.
-- Keeps your existing API surface, registries, caching, pricing, Telegram helpers, etc.
-- Does NOT change call sites — BUY_IMPLS/SELL_IMPLS still expose "pump"/"raydium" keys.
+High level:
+- Delegates actual swaps (Jupiter v6) to utils_pkg.lightning_impl
+- Provides Jupiter quote + price helpers (token <-> SOL)
+- Manages Raydium and Pump.fun fallbacks
+- Provides token metadata + decimals helpers
+- Exposes BUY_IMPLS / SELL_IMPLS registries keyed by "raydium", "pump", "lightning"
 
-Key features (unchanged)
-- Jupiter v6-first (public/pro relays), optional legacy (/swap/v1/*) toggle
-- Strict 32-byte base58 validation (no auto-trimming/fixing)
-- Robust quote/swap HTTP helpers, basic rate limiting, circuit breaker
-- On-chain decimals probe (RPC getAccountInfo) with optional /tokens fallback cache
-- Price helper (token→SOL) with short TTL, bad-ID blacklist
-- Telegram notifications helpers (optional)
-- Dynamic priority fee tuner scaffolding (seed + observe API)
-- Clean public API and compatibility shims for existing imports
-
-Env knobs (notable)
-- JUP_UPSTREAM, JUP_ALT_BASE_URLS, JUP_API_KEY, JUP_AS_LEGACY, JUP_ONLY_DIRECT
-- PF_SLIPPAGE_BPS, PF_TRADE_SOL, PF_PRIORITY_SOL, PF_PRIORITY_DYNAMIC
-- MIN_SOL_BALANCE, DRY_RUN
-- SOL_RPC_URL / RPC_URL
-- ROUTER_* timeouts and retries
+Key behaviors:
+- BUY/SELL wrappers:
+    - Primary: Jupiter via lightning_impl
+    - Fallback: Raydium (for generic pools) or Pump.fun (for pump tokens)
+- DRYRUN-safe: dryrun stops before sending real txs, but still allows quotes
+- Strict base58 mint validation
+- On-chain decimals probe via RPC + optional /tokens cache
+- Price helper: mint -> SOL price with TTL + blacklist
 """
 
 import asyncio
 import base64
-import json
 import os
 import random
-import re
 import time
-from typing import Any, Dict, Optional, Tuple, Callable, List
+from typing import Any, Dict, Optional, Tuple, Callable, List, Union
 
 import requests
 from requests.exceptions import RequestException
-import httpx
-from httpx import HTTPStatusError
 
 from utils_pkg import lightning_impl as lightning
 try:
@@ -55,7 +44,7 @@ except Exception:
 # ----- BEGIN: ENV-DRIVEN HARD JUPITER DISABLE GUARD -----
 import logging
 
-log = logging.getLogger(__name__) if 'log' not in globals() else log
+log = logging.getLogger(__name__) if "log" not in globals() else log
 
 
 def _env_false(val: str) -> bool:
@@ -63,18 +52,17 @@ def _env_false(val: str) -> bool:
 
 
 JUPIER_DISABLED_BY_ENV = (
-    _env_false(os.getenv("ROUTER_ALLOW_JUPITER", "0"))  # prefer explicit allow flag
+    _env_false(os.getenv("ROUTER_ALLOW_JUPITER", "0"))
     or _env_false(os.getenv("JUP_ENABLED", "0"))
 )
 
-# Explicitly blank out any base urls we may have inherited
 if JUPIER_DISABLED_BY_ENV:
-    # Defensive: make sure the rest of the code sees these as empty strings
     os.environ["JUP_BASE_URL"] = ""
     os.environ["JUP_ALT_BASE_URLS"] = ""
-    log.info({"event": "JUP_DISABLED_BY_ENV", "msg": "Jupiter calls disabled by env"})
+    log.info(
+        {"event": "JUP_DISABLED_BY_ENV", "msg": "Jupiter calls disabled by env"}
+    )
 
-    # Provide a safe stub for the common Jupiter call sites used by router
     def _jupiter_quote_stub(*args, **kwargs):
         raise RuntimeError(
             "Jupiter disabled by environment - quote requested but blocked"
@@ -86,8 +74,9 @@ if JUPIER_DISABLED_BY_ENV:
         pass
 # ----- END: ENV-DRIVEN HARD JUPITER DISABLE GUARD -----
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Logging
+# Logging setup
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from logging_setup import get_logger
@@ -120,15 +109,16 @@ if not hasattr(log, "every"):
 
     setattr(log, "every", _every)  # type: ignore[attr-defined]
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Wallet / utils imports (kept for feature parity and potential callers)
+# Wallet / utils imports (some used by guards, price helpers)
 # ──────────────────────────────────────────────────────────────────────────────
 from utils_pkg.solana_wallet import (
     load_keypair,
     get_pubkey_str,
-    sign_and_send_b64_tx,  # fallback sender
-    _send_b64_with_diag,  # robust sender w/ simulate diagnostics
-    get_balance_lamports,  # sync balance helper
+    sign_and_send_b64_tx,  # kept for backwards-compat callers
+    _send_b64_with_diag,   # diagnostic sender
+    get_balance_lamports,
 )
 
 try:
@@ -166,6 +156,7 @@ except Exception:  # pragma: no cover
 
     budget = _BudgetNoop()  # type: ignore
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Env helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -190,29 +181,31 @@ def _envi(k: str, d: int) -> int:
         return int(d)
 
 
-# --- Router registration shim (safe default to lightning) ---
-def _env_bool(name, default=False):
+def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Router registration shim (safe default to lightning)
+# ──────────────────────────────────────────────────────────────────────────────
 ALLOW_PUMP = _env_bool("ROUTER_ALLOW_PUMP", True)
 ALLOW_RAYDIUM = _env_bool("ROUTER_ALLOW_RAYDIUM", True)
 
 BUY_IMPL = os.getenv("ROUTER_BUY_IMPL", "lightning").strip().lower()
 SELL_IMPL = os.getenv("ROUTER_SELL_IMPL", "lightning").strip().lower()
 
-# Global registries the main loop uses
 BUY_IMPLS: Dict[str, Callable[..., Any]] = {}
 SELL_IMPLS: Dict[str, Callable[..., Any]] = {}
 
-# Import the lightning impls once (source of truth for swaps)
+# Import lightning swap functions as our core engine
 from utils_pkg.lightning_impl import (
     buy_via_lightning as _buy_lightning,
     sell_via_lightning as _sell_lightning,
 )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Chain / RPC config
@@ -235,14 +228,17 @@ TX_COMMITMENT = _TX_COMMITMENT
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
+LAMPORTS_PER_SOL_F = float(LAMPORTS_PER_SOL)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Toggles / timeouts / retries
 # ──────────────────────────────────────────────────────────────────────────────
-# NOTE: The router DOES NOT short-circuit on DRYRUN; it allows the call to
-# reach lightning_impl where DRYRUN only skips the *send*. This is required
-# so you can see quote + ENTRY_TX_DRYRUN from the main loop.
-DRY_RUN = _envb("DRYRUN", False) or _envb("DRY_RUN", False) or _envb("IS_DRYRUN", False)
+DRY_RUN = (
+    _envb("DRYRUN", False)
+    or _envb("DRY_RUN", False)
+    or _envb("IS_DRYRUN", False)
+)
 MIN_SOL_BALANCE = _envf("MIN_SOL_BALANCE", 3.0)
 
 HTTP_TIMEOUT_GET = max(5.0, _envf("ROUTER_HTTP_TIMEOUT_GET_SEC", 20.0))
@@ -268,7 +264,6 @@ _TOKENS_CACHE: Tuple[float, List[dict]] | None = None
 _QUOTE_FLIGHT: Dict[str, asyncio.Future[Any]] = {}
 _quote_lock = asyncio.Lock()
 
-# Bad ID blacklist for price calls
 BAD_ID_TTL_SEC = max(10, _envi("ROUTER_BAD_ID_TTL_SEC", 60))
 _BAD_PRICE_BLACKLIST: Dict[str, float] = {}
 
@@ -278,23 +273,26 @@ _UA = {
     "content-type": "application/json",
 }
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Jupiter upstream (v6-first)
+# Jupiter upstream (for quotes & tokens catalog)
 # ──────────────────────────────────────────────────────────────────────────────
 JUP_UPSTREAM: str = (
     os.getenv("JUP_UPSTREAM") or os.getenv("JUP_BASE_URL") or "https://api.jup.ag"
 ).rstrip("/")
+
 JUP_ALT_BASE_URLS: List[str] = [
     u.strip().rstrip("/")
     for u in (os.getenv("JUP_ALT_BASE_URLS") or "").split(",")
     if u.strip()
 ]
+
 AS_LEGACY = _envb("JUP_AS_LEGACY", False)
 ONLY_DIRECT_DEFAULT = _envb("JUP_ONLY_DIRECT", False)
 
-# Only supply a default alt if user didn't specify any
 if not AS_LEGACY and not JUP_ALT_BASE_URLS:
     JUP_ALT_BASE_URLS = [os.getenv("JUP_BASE_URL", "https://api.jup.ag")]
+
 _JUP_LAST_GOOD_BASE: Optional[str] = None
 
 
@@ -331,7 +329,6 @@ def _jup_headers() -> Dict[str, str]:
 
 
 def _bases() -> List[str]:
-    # Order: last good → primary → alternates (deduped)
     out: List[str] = []
     if _JUP_LAST_GOOD_BASE:
         out.append(_JUP_LAST_GOOD_BASE)
@@ -343,7 +340,6 @@ def _bases() -> List[str]:
     return out
 
 
-# Circuit breaker
 _JUP_FAIL_COUNT = 0
 _JUP_FAIL_LIMIT = _envi("JUP_FAIL_LIMIT", 8)
 _JUP_BREAKER_COOLDOWN = _envf("JUP_BREAKER_COOLDOWN_SEC", 30.0)
@@ -370,6 +366,7 @@ def _jup_record_failure() -> None:
     if _JUP_FAIL_COUNT >= _JUP_FAIL_LIMIT:
         _JUP_BREAKER_UNTIL = time.time() + _JUP_BREAKER_COOLDOWN
         log.event("JUP_BREAKER_TRIPPED", until=_JUP_BREAKER_UNTIL)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Telegram helpers (optional)
@@ -434,6 +431,7 @@ async def _send_safe(msg: str, *, src: str) -> None:
     except Exception:
         log.event("TG_SEND_FAIL", src=src)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Base58 & mint sanitation (STRICT)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -484,7 +482,9 @@ def _sanitize_mint(m: str) -> str:
 
 
 def normalize_pump_id_to_mint(raw: str) -> str:
-    """API compatibility: try external normalize_mint, else accept valid base58 pubkeys."""
+    """
+    API compatibility: try external normalize_mint, else accept valid base58 pubkeys.
+    """
     if _external_normalize_mint is not None:
         try:
             return _external_normalize_mint(raw)  # type: ignore
@@ -495,8 +495,9 @@ def normalize_pump_id_to_mint(raw: str) -> str:
         return raw_s
     raise ValueError(f"cannot normalize to mint: {raw}")
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# HTTP helpers (Jupiter)
+# HTTP helpers (Jupiter quotes & /tokens)
 # ──────────────────────────────────────────────────────────────────────────────
 async def _jup_gate() -> None:
     global _JUP_LAST_TS
@@ -536,7 +537,10 @@ async def _http_get(kind: str, *, params: dict, timeout: float) -> dict:
         try:
             url = _quote_url(base) if kind == "quote" else f"{base.rstrip('/')}/{kind}"
             r = requests.get(
-                url, params=params, timeout=timeout, headers=_jup_headers()
+                url,
+                params=params,
+                timeout=timeout,
+                headers=_jup_headers(),
             )
             try:
                 js = r.json()
@@ -591,6 +595,7 @@ async def _http_post_swap(
         await asyncio.sleep(0.12)
     _jup_record_failure()
     raise last_err or RuntimeError("all swap endpoints failed")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Tokens catalog + decimals
@@ -712,6 +717,7 @@ async def get_decimals(mint: str) -> Optional[int]:
     _assert_pubkey(m, "mint")
     return await _get_decimals(m)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Jupiter quote wrappers + public helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -772,6 +778,7 @@ async def _singleflight_quote(key: str, maker: Callable[[], Any]) -> dict:
         async with _quote_lock:
             _QUOTE_FLIGHT.pop(key, None)
 
+
 async def _jup_quote(
     input_mint: str,
     output_mint: str,
@@ -787,7 +794,15 @@ async def _jup_quote(
     _assert_pubkey(output_mint, "outputMint")
     sbps = int(slippage_bps if slippage_bps is not None else _slippage_bps_default())
     legacy = bool(AS_LEGACY)
-    key = _qkey(input_mint, output_mint, amount_iu, sbps, swap_mode, only_direct, legacy)
+    key = _qkey(
+        input_mint,
+        output_mint,
+        amount_iu,
+        sbps,
+        swap_mode,
+        only_direct,
+        legacy,
+    )
 
     cached = await _get_cached_quote(key)
     if cached is not None:
@@ -805,10 +820,9 @@ async def _jup_quote(
                 "slippageBps": sbps,
                 "onlyDirectRoutes": "true" if only_direct else "false",
                 "asLegacyTransaction": "true" if legacy else "false",
-                "swapMode": swap_mode,  # ignored by modern /quote but fine to include
+                "swapMode": swap_mode,
             }
 
-            # Optional debug: logs params every ~50 calls so we can see bad/no-route cases
             log.every(
                 "jup.quote.debug",
                 n=50,
@@ -827,7 +841,7 @@ async def _jup_quote(
 
     return await _singleflight_quote(key, _fetch)
 
-# Public quote helpers (no on-chain send)
+
 def _clamp_slippage_bps(v: Optional[int]) -> int:
     try:
         sv = int(v if v is not None else _slippage_bps_default())
@@ -851,7 +865,11 @@ async def _safe_decimals(mint: str, fallback: int = 6) -> int:
 
 
 async def get_sell_quote(
-    *, mint: str, amount_raw: int, slippage_bps: Optional[int] = None, only_direct: Optional[bool] = None
+    *,
+    mint: str,
+    amount_raw: int,
+    slippage_bps: Optional[int] = None,
+    only_direct: Optional[bool] = None,
 ) -> Dict[str, Any]:
     if not isinstance(amount_raw, int) or amount_raw <= 0:
         raise ValueError("amount_raw must be a positive integer")
@@ -922,8 +940,9 @@ async def get_buy_quote(
         "decimals": dec,
     }
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Price helper
+# Price helper (mint → SOL)
 # ──────────────────────────────────────────────────────────────────────────────
 def _price_probe_amounts(dec: int) -> List[int]:
     dec = max(0, min(int(dec or 0), 18))
@@ -940,7 +959,6 @@ def _price_probe_amounts(dec: int) -> List[int]:
 
 
 async def get_price_ui(mint: str) -> float:
-    # Fast path
     if mint == SOL_MINT:
         return 1.0
     raw = (mint or "").strip()
@@ -991,7 +1009,6 @@ async def get_price_ui(mint: str) -> float:
     return 0.0
 
 
-# Aliases for backwards compatibility
 price_of_ui = get_price_ui
 price_of = get_price_ui
 
@@ -999,8 +1016,9 @@ price_of = get_price_ui
 async def mint_decimals(mint: str) -> Optional[int]:
     return await get_decimals(mint)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Priority fee tuner (scaffold) + status polling (usable by impl)
+# Priority fee tuner scaffold + status polling
 # ──────────────────────────────────────────────────────────────────────────────
 def _to_sol_from_lamports_like(x: float) -> float:
     lamports = float(x)
@@ -1024,16 +1042,27 @@ def _qn_priority_seed_blocking() -> Optional[float]:
     ]
     for p in payloads:
         try:
-            r = requests.post(QN_RPC_URL, json=p, timeout=QN_HINT_TIMEOUT_S, headers=_UA)
+            r = requests.post(
+                QN_RPC_URL,
+                json=p,
+                timeout=QN_HINT_TIMEOUT_S,
+                headers=_UA,
+            )
             js = r.json()
             res = js.get("result")
             if isinstance(res, dict):
-                for k in ("median", "recentMedian", "lamports", "prioritizationFee", "perSignature"):
+                for k in (
+                    "median",
+                    "recentMedian",
+                    "lamports",
+                    "prioritizationFee",
+                    "perSignature",
+                ):
                     v = res.get(k)
                     if v is not None:
                         return _to_sol_from_lamports_like(float(v))
             elif isinstance(res, list) and res:
-                vals = []
+                vals: List[float] = []
                 for it in res:
                     if isinstance(it, dict):
                         v = (
@@ -1104,8 +1133,10 @@ class DynPriority:
                     or st.get("slot")
                     or st.get("confirmed")
                 ):
-                    dur = max(0.0, time.time() - self._pending.pop(sig, time.time()))
-                    # tuning is left to the impl; we only report here if needed
+                    dur = max(
+                        0.0,
+                        time.time() - self._pending.pop(sig, time.time()),
+                    )
                     log.every("prio.obs", n=10, msg="PRIO_OBS", sig=sig, dur=dur)
                     return
             except Exception:
@@ -1143,7 +1174,9 @@ async def shutdown() -> None:
 
 
 async def _enforce_min_sol(required_spend_lamports: int = 0) -> bool:
-    """Kept for impls that may import this guard."""
+    """
+    Guard used by impls to block trades when SOL balance would dip below reserve.
+    """
     try:
         min_sol_env = os.getenv("MIN_SOL_BALANCE", "").strip()
         min_sol = float(min_sol_env) if min_sol_env else float(MIN_SOL_BALANCE)
@@ -1175,18 +1208,13 @@ async def _enforce_min_sol(required_spend_lamports: int = 0) -> bool:
         return False
     return True
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# BUY/SELL WRAPPERS with Jupiter→Raydium fallback + Pump.fun fallback
+# BUY/SELL WRAPPERS — Jupiter via lightning_impl with Raydium fallback
 # ──────────────────────────────────────────────────────────────────────────────
-
-# Error markers that lightning_impl uses when there is no route
-_NO_ROUTE_ERRORS = {"jup_no_route", "jup_no_route_cached"}
-
-
 async def _fallback_buy_on_raydium(
     *, mint: str, amount_sol: float, slippage_bps: int
 ) -> Optional[str]:
-    """Try Raydium path if available; tolerate absence gracefully."""
     if raydium is None:
         return None
     try:
@@ -1210,7 +1238,11 @@ async def _fallback_buy_on_raydium(
 
 
 async def _fallback_sell_on_raydium(
-    *, mint: str, token_program: Optional[str], amount_raw: int, slippage_bps: int
+    *,
+    mint: str,
+    token_program: Optional[str],
+    amount_raw: int,
+    slippage_bps: int,
 ) -> Optional[str]:
     if raydium is None:
         return None
@@ -1237,28 +1269,65 @@ async def _fallback_sell_on_raydium(
 
 
 async def buy_via_lightning(
-    *, mint: str, amount_sol: float, slippage_bps: int | None = None
-) -> Optional[str]:
+    *,
+    mint: str,
+    amount_sol: float,
+    slippage_bps: Optional[int] = None,
+    return_meta: bool = False,
+) -> Union[Optional[str], Tuple[Optional[str], Dict[str, Any]]]:
     """
-    Primary BUY path for generic pools (raydium/lightning):
-    try Jupiter via lightning_impl, then fallback to Raydium on no-route.
+    Primary BUY path for generic pools (Raydium/Jupiter via lightning_impl):
+
+    - Try Jupiter v6 via lightning_impl first.
+    - If no signature and not DRYRUN, fall back to Raydium if available.
+
+    If return_meta=False (default): returns Optional[str] (tx sig).
+    If return_meta=True: returns (Optional[str], meta_dict) where meta_dict includes:
+        - amount_raw: token out amount from Jupiter quote
+        - in_amount_raw: lamports in
+        - priceImpactPct, decimals, etc. (as provided by lightning_impl/router)
     """
-    if slippage_bps is None:
-        slippage_bps = _clamp_slippage_bps(None)
+    sbps = _clamp_slippage_bps(slippage_bps)
+    meta: Dict[str, Any] = {}
+
+    # Jupiter path via lightning_impl
     try:
-        sig = await _buy_lightning(
-            mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps
-        )
-        if sig:
-            return sig
-        return None
-    except RuntimeError as e:
-        if str(e) in _NO_ROUTE_ERRORS:
-            log.info({"event": "ROUTER_FALLBACK_RAYDIUM", "mint": mint})
-            return await _fallback_buy_on_raydium(
-                mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps
+        if return_meta:
+            sig, meta = await _buy_lightning(
+                mint=mint,
+                amount_sol=amount_sol,
+                slippage_bps=sbps,
+                return_meta=True,
             )
-        raise
+        else:
+            sig = await _buy_lightning(
+                mint=mint,
+                amount_sol=amount_sol,
+                slippage_bps=sbps,
+            )
+        # DRYRUN path → lightning_impl returns None but we don't want to hit Raydium
+        if sig or DRY_RUN:
+            return (sig, meta) if return_meta else sig
+    except Exception as e:
+        # Any unexpected error from lightning_impl: log, then try Raydium
+        log.event(
+            "ROUTER_LIGHTNING_BUY_ERROR",
+            mint=mint,
+            err=str(e)[:200],
+            amount_sol=float(amount_sol),
+        )
+
+    # Raydium fallback (only if not dryrun and Raydium is wired)
+    if not DRY_RUN:
+        sig2 = await _fallback_buy_on_raydium(
+            mint=mint,
+            amount_sol=amount_sol,
+            slippage_bps=sbps,
+        )
+        return (sig2, meta) if return_meta else sig2
+
+    # If we got here, no sig and no fallback
+    return (None, meta) if return_meta else None
 
 
 async def sell_via_lightning(
@@ -1266,47 +1335,52 @@ async def sell_via_lightning(
     mint: str,
     token_program: Optional[str],
     amount_raw: int,
-    slippage_bps: int | None = None,
+    slippage_bps: Optional[int] = None,
 ) -> Optional[str]:
     """
-    Primary SELL path: try Jupiter via lightning_impl, fallback to Raydium on no-route.
+    Primary SELL path:
+    - Try Jupiter via lightning_impl first
+    - If no signature and not DRYRUN, fall back to Raydium
     """
-    if slippage_bps is None:
-        slippage_bps = _clamp_slippage_bps(None)
+    sbps = _clamp_slippage_bps(slippage_bps)
+
     try:
         sig = await _sell_lightning(
             mint=mint,
             token_program=token_program,
             amount_raw=amount_raw,
-            slippage_bps=slippage_bps,
+            slippage_bps=sbps,
         )
-        if sig:
+        if sig or DRY_RUN:
             return sig
-        return None
-    except RuntimeError as e:
-        if str(e) in _NO_ROUTE_ERRORS:
-            log.info({"event": "ROUTER_FALLBACK_RAYDIUM_SELL", "mint": mint})
-            return await _fallback_sell_on_raydium(
-                mint=mint,
-                token_program=token_program,
-                amount_raw=amount_raw,
-                slippage_bps=slippage_bps,
-            )
-        raise
+    except Exception as e:
+        log.event(
+            "ROUTER_LIGHTNING_SELL_ERROR",
+            mint=mint,
+            err=str(e)[:200],
+            amount_raw=int(amount_raw),
+        )
+
+    if not DRY_RUN:
+        return await _fallback_sell_on_raydium(
+            mint=mint,
+            token_program=token_program,
+            amount_raw=amount_raw,
+            slippage_bps=sbps,
+        )
+    return None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pump.fun direct-buy fallback wrapper
 # ──────────────────────────────────────────────────────────────────────────────
-LAMPORTS_PER_SOL_F = float(LAMPORTS_PER_SOL)
-
-
 async def _pump_direct_buy_lamports(
     *, mint: str, in_amount_lamports: int, slippage_bps: int
 ) -> dict:
     """
     Thin adapter around utils_pkg.pump_trader.
 
-    Expects pump_trader to expose either:
+    Expected pump_trader functions:
       - buy_direct_lamports(mint=..., in_amount_lamports=..., slippage_bps=...)
         OR
       - buy_pump_token(mint=..., sol_amount=..., slippage_bps=...)
@@ -1328,7 +1402,6 @@ async def _pump_direct_buy_lamports(
                 slippage_bps=slippage_bps,
             )
 
-        # Fallback: derive SOL amount and call a sol-amount-based helper
         sol_amount = in_amount_lamports / LAMPORTS_PER_SOL_F
         if hasattr(pump_trader, "buy_pump_token") and callable(
             getattr(pump_trader, "buy_pump_token")
@@ -1360,72 +1433,27 @@ async def pump_buy_with_fallback(
     *,
     mint: str,
     amount_sol: float,
-    slippage_bps: int | None = None,
+    slippage_bps: Optional[int] = None,
     label: str = "pump-buy",
 ) -> Optional[str]:
     """
     Pump-specific BUY path:
 
-    1) Try lightning_impl (Jupiter) first.
-    2) If Jupiter has no route (404/400 or 'No routes' msg), fall back to direct Pump.fun buy.
+    1) Try Jupiter v6 via lightning_impl (Pump-routed routes if available).
+    2) If no signature and not DRYRUN, fall back to direct Pump.fun bonding curve buy.
     """
-    if slippage_bps is None:
-        slippage_bps = _clamp_slippage_bps(None)
+    sbps = _clamp_slippage_bps(slippage_bps)
 
-    # 1) Try Jupiter via lightning_impl
+    # Step 1: Jupiter via lightning_impl
     try:
         sig = await _buy_lightning(
-            mint=mint, amount_sol=amount_sol, slippage_bps=slippage_bps
+            mint=mint,
+            amount_sol=amount_sol,
+            slippage_bps=sbps,
         )
-        if sig:
+        if sig or DRY_RUN:
             return sig
-        return None
-
-    except HTTPStatusError as e:
-        # Explicitly handle HTTP 400/404 / no-route cases
-        status = e.response.status_code
-        text = ""
-        try:
-            text = e.response.text
-        except Exception:
-            pass
-
-        if status not in (400, 404) and "No routes" not in text and "no routes" not in text:
-            # Unexpected HTTP error -> bubble up
-            raise
-
-        log.info(
-            {
-                "event": "PUMP_FALLBACK_JUP_NO_ROUTE",
-                "mint": mint,
-                "status": status,
-                "snippet": text[:160],
-                "label": label,
-            }
-        )
-
-    except RuntimeError as e:
-        # Preserve existing special no-route markers if lightning_impl uses them
-        if str(e) in _NO_ROUTE_ERRORS:
-            log.info(
-                {
-                    "event": "PUMP_FALLBACK_JUP_MARKER",
-                    "mint": mint,
-                    "label": label,
-                }
-            )
-        else:
-            log.warning(
-                {
-                    "event": "PUMP_FALLBACK_JUP_RUNTIME",
-                    "mint": mint,
-                    "err": str(e),
-                    "label": label,
-                }
-            )
-
     except Exception as e:
-        # Generic failure -> we still *attempt* Pump.fun, but log loudly
         log.warning(
             {
                 "event": "PUMP_FALLBACK_JUP_ERROR",
@@ -1435,7 +1463,11 @@ async def pump_buy_with_fallback(
             }
         )
 
-    # 2) Fallback: direct Pump.fun bonding curve buy
+    # If DRYRUN, do NOT fall back to Pump.fun (would be real trade)
+    if DRY_RUN:
+        return None
+
+    # Step 2: Direct Pump.fun bonding curve buy
     in_amount_lamports = int(round(float(amount_sol) * LAMPORTS_PER_SOL_F))
     if in_amount_lamports <= 0:
         return None
@@ -1443,7 +1475,7 @@ async def pump_buy_with_fallback(
     pump_res = await _pump_direct_buy_lamports(
         mint=mint,
         in_amount_lamports=in_amount_lamports,
-        slippage_bps=slippage_bps,
+        slippage_bps=sbps,
     )
 
     if pump_res.get("ok"):
@@ -1466,6 +1498,7 @@ async def pump_buy_with_fallback(
     )
     return None
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Token metadata helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1482,8 +1515,9 @@ def get_token_symbol(mint: str) -> Optional[str]:
     s = (meta or {}).get("symbol")
     return str(s).strip() if s else None
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Registry wiring — register AFTER wrappers are defined so we point to them
+# Registry wiring — register AFTER wrappers are defined
 # ──────────────────────────────────────────────────────────────────────────────
 def _register_lightning() -> None:
     # pump uses dedicated Pump.fun fallback wrapper
@@ -1496,7 +1530,7 @@ def _register_lightning() -> None:
         BUY_IMPLS["raydium"] = buy_via_lightning
         SELL_IMPLS["raydium"] = sell_via_lightning
 
-    # Also provide a generic "lightning" key for direct calls, if any.
+    # Also provide a generic "lightning" key for direct calls
     BUY_IMPLS.setdefault("lightning", buy_via_lightning)
     SELL_IMPLS.setdefault("lightning", sell_via_lightning)
 
@@ -1504,7 +1538,6 @@ def _register_lightning() -> None:
 if BUY_IMPL == "lightning":
     _register_lightning()
 
-# Helpful startup log (confirms registration happened)
 try:
     log.info(
         {
@@ -1516,8 +1549,9 @@ try:
 except Exception:
     pass
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Exports
+# Public exports
 # ──────────────────────────────────────────────────────────────────────────────
 __all__ = [
     # lifecycle

@@ -11,7 +11,7 @@ from utils_pkg.lightning_impl import sell_via_lightning
 
 log = logging.getLogger("sniper.exit_worker")
 
-# Type alias for readability
+# Type alias for clarity
 ExitRequest = Dict[str, Any]
 
 # ============================================================================
@@ -44,14 +44,14 @@ def _env_float(key: str, default: float) -> float:
 # Global config
 # ============================================================================
 
-# Legacy aliases – any of these turn dryrun on
+# Any of these will put the exit worker into dryrun mode
 DRYRUN: bool = (
     _env_bool("DRYRUN", False)
     or _env_bool("DRY_RUN", False)
     or _env_bool("IS_DRYRUN", False)
 )
 
-# Master flag for the overall exit engine (logic side)
+# Master flag – if this is off, all front-end hooks are no-ops
 EXIT_ENGINE_ENABLED: bool = _env_bool("EXIT_ENGINE_ENABLED", True)
 
 # Background worker that actually sends sells
@@ -59,39 +59,42 @@ EXIT_WORKER_ENABLED: bool = _env_bool("EXIT_WORKER_ENABLED", True)
 EXIT_WORKER_POLL_SEC: float = _env_float("EXIT_WORKER_POLL_SEC", 3.0)
 EXIT_WORKER_BATCH: int = _env_int("EXIT_WORKER_BATCH", 5)
 
-# Slippage settings
+# Slippage configuration
 PF_SLIPPAGE_BPS: int = _env_int("PF_SLIPPAGE_BPS", 200)
 EXIT_WORKER_SLIPPAGE_BPS: int = _env_int(
-    "EXIT_WORKER_SLIPPAGE_BPS", PF_SLIPPAGE_BPS
+    "EXIT_WORKER_SLIPPAGE_BPS",
+    PF_SLIPPAGE_BPS,
 )
 
-# How much of the position to dump, 1.0 = 100%
-EXIT_WORKER_SELL_PCT: float = float(os.getenv("EXIT_WORKER_SELL_PCT", "1.0"))
+# How much of the position to dump; 1.0 = 100%
+try:
+    EXIT_WORKER_SELL_PCT: float = float(os.getenv("EXIT_WORKER_SELL_PCT", "1.0"))
+except Exception:
+    EXIT_WORKER_SELL_PCT = 1.0
+EXIT_WORKER_SELL_PCT = max(0.01, min(1.0, EXIT_WORKER_SELL_PCT))
 
-# Whether requests coming from on_buy_filled() should be executed immediately.
-# Safe default is False – other modules (risk manager) can enqueue their own
-# "sell now" requests or transform these placeholders.
+# Whether on_buy_filled() should try to execute immediately
 EXIT_ON_BUY_FILLED: bool = _env_bool("EXIT_ON_BUY_FILLED", False)
 
-# TTL for exit_request keys in Redis (seconds)
+# TTL for exit_request:* keys in Redis (seconds)
 EXIT_REQUEST_TTL_SEC: int = _env_int("EXIT_REQUEST_TTL_SEC", 600)
 
-# Optional dust guard – if >0, we skip sells that are smaller than this.
+# Optional dust guard – if >0, skip exits smaller than this raw amount
 EXIT_WORKER_MIN_RAW: int = _env_int("EXIT_WORKER_MIN_RAW", 0)
 
-# Only used for logging / sanity checks
+# Only used for sanity logs when comparing to SOL
 LAMPORTS_PER_SOL = 1_000_000_000
 
 
 # ============================================================================
-# Redis helpers
+# Redis helpers (exit_request storage)
 # ============================================================================
 
 
 async def _scan_exit_requests(limit: int) -> List[str]:
     """
-    SCAN Redis for exit_request:* keys, up to `limit`.
-    Returns a list of key names as str.
+    Scan Redis for exit_request:* keys, up to `limit`.
+    Returns a list of key names.
     """
     if redis is None:
         return []
@@ -132,6 +135,7 @@ async def _load_exit_request(key: str) -> Optional[ExitRequest]:
         raw = await redis.get(key)
         if raw is None:
             return None
+
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8", "ignore")
 
@@ -142,8 +146,8 @@ async def _load_exit_request(key: str) -> Optional[ExitRequest]:
         mint = str(data.get("mint", "")).strip()
         if not mint:
             return None
-
         data["mint"] = mint
+
         return data
     except Exception as e:  # noqa: BLE001
         log.debug("EXIT_WORKER_LOAD_ERROR key=%s err=%s", key, e, exc_info=True)
@@ -156,6 +160,7 @@ async def _delete_exit_request(key: str) -> None:
     """
     if redis is None:
         return
+
     try:
         await redis.delete(key)
     except Exception:  # noqa: BLE001
@@ -167,8 +172,9 @@ async def _store_exit_request(payload: ExitRequest) -> Optional[str]:
     Persist an exit_request to Redis, returning the key.
 
     Key format: exit_request:{mint}
-    We use per-mint keys for idempotency: multiple modules that try
-    to enqueue for the same mint will just clobber the previous request.
+
+    We deliberately key by mint so that multiple modules that race to enqueue
+    exits for the same mint simply overwrite each other (idempotent semantics).
     """
     if redis is None:
         log.debug("EXIT_ENGINE_NO_REDIS_FOR_STORE")
@@ -198,9 +204,15 @@ async def _store_exit_request(payload: ExitRequest) -> Optional[str]:
 
 def _derive_raw_from_ui(req: ExitRequest) -> Optional[int]:
     """
-    Try to derive raw token amount from ui amount + decimals.
+    Try to derive a raw token amount from ui amount + decimals.
 
-    Supports a bunch of common key shapes used across the codebase.
+    Recognised keys:
+
+      UI amount keys:
+        position_ui / amount_ui / size_ui / size / qty_ui / qty
+
+      Decimal keys:
+        dec / decimals / token_decimals
     """
     ui_keys = (
         "position_ui",
@@ -249,7 +261,7 @@ def _derive_raw_from_ui(req: ExitRequest) -> Optional[int]:
         return None
 
     try:
-        scale = 10**int(dec)
+        scale = 10 ** int(dec)
         raw = int(ui * scale)
         if raw > 0:
             return raw
@@ -266,11 +278,11 @@ def _extract_amount_raw_from_req(req: ExitRequest) -> Optional[int]:
     Preferred field:
         "position_raw": int
 
-    We also handle alternative shapes and derive from ui+decimals
-    when possible.
+    Fallbacks:
+        amount_raw / size_raw / raw_amount_out / raw_out / token_amount_raw
+        or derived from ui+decimals.
 
-    Returns:
-        amount_raw: int or None if we can't determine.
+    Applies EXIT_WORKER_SELL_PCT and EXIT_WORKER_MIN_RAW guards.
     """
     raw_keys = (
         "position_raw",
@@ -297,8 +309,12 @@ def _extract_amount_raw_from_req(req: ExitRequest) -> Optional[int]:
     if amt is None or amt <= 0:
         return None
 
-    sell_pct = float(req.get("sell_pct", EXIT_WORKER_SELL_PCT))
+    try:
+        sell_pct = float(req.get("sell_pct", EXIT_WORKER_SELL_PCT))
+    except Exception:
+        sell_pct = EXIT_WORKER_SELL_PCT
     sell_pct = max(0.01, min(1.0, sell_pct))
+
     amt_final = int(int(amt) * sell_pct)
 
     if EXIT_WORKER_MIN_RAW > 0 and amt_final < EXIT_WORKER_MIN_RAW:
@@ -308,7 +324,7 @@ def _extract_amount_raw_from_req(req: ExitRequest) -> Optional[int]:
 
 
 # ============================================================================
-# Exit engine – logic side (front-end API)
+# Exit engine – logic front-end
 # ============================================================================
 
 
@@ -316,32 +332,29 @@ class _ExitEngine:
     """
     Exit engine (front-end):
 
-    - on_trade_tick: placeholder for future follow-through logic.
-    - on_buy_filled: tolerant API used by Strategy to enqueue exit requests.
-    - enqueue_exit_request: generic way for risk manager / manual controls
-      to schedule exits.
+    - on_trade_tick: placeholder for follow-through / stats (currently no-op).
+    - on_buy_filled: tolerant API used by Strategy to enqueue exits.
+    - enqueue_exit_request: generic API for risk manager / manual exits.
 
-    If we truly cannot infer size in on_buy_filled, we log
-    EXIT_ENGINE_SKIP_NO_SIZE – *this is what you saw in logs*.
-    After we patch main.py to always pass `amount_raw`, this should
-    basically never happen again.
+    Calls store exit_request payloads in Redis. The background worker
+    (exit_worker_loop) performs the actual sells by calling sell_via_lightning.
     """
 
     def __init__(self) -> None:
         self.enabled = EXIT_ENGINE_ENABLED
 
     # ------------------------------------------------------------------ #
-    # Hooks used by scanners / strategy
+    # Hooks called by Strategy / scanners
     # ------------------------------------------------------------------ #
 
     async def on_trade_tick(self, raw_event: Dict[str, Any]) -> None:
         """
-        Called on every trade tick (for future momentum/follow-through usage).
-        Currently a no-op, but wired so we can extend later without changing
-        callers.
+        Called on every trade tick (for future use).
+        Currently a no-op so we don't disturb callers.
         """
         if not self.enabled:
             return
+        # hook point for future logic
         return
 
     async def on_buy_filled(
@@ -352,20 +365,19 @@ class _ExitEngine:
         amount_raw: Optional[int] = None,
     ) -> None:
         """
-        Called when a BUY is filled.
+        Called by Strategy AFTER a BUY is confirmed on-chain.
 
-        Tolerant signature:
+        Typical usage:
 
             await exit_engine.on_buy_filled(ev)
             await exit_engine.on_buy_filled(ev, tx_sig)
             await exit_engine.on_buy_filled(ev, tx_sig, amount_raw=..)
 
-        We pull what we can from `ev`, construct an exit_request payload,
-        and store it in Redis. The background worker performs the actual sell.
+        We construct an exit_request payload and put it into Redis.
+        A separate worker loop later executes the sell.
 
-        If we *cannot* infer a size, we log EXIT_ENGINE_SKIP_NO_SIZE and
-        return. The fix for that is to make sure main.py calls this with
-        a real amount_raw / ui+dec – which we’ll handle in the next step.
+        If we *cannot* infer a position size, we log EXIT_ENGINE_SKIP_NO_SIZE
+        and return – this is exactly the log you saw earlier.
         """
         if not self.enabled:
             return
@@ -399,11 +411,12 @@ class _ExitEngine:
                 or ev.get("sig")
                 or ev.get("tx")
             )
-            if tx_sig:
-                tx_sig = str(tx_sig)
+        if tx_sig:
+            tx_sig = str(tx_sig)
 
         # --- Position size ----------------------------------------------
         if amount_raw is None:
+            # Try common raw keys directly on the event
             for k in (
                 "position_raw",
                 "amount_raw",
@@ -411,6 +424,7 @@ class _ExitEngine:
                 "raw_amount_out",
                 "raw_out",
                 "size_raw",
+                "token_amount_raw",
             ):
                 v = ev.get(k)
                 if isinstance(v, (int, float)) and v > 0:
@@ -418,11 +432,13 @@ class _ExitEngine:
                     break
 
         if amount_raw is None or amount_raw <= 0:
+            # Try to infer from ui + decimals on the event itself
             derived = _derive_raw_from_ui(ev)
             if derived is not None and derived > 0:
                 amount_raw = derived
 
         if amount_raw is None or amount_raw <= 0:
+            # Still nothing – we cannot safely create an exit
             log.info(
                 "EXIT_ENGINE_SKIP_NO_SIZE",
                 extra={
@@ -443,7 +459,10 @@ class _ExitEngine:
 
         # --- General metadata -------------------------------------------
         reason = str(ev.get("reason", "on_buy_filled"))
-        sell_pct = float(ev.get("sell_pct", EXIT_WORKER_SELL_PCT))
+        try:
+            sell_pct = float(ev.get("sell_pct", EXIT_WORKER_SELL_PCT))
+        except Exception:
+            sell_pct = EXIT_WORKER_SELL_PCT
         sell_pct = max(0.01, min(1.0, sell_pct))
 
         follow_stats = ev.get("follow_stats")
@@ -462,7 +481,6 @@ class _ExitEngine:
         if tx_sig:
             payload["tx_sig"] = tx_sig
 
-        # Enqueue to worker
         key = await _store_exit_request(payload)
         if key:
             log.info(
@@ -477,7 +495,7 @@ class _ExitEngine:
                 },
             )
 
-        # Optional: immediate execution
+        # Optional: immediate execution (still goes through _execute_exit)
         if EXIT_ON_BUY_FILLED:
             log.info(
                 "EXIT_ENGINE_IMMEDIATE_ON_BUY_FILLED",
@@ -507,10 +525,9 @@ class _ExitEngine:
         """
         Generic way to schedule an exit for a position.
 
-        Intended for the risk manager, stop-loss logic, or manual
-        "panic sell" triggers.
-
-        Returns the Redis key used, or None on failure.
+        Intended for:
+          - risk manager / TSL / SL logic
+          - "panic sell" or manual controls
         """
         if not self.enabled:
             return None
@@ -563,7 +580,7 @@ class _ExitEngine:
         return key
 
 
-# Global instance used by scripts/main.py and others
+# Global instance used everywhere else
 exit_engine = _ExitEngine()
 
 
@@ -641,7 +658,7 @@ async def _execute_exit(req: ExitRequest) -> None:
 
 async def _process_once() -> None:
     """
-    Single tick: scan for exit requests and process up to EXIT_WORKER_BATCH.
+    Single tick: scan for exit_request:* keys and process up to EXIT_WORKER_BATCH.
     """
     if not EXIT_WORKER_ENABLED:
         return
@@ -675,8 +692,7 @@ async def _process_once() -> None:
 
         await _execute_exit(req)
 
-        # Remove the request regardless of success; if the sell failed,
-        # follow-up logic (like a re-queue) should recreate a new request.
+        # Always delete; re-queues should create a new request
         await _delete_exit_request(key)
 
 
@@ -711,11 +727,9 @@ async def exit_worker_loop(stop_evt: asyncio.Event) -> None:
         except Exception:  # noqa: BLE001
             log.exception("EXIT_WORKER_TICK_ERROR")
 
-        # wait with timeout so we can exit quickly when stop_evt is set
+        # Wait with timeout so the loop can exit promptly when stop_evt is set
         try:
-            await asyncio.wait_for(
-                stop_evt.wait(), timeout=EXIT_WORKER_POLL_SEC
-            )
+            await asyncio.wait_for(stop_evt.wait(), timeout=EXIT_WORKER_POLL_SEC)
         except asyncio.TimeoutError:
-            # normal: timeout means go to next tick
+            # normal tick – go again
             continue
