@@ -1224,12 +1224,50 @@ def _am() -> AlertManager:
     return _AM_SINGLETON
 
 
+def _normalize_spend_sol(d: Dict[str, Any]) -> float:
+    """
+    Ensure we always have a numeric 'spend_sol' field on buy payloads/events.
+
+    Priority:
+      1) existing d["spend_sol"]
+      2) d["amount_sol"] (common param name)
+      3) d["size_sol"] / d["size"] if present
+      4) 0.0 (last resort – but we really expect one of the above)
+
+    The normalized value is also written back into d["spend_sol"] so any
+    downstream consumers (exit engine, PnL, alerts) see the same value.
+    """
+    cand = d.get("spend_sol", None)
+
+    if cand in (None, "", 0, 0.0):
+        # common alternative keys the strategy/router may have set
+        for k in ("amount_sol", "size_sol", "size"):
+            v = d.get(k, None)
+            if v not in (None, ""):
+                cand = v
+                break
+
+    try:
+        spend = float(cand) if cand not in (None, "") else 0.0
+    except Exception:
+        spend = 0.0
+
+    if spend < 0:
+        spend = 0.0
+
+    d["spend_sol"] = spend
+    return spend
+
+
 async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
     """
     Called when a BUY has been submitted to the router.
 
-    payload: {mint, pool, symbol, spend_sol, route, hint}
+    payload: {mint, pool, symbol, spend_sol?, amount_sol?, route, hint}
     """
+    # normalize size so everything downstream (logs, alerts, exit) sees a number
+    spend_sol = _normalize_spend_sol(payload)
+
     # metrics
     try:
         bump("buys_submitted")
@@ -1244,7 +1282,7 @@ async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
             symbol=payload.get("symbol"),
             pool=payload.get("pool"),
             route=payload.get("route"),
-            spend_sol=payload.get("spend_sol"),
+            spend_sol=spend_sol,
             hint=payload.get("hint"),
         )
     except Exception:
@@ -1256,7 +1294,7 @@ async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
             txt = (
                 f"🟡 Submitted BUY {payload.get('symbol') or ''}\n"
                 f"mint={payload.get('mint')}  route={payload.get('route') or 'auto'}  "
-                f"size={payload.get('spend_sol') or '—'} SOL"
+                f"size={spend_sol or '—'} SOL"
             )
             create_task(_am().notify_text(txt))
         except Exception as _e:
@@ -1323,7 +1361,7 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
     """
     Called when the router reports a BUY fill.
 
-    ev: { mint, signature, symbol, spend_sol, pool, amount_raw? }
+    ev: { mint, signature, symbol, spend_sol?, amount_sol?, pool, amount_raw? }
 
     Responsibilities:
       - bump metrics
@@ -1335,10 +1373,16 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
       Exit / auto-sell logic is handled *after RPC confirmation* inside
       Strategy (_gate_candidate / direct-buy path), which calls
       exit_engine.on_buy_filled(ev, ...) exactly once per real fill.
+
+      Because 'ev' is a dict passed by reference, normalizing ev["spend_sol"]
+      here ensures the exit engine sees the same non-zero size.
     """
     # No-op in DRYRUN / package-dryrun environments
     if _dryrun_env_on() or _pkg_is_dryrun:
         return
+
+    # normalize size
+    spend_sol = _normalize_spend_sol(ev)
 
     # metrics
     try:
@@ -1353,7 +1397,7 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
             mint=ev.get("mint"),
             symbol=ev.get("symbol"),
             pool=ev.get("pool"),
-            spend_sol=ev.get("spend_sol"),
+            spend_sol=spend_sol,
             sig=ev.get("signature"),
         )
     except Exception:
@@ -1369,7 +1413,7 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
                     symbol=ev.get("symbol"),
                     pool=ev.get("pool"),
                     sig=ev.get("signature"),
-                    spend_sol=ev.get("spend_sol"),
+                    spend_sol=spend_sol,
                     out_amount=ev.get("amount_raw"),  # if present
                 )
             )
@@ -1387,8 +1431,11 @@ async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
     """
     Called when a BUY fails in the router.
 
-    payload: {mint, pool, symbol, spend_sol, route, hint, reason, error}
+    payload: {mint, pool, symbol, spend_sol?, amount_sol?, route, hint, reason, error}
     """
+    # normalize size for analytics
+    spend_sol = _normalize_spend_sol(payload)
+
     # structured log
     try:
         log.event(
@@ -1397,7 +1444,7 @@ async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
             symbol=payload.get("symbol"),
             pool=payload.get("pool"),
             route=payload.get("route"),
-            spend_sol=payload.get("spend_sol"),
+            spend_sol=spend_sol,
             reason=payload.get("reason"),
             error=payload.get("error"),
         )
@@ -1410,6 +1457,7 @@ async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
             txt = (
                 f"🔴 BUY FAILED {payload.get('symbol') or ''}\n"
                 f"mint={payload.get('mint')}  route={payload.get('route') or 'auto'}\n"
+                f"size={spend_sol or '—'} SOL\n"
                 f"reason={payload.get('reason') or '—'}  err={payload.get('error') or '—'}"
             )
             create_task(_am().notify_text(txt))
