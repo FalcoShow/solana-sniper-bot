@@ -11,6 +11,7 @@ import sys
 import traceback
 from asyncio import create_task
 from typing import Any, Dict, Optional, Tuple
+7
 
 try:
     import aiohttp  # type: ignore
@@ -327,6 +328,8 @@ def _safe_log_router_state(event: str, **fields: Any) -> None:
 def _candidate_buy_names() -> list[str]:
     # Preferred stable names first, then common variants.
     return [
+        "buy_via_lightning",     # primary Jupiter v6 path (supports return_meta)
+        "pump_buy_with_fallback",
         "maybe_buy",
         "buy",
         "route_and_buy",
@@ -334,7 +337,6 @@ def _candidate_buy_names() -> list[str]:
         "buy_token",
         "execute_buy",
         "exec_buy",
-        "buy_via_lightning",
         "_buy_lightning",
         "buy_lightning",
         "buy_direct",
@@ -414,13 +416,13 @@ def _build_kwargs_for_router(
     fn: Any,
     mint: str,
     ui: Dict[str, Any],
-    on_buy_submitted,
-    on_buy_filled,
-    on_buy_failed,
 ) -> Dict[str, Any]:
     """
     Introspect the router buy function and pass only parameters it expects.
     This keeps us forwards-compatible across refactors of utils_pkg.router.
+
+    IMPORTANT: if the underlying buy supports `return_meta`, we set it True
+    so we can harvest exact entry size/price data.
     """
     kwargs: Dict[str, Any] = {}
     try:
@@ -448,12 +450,9 @@ def _build_kwargs_for_router(
                 in {"1", "true", "yes", "on"}
             )
 
-        if "on_buy_submitted" in names:
-            kwargs["on_buy_submitted"] = on_buy_submitted
-        if "on_buy_filled" in names:
-            kwargs["on_buy_filled"] = on_buy_filled
-        if "on_buy_failed" in names:
-            kwargs["on_buy_failed"] = on_buy_failed
+        # If the impl supports meta, request it so we can log into Notion/DB.
+        if "return_meta" in names:
+            kwargs["return_meta"] = True
     except Exception:
         # If introspection fails, fall back to the safest minimal call
         kwargs = {"mint": mint, "ui": ui}
@@ -465,19 +464,19 @@ async def _call_with_variants(
     *,
     mint: str,
     ui: Dict[str, Any],
-    on_buy_submitted,
-    on_buy_filled,
-    on_buy_failed,
 ):
     """
     Call the router buy function with best-effort kwargs, falling back through
     multiple signatures until one succeeds.
+
+    Return value is passed through untouched so maybe_buy() can interpret:
+      - str                        → tx signature
+      - dict                       → {signature, ...}
+      - (sig, entry_meta) tuple    → sig + entry meta from lightning_impl
     """
-    # Variant 1: full introspected kwargs
+    # Variant 1: full introspected kwargs (including return_meta if supported)
     try:
-        kw_sig = _build_kwargs_for_router(
-            fn, mint, ui, on_buy_submitted, on_buy_filled, on_buy_failed
-        )
+        kw_sig = _build_kwargs_for_router(fn, mint, ui)
         res = fn(**kw_sig)
         if inspect.isawaitable(res):
             res = await res
@@ -546,13 +545,12 @@ async def maybe_buy(
     """
     Unified buy entrypoint for the rest of the script.
 
-    Picks the best buy-capable function from utils_pkg.router and calls it
-    with hooks for:
-      - on_buy_submitted
-      - on_buy_filled
-      - on_buy_failed
-
-    Returns a tx signature string if one can be extracted, otherwise None.
+    - Picks the best buy-capable function from utils_pkg.router.
+    - If the underlying buy supports `return_meta`, we harvest (sig, entry_meta)
+      and log entry metadata (size, in/out amounts, priceImpact) using
+      log_entry_from_meta so Notion/DB stay in sync.
+    - Still returns a plain tx signature string (or None), so Strategy and
+      other callers remain fully compatible.
     """
     if router is None:
         _safe_log_router_state("ROUTER_UNAVAILABLE_FOR_BUY")
@@ -577,23 +575,68 @@ async def maybe_buy(
         file=getattr(router, "__file__", "<router?>"),
     )
 
+    # Call router, possibly getting back (sig, entry_meta)
     res = await _call_with_variants(
         fn,
         mint=mint,
         ui=ui,
-        on_buy_submitted=on_buy_submitted,
-        on_buy_filled=on_buy_filled,
-        on_buy_failed=on_buy_failed,
     )
 
-    if isinstance(res, str):
-        return res
-    if isinstance(res, dict):
+    sig: Optional[str] = None
+    entry_meta: Dict[str, Any] = {}
+
+    # Case 1: new-style (sig, entry_meta) from lightning_impl via return_meta=True
+    if isinstance(res, tuple) and len(res) == 2:
+        maybe_sig, maybe_meta = res
+        if isinstance(maybe_sig, str) and maybe_sig:
+            sig = maybe_sig
+        if isinstance(maybe_meta, dict):
+            entry_meta = maybe_meta or {}
+
+    # Case 2: raw string signature
+    elif isinstance(res, str):
+        sig = res
+
+    # Case 3: dict with a signature key
+    elif isinstance(res, dict):
         for k in ("signature", "sig", "tx_sig", "tx", "id"):
             v = res.get(k)
             if isinstance(v, str) and v:
-                return v
-    return None
+                sig = v
+                break
+
+    # If we have entry meta, log it for downstream analytics + Notion/DB.
+    if entry_meta:
+        try:
+            # fire-and-forget structured log for debugging
+            log.event(
+                "ENTRY_META",
+                mint=mint,
+                amount_raw=int(entry_meta.get("amount_raw") or 0),
+                in_amount_raw=int(entry_meta.get("in_amount_raw") or 0),
+                priceImpactPct=entry_meta.get("priceImpactPct"),
+                pool=ui.get("pool") or "unknown",
+                symbol=ui.get("symbol") or ui.get("name") or "?",
+            )
+        except Exception:
+            # meta logging must never break trading
+            pass
+
+        # Persist to PG + Notion (best-effort, never breaks flow)
+        try:
+            await log_entry_from_meta(
+                mint=mint,
+                entry_meta=entry_meta,
+                ui=ui,
+                sig=sig,
+            )
+        except Exception:
+            # DB/Notion failures are non-fatal
+            log.event("ENTRY_META_LOG_FAIL", mint=mint)
+
+    # NOTE: we do NOT call on_buy_* hooks here.
+    # Strategy handles hooks after confirmation as the single source of truth.
+    return sig
 
 # ---------- /ROUTER BUY WRAPPER ----------
 
@@ -689,7 +732,6 @@ async def _confirm_sig(sig: str) -> Tuple[bool, Optional[str]]:
         await asyncio.sleep(0.35)
 
     return False, "timeout"
-
 
 # ---------------------------
 # ENV helpers
@@ -1492,8 +1534,8 @@ class Strategy:
         )
         self._gate_sema = asyncio.Semaphore(max(1, gate_max))
 
-        # Per-mint state while we observe trades/prices in the window
-        # keyed by *raw mint* so on_trade() can update counts
+        # Per-mint momentum state while we observe trades/prices in the window
+        # keyed by *raw mint* so on_trade() can update counts safely
         self._gate_state: Dict[str, Dict[str, Any]] = {}
 
         # Momentum config (mirrors env/constants)
@@ -1524,8 +1566,8 @@ class Strategy:
         """
         Safely get/create gate state for a raw mint.
 
-        This is critical to avoid KeyError races when gate-state is cleared
-        or was never initialised for some reason (e.g. dedupe / early return).
+        This avoids KeyError races when gate-state is cleared or was never
+        initialised (e.g. dedupe / early return).
         """
         st = self._gate_state.get(mint_raw)
         if st is None:
@@ -1885,10 +1927,10 @@ class Strategy:
                         pass
                     return
 
-            # ---- Execute buy via router / maybe_buy ---------------------
+            # ---- Execute buy via maybe_buy (supports meta return) -------
             try:
                 async with self._sema:
-                    tx_sig = await maybe_buy(
+                    result = await maybe_buy(
                         mint=mint_norm,
                         ui=ui | {"dryrun": IS_DRYRUN},
                         on_buy_submitted=_buy_hook_submitted,
@@ -1896,6 +1938,27 @@ class Strategy:
                         on_buy_failed=_buy_hook_failed,
                     )
                 self._diag["buys_submitted"] += 1
+
+                # Support both:
+                #   tx_sig = await maybe_buy(...)
+                #   (tx_sig, meta) = await maybe_buy(...)
+                tx_sig: Optional[str]
+                meta: Dict[str, Any] = {}
+
+                if isinstance(result, tuple) and len(result) == 2:
+                    tx_sig, meta = result  # type: ignore[assignment]
+                    if not isinstance(meta, dict):
+                        meta = {}
+                elif isinstance(result, str) or result is None:
+                    tx_sig = result  # type: ignore[assignment]
+                else:
+                    tx_sig = None
+
+                # If meta includes amount_raw, persist it into UI for exit engine
+                if isinstance(meta, dict):
+                    ar = meta.get("amount_raw")
+                    if isinstance(ar, int) and ar > 0:
+                        ui["amount_raw"] = ar
 
                 if tx_sig:
                     # Fire submitted hook again as a safety net (if router didn't)
@@ -1915,7 +1978,8 @@ class Strategy:
                             },
                         )
 
-                        # Alerts (Telegram/Notion) – secondary path, primary is _buy_hook_filled
+                        # Alerts (Telegram/Notion) – secondary path,
+                        # primary is _buy_hook_filled
                         try:
                             create_task(
                                 _am().notify_trade_fill(
@@ -1945,7 +2009,7 @@ class Strategy:
                                     "pool": ui.get("pool") or "unknown",
                                 }
 
-                                # best-effort amount_raw extraction from UI context
+                                # Best-effort amount_raw extraction from UI/meta
                                 amount_raw: Optional[int] = None
                                 for k in (
                                     "amount_raw",
@@ -2287,7 +2351,7 @@ class Strategy:
                         except Exception:
                             pass
 
-                    tx_sig = await maybe_buy(
+                    result = await maybe_buy(
                         mint=mint_norm,
                         ui=ui | {"dryrun": IS_DRYRUN},
                         on_buy_submitted=_buy_hook_submitted,
@@ -2295,6 +2359,24 @@ class Strategy:
                         on_buy_failed=_buy_hook_failed,
                     )
                     self._diag["buys_submitted"] += 1
+
+                    # Same `(tx_sig, meta)` handling as gated path
+                    tx_sig: Optional[str]
+                    meta: Dict[str, Any] = {}
+
+                    if isinstance(result, tuple) and len(result) == 2:
+                        tx_sig, meta = result  # type: ignore[assignment]
+                        if not isinstance(meta, dict):
+                            meta = {}
+                    elif isinstance(result, str) or result is None:
+                        tx_sig = result  # type: ignore[assignment]
+                    else:
+                        tx_sig = None
+
+                    if isinstance(meta, dict):
+                        ar = meta.get("amount_raw")
+                        if isinstance(ar, int) and ar > 0:
+                            ui["amount_raw"] = ar
 
                     if tx_sig:
                         try:

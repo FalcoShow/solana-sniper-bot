@@ -1,4 +1,3 @@
-# utils_pkg/core_utils.py
 # Core utilities for the sniper:
 # - resource init/close (Redis, HTTP, Solana, optional Postgres, SQLite)
 # - pricing helpers (Coingecko, Birdeye, Dexscreener)
@@ -162,6 +161,8 @@ TOKEN_PROGRAM_ID = PublicKey.from_string(
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 )
 WSOL_MINT = "So11111111111111111111111111111111111111112"
+LAMPORTS_PER_SOL = 1_000_000_000
+LAMPORTS_PER_SOL_F = float(LAMPORTS_PER_SOL)
 COINGECKO_SOL_API = (
     "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
 )
@@ -244,6 +245,72 @@ async def init_sqlite() -> None:
             "(token TEXT PRIMARY KEY, price REAL, timestamp INTEGER)"
         )
         await db.commit()
+
+
+async def remember_entry_price(
+    token: str,
+    price: float,
+    ts: Optional[int] = None,
+) -> None:
+    """
+    Cache last known entry price for a token in sqlite (token → price, timestamp).
+
+    `price` can be USD or SOL; callers should be consistent. We just store the float.
+    """
+    try:
+        p = float(price)
+        if p <= 0:
+            return
+    except Exception:
+        return
+    if ts is None:
+        ts = int(time.time())
+    try:
+        async with aiosqlite.connect(SQLITE_DB_PATH) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO sniped_tokens (token, price, timestamp) "
+                "VALUES (?, ?, ?)",
+                (str(token), float(p), int(ts)),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"remember_entry_price failed: {e}")
+
+
+async def get_entry_price(
+    token: str,
+) -> Optional[Tuple[float, int]]:
+    """
+    Return (price, timestamp) for a token from sqlite, or None if missing.
+    """
+    try:
+        async with aiosqlite.connect(SQLITE_DB_PATH) as db:
+            async with db.execute(
+                "SELECT price, timestamp FROM sniped_tokens WHERE token = ?",
+                (str(token),),
+            ) as cur:
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                price, ts = row
+                return float(price or 0.0), int(ts or 0)
+    except Exception as e:
+        logger.warning(f"get_entry_price failed: {e}")
+        return None
+
+
+async def clear_entry_price(token: str) -> None:
+    """
+    Remove a token's cached entry price from sqlite.
+    """
+    try:
+        async with aiosqlite.connect(SQLITE_DB_PATH) as db:
+            await db.execute(
+                "DELETE FROM sniped_tokens WHERE token = ?", (str(token),)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"clear_entry_price failed: {e}")
 
 
 # --------------------------------------------------------------------------
@@ -912,6 +979,9 @@ async def log_trade_event(
     side: str | None = None,
     signature: Any | None = None,
 ) -> None:
+    """
+    Backwards-compatible trade logger (used mainly for exits / PnL).
+    """
     await pg_log_trade(
         token=token,
         symbol=symbol,
@@ -931,6 +1001,96 @@ async def log_trade_event(
             entry=entry,
             current=current,
             profit=profit,
+            reason=reason,
+        )
+    except Exception:
+        pass
+
+
+async def log_entry_from_meta(
+    *,
+    mint: str,
+    symbol: str,
+    meta: Dict[str, Any],
+    decimals: int | None = None,
+    reason: str = "ENTRY",
+    signature: Any | None = None,
+) -> None:
+    """
+    New: Use Jupiter / lightning entry meta to log exact entry size + price.
+
+    Expects `meta` from lightning_impl.buy_via_lightning(return_meta=True):
+      meta["amount_raw"]      → raw out token amount
+      meta["in_amount_raw"]   → lamports in
+      meta["priceImpactPct"]  → price impact (optional)
+
+    We:
+      - compute token size in UI units (using decimals, default 9)
+      - compute entry price in SOL & USD
+      - store to sqlite entry cache (mint → price)
+      - write a 'side=entry' row into Postgres TRADES
+      - write a row into Notion
+    """
+    try:
+        out_raw = int(meta.get("amount_raw") or meta.get("outAmount") or 0)
+    except Exception:
+        out_raw = 0
+    try:
+        in_raw = int(meta.get("in_amount_raw") or meta.get("inAmount") or 0)
+    except Exception:
+        in_raw = 0
+
+    # If we don't have both legs, we still proceed but mark amounts as None
+    if out_raw <= 0 or in_raw <= 0:
+        amount_ui = 0.0
+        entry_price_sol = 0.0
+    else:
+        d = 9 if decimals is None else max(0, min(int(decimals), 18))
+        scale = float(10**d)
+        amount_ui = out_raw / scale if out_raw > 0 else 0.0
+        sol_spent = in_raw / LAMPORTS_PER_SOL_F
+        entry_price_sol = sol_spent / amount_ui if amount_ui > 0 else 0.0
+
+    # Convert entry price to USD if possible
+    entry_price_usd = 0.0
+    try:
+        px_sol_usd = await get_sol_usd()
+        if px_sol_usd > 0 and entry_price_sol > 0:
+            entry_price_usd = entry_price_sol * px_sol_usd
+    except Exception:
+        entry_price_usd = 0.0
+
+    # Store entry price to sqlite cache (prefer USD, fall back to SOL)
+    try:
+        await remember_entry_price(
+            mint,
+            entry_price_usd or entry_price_sol or 0.0,
+        )
+    except Exception:
+        pass
+
+    # Postgres row: treat as "entry" side with amount and entry price
+    await pg_log_trade(
+        token=mint,
+        symbol=symbol,
+        side="entry",
+        amount=amount_ui if amount_ui > 0 else None,
+        entry=entry_price_usd or entry_price_sol or None,
+        current=None,
+        profit=None,
+        reason=reason,
+        signature=signature,
+    )
+
+    # Notion row mirroring same info (amount + entry; no current/profit yet)
+    try:
+        await log_to_notion(
+            token=mint,
+            symbol=symbol or mint,
+            balance=amount_ui if amount_ui > 0 else 0.0,
+            entry=entry_price_usd or entry_price_sol or 0.0,
+            current=0.0,
+            profit=0.0,
             reason=reason,
         )
     except Exception:
