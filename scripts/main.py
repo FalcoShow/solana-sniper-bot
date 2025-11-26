@@ -2624,6 +2624,7 @@ class Strategy:
             os.getenv("ENTRY_FORCE_BUY_RAYDIUM", "0") == "1"
             and pool == "raydium"
         )
+
         # --- Raydium-specific age guard (we only want relatively "fresh" runners)
         age_min = float(
             raw_event.get("token_age_min")
@@ -2641,7 +2642,7 @@ class Strategy:
             log.event(
                 "ENTRY_RAY_AGE_REJECT",
                 pool=pool,
-                mint=mint_norm,
+                mint="(pending_norm)",
                 symbol=_extract_symbol(raw_event),
                 age_min=age_min,
                 ray_max_age_min=RAY_MAX_AGE_MIN,
@@ -3018,6 +3019,7 @@ class Strategy:
                         except Exception:
                             pass
 
+                    # Execute buy
                     result = await maybe_buy(
                         mint=mint_norm,
                         ui=ui | {"dryrun": IS_DRYRUN},
@@ -3027,10 +3029,10 @@ class Strategy:
                     )
                     self._diag["buys_submitted"] += 1
 
-                    # Same `(tx_sig, meta)` handling as gated path
-                    tx_sig: Optional[str]
+                    # Parse result
+                    tx_sig: Optional[str] = None
                     meta: Dict[str, Any] = {}
-                    amount_raw_meta: Optional[int] = None
+                    amount_raw: Optional[int] = None
 
                     if isinstance(result, tuple) and len(result) == 2:
                         tx_sig, meta = result  # type: ignore[assignment]
@@ -3052,13 +3054,14 @@ class Strategy:
                         ):
                             v = meta.get(k)
                             if isinstance(v, (int, float)) and v > 0:
-                                amount_raw_meta = int(v)
+                                amount_raw = int(v)
                                 break
 
-                        if amount_raw_meta and amount_raw_meta > 0:
-                            ui["amount_raw"] = amount_raw_meta
+                        if amount_raw and amount_raw > 0:
+                            ui["amount_raw"] = amount_raw
 
                     if tx_sig:
+                        # Fire submitted hook again with enriched UI
                         try:
                             await _buy_hook_submitted({"mint": mint_norm, **ui})
                         except Exception:
@@ -3075,6 +3078,7 @@ class Strategy:
                                 },
                             )
 
+                            # Alert manager (Telegram/Discord)
                             try:
                                 create_task(
                                     _am().notify_trade_fill(
@@ -3104,7 +3108,7 @@ class Strategy:
                                         "pool": ui.get("pool") or "legacy",
                                     }
 
-                                    amount_raw: Optional[int] = amount_raw_meta
+                                    # ensure amount_raw present
                                     if amount_raw is None:
                                         for k in (
                                             "amount_raw",
@@ -3122,25 +3126,42 @@ class Strategy:
                                             if isinstance(v, float) and v > 0:
                                                 amount_raw = int(v)
                                                 break
-try:
-    await exit_engine.on_buy_filled(
-        ev,
-        tx_sig=tx_sig,
-        amount_raw=amount_raw,
-    )
-except Exception:
-    if DEBUG_TX:
-        traceback.print_exc()
-                            self._diag["buys_filled"] += 1
-                            try:
-                                record_buy_result(ok=True, reason="executed", sig=tx_sig)
-                            except Exception:
-                                pass
-                            asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
+
+                                    # Notify exit engine
+                                    try:
+                                        await exit_engine.on_buy_filled(
+                                            ev,
+                                            tx_sig=tx_sig,
+                                            amount_raw=amount_raw,
+                                        )
+                                    except Exception:
+                                        if DEBUG_TX:
+                                            traceback.print_exc()
+
+                                    self._diag["buys_filled"] += 1
+                                    try:
+                                        record_buy_result(
+                                            ok=True,
+                                            reason="executed",
+                                            sig=tx_sig,
+                                        )
+                                    except Exception:
+                                        pass
+                                    asyncio.create_task(
+                                        _post_buy_exit_test(mint_norm, tx_sig)
+                                    )
+                                except Exception:
+                                    if DEBUG_TX:
+                                        traceback.print_exc()
                         else:
+                            # Confirmation failed / timed out
                             log.error(
                                 "BUY_FAILED",
-                                extra={"mint": mint_norm, "tx_sig": tx_sig, "reason": info},
+                                extra={
+                                    "mint": mint_norm,
+                                    "tx_sig": tx_sig,
+                                    "reason": info,
+                                },
                             )
                             try:
                                 await _buy_hook_failed(
@@ -3153,6 +3174,7 @@ except Exception:
                             except Exception:
                                 pass
                     else:
+                        # No tx_sig came back from maybe_buy
                         if IS_DRYRUN:
                             log.event("BUY_DRYRUN_EXIT", mint=mint_norm)
                             try:
