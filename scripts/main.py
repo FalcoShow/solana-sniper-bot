@@ -1733,14 +1733,19 @@ class Strategy:
                 False = block entry
 
         Behaviour:
-          - For pump:
-              * if no data and momo_allow_no_data_pump=1 → bypass (log only)
-              * else: strict → reject on no-data or weak momentum
-          - For raydium:
-              * if no data → advisory only (log, but do NOT block)
-              * if data but not up enough / no trades → reject
-          - For other pools:
-              * strict (like pump with allow_no_data_pump=0)
+          - Pump:
+              * if trades < min_trades:
+                    - obey MOMO_ALLOW_NO_DATA_FOR_PUMP (bypass or reject)
+              * if trades >= min_trades and price data is missing:
+                    - trades-only gate ⇒ allow (with log)
+              * if trades >= min_trades and price data present:
+                    - full pct_up + trades checks
+          - Raydium:
+              * no data → advisory only (log, do NOT block)
+              * with data but weak momentum → reject
+          - Other pools:
+              * no data → reject
+              * with data but weak momentum → reject
         """
         if not self.momo_enabled:
             return True
@@ -1748,15 +1753,14 @@ class Strategy:
         pool = (pool or "").lower()
         no_trades = trades < self.momo_min_trades
         no_price_data = (price0 <= 0.0 or price1 <= 0.0)
-        no_data = no_trades or no_price_data
 
-        # --- NO DATA CASE ------------------------------------------------
-        if no_data:
-            # Pump: optionally bypass no-data check
-            if pool in ("pump", "pumpfun", "pump.fun"):
+        # ───── Pump-special handling ─────────────────────────────────────
+        if pool in ("pump", "pumpfun", "pump.fun"):
+            # 1) Absolutely no trades in the window
+            if no_trades:
                 if self.momo_allow_no_data_pump:
                     log.event(
-                        "MOMO_BYPASS_NO_DATA_PUMP",
+                        "MOMO_BYPASS_NO_TRADES_PUMP",
                         pool=pool,
                         mint=mint,
                         symbol=symbol,
@@ -1768,9 +1772,8 @@ class Strategy:
                     )
                     return True
 
-                # Strict pump dead-coin protection
                 log.event(
-                    "MOMO_SKIP_NO_DATA",
+                    "MOMO_SKIP_NO_TRADES_PUMP",
                     pool=pool,
                     mint=mint,
                     symbol=symbol,
@@ -1781,12 +1784,33 @@ class Strategy:
                     min_up_pct=self.momo_min_up_pct,
                 )
                 try:
-                    record_buy_result(ok=False, reason="momo_no_data")
+                    record_buy_result(ok=False, reason="momo_no_trades_pump")
                 except Exception:
                     pass
                 self._diag["rejected_momo"] += 1
                 return False
 
+            # 2) We DO have trades >= min_trades
+            if no_price_data:
+                # Jupiter can't price it yet – rely on trades + upstream filters.
+                log.event(
+                    "MOMO_PUMP_TRADES_ONLY_OK",
+                    pool=pool,
+                    mint=mint,
+                    symbol=symbol,
+                    trades=trades,
+                    price0=price0,
+                    price1=price1,
+                    min_trades=self.momo_min_trades,
+                    min_up_pct=self.momo_min_up_pct,
+                )
+                return True
+            # else: fall through to generic pct_up evaluation below
+
+        # ───── Generic no-data handling (non-pump, or pump with price) ──
+        no_data = no_trades or no_price_data
+
+        if no_data:
             # Raydium: advisory only on no-data (do NOT block)
             if pool == "raydium":
                 log.event(
@@ -1800,7 +1824,6 @@ class Strategy:
                     min_trades=self.momo_min_trades,
                     min_up_pct=self.momo_min_up_pct,
                 )
-                # Let other filters + liq screen decide; we don't block here.
                 return True
 
             # Other pools: strict
@@ -1822,7 +1845,7 @@ class Strategy:
             self._diag["rejected_momo"] += 1
             return False
 
-        # --- HAVE DATA: evaluate real momentum --------------------------
+        # ───── HAVE DATA: evaluate real momentum ────────────────────────
         pct_up = ((price1 / max(price0, 1e-12)) - 1.0) * 100.0
         up_ok = pct_up >= self.momo_min_up_pct
         trades_ok = trades >= self.momo_min_trades
@@ -1843,7 +1866,6 @@ class Strategy:
         )
 
         if not (up_ok and trades_ok):
-            # For all pools (pump + raydium): weak / down-only momentum → reject
             reasons: list[str] = []
             if not up_ok:
                 reasons.append(f"up {pct_up:.2f}% < {self.momo_min_up_pct}%")
