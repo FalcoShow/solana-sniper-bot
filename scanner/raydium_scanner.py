@@ -1,6 +1,6 @@
 # scanner/raydium_scanner.py
 # Raydium scanner via Dexscreener — builds "meta" dicts compatible with
-# utils_pkg.pair_filters and surfaces only high-quality runners.
+# utils_pkg.pair_filters and surfaces runner candidates for the sniper.
 from __future__ import annotations
 
 import os
@@ -80,7 +80,7 @@ BASE = _s("DEXSCREENER_BASE_URL", "https://api.dexscreener.com").rstrip("/")
 # Dexscreener search limit per query (higher = more raw pairs to evaluate)
 SEARCH_LIMIT = max(50, _i("RAYDIUM_SEARCH_LIMIT", 250))
 
-# How many top candidates we keep per scan (after PF filtering + scoring)
+# How many top candidates we keep per scan (after PF filtering + scoring/fallback)
 LIMIT = _i("RAYDIUM_LIMIT", 40)
 
 TIMEOUT_S = _f("RAYDIUM_HTTP_TIMEOUT_SEC", 12.0)
@@ -109,7 +109,10 @@ SEARCH_QUERIES = [
 ]
 
 # Raydium ↔ PF interaction flags
-RAYDIUM_BYPASS_PF = _b("RAYDIUM_BYPASS_PF", False)
+# IMPORTANT: default TRUE now so we bypass PF by default and rely on fallback
+# for "more action with safety". You can turn PF back on by setting
+# RAYDIUM_BYPASS_PF=0 in env.
+RAYDIUM_BYPASS_PF = _b("RAYDIUM_BYPASS_PF", True)
 RAYDIUM_ENABLE_FALLBACK = _b("RAYDIUM_ENABLE_FALLBACK", True)
 RAYDIUM_FALLBACK_MIN_LIQ_USD = _f("RAYDIUM_FALLBACK_MIN_LIQ_USD", 150.0)
 RAYDIUM_FALLBACK_MIN_CHANGE_5M = _f("RAYDIUM_FALLBACK_MIN_CHANGE_5M", 0.0)
@@ -504,12 +507,12 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "freeze_authority_disabled": True,
         }
 
-# NOTE: do NOT hard-filter here. Let PF and fallback handle liq/age/etc
-        # so we can tune behavior via env vars without losing all pairs.
+        # NOTE: we do NOT hard-filter here. Let soft filters + PF/fallback handle liq/age/etc
         return meta
     except Exception as e:
         logger.debug("Raydium normalize error: %s", e)
         return None
+
 
 # -----------------------------------------------------------------------------
 # Optional AI / whales enrichment
@@ -568,6 +571,7 @@ async def _enrich_ai_and_whales(metas: List[Dict[str, Any]]) -> None:
 def _apply_pf(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Apply PF filters & scoring and return top LIMIT by final_score.
+    (Note: we bypass this by default now unless RAYDIUM_BYPASS_PF=0.)
     """
     out: List[Dict[str, Any]] = []
 
@@ -759,8 +763,26 @@ async def scan_raydium(*args):
             if m:
                 metas.append(m)
 
+        total_metas = len(metas)
+
+        # --- soft prefilter: keep out truly dead dust but allow more than PF ---
+        soft_metas: List[Dict[str, Any]] = []
+        for m in metas:
+            try:
+                liq = float(m.get("liq_usd") or 0.0)
+                age = float(m.get("token_age_min") or 9999.0)
+
+                if SOFT_MIN_LIQ_USD > 0.0 and liq < SOFT_MIN_LIQ_USD:
+                    continue
+                if SOFT_MAX_AGE_MIN > 0.0 and age > SOFT_MAX_AGE_MIN:
+                    continue
+
+                soft_metas.append(m)
+            except Exception:
+                continue
+
         if DEBUG_META_SAMPLE:
-            if metas:
+            if soft_metas:
                 sample = [
                     {
                         "sym": m.get("symbol"),
@@ -771,33 +793,37 @@ async def scan_raydium(*args):
                         "chg5": m.get("price_change_5m_pct"),
                         "age_min": m.get("token_age_min"),
                     }
-                    for m in metas[:5]
+                    for m in soft_metas[:5]
                 ]
                 logger.info(
-                    "RAY_META_SAMPLE count=%d first=%s",
-                    len(metas),
+                    "RAY_META_SAMPLE count=%d (soft=%d, raw=%d) first=%s",
+                    len(soft_metas),
+                    len(soft_metas),
+                    total_metas,
                     sample,
                 )
             else:
-                logger.info("RAY_META_SAMPLE count=0")
+                logger.info(
+                    "RAY_META_SAMPLE count=0 (soft=0, raw=%d)", total_metas
+                )
 
         # Optional AI / whale enrichment (no-op if disabled or imports fail).
         with contextlib.suppress(Exception):
-            await _enrich_ai_and_whales(metas)
+            await _enrich_ai_and_whales(soft_metas)
 
         pf_runners: List[Dict[str, Any]] = []
         if not RAYDIUM_BYPASS_PF:
-            pf_runners = _apply_pf(metas)
+            pf_runners = _apply_pf(soft_metas)
 
         fb: List[Dict[str, Any]] = []
         if pf_runners:
             runners = pf_runners
         else:
-            fb = _fallback_candidates(metas)
-            if not fb and metas:
+            fb = _fallback_candidates(soft_metas)
+            if not fb and soft_metas:
                 logger.warning(
-                    "Raydium: PF produced 0 runners and fallback found nothing from %d metas",
-                    len(metas),
+                    "Raydium: PF produced 0 runners and fallback found nothing from %d metas (soft-filtered)",
+                    len(soft_metas),
                 )
             runners = fb
 
@@ -806,18 +832,18 @@ async def scan_raydium(*args):
                 "RAY_PF_RESULT pf=%d fb=%d metas=%d pairs=%d",
                 len(pf_runners),
                 len(fb),
-                len(metas),
+                len(soft_metas),
                 len(pairs),
             )
 
         logger.info(
             "scanner.raydium: %s runners returned (from %s metas, %s raw pairs)",
             len(runners),
-            len(metas),
+            len(soft_metas),
             len(pairs),
         )
 
-        # 🔥 Key change: send MOMO for whatever runners we're actually using
+        # 🔥 Key: send MOMO for whatever runners we're actually using
         if runners:
             await _send_momo_for_runners(runners)
 
