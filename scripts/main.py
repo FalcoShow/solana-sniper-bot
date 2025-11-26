@@ -4,14 +4,17 @@ import asyncio
 import contextlib
 import datetime as _dt
 import importlib
+import inspect
 import json
+import logging
 import os
 import signal
 import sys
+import threading
+import time
 import traceback
 from asyncio import create_task
 from typing import Any, Dict, Optional, Tuple
-7
 
 try:
     import aiohttp  # type: ignore
@@ -22,16 +25,16 @@ except Exception:  # pragma: no cover
 from utils_pkg.core_utils import AlertManager, redis
 
 """
-scripts/main.py (vNext)
+scripts/main.py (vNext, part 1)
 
 High-level responsibilities:
 - Hardened startup, logging, and shutdown.
 - DSN normalizer -> asyncpg-safe DSNs from any Render/PG env.
 - Global env config for entry filters, momentum, pools, & cooldowns.
 - Unified router buy wrapper (maybe_buy) with rich buy hooks:
-      - on_buy_submitted (logs + alerts)
-      - on_buy_filled    (alerts + exit_engine + Notion snapshot)
-      - on_buy_failed    (alerts + guardrail telemetry)
+      - _buy_hook_submitted  (logs + alerts)
+      - _buy_hook_filled     (alerts + exit_engine via Strategy, Notion snapshot)
+      - _buy_hook_failed     (alerts + guardrail telemetry)
 - Momentum/entry env, including ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP.
 - Optional health endpoint (/health) if aiohttp & HEALTH_PORT present.
 - Optional Sentry initialisation when SENTRY_DSN is set.
@@ -67,6 +70,7 @@ except Exception:  # pragma: no cover
 try:
     C = importlib.import_module("config")
 except Exception:  # pragma: no cover
+
     class _C:
         ENABLE_RAYDIUM_SCANNER = True
 
@@ -75,9 +79,6 @@ except Exception:  # pragma: no cover
 # ---------------------------
 # Logging (robust + collision-safe helpers)
 # ---------------------------
-import logging
-import threading
-import time
 
 # Reserved LogRecord keys we must NOT place inside `extra`
 _RESERVED: set[str] = {
@@ -152,7 +153,7 @@ try:
 
     _base_log = get_logger()
 except Exception:  # pragma: no cover
-    # Emergency fallback: stdout logger
+
     class DummyLogger(logging.Logger):
         def __init__(self):
             super().__init__("dummy")
@@ -192,6 +193,7 @@ log = _attach_log_helpers_base(_base_log)
 try:
     from scripts.pp_utils import normalize_mint as _pp_normalize
 except Exception:  # pragma: no cover
+
     def _pp_normalize(s: str) -> str:  # type: ignore
         return s.strip()
 
@@ -215,7 +217,11 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 def _dryrun_env_on() -> bool:
     # honour any of these flags
-    return _env_bool("DRYRUN") or _env_bool("DRY_RUN") or _env_bool("IS_DRYRUN")
+    return (
+        _env_bool("DRYRUN")
+        or _env_bool("DRY_RUN")
+        or _env_bool("IS_DRYRUN")
+    )
 
 
 # ---------------------------
@@ -224,6 +230,7 @@ def _dryrun_env_on() -> bool:
 try:
     from utils_pkg.pumpportal_client import PumpPortalClient
 except Exception:  # pragma: no cover
+
     class PumpPortalClient:  # type: ignore
         def __init__(self, *a, **kw):
             raise RuntimeError("PumpPortalClient not available")
@@ -234,6 +241,7 @@ except Exception:  # pragma: no cover
 try:
     from utils_pkg.trader import sell_on_jupiter, IS_DRYRUN as _pkg_is_dryrun
 except Exception:  # pragma: no cover
+
     async def sell_on_jupiter(*_a, **_kw):  # type: ignore
         raise RuntimeError("sell_on_jupiter not available")
 
@@ -244,6 +252,7 @@ except Exception:  # pragma: no cover
 try:
     from utils_pkg.auto_exit_worker import exit_worker_loop, exit_engine  # type: ignore
 except Exception:  # pragma: no cover
+
     async def exit_worker_loop(stop_evt: asyncio.Event) -> None:  # type: ignore
         while not stop_evt.is_set():
             await asyncio.sleep(5)
@@ -258,6 +267,7 @@ except Exception:  # pragma: no cover
 try:
     from utils_pkg.dedupe import claim_once  # (key:str, ttl:int) -> bool
 except Exception:  # pragma: no cover
+
     def claim_once(_key: str, _ttl: int = 3600) -> bool:  # type: ignore
         return True
 
@@ -265,6 +275,7 @@ except Exception:  # pragma: no cover
 try:
     from utils_pkg.guardrails import buys_allowed, record_buy_result
 except Exception:  # pragma: no cover
+
     def buys_allowed() -> bool:  # type: ignore
         return True
 
@@ -275,6 +286,7 @@ except Exception:  # pragma: no cover
 try:
     from utils_pkg.positions import all as all_positions
 except Exception:  # pragma: no cover
+
     def all_positions():  # type: ignore
         return []
 
@@ -283,6 +295,7 @@ except Exception:  # pragma: no cover
 try:
     from utils_pkg.risk_manager import risk_manager_loop  # type: ignore
 except Exception:  # pragma: no cover
+
     async def risk_manager_loop(stop_evt: asyncio.Event) -> None:  # type: ignore
         while not stop_evt.is_set():
             await asyncio.sleep(10)
@@ -292,6 +305,7 @@ except Exception:  # pragma: no cover
 try:
     from utils_pkg.sell_loop import run_sell_loop  # type: ignore
 except Exception:  # pragma: no cover
+
     async def run_sell_loop(stop_evt: asyncio.Event) -> None:  # type: ignore
         while not stop_evt.is_set():
             await asyncio.sleep(10)
@@ -314,7 +328,6 @@ except Exception:  # pragma: no cover
     _route_get_decimals = None  # type: ignore
 
 # ---------- ROUTER BUY WRAPPER ----------
-import inspect
 
 
 def _safe_log_router_state(event: str, **fields: Any) -> None:
@@ -328,7 +341,7 @@ def _safe_log_router_state(event: str, **fields: Any) -> None:
 def _candidate_buy_names() -> list[str]:
     # Preferred stable names first, then common variants.
     return [
-        "buy_via_lightning",     # primary Jupiter v6 path (supports return_meta)
+        "buy_via_lightning",  # primary Jupiter v6 path (supports return_meta)
         "pump_buy_with_fallback",
         "maybe_buy",
         "buy",
@@ -551,6 +564,10 @@ async def maybe_buy(
       log_entry_from_meta so Notion/DB stay in sync.
     - Still returns a plain tx signature string (or None), so Strategy and
       other callers remain fully compatible.
+
+    NOTE:
+      The on_buy_* callbacks are *not* invoked here. Strategy acts as the
+      single source of truth for calling _buy_hook_* after confirmation.
     """
     if router is None:
         _safe_log_router_state("ROUTER_UNAVAILABLE_FOR_BUY")
@@ -624,18 +641,23 @@ async def maybe_buy(
 
         # Persist to PG + Notion (best-effort, never breaks flow)
         try:
-            await log_entry_from_meta(
+            await log_entry_from_meta(  # defined later in this file
                 mint=mint,
                 entry_meta=entry_meta,
                 ui=ui,
                 sig=sig,
             )
-        except Exception:
+        except Exception as e:
             # DB/Notion failures are non-fatal
-            log.event("ENTRY_META_LOG_FAIL", mint=mint)
+            try:
+                log.event(
+                    "ENTRY_META_LOG_FAIL",
+                    mint=mint,
+                    err=str(e)[:200],
+                )
+            except Exception:
+                pass
 
-    # NOTE: we do NOT call on_buy_* hooks here.
-    # Strategy handles hooks after confirmation as the single source of truth.
     return sig
 
 # ---------- /ROUTER BUY WRAPPER ----------
@@ -644,6 +666,7 @@ async def maybe_buy(
 try:
     from utils_pkg.liquidity import screen_token
 except Exception:  # pragma: no cover
+
     async def screen_token(_mint: str):  # type: ignore
         return True, {"ok": True}
 
@@ -652,6 +675,7 @@ except Exception:  # pragma: no cover
 try:
     from utils_pkg.price_feed import close as pricefeed_close
 except Exception:  # pragma: no cover
+
     async def pricefeed_close() -> None:
         return None
 
@@ -667,6 +691,7 @@ except Exception:  # pragma: no cover
 def _get_raydium_scanner():
     try:
         from scanner.raydium_scanner import scan_raydium  # type: ignore
+
         return scan_raydium
     except Exception:
         return None
@@ -736,6 +761,8 @@ async def _confirm_sig(sig: str) -> Tuple[bool, Optional[str]]:
 # ---------------------------
 # ENV helpers
 # ---------------------------
+
+
 def _as_bool(s: str, default: bool = False) -> bool:
     try:
         return s.strip().lower() in ("1", "true", "yes", "on")
@@ -797,10 +824,11 @@ def _as_int(val: Any, default: int) -> int:
     except Exception:
         return default
 
-
 # ---------------------------
 # DSN normalizer
 # ---------------------------
+
+
 def _dsn_to_asyncpg(dsn: str | None) -> str:
     """
     Normalize a DSN into something asyncpg understands:
@@ -962,6 +990,8 @@ RISK_MANAGER_POLL_SEC = _as_float(
 # ---------------------------
 # Small helpers
 # ---------------------------
+
+
 def _get_first(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
     for k in keys:
         if k in d and d[k] is not None:
@@ -1026,10 +1056,11 @@ def _approx_minutes_since(ts_any: Any) -> Optional[float]:
 def utc_today_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).date().isoformat()
 
-
 # ---------------------------
 # Basic filters (pre-momentum / pre-expensive work)
 # ---------------------------
+
+
 def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
     """
     Very early guardrail filter before we do any heavy work.
@@ -1128,10 +1159,11 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
 
     return True
 
-
 # ---------------------------
 # Post-buy optional immediate sell test
 # ---------------------------
+
+
 async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
     """
     Optional post-buy path: if POSTBUY_MODE=immediate_sell_test, do a
@@ -1147,10 +1179,11 @@ async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
         if DEBUG_TX:
             traceback.print_exc()
 
-
 # ---------------------------
 # Liquidity retry helper
 # ---------------------------
+
+
 async def _screen_with_retry(
     mint: str,
     tries: int = 3,
@@ -1203,10 +1236,11 @@ async def _await_mint_ready(
         waited += step_s
     return None
 
-
 # ---------------------------
 # Boot: ensure keypair file
 # ---------------------------
+
+
 def _ensure_keypair_file() -> None:
     """
     Make sure ~/.config/solana/id.json exists. If not, and KEYPAIR_JSON /
@@ -1246,7 +1280,6 @@ def _ensure_keypair_file() -> None:
             log.event("KEYPAIR_FILE_WRITE_FAIL", error=str(e))
         except Exception:
             print(f"[boot] could not write wallet: {e}", flush=True)
-
 
 # ---------------------------
 # BUY HOOKS (submitted / filled / failed)
@@ -1379,12 +1412,12 @@ async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
                 extra={"err": str(_e)[:200]},
             )
 
-
 # --- Notion (optional daily PnL sync) ---
 try:
     # safe no-op if NOTION_ENABLED != 1 inside this helper
     from utils_pkg.notion_pnl import push_daily_pnl
 except Exception:  # pragma: no cover
+
     def push_daily_pnl(_snapshot):  # type: ignore[override]
         return None
 
@@ -1593,7 +1626,7 @@ class Strategy:
         self.momo_allow_no_data_pump: bool = bool(ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP)
 
         # Diagnostics (mirrored into DIAG_MINUTE)
-        self._diag = {
+        self._diag: Dict[str, int] = {
             "events_total": 0,
             "events_trade": 0,
             "events_new_token": 0,
@@ -1633,7 +1666,7 @@ class Strategy:
         while not stop_evt.is_set():
             await asyncio.sleep(interval_s)
             et = self._diag["events_total"]
-            rate = (et - last_total) / interval_s
+            rate = (et - last_total) / max(interval_s, 1e-3)
             last_total = et
             log.event(
                 "DIAG_MINUTE",
@@ -1811,7 +1844,7 @@ class Strategy:
 
         if not (up_ok and trades_ok):
             # For all pools (pump + raydium): weak / down-only momentum → reject
-            reasons = []
+            reasons: list[str] = []
             if not up_ok:
                 reasons.append(f"up {pct_up:.2f}% < {self.momo_min_up_pct}%")
             if not trades_ok:
@@ -2204,9 +2237,11 @@ class Strategy:
                 or raw_event.get("vol5")
                 or 0.0
             )
+            # Support both naming schemes: price_change_5m_pct / chg5 / up_5m_pct
             up5 = float(
                 raw_event.get("price_change_5m_pct")
                 or raw_event.get("chg5")
+                or raw_event.get("up_5m_pct")
                 or 0.0
             )
             buys5 = int(raw_event.get("buys_5m") or raw_event.get("buys5") or 0)
