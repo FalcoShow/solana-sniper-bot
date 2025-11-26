@@ -2015,140 +2015,153 @@ class Strategy:
                         on_buy_filled=_buy_hook_filled,
                         on_buy_failed=_buy_hook_failed,
                     )
-                self._diag["buys_submitted"] += 1
+                    self._diag["buys_submitted"] += 1
 
-                # Support both:
-                #   tx_sig = await maybe_buy(...)
-                #   (tx_sig, meta) = await maybe_buy(...)
-                tx_sig: Optional[str]
-                meta: Dict[str, Any] = {}
+                    # Support both:
+                    #   tx_sig = await maybe_buy(...)
+                    #   (tx_sig, meta) = await maybe_buy(...)
+                    tx_sig: Optional[str]
+                    meta: Dict[str, Any] = {}
+                    amount_raw_meta: Optional[int] = None
 
-                if isinstance(result, tuple) and len(result) == 2:
-                    tx_sig, meta = result  # type: ignore[assignment]
-                    if not isinstance(meta, dict):
-                        meta = {}
-                elif isinstance(result, str) or result is None:
-                    tx_sig = result  # type: ignore[assignment]
-                else:
-                    tx_sig = None
+                    if isinstance(result, tuple) and len(result) == 2:
+                        tx_sig, meta = result  # type: ignore[assignment]
+                        if not isinstance(meta, dict):
+                            meta = {}
+                    elif isinstance(result, str) or result is None:
+                        tx_sig = result  # type: ignore[assignment]
+                    else:
+                        tx_sig = None
 
-                # If meta includes amount_raw, persist it into UI for exit engine
-                if isinstance(meta, dict):
-                    ar = meta.get("amount_raw")
-                    if isinstance(ar, int) and ar > 0:
-                        ui["amount_raw"] = ar
+                    # ── Extract size from meta and mirror into UI ────────
+                    if isinstance(meta, dict):
+                        for k in (
+                            "amount_raw",
+                            "out_amount",
+                            "raw_out",
+                            "raw_amount_out",
+                            "token_amount_raw",
+                        ):
+                            v = meta.get(k)
+                            if isinstance(v, (int, float)) and v > 0:
+                                amount_raw_meta = int(v)
+                                break
 
-                if tx_sig:
-                    # Fire submitted hook again as a safety net (if router didn't)
-                    try:
-                        await _buy_hook_submitted({"mint": mint_norm, **ui})
-                    except Exception:
-                        pass
+                        if amount_raw_meta and amount_raw_meta > 0:
+                            ui["amount_raw"] = amount_raw_meta
 
-                    ok, info = await _confirm_sig(tx_sig)
-                    if ok:
-                        log.info(
-                            "BUY_FILLED",
-                            extra={
-                                "mint": mint_norm,
-                                "tx_sig": tx_sig,
-                                "slot": info,
-                            },
-                        )
-
-                        # Alerts (Telegram/Notion) – secondary path,
-                        # primary is _buy_hook_filled
+                    if tx_sig:
+                        # Fire submitted hook again as a safety net (if router didn't)
                         try:
-                            create_task(
-                                _am().notify_trade_fill(
-                                    side="BUY",
-                                    mint=mint_norm,
-                                    symbol=ui.get("symbol"),
-                                    pool=ui.get("pool") or "unknown",
-                                    sig=tx_sig,
-                                    spend_sol=ui.get("spend_sol"),
-                                    out_amount=ui.get("amount_raw"),
-                                )
-                            )
-                        except Exception as _e:
-                            log.warning(
-                                "ALERT_BUY_FILLED_FAIL",
-                                extra={"err": str(_e)[:200]},
-                            )
+                            await _buy_hook_submitted({"mint": mint_norm, **ui})
+                        except Exception:
+                            pass
 
-                        # Exit engine hook (fallback; primary wiring is _buy_hook_filled)
-                        if EXIT_ENGINE_ENABLED:
-                            try:
-                                ev = {
+                        ok, info = await _confirm_sig(tx_sig)
+                        if ok:
+                            log.info(
+                                "BUY_FILLED",
+                                extra={
                                     "mint": mint_norm,
-                                    "signature": tx_sig,
-                                    "symbol": ui.get("symbol"),
-                                    "spend_sol": ui.get("spend_sol") or 0.0,
-                                    "pool": ui.get("pool") or "unknown",
-                                }
+                                    "tx_sig": tx_sig,
+                                    "slot": info,
+                                },
+                            )
 
-                                # Best-effort amount_raw extraction from UI/meta
-                                amount_raw: Optional[int] = None
-                                for k in (
-                                    "amount_raw",
-                                    "position_raw",
-                                    "size_raw",
-                                    "raw_out",
-                                    "raw_amount_out",
-                                    "out_amount",
-                                    "token_amount_raw",
-                                ):
-                                    v = ui.get(k)
-                                    if isinstance(v, int) and v > 0:
-                                        amount_raw = v
-                                        break
-                                    if isinstance(v, float) and v > 0:
-                                        amount_raw = int(v)
-                                        break
+                            # Alerts (Telegram/Notion) – secondary path,
+                            # primary is _buy_hook_filled
+                            try:
+                                create_task(
+                                    _am().notify_trade_fill(
+                                        side="BUY",
+                                        mint=mint_norm,
+                                        symbol=ui.get("symbol"),
+                                        pool=ui.get("pool") or "unknown",
+                                        sig=tx_sig,
+                                        spend_sol=ui.get("spend_sol"),
+                                        out_amount=ui.get("amount_raw"),
+                                    )
+                                )
+                            except Exception as _e:
+                                log.warning(
+                                    "ALERT_BUY_FILLED_FAIL",
+                                    extra={"err": str(_e)[:200]},
+                                )
 
-                                await exit_engine.on_buy_filled(
-                                    ev,
-                                    tx_sig=tx_sig,
-                                    amount_raw=amount_raw,
+                            # Exit engine hook (fallback; primary wiring is _buy_hook_filled)
+                            if EXIT_ENGINE_ENABLED:
+                                try:
+                                    ev = {
+                                        "mint": mint_norm,
+                                        "signature": tx_sig,
+                                        "symbol": ui.get("symbol"),
+                                        "spend_sol": ui.get("spend_sol") or 0.0,
+                                        "pool": ui.get("pool") or "unknown",
+                                    }
+
+                                    # Best-effort amount_raw extraction from meta first, then UI
+                                    amount_raw: Optional[int] = amount_raw_meta
+                                    if amount_raw is None:
+                                        for k in (
+                                            "amount_raw",
+                                            "position_raw",
+                                            "size_raw",
+                                            "raw_out",
+                                            "raw_amount_out",
+                                            "out_amount",
+                                            "token_amount_raw",
+                                        ):
+                                            v = ui.get(k)
+                                            if isinstance(v, int) and v > 0:
+                                                amount_raw = v
+                                                break
+                                            if isinstance(v, float) and v > 0:
+                                                amount_raw = int(v)
+                                                break
+
+                                    await exit_engine.on_buy_filled(
+                                        ev,
+                                        tx_sig=tx_sig,
+                                        amount_raw=amount_raw,
+                                    )
+                                except Exception:
+                                    if DEBUG_TX:
+                                        traceback.print_exc()
+
+                            self._diag["buys_filled"] += 1
+                            try:
+                                record_buy_result(ok=True, reason="executed", sig=tx_sig)
+                            except Exception:
+                                pass
+                            asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
+                        else:
+                            log.error(
+                                "BUY_FAILED",
+                                extra={"mint": mint_norm, "tx_sig": tx_sig, "reason": info},
+                            )
+                            try:
+                                await _buy_hook_failed(
+                                    {"mint": mint_norm, "reason": info, **ui}
                                 )
                             except Exception:
-                                if DEBUG_TX:
-                                    traceback.print_exc()
-
-                        self._diag["buys_filled"] += 1
-                        try:
-                            record_buy_result(ok=True, reason="executed", sig=tx_sig)
-                        except Exception:
-                            pass
-                        asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
+                                pass
+                            try:
+                                record_buy_result(ok=False, reason=str(info))
+                            except Exception:
+                                pass
                     else:
-                        log.error(
-                            "BUY_FAILED",
-                            extra={"mint": mint_norm, "tx_sig": tx_sig, "reason": info},
-                        )
-                        try:
-                            await _buy_hook_failed(
-                                {"mint": mint_norm, "reason": info, **ui}
-                            )
-                        except Exception:
-                            pass
-                        try:
-                            record_buy_result(ok=False, reason=str(info))
-                        except Exception:
-                            pass
-                else:
-                    # DRYRUN path usually returns None
-                    if IS_DRYRUN:
-                        log.event("BUY_DRYRUN_EXIT", mint=mint_norm)
-                        try:
-                            record_buy_result(ok=False, reason="dryrun_exit")
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            record_buy_result(ok=False, reason="no_tx_sig")
-                        except Exception:
-                            pass
+                        # DRYRUN path usually returns None
+                        if IS_DRYRUN:
+                            log.event("BUY_DRYRUN_EXIT", mint=mint_norm)
+                            try:
+                                record_buy_result(ok=False, reason="dryrun_exit")
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                record_buy_result(ok=False, reason="no_tx_sig")
+                            except Exception:
+                                pass
 
             except Exception:
                 traceback.print_exc()
@@ -2424,7 +2437,10 @@ class Strategy:
                                 )
                                 self._diag["rejected_guardrails"] += 1
                                 try:
-                                    record_buy_result(ok=False, reason="max_tradeable_exec")
+                                    record_buy_result(
+                                        ok=False,
+                                        reason="max_tradeable_exec",
+                                    )
                                 except Exception:
                                     pass
                                 return
@@ -2443,6 +2459,7 @@ class Strategy:
                     # Same `(tx_sig, meta)` handling as gated path
                     tx_sig: Optional[str]
                     meta: Dict[str, Any] = {}
+                    amount_raw_meta: Optional[int] = None
 
                     if isinstance(result, tuple) and len(result) == 2:
                         tx_sig, meta = result  # type: ignore[assignment]
@@ -2453,10 +2470,22 @@ class Strategy:
                     else:
                         tx_sig = None
 
+                    # Extract size from meta and mirror into UI
                     if isinstance(meta, dict):
-                        ar = meta.get("amount_raw")
-                        if isinstance(ar, int) and ar > 0:
-                            ui["amount_raw"] = ar
+                        for k in (
+                            "amount_raw",
+                            "out_amount",
+                            "raw_out",
+                            "raw_amount_out",
+                            "token_amount_raw",
+                        ):
+                            v = meta.get(k)
+                            if isinstance(v, (int, float)) and v > 0:
+                                amount_raw_meta = int(v)
+                                break
+
+                        if amount_raw_meta and amount_raw_meta > 0:
+                            ui["amount_raw"] = amount_raw_meta
 
                     if tx_sig:
                         try:
@@ -2504,23 +2533,24 @@ class Strategy:
                                         "pool": ui.get("pool") or "legacy",
                                     }
 
-                                    amount_raw: Optional[int] = None
-                                    for k in (
-                                        "amount_raw",
-                                        "position_raw",
-                                        "size_raw",
-                                        "raw_out",
-                                        "raw_amount_out",
-                                        "out_amount",
-                                        "token_amount_raw",
-                                    ):
-                                        v = ui.get(k)
-                                        if isinstance(v, int) and v > 0:
-                                            amount_raw = v
-                                            break
-                                        if isinstance(v, float) and v > 0:
-                                            amount_raw = int(v)
-                                            break
+                                    amount_raw: Optional[int] = amount_raw_meta
+                                    if amount_raw is None:
+                                        for k in (
+                                            "amount_raw",
+                                            "position_raw",
+                                            "size_raw",
+                                            "raw_out",
+                                            "raw_amount_out",
+                                            "out_amount",
+                                            "token_amount_raw",
+                                        ):
+                                            v = ui.get(k)
+                                            if isinstance(v, int) and v > 0:
+                                                amount_raw = v
+                                                break
+                                            if isinstance(v, float) and v > 0:
+                                                amount_raw = int(v)
+                                                break
 
                                     await exit_engine.on_buy_filled(
                                         ev,
