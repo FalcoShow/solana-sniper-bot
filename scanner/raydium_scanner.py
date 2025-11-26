@@ -16,7 +16,7 @@ import certifi
 
 from config import (
     PF_SCAN_MIN_LIQ_USD,
-    PF_SCAN_MIN_MCAP_USD,
+    PF_SCAN_MIN_MCAP_USD,  # kept for future use / consistency
     PF_SCAN_MAX_TOKEN_AGE_MIN,
 )
 
@@ -109,25 +109,14 @@ SEARCH_QUERIES = [
 ]
 
 # Raydium ↔ PF interaction flags
-# IMPORTANT: default TRUE now so we bypass PF by default and rely on fallback
-# for "more action with safety". You can turn PF back on by setting
-# RAYDIUM_BYPASS_PF=0 in env.
+# Default TRUE: bypass PF (only use fallback) unless you explicitly turn it off.
 RAYDIUM_BYPASS_PF = _b("RAYDIUM_BYPASS_PF", True)
 RAYDIUM_ENABLE_FALLBACK = _b("RAYDIUM_ENABLE_FALLBACK", True)
-RAYDIUM_FALLBACK_MIN_LIQ_USD = _f("RAYDIUM_FALLBACK_MIN_LIQ_USD", 150.0)
-RAYDIUM_FALLBACK_MIN_CHANGE_5M = _f("RAYDIUM_FALLBACK_MIN_CHANGE_5M", 0.0)
-RAYDIUM_FALLBACK_LIMIT = max(1, _i("RAYDIUM_FALLBACK_LIMIT", 8))
 
-# Global scanner-level envs (used inside fallback)
-SCANNER_MIN_BUYS_5M = _i("SCANNER_MIN_BUYS_5M", 1)
-SCANNER_MIN_VOLUME_5M_USD = _f("SCANNER_MIN_VOLUME_5M_USD", 20.0)
-SCANNER_REQUIRE_BUY_PRESSURE = _b("SCANNER_REQUIRE_BUY_PRESSURE", True)
-SCANNER_MIN_BUY_RATIO = _f("SCANNER_MIN_BUY_RATIO", 0.50)
-# IMPORTANT: default 0.0 so if you don't set env, we *don't* hard-gate by 5m price.
-SCANNER_MIN_PRICE_CHANGE_5M = _f("SCANNER_MIN_PRICE_CHANGE_5M", 0.0)
-# 0.0 means "no age cap" here; we only use PF_SCAN_MAX_TOKEN_AGE_MIN if > 0.
-DEFAULT_AGE_CAP = PF_SCAN_MAX_TOKEN_AGE_MIN if PF_SCAN_MAX_TOKEN_AGE_MIN > 0 else 0.0
-SCANNER_MAX_AGE_MIN = _f("SCANNER_MAX_AGE_MIN", DEFAULT_AGE_CAP)
+# New, simple fallback tuning (what you just set in env)
+RAYDIUM_FB_MIN_BUYS_5M = _i("RAYDIUM_FB_MIN_BUYS_5M", 1)
+RAYDIUM_FB_MIN_VOL5_USD = _f("RAYDIUM_FB_MIN_VOL5_USD", 300.0)
+RAYDIUM_FB_MAX_RUNNERS = max(1, _i("RAYDIUM_FB_MAX_RUNNERS", 3))
 
 # -------------------------------------------------------------------------
 # Soft prefilters BEFORE PF_* (to cut truly dead dust but let more pass)
@@ -140,6 +129,7 @@ _BASE_SOFT_MAX_AGE_DEFAULT = (
 SOFT_MIN_LIQ_USD = _f("RAYDIUM_SOFT_MIN_LIQ_USD", _BASE_SOFT_LIQ_DEFAULT)
 # NOTE: we do NOT soft-filter on mcap anymore; too many SOL/RAY new tokens have 0 mcap in Dexscreener.
 SOFT_MAX_AGE_MIN = _f("RAYDIUM_SOFT_MAX_AGE_MIN", _BASE_SOFT_MAX_AGE_DEFAULT)
+
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -188,6 +178,23 @@ def _age_min(pair_created_ms: Optional[int]) -> Optional[float]:
 def _buy_ratio(buys: int, sells: int) -> float:
     total = max(1, buys + sells)
     return float(buys) / float(total)
+
+
+def _vol_key(vol: Dict[str, Any], key1: str, alt_key: Optional[str] = None) -> float:
+    """
+    Safely extract a USD volume for a given timeframe from Dexscreener's volume map.
+    Handles both:
+      - {"m5": 123.4}
+      - {"m5": {"usd": 123.4}}
+    """
+    raw = vol.get(key1)
+    if isinstance(raw, dict):
+        raw = raw.get("usd")
+    if raw is None and alt_key:
+        raw = vol.get(alt_key)
+        if isinstance(raw, dict):
+            raw = raw.get("usd")
+    return _nz_float(raw, 0.0)
 
 
 # -----------------------------------------------------------------------------
@@ -327,25 +334,10 @@ def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
     sells_24h = _safe_int(h24_tx.get("sells"), 0)
 
     vol = pair.get("volume") or {}
-    # Dexscreener: sometimes nested: {"m5": {"usd": ..}} but usually flat usd numbers.
-    vol_5m_usd = _nz_float(
-        vol.get("m5")
-        or (vol.get("m5") or {}).get("usd")
-        or vol.get("5m"),
-        0.0,
-    )
-    vol_1h_usd = _nz_float(
-        vol.get("h1")
-        or (vol.get("h1") or {}).get("usd")
-        or vol.get("1h"),
-        0.0,
-    )
-    vol_24h_usd = _nz_float(
-        vol.get("h24")
-        or (vol.get("h24") or {}).get("usd")
-        or vol.get("24h"),
-        0.0,
-    )
+
+    vol_5m_usd = _vol_key(vol, "m5", "5m")
+    vol_1h_usd = _vol_key(vol, "h1", "1h")
+    vol_24h_usd = _vol_key(vol, "h24", "24h")
 
     # Fallbacks if only longer timeframes exist
     if vol_5m_usd <= 0.0 and vol_1h_usd > 0.0:
@@ -507,7 +499,6 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "freeze_authority_disabled": True,
         }
 
-        # NOTE: we do NOT hard-filter here. Let soft filters + PF/fallback handle liq/age/etc
         return meta
     except Exception as e:
         logger.debug("Raydium normalize error: %s", e)
@@ -552,7 +543,9 @@ async def _enrich_ai_and_whales(metas: List[Dict[str, Any]]) -> None:
             if WHALES_ENABLED:
                 try:
                     px = float(meta.get("price_usd") or 0.0)
-                    thresh_usd = float(PF_SCAN_MIN_WHALE_SIZE_SOL) * px if px > 0 else 50_000.0
+                    thresh_usd = (
+                        float(PF_SCAN_MIN_WHALE_SIZE_SOL) * px if px > 0 else 50_000.0
+                    )
                     has_whale = await is_whale_wallet(mint, usd_threshold=thresh_usd)
                     if has_whale:
                         meta["whales_5m"] = max(1, int(meta.get("whales_5m") or 0))
@@ -565,7 +558,7 @@ async def _enrich_ai_and_whales(metas: List[Dict[str, Any]]) -> None:
 
 
 # -----------------------------------------------------------------------------
-# PF-based filtering & ranking + fallback
+# PF-based filtering & ranking + NEW fallback picker
 # -----------------------------------------------------------------------------
 
 def _apply_pf(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -596,62 +589,69 @@ def _apply_pf(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out[:LIMIT]
 
 
-def _fallback_candidates(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _fallback_pick_metas(
+    metas: List[Dict[str, Any]],
+    *,
+    log: logging.Logger,
+    why: str = "fb",
+) -> List[Dict[str, Any]]:
     """
-    When PF returns nothing but we still have metas, pick some "good enough"
-    runners using scanner-style rules (liq + 5m up + buy pressure).
-    All conditions can be effectively disabled by setting env thresholds to 0.
+    Very simple, permissive Raydium fallback:
+    - ignore age and PF scoring
+    - keep anything with decent 5m volume + at least 1 buy
+    - sort by 5m volume desc and cap by env limit
+
+    Controlled by:
+      - RAYDIUM_FB_MIN_BUYS_5M
+      - RAYDIUM_FB_MIN_VOL5_USD
+      - RAYDIUM_FB_MAX_RUNNERS
     """
     if not RAYDIUM_ENABLE_FALLBACK or not metas:
         return []
 
-    cands: List[Dict[str, Any]] = []
+    fb_min_buys = int(RAYDIUM_FB_MIN_BUYS_5M)
+    fb_min_vol = float(RAYDIUM_FB_MIN_VOL5_USD)
+    fb_max = int(RAYDIUM_FB_MAX_RUNNERS)
 
-    # Effective thresholds (respect 0 = disabled)
-    liq_min = max(0.0, float(RAYDIUM_FALLBACK_MIN_LIQ_USD))
-    chg_min = max(
-        0.0,
-        float(RAYDIUM_FALLBACK_MIN_CHANGE_5M),
-        float(SCANNER_MIN_PRICE_CHANGE_5M),
-    )
-    buys_min = max(0, int(SCANNER_MIN_BUYS_5M))
-    vol_min = max(0.0, float(SCANNER_MIN_VOLUME_5M_USD))
-    ratio_min = max(0.0, float(SCANNER_MIN_BUY_RATIO))
-    age_cap = float(SCANNER_MAX_AGE_MIN)
-
+    candidates: List[Dict[str, Any]] = []
     for m in metas:
         try:
-            liq = float(m.get("liq_usd") or 0.0)
-            age = float(m.get("token_age_min") or 9999.0)
-            chg5 = float(m.get("price_change_5m_pct") or 0.0)
             buys5 = int(m.get("buys_5m") or 0)
             vol5 = float(m.get("vol_5m_usd") or 0.0)
-            ratio = float(m.get("buy_ratio_5m") or 0.0)
 
-            if liq_min > 0 and liq < liq_min:
+            if buys5 < fb_min_buys:
                 continue
-            if age_cap > 0 and age > age_cap:
-                continue
-            if chg_min > 0 and chg5 < chg_min:
-                continue
-            if buys_min > 0 and buys5 < buys_min and vol_min > 0 and vol5 < vol_min:
-                continue
-            if SCANNER_REQUIRE_BUY_PRESSURE and ratio_min > 0 and ratio < ratio_min:
+            if vol5 < fb_min_vol:
                 continue
 
-            cands.append(m)
+            candidates.append(m)
         except Exception:
             continue
 
-    # Rank fallback by a combo of 5m change + 5m volume
-    cands.sort(
-        key=lambda x: (
-            float(x.get("price_change_5m_pct") or 0.0),
-            float(x.get("vol_5m_usd") or 0.0),
-        ),
-        reverse=True,
+    if not candidates:
+        log.info(
+            "Raydium fallback[%s]: 0 metas matched fb_min_buys=%d fb_min_vol=%s from %d metas",
+            why,
+            fb_min_buys,
+            fb_min_vol,
+            len(metas),
+        )
+        return []
+
+    # Prefer the most actively traded in the last 5m
+    candidates.sort(key=lambda m: float(m.get("vol_5m_usd") or 0.0), reverse=True)
+    picked = candidates[:fb_max]
+
+    log.info(
+        "Raydium fallback[%s]: picked %d/%d metas (fb_min_buys=%d fb_min_vol=%s fb_max=%d)",
+        why,
+        len(picked),
+        len(candidates),
+        fb_min_buys,
+        fb_min_vol,
+        fb_max,
     )
-    return cands[:RAYDIUM_FALLBACK_LIMIT]
+    return picked
 
 
 # -----------------------------------------------------------------------------
@@ -745,8 +745,8 @@ async def scan_raydium(*args):
 
     try:
         logger.info(
-            "scanner.raydium: starting scan; queries=%s soft_min_liq=$%.0f pf_min_liq=$%.0f "
-            "limit=%d search_limit=%d bypass_pf=%s fallback=%s",
+            "scanner.raydium: starting scan; queries=%s soft_min_liq=$%.0f "
+            "pf_min_liq=$%.0f limit=%d search_limit=%d bypass_pf=%s fallback=%s",
             ",".join(SEARCH_QUERIES),
             SOFT_MIN_LIQ_USD,
             PF_SCAN_MIN_LIQ_USD,
@@ -824,23 +824,23 @@ async def scan_raydium(*args):
         if not RAYDIUM_BYPASS_PF:
             pf_runners = _apply_pf(soft_metas)
 
-        fb: List[Dict[str, Any]] = []
+        fb_metas: List[Dict[str, Any]] = []
         if pf_runners:
             runners = pf_runners
         else:
-            fb = _fallback_candidates(soft_metas)
-            if not fb and soft_metas:
+            fb_metas = _fallback_pick_metas(soft_metas, log=logger, why="ray")
+            if not fb_metas and soft_metas:
                 logger.warning(
                     "Raydium: PF produced 0 runners and fallback found nothing from %d metas (soft-filtered)",
                     len(soft_metas),
                 )
-            runners = fb
+            runners = fb_metas
 
         if DEBUG_PF_RESULT:
             logger.info(
                 "RAY_PF_RESULT pf=%d fb=%d metas=%d pairs=%d",
                 len(pf_runners),
-                len(fb),
+                len(fb_metas),
                 len(soft_metas),
                 len(pairs),
             )
