@@ -54,6 +54,7 @@ from solders.pubkey import Pubkey as PublicKey
 # Try both transaction styles for broad compatibility (Jupiter swap deserialization)
 try:
     from solders.transaction import VersionedTransaction as SVTx
+
     _HAS_VERSIONED = True
 except Exception:
     _HAS_VERSIONED = False
@@ -173,8 +174,10 @@ DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
 # --------------------------------------------------------------------------
 # Optional Postgres (TRADES + POSITIONS)
 # --------------------------------------------------------------------------
+
 PG_METADATA = MetaData()
-_pg_engine: AsyncEngine | None = None
+_PG_ENGINE: Optional[AsyncEngine] = None
+
 
 TRADES = Table(
     "trades",
@@ -220,76 +223,118 @@ POSITIONS = Table(
 )
 
 
-async def init_postgres() -> None:
+def _pg_enabled() -> bool:
     """
-    Initialize global AsyncEngine for Postgres if enabled.
+    Decide if Postgres should be used.
 
-    Uses utils_pkg.db_dsn.pick_pg_dsn() so it works for both local + Render.
-    Also ensures TRADES and POSITIONS tables exist.
+    Priority:
+      - POSITIONS_PG_ENABLED env
+      - PG_ENABLED (from config/env)
+      - default: True if any DSN is present
     """
-    global _pg_engine
-    if not PG_ENABLED or _pg_engine is not None:
-        return
+    env_flag = os.getenv("POSITIONS_PG_ENABLED")
+    if env_flag is not None:
+        return env_flag.strip().lower() in ("1", "true", "yes", "y", "on")
 
+    # Fall back to config-level PG_ENABLED if present
     try:
-        from utils_pkg.db_dsn import pick_pg_dsn  # local import avoids cycles
+        if isinstance(PG_ENABLED, bool):
+            return PG_ENABLED
+    except Exception:
+        pass
 
-        dsn, connect_args = pick_pg_dsn()
-    except Exception as e:
-        logger.warning(f"Postgres init skipped: DSN picker error: {e}")
-        return
+    # If any DSN is present, assume enabled
+    return _get_pg_dsn() is not None
 
+
+def _get_pg_dsn() -> Optional[str]:
+    """
+    Choose the best DSN from env.
+
+    Priority:
+      1) POSITIONS_PG_DSN
+      2) DATABASE_URL
+      3) PG_DSN / PG_DSN_INTERNAL / PG_DSN_EXTERNAL
+    """
+    for key in (
+        "POSITIONS_PG_DSN",
+        "DATABASE_URL",
+        "PG_DSN",
+        "PG_DSN_INTERNAL",
+        "PG_DSN_EXTERNAL",
+    ):
+        v = os.getenv(key)
+        if v and v.strip():
+            return v.strip()
+    return None
+
+
+async def _ensure_pg_engine() -> Optional[AsyncEngine]:
+    """
+    Create the global async SQLAlchemy engine if enabled & DSN present.
+    Safe to call multiple times.
+    """
+    global _PG_ENGINE
+
+    if _PG_ENGINE is not None:
+        return _PG_ENGINE
+
+    backend = (os.getenv("PF_POSITIONS_BACKEND", "pg") or "pg").strip().lower()
+    enabled = _pg_enabled() and backend == "pg"
+
+    if not enabled:
+        logger.info(
+            "PG_INIT_SKIP",
+            extra={"enabled": enabled, "backend": backend},
+        )
+        return None
+
+    dsn = _get_pg_dsn()
     if not dsn:
-        logger.warning("Postgres init skipped: no DSN found")
-        return
-
-    eng = create_async_engine(
-        dsn,
-        echo=False,
-        pool_pre_ping=True,
-        pool_recycle=1800,
-        pool_size=5,
-        max_overflow=5,
-        connect_args=connect_args or {},
-    )
+        logger.warning("PG_INIT_SKIP: no_dsn_env")
+        return None
 
     try:
-        async with eng.begin() as conn:
-            # Simple liveness check
+        _PG_ENGINE = create_async_engine(
+            dsn,
+            pool_pre_ping=True,
+            pool_size=5,
+            max_overflow=5,
+        )
+        mask = dsn.split("@", 1)[-1] if "@" in dsn else dsn
+        logger.info("PG_INIT_OK", extra={"dsn_mask": mask})
+        # Ensure tables exist and basic liveness
+        async with _PG_ENGINE.begin() as conn:
             await conn.execute(text("SELECT 1"))
-            # Create all known tables (TRADES, POSITIONS, etc.)
             await conn.run_sync(PG_METADATA.create_all)
-        _pg_engine = eng
-        logger.info("Postgres ready")
+        return _PG_ENGINE
     except Exception as e:
-        logger.warning(f"Postgres init failed: {e}")
-        try:
-            await eng.dispose()
-        finally:
-            _pg_engine = None
+        logger.error("PG_INIT_FAIL", extra={"err": str(e)[:200]})
+        if _PG_ENGINE is not None:
+            try:
+                await _PG_ENGINE.dispose()
+            except Exception:
+                pass
+        _PG_ENGINE = None
+        return None
 
 
-def get_pg_engine() -> AsyncEngine | None:
+def get_pg_engine() -> Optional[AsyncEngine]:
     """
-    Return the global AsyncEngine (may be None if PG is disabled or init failed).
-
-    This is non-async for legacy callers that only need the engine object and will
-    manage connections themselves.
+    Returns the global AsyncEngine, or None if PG is disabled / failed.
     """
-    return _pg_engine
+    return _PG_ENGINE
 
 
-async def get_pg() -> AsyncEngine | None:
+async def get_pg() -> Optional[AsyncEngine]:
     """
     Async helper: ensure Postgres is initialized and return AsyncEngine (or None).
 
     Safe to `await` from anywhere; if PG is disabled/misconfigured it simply
     returns None and does nothing.
     """
-    global _pg_engine
-    if _pg_engine is None:
-        await init_postgres()
-    return _pg_engine
+    await _ensure_pg_engine()
+    return _PG_ENGINE
 
 
 # --------------------------------------------------------------------------
@@ -422,7 +467,7 @@ def _effective_rpc_url() -> str:
 
 
 # --------------------------------------------------------------------------
-# Initialization / Shutdown (HTTP, Solana, wallet)
+# Initialization / Shutdown (HTTP, Solana, wallet, Postgres, sqlite)
 # --------------------------------------------------------------------------
 
 
@@ -438,7 +483,8 @@ async def init_resources() -> None:
     if session and not session.closed and solana_client and wallet:
         return
 
-    await init_postgres()
+    # DBs first so later helpers can log
+    await _ensure_pg_engine()
     await init_sqlite()
 
     if session is None or session.closed:
@@ -460,7 +506,8 @@ async def init_resources() -> None:
 
 
 async def close_resources() -> None:
-    global session, solana_client, redis, wallet
+    global session, solana_client, redis, wallet, _PG_ENGINE
+
     try:
         if session and not session.closed:
             await session.close()
@@ -468,10 +515,12 @@ async def close_resources() -> None:
         session = None
 
     try:
-        if _pg_engine is not None:
-            await _pg_engine.dispose()
+        if _PG_ENGINE is not None:
+            await _PG_ENGINE.dispose()
     except Exception:
         pass
+    finally:
+        _PG_ENGINE = None
 
     try:
         if solana_client:
@@ -994,8 +1043,10 @@ async def pg_log_trade(
     reason: str | None,
     signature: Any | None = None,
 ) -> None:
-    if _pg_engine is None:
+    eng = await get_pg()
+    if eng is None:
         return
+
     sig_txt: Optional[str] = None
     try:
         if isinstance(signature, str):
@@ -1008,7 +1059,7 @@ async def pg_log_trade(
     except Exception:
         pass
     try:
-        async with _pg_engine.begin() as conn:
+        async with eng.begin() as conn:
             await conn.execute(
                 TRADES.insert().values(
                     ts=datetime.utcnow(),
