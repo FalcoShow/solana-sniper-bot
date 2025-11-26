@@ -113,7 +113,7 @@ SEARCH_QUERIES = [
 RAYDIUM_BYPASS_PF = _b("RAYDIUM_BYPASS_PF", True)
 RAYDIUM_ENABLE_FALLBACK = _b("RAYDIUM_ENABLE_FALLBACK", True)
 
-# New, simple fallback tuning (what you just set in env)
+# New, simple fallback tuning
 RAYDIUM_FB_MIN_BUYS_5M = _i("RAYDIUM_FB_MIN_BUYS_5M", 1)
 RAYDIUM_FB_MIN_VOL5_USD = _f("RAYDIUM_FB_MIN_VOL5_USD", 300.0)
 RAYDIUM_FB_MAX_RUNNERS = max(1, _i("RAYDIUM_FB_MAX_RUNNERS", 3))
@@ -129,6 +129,9 @@ _BASE_SOFT_MAX_AGE_DEFAULT = (
 SOFT_MIN_LIQ_USD = _f("RAYDIUM_SOFT_MIN_LIQ_USD", _BASE_SOFT_LIQ_DEFAULT)
 # NOTE: we do NOT soft-filter on mcap anymore; too many SOL/RAY new tokens have 0 mcap in Dexscreener.
 SOFT_MAX_AGE_MIN = _f("RAYDIUM_SOFT_MAX_AGE_MIN", _BASE_SOFT_MAX_AGE_DEFAULT)
+
+# Hard Raydium age cap (in minutes) – this is what you set to 1440
+RAY_MAX_AGE_MIN = _f("RAY_MAX_AGE_MIN", 0.0)  # 0 = no extra cap
 
 
 # -----------------------------------------------------------------------------
@@ -558,7 +561,7 @@ async def _enrich_ai_and_whales(metas: List[Dict[str, Any]]) -> None:
 
 
 # -----------------------------------------------------------------------------
-# PF-based filtering & ranking + NEW fallback picker
+# PF-based filtering & ranking + fallback picker
 # -----------------------------------------------------------------------------
 
 def _apply_pf(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -597,7 +600,7 @@ def _fallback_pick_metas(
 ) -> List[Dict[str, Any]]:
     """
     Very simple, permissive Raydium fallback:
-    - ignore age and PF scoring
+    - PF scoring is skipped (upstream age/liq filters already applied)
     - keep anything with decent 5m volume + at least 1 buy
     - sort by 5m volume desc and cap by env limit
 
@@ -790,6 +793,25 @@ async def scan_raydium(*args):
             )
             soft_metas = metas
 
+        # --- NEW: hard age cap using RAY_MAX_AGE_MIN (applies to PF and fallback) ---
+        if RAY_MAX_AGE_MIN > 0.0 and soft_metas:
+            before = len(soft_metas)
+            age_filtered: List[Dict[str, Any]] = []
+            for m in soft_metas:
+                age = m.get("token_age_min")
+                if not isinstance(age, (int, float)):
+                    # If we don't know the age, keep it (can tune later if needed)
+                    age_filtered.append(m)
+                elif age <= RAY_MAX_AGE_MIN:
+                    age_filtered.append(m)
+            soft_metas = age_filtered
+            logger.info(
+                "RAY_AGE_FILTER before=%d after=%d max_age_min=%.1f",
+                before,
+                len(soft_metas),
+                RAY_MAX_AGE_MIN,
+            )
+
         if DEBUG_META_SAMPLE:
             if soft_metas:
                 sample = [
@@ -831,7 +853,7 @@ async def scan_raydium(*args):
             fb_metas = _fallback_pick_metas(soft_metas, log=logger, why="ray")
             if not fb_metas and soft_metas:
                 logger.warning(
-                    "Raydium: PF produced 0 runners and fallback found nothing from %d metas (soft-filtered)",
+                    "Raydium: PF produced 0 runners and fallback found nothing from %d metas (soft-filtered + age-capped)",
                     len(soft_metas),
                 )
             runners = fb_metas
