@@ -781,6 +781,15 @@ async def scan_raydium(*args):
             except Exception:
                 continue
 
+        # ⚠️ Safety net: if soft filters nuked everything, fall back to raw metas
+        if not soft_metas and metas:
+            logger.info(
+                "scanner.raydium: soft filters removed all metas (raw=%d); "
+                "falling back to raw metas for PF/fallback",
+                total_metas,
+            )
+            soft_metas = metas
+
         if DEBUG_META_SAMPLE:
             if soft_metas:
                 sample = [
@@ -843,7 +852,7 @@ async def scan_raydium(*args):
             len(pairs),
         )
 
-        # 🔥 Key: send MOMO for whatever runners we're actually using
+        # 🔥 Send MOMO for whatever runners we’re actually using
         if runners:
             await _send_momo_for_runners(runners)
 
