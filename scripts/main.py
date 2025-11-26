@@ -31,6 +31,8 @@ High-level responsibilities:
 - Hardened startup, logging, and shutdown.
 - DSN normalizer -> asyncpg-safe DSNs from any Render/PG env.
 - Global env config for entry filters, momentum, pools, & cooldowns.
+- Exit env + logging helpers (EXIT_TICK, EXIT_STOP_LOSS, EXIT_TSL_ARM, EXIT_TSL_HIT, EXIT_STAGNANT)
+  so the exit loop (part 2) can emit rich telemetry per-position.
 - Unified router buy wrapper (maybe_buy) with rich buy hooks:
       - _buy_hook_submitted  (logs + alerts)
       - _buy_hook_filled     (alerts + exit_engine via Strategy, Notion snapshot)
@@ -993,6 +995,32 @@ RISK_MANAGER_POLL_SEC = _as_float(
 )
 
 # ---------------------------
+# Exit env (shared by Strategy / exit loop) + thresholds
+# ---------------------------
+
+# Hard stop loss (pct below entry, e.g. 8 => -8%)
+EXIT_STOP_LOSS_PCT = _as_float(
+    os.getenv("EXIT_STOP_LOSS_PCT", os.getenv("PF_SL_PCT", "8.0")),
+    8.0,
+)
+
+# Time-based stagnation exit (minutes + min move in either direction)
+EXIT_STAGNANT_MAX_MIN = _as_float(os.getenv("EXIT_STAGNANT_MAX_MIN", "10.0"), 10.0)
+EXIT_STAGNANT_MIN_MOVE_PCT = _as_float(
+    os.getenv("EXIT_STAGNANT_MIN_MOVE_PCT", "5.0"),
+    5.0,
+)
+
+# Trailing stop thresholds:
+# - PF_TSL_ARM_PCT: arm trailing stop once peak gain >= this
+# - PF_TSL_PCT: allowed drawdown from hi-water (e.g. 4.5 => sell after -4.5% from peak)
+PF_TSL_ARM_PCT = _as_float(os.getenv("PF_TSL_ARM_PCT", "10.0"), 10.0)
+PF_TSL_PCT = _as_float(os.getenv("PF_TSL_PCT", "4.5"), 4.5)
+
+# Optional take-profit threshold (not mandatory, but useful if exit loop uses it)
+EXIT_TAKE_PROFIT_PCT = _as_float(os.getenv("EXIT_TP_PCT", "0.0"), 0.0)
+
+# ---------------------------
 # Small helpers
 # ---------------------------
 
@@ -1687,6 +1715,134 @@ async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
         pass
 
 # ---------------------------
+# Exit logging helpers (used in part 2 exit loop)
+# ---------------------------
+
+
+def exit_log_heartbeat(
+    *,
+    mint: str,
+    symbol: Optional[str],
+    age_s: float,
+    pnl_pct: float,
+    hi_water_pct: float,
+    move_pct: Optional[float] = None,
+) -> None:
+    """
+    Per-position heartbeat log emitted on each exit tick.
+
+    This is wired from the exit loop (part 2) right after we compute
+    PnL / hi-water / age, but *before* we apply any exit rules.
+    """
+    try:
+        fields: Dict[str, Any] = {
+            "mint": mint,
+            "symbol": symbol,
+            "age_min": round(age_s / 60.0, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "hi_water_pct": round(hi_water_pct, 2),
+            "stagnant_max_min": EXIT_STAGNANT_MAX_MIN,
+            "stagnant_min_move_pct": EXIT_STAGNANT_MIN_MOVE_PCT,
+        }
+        if move_pct is not None:
+            fields["move_pct"] = round(move_pct, 2)
+        log.event("EXIT_TICK", **fields)
+    except Exception:
+        # logging must never block exits
+        pass
+
+
+def exit_log_stop_loss(
+    *,
+    mint: str,
+    symbol: Optional[str],
+    pnl_pct: float,
+) -> None:
+    """
+    Structured log when the hard stop-loss rule fires.
+    """
+    try:
+        log.event(
+            "EXIT_STOP_LOSS",
+            mint=mint,
+            symbol=symbol,
+            pnl_pct=round(pnl_pct, 2),
+            stop_loss_pct=EXIT_STOP_LOSS_PCT,
+        )
+    except Exception:
+        pass
+
+
+def exit_log_tsl_arm(
+    *,
+    mint: str,
+    symbol: Optional[str],
+    hi_water_pct: float,
+) -> None:
+    """
+    Structured log when trailing stop becomes armed for a position.
+    """
+    try:
+        log.event(
+            "EXIT_TSL_ARM",
+            mint=mint,
+            symbol=symbol,
+            hi_water_pct=round(hi_water_pct, 2),
+            arm_pct=PF_TSL_ARM_PCT,
+        )
+    except Exception:
+        pass
+
+
+def exit_log_tsl_hit(
+    *,
+    mint: str,
+    symbol: Optional[str],
+    hi_water_pct: float,
+    pnl_pct: float,
+) -> None:
+    """
+    Structured log when the trailing stop *fires* (sell triggered).
+    """
+    try:
+        log.event(
+            "EXIT_TSL_HIT",
+            mint=mint,
+            symbol=symbol,
+            hi_water_pct=round(hi_water_pct, 2),
+            pnl_pct=round(pnl_pct, 2),
+            tsl_drawdown_pct=PF_TSL_PCT,
+        )
+    except Exception:
+        pass
+
+
+def exit_log_stagnant(
+    *,
+    mint: str,
+    symbol: Optional[str],
+    age_min: float,
+    pnl_pct: float,
+    move_pct: float,
+) -> None:
+    """
+    Structured log when the stagnation rule fires (chop / no movement exit).
+    """
+    try:
+        log.event(
+            "EXIT_STAGNANT",
+            mint=mint,
+            symbol=symbol,
+            age_min=round(age_min, 2),
+            pnl_pct=round(pnl_pct, 2),
+            move_pct=round(move_pct, 2),
+            stagnant_max_min=EXIT_STAGNANT_MAX_MIN,
+            stagnant_min_move_pct=EXIT_STAGNANT_MIN_MOVE_PCT,
+        )
+    except Exception:
+        pass
+
+# ---------------------------
 # Strategy
 # ---------------------------
 class Strategy:
@@ -1742,14 +1898,16 @@ class Strategy:
             self._gate_state[mint_raw] = st
         return st
 
-    # --- DIAGNOSTICS -----------------------------------------------------
+    # --- DIAGNOSTICS + POSITION HEARTBEAT ------------------------------- #
     async def diag_loop(
         self,
         stop_evt: asyncio.Event,
         interval_s: float = 60.0,
     ) -> None:
         """
-        Periodic diagnostics emitter: logs event rate and rejection counts.
+        Periodic diagnostics emitter:
+          - aggregate event counters
+          - per-position heartbeat logs
         """
         last_total = 0
         while not stop_evt.is_set():
@@ -1757,6 +1915,8 @@ class Strategy:
             et = self._diag["events_total"]
             rate = (et - last_total) / max(interval_s, 1e-3)
             last_total = et
+
+            # Aggregate diag snapshot
             log.event(
                 "DIAG_MINUTE",
                 events_total=self._diag["events_total"],
@@ -1769,6 +1929,103 @@ class Strategy:
                 buys_sub=self._diag["buys_submitted"],
                 buys_fill=self._diag["buys_filled"],
             )
+
+            # --- Per-position heartbeat --------------------------------
+            # One log per open position, capped by POSITION_HEARTBEAT_MAX
+            try:
+                try:
+                    poss = list(all_positions())
+                except Exception:
+                    poss = []
+
+                max_hb = _as_int(os.getenv("POSITION_HEARTBEAT_MAX", "25"), 25)
+                if max_hb <= 0:
+                    continue
+
+                for p in poss[:max_hb]:
+                    try:
+                        mint = str(p.get("mint") or p.get("token") or "").strip()
+                        if not mint:
+                            continue
+
+                        symbol = (
+                            p.get("symbol")
+                            or p.get("ticker")
+                            or p.get("name")
+                            or "?"
+                        )
+
+                        # Token qty
+                        qty_tokens = float(
+                            p.get("amount")
+                            or p.get("qty")
+                            or p.get("size_token")
+                            or 0.0
+                        ) or 0.0
+
+                        # Raw size (lamports/raw tokens)
+                        size_raw_any = (
+                            p.get("amount_raw")
+                            or p.get("position_raw")
+                            or p.get("size_raw")
+                            or 0
+                        )
+                        try:
+                            size_raw = int(size_raw_any)
+                        except Exception:
+                            size_raw = 0
+
+                        # Total entry cost in SOL if available
+                        entry_total_any = (
+                            p.get("entry_total_sol")
+                            or p.get("cost_basis_sol")
+                            or p.get("cost")
+                            or 0.0
+                        )
+                        try:
+                            entry_total_sol = float(entry_total_any)
+                        except Exception:
+                            entry_total_sol = 0.0
+
+                        # Mark price & current value
+                        mark_price = 0.0
+                        try:
+                            if mint and qty_tokens > 0:
+                                mark_price = float(await _route_price_ui(mint))
+                        except Exception:
+                            mark_price = 0.0
+
+                        cur_val = (
+                            mark_price * qty_tokens
+                            if (mark_price > 0 and qty_tokens > 0)
+                            else 0.0
+                        )
+                        pnl_sol = cur_val - entry_total_sol if entry_total_sol > 0 else 0.0
+                        pnl_pct = (
+                            ((cur_val / entry_total_sol) - 1.0) * 100.0
+                            if entry_total_sol > 0
+                            else None
+                        )
+
+                        log.event(
+                            "POSITION_HEARTBEAT",
+                            mint=mint,
+                            symbol=symbol,
+                            qty_tokens=qty_tokens,
+                            size_raw=size_raw,
+                            entry_total_sol=entry_total_sol,
+                            mark_price_sol=mark_price,
+                            cur_val_sol=cur_val,
+                            pnl_sol=pnl_sol,
+                            pnl_pct=pnl_pct,
+                        )
+                    except Exception:
+                        if DEBUG_TX:
+                            traceback.print_exc()
+                        continue
+            except Exception:
+                if DEBUG_TX:
+                    traceback.print_exc()
 
     # --- TRADE TICKS (for momo counts + exit engine) --------------------
     async def on_trade(self, raw_event: Dict[str, Any]) -> None:
@@ -1850,6 +2107,7 @@ class Strategy:
                 if self.momo_allow_no_data_pump:
                     log.event(
                         "MOMO_BYPASS_NO_TRADES_PUMP",
+                        rule="momentum",
                         pool=pool,
                         mint=mint,
                         symbol=symbol,
@@ -1863,6 +2121,7 @@ class Strategy:
 
                 log.event(
                     "MOMO_SKIP_NO_TRADES_PUMP",
+                    rule="momentum",
                     pool=pool,
                     mint=mint,
                     symbol=symbol,
@@ -1884,6 +2143,7 @@ class Strategy:
                 # Jupiter can't price it yet – rely on trades + upstream filters.
                 log.event(
                     "MOMO_PUMP_TRADES_ONLY_OK",
+                    rule="momentum",
                     pool=pool,
                     mint=mint,
                     symbol=symbol,
@@ -1904,6 +2164,7 @@ class Strategy:
             if pool == "raydium":
                 log.event(
                     "MOMO_SKIP_NO_DATA",
+                    rule="momentum",
                     pool=pool,
                     mint=mint,
                     symbol=symbol,
@@ -1918,6 +2179,7 @@ class Strategy:
             # Other pools: strict
             log.event(
                 "MOMO_SKIP_NO_DATA",
+                rule="momentum",
                 pool=pool,
                 mint=mint,
                 symbol=symbol,
@@ -1941,6 +2203,7 @@ class Strategy:
 
         log.event(
             "MOMO_EVAL",
+            rule="momentum",
             pool=pool,
             mint=mint,
             symbol=symbol,
@@ -1963,6 +2226,7 @@ class Strategy:
 
             log.event(
                 "MOMO_REJECT",
+                rule="momentum",
                 pool=pool,
                 mint=mint,
                 symbol=symbol,
@@ -1979,6 +2243,7 @@ class Strategy:
 
         log.event(
             "MOMO_OK",
+            rule="momentum",
             pool=pool,
             mint=mint,
             symbol=symbol,
@@ -2015,7 +2280,18 @@ class Strategy:
                             f".[dedupe] gate already running for {mint_norm} — skip",
                             flush=True,
                         )
+                    log.event(
+                        "RULE_DEDUPE_GATE_SKIP",
+                        mint=mint_norm,
+                        where="gate_candidate",
+                    )
                     return
+                else:
+                    log.event(
+                        "RULE_DEDUPE_GATE_OK",
+                        mint=mint_norm,
+                        where="gate_candidate",
+                    )
 
             pool = str(ui.get("pool") or "").lower()
 
@@ -2079,6 +2355,13 @@ class Strategy:
             )
             if not momo_ok:
                 # strict momentum rejections already logged + diag updated
+                log.event(
+                    "RULE_MOMENTUM_BLOCK",
+                    pool=pool,
+                    mint=mint_norm,
+                    symbol=symbol,
+                    trades=trades,
+                )
                 return
 
             # ---- Guardrails before executing a buy ----------------------
@@ -2093,18 +2376,33 @@ class Strategy:
                 except Exception:
                     pass
                 self._diag["rejected_guardrails"] += 1
+                log.event(
+                    "RULE_GUARDRAILS_EXEC_BLOCK",
+                    where="gate_candidate",
+                    mint=mint_norm,
+                    pool=pool,
+                )
                 return
 
             max_tradeable = MAX_TRADEABLE
             if max_tradeable > 0:
                 try:
                     if len(list(all_positions())) >= max_tradeable:
-                        log.event("BUY_BLOCK_MAX_TRADEABLE", cap=max_tradeable)
+                        log.event(
+                            "BUY_BLOCK_MAX_TRADEABLE",
+                            cap=max_tradeable,
+                        )
                         try:
                             record_buy_result(ok=False, reason="max_tradeable")
                         except Exception:
                             pass
                         self._diag["rejected_guardrails"] += 1
+                        log.event(
+                            "RULE_MAX_TRADEABLE_BLOCK",
+                            where="gate_candidate",
+                            mint=mint_norm,
+                            pool=pool,
+                        )
                         return
                 except Exception:
                     pass
@@ -2124,7 +2422,18 @@ class Strategy:
                         record_buy_result(ok=False, reason="buy_claimed_elsewhere")
                     except Exception:
                         pass
+                    log.event(
+                        "RULE_DEDUPE_BUY_SKIP",
+                        mint=mint_norm,
+                        where="gate_candidate",
+                    )
                     return
+                else:
+                    log.event(
+                        "RULE_DEDUPE_BUY_OK",
+                        mint=mint_norm,
+                        where="gate_candidate",
+                    )
 
             # ---- Execute buy via maybe_buy (supports meta return) -------
             try:
@@ -2322,6 +2631,11 @@ class Strategy:
                 record_buy_result(ok=False, reason="guardrails_top")
             except Exception:
                 pass
+            log.event(
+                "RULE_GUARDRAILS_TOP_BLOCK",
+                pool=pool,
+                reason="pause_or_not_allowed",
+            )
             return
 
         max_tradeable = MAX_TRADEABLE
@@ -2334,9 +2648,23 @@ class Strategy:
                         record_buy_result(ok=False, reason="max_tradeable_top")
                     except Exception:
                         pass
+                    log.event(
+                        "RULE_MAX_TRADEABLE_BLOCK",
+                        where="top",
+                        pool=pool,
+                        cap=max_tradeable,
+                    )
                     return
             except Exception:
                 pass
+
+        # If we got here, guardrails-top passed for this candidate
+        log.event(
+            "RULE_GUARDRAILS_TOP_OK",
+            pool=pool,
+            max_tradeable=max_tradeable,
+            pause=int(PAUSE_TRADING),
+        )
 
         # Extract and normalise mint
         mint_source = _extract_raw_mint(raw_event)
@@ -2398,6 +2726,12 @@ class Strategy:
                 sells5=sells5,
                 age_min=age_min,
             )
+            log.event(
+                "RULE_BASIC_FILTERS_FAIL",
+                pool=pool,
+                mint=mint_norm,
+                symbol=_extract_symbol(raw_event),
+            )
             if DEBUG_LOCAL:
                 print(
                     f"[ENTRY_FILTER_REJECT] pool={pool} sym={_extract_symbol(raw_event)} "
@@ -2419,11 +2753,26 @@ class Strategy:
                 mint=mint_norm,
                 symbol=_extract_symbol(raw_event),
             )
+            log.event(
+                "RULE_BASIC_FILTERS_BYPASS",
+                pool=pool,
+                mint=mint_norm,
+                symbol=_extract_symbol(raw_event),
+                reason="force_ray",
+            )
             if DEBUG_LOCAL:
                 print(
                     f"[ENTRY_FILTER_BYPASS_FORCE_RAYDIUM] sym={_extract_symbol(raw_event)} mint={mint_norm}",
                     flush=True,
                 )
+        else:
+            # Basic filters passed normally
+            log.event(
+                "RULE_BASIC_FILTERS_OK",
+                pool=pool,
+                mint=mint_norm,
+                symbol=_extract_symbol(raw_event),
+            )
 
         # ---------- LIQUIDITY SCREEN -----------------------------------
         dec_from_liq: Optional[int] = None
@@ -2457,6 +2806,12 @@ class Strategy:
                     mint=mint_norm,
                     reason=str((rep or {}).get("reason")),
                 )
+                log.event(
+                    "RULE_LIQ_FILTER_FAIL",
+                    pool=pool,
+                    mint=mint_norm,
+                    reason=str((rep or {}).get("reason")),
+                )
                 try:
                     record_buy_result(ok=False, reason="liquidity_reject")
                 except Exception:
@@ -2472,6 +2827,12 @@ class Strategy:
                 priceImpactPct=(rep or {}).get("priceImpactPct"),
                 dec=dec_from_liq,
             )
+            log.event(
+                "RULE_LIQ_FILTER_OK",
+                pool=pool,
+                mint=mint_norm,
+                dec=dec_from_liq,
+            )
 
         elif LIQ_FILTER_ENABLED and force_ray:
             # Skip liq screen entirely in force-ray mode
@@ -2480,6 +2841,12 @@ class Strategy:
                 pool=pool,
                 mint=mint_norm,
                 symbol=_extract_symbol(raw_event),
+            )
+            log.event(
+                "RULE_LIQ_FILTER_BYPASS",
+                pool=pool,
+                mint=mint_norm,
+                reason="force_ray",
             )
             if DEBUG_LOCAL:
                 print(
@@ -2515,7 +2882,18 @@ class Strategy:
                         f".[dedupe] gate-propose taken for {mint_norm} — skip",
                         flush=True,
                     )
+                log.event(
+                    "RULE_DEDUPE_GATE_SKIP",
+                    where="gate_propose",
+                    mint=mint_norm,
+                )
                 return
+            else:
+                log.event(
+                    "RULE_DEDUPE_GATE_OK",
+                    where="gate_propose",
+                    mint=mint_norm,
+                )
 
         # Momentum enabled → send into gate; otherwise buy immediately
         if self.momo_enabled:
@@ -2531,7 +2909,19 @@ class Strategy:
                         f".[dedupe] buy already claimed for {mint_norm} — skip",
                         flush=True,
                     )
+                log.event(
+                    "RULE_DEDUPE_BUY_SKIP",
+                    where="direct_buy",
+                    mint=mint_norm,
+                )
                 return
+            else:
+                if DEDUPE_ENABLED:
+                    log.event(
+                        "RULE_DEDUPE_BUY_OK",
+                        where="direct_buy",
+                        mint=mint_norm,
+                    )
 
             async with self._sema:
                 try:
@@ -2554,6 +2944,12 @@ class Strategy:
                             record_buy_result(ok=False, reason="guardrails_exec")
                         except Exception:
                             pass
+                        log.event(
+                            "RULE_GUARDRAILS_EXEC_BLOCK",
+                            where="direct_buy",
+                            mint=mint_norm,
+                            pool=pool,
+                        )
                         return
 
                     max_tradeable = MAX_TRADEABLE
@@ -2572,6 +2968,12 @@ class Strategy:
                                     )
                                 except Exception:
                                     pass
+                                log.event(
+                                    "RULE_MAX_TRADEABLE_BLOCK",
+                                    where="direct_buy",
+                                    mint=mint_norm,
+                                    pool=pool,
+                                )
                                 return
                         except Exception:
                             pass
@@ -3320,6 +3722,9 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
       - Shields Strategy handlers from crashing the stream
     """
     strat = Strategy()
+    # Expose this Strategy globally so Raydium scanner can reuse it
+    globals()["strat"] = strat
+
     local_stop = stop_evt or asyncio.Event()
     diag_task = asyncio.create_task(
         strat.diag_loop(local_stop),
@@ -3488,16 +3893,14 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                 candidates=len(candidates),
             )
 
-            # 🔑 Get or create a Strategy instance for Raydium
+            # 🔑 Get or reuse a Strategy instance for Raydium
             s = globals().get("strat")
             if s is None:
                 try:
-                    # Strategy is defined earlier in this module
                     s = Strategy()  # type: ignore[name-defined]
                     globals()["strat"] = s
                     log.event("STRATEGY_INIT_RAYDIUM")
                 except NameError:
-                    # Strategy class not visible yet – just warn (once) and skip
                     if DEBUG_TX and not warned_no_strat:
                         print(
                             "[raydium] Strategy not defined yet; skipping batch",
@@ -3507,7 +3910,6 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                     s = None
 
             if s is None:
-                # Nothing we can do this loop
                 if DEBUG_TX:
                     print("[raydium] strat still not ready; skipping batch", flush=True)
             elif candidates:
