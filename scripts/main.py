@@ -35,6 +35,8 @@ High-level responsibilities:
       - _buy_hook_submitted  (logs + alerts)
       - _buy_hook_filled     (alerts + exit_engine via Strategy, Notion snapshot)
       - _buy_hook_failed     (alerts + guardrail telemetry)
+- log_entry_from_meta: normalize entry meta (lamports_in / amount_raw / spend_sol),
+  log structured ENTRY_META_NORMALIZED, and cache in Redis for diagnostics.
 - Momentum/entry env, including ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP.
 - Optional health endpoint (/health) if aiohttp & HEALTH_PORT present.
 - Optional Sentry initialisation when SENTRY_DSN is set.
@@ -560,8 +562,8 @@ async def maybe_buy(
 
     - Picks the best buy-capable function from utils_pkg.router.
     - If the underlying buy supports `return_meta`, we harvest (sig, entry_meta)
-      and log entry metadata (size, in/out amounts, priceImpact) using
-      log_entry_from_meta so Notion/DB stay in sync.
+      and normalize it via log_entry_from_meta (lamports_in / amount_raw /
+      spend_sol) so Notion/DB/exit-engine stay in sync.
     - Still returns a plain tx signature string (or None), so Strategy and
       other callers remain fully compatible.
 
@@ -622,15 +624,19 @@ async def maybe_buy(
                 sig = v
                 break
 
-    # If we have entry meta, log it for downstream analytics + Notion/DB.
+    # If we have entry meta, log and normalize it for downstream consumers.
     if entry_meta:
+        # raw debug log for troubleshooting
         try:
-            # fire-and-forget structured log for debugging
             log.event(
                 "ENTRY_META",
                 mint=mint,
                 amount_raw=int(entry_meta.get("amount_raw") or 0),
-                in_amount_raw=int(entry_meta.get("in_amount_raw") or 0),
+                in_amount_raw=int(
+                    entry_meta.get("in_amount_raw")
+                    or entry_meta.get("lamports_in")
+                    or 0
+                ),
                 priceImpactPct=entry_meta.get("priceImpactPct"),
                 pool=ui.get("pool") or "unknown",
                 symbol=ui.get("symbol") or ui.get("name") or "?",
@@ -639,16 +645,15 @@ async def maybe_buy(
             # meta logging must never break trading
             pass
 
-        # Persist to PG + Notion (best-effort, never breaks flow)
+        # Best-effort normalization + caching; never break the buy flow
         try:
-            await log_entry_from_meta(  # defined later in this file
+            entry_meta = await log_entry_from_meta(
                 mint=mint,
                 entry_meta=entry_meta,
                 ui=ui,
                 sig=sig,
             )
         except Exception as e:
-            # DB/Notion failures are non-fatal
             try:
                 log.event(
                     "ENTRY_META_LOG_FAIL",
@@ -1358,6 +1363,90 @@ def _normalize_spend_sol(d: Dict[str, Any]) -> float:
     return spend
 
 
+async def log_entry_from_meta(
+    *,
+    mint: str,
+    entry_meta: Dict[str, Any],
+    ui: Dict[str, Any],
+    sig: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Normalize router entry_meta and cache a compact view in Redis for
+    diagnostics / downstream consumers.
+
+    - ensures lamports_in and amount_raw are ints
+    - derives spend_sol via _normalize_spend_sol
+    - emits ENTRY_META_NORMALIZED structured log
+    - best-effort Redis cache: entry_meta:{mint}
+    """
+    meta: Dict[str, Any] = dict(entry_meta or {})
+
+    # Normalize lamports_in / amount_raw
+    lamports_in = int(
+        meta.get("in_amount_raw")
+        or meta.get("lamports_in")
+        or meta.get("amount_in_raw")
+        or 0
+    )
+    amount_raw = int(meta.get("amount_raw") or meta.get("out_raw") or 0)
+
+    meta["lamports_in"] = lamports_in
+    meta["amount_raw"] = amount_raw
+
+    # Build a small payload to reuse our spend_sol normalization helper
+    payload: Dict[str, Any] = {
+        "mint": mint,
+        "symbol": ui.get("symbol") or ui.get("name") or meta.get("symbol"),
+        "pool": ui.get("pool") or meta.get("pool") or "unknown",
+        "lamports_in": lamports_in,
+        "in_amount_raw": lamports_in,
+        "amount_raw": amount_raw,
+        "spend_sol": meta.get("spend_sol"),
+    }
+
+    spend_sol = _normalize_spend_sol(payload)
+    meta["spend_sol"] = spend_sol
+
+    # Structured log for debugging / telemetry
+    try:
+        log.event(
+            "ENTRY_META_NORMALIZED",
+            mint=mint,
+            symbol=payload.get("symbol"),
+            pool=payload.get("pool"),
+            lamports_in=lamports_in,
+            amount_raw=amount_raw,
+            spend_sol=spend_sol,
+            sig=sig,
+            priceImpactPct=meta.get("priceImpactPct"),
+        )
+    except Exception:
+        pass
+
+    # Best-effort Redis cache for external diagnostics / scripts
+    try:
+        if redis is not None:
+            key = f"entry_meta:{mint}"
+            data = json.dumps(
+                {
+                    "mint": mint,
+                    "symbol": payload.get("symbol"),
+                    "pool": payload.get("pool"),
+                    "lamports_in": lamports_in,
+                    "amount_raw": amount_raw,
+                    "spend_sol": spend_sol,
+                    "sig": sig,
+                    "priceImpactPct": meta.get("priceImpactPct"),
+                }
+            )
+            await redis.set(key, data, ex=24 * 3600)
+    except Exception:
+        # Redis failures are non-fatal and must never block trading
+        pass
+
+    return meta
+
+
 async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
     """
     Called when a BUY has been submitted to the router.
@@ -1930,6 +2019,16 @@ class Strategy:
 
             pool = str(ui.get("pool") or "").lower()
 
+            # Ensure spend_sol is baked into UI so BUY_SUBMITTED / exit see
+            # the same size the router is about to use.
+            try:
+                spend_hint = _compute_spend_sol(ui)
+                if spend_hint > 0:
+                    ui["spend_sol"] = float(spend_hint)
+            except Exception:
+                # Never block on size estimation
+                pass
+
             # Initialise gate state (keyed by raw mint so on_trade() updates)
             st = self._get_gate_state(mint_raw)
             st["trades"] = 0
@@ -2436,6 +2535,14 @@ class Strategy:
 
             async with self._sema:
                 try:
+                    # Ensure spend_sol is present for BUY_SUBMITTED / exit hooks
+                    try:
+                        spend_hint = _compute_spend_sol(ui)
+                        if spend_hint > 0:
+                            ui["spend_sol"] = float(spend_hint)
+                    except Exception:
+                        pass
+
                     if PAUSE_TRADING or not buys_allowed():
                         if DEBUG_LOCAL:
                             print(
@@ -2627,6 +2734,7 @@ class Strategy:
         # Cooldown between processing new tokens
         await asyncio.sleep(LOOP_COOLDOWN_SEC)
 
+
 # ---------------------------
 # Mint normalization wrappers
 # ---------------------------
@@ -2656,6 +2764,223 @@ def _is_probable_mint(s: str) -> bool:
         except Exception:
             return False
     return bool(_pp_normalize(s))
+
+
+# ---------------------------
+# Entry meta logging (PG + analytics)
+# ---------------------------
+_ENTRY_LOG_TABLE_READY: bool = False
+
+
+async def _ensure_entry_log_table() -> None:
+    """
+    Ensure the entry_log table exists in the primary PG DSN.
+
+    We use the generic PG DSN if present, otherwise fall back to PNL DSN.
+    Safe no-op if asyncpg / DSN are missing.
+    """
+    global _ENTRY_LOG_TABLE_READY
+
+    if _ENTRY_LOG_TABLE_READY:
+        return
+    if not asyncpg:
+        return
+
+    dsn = _PG_DSN_ASYNC or _PNL_DSN_ASYNC
+    if not dsn:
+        return
+
+    try:
+        conn = await asyncpg.connect(dsn)
+        try:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS entry_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    mint TEXT NOT NULL,
+                    symbol TEXT,
+                    pool TEXT,
+                    signature TEXT,
+                    route TEXT,
+                    spend_sol NUMERIC,
+                    in_amount_raw NUMERIC,
+                    out_amount_raw NUMERIC,
+                    price_impact NUMERIC,
+                    meta JSONB,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            _ENTRY_LOG_TABLE_READY = True
+            log.event("ENTRY_PG_READY", dsn=_PG_DSN_MASK or "<dsn>")
+        finally:
+            await conn.close()
+    except Exception as e:
+        if DEBUG_TX:
+            traceback.print_exc()
+        log.event("ENTRY_PG_ERROR", when="ensure_table", error=str(e))
+
+
+def _spend_from_meta_and_ui(entry_meta: Dict[str, Any], ui: Dict[str, Any]) -> float:
+    """
+    Derive spend_sol from entry_meta (preferred) and fall back to UI/env.
+    """
+    # Prefer lamport-sized fields from meta
+    lamports_val = None
+    for k in (
+        "in_amount_raw",
+        "inAmount",
+        "lamports_in",
+        "amount_in_raw",
+        "input_amount",
+    ):
+        v = entry_meta.get(k)
+        if v not in (None, ""):
+            lamports_val = v
+            break
+
+    if lamports_val is not None:
+        try:
+            lamports_f = float(lamports_val)
+            lps = float(globals().get("LAMPORTS_PER_SOL", 1_000_000_000))
+            return max(0.0, lamports_f / lps)
+        except Exception:
+            pass
+
+    # Then SOL-sized fields from meta
+    for k in ("spend_sol", "amount_sol", "size_sol", "size_in_sol", "size"):
+        v = entry_meta.get(k)
+        if v not in (None, ""):
+            try:
+                return max(0.0, float(v))
+            except Exception:
+                pass
+
+    # Finally fall back to UI/env helper
+    try:
+        return max(0.0, float(_compute_spend_sol(ui)))
+    except Exception:
+        return 0.0
+
+
+async def log_entry_from_meta(
+    *,
+    mint: str,
+    entry_meta: Dict[str, Any],
+    ui: Dict[str, Any],
+    sig: Optional[str] = None,
+) -> None:
+    """
+    Persist a single entry into Postgres (and emit structured logs).
+
+    This is called once per *successful* router-level buy that returns meta.
+    Failures are swallowed so trading flow is never blocked.
+    """
+    if not entry_meta:
+        return
+
+    # Structured log for observability
+    try:
+        log.event(
+            "ENTRY_META_PLAIN",
+            mint=mint,
+            symbol=ui.get("symbol") or ui.get("name") or "?",
+            pool=ui.get("pool") or "unknown",
+            sig=sig,
+            amount_raw=int(entry_meta.get("amount_raw") or 0),
+            in_amount_raw=int(entry_meta.get("in_amount_raw") or 0),
+            priceImpactPct=entry_meta.get("priceImpactPct"),
+        )
+    except Exception:
+        pass
+
+    if not asyncpg:
+        # No PG, nothing else to do
+        return
+
+    dsn = _PG_DSN_ASYNC or _PNL_DSN_ASYNC
+    if not dsn:
+        return
+
+    try:
+        await _ensure_entry_log_table()
+    except Exception:
+        # Table creation failure is non-fatal
+        pass
+
+    pool = ui.get("pool") or "unknown"
+    symbol = ui.get("symbol") or ui.get("name") or "?"
+    route = ui.get("route") or entry_meta.get("route") or None
+
+    spend_sol = _spend_from_meta_and_ui(entry_meta, ui)
+
+    in_raw = entry_meta.get("in_amount_raw")
+    out_raw = entry_meta.get("amount_raw")
+    price_impact = entry_meta.get("priceImpactPct")
+
+    # Normalize for PG
+    def _as_num(x: Any) -> Optional[float]:
+        if x in (None, "", 0, 0.0):
+            return None
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    in_raw_f = _as_num(in_raw)
+    out_raw_f = _as_num(out_raw)
+    price_imp_f = _as_num(price_impact)
+
+    try:
+        conn = await asyncpg.connect(dsn)
+        try:
+            await conn.execute(
+                """
+                INSERT INTO entry_log (
+                    at_utc,
+                    mint,
+                    symbol,
+                    pool,
+                    signature,
+                    route,
+                    spend_sol,
+                    in_amount_raw,
+                    out_amount_raw,
+                    price_impact,
+                    meta
+                )
+                VALUES (NOW() AT TIME ZONE 'UTC', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+                """,
+                mint,
+                symbol,
+                pool,
+                sig,
+                route,
+                spend_sol if spend_sol > 0 else None,
+                in_raw_f,
+                out_raw_f,
+                price_imp_f,
+                json.dumps(entry_meta),
+            )
+            log.event(
+                "ENTRY_META_PG_INSERTED",
+                mint=mint,
+                symbol=symbol,
+                pool=pool,
+                sig=sig,
+                spend_sol=spend_sol,
+            )
+        finally:
+            await conn.close()
+    except Exception as e:
+        if DEBUG_TX:
+            traceback.print_exc()
+        try:
+            log.event("ENTRY_META_PG_ERROR", error=str(e))
+        except Exception:
+            pass
+
 
 # ---------------------------
 # Daily PnL helpers  (USES NORMALIZED DSN)
