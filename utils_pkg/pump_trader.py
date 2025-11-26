@@ -15,29 +15,12 @@ Key features
 - Noroute cooldown: if a mint can’t route, back off per-mint to avoid thrashing.
 - Extensive telemetry via logging_setup.get_logger().event + bump() counters.
 - All optional deps handled via soft imports; safe in DRYRUN.
-- NEW: Direct Pump.fun helpers:
+- Direct Pump.fun helpers:
     * buy_pump_token(mint, sol_amount, slippage_bps)
     * buy_direct_lamports(mint, in_amount_lamports, slippage_bps)
   for router’s Jupiter→Pump fallback.
-
-Env toggles (selected)
-----------------------
-DRYRUN / DRY_RUN
-PF_TRADE_RISK_PCT, PF_TRADE_MIN_SOL, PF_TRADE_MAX_SOL, PF_TRADE_STEP_SOL
-PF_TRADE_AUTOSIZE_REFRESH_SEC
-MIN_SOL_BALANCE
-PF_SLIPPAGE_BPS
-PF_PRIORITY_SOL, PF_JITO_TIP_SOL (alias), PF_COMPUTE_UNITS
-PF_POOLS
-PF_DEBUG_TX
-MAX_CONCURRENT_BUYS, BUY_COOLDOWN_SEC (alias PF_COOLDOWN_SEC)
-NOROUTE_COOLDOWN_SEC
-ENTRY_* (momentum & liquidity windows)
-TELEGRAM_ENABLED, TELEGRAM_NOTIFY_FILLED
-DEDUPE_ENABLED, DEDUPE_TTL_SEC
-CONFIRM_TIMEOUT_SEC, CONFIRM_COMMITMENT (processed/confirmed/finalized)
-ROUTEGUARD_ALLOW_NO_ROUTE, ROUTEGUARD_REQUIRE_SELL
-PF_USE_LOCAL_FALLBACK
+- NEW: On successful BUY, upsert an open row into Postgres `positions` table via
+  utils_pkg.core_utils.pg_upsert_position (wallet+mint+pool is unique key).
 """
 
 import asyncio
@@ -79,7 +62,7 @@ try:
     from utils_pkg.telegram_utils import notify_trade_fill
 except Exception:  # pragma: no cover
 
-    async def notify_trade_fill(*_a, **_k):  # type: ignore
+    async def notify_trade_fill(*_a, **_k):  # type: ignore[func-returns-value]
         return None
 
 # Wallet helpers
@@ -105,10 +88,10 @@ try:
     from utils_pkg.liquidity import looks_like_mint, screen_token  # type: ignore
 except Exception:  # pragma: no cover
 
-    def looks_like_mint(_: str) -> bool:  # type: ignore
+    def looks_like_mint(_: str) -> bool:  # type: ignore[override]
         return False
 
-    async def screen_token(_: str):  # type: ignore
+    async def screen_token(_: str):  # type: ignore[override]
         return True, {"ok": True}
 
 # Optional global guardrails & dedupe
@@ -116,24 +99,34 @@ try:
     from utils_pkg.guardrails import buys_allowed, record_buy_result  # type: ignore
 except Exception:  # pragma: no cover
 
-    def buys_allowed() -> bool:  # type: ignore
+    def buys_allowed() -> bool:  # type: ignore[override]
         return True
 
-    def record_buy_result(*_a, **_k):  # type: ignore
+    def record_buy_result(*_a, **_k):  # type: ignore[override]
         return None
 
 try:
     from utils_pkg.dedupe import claim_once  # type: ignore
 except Exception:  # pragma: no cover
 
-    def claim_once(_key: str, _ttl: int = 60) -> bool:  # type: ignore
+    def claim_once(_key: str, _ttl: int = 60) -> bool:  # type: ignore[override]
         return True
 
 # Optional external routeguard
 try:
     from utils_pkg.routeguard import preflight as rg_preflight  # type: ignore
 except Exception:  # pragma: no cover
-    rg_preflight = None  # type: ignore
+    rg_preflight = None  # type: ignore[assignment]
+
+# NEW: Postgres positions helpers (soft import)
+try:
+    from utils_pkg.core_utils import pg_upsert_position  # type: ignore
+except Exception:  # pragma: no cover
+
+    async def pg_upsert_position(**_kwargs):  # type: ignore[func-returns-value]
+        # No-op if Postgres isn’t available; keeps code paths async-safe.
+        return None
+
 
 log = get_logger()
 
@@ -171,6 +164,7 @@ def _envi_alias(keys: List[str], d: int) -> int:
                 pass
     return d
 
+
 # =============================================================================
 # ENV & knobs
 # =============================================================================
@@ -193,7 +187,9 @@ if MIN_SOL_PER_TRADE > MAX_SOL_PER_TRADE:
 
 # Pacing/concurrency
 BUY_COOLDOWN_SEC = _envi_alias(["BUY_COOLDOWN_SEC", "PF_COOLDOWN_SEC"], 120)
-MAX_CONCURRENT_BUYS = max(1, _envi_alias(["MAX_CONCURRENT_BUYS", "PF_MAX_CONCURRENT"], 2))
+MAX_CONCURRENT_BUYS = max(
+    1, _envi_alias(["MAX_CONCURRENT_BUYS", "PF_MAX_CONCURRENT"], 2)
+)
 NOROUTE_COOLDOWN_SEC = _envi("NOROUTE_COOLDOWN_SEC", 600)
 
 # Route guard policies (internal fallback)
@@ -287,6 +283,7 @@ def _cooldown_ok(key: str, ttl: int) -> bool:
 def _note_no_route(key: str) -> None:
     _last_no_route[key] = time.time()
 
+
 # =============================================================================
 # Momentum gate
 # =============================================================================
@@ -325,6 +322,7 @@ async def _momentum_ok(mint: str) -> bool:
     )
     return ok
 
+
 # =============================================================================
 # Liquidity-aware size boost
 # =============================================================================
@@ -355,6 +353,7 @@ async def _liquidity_size_boost(mint: str, base_sol: float) -> float:
     sized = base_sol * boost
     return min(MAX_SOL_PER_TRADE, max(MIN_SOL_PER_TRADE, sized))
 
+
 # =============================================================================
 # Fallback autosizer
 # =============================================================================
@@ -368,6 +367,7 @@ async def _autosize_by_wallet(owner: str) -> float:
     base = _cached_wallet_sol * max(0.0, min(1.0, RISK_PCT_OF_WALLET))
     base = min(MAX_SOL_PER_TRADE, max(MIN_SOL_PER_TRADE, base))
     return _round_step(base, STEP_SOL)
+
 
 # =============================================================================
 # Internal Route Guard (fallback)
@@ -402,6 +402,7 @@ async def _internal_preflight(
             return False, q_buy
 
     return True, q_buy
+
 
 # =============================================================================
 # PumpPortal (Lightning) helpers
@@ -449,9 +450,7 @@ async def _pp_post_json(
 ) -> Dict[str, Any]:
     def _req():
         r = requests.post(url, json=body, timeout=timeout, allow_redirects=False)
-        ctype = (r.headers.get("content-type") or "").split(";")[
-            0
-        ].strip().lower()
+        ctype = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
         if r.status_code == 200 and ctype != "application/json":
             head = (r.text or "")[:200].replace("\n", " ")
             raise TemporaryPumpPortal(
@@ -489,6 +488,7 @@ def _pp_candidates(raw_hint: str) -> List[Tuple[str, str]]:
             out.append((s, "as-raw"))
     return out
 
+
 # =============================================================================
 # Hooks types & helpers
 # =============================================================================
@@ -523,6 +523,7 @@ async def _fire_failed(h: FailedHook, payload: Dict[str, Any]) -> None:
     except Exception as e:
         log.warning("on_buy_failed hook failed: %s", e)
 
+
 # =============================================================================
 # Buy execution helpers (Jupiter + optional confirm)
 # =============================================================================
@@ -556,7 +557,7 @@ async def _maybe_confirm(sig: Optional[str]) -> Optional[str]:
     if CONFIRM_TIMEOUT_SEC <= 0:
         return sig
     try:
-        if _confirm_signature:  # type: ignore
+        if _confirm_signature:  # type: ignore[attr-defined]
             ok = await _confirm_signature(
                 sig, timeout=CONFIRM_TIMEOUT_SEC, commitment=CONFIRM_COMMITMENT
             )
@@ -568,6 +569,7 @@ async def _maybe_confirm(sig: Optional[str]) -> Optional[str]:
     except Exception as e:
         log.event("CONFIRM_ERROR", sig=sig, err=str(e))
     return sig
+
 
 # =============================================================================
 # Public: maybe_buy (strategy entry)
@@ -691,7 +693,7 @@ async def maybe_buy(
     if not skip_jupiter:
         if rg_preflight:
             try:
-                allow_buy, q_buy = await rg_preflight(  # type: ignore
+                allow_buy, q_buy = await rg_preflight(  # type: ignore[misc]
                     mint=mint, lamports_in=lamports_in
                 )
             except Exception:
@@ -754,6 +756,21 @@ async def maybe_buy(
                         sig=sig,
                         symbol=symbol or "-",
                     )
+
+                    # NEW: upsert open position row (wallet+mint+pool)
+                    try:
+                        await pg_upsert_position(
+                            wallet=owner,
+                            mint=mint,
+                            pool=pool,
+                            symbol=symbol or None,
+                            size_raw=None,
+                            size_sol=spend_sol,
+                            entry_price=None,
+                            status="open",
+                        )
+                    except Exception as e:
+                        log.warning("pg_upsert_position (jupiter) failed: %s", e)
 
                     # 🔔 Telegram fill (BUY)
                     if TELEGRAM_ENABLED and TELEGRAM_NOTIFY_FILLED:
@@ -901,6 +918,24 @@ async def maybe_buy(
                                         sig=sig2,
                                     )
 
+                                    # NEW: upsert position
+                                    try:
+                                        await pg_upsert_position(
+                                            wallet=owner,
+                                            mint=mint,
+                                            pool=pool,
+                                            symbol=symbol or None,
+                                            size_raw=None,
+                                            size_sol=spend_sol,
+                                            entry_price=None,
+                                            status="open",
+                                        )
+                                    except Exception as e:
+                                        log.warning(
+                                            "pg_upsert_position (pp_local) failed: %s",
+                                            e,
+                                        )
+
                                     if (
                                         TELEGRAM_ENABLED
                                         and TELEGRAM_NOTIFY_FILLED
@@ -965,6 +1000,21 @@ async def maybe_buy(
                         sig=sig,
                     )
 
+                    # NEW: upsert position
+                    try:
+                        await pg_upsert_position(
+                            wallet=owner,
+                            mint=mint,
+                            pool=pool,
+                            symbol=symbol or None,
+                            size_raw=None,
+                            size_sol=spend_sol,
+                            entry_price=None,
+                            status="open",
+                        )
+                    except Exception as e:
+                        log.warning("pg_upsert_position (pp_remote) failed: %s", e)
+
                     if TELEGRAM_ENABLED and TELEGRAM_NOTIFY_FILLED:
                         try:
                             await notify_trade_fill(
@@ -1013,6 +1063,23 @@ async def maybe_buy(
                             spend_sol=spend_sol,
                             sig=sig2,
                         )
+
+                        # NEW: upsert position
+                        try:
+                            await pg_upsert_position(
+                                wallet=owner,
+                                mint=mint,
+                                pool=pool,
+                                symbol=symbol or None,
+                                size_raw=None,
+                                size_sol=spend_sol,
+                                entry_price=None,
+                                status="open",
+                            )
+                        except Exception as e:
+                            log.warning(
+                                "pg_upsert_position (pp_sign) failed: %s", e
+                            )
 
                         if TELEGRAM_ENABLED and TELEGRAM_NOTIFY_FILLED:
                             try:
@@ -1064,8 +1131,9 @@ async def maybe_buy(
         record_buy_result(ok=False, reason="end_of_paths")
         return None
 
+
 # =============================================================================
-# NEW: Direct Pump.fun helpers for router fallback
+# Direct Pump.fun helpers for router fallback
 # =============================================================================
 async def buy_pump_token(
     *,
@@ -1221,6 +1289,7 @@ async def buy_direct_lamports(
         pool=pool,
     )
 
+
 # =============================================================================
 # Mint resolvers (unchanged behavior, hardened)
 # =============================================================================
@@ -1319,6 +1388,7 @@ def resolve_true_mint(
     if (suf is None) and _looks_base58(base):
         return base
     return None
+
 
 __all__ = [
     "maybe_buy",

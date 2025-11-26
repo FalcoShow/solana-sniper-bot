@@ -6,6 +6,7 @@
 # - Jupiter v6 swap helpers (versioned and legacy)
 # - entry price cache and small utils
 # - savings transfer (lazy import of Transaction to avoid module import errors)
+# - Postgres helpers for TRADES + POSITIONS tables
 # This file intentionally uses ASCII-only characters for maximum compatibility.
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from sqlalchemy import (
     Float,
     DateTime,
     text,
+    UniqueConstraint,
 )
 
 from .alert_manager import AlertManager
@@ -169,7 +171,7 @@ COINGECKO_SOL_API = (
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
 
 # --------------------------------------------------------------------------
-# Optional Postgres
+# Optional Postgres (TRADES + POSITIONS)
 # --------------------------------------------------------------------------
 PG_METADATA = MetaData()
 _pg_engine: AsyncEngine | None = None
@@ -190,11 +192,45 @@ TRADES = Table(
     Column("signature", String(128), nullable=True),
 )
 
+POSITIONS = Table(
+    "positions",
+    PG_METADATA,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("wallet", String(64), nullable=False),
+    Column("mint", String(64), nullable=False),
+    Column("pool", String(32), nullable=False),
+    Column("symbol", String(64), nullable=True),
+    Column("size_raw", Float, nullable=True),
+    Column("size_sol", Float, nullable=True),
+    Column("entry_price", Float, nullable=True),
+    Column("opened_at", DateTime, nullable=False, default=datetime.utcnow),
+    Column("updated_at", DateTime, nullable=False, default=datetime.utcnow),
+    Column(
+        "status",
+        String(16),
+        nullable=False,
+        server_default=text("'open'"),
+    ),
+    UniqueConstraint(
+        "wallet",
+        "mint",
+        "pool",
+        name="uq_positions_wallet_mint_pool",
+    ),
+)
+
 
 async def init_postgres() -> None:
+    """
+    Initialize global AsyncEngine for Postgres if enabled.
+
+    Uses utils_pkg.db_dsn.pick_pg_dsn() so it works for both local + Render.
+    Also ensures TRADES and POSITIONS tables exist.
+    """
     global _pg_engine
     if not PG_ENABLED or _pg_engine is not None:
         return
+
     try:
         from utils_pkg.db_dsn import pick_pg_dsn  # local import avoids cycles
 
@@ -202,9 +238,11 @@ async def init_postgres() -> None:
     except Exception as e:
         logger.warning(f"Postgres init skipped: DSN picker error: {e}")
         return
+
     if not dsn:
         logger.warning("Postgres init skipped: no DSN found")
         return
+
     eng = create_async_engine(
         dsn,
         echo=False,
@@ -214,9 +252,12 @@ async def init_postgres() -> None:
         max_overflow=5,
         connect_args=connect_args or {},
     )
+
     try:
         async with eng.begin() as conn:
+            # Simple liveness check
             await conn.execute(text("SELECT 1"))
+            # Create all known tables (TRADES, POSITIONS, etc.)
             await conn.run_sync(PG_METADATA.create_all)
         _pg_engine = eng
         logger.info("Postgres ready")
@@ -229,6 +270,25 @@ async def init_postgres() -> None:
 
 
 def get_pg_engine() -> AsyncEngine | None:
+    """
+    Return the global AsyncEngine (may be None if PG is disabled or init failed).
+
+    This is non-async for legacy callers that only need the engine object and will
+    manage connections themselves.
+    """
+    return _pg_engine
+
+
+async def get_pg() -> AsyncEngine | None:
+    """
+    Async helper: ensure Postgres is initialized and return AsyncEngine (or None).
+
+    Safe to `await` from anywhere; if PG is disabled/misconfigured it simply
+    returns None and does nothing.
+    """
+    global _pg_engine
+    if _pg_engine is None:
+        await init_postgres()
     return _pg_engine
 
 
@@ -805,7 +865,7 @@ async def is_whale_wallet(
 
 
 # --------------------------------------------------------------------------
-# Notion logging
+# Notion + Postgres trade logging
 # --------------------------------------------------------------------------
 
 
@@ -1095,6 +1155,121 @@ async def log_entry_from_meta(
         )
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------
+# Postgres helpers for positions (BUY/SELL wiring)
+# --------------------------------------------------------------------------
+
+
+async def pg_upsert_position(
+    *,
+    wallet: str,
+    mint: str,
+    pool: str,
+    symbol: str | None = None,
+    size_raw: float | None = None,
+    size_sol: float | None = None,
+    entry_price: float | None = None,
+    status: str = "open",
+) -> None:
+    """
+    Insert or update an open/active position.
+
+    - Unique key is (wallet, mint, pool).
+    - opened_at is set on first insert and left unchanged on updates.
+    - updated_at is always bumped to now().
+    """
+    eng = await get_pg()
+    if eng is None:
+        return
+
+    try:
+        async with eng.begin() as conn:
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO positions (
+                        wallet, mint, pool, symbol,
+                        size_raw, size_sol, entry_price,
+                        opened_at, updated_at, status
+                    )
+                    VALUES (
+                        :wallet, :mint, :pool, :symbol,
+                        :size_raw, :size_sol, :entry_price,
+                        now(), now(), :status
+                    )
+                    ON CONFLICT (wallet, mint, pool)
+                    DO UPDATE SET
+                        symbol      = EXCLUDED.symbol,
+                        size_raw    = EXCLUDED.size_raw,
+                        size_sol    = EXCLUDED.size_sol,
+                        entry_price = EXCLUDED.entry_price,
+                        status      = EXCLUDED.status,
+                        updated_at  = now();
+                    """
+                ),
+                {
+                    "wallet": wallet,
+                    "mint": mint,
+                    "pool": pool,
+                    "symbol": symbol,
+                    "size_raw": size_raw,
+                    "size_sol": size_sol,
+                    "entry_price": entry_price,
+                    "status": status or "open",
+                },
+            )
+    except Exception as e:
+        logger.warning(f"pg_upsert_position failed: {e}")
+
+
+async def pg_close_position(
+    *,
+    wallet: str,
+    mint: str,
+    pool: str,
+    final_size_raw: float | None = None,
+    final_size_sol: float | None = None,
+    status: str = "closed",
+) -> None:
+    """
+    Mark an existing position as closed (or any other terminal status).
+
+    Used on SELL_FILLED / EXIT events. We keep the row but flip status and bump
+    updated_at; you can optionally zero or override size fields.
+    """
+    eng = await get_pg()
+    if eng is None:
+        return
+
+    try:
+        async with eng.begin() as conn:
+            await conn.execute(
+                text(
+                    """
+                    UPDATE positions
+                    SET
+                        status     = :status,
+                        size_raw   = COALESCE(:final_size_raw, size_raw),
+                        size_sol   = COALESCE(:final_size_sol, size_sol),
+                        updated_at = now()
+                    WHERE wallet = :wallet
+                      AND mint   = :mint
+                      AND pool   = :pool;
+                    """
+                ),
+                {
+                    "wallet": wallet,
+                    "mint": mint,
+                    "pool": pool,
+                    "status": status or "closed",
+                    "final_size_raw": final_size_raw,
+                    "final_size_sol": final_size_sol,
+                },
+            )
+    except Exception as e:
+        logger.warning(f"pg_close_position failed: {e}")
 
 
 # --------------------------------------------------------------------------

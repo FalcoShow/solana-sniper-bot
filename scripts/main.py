@@ -3122,16 +3122,15 @@ class Strategy:
                                             if isinstance(v, float) and v > 0:
                                                 amount_raw = int(v)
                                                 break
-
-                                    await exit_engine.on_buy_filled(
-                                        ev,
-                                        tx_sig=tx_sig,
-                                        amount_raw=amount_raw,
-                                    )
-                                except Exception:
-                                    if DEBUG_LOCAL:
-                                        traceback.print_exc()
-
+try:
+    await exit_engine.on_buy_filled(
+        ev,
+        tx_sig=tx_sig,
+        amount_raw=amount_raw,
+    )
+except Exception:
+    if DEBUG_TX:
+        traceback.print_exc()
                             self._diag["buys_filled"] += 1
                             try:
                                 record_buy_result(ok=True, reason="executed", sig=tx_sig)
