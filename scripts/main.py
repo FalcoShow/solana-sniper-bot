@@ -935,6 +935,9 @@ MIN_INITIAL_BUY_SOL = _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
 MAX_NAME_LEN = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
 ENTRY_MAX_AGE_MIN = _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20)
 MIN_POOL_AGE_MIN = _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3)
+# NEW – separate cap for Raydium runners (in minutes).
+# 0 = no additional cap (use your own preference here; I’d start with 1440 = 24h)
+RAY_MAX_AGE_MIN = _as_float(os.getenv("RAY_MAX_AGE_MIN", "1440"), 1440.0)
 
 SYMBOL_BLACKLIST = {
     s.strip().upper()
@@ -2621,6 +2624,43 @@ class Strategy:
             os.getenv("ENTRY_FORCE_BUY_RAYDIUM", "0") == "1"
             and pool == "raydium"
         )
+        # --- Raydium-specific age guard (we only want relatively "fresh" runners)
+        age_min = float(
+            raw_event.get("token_age_min")
+            or raw_event.get("age_min")
+            or 0.0
+        )
+
+        if (
+            pool == "raydium"
+            and not force_ray  # let you bypass manually if you REALLY want old coins
+            and RAY_MAX_AGE_MIN > 0
+            and age_min > RAY_MAX_AGE_MIN
+        ):
+            self._diag["rejected_filters"] += 1
+            log.event(
+                "ENTRY_RAY_AGE_REJECT",
+                pool=pool,
+                mint=mint_norm,
+                symbol=_extract_symbol(raw_event),
+                age_min=age_min,
+                ray_max_age_min=RAY_MAX_AGE_MIN,
+            )
+            try:
+                record_buy_result(
+                    ok=False,
+                    reason="ray_age_reject",
+                    age_min=age_min,
+                )
+            except Exception:
+                pass
+            if DEBUG_LOCAL:
+                print(
+                    f"[ENTRY_RAY_AGE_REJECT] sym={_extract_symbol(raw_event)} "
+                    f"age={age_min:.1f}m > {RAY_MAX_AGE_MIN:.1f}m — skip",
+                    flush=True,
+                )
+            return
 
         # Top-level guardrails
         if PAUSE_TRADING or not buys_allowed():
