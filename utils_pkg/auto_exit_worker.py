@@ -65,6 +65,15 @@ EXIT_WORKER_SLIPPAGE_BPS: int = _env_int(
     "EXIT_WORKER_SLIPPAGE_BPS",
     PF_SLIPPAGE_BPS,
 )
+# Default exit config (used when a new BUY fills)
+EXIT_DEFAULT_SL_PCT: float = _env_float("EXIT_STOP_LOSS_PCT", 8.0)
+EXIT_DEFAULT_TSL_ARM_PCT: float = _env_float("PF_TSL_ARM_PCT", 10.0)
+EXIT_DEFAULT_TSL_PCT: float = _env_float("PF_TSL_PCT", 4.5)
+EXIT_DEFAULT_STAGNANT_MAX_MIN: int = _env_int("EXIT_STAGNANT_MAX_MIN", 7)
+EXIT_DEFAULT_STAGNANT_MIN_MOVE_PCT: float = _env_float(
+    "EXIT_STAGNANT_MIN_MOVE_PCT",
+    6.0,
+)
 
 # How much of the position to dump; 1.0 = 100%
 try:
@@ -379,6 +388,38 @@ def _extract_amount_raw_from_req(req: ExitRequest) -> Optional[int]:
 
     return amt_final if amt_final > 0 else None
 
+def _build_default_exit_config(ev: ExitRequest | Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a default exit config for a new BUY.
+
+    Uses env defaults but lets the event override them via:
+      sl_pct, tsl_arm_pct, tsl_pct, stagnant_max_min, stagnant_min_move_pct
+    """
+    cfg: Dict[str, Any] = {}
+
+    def _float(ev_key: str, default: float) -> float:
+        v = ev.get(ev_key)
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    def _int(ev_key: str, default: int) -> int:
+        v = ev.get(ev_key)
+        try:
+            return int(v)
+        except Exception:
+            return int(default)
+
+    cfg["sl_pct"] = _float("sl_pct", EXIT_DEFAULT_SL_PCT)
+    cfg["tsl_arm_pct"] = _float("tsl_arm_pct", EXIT_DEFAULT_TSL_ARM_PCT)
+    cfg["tsl_pct"] = _float("tsl_pct", EXIT_DEFAULT_TSL_PCT)
+    cfg["stagnant_max_min"] = _int("stagnant_max_min", EXIT_DEFAULT_STAGNANT_MAX_MIN)
+    cfg["stagnant_min_move_pct"] = _float(
+        "stagnant_min_move_pct",
+        EXIT_DEFAULT_STAGNANT_MIN_MOVE_PCT,
+    )
+    return cfg
 
 # ============================================================================
 # Exit engine – logic front-end
@@ -433,8 +474,9 @@ class _ExitEngine:
         We construct an exit_request payload and put it into Redis.
         A separate worker loop later executes the sell.
 
-        If we *cannot* infer a position size, we log EXIT_ENGINE_SKIP_NO_SIZE
-        and return – this is the guard that previously fired.
+        Previously, if we *could not* infer a position size, we logged
+        EXIT_ENGINE_SKIP_NO_SIZE and returned. That meant **no exit job** and
+        no auto-exit. We now do a best-effort fallback instead.
         """
         if not self.enabled:
             return
@@ -471,15 +513,32 @@ class _ExitEngine:
         if tx_sig:
             tx_sig = str(tx_sig)
 
+        # --- Spend SOL (diagnostic only, but we normalise it) -----------
+        # Reuse helper so spend_sol is consistent with other modules.
+        spend_sol = ev.get("spend_sol") or ev.get("entry_spend_sol") or 0.0
+        try:
+            spend_sol = float(spend_sol)
+        except Exception:
+            spend_sol = 0.0
+
         # --- Position size (raw tokens) ---------------------------------
+        # 1) explicit argument from caller wins
+        # 2) obvious fields on the event
+        # 3) generic helper + UI/decimals derivation
+        # 4) last-resort estimate from spend_sol + price + decimals
+
         if amount_raw is None:
             for k in (
                 "position_raw",
                 "amount_raw",
                 "out_amount",
+                "out_amount_raw",
+                "amount_out",       # some paths use this spelling
                 "raw_amount_out",
                 "raw_out",
                 "size_raw",
+                "base_amount_raw",
+                "base_size_raw",
                 "token_amount_raw",
             ):
                 v = ev.get(k)
@@ -487,30 +546,86 @@ class _ExitEngine:
                     amount_raw = int(v)
                     break
 
+        # 2.5) generic helper which also honours sell_pct etc
+        if amount_raw is None or amount_raw <= 0:
+            probe = dict(ev)
+            maybe = _extract_amount_raw_from_req(probe)
+            if maybe is not None and maybe > 0:
+                amount_raw = maybe
+
+        # 3) derive from ui+decimals if we still have nothing
         if amount_raw is None or amount_raw <= 0:
             derived = _derive_raw_from_ui(ev)
             if derived is not None and derived > 0:
                 amount_raw = derived
 
+        # 4) last-resort: estimate from spend_sol + entry price + decimals
         if amount_raw is None or amount_raw <= 0:
-            # This is the only place we should log EXIT_ENGINE_SKIP_NO_SIZE now.
+            price_keys = (
+                "price_entry_ui",
+                "entry_price_ui",
+                "fill_price_ui",
+                "price_ui",
+                "price",
+            )
+            price = None
+            for pk in price_keys:
+                v = ev.get(pk)
+                if v is None:
+                    continue
+                try:
+                    f = float(v)
+                    if f > 0:
+                        price = f
+                        break
+                except Exception:
+                    continue
+
+            dec = None
+            for dk in ("dec", "decimals", "token_decimals"):
+                v = ev.get(dk)
+                if v is None:
+                    continue
+                try:
+                    di = int(v)
+                    if di >= 0:
+                        dec = di
+                        break
+                except Exception:
+                    continue
+
+            if spend_sol > 0 and price and dec is not None:
+                try:
+                    ui_qty = float(spend_sol) / float(price)
+                    rough_raw = int(ui_qty * (10 ** int(dec)))
+                    if rough_raw > 0:
+                        amount_raw = rough_raw
+                        log.info(
+                            "EXIT_ENGINE_FALLBACK_FROM_SPEND",
+                            extra={
+                                "mint": mint,
+                                "spend_sol": spend_sol,
+                                "price": price,
+                                "dec": dec,
+                                "amount_raw": rough_raw,
+                            },
+                        )
+                except Exception:
+                    pass
+
+        # If we *still* have no size, log but DO NOT crash anything.
+        if amount_raw is None or amount_raw <= 0:
             log.info(
-                "EXIT_ENGINE_SKIP_NO_SIZE",
+                "EXIT_ENGINE_FALLBACK_FULL_SIZE_FAILED",
                 extra={
                     "mint": mint,
                     "keys": list(ev.keys()),
-                    "spend_sol": ev.get("spend_sol"),
+                    "spend_sol": spend_sol,
                     "pool": ev.get("pool"),
                 },
             )
+            # We bail here because we truly cannot infer the position.
             return
-
-        # --- Spend SOL (diagnostic only) --------------------------------
-        spend_sol = ev.get("spend_sol") or ev.get("entry_spend_sol") or 0.0
-        try:
-            spend_sol = float(spend_sol)
-        except Exception:
-            spend_sol = 0.0
 
         # --- General metadata -------------------------------------------
         reason = str(ev.get("reason", "on_buy_filled"))
@@ -524,6 +639,9 @@ class _ExitEngine:
         if not isinstance(follow_stats, dict):
             follow_stats = {}
 
+        # Build default exit config for this BUY
+        exit_cfg = _build_default_exit_config(ev)
+
         payload: ExitRequest = {
             "mint": mint,
             "position_raw": int(amount_raw),
@@ -532,6 +650,7 @@ class _ExitEngine:
             "reason": reason,
             "follow_stats": follow_stats,
             "source": "on_buy_filled",
+            "exit_config": exit_cfg,
         }
         if tx_sig:
             payload["tx_sig"] = tx_sig
