@@ -7,7 +7,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from .core_utils import redis
+from .core_utils import redis, _am, create_task
 
 # Optional: best-effort sell result logger (if defined in core_utils)
 try:  # pragma: no cover - optional dependency
@@ -659,6 +659,9 @@ class _ExitEngine:
             "follow_stats": follow_stats,
             "source": "on_buy_filled",
             "exit_config": exit_cfg,
+            # extra context for alerts
+            "symbol": ev.get("symbol") or ev.get("name"),
+            "pool": ev.get("pool") or "unknown",
         }
         if tx_sig:
             payload["tx_sig"] = tx_sig
@@ -676,6 +679,27 @@ class _ExitEngine:
                     "tx_sig": tx_sig,
                 },
             )
+    # Optional AlertManager notification (Telegram / Notion)
+    try:
+        symbol = req.get("symbol") or req.get("name") or mint
+        pool = req.get("pool") or "unknown"
+
+        create_task(
+            _am().notify_trade_fill(
+                side="SELL",
+                mint=mint,
+                symbol=symbol,
+                pool=pool,
+                sig=str(sig) if sig else None,
+                spend_sol=spend_sol,
+                out_amount=amount_raw,
+            )
+        )
+    except Exception as e:
+        log.warning(
+            "EXIT_WORKER_ALERT_FAIL",
+            extra={"mint": mint, "err": str(e)[:200]},
+        )
 
         if EXIT_ON_BUY_FILLED:
             log.info(
