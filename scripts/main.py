@@ -35,7 +35,7 @@ High-level responsibilities:
   so the exit loop (part 2) can emit rich telemetry per-position.
 - Unified router buy wrapper (maybe_buy) with rich buy hooks:
       - _buy_hook_submitted  (logs + alerts)
-      - _buy_hook_filled     (alerts + exit_engine via Strategy, Notion snapshot)
+      - _buy_hook_filled     (alerts + exit_engine via Strategy/this hook, Notion snapshot)
       - _buy_hook_failed     (alerts + guardrail telemetry)
 - log_entry_from_meta: normalize entry meta (lamports_in / amount_raw / spend_sol),
   log structured ENTRY_META_NORMALIZED, and cache in Redis for diagnostics.
@@ -1597,12 +1597,9 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
       - structured logs
       - primary alert (Telegram / AlertManager)
       - optional intraday Notion snapshot
+      - NOTIFY EXIT ENGINE (so exit worker can manage TP/SL/TSL/stagnation)
 
     NOTE:
-      Exit / auto-sell logic is handled *after RPC confirmation* inside
-      Strategy (_gate_candidate / direct-buy path), which calls
-      exit_engine.on_buy_filled(ev, ...) exactly once per real fill.
-
       Because 'ev' is a dict passed by reference, normalizing ev["spend_sol"]
       here ensures the exit engine sees the same non-zero size.
     """
@@ -1661,6 +1658,22 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
                 "ALERT_BUY_FILLED_FAIL",
                 extra={"err": str(_e)[:200]},
             )
+
+    # ✅ NEW: push the fill into the exit engine so the sell worker
+    # has a guaranteed, normalized view of the position.
+    if EXIT_ENGINE_ENABLED:
+        try:
+            await exit_engine.on_buy_filled(ev)
+        except Exception as e:
+            try:
+                log.event(
+                    "EXIT_ENGINE_ON_BUY_FILLED_FAIL",
+                    err=str(e)[:200],
+                    mint=ev.get("mint"),
+                    symbol=ev.get("symbol"),
+                )
+            except Exception:
+                pass
 
     # Kick an intraday Notion push (debounced, safe if disabled)
     asyncio.create_task(_notion_intraday_snapshot_push())
@@ -3327,7 +3340,7 @@ def _spend_from_meta_and_ui(entry_meta: Dict[str, Any], ui: Dict[str, Any]) -> f
         return 0.0
 
 
-async def log_entry_from_meta(
+async def log_entry_pg_from_meta(
     *,
     mint: str,
     entry_meta: Dict[str, Any],
@@ -3337,8 +3350,8 @@ async def log_entry_from_meta(
     """
     Persist a single entry into Postgres (and emit structured logs).
 
-    This is called once per *successful* router-level buy that returns meta.
-    Failures are swallowed so trading flow is never blocked.
+    NOTE: This is separate from the Redis/normalization log_entry_from_meta
+    defined in part 1. Call this helper explicitly if you want PG logging.
     """
     if not entry_meta:
         return
