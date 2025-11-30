@@ -31,11 +31,12 @@ High-level responsibilities:
 - Hardened startup, logging, and shutdown.
 - DSN normalizer -> asyncpg-safe DSNs from any Render/PG env.
 - Global env config for entry filters, momentum, pools, & cooldowns.
-- Exit env + logging helpers (EXIT_TICK, EXIT_STOP_LOSS, EXIT_TSL_ARM, EXIT_TSL_HIT, EXIT_STAGNANT)
-  so the exit loop (part 2) can emit rich telemetry per-position.
+- Exit env + logging helpers (EXIT_TICK, EXIT_STOP_LOSS, EXIT_TSL_ARM, EXIT_TSL_HIT,
+  EXIT_STAGNANT) so the exit loop (part 2 + utils_pkg.auto_sell) can emit rich
+  telemetry per-position.
 - Unified router buy wrapper (maybe_buy) with rich buy hooks:
       - _buy_hook_submitted  (logs + alerts)
-      - _buy_hook_filled     (alerts + exit_engine via Strategy/this hook, Notion snapshot)
+      - _buy_hook_filled     (alerts + exit_engine, Notion snapshot)
       - _buy_hook_failed     (alerts + guardrail telemetry)
 - log_entry_from_meta: normalize entry meta (lamports_in / amount_raw / spend_sol),
   log structured ENTRY_META_NORMALIZED, and cache in Redis for diagnostics.
@@ -252,7 +253,7 @@ except Exception:  # pragma: no cover
     _pkg_is_dryrun = True  # type: ignore[assignment]
 
 # Exit engine + worker: the engine enqueues exit_request:* in Redis,
-# and the worker consumes them. (Loops wired in part 2.)
+# and the worker consumes them. (Loops wired in part 2 / auto_sell.)
 try:
     from utils_pkg.auto_exit_worker import exit_worker_loop, exit_engine  # type: ignore
 except Exception:  # pragma: no cover
@@ -266,6 +267,20 @@ except Exception:  # pragma: no cover
         async def on_buy_filled(self, *_a, **_kw): ...
 
     exit_engine = _NoopExit()  # type: ignore
+
+# Auto-sell loop (main exit loop; started in part 2 main())
+try:
+    from utils_pkg.auto_sell import exit_engine_loop  # type: ignore
+except Exception:  # pragma: no cover
+
+    async def exit_engine_loop() -> None:  # type: ignore
+        """
+        Fallback no-op loop if utils_pkg.auto_sell is missing.
+        This prevents crashes; real implementation is in auto_sell.py.
+        """
+        while True:
+            await asyncio.sleep(float(os.getenv("EXIT_LOOP_INTERVAL_SEC", "15")))
+
 
 # Optional position / guardrail helpers
 try:
@@ -295,7 +310,7 @@ except Exception:  # pragma: no cover
         return []
 
 
-# Optional extra risk loop (separate from auto_exit_worker)
+# Optional extra risk loop (separate from auto_exit_worker / auto_sell)
 try:
     from utils_pkg.risk_manager import risk_manager_loop  # type: ignore
 except Exception:  # pragma: no cover
@@ -903,7 +918,24 @@ _PNL_DSN_ASYNC, _PG_DSN_ASYNC, _PG_DSN_MASK = _pick_env_dsn()
 # ---------------------------
 # Config (env)
 # ---------------------------
-EXIT_ENGINE_ENABLED = _as_bool(os.getenv("EXIT_ENGINE_ENABLED", "1"), True)
+
+# Exit engine / auto-sell toggles:
+# We treat any of these as enabling the exit loop:
+#   EXIT_ENGINE_ENABLED=1, EXIT_ENGINE=1, ENABLE_EXIT_ENGINE=1, ENABLE_AUTO_SELL=1.
+_RAW_EXIT_ENABLED = _as_bool(
+    os.getenv("EXIT_ENGINE_ENABLED", os.getenv("EXIT_ENGINE", "1")),
+    True,
+)
+_AUTO_SELL_ENABLED = _as_bool(
+    os.getenv("ENABLE_AUTO_SELL", os.getenv("AUTO_SELL_ENABLED", "0")),
+    False,
+)
+ENABLE_EXIT_ENGINE = _RAW_EXIT_ENABLED or _AUTO_SELL_ENABLED or _as_bool(
+    os.getenv("ENABLE_EXIT_ENGINE", "0"),
+    False,
+)
+EXIT_ENGINE_ENABLED = ENABLE_EXIT_ENGINE
+
 DEDUPE_ENABLED = _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True)
 DEDUPE_TTL_SEC = _as_int(os.getenv("PF_DEDUPE_TTL_SEC", "3600"), 3600)
 LIQ_FILTER_ENABLED = _as_bool(os.getenv("ENTRY_LIQ_FILTER", "1"), True)
@@ -936,7 +968,6 @@ MAX_NAME_LEN = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
 ENTRY_MAX_AGE_MIN = _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20)
 MIN_POOL_AGE_MIN = _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3)
 # NEW – separate cap for Raydium runners (in minutes).
-# 0 = no additional cap (use your own preference here; I’d start with 1440 = 24h)
 RAY_MAX_AGE_MIN = _as_float(os.getenv("RAY_MAX_AGE_MIN", "1440"), 1440.0)
 
 SYMBOL_BLACKLIST = {
@@ -1597,7 +1628,8 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
       - structured logs
       - primary alert (Telegram / AlertManager)
       - optional intraday Notion snapshot
-      - NOTIFY EXIT ENGINE (so exit worker can manage TP/SL/TSL/stagnation)
+      - NOTIFY EXIT ENGINE (so exit worker / auto_sell can manage
+        TP/SL/TSL/stagnation)
 
     NOTE:
       Because 'ev' is a dict passed by reference, normalizing ev["spend_sol"]
@@ -1659,7 +1691,7 @@ async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
                 extra={"err": str(_e)[:200]},
             )
 
-    # ✅ NEW: push the fill into the exit engine so the sell worker
+    # ✅ Push the fill into the exit engine so the sell worker
     # has a guaranteed, normalized view of the position.
     if EXIT_ENGINE_ENABLED:
         try:
@@ -1747,8 +1779,8 @@ def exit_log_heartbeat(
     """
     Per-position heartbeat log emitted on each exit tick.
 
-    This is wired from the exit loop (part 2) right after we compute
-    PnL / hi-water / age, but *before* we apply any exit rules.
+    This is wired from the exit loop (part 2 / auto_sell) right after we
+    compute PnL / hi-water / age, but *before* we apply any exit rules.
     """
     try:
         fields: Dict[str, Any] = {
@@ -4092,7 +4124,8 @@ async def _start_background_tasks(
             hour_utc=DAILY_PNL_HOUR_UTC,
         )
 
-    # Auto-exit worker: processes exit_request:* in Redis and executes sells
+    # Auto-exit worker: processes exit_request:* in Redis and executes sells.
+    # This is the "exit loop" and drives EXIT_TICK / EXIT_* logs from exit_engine.
     if _as_bool(os.getenv("EXIT_WORKER_ENABLED", "1"), True):
         if redis is None:
             log.event(
@@ -4180,6 +4213,7 @@ def _boot_banner() -> None:
     pools = ",".join(sorted(POOLS_FILTER)) if POOLS_FILTER else "<all>"
     effective_dryrun = _dryrun_env_on() or bool(_pkg_is_dryrun)
     pump_trades = _env_bool("PUMP_SUBSCRIBE_TRADES", True)
+    exit_worker_enabled = _as_bool(os.getenv("EXIT_WORKER_ENABLED", "1"), True)
     print(
         "\n=== 🟢 sniper main boot ===\n"
         f"DRYRUN={effective_dryrun}\n"
@@ -4193,6 +4227,7 @@ def _boot_banner() -> None:
         f"allow_no_data_pump={int(ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP)}\n"
         f"LIQ_FILTER={int(LIQ_FILTER_ENABLED)} | "
         f"EXIT_ENGINE={int(EXIT_ENGINE_ENABLED)} | "
+        f"EXIT_WORKER={int(exit_worker_enabled)} | "
         f"MAX_TRADEABLE={MAX_TRADEABLE}\n"
         f"POOLS={pools} | PUMP_TRADES={int(pump_trades)}\n"
         f"PG(asyncpg) DSN={_PG_DSN_MASK or '<none>'} | HEALTH_PORT={HEALTH_PORT or 'off'}\n"

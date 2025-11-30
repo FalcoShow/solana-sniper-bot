@@ -4,21 +4,54 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from .core_utils import redis
+
+# Optional: best-effort sell result logger (if defined in core_utils)
+try:  # pragma: no cover - optional dependency
+    from .core_utils import record_sell_result  # type: ignore
+except Exception:  # noqa: BLE001
+    record_sell_result = None  # type: ignore[assignment]
+
 from utils_pkg.lightning_impl import sell_via_lightning
 
+# -----------------------------------------------------------------------------
+# Logger (with safety shims for .event / .every)
+# -----------------------------------------------------------------------------
 log = logging.getLogger("sniper.exit_worker")
 
-# Type alias for clarity
+
+if not hasattr(log, "event"):
+
+    def _event(name: str, **kw: Any) -> None:  # pragma: no cover - shim
+        log.info("%s %s", name, kw)
+
+    setattr(log, "event", _event)
+
+if not hasattr(log, "every"):
+
+    _every_cache: Dict[str, int] = {}
+
+    def _every(key: str, n: int = 60, msg: str | None = None, **kw: Any) -> None:  # pragma: no cover - shim
+        c = _every_cache.get(key, 0) + 1
+        _every_cache[key] = c
+        if c % max(1, n) == 0:
+            if msg:
+                log.info("%s %s", msg, kw)
+            else:
+                log.info("%s %s", key, kw)
+
+    setattr(log, "every", _every)
+
+# Type alias
 ExitRequest = Dict[str, Any]
 
-# ============================================================================
+
+# -----------------------------------------------------------------------------
 # Env helpers
-# ============================================================================
-
-
+# -----------------------------------------------------------------------------
 def _env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
     if v is None:
@@ -40,18 +73,15 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
-# ============================================================================
+# -----------------------------------------------------------------------------
 # Global config
-# ============================================================================
-
-# Any of these will put the exit worker into dryrun mode
+# -----------------------------------------------------------------------------
 DRYRUN: bool = (
     _env_bool("DRYRUN", False)
     or _env_bool("DRY_RUN", False)
     or _env_bool("IS_DRYRUN", False)
 )
 
-# Master flag – if this is off, all front-end hooks are no-ops
 EXIT_ENGINE_ENABLED: bool = _env_bool("EXIT_ENGINE_ENABLED", True)
 
 # Background worker that actually sends sells
@@ -59,12 +89,17 @@ EXIT_WORKER_ENABLED: bool = _env_bool("EXIT_WORKER_ENABLED", True)
 EXIT_WORKER_POLL_SEC: float = _env_float("EXIT_WORKER_POLL_SEC", 3.0)
 EXIT_WORKER_BATCH: int = _env_int("EXIT_WORKER_BATCH", 5)
 
+# Heartbeat / observability
+EXIT_WORKER_HEARTBEAT_SEC: float = _env_float("EXIT_WORKER_HEARTBEAT_SEC", 30.0)
+EXIT_WORKER_IDLE_LOG_EVERY_TICKS: int = _env_int("EXIT_WORKER_IDLE_LOG_EVERY_TICKS", 10)
+
 # Slippage configuration
 PF_SLIPPAGE_BPS: int = _env_int("PF_SLIPPAGE_BPS", 200)
 EXIT_WORKER_SLIPPAGE_BPS: int = _env_int(
     "EXIT_WORKER_SLIPPAGE_BPS",
     PF_SLIPPAGE_BPS,
 )
+
 # Default exit config (used when a new BUY fills)
 EXIT_DEFAULT_SL_PCT: float = _env_float("EXIT_STOP_LOSS_PCT", 8.0)
 EXIT_DEFAULT_TSL_ARM_PCT: float = _env_float("PF_TSL_ARM_PCT", 10.0)
@@ -92,42 +127,47 @@ EXIT_REQUEST_TTL_SEC: int = _env_int("EXIT_REQUEST_TTL_SEC", 600)
 EXIT_WORKER_MIN_RAW: int = _env_int("EXIT_WORKER_MIN_RAW", 0)
 
 # Only used for sanity logs when comparing to SOL
-LAMPORTS_PER_SOL = 1_000_000_000
+LAMPORTS_PER_SOL: int = 1_000_000_000
+
+# -----------------------------------------------------------------------------
+# Worker stats (for heartbeat + diagnostics)
+# -----------------------------------------------------------------------------
+_worker_stats: Dict[str, Any] = {
+    "ticks": 0,
+    "jobs_seen": 0,
+    "jobs_processed": 0,
+    "sells_ok": 0,
+    "sells_err": 0,
+    "skipped_no_amount": 0,
+    "last_job_ts": None,
+}
 
 
-# ============================================================================
+# -----------------------------------------------------------------------------
 # Size helpers
-# ============================================================================
-
-
+# -----------------------------------------------------------------------------
 def _job_spend_sol(job: Dict[str, Any]) -> float:
     """
     Normalize exit job size into SOL and write back job['spend_sol'].
 
-    We will try, in order:
-      1) job['spend_sol'], job['amount_sol'], job['size_sol'], job['size']
-      2) lamport fields -> convert to SOL:
-         job['lamports_in'], job['in_amount_raw'], job['amount_raw'], job['base_size_raw']
-      3) fallback to 0.0
-
-    This mirrors the _normalize_spend_sol logic in main.py so exit
-    engine + alerts always see a consistent spend_sol when possible.
+    This mirrors the _normalize_spend_sol logic used on the entry side so that
+    alerts / analytics / exit decisions all see a consistent spend_sol.
     """
     cand = job.get("spend_sol", None)
 
-    # --- SOL-sized candidates first ---
+    # SOL-sized fields first
     if cand in (None, "", 0, 0.0):
         for k in ("amount_sol", "size_sol", "size"):
-            v = job.get(k, None)
+            v = job.get(k)
             if v not in (None, ""):
                 cand = v
                 break
 
-    # --- Lamports -> SOL ---
+    # Lamports -> SOL
     if cand in (None, "", 0, 0.0):
         lamports_val = None
         for k in ("lamports_in", "in_amount_raw", "amount_raw", "base_size_raw"):
-            v = job.get(k, None)
+            v = job.get(k)
             if v not in (None, ""):
                 lamports_val = v
                 break
@@ -139,7 +179,6 @@ def _job_spend_sol(job: Dict[str, Any]) -> float:
             except Exception:
                 cand = 0.0
 
-    # --- Final numeric cleanup ---
     try:
         size_sol = float(cand) if cand not in (None, "") else 0.0
     except Exception:
@@ -152,17 +191,16 @@ def _job_spend_sol(job: Dict[str, Any]) -> float:
     return size_sol
 
 
-# ============================================================================
+# -----------------------------------------------------------------------------
 # Redis helpers (exit_request storage)
-# ============================================================================
-
-
+# -----------------------------------------------------------------------------
 async def _scan_exit_requests(limit: int) -> List[str]:
     """
     Scan Redis for exit_request:* keys, up to `limit`.
     Returns a list of key names.
     """
     if redis is None:
+        log.event("EXIT_WORKER_NO_REDIS", where="scan")
         return []
 
     keys: List[str] = []
@@ -243,7 +281,7 @@ async def _store_exit_request(payload: ExitRequest) -> Optional[str]:
     exits for the same mint simply overwrite each other (idempotent semantics).
     """
     if redis is None:
-        log.debug("EXIT_ENGINE_NO_REDIS_FOR_STORE")
+        log.event("EXIT_ENGINE_NO_REDIS_FOR_STORE")
         return None
 
     mint = str(payload.get("mint", "")).strip()
@@ -263,11 +301,9 @@ async def _store_exit_request(payload: ExitRequest) -> Optional[str]:
         return None
 
 
-# ============================================================================
+# -----------------------------------------------------------------------------
 # Amount helpers (token raw, not SOL)
-# ============================================================================
-
-
+# -----------------------------------------------------------------------------
 def _derive_raw_from_ui(req: ExitRequest) -> Optional[int]:
     """
     Try to derive a raw token amount from ui amount + decimals.
@@ -280,14 +316,7 @@ def _derive_raw_from_ui(req: ExitRequest) -> Optional[int]:
       Decimal keys:
         dec / decimals / token_decimals
     """
-    ui_keys = (
-        "position_ui",
-        "amount_ui",
-        "size_ui",
-        "size",
-        "qty_ui",
-        "qty",
-    )
+    ui_keys = ("position_ui", "amount_ui", "size_ui", "size", "qty_ui", "qty")
     dec_keys = ("dec", "decimals", "token_decimals")
 
     ui: Optional[float] = None
@@ -388,6 +417,7 @@ def _extract_amount_raw_from_req(req: ExitRequest) -> Optional[int]:
 
     return amt_final if amt_final > 0 else None
 
+
 def _build_default_exit_config(ev: ExitRequest | Dict[str, Any]) -> Dict[str, Any]:
     """
     Build a default exit config for a new BUY.
@@ -414,18 +444,20 @@ def _build_default_exit_config(ev: ExitRequest | Dict[str, Any]) -> Dict[str, An
     cfg["sl_pct"] = _float("sl_pct", EXIT_DEFAULT_SL_PCT)
     cfg["tsl_arm_pct"] = _float("tsl_arm_pct", EXIT_DEFAULT_TSL_ARM_PCT)
     cfg["tsl_pct"] = _float("tsl_pct", EXIT_DEFAULT_TSL_PCT)
-    cfg["stagnant_max_min"] = _int("stagnant_max_min", EXIT_DEFAULT_STAGNANT_MAX_MIN)
+    cfg["stagnant_max_min"] = _int(
+        "stagnant_max_min",
+        EXIT_DEFAULT_STAGNANT_MAX_MIN,
+    )
     cfg["stagnant_min_move_pct"] = _float(
         "stagnant_min_move_pct",
         EXIT_DEFAULT_STAGNANT_MIN_MOVE_PCT,
     )
     return cfg
 
-# ============================================================================
+
+# -----------------------------------------------------------------------------
 # Exit engine – logic front-end
-# ============================================================================
-
-
+# -----------------------------------------------------------------------------
 class _ExitEngine:
     """
     Exit engine (front-end):
@@ -434,7 +466,7 @@ class _ExitEngine:
     - on_buy_filled: tolerant API used by Strategy to enqueue exits.
     - enqueue_exit_request: generic API for risk manager / manual exits.
 
-    Calls store exit_request payloads in Redis. The background worker
+    Stores exit_request payloads in Redis. The background worker
     (exit_worker_loop) performs the actual sells by calling sell_via_lightning.
     """
 
@@ -444,7 +476,6 @@ class _ExitEngine:
     # ------------------------------------------------------------------ #
     # Hooks called by Strategy / scanners
     # ------------------------------------------------------------------ #
-
     async def on_trade_tick(self, raw_event: Dict[str, Any]) -> None:
         """
         Called on every trade tick (for future use).
@@ -452,7 +483,7 @@ class _ExitEngine:
         """
         if not self.enabled:
             return
-        # hook point for future logic
+        # hook point for future follow-through logic
         return
 
     async def on_buy_filled(
@@ -465,28 +496,18 @@ class _ExitEngine:
         """
         Called by Strategy AFTER a BUY is confirmed on-chain.
 
-        Typical usage:
-
-            await exit_engine.on_buy_filled(ev)
-            await exit_engine.on_buy_filled(ev, tx_sig)
-            await exit_engine.on_buy_filled(ev, tx_sig, amount_raw=..)
-
         We construct an exit_request payload and put it into Redis.
         A separate worker loop later executes the sell.
-
-        Previously, if we *could not* infer a position size, we logged
-        EXIT_ENGINE_SKIP_NO_SIZE and returned. That meant **no exit job** and
-        no auto-exit. We now do a best-effort fallback instead.
         """
         if not self.enabled:
             return
         if redis is None:
-            log.debug("EXIT_ENGINE_NO_REDIS")
+            log.event("EXIT_ENGINE_NO_REDIS", where="on_buy_filled")
             return
         if not isinstance(ev, dict):
             return
 
-        # --- Mint --------------------------------------------------------
+        # Mint
         mint = (
             ev.get("mint")
             or ev.get("token")
@@ -500,9 +521,9 @@ class _ExitEngine:
                 extra={"ev_keys": list(ev.keys())},
             )
             return
-        mint = str(mint)
+        mint = str(mint).strip()
 
-        # --- Signature (tolerant) ---------------------------------------
+        # Signature
         if tx_sig is None:
             tx_sig = (
                 ev.get("signature")
@@ -513,27 +534,21 @@ class _ExitEngine:
         if tx_sig:
             tx_sig = str(tx_sig)
 
-        # --- Spend SOL (diagnostic only, but we normalise it) -----------
-        # Reuse helper so spend_sol is consistent with other modules.
+        # Spend SOL (diagnostic only)
         spend_sol = ev.get("spend_sol") or ev.get("entry_spend_sol") or 0.0
         try:
             spend_sol = float(spend_sol)
         except Exception:
             spend_sol = 0.0
 
-        # --- Position size (raw tokens) ---------------------------------
-        # 1) explicit argument from caller wins
-        # 2) obvious fields on the event
-        # 3) generic helper + UI/decimals derivation
-        # 4) last-resort estimate from spend_sol + price + decimals
-
+        # Try to infer raw size
         if amount_raw is None:
             for k in (
                 "position_raw",
                 "amount_raw",
                 "out_amount",
                 "out_amount_raw",
-                "amount_out",       # some paths use this spelling
+                "amount_out",
                 "raw_amount_out",
                 "raw_out",
                 "size_raw",
@@ -546,20 +561,17 @@ class _ExitEngine:
                     amount_raw = int(v)
                     break
 
-        # 2.5) generic helper which also honours sell_pct etc
         if amount_raw is None or amount_raw <= 0:
             probe = dict(ev)
             maybe = _extract_amount_raw_from_req(probe)
             if maybe is not None and maybe > 0:
                 amount_raw = maybe
 
-        # 3) derive from ui+decimals if we still have nothing
         if amount_raw is None or amount_raw <= 0:
             derived = _derive_raw_from_ui(ev)
             if derived is not None and derived > 0:
                 amount_raw = derived
 
-        # 4) last-resort: estimate from spend_sol + entry price + decimals
         if amount_raw is None or amount_raw <= 0:
             price_keys = (
                 "price_entry_ui",
@@ -613,7 +625,6 @@ class _ExitEngine:
                 except Exception:
                     pass
 
-        # If we *still* have no size, log but DO NOT crash anything.
         if amount_raw is None or amount_raw <= 0:
             log.info(
                 "EXIT_ENGINE_FALLBACK_FULL_SIZE_FAILED",
@@ -624,10 +635,8 @@ class _ExitEngine:
                     "pool": ev.get("pool"),
                 },
             )
-            # We bail here because we truly cannot infer the position.
             return
 
-        # --- General metadata -------------------------------------------
         reason = str(ev.get("reason", "on_buy_filled"))
         try:
             sell_pct = float(ev.get("sell_pct", EXIT_WORKER_SELL_PCT))
@@ -639,7 +648,6 @@ class _ExitEngine:
         if not isinstance(follow_stats, dict):
             follow_stats = {}
 
-        # Build default exit config for this BUY
         exit_cfg = _build_default_exit_config(ev)
 
         payload: ExitRequest = {
@@ -669,7 +677,6 @@ class _ExitEngine:
                 },
             )
 
-        # Optional: immediate execution (still goes through _execute_exit)
         if EXIT_ON_BUY_FILLED:
             log.info(
                 "EXIT_ENGINE_IMMEDIATE_ON_BUY_FILLED",
@@ -684,7 +691,6 @@ class _ExitEngine:
     # ------------------------------------------------------------------ #
     # Generic API for risk manager / manual exits
     # ------------------------------------------------------------------ #
-
     async def enqueue_exit_request(
         self,
         *,
@@ -706,7 +712,7 @@ class _ExitEngine:
         if not self.enabled:
             return None
         if redis is None:
-            log.debug("EXIT_ENGINE_NO_REDIS")
+            log.event("EXIT_ENGINE_NO_REDIS", where="enqueue_manual")
             return None
 
         mint = str(mint).strip()
@@ -754,29 +760,29 @@ class _ExitEngine:
         return key
 
 
-# Global instance used everywhere else
+# Global instance used elsewhere (Strategy, risk manager, etc.)
 exit_engine = _ExitEngine()
 
 
-# ============================================================================
+# -----------------------------------------------------------------------------
 # Core exit execution (worker)
-# ============================================================================
-
-
+# -----------------------------------------------------------------------------
 async def _execute_exit(req: ExitRequest) -> None:
     """
     Perform a forced exit for a single mint based on an exit_request payload.
     """
+    global _worker_stats
+
     mint = str(req.get("mint"))
     reason = str(req.get("reason", "unknown"))
     source = str(req.get("source", "unknown"))
     follow = req.get("follow_stats", {}) or {}
 
-    # Normalise spend_sol for diagnostics; we do NOT gate on this.
     spend_sol = _job_spend_sol(req)
 
     amount_raw = _extract_amount_raw_from_req(req)
     if amount_raw is None or amount_raw <= 0:
+        _worker_stats["skipped_no_amount"] += 1
         log.info(
             "EXIT_WORKER_SKIP_NO_AMOUNT",
             extra={
@@ -786,9 +792,20 @@ async def _execute_exit(req: ExitRequest) -> None:
                 "spend_sol": spend_sol,
             },
         )
+        if record_sell_result:
+            try:
+                record_sell_result(
+                    ok=False,
+                    reason="no_amount",
+                    mint=mint,
+                    meta={"source": source, "spend_sol": spend_sol},
+                )
+            except Exception:
+                pass
         return
 
     if DRYRUN:
+        _worker_stats["sells_ok"] += 1  # treat as logically successful
         log.info(
             "EXIT_WORKER_DRYRUN",
             extra={
@@ -800,6 +817,16 @@ async def _execute_exit(req: ExitRequest) -> None:
                 "spend_sol": spend_sol,
             },
         )
+        if record_sell_result:
+            try:
+                record_sell_result(
+                    ok=False,
+                    reason="dryrun",
+                    mint=mint,
+                    meta={"source": source, "amount_raw": int(amount_raw)},
+                )
+            except Exception:
+                pass
         return
 
     log.info(
@@ -822,6 +849,7 @@ async def _execute_exit(req: ExitRequest) -> None:
             slippage_bps=int(EXIT_WORKER_SLIPPAGE_BPS),
         )
     except Exception as e:  # noqa: BLE001
+        _worker_stats["sells_err"] += 1
         log.warning(
             "EXIT_WORKER_SELL_ERROR",
             extra={
@@ -832,7 +860,20 @@ async def _execute_exit(req: ExitRequest) -> None:
                 "spend_sol": spend_sol,
             },
         )
+        if record_sell_result:
+            try:
+                record_sell_result(
+                    ok=False,
+                    reason=str(e),
+                    mint=mint,
+                    meta={"source": source, "amount_raw": int(amount_raw)},
+                )
+            except Exception:
+                pass
         return
+
+    _worker_stats["sells_ok"] += 1
+    _worker_stats["last_job_ts"] = time.time()
 
     log.info(
         "EXIT_WORKER_SELL_DONE",
@@ -846,20 +887,42 @@ async def _execute_exit(req: ExitRequest) -> None:
         },
     )
 
+    if record_sell_result:
+        try:
+            record_sell_result(
+                ok=True,
+                reason=reason,
+                mint=mint,
+                sig=sig,
+                meta={"source": source, "amount_raw": int(amount_raw)},
+            )
+        except Exception:
+            pass
 
-async def _process_once() -> None:
+
+async def _process_once() -> int:
     """
     Single tick: scan for exit_request:* keys and process up to EXIT_WORKER_BATCH.
+
+    Returns:
+        int: number of exit jobs processed in this tick.
     """
+    global _worker_stats
+
     if not EXIT_WORKER_ENABLED:
-        return
+        return 0
     if redis is None:
-        log.debug("EXIT_WORKER_NO_REDIS")
-        return
+        log.event("EXIT_WORKER_NO_REDIS", where="process_once")
+        return 0
+
+    _worker_stats["ticks"] += 1
 
     keys = await _scan_exit_requests(EXIT_WORKER_BATCH)
+    job_count = len(keys)
+    _worker_stats["jobs_seen"] += job_count
+
     if not keys:
-        return
+        return 0
 
     for key in keys:
         req = await _load_exit_request(key)
@@ -881,17 +944,55 @@ async def _process_once() -> None:
             },
         )
 
+        _worker_stats["jobs_processed"] += 1
         await _execute_exit(req)
 
         # Always delete; re-queues should create a new request
         await _delete_exit_request(key)
 
+    return job_count
 
-# ============================================================================
+
+# -----------------------------------------------------------------------------
+# Heartbeat / observability
+# -----------------------------------------------------------------------------
+def _heartbeat_payload() -> Dict[str, Any]:
+    """
+    Build a structured snapshot of worker stats for logging.
+    """
+    now_ts = time.time()
+    last_ts = _worker_stats.get("last_job_ts")
+    since_last = None
+    if isinstance(last_ts, (int, float)) and last_ts > 0:
+        since_last = now_ts - last_ts
+
+    return {
+        "ticks": _worker_stats.get("ticks"),
+        "jobs_seen": _worker_stats.get("jobs_seen"),
+        "jobs_processed": _worker_stats.get("jobs_processed"),
+        "sells_ok": _worker_stats.get("sells_ok"),
+        "sells_err": _worker_stats.get("sells_err"),
+        "skipped_no_amount": _worker_stats.get("skipped_no_amount"),
+        "seconds_since_last_job": since_last,
+        "dryrun": DRYRUN,
+        "poll_sec": EXIT_WORKER_POLL_SEC,
+        "batch": EXIT_WORKER_BATCH,
+        "slippage_bps": EXIT_WORKER_SLIPPAGE_BPS,
+        "sell_pct": EXIT_WORKER_SELL_PCT,
+    }
+
+
+def _log_heartbeat() -> None:
+    """
+    Emit a loud, structured heartbeat so you can SEE that the worker lives.
+    """
+    payload = _heartbeat_payload()
+    log.event("EXIT_WORKER_HEARTBEAT", **payload)
+
+
+# -----------------------------------------------------------------------------
 # Public loop entrypoint
-# ============================================================================
-
-
+# -----------------------------------------------------------------------------
 async def exit_worker_loop(stop_evt: asyncio.Event) -> None:
     """
     Background loop: periodically scans Redis for exit_request:* keys
@@ -911,12 +1012,43 @@ async def exit_worker_loop(stop_evt: asyncio.Event) -> None:
             "dryrun": DRYRUN,
         },
     )
+    log.event(
+        "EXIT_WORKER_CONFIG",
+        poll_sec=EXIT_WORKER_POLL_SEC,
+        batch=EXIT_WORKER_BATCH,
+        slippage_bps=EXIT_WORKER_SLIPPAGE_BPS,
+        sell_pct=EXIT_WORKER_SELL_PCT,
+        dryrun=int(DRYRUN),
+        heartbeat_sec=EXIT_WORKER_HEARTBEAT_SEC,
+    )
+
+    last_hb = 0.0
+    idle_ticks = 0
 
     while not stop_evt.is_set():
+        jobs_processed = 0
         try:
-            await _process_once()
+            jobs_processed = await _process_once()
         except Exception:  # noqa: BLE001
             log.exception("EXIT_WORKER_TICK_ERROR")
+
+        if jobs_processed == 0:
+            idle_ticks += 1
+            if idle_ticks >= max(1, EXIT_WORKER_IDLE_LOG_EVERY_TICKS):
+                idle_ticks = 0
+                log.event(
+                    "EXIT_WORKER_IDLE",
+                    ticks=_worker_stats.get("ticks"),
+                    jobs_seen=_worker_stats.get("jobs_seen"),
+                    jobs_processed=_worker_stats.get("jobs_processed"),
+                )
+        else:
+            idle_ticks = 0
+
+        now = time.time()
+        if (now - last_hb) >= max(5.0, EXIT_WORKER_HEARTBEAT_SEC):
+            last_hb = now
+            _log_heartbeat()
 
         # Wait with timeout so the loop can exit promptly when stop_evt is set
         try:
