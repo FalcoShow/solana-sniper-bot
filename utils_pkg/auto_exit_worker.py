@@ -7,11 +7,16 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from .core_utils import redis, _am, create_task
+# Import core_utils as a module so we can flexibly access attributes
+from . import core_utils
+
+# Pull commonly-used symbols from core_utils
+redis = getattr(core_utils, "redis", None)
+create_task = getattr(core_utils, "create_task", asyncio.create_task)
 
 # Optional: best-effort sell result logger (if defined in core_utils)
 try:  # pragma: no cover - optional dependency
-    from .core_utils import record_sell_result  # type: ignore
+    record_sell_result = getattr(core_utils, "record_sell_result")  # type: ignore[assignment]
 except Exception:  # noqa: BLE001
     record_sell_result = None  # type: ignore[assignment]
 
@@ -149,6 +154,49 @@ _worker_stats: Dict[str, Any] = {
     "skipped_no_amount": 0,
     "last_job_ts": None,
 }
+
+
+# -----------------------------------------------------------------------------
+# Helper: get AlertManager instance (Telegram / Notion)
+# -----------------------------------------------------------------------------
+def _get_am():
+    """
+    Best-effort accessor for the AlertManager / alert manager singleton.
+
+    We try several common names on core_utils:
+      - _am()               (old pattern)
+      - am() / am
+      - get_am() / get_alert_manager()
+      - alert_manager / ALERT_MANAGER
+
+    If nothing works, returns None and callers should simply skip alerts.
+    """
+    candidates = [
+        getattr(core_utils, "_am", None),
+        getattr(core_utils, "am", None),
+        getattr(core_utils, "get_am", None),
+        getattr(core_utils, "get_alert_manager", None),
+        getattr(core_utils, "alert_manager", None),
+        getattr(core_utils, "ALERT_MANAGER", None),
+    ]
+
+    for cand in candidates:
+        if cand is None:
+            continue
+
+        try:
+            # If it's callable (factory), call it; otherwise assume instance
+            am = cand() if callable(cand) else cand
+        except TypeError:
+            # Some callables might not need args; if that fails, treat as instance
+            am = cand
+        except Exception:
+            continue
+
+        if am is not None:
+            return am
+
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -914,20 +962,24 @@ async def _execute_exit(req: ExitRequest) -> None:
 
     # Optional AlertManager notification (Telegram / Notion)
     try:
-        symbol = req.get("symbol") or req.get("name") or mint
-        pool = req.get("pool") or "unknown"
+        am = _get_am()
+        if am is not None:
+            symbol = req.get("symbol") or req.get("name") or mint
+            pool = req.get("pool") or "unknown"
 
-        create_task(
-            _am().notify_trade_fill(
-                side="SELL",
-                mint=mint,
-                symbol=symbol,
-                pool=pool,
-                sig=str(sig) if sig else None,
-                spend_sol=spend_sol,
-                out_amount=amount_raw,
+            create_task(
+                am.notify_trade_fill(
+                    side="SELL",
+                    mint=mint,
+                    symbol=symbol,
+                    pool=pool,
+                    sig=str(sig) if sig else None,
+                    spend_sol=spend_sol,
+                    out_amount=amount_raw,
+                )
             )
-        )
+        else:
+            log.event("EXIT_WORKER_NO_ALERT_MANAGER", mint=mint)
     except Exception as e:
         log.warning(
             "EXIT_WORKER_ALERT_FAIL",
