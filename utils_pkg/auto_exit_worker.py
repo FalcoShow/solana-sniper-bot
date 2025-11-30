@@ -34,7 +34,12 @@ if not hasattr(log, "every"):
 
     _every_cache: Dict[str, int] = {}
 
-    def _every(key: str, n: int = 60, msg: str | None = None, **kw: Any) -> None:  # pragma: no cover - shim
+    def _every(
+        key: str,
+        n: int = 60,
+        msg: str | None = None,
+        **kw: Any,
+    ) -> None:  # pragma: no cover - shim
         c = _every_cache.get(key, 0) + 1
         _every_cache[key] = c
         if c % max(1, n) == 0:
@@ -91,7 +96,10 @@ EXIT_WORKER_BATCH: int = _env_int("EXIT_WORKER_BATCH", 5)
 
 # Heartbeat / observability
 EXIT_WORKER_HEARTBEAT_SEC: float = _env_float("EXIT_WORKER_HEARTBEAT_SEC", 30.0)
-EXIT_WORKER_IDLE_LOG_EVERY_TICKS: int = _env_int("EXIT_WORKER_IDLE_LOG_EVERY_TICKS", 10)
+EXIT_WORKER_IDLE_LOG_EVERY_TICKS: int = _env_int(
+    "EXIT_WORKER_IDLE_LOG_EVERY_TICKS",
+    10,
+)
 
 # Slippage configuration
 PF_SLIPPAGE_BPS: int = _env_int("PF_SLIPPAGE_BPS", 200)
@@ -679,28 +687,8 @@ class _ExitEngine:
                     "tx_sig": tx_sig,
                 },
             )
-    # Optional AlertManager notification (Telegram / Notion)
-    try:
-        symbol = req.get("symbol") or req.get("name") or mint
-        pool = req.get("pool") or "unknown"
 
-        create_task(
-            _am().notify_trade_fill(
-                side="SELL",
-                mint=mint,
-                symbol=symbol,
-                pool=pool,
-                sig=str(sig) if sig else None,
-                spend_sol=spend_sol,
-                out_amount=amount_raw,
-            )
-        )
-    except Exception as e:
-        log.warning(
-            "EXIT_WORKER_ALERT_FAIL",
-            extra={"mint": mint, "err": str(e)[:200]},
-        )
-
+        # Optional: immediate execution (still uses the worker logic)
         if EXIT_ON_BUY_FILLED:
             log.info(
                 "EXIT_ENGINE_IMMEDIATE_ON_BUY_FILLED",
@@ -865,6 +853,7 @@ async def _execute_exit(req: ExitRequest) -> None:
         },
     )
 
+    sig = None
     try:
         sig = await sell_via_lightning(
             mint=mint,
@@ -922,6 +911,28 @@ async def _execute_exit(req: ExitRequest) -> None:
             )
         except Exception:
             pass
+
+    # Optional AlertManager notification (Telegram / Notion)
+    try:
+        symbol = req.get("symbol") or req.get("name") or mint
+        pool = req.get("pool") or "unknown"
+
+        create_task(
+            _am().notify_trade_fill(
+                side="SELL",
+                mint=mint,
+                symbol=symbol,
+                pool=pool,
+                sig=str(sig) if sig else None,
+                spend_sol=spend_sol,
+                out_amount=amount_raw,
+            )
+        )
+    except Exception as e:
+        log.warning(
+            "EXIT_WORKER_ALERT_FAIL",
+            extra={"mint": mint, "err": str(e)[:200]},
+        )
 
 
 async def _process_once() -> int:
