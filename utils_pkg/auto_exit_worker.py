@@ -7,6 +7,8 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
+import httpx  # for direct Telegram fallback
+
 # Import core_utils as a module so we can flexibly access attributes
 from . import core_utils
 
@@ -142,6 +144,12 @@ EXIT_WORKER_MIN_RAW: int = _env_int("EXIT_WORKER_MIN_RAW", 0)
 # Only used for sanity logs when comparing to SOL
 LAMPORTS_PER_SOL: int = 1_000_000_000
 
+# Telegram fallback config
+TELEGRAM_ENABLED: bool = _env_bool("TELEGRAM_ENABLED", False)
+TELEGRAM_NOTIFY_SELLS: bool = _env_bool("TELEGRAM_NOTIFY_SELLS", True)
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
 # -----------------------------------------------------------------------------
 # Worker stats (for heartbeat + diagnostics)
 # -----------------------------------------------------------------------------
@@ -188,7 +196,6 @@ def _get_am():
             # If it's callable (factory), call it; otherwise assume instance
             am = cand() if callable(cand) else cand
         except TypeError:
-            # Some callables might not need args; if that fails, treat as instance
             am = cand
         except Exception:
             continue
@@ -197,6 +204,71 @@ def _get_am():
             return am
 
     return None
+
+
+# -----------------------------------------------------------------------------
+# Telegram fallback helper
+# -----------------------------------------------------------------------------
+async def _notify_sell_telegram(
+    *,
+    mint: str,
+    symbol: Optional[str],
+    pool: str,
+    sig: Optional[str],
+    spend_sol: float,
+    amount_raw: int,
+    reason: str,
+    source: str,
+) -> None:
+    """
+    Direct Telegram Bot API fallback for SELL alerts when AlertManager
+    is not available.
+    """
+    if not (
+        TELEGRAM_ENABLED
+        and TELEGRAM_NOTIFY_SELLS
+        and TELEGRAM_BOT_TOKEN
+        and TELEGRAM_CHAT_ID
+    ):
+        return
+
+    try:
+        chat_id_int = int(TELEGRAM_CHAT_ID)
+    except Exception:
+        # If chat id isn't int, just pass the string
+        chat_id_int = TELEGRAM_CHAT_ID  # type: ignore[assignment]
+
+    sym = symbol or mint
+    text = (
+        f"SELL ✅ {sym}\n"
+        f"Pool: {pool}\n"
+        f"Reason: {reason} ({source})\n"
+        f"Size (raw): {amount_raw}\n"
+        f"Est entry SOL: {spend_sol:.6f}\n"
+        f"Tx: {sig or 'pending...'}"
+    )
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                url,
+                json={
+                    "chat_id": chat_id_int,
+                    "text": text,
+                    "disable_web_page_preview": True,
+                },
+            )
+        log.info(
+            "EXIT_WORKER_TG_SENT",
+            extra={"mint": mint, "symbol": sym, "chat_id": TELEGRAM_CHAT_ID},
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "EXIT_WORKER_TG_FAIL",
+            extra={"mint": mint, "err": str(e)[:200]},
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -960,13 +1032,13 @@ async def _execute_exit(req: ExitRequest) -> None:
         except Exception:
             pass
 
-    # Optional AlertManager notification (Telegram / Notion)
+    # Alerts: AlertManager first, then Telegram fallback
+    symbol = req.get("symbol") or req.get("name") or mint
+    pool = req.get("pool") or "unknown"
+
     try:
         am = _get_am()
         if am is not None:
-            symbol = req.get("symbol") or req.get("name") or mint
-            pool = req.get("pool") or "unknown"
-
             create_task(
                 am.notify_trade_fill(
                     side="SELL",
@@ -980,7 +1052,17 @@ async def _execute_exit(req: ExitRequest) -> None:
             )
         else:
             log.event("EXIT_WORKER_NO_ALERT_MANAGER", mint=mint)
-    except Exception as e:
+            await _notify_sell_telegram(
+                mint=mint,
+                symbol=symbol,
+                pool=pool,
+                sig=sig,
+                spend_sol=spend_sol,
+                amount_raw=amount_raw,
+                reason=reason,
+                source=source,
+            )
+    except Exception as e:  # noqa: BLE001
         log.warning(
             "EXIT_WORKER_ALERT_FAIL",
             extra={"mint": mint, "err": str(e)[:200]},
