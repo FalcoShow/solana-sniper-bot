@@ -45,12 +45,16 @@ Design
          * risk_mode / risk_capacity
          * hard_halt / plan_gap_pct / plan_status (via risk API)
 
-2) Optional fine-tuned OpenAI model:
+2) Optional OpenAI model (fine-tuned or base):
      - Produces a 0..1 probability of “good trade”
      - Blended with heuristic using ENTRY_AI_WEIGHT
      - Multi-model routing via ENTRY_MODEL_ROUTING_JSON and hints:
            features.entry_head / segment / regime_label
      - Payload auto-trimmed to ENTRY_MAX_FEATURE_BYTES with a curated key set
+     - Uses either:
+         * New SDK:   OpenAI().chat.completions.create(...)
+         * Legacy:    openai.ChatCompletion.create(...)
+       so it works with both modern and older openai installs.
 
 3) Per-source & regime-aware gating:
      - Global floor (ENTRY_MIN_SCORE) plus per-source overrides
@@ -163,7 +167,7 @@ def _log1p(x: float) -> float:
 # Core config (entry-level knobs)
 # ============================================================================ #
 
-# Fine-tuned entry model (if any)
+# Fine-tuned / base entry model
 ENTRY_MODEL = (
     os.getenv("ENTRY_MODEL_NAME", "").strip()
     or os.getenv("ENTRY_MODEL", "").strip()
@@ -294,47 +298,52 @@ _ENTRY_DYNAMIC_MIN_SCORE: Optional[float] = None
 
 
 # ============================================================================ #
-# OpenAI client shim (new responses API + legacy ChatCompletion)
+# OpenAI client shim (new SDK chat.completions + legacy ChatCompletion)
 # ============================================================================ #
 
 _CLIENT: Any = None
-_USE_RESPONSES_API = False
+_CLIENT_KIND: str = "none"  # "sdk" or "legacy"
 
 
 def _ensure_client() -> Optional[Any]:
     """
-    Try to import either the new `OpenAI` client or legacy `openai` module.
-    Returns a client object or None if unavailable.
+    Try to import either the new `OpenAI` client (SDK v1+) or legacy `openai`
+    module (<=0.28). Returns a client object or None if unavailable.
+
+    We intentionally do NOT use the Responses API here, only chat.completions /
+    ChatCompletion, to avoid signature mismatches like:
+        Responses.create() got an unexpected keyword argument 'response_format'
     """
-    global _CLIENT, _USE_RESPONSES_API
+    global _CLIENT, _CLIENT_KIND
 
     if _CLIENT is not None:
         return _CLIENT
 
-    # New-style client
+    # New-style SDK (openai>=1.x, including 2.9.0)
     try:
         from openai import OpenAI  # type: ignore
 
         _CLIENT = OpenAI()
-        _USE_RESPONSES_API = True
-        log.info("ai_entry_logic: using OpenAI responses client")
+        _CLIENT_KIND = "sdk"
+        log.info("ai_entry_logic: using OpenAI chat.completions client (SDK)")
         return _CLIENT
     except Exception:
         pass
 
-    # Legacy client
+    # Legacy client (openai<=0.28.x)
     try:
         import openai  # type: ignore
 
         if not getattr(openai, "api_key", None):
             openai.api_key = os.getenv("OPENAI_API_KEY", "")
         _CLIENT = openai
-        _USE_RESPONSES_API = False
+        _CLIENT_KIND = "legacy"
         log.info("ai_entry_logic: using legacy openai.ChatCompletion client")
         return _CLIENT
     except Exception:
         log.warning("ai_entry_logic: no OpenAI client available; AI disabled")
         _CLIENT = None
+        _CLIENT_KIND = "none"
         return None
 
 
@@ -1121,8 +1130,6 @@ async def _maybe_enrich_risk_context(features: Dict[str, Any]) -> None:
             )
 
         # Strategy-driven entry score gate (fed from self_learning_ai_strategy)
-        # We keep it separate as ctx_entry_score_gate so we can clamp thresholds
-        # upward without losing dynamic floor behavior.
         if "entry_score_gate" in snap and "ctx_entry_score_gate" not in features:
             try:
                 features["ctx_entry_score_gate"] = float(snap.get("entry_score_gate", 0.0))
@@ -1140,11 +1147,12 @@ async def _maybe_enrich_risk_context(features: Dict[str, Any]) -> None:
 
 async def _ai_score(features: Dict[str, Any]) -> Optional[float]:
     """
-    Call the fine-tuned OpenAI model (if configured) to get a 0..1 score.
+    Call the OpenAI model (fine-tuned or base) to get a 0..1 score.
     On any failure, returns None so callers can fall back to heuristic.
 
-    NOTE: This function is also used by backtests via utils_pkg.backtest_engine.
-    Keep signature stable.
+    This helper is compatible with:
+      - New SDK: OpenAI().chat.completions.create(...)
+      - Legacy:  openai.ChatCompletion.create(...)
     """
     if not ENTRY_AI_ENABLED:
         return None
@@ -1232,25 +1240,39 @@ async def _ai_score(features: Dict[str, Any]) -> Optional[float]:
     )
 
     try:
-        if _USE_RESPONSES_API:
+        # New SDK path
+        if _CLIENT_KIND == "sdk":
 
-            def _do_req() -> Any:
-                return client.responses.create(
-                    model=model,
-                    input=prompt,
-                    response_format={"type": "json_object"},
-                )
+            def _do_req_sdk() -> Any:
+                try:
+                    # Modern JSON mode (SDK v1+)
+                    return client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": "You output JSON only."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.0,
+                        response_format={"type": "json_object"},
+                    )
+                except TypeError:
+                    # Fallback if this SDK version doesn't support response_format
+                    return client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": "You output JSON only."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.0,
+                    )
 
             resp = await asyncio.wait_for(
-                asyncio.to_thread(_do_req),
+                asyncio.to_thread(_do_req_sdk),
                 timeout=ENTRY_AI_TIMEOUT_SEC,
             )
-            content_str = str(resp)
-            try:
-                out = resp.output[0].content[0].text  # type: ignore[attr-defined,index]
-                content_str = getattr(out, "value", str(out))
-            except Exception:
-                pass
+            content_str = resp.choices[0].message.content  # type: ignore[assignment]
+
+        # Legacy openai<=0.28 path
         else:
 
             def _do_req_legacy() -> Any:
@@ -1269,6 +1291,7 @@ async def _ai_score(features: Dict[str, Any]) -> Optional[float]:
             )
             content_str = resp["choices"][0]["message"]["content"]  # type: ignore[index]
 
+        # Parse JSON
         try:
             obj = json.loads(content_str)
             score = float(obj.get("score", 0.0))
@@ -1692,7 +1715,7 @@ async def should_enter(features: Dict[str, Any]) -> Tuple[bool, float, str]:
 
     # Slight extra caution if win-rate is horrible AND we're conservative
     if win_rate_pct > 0.0 and win_rate_pct < 40.0 and _effective_risk_profile(features) == "conservative":
-        # we don't hard fail, but nudge threshold via dynamic floor anyway
+        # not a hard fail — threshold tightening already handled by dynamics
         pass
 
     # ------------------------------------------------------------------ #
