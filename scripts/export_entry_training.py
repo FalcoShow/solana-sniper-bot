@@ -97,6 +97,10 @@ def _extract_features(row: Dict[str, Any]) -> Dict[str, Any]:
          'feature' and looks like JSON / dict.
       3) Ensure we always return a dict (possibly empty).
     """
+    if not isinstance(row, dict):
+        # extra safety; should never happen with RealDictCursor
+        return {}
+
     # First: explicit candidate keys in priority order
     val = None
     for key in _FEATURE_CANDIDATE_KEYS:
@@ -207,7 +211,8 @@ def _iter_rows(
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(query, (since, limit))
         for row in cur:
-            return row
+            # Each row is a dict from RealDictCursor
+            yield row
 
 
 def main() -> None:
