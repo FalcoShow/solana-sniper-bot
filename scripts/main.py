@@ -2573,8 +2573,13 @@ class Strategy:
                 • False → block
                 • None  → no opinion (do not gate)
 
-        This is intentionally defensive: if api changes or errors occur,
-        we fall back to (None, None) and DO NOT block.
+        Design notes
+        ------------
+        - Ultra-defensive: any error → (None, None) and we DO NOT block.
+        - Uses Candidate.__annotations__ to only pass fields the dataclass knows.
+        - Fills V3+++ fields with sensible defaults if the feature is missing:
+            pool_age_min, impact_1k_bps, vol5m_pct, top10_pct,
+            honeypot_flag, whale_touches_1h.
         """
         if not self.ai_pre_enabled or self._score_mod is None:
             return None, None
@@ -2583,30 +2588,13 @@ class Strategy:
             Candidate = getattr(self._score_mod, "Candidate", None)
             pass_gate = getattr(self._score_mod, "pass_gate", None)
             if Candidate is None or not callable(pass_gate):
+                # ai_buy_scoring not imported / older version: no-op
                 return None, None
 
-            # Build candidate kwargs generically and filter by annotation keys
-            base_kwargs: Dict[str, Any] = {
-                "mint": mint_norm,
-                "pool": pool,
-                "symbol": symbol,
-                "liq_usd": ui.get("liq_usd")
-                or raw_event.get("liq_usd")
-                or raw_event.get("liq")
-                or 0.0,
-                "vol_5m_usd": ui.get("vol_5m_usd")
-                or raw_event.get("vol_5m_usd")
-                or raw_event.get("vol5")
-                or 0.0,
-                "buys_5m": ui.get("buys_5m")
-                or raw_event.get("buys_5m")
-                or raw_event.get("buys5")
-                or 0,
-                "sells_5m": ui.get("sells_5m")
-                or raw_event.get("sells_5m")
-                or raw_event.get("sells5")
-                or 0,
-                "age_min": raw_event.get("token_age_min")
+            # ---------- Core primitive fields ----------
+            # age_min used both as "age_min" and as fallback for "pool_age_min"
+            age_min = (
+                raw_event.get("token_age_min")
                 or raw_event.get("age_min")
                 or _approx_minutes_since(
                     _get_first(
@@ -2618,18 +2606,119 @@ class Strategy:
                         default=None,
                     )
                 )
-                or 0.0,
+                or 0.0
+            )
+
+            liq_usd = (
+                ui.get("liq_usd")
+                or raw_event.get("liq_usd")
+                or raw_event.get("liq")
+                or 0.0
+            )
+
+            vol_5m_usd = (
+                ui.get("vol_5m_usd")
+                or raw_event.get("vol_5m_usd")
+                or raw_event.get("vol5")
+                or 0.0
+            )
+
+            buys_5m = (
+                ui.get("buys_5m")
+                or raw_event.get("buys_5m")
+                or raw_event.get("buys5")
+                or 0
+            )
+
+            sells_5m = (
+                ui.get("sells_5m")
+                or raw_event.get("sells_5m")
+                or raw_event.get("sells5")
+                or 0
+            )
+
+            # ---------- V3+++ / quant-grade extra features ----------
+            # Pool age in minutes (prefer explicit feature, otherwise reuse age_min)
+            pool_age_min = features.get("pool_age_min")
+            if pool_age_min is None:
+                pool_age_min = age_min
+
+            # Slippage / impact if we slam 1k USD into the pool (basis points)
+            impact_1k_bps = (
+                features.get("impact_1k_bps")
+                or ui.get("impact_1k_bps")
+                or 0.0
+            )
+
+            # Volume share & holder concentration
+            vol5m_pct = features.get("vol5m_pct") or 0.0
+            top10_pct = features.get("top10_pct") or 0.0
+
+            # Rug / honeypot / whale signal flags
+            honeypot_flag = bool(
+                features.get("honeypot_flag")
+                or ui.get("honeypot_flag")
+                or raw_event.get("honeypot_flag")
+                or raw_event.get("honeypot")
+                or False
+            )
+
+            whale_touches_1h = int(
+                features.get("whale_touches_1h")
+                or features.get("whale_touches_60m")
+                or 0
+            )
+
+            # ---------- Build base kwargs ----------
+            base_kwargs: Dict[str, Any] = {
+                "mint": mint_norm,
+                "pool": pool,
+                "symbol": symbol,
+                "liq_usd": float(liq_usd),
+                "vol_5m_usd": float(vol_5m_usd),
+                "buys_5m": int(buys_5m),
+                "sells_5m": int(sells_5m),
+                "age_min": float(age_min),
+
+                # V3+++ extra fields (only used if Candidate defines them)
+                "pool_age_min": float(pool_age_min),
+                "impact_1k_bps": float(impact_1k_bps),
+                "vol5m_pct": float(vol5m_pct),
+                "top10_pct": float(top10_pct),
+                "honeypot_flag": bool(honeypot_flag),
+                "whale_touches_1h": int(whale_touches_1h),
+
+                # Contextual AI / risk features
                 "ai_entry_score": ui.get("ai_entry_score"),
                 "risk_capacity": ui.get("risk_capacity"),
                 "regime_score": features.get("regime_score"),
             }
 
+            # ---------- Filter by Candidate annotations (backwards compatible) ----------
             cand_kwargs = dict(base_kwargs)
             ann = getattr(Candidate, "__annotations__", None)
             if isinstance(ann, dict) and ann:
                 cand_kwargs = {k: v for k, v in base_kwargs.items() if k in ann}
 
-            candidate = Candidate(**cand_kwargs)  # type: ignore[misc]
+            # ---------- Construct Candidate (defensive) ----------
+            try:
+                candidate = Candidate(**cand_kwargs)  # type: ignore[misc]
+            except TypeError as e:
+                # If something still mismatches, log & give up rather than blocking.
+                try:
+                    log.event(
+                        "AI_PRE_SCORE_CANDIDATE_ERROR",
+                        mint=mint_norm,
+                        pool=pool,
+                        symbol=symbol,
+                        err=str(e)[:200],
+                        cand_keys=list(cand_kwargs.keys()),
+                    )
+                except Exception:
+                    pass
+                return None, None
+
+            # ---------- Call pass_gate ----------
             res = pass_gate(candidate)  # type: ignore[misc]
             if inspect.isawaitable(res):
                 res = await res
@@ -2637,6 +2726,7 @@ class Strategy:
             pre_score: Optional[float] = None
             decision: Optional[bool] = None
 
+            # pass_gate can return: bool, float, (decision,), (decision, score, ...)
             if isinstance(res, (list, tuple)):
                 if len(res) >= 1:
                     decision = bool(res[0])
@@ -2647,13 +2737,15 @@ class Strategy:
                         pre_score = None
             elif isinstance(res, (int, float)):
                 pre_score = float(res)
+            elif isinstance(res, bool):
+                decision = res
 
-            # Optional min-score enforcement
+            # ---------- Optional min-score enforcement ----------
             if pre_score is not None and self.ai_pre_min_score > 0:
                 if pre_score < self.ai_pre_min_score:
                     decision = False if decision is None else bool(decision and False)
 
-            # Optional logging hook
+            # ---------- Logging ----------
             try:
                 log.event(
                     "AI_PRE_SCORE",
@@ -2663,8 +2755,10 @@ class Strategy:
                     pre_score=pre_score,
                     pre_min=self.ai_pre_min_score,
                     decision=(
-                        "allow" if decision is True
-                        else "block" if decision is False
+                        "allow"
+                        if decision is True
+                        else "block"
+                        if decision is False
                         else "none"
                     ),
                 )
@@ -2672,6 +2766,7 @@ class Strategy:
                 pass
 
             return pre_score, decision
+
         except Exception as e:
             if DEBUG_TX:
                 traceback.print_exc()
