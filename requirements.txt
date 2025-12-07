@@ -1,31 +1,77 @@
-# --- Core async HTTP / DNS-safe relay ---
+# ============================================================
+# Solana Sniper Bot — V3+++ / Quant-Grade Requirements
+# ============================================================
+#
+# This file is designed to be:
+#   • Compatible with Python 3.11+ (Render) and 3.13 (local)
+#   • Deterministic enough for prod, but not over-pinned
+#   • Split into logical sections so you can tweak easily
+#
+# If Render slug size ever becomes a problem, the first things
+# to optionally trim are the "Quant / Analytics" and "Web UI"
+# sections (pandas, scipy, FastAPI, Playwright, etc.).
+# ============================================================
+
+# ------------------------------------------------------------
+# Core async HTTP / networking
+# ------------------------------------------------------------
 aiohttp==3.9.5
-brotli>=1.1.0            # needed to decode Cloudflare br responses
-
-# --- Async DB stack ---
-SQLAlchemy==2.0.44       # matches your runtime logs
-asyncpg==0.29.0
-psycopg2-binary==2.9.9   # only used by your sell loop / any sync PG paths
-
-# --- Storage / cache / config ---
-aiosqlite==0.21.0
-redis==5.3.1
-python-dotenv==1.0.1
-
-# --- HTTP clients / websockets ---
-httpx==0.28.1            # you use httpx directly; pin to what your logs showed
+httpx==0.28.1
 requests==2.32.3
 websockets==11.0.3
+brotli>=1.1.0            # decode Cloudflare 'br' responses
 
-# --- Solana toolchain ---
+# ------------------------------------------------------------
+# Storage / cache / config
+# ------------------------------------------------------------
+redis==5.3.1             # Upstash / Render Redis client
+aiosqlite==0.21.0        # Local lightweight DB / caching
+python-dotenv==1.0.1     # .env loader for local dev
+
+# ------------------------------------------------------------
+# Database stack (Postgres / PnL / AI DB)
+# ------------------------------------------------------------
+SQLAlchemy==2.0.44       # ORM / query builder
+asyncpg==0.29.0          # Async driver for SQLAlchemy
+psycopg2-binary==2.9.11  # Sync PG paths used by ai_db / legacy
+psycopg[binary]==3.3.2   # Modern psycopg3 (binary wheels)
+
+# ------------------------------------------------------------
+# Solana + crypto tooling
+# ------------------------------------------------------------
 solana==0.36.9
 solders==0.26.0
 base58==2.1.1
 
-# --- Compatibility helpers (safe on 3.12) ---
-typing-extensions==4.15.0
-certifi==2024.2.2
-playwright==1.55.0
+# ------------------------------------------------------------
+# Quant / analytics / ML helpers
+# ------------------------------------------------------------
+numpy==2.0.2
+pandas==2.2.2
+scipy==1.13.1
+scikit-learn==1.5.1
+
+# ------------------------------------------------------------
+# AI / LLM integration
+# ------------------------------------------------------------
+openai>=1.54.0           # used by AI risk / scoring layers
+
+# ------------------------------------------------------------
+# Web / API surface (optional but nice)
+# ------------------------------------------------------------
 fastapi==0.120.0
 uvicorn==0.38.0
-openai>=1.54.0
+
+# ------------------------------------------------------------
+# Tooling / automation / scraping (optional)
+# ------------------------------------------------------------
+playwright==1.55.0       # browser automation (optional alpha feeds, etc.)
+
+# ------------------------------------------------------------
+# Utilities / compatibility
+# ------------------------------------------------------------
+typing-extensions==4.15.0
+certifi==2024.2.2
+tenacity==9.0.0          # general-purpose retry helper
+orjson==3.10.7           # fast JSON for logs / APIs
+pydantic==2.9.2          # typed settings / validation

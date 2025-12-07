@@ -1,5 +1,52 @@
 from __future__ import annotations
 
+"""
+utils_pkg/auto_exit_worker.py
+
+Auto exit worker (V3+++ / quant-grade)
+======================================
+
+High-level role
+---------------
+This module is the *execution layer* for exits:
+
+  • Stores exit requests in Redis as:
+        exit_request:{mint} -> JSON payload
+  • Background worker loop scans and executes those exits via Jupiter V6
+    (utils_pkg.lightning_impl.sell_via_lightning).
+  • Integrates with:
+        - risk_manager (capacity / hard-halt / gating of exits),
+        - ai_sell_logic + data_logger (AI outcome logging),
+        - self_learning_ai_strategy (entry outcome feedback),
+        - reinvestor (feeding realized exits into reinvestment brain),
+        - AlertManager (Telegram / Notion) + direct Telegram fallback.
+  • Respects DRYRUN and multiple env flags, and is safe to run even if
+    some optional modules (risk_manager, reinvestor, data_logger,
+    self_learning_ai_strategy) are missing.
+
+Public API
+----------
+  • exit_engine: _ExitEngine singleton with:
+
+        async exit_engine.on_buy_filled(ev: dict, tx_sig: str | None = None, *, amount_raw: int | None = None)
+        async exit_engine.enqueue_exit_request(...)
+
+    - `on_buy_filled` is called by Strategy / exit_engine directly after buys.
+    - `enqueue_exit_request` is used by exit_engine.follow-through, risk_manager,
+      ai_sell_logic, or manual / panic controls.
+
+  • async def exit_worker_loop(stop_evt: asyncio.Event) -> None
+        - Background loop that actually executes sells.
+
+Safety guarantees
+-----------------
+  • If Redis is missing → exits are simply ignored (no crash).
+  • If risk_manager / reinvestor / data_logger / self_learning_ai_strategy are
+    missing → exits still work.
+  • If DRYRUN is set → no sells are sent, but logs / analytics still flow.
+  • If anything blows up in workers, errors are logged and loop keeps running.
+"""
+
 import asyncio
 import json
 import logging
@@ -22,13 +69,38 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # noqa: BLE001
     record_sell_result = None  # type: ignore[assignment]
 
+# Optional: AI outcome logger (data_logger); the worker still functions if missing
+try:  # pragma: no cover - optional dependency
+    from utils_pkg import data_logger  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001
+    data_logger = None  # type: ignore[assignment]
+
+# Optional: risk manager (capacity / exit gating)
+try:  # pragma: no cover - optional dependency
+    from utils_pkg import risk_manager as _RM  # type: ignore[attr-defined]
+    RISK = getattr(_RM, "risk_manager", _RM)
+except Exception:  # noqa: BLE001
+    RISK = None  # type: ignore[assignment]
+
+# Optional: reinvestor (feeds realized exits into reinvestment plan)
+try:  # pragma: no cover - optional dependency
+    from utils_pkg import reinvestor as _REINV  # type: ignore[attr-defined]
+    REINV = getattr(_REINV, "reinvestor", _REINV)
+except Exception:  # noqa: BLE001
+    REINV = None  # type: ignore[assignment]
+
+# Optional: self-learning brain (consumes entry outcomes)
+try:  # pragma: no cover - optional dependency
+    from utils_pkg import self_learning_ai_strategy as _SLM  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001
+    _SLM = None  # type: ignore[assignment]
+
 from utils_pkg.lightning_impl import sell_via_lightning
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Logger (with safety shims for .event / .every)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 log = logging.getLogger("sniper.exit_worker")
-
 
 if not hasattr(log, "event"):
 
@@ -60,15 +132,14 @@ if not hasattr(log, "every"):
 # Type alias
 ExitRequest = Dict[str, Any]
 
-
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Env helpers
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 def _env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
     if v is None:
         return default
-    return str(v).lower() in ("1", "true", "t", "yes", "y", "on")
+    return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
 
 def _env_int(key: str, default: int) -> int:
@@ -85,9 +156,9 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Global config
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 DRYRUN: bool = (
     _env_bool("DRYRUN", False)
     or _env_bool("DRY_RUN", False)
@@ -101,6 +172,9 @@ EXIT_WORKER_ENABLED: bool = _env_bool("EXIT_WORKER_ENABLED", True)
 EXIT_WORKER_POLL_SEC: float = _env_float("EXIT_WORKER_POLL_SEC", 3.0)
 EXIT_WORKER_BATCH: int = _env_int("EXIT_WORKER_BATCH", 5)
 
+# Max parallel sells in-flight (simple concurrency guard)
+EXIT_WORKER_MAX_CONCURRENCY: int = _env_int("EXIT_WORKER_MAX_CONCURRENCY", 8)
+
 # Heartbeat / observability
 EXIT_WORKER_HEARTBEAT_SEC: float = _env_float("EXIT_WORKER_HEARTBEAT_SEC", 30.0)
 EXIT_WORKER_IDLE_LOG_EVERY_TICKS: int = _env_int(
@@ -108,7 +182,7 @@ EXIT_WORKER_IDLE_LOG_EVERY_TICKS: int = _env_int(
     10,
 )
 
-# Slippage configuration
+# Slippage configuration (can be overridden per job)
 PF_SLIPPAGE_BPS: int = _env_int("PF_SLIPPAGE_BPS", 200)
 EXIT_WORKER_SLIPPAGE_BPS: int = _env_int(
     "EXIT_WORKER_SLIPPAGE_BPS",
@@ -144,15 +218,30 @@ EXIT_WORKER_MIN_RAW: int = _env_int("EXIT_WORKER_MIN_RAW", 0)
 # Only used for sanity logs when comparing to SOL
 LAMPORTS_PER_SOL: int = 1_000_000_000
 
+# Optional: risk guard behavior
+EXIT_RISK_GUARD_ENABLED: bool = _env_bool("EXIT_RISK_GUARD_ENABLED", True)
+EXIT_RISK_RESPECT_HARD_HALT: bool = _env_bool(
+    "EXIT_RISK_RESPECT_HARD_HALT",
+    True,
+)
+
+# Optional: reinvestor integration toggle
+EXIT_REINVEST_ENABLED: bool = _env_bool("EXIT_REINVEST_ENABLED", True)
+
 # Telegram fallback config
 TELEGRAM_ENABLED: bool = _env_bool("TELEGRAM_ENABLED", False)
 TELEGRAM_NOTIFY_SELLS: bool = _env_bool("TELEGRAM_NOTIFY_SELLS", True)
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# -----------------------------------------------------------------------------
+# AI outcome logging / self-learning / risk notifications
+EXIT_AI_OUTCOME_ENABLED: bool = _env_bool("EXIT_AI_OUTCOME_ENABLED", True)
+EXIT_NOTIFY_SELF_LEARNING: bool = _env_bool("EXIT_NOTIFY_SELF_LEARNING", True)
+EXIT_NOTIFY_RISK_MANAGER: bool = _env_bool("EXIT_NOTIFY_RISK_MANAGER", True)
+
+# ----------------------------------------------------------------------------- #
 # Worker stats (for heartbeat + diagnostics)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 _worker_stats: Dict[str, Any] = {
     "ticks": 0,
     "jobs_seen": 0,
@@ -160,13 +249,17 @@ _worker_stats: Dict[str, Any] = {
     "sells_ok": 0,
     "sells_err": 0,
     "skipped_no_amount": 0,
+    "skipped_risk_block": 0,
     "last_job_ts": None,
 }
 
+# Simple concurrency guard for in-flight sells
+_SELL_SEMA = asyncio.Semaphore(max(1, EXIT_WORKER_MAX_CONCURRENCY))
 
-# -----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------- #
 # Helper: get AlertManager instance (Telegram / Notion)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 def _get_am():
     """
     Best-effort accessor for the AlertManager / alert manager singleton.
@@ -206,9 +299,9 @@ def _get_am():
     return None
 
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Telegram fallback helper
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 async def _notify_sell_telegram(
     *,
     mint: str,
@@ -271,9 +364,9 @@ async def _notify_sell_telegram(
         )
 
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Size helpers
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 def _job_spend_sol(job: Dict[str, Any]) -> float:
     """
     Normalize exit job size into SOL and write back job['spend_sol'].
@@ -319,9 +412,9 @@ def _job_spend_sol(job: Dict[str, Any]) -> float:
     return size_sol
 
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Redis helpers (exit_request storage)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 async def _scan_exit_requests(limit: int) -> List[str]:
     """
     Scan Redis for exit_request:* keys, up to `limit`.
@@ -429,9 +522,9 @@ async def _store_exit_request(payload: ExitRequest) -> Optional[str]:
         return None
 
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Amount helpers (token raw, not SOL)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 def _derive_raw_from_ui(req: ExitRequest) -> Optional[int]:
     """
     Try to derive a raw token amount from ui amount + decimals.
@@ -583,15 +676,663 @@ def _build_default_exit_config(ev: ExitRequest | Dict[str, Any]) -> Dict[str, An
     return cfg
 
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
+# Shared helper for optional modules
+# ----------------------------------------------------------------------------- #
+async def _call_optional_hook(
+    mod: Any,
+    fn_candidates: tuple[str, ...],
+    payload: Dict[str, Any],
+) -> None:
+    """
+    Try a list of candidate function names on a module; call the first found.
+
+    Supports sync or async functions, never raises.
+    """
+    if mod is None:
+        return
+    for name in fn_candidates:
+        fn = getattr(mod, name, None)
+        if not callable(fn):
+            continue
+        try:
+            if asyncio.iscoroutinefunction(fn):
+                await fn(payload)  # type: ignore[misc]
+            else:
+                await asyncio.to_thread(fn, payload)  # type: ignore[misc]
+        except Exception:
+            # Swallow – this is strictly best-effort.
+            pass
+        break
+
+
+# ----------------------------------------------------------------------------- #
+# Risk-manager integration helpers
+# ----------------------------------------------------------------------------- #
+def _risk_can_exit(
+    *,
+    mint: str,
+    amount_raw: int,
+    spend_sol: float,
+    reason: str,
+    source: str,
+) -> tuple[bool, Optional[str]]:
+    """
+    Ask risk_manager (if present) whether this exit is allowed.
+
+    Returns:
+        (allowed: bool, label: Optional[str])
+    """
+    if not EXIT_RISK_GUARD_ENABLED or RISK is None:
+        return True, None
+
+    # If risk manager exposes a global hard-halt, respect it
+    try:
+        hard_halt = getattr(RISK, "hard_halt", False)
+        if EXIT_RISK_RESPECT_HARD_HALT and hard_halt:
+            log.info(
+                "EXIT_WORKER_RISK_HARD_HALT",
+                extra={"mint": mint, "reason": reason, "source": source},
+            )
+            return False, "hard_halt"
+    except Exception:
+        # Non-fatal: just ignore if field missing
+        pass
+
+    # Try a few method names for compatibility
+    method_candidates = ("can_exit", "can_execute_exit", "allow_exit")
+    fn = None
+    for name in method_candidates:
+        fn = getattr(RISK, name, None)
+        if callable(fn):
+            break
+
+    if fn is None:
+        return True, None
+
+    try:
+        # Try full keyword set; if TypeError, fall back to smaller sets
+        try_kwargs = [
+            dict(
+                mint=mint,
+                amount_raw=amount_raw,
+                spend_sol=spend_sol,
+                reason=reason,
+                source=source,
+            ),
+            dict(mint=mint, amount_raw=amount_raw, reason=reason),
+            dict(mint=mint, amount_raw=amount_raw),
+        ]
+
+        res = None
+        for kw in try_kwargs:
+            try:
+                res = fn(**kw)  # type: ignore[misc]
+                break
+            except TypeError:
+                continue
+
+        if res is None:
+            return True, None
+
+        if isinstance(res, tuple) and len(res) >= 1:
+            allowed = bool(res[0])
+            label = res[1] if len(res) > 1 else None
+            return allowed, label  # type: ignore[return-value]
+
+        return bool(res), None
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "EXIT_WORKER_RISK_FAIL",
+            extra={"mint": mint, "err": str(e)[:200]},
+        )
+        return True, None
+
+
+async def _risk_on_exit_completed(
+    *,
+    mint: str,
+    amount_raw: int,
+    spend_sol: float,
+    reason: str,
+    source: str,
+    sig: Optional[str],
+    ok: bool,
+) -> None:
+    """
+    Notify risk_manager that an exit completed, if such a hook exists.
+    """
+    if RISK is None or not EXIT_NOTIFY_RISK_MANAGER:
+        return
+
+    method_candidates = ("on_exit_filled", "record_exit", "notify_exit")
+    fn = None
+    for name in method_candidates:
+        fn = getattr(RISK, name, None)
+        if callable(fn):
+            break
+
+    if fn is None:
+        return
+
+    payload = {
+        "mint": mint,
+        "amount_raw": int(amount_raw),
+        "spend_sol": float(spend_sol),
+        "reason": reason,
+        "source": source,
+        "sig": sig,
+        "ok": bool(ok),
+        "ts": time.time(),
+    }
+
+    try:
+        if asyncio.iscoroutinefunction(fn):
+            await fn(payload)  # type: ignore[misc]
+        else:
+            await asyncio.to_thread(fn, payload)  # type: ignore[misc]
+    except Exception:
+        log.debug("EXIT_WORKER_RISK_NOTIFY_FAIL", exc_info=True)
+
+
+# ----------------------------------------------------------------------------- #
+# Reinvestor integration helpers
+# ----------------------------------------------------------------------------- #
+async def _notify_reinvestor(
+    *,
+    req: ExitRequest,
+    spend_sol: float,
+    sig: Optional[str],
+) -> None:
+    """
+    Feed realized exits into reinvestor, if enabled and available.
+
+    Expected keys from req (if present):
+      - pnl_pct
+      - candidate_id / entry_candidate_id
+      - reason / source
+    """
+    if not EXIT_REINVEST_ENABLED or REINV is None:
+        return
+
+    method_candidates = ("on_exit_filled", "record_exit", "handle_exit")
+    fn = None
+    for name in method_candidates:
+        fn = getattr(REINV, name, None)
+        if callable(fn):
+            break
+
+    if fn is None:
+        return
+
+    mint = str(req.get("mint"))
+    reason = str(req.get("reason", "unknown"))
+    source = str(req.get("source", "unknown"))
+
+    pnl = req.get("pnl_pct")
+    candidate_id = req.get("candidate_id") or req.get("entry_candidate_id")
+
+    payload = {
+        "mint": mint,
+        "pnl_pct": pnl,
+        "spend_sol": spend_sol,
+        "reason": reason,
+        "source": source,
+        "sig": sig,
+        "candidate_id": candidate_id,
+        "ts": time.time(),
+    }
+
+    try:
+        if asyncio.iscoroutinefunction(fn):
+            await fn(payload)  # type: ignore[misc]
+        else:
+            await asyncio.to_thread(fn, payload)  # type: ignore[misc]
+    except Exception:
+        log.debug("EXIT_WORKER_REINVEST_NOTIFY_FAIL", exc_info=True)
+
+
+# ----------------------------------------------------------------------------- #
+# AI outcome logging (entry outcome + self-learning)
+# ----------------------------------------------------------------------------- #
+async def _maybe_log_ai_outcome(
+    *,
+    req: ExitRequest,
+    sig: Optional[str],
+    spend_sol: float,
+    reason: str,
+    source: str,
+    redis_handle=None,
+) -> None:
+    """
+    Optional AI training hook.
+
+    If data_logger is available AND the exit_request includes enough info
+    (candidate_id + pnl_pct + hold_seconds), we write an entry_outcomes row.
+
+    To avoid double-logging with ai_sell_logic.schedule_force_exit, we use the
+    same Redis guard key: outcome_logged:{candidate_id}.
+
+    In addition, if self_learning_ai_strategy is available, we pass a compact
+    outcome payload so the self-learning brain can adjust future knobs.
+    """
+    if not EXIT_AI_OUTCOME_ENABLED:
+        return
+    if data_logger is None and _SLM is None:
+        return
+
+    if redis_handle is None:
+        redis_handle = redis
+
+    try:
+        cand_id = req.get("candidate_id") or req.get("entry_candidate_id")
+        if isinstance(cand_id, str) and cand_id.isdigit():
+            cand_id = int(cand_id)
+        if not isinstance(cand_id, int) or cand_id <= 0:
+            return
+
+        guard_key = None
+        if redis_handle is not None:
+            guard_key = f"outcome_logged:{cand_id}"
+            try:
+                already = await redis_handle.get(guard_key)
+                if already:
+                    # Already logged by ai_sell_logic or previous path
+                    return
+            except Exception:
+                guard_key = None  # if guard lookup fails, we still try once
+
+        pnl = req.get("pnl_pct")
+        hold_sec = req.get("hold_seconds") or req.get("hold_sec")
+
+        # Fallback: derive hold_seconds from entry_ts -> now
+        if hold_sec is None:
+            entry_ts = req.get("entry_ts") or req.get("ts_entry")
+            if isinstance(entry_ts, (int, float)) and entry_ts > 0:
+                hold_sec = max(0.0, time.time() - float(entry_ts))
+
+        if pnl is None or hold_sec is None:
+            return
+
+        try:
+            pnl_f = float(pnl)
+            hold_f = float(hold_sec)
+        except Exception:
+            return
+
+        got_stopped = bool(
+            req.get("got_stopped")
+            or req.get("stopped")
+            or ("stop" in str(reason).lower())
+        )
+        label = req.get("ai_label") or req.get("exit_label")
+        extra = {
+            "source": source,
+            "reason": reason,
+            "spend_sol": spend_sol,
+            "sig": sig,
+        }
+
+        # 1) Core DB logging via data_logger (if present)
+        if data_logger is not None:
+            await asyncio.to_thread(
+                data_logger.log_entry_outcome,
+                candidate_id=int(cand_id),
+                pnl_pct=pnl_f,
+                hold_seconds=hold_f,
+                got_stopped=got_stopped,
+                label=label,
+                notes=req.get("notes"),
+                extra=extra,
+            )
+
+        # 2) Self-learning brain notification (if present)
+        if EXIT_NOTIFY_SELF_LEARNING and _SLM is not None:
+            outcome_payload = {
+                "candidate_id": int(cand_id),
+                "pnl_pct": pnl_f,
+                "hold_seconds": hold_f,
+                "got_stopped": got_stopped,
+                "label": label,
+                "source": source,
+                "reason": reason,
+                "spend_sol": spend_sol,
+                "sig": sig,
+                "ts": time.time(),
+            }
+            await _call_optional_hook(
+                _SLM,
+                ("on_entry_outcome", "on_exit_outcome", "on_trade_outcome"),
+                outcome_payload,
+            )
+
+        # Mark as logged so ai_sell_logic won't double-log (and vice versa)
+        if guard_key and redis_handle is not None:
+            try:
+                await redis_handle.setex(guard_key, 86400, "1")
+            except Exception:
+                pass
+
+    except Exception:
+        log.debug("EXIT_WORKER_AI_OUTCOME_LOG_FAIL", exc_info=True)
+
+
+# ----------------------------------------------------------------------------- #
+# Core exit execution (worker)
+# ----------------------------------------------------------------------------- #
+async def _execute_exit(req: ExitRequest) -> None:
+    """
+    Perform a forced exit for a single mint based on an exit_request payload.
+    """
+    global _worker_stats
+
+    mint = str(req.get("mint"))
+    reason = str(req.get("reason", "unknown"))
+    source = str(req.get("source", "unknown"))
+    follow = req.get("follow_stats", {}) or {}
+
+    spend_sol = _job_spend_sol(req)
+
+    amount_raw = _extract_amount_raw_from_req(req)
+    if amount_raw is None or amount_raw <= 0:
+        _worker_stats["skipped_no_amount"] += 1
+        log.info(
+            "EXIT_WORKER_SKIP_NO_AMOUNT",
+            extra={
+                "mint": mint,
+                "reason": reason,
+                "source": source,
+                "spend_sol": spend_sol,
+            },
+        )
+        if record_sell_result:
+            try:
+                record_sell_result(
+                    ok=False,
+                    reason="no_amount",
+                    mint=mint,
+                    meta={"source": source, "spend_sol": spend_sol},
+                )
+            except Exception:
+                pass
+        return
+
+    # Risk manager gating (pre-flight)
+    allowed, risk_label = _risk_can_exit(
+        mint=mint,
+        amount_raw=int(amount_raw),
+        spend_sol=spend_sol,
+        reason=reason,
+        source=source,
+    )
+    if not allowed:
+        _worker_stats["skipped_risk_block"] += 1
+        log.info(
+            "EXIT_WORKER_BLOCKED_BY_RISK",
+            extra={
+                "mint": mint,
+                "amount_raw": int(amount_raw),
+                "reason": reason,
+                "source": source,
+                "risk_label": risk_label,
+            },
+        )
+        if record_sell_result:
+            try:
+                record_sell_result(
+                    ok=False,
+                    reason=f"blocked_by_risk:{risk_label or 'unknown'}",
+                    mint=mint,
+                    meta={"source": source, "amount_raw": int(amount_raw)},
+                )
+            except Exception:
+                pass
+        return
+
+    # Per-job slippage override
+    try:
+        slippage_bps = int(req.get("slippage_bps", EXIT_WORKER_SLIPPAGE_BPS))
+    except Exception:
+        slippage_bps = EXIT_WORKER_SLIPPAGE_BPS
+
+    if DRYRUN:
+        _worker_stats["sells_ok"] += 1  # treat as logically successful
+        log.info(
+            "EXIT_WORKER_DRYRUN",
+            extra={
+                "mint": mint,
+                "amount_raw": int(amount_raw),
+                "reason": reason,
+                "source": source,
+                "follow": follow,
+                "spend_sol": spend_sol,
+                "slippage_bps": slippage_bps,
+            },
+        )
+        if record_sell_result:
+            try:
+                record_sell_result(
+                    ok=False,
+                    reason="dryrun",
+                    mint=mint,
+                    meta={"source": source, "amount_raw": int(amount_raw)},
+                )
+            except Exception:
+                pass
+        # Risk manager / reinvestor shouldn't update PnL on dryrun
+        return
+
+    log.info(
+        "EXIT_WORKER_SELL_START",
+        extra={
+            "mint": mint,
+            "amount_raw": int(amount_raw),
+            "slippage_bps": slippage_bps,
+            "reason": reason,
+            "source": source,
+            "spend_sol": spend_sol,
+        },
+    )
+
+    sig = None
+    try:
+        async with _SELL_SEMA:
+            sig = await sell_via_lightning(
+                mint=mint,
+                token_program=None,
+                amount_raw=int(amount_raw),
+                slippage_bps=int(slippage_bps),
+            )
+    except Exception as e:  # noqa: BLE001
+        _worker_stats["sells_err"] += 1
+        log.warning(
+            "EXIT_WORKER_SELL_ERROR",
+            extra={
+                "mint": mint,
+                "err": str(e)[:200],
+                "reason": reason,
+                "source": source,
+                "spend_sol": spend_sol,
+            },
+        )
+        if record_sell_result:
+            try:
+                record_sell_result(
+                    ok=False,
+                    reason=str(e),
+                    mint=mint,
+                    meta={"source": source, "amount_raw": int(amount_raw)},
+                )
+            except Exception:
+                pass
+
+        await _risk_on_exit_completed(
+            mint=mint,
+            amount_raw=int(amount_raw),
+            spend_sol=spend_sol,
+            reason=reason,
+            source=source,
+            sig=None,
+            ok=False,
+        )
+        return
+
+    _worker_stats["sells_ok"] += 1
+    _worker_stats["last_job_ts"] = time.time()
+
+    log.info(
+        "EXIT_WORKER_SELL_DONE",
+        extra={
+            "mint": mint,
+            "amount_raw": int(amount_raw),
+            "sig": sig,
+            "reason": reason,
+            "source": source,
+            "spend_sol": spend_sol,
+        },
+    )
+
+    if record_sell_result:
+        try:
+            record_sell_result(
+                ok=True,
+                reason=reason,
+                mint=mint,
+                sig=(
+                    sig if isinstance(sig, str) else (sig.decode("utf-8") if sig else None)
+                ),
+                meta={"source": source, "amount_raw": int(amount_raw)},
+            )
+        except Exception:
+            pass
+
+    # Notify risk manager that exit completed
+    await _risk_on_exit_completed(
+        mint=mint,
+        amount_raw=int(amount_raw),
+        spend_sol=spend_sol,
+        reason=reason,
+        source=source,
+        sig=sig if isinstance(sig, str) else None,
+        ok=True,
+    )
+
+    # Optional AI / training outcome logging (deduped vs ai_sell_logic)
+    await _maybe_log_ai_outcome(
+        req=req,
+        sig=sig if isinstance(sig, str) else None,
+        spend_sol=spend_sol,
+        reason=reason,
+        source=source,
+        redis_handle=redis,
+    )
+
+    # Optional reinvestor notification
+    await _notify_reinvestor(
+        req=req,
+        spend_sol=spend_sol,
+        sig=sig if isinstance(sig, str) else None,
+    )
+
+    # Alerts: AlertManager first, then Telegram fallback
+    symbol = req.get("symbol") or req.get("name") or mint
+    pool = req.get("pool") or "unknown"
+
+    try:
+        am = _get_am()
+        if am is not None:
+            create_task(
+                am.notify_trade_fill(
+                    side="SELL",
+                    mint=mint,
+                    symbol=symbol,
+                    pool=pool,
+                    sig=str(sig) if sig else None,
+                    spend_sol=spend_sol,
+                    out_amount=amount_raw,
+                )
+            )
+        else:
+            log.event("EXIT_WORKER_NO_ALERT_MANAGER", mint=mint)
+            await _notify_sell_telegram(
+                mint=mint,
+                symbol=symbol,
+                pool=pool,
+                sig=sig if isinstance(sig, str) else None,
+                spend_sol=spend_sol,
+                amount_raw=amount_raw,
+                reason=reason,
+                source=source,
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "EXIT_WORKER_ALERT_FAIL",
+            extra={"mint": mint, "err": str(e)[:200]},
+        )
+
+
+async def _process_once() -> int:
+    """
+    Single tick: scan for exit_request:* keys and process up to EXIT_WORKER_BATCH.
+
+    Returns:
+        int: number of exit jobs processed in this tick.
+    """
+    global _worker_stats
+
+    if not EXIT_WORKER_ENABLED:
+        return 0
+    if redis is None:
+        log.event("EXIT_WORKER_NO_REDIS", where="process_once")
+        return 0
+
+    _worker_stats["ticks"] += 1
+
+    keys = await _scan_exit_requests(EXIT_WORKER_BATCH)
+    job_count = len(keys)
+    _worker_stats["jobs_seen"] += job_count
+
+    if not keys:
+        return 0
+
+    for key in keys:
+        req = await _load_exit_request(key)
+        if not req:
+            await _delete_exit_request(key)
+            continue
+
+        mint = str(req.get("mint"))
+        reason = str(req.get("reason", "unknown"))
+        source = str(req.get("source", "unknown"))
+
+        log.info(
+            "EXIT_WORKER_REQUEST",
+            extra={
+                "key": key,
+                "mint": mint,
+                "reason": reason,
+                "source": source,
+            },
+        )
+
+        _worker_stats["jobs_processed"] += 1
+        await _execute_exit(req)
+
+        # Always delete; re-queues should create a new request
+        await _delete_exit_request(key)
+
+    return job_count
+
+
+# ----------------------------------------------------------------------------- #
 # Exit engine – logic front-end
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 class _ExitEngine:
     """
     Exit engine (front-end):
 
     - on_trade_tick: placeholder for follow-through / stats (currently no-op).
-    - on_buy_filled: tolerant API used by Strategy to enqueue exits.
+    - on_buy_filled: tolerant API used by Strategy / exit_engine to enqueue exits.
     - enqueue_exit_request: generic API for risk manager / manual exits.
 
     Stores exit_request payloads in Redis. The background worker
@@ -611,7 +1352,7 @@ class _ExitEngine:
         """
         if not self.enabled:
             return
-        # hook point for future follow-through logic
+        # hook point for future per-mint exit stats if needed
         return
 
     async def on_buy_filled(
@@ -701,6 +1442,7 @@ class _ExitEngine:
                 amount_raw = derived
 
         if amount_raw is None or amount_raw <= 0:
+            # Fallback: approximate from spend_sol / price / decimals
             price_keys = (
                 "price_entry_ui",
                 "entry_price_ui",
@@ -790,6 +1532,11 @@ class _ExitEngine:
             # extra context for alerts
             "symbol": ev.get("symbol") or ev.get("name"),
             "pool": ev.get("pool") or "unknown",
+            # optional AI fields for later outcome logging
+            "candidate_id": ev.get("candidate_id") or ev.get("entry_candidate_id"),
+            "entry_ts": ev.get("entry_ts") or ev.get("ts_entry"),
+            # allow per-position slippage override if present
+            "slippage_bps": ev.get("slippage_bps"),
         }
         if tx_sig:
             payload["tx_sig"] = tx_sig
@@ -833,6 +1580,8 @@ class _ExitEngine:
         entry_spend_sol: float | None = None,
         follow_stats: Optional[Dict[str, Any]] = None,
         tx_sig: Optional[str] = None,
+        candidate_id: Optional[int] = None,
+        slippage_bps: Optional[int] = None,
     ) -> Optional[str]:
         """
         Generic way to schedule an exit for a position.
@@ -840,6 +1589,7 @@ class _ExitEngine:
         Intended for:
           - risk manager / TSL / SL logic
           - "panic sell" or manual controls
+          - exit_engine.follow-through forced exits
         """
         if not self.enabled:
             return None
@@ -873,6 +1623,8 @@ class _ExitEngine:
             "entry_spend_sol": float(entry_spend_sol or 0.0),
             "follow_stats": follow_stats,
             "source": "manual",
+            "candidate_id": candidate_id,
+            "slippage_bps": slippage_bps,
         }
         if tx_sig:
             payload["tx_sig"] = str(tx_sig)
@@ -892,239 +1644,13 @@ class _ExitEngine:
         return key
 
 
-# Global instance used elsewhere (Strategy, risk manager, etc.)
+# Global instance used elsewhere (Strategy, risk manager, exit_engine, etc.)
 exit_engine = _ExitEngine()
 
 
-# -----------------------------------------------------------------------------
-# Core exit execution (worker)
-# -----------------------------------------------------------------------------
-async def _execute_exit(req: ExitRequest) -> None:
-    """
-    Perform a forced exit for a single mint based on an exit_request payload.
-    """
-    global _worker_stats
-
-    mint = str(req.get("mint"))
-    reason = str(req.get("reason", "unknown"))
-    source = str(req.get("source", "unknown"))
-    follow = req.get("follow_stats", {}) or {}
-
-    spend_sol = _job_spend_sol(req)
-
-    amount_raw = _extract_amount_raw_from_req(req)
-    if amount_raw is None or amount_raw <= 0:
-        _worker_stats["skipped_no_amount"] += 1
-        log.info(
-            "EXIT_WORKER_SKIP_NO_AMOUNT",
-            extra={
-                "mint": mint,
-                "reason": reason,
-                "source": source,
-                "spend_sol": spend_sol,
-            },
-        )
-        if record_sell_result:
-            try:
-                record_sell_result(
-                    ok=False,
-                    reason="no_amount",
-                    mint=mint,
-                    meta={"source": source, "spend_sol": spend_sol},
-                )
-            except Exception:
-                pass
-        return
-
-    if DRYRUN:
-        _worker_stats["sells_ok"] += 1  # treat as logically successful
-        log.info(
-            "EXIT_WORKER_DRYRUN",
-            extra={
-                "mint": mint,
-                "amount_raw": int(amount_raw),
-                "reason": reason,
-                "source": source,
-                "follow": follow,
-                "spend_sol": spend_sol,
-            },
-        )
-        if record_sell_result:
-            try:
-                record_sell_result(
-                    ok=False,
-                    reason="dryrun",
-                    mint=mint,
-                    meta={"source": source, "amount_raw": int(amount_raw)},
-                )
-            except Exception:
-                pass
-        return
-
-    log.info(
-        "EXIT_WORKER_SELL_START",
-        extra={
-            "mint": mint,
-            "amount_raw": int(amount_raw),
-            "slippage_bps": EXIT_WORKER_SLIPPAGE_BPS,
-            "reason": reason,
-            "source": source,
-            "spend_sol": spend_sol,
-        },
-    )
-
-    sig = None
-    try:
-        sig = await sell_via_lightning(
-            mint=mint,
-            token_program=None,
-            amount_raw=int(amount_raw),
-            slippage_bps=int(EXIT_WORKER_SLIPPAGE_BPS),
-        )
-    except Exception as e:  # noqa: BLE001
-        _worker_stats["sells_err"] += 1
-        log.warning(
-            "EXIT_WORKER_SELL_ERROR",
-            extra={
-                "mint": mint,
-                "err": str(e)[:200],
-                "reason": reason,
-                "source": source,
-                "spend_sol": spend_sol,
-            },
-        )
-        if record_sell_result:
-            try:
-                record_sell_result(
-                    ok=False,
-                    reason=str(e),
-                    mint=mint,
-                    meta={"source": source, "amount_raw": int(amount_raw)},
-                )
-            except Exception:
-                pass
-        return
-
-    _worker_stats["sells_ok"] += 1
-    _worker_stats["last_job_ts"] = time.time()
-
-    log.info(
-        "EXIT_WORKER_SELL_DONE",
-        extra={
-            "mint": mint,
-            "amount_raw": int(amount_raw),
-            "sig": sig,
-            "reason": reason,
-            "source": source,
-            "spend_sol": spend_sol,
-        },
-    )
-
-    if record_sell_result:
-        try:
-            record_sell_result(
-                ok=True,
-                reason=reason,
-                mint=mint,
-                sig=sig,
-                meta={"source": source, "amount_raw": int(amount_raw)},
-            )
-        except Exception:
-            pass
-
-    # Alerts: AlertManager first, then Telegram fallback
-    symbol = req.get("symbol") or req.get("name") or mint
-    pool = req.get("pool") or "unknown"
-
-    try:
-        am = _get_am()
-        if am is not None:
-            create_task(
-                am.notify_trade_fill(
-                    side="SELL",
-                    mint=mint,
-                    symbol=symbol,
-                    pool=pool,
-                    sig=str(sig) if sig else None,
-                    spend_sol=spend_sol,
-                    out_amount=amount_raw,
-                )
-            )
-        else:
-            log.event("EXIT_WORKER_NO_ALERT_MANAGER", mint=mint)
-            await _notify_sell_telegram(
-                mint=mint,
-                symbol=symbol,
-                pool=pool,
-                sig=sig,
-                spend_sol=spend_sol,
-                amount_raw=amount_raw,
-                reason=reason,
-                source=source,
-            )
-    except Exception as e:  # noqa: BLE001
-        log.warning(
-            "EXIT_WORKER_ALERT_FAIL",
-            extra={"mint": mint, "err": str(e)[:200]},
-        )
-
-
-async def _process_once() -> int:
-    """
-    Single tick: scan for exit_request:* keys and process up to EXIT_WORKER_BATCH.
-
-    Returns:
-        int: number of exit jobs processed in this tick.
-    """
-    global _worker_stats
-
-    if not EXIT_WORKER_ENABLED:
-        return 0
-    if redis is None:
-        log.event("EXIT_WORKER_NO_REDIS", where="process_once")
-        return 0
-
-    _worker_stats["ticks"] += 1
-
-    keys = await _scan_exit_requests(EXIT_WORKER_BATCH)
-    job_count = len(keys)
-    _worker_stats["jobs_seen"] += job_count
-
-    if not keys:
-        return 0
-
-    for key in keys:
-        req = await _load_exit_request(key)
-        if not req:
-            await _delete_exit_request(key)
-            continue
-
-        mint = str(req.get("mint"))
-        reason = str(req.get("reason", "unknown"))
-        source = str(req.get("source", "unknown"))
-
-        log.info(
-            "EXIT_WORKER_REQUEST",
-            extra={
-                "key": key,
-                "mint": mint,
-                "reason": reason,
-                "source": source,
-            },
-        )
-
-        _worker_stats["jobs_processed"] += 1
-        await _execute_exit(req)
-
-        # Always delete; re-queues should create a new request
-        await _delete_exit_request(key)
-
-    return job_count
-
-
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Heartbeat / observability
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 def _heartbeat_payload() -> Dict[str, Any]:
     """
     Build a structured snapshot of worker stats for logging.
@@ -1142,11 +1668,13 @@ def _heartbeat_payload() -> Dict[str, Any]:
         "sells_ok": _worker_stats.get("sells_ok"),
         "sells_err": _worker_stats.get("sells_err"),
         "skipped_no_amount": _worker_stats.get("skipped_no_amount"),
+        "skipped_risk_block": _worker_stats.get("skipped_risk_block"),
         "seconds_since_last_job": since_last,
         "dryrun": DRYRUN,
         "poll_sec": EXIT_WORKER_POLL_SEC,
         "batch": EXIT_WORKER_BATCH,
         "slippage_bps": EXIT_WORKER_SLIPPAGE_BPS,
+        "max_concurrency": EXIT_WORKER_MAX_CONCURRENCY,
         "sell_pct": EXIT_WORKER_SELL_PCT,
     }
 
@@ -1159,9 +1687,9 @@ def _log_heartbeat() -> None:
     log.event("EXIT_WORKER_HEARTBEAT", **payload)
 
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Public loop entrypoint
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 async def exit_worker_loop(stop_evt: asyncio.Event) -> None:
     """
     Background loop: periodically scans Redis for exit_request:* keys
@@ -1179,6 +1707,7 @@ async def exit_worker_loop(stop_evt: asyncio.Event) -> None:
             "slippage_bps": EXIT_WORKER_SLIPPAGE_BPS,
             "sell_pct": EXIT_WORKER_SELL_PCT,
             "dryrun": DRYRUN,
+            "max_concurrency": EXIT_WORKER_MAX_CONCURRENCY,
         },
     )
     log.event(
@@ -1189,6 +1718,7 @@ async def exit_worker_loop(stop_evt: asyncio.Event) -> None:
         sell_pct=EXIT_WORKER_SELL_PCT,
         dryrun=int(DRYRUN),
         heartbeat_sec=EXIT_WORKER_HEARTBEAT_SEC,
+        max_concurrency=EXIT_WORKER_MAX_CONCURRENCY,
     )
 
     last_hb = 0.0
@@ -1225,3 +1755,9 @@ async def exit_worker_loop(stop_evt: asyncio.Event) -> None:
         except asyncio.TimeoutError:
             # normal tick – go again
             continue
+
+
+__all__ = [
+    "exit_engine",
+    "exit_worker_loop",
+]

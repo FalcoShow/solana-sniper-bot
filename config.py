@@ -1,15 +1,26 @@
 # config.py
-# Centralized config for the Solana Sniper + DayTrader bot
+# Centralized config for the Solana Sniper + DayTrader bot (V3+++ / quant-grade)
+#
 # - Rich env parsing with sane defaults
-# - Backward-compat aliases (PG_DSN*, NOTION_* aliases, RAYDIUM_PAIRS_API, etc.)
-# - Switches for AI scoring, adaptive sell, scanners, social, whale filters, daytrader
-# - Storage: Redis + SQLite + optional Postgres
+# - Backward-compat aliases for older modules
+# - Knobs for:
+#     • core infra (RPC, Redis, Postgres, Notion, alerts)
+#     • scanners (Raydium, Pump.fun, Dexscreener)
+#     • Jupiter/router / swap settings
+#     • risk manager + daily drawdown / kill-switch
+#     • AI stack (entry, rug/fraud, sell, buy scoring, self-learning)
+#     • PairFilter thresholds (PF_*)
+#     • regime detection
+#     • logging / diagnostics / backtests
+#
+# This file should stay *dumb*: just parse env → constants. No heavy logic.
+
 from __future__ import annotations
 
-import os
 import json
 import logging
-from typing import Dict, List
+import os
+from typing import Any, Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -20,7 +31,7 @@ def _get_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _get_float(name: str, default: float) -> float:
@@ -43,14 +54,14 @@ def _get_int(name: str, default: int) -> int:
         return int(default)
 
 
-def _get_list(name: str, default: List[str] | None = None, sep: str = ",") -> List[str]:
+def _get_list(name: str, default: Optional[List[str]] = None, sep: str = ",") -> List[str]:
     raw = os.getenv(name)
     if not raw:
         return list(default or [])
     return [s.strip() for s in raw.split(sep) if s.strip()]
 
 
-def _get_json(name: str, default):
+def _get_json(name: str, default: Any) -> Any:
     raw = os.getenv(name)
     if not raw:
         return default
@@ -62,22 +73,23 @@ def _get_json(name: str, default):
 
 def _get_prob(name: str, default: float) -> float:
     """
-    Accept [0..1] or percent [0..100].
-    If value > 1 we assume it is percent and divide by 100.
+    Accept [0..1] or percent [0..100]. If value > 1 we assume it is percent
+    and divide by 100.
     """
     v = _get_float(name, default)
     return v / 100.0 if v > 1 else v
 
 
 # ---------------------------------------------------------------------------
-# App / logging
+# App / logging / environment
 # ---------------------------------------------------------------------------
 
 APP_NAME = os.getenv("APP_NAME", "solana-sniper-bot-pro")
-ENV = os.getenv("ENV", "dev")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+ENV = os.getenv("ENV", "dev").lower()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 STRICT_CONFIG = _get_bool("STRICT_CONFIG", False)
 
+IS_PROD = ENV in {"prod", "production"}
 ENABLE_METRICS = _get_bool("ENABLE_METRICS", True)
 METRICS_PORT = _get_int("METRICS_PORT", 9108)
 
@@ -86,12 +98,13 @@ METRICS_PORT = _get_int("METRICS_PORT", 9108)
 # RPC / chain
 # ---------------------------------------------------------------------------
 
+NETWORK = os.getenv("NETWORK", "").strip() or os.getenv("SOLANA_CLUSTER", "mainnet")
 RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
 RPC_URLS = _get_list("RPC_URLS", [RPC_URL])
 WEBSOCKET_URL = os.getenv("WEBSOCKET_URL", "")
 COMMITMENT = os.getenv("COMMITMENT", "confirmed")  # processed|confirmed|finalized
 
-# Back-compat for legacy code
+# Back-compat alias
 SOLANA_ENDPOINT = RPC_URL
 
 # Helius (optional)
@@ -113,6 +126,9 @@ WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY", "")
 WALLET_PUBKEY = os.getenv("WALLET_PUBKEY", os.getenv("WALLET_PUBLIC_KEY", ""))
 SAVINGS_WALLET = os.getenv("SAVINGS_WALLET", "")
 
+# Minimum free SOL to keep as safety buffer
+MIN_SOL_BALANCE = _get_float("MIN_SOL_BALANCE", 0.20)
+
 
 # ---------------------------------------------------------------------------
 # External APIs / scanners
@@ -125,20 +141,22 @@ COINGECKO_SOL_API = os.getenv(
 
 # Legacy scanner endpoints (still used by some scripts)
 RAYDIUM_API_URL = os.getenv("RAYDIUM_API_URL", "https://api.raydium.io/pairs")
+
 DEXSCREENER_API_URL = os.getenv(
     "DEXSCREENER_API_URL",
     "https://api.dexscreener.com/latest/dex/tokens",
 )
+
 PUMPFUN_API_URL = os.getenv("PUMPFUN_API_URL", "https://pump.fun/api/v1/tokens")
 BIRDEYE_API_URL = os.getenv("BIRDEYE_API_URL", "https://public-api.birdeye.so")
 
-# Dexscreener base (for raydium_scanner via /latest/dex/search)
+# Dexscreener base (used by scanner/dexscreener_scanner.py via /latest/dex/search)
 DEXSCREENER_BASE_URL = os.getenv(
     "DEXSCREENER_BASE_URL",
     "https://api.dexscreener.com",
 ).rstrip("/")
 
-# Pump.fun scanner tuning
+# Pump.fun scanner tuning (mirrors envs inside scanner/pumpfun_scanner.py)
 PUMPFUN_API_BASE = os.getenv("PUMPFUN_API_BASE", "").rstrip("/")
 PUMPFUN_HTTP_TIMEOUT_S = _get_int("PUMPFUN_HTTP_TIMEOUT_S", 15)
 PUMPFUN_HTTP_CONN_LIMIT = _get_int("PUMPFUN_HTTP_CONN_LIMIT", 30)
@@ -152,7 +170,7 @@ PUMPFUN_SKIP_HTMLNEXT = _get_bool("PUMPFUN_SKIP_HTMLNEXT", False)
 # Jupiter v6 / router
 # ---------------------------------------------------------------------------
 
-# lightning_impl.py mainly uses the JUP_* envs directly; these are for convenience.
+# lightning_impl / router mainly use the JUP_* envs directly; these are centralized here.
 JUP_BASE_URL = os.getenv("JUP_BASE_URL", "https://api.jup.ag").rstrip("/")
 JUP_ALT_BASE_URLS = _get_list("JUP_ALT_BASE_URLS", [JUP_BASE_URL])
 JUP_AS_LEGACY = _get_bool("JUP_AS_LEGACY", True)
@@ -165,6 +183,9 @@ JUPITER_API_BASE = os.getenv("JUPITER_API_BASE", "https://quote-api.jup.ag/v6")
 JUPITER_QUOTE_API = os.getenv("JUPITER_QUOTE_API", f"{JUPITER_API_BASE}/quote")
 JUPITER_SWAP_API = os.getenv("JUPITER_SWAP_API", JUPITER_API_BASE)
 
+# Slippage for Jupiter routes (fraction; 0.005 = 0.5%)
+JUPITER_MAX_SLIPPAGE = _get_float("JUPITER_MAX_SLIPPAGE", 0.005)
+
 
 # ---------------------------------------------------------------------------
 # Credentials / keys
@@ -175,10 +196,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 
-# Notion (support both naming styles you used)
+# Notion
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", os.getenv("NOTION_API_KEY", ""))
 NOTION_DATABASE_ID = os.getenv(
-    "NOTION_DATABASE_ID", os.getenv("NOTION_DB_TRADES", "")
+    "NOTION_DATABASE_ID",
+    os.getenv("NOTION_DB_TRADES", ""),
 )
 ENABLE_NOTION_LOGGING = _get_bool("ENABLE_NOTION_LOGGING", True)
 
@@ -194,7 +216,7 @@ NOTION_PROP_TIME = os.getenv("NOTION_PROP_TIME", "Timestamp")
 # Birdeye
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
 
-# OpenAI
+# OpenAI / AI models
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
@@ -227,7 +249,7 @@ POSTGRES_DSN = os.getenv("POSTGRES_DSN", PG_DSN or PG_DSN_INTERNAL or PG_DSN_EXT
 
 
 # ---------------------------------------------------------------------------
-# Trading / execution (shared)
+# Trading / execution (shared sniper knobs)
 # ---------------------------------------------------------------------------
 
 # High-level mode for the sniper
@@ -235,22 +257,18 @@ AUTO_BUY_ENABLED = _get_bool("AUTO_BUY_ENABLED", True)
 AUTO_SELL_ENABLED = _get_bool("AUTO_SELL_ENABLED", True)
 PAPER_TRADING = _get_bool("PAPER_TRADING", False)  # sniper-level paper trading
 
-# Global safety toggles used by sniper/sniper.py
+# Global safety toggles
 PAUSE_TRADING = _get_bool("PAUSE_TRADING", False)
 DRY_RUN = _get_bool("DRY_RUN", False)
 # Back-compat: some modules import DRYRUN instead of DRY_RUN
 DRYRUN = DRY_RUN
 
-# Slippage for Jupiter routes
-JUPITER_MAX_SLIPPAGE = _get_float("JUPITER_MAX_SLIPPAGE", 0.005)  # 0.5%
-
 TRANSACTION_TIMEOUT = _get_int("TRANSACTION_TIMEOUT", 20)
 MAX_RETRIES = _get_int("MAX_RETRIES", 3)
 EXEC_DELAY = _get_int("SNIPER_EXEC_DELAY", _get_int("EXEC_DELAY", 0))
 
-# Dynamic sizing / risk
+# Dynamic sizing / risk (legacy baseline)
 MAX_RISK_PER_TRADE = _get_float("MAX_RISK_PER_TRADE", 0.05)  # 5% of SOL stack
-MIN_SOL_BALANCE = _get_float("MIN_SOL_BALANCE", 0.20)
 MIN_VOLATILITY = _get_float("MIN_VOLATILITY", 0.02)
 PARTIAL_SELL_CHUNKS = _get_int("PARTIAL_SELL_CHUNKS", 4)
 
@@ -258,14 +276,17 @@ PARTIAL_SELL_CHUNKS = _get_int("PARTIAL_SELL_CHUNKS", 4)
 TICKET_PCT_EQUITY = _get_float("TICKET_PCT_EQUITY", 0.04)  # 4% of equity
 TICKET_USD_CAP = _get_float("TICKET_USD_CAP", 300.0)
 
-# Targets / SL / hold
+# Minimum SOL per initial buy used by some scanners/strategies
+ENTRY_MIN_INITIAL_BUY_SOL = _get_float("ENTRY_MIN_INITIAL_BUY_SOL", 0.0025)
+
+# Targets / SL / hold (generic baseline)
 TARGET_PROFIT_PERCENT = _get_float("TARGET_PROFIT_PERCENT", 200.0)  # 200% = 2x
 STOP_LOSS_PERCENT = _get_float("STOP_LOSS_PERCENT", 20.0)
 TRAILING_STOP_ENABLED = _get_bool("TRAILING_STOP_ENABLED", True)
 MAX_HOLD_TIME_MINUTES = _get_int("MAX_HOLD_TIME_MINUTES", 360)
 HOLD_IF_SCORE_ABOVE = _get_prob("HOLD_IF_SCORE_ABOVE", 0.85)  # 0..1
 
-# Take-profit ladder used by sniper._buy_token
+# Take-profit ladder used by some sniper flows
 TAKE_PROFIT1_PCT = _get_float("TAKE_PROFIT1_PCT", 30.0)
 TAKE_PROFIT2_PCT = _get_float("TAKE_PROFIT2_PCT", 60.0)
 TAKE_PROFIT3_PCT = _get_float("TAKE_PROFIT3_PCT", 120.0)
@@ -279,11 +300,80 @@ REINVESTMENT_HONEYPOT_CHECK = _get_bool("REINVESTMENT_HONEYPOT_CHECK", True)
 
 
 # ---------------------------------------------------------------------------
-# Entry momentum guard (Strategy uses these directly)
+# Quant-grade risk manager (used by utils_pkg.risk_manager)
+# ---------------------------------------------------------------------------
+
+# High-level risk profile (used by risk_manager for presets / modes)
+RISK_PROFILE = os.getenv("RISK_PROFILE", "balanced").lower()
+RISK_MODE_OVERRIDE = os.getenv("RISK_MODE_OVERRIDE", "").strip() or None
+
+# Per-trade & per-coin equity caps
+RISK_MAX_EQUITY_PCT_PER_TRADE = _get_float(
+    "RISK_MAX_EQUITY_PCT_PER_TRADE",
+    TICKET_PCT_EQUITY,
+)
+RISK_MAX_EQUITY_PCT_PER_COIN = _get_float(
+    "RISK_MAX_EQUITY_PCT_PER_COIN",
+    0.10,  # 10% default cap per mint
+)
+
+# Global concurrency / positions
+RISK_MAX_OPEN_POSITIONS = _get_int("RISK_MAX_OPEN_POSITIONS", 6)
+RISK_MAX_PARALLEL_BUYS = _get_int("RISK_MAX_PARALLEL_BUYS", 3)
+
+# Daily limits / kill-switch
+RISK_MAX_DAILY_DRAWDOWN_PCT = _get_float("RISK_MAX_DAILY_DRAWDOWN_PCT", 0.18)  # 18%
+RISK_MAX_DAILY_LOSS_SOL = _get_float("RISK_MAX_DAILY_LOSS_SOL", 9999.0)  # optional hard cap
+RISK_CIRCUIT_BREAKER_MINUTES = _get_int("RISK_CIRCUIT_BREAKER_MINUTES", 45)
+
+STOP_AFTER_DAILY_PROFIT_PCT = _get_float("STOP_AFTER_DAILY_PROFIT_PCT", 25.0)
+DAILY_SPEND_CAP_PCT = _get_float("DAILY_SPEND_CAP_PCT", 0.35)  # of equity
+
+# Kill-switch behaviour
+RISK_HARD_KILL_ON_DRAWNDOWN = _get_bool("RISK_HARD_KILL_ON_DRAWNDOWN", True)
+RISK_ALLOW_REENTRY_AFTER_BREAK = _get_bool("RISK_ALLOW_REENTRY_AFTER_BREAK", True)
+
+# Back-compat for modules that read MAX_CONCURRENT_POS directly
+MAX_CONCURRENT_POS = _get_int("MAX_CONCURRENT_POS", RISK_MAX_OPEN_POSITIONS)
+
+
+# ---------------------------------------------------------------------------
+# Exit engine / auto-sell (used by utils_pkg.exit_engine & auto_sell)
+# ---------------------------------------------------------------------------
+
+# Static stop loss and take-profit
+EXIT_STOP_LOSS_PCT = _get_float("EXIT_STOP_LOSS_PCT", STOP_LOSS_PERCENT)
+EXIT_TP1_PCT = _get_float("EXIT_TP1_PCT", TAKE_PROFIT1_PCT)
+EXIT_TP2_PCT = _get_float("EXIT_TP2_PCT", TAKE_PROFIT2_PCT)
+EXIT_TP3_PCT = _get_float("EXIT_TP3_PCT", TAKE_PROFIT3_PCT)
+
+# Trailing stop logic
+EXIT_TSL_ENABLED = _get_bool("EXIT_TSL_ENABLED", True)
+EXIT_TSL_ARM_PCT = _get_float("EXIT_TSL_ARM_PCT", 12.0)
+EXIT_TSL_STEP_PCT = _get_float("EXIT_TSL_STEP_PCT", 4.5)
+
+# Legacy PF_* aliases for trailing stop (used by older Pump.fun paths)
+PF_TSL_ARM_PCT = _get_float("PF_TSL_ARM_PCT", EXIT_TSL_ARM_PCT)
+PF_TSL_PCT = _get_float("PF_TSL_PCT", EXIT_TSL_STEP_PCT)
+PF_SL_PCT = _get_float("PF_SL_PCT", EXIT_STOP_LOSS_PCT)
+
+# Stagnant / dead coin exits
+EXIT_STAGNANT_MAX_MIN = _get_int("EXIT_STAGNANT_MAX_MIN", 10)
+EXIT_STAGNANT_MIN_MOVE_PCT = _get_float("EXIT_STAGNANT_MIN_MOVE_PCT", 5.0)
+EXIT_DEAD_COIN_MAX_MIN = _get_int("EXIT_DEAD_COIN_MAX_MIN", 45)
+EXIT_DEAD_MIN_LIQ_USD = _get_float("EXIT_DEAD_MIN_LIQ_USD", 400.0)
+EXIT_FORCE_AFTER_X_MULT = _get_float("EXIT_FORCE_AFTER_X_MULT", 8.0)  # hard rug-avoid exit
+
+# Profit lock-in
+EXIT_LOCK_PROFIT_AFTER_MULT = _get_float("EXIT_LOCK_PROFIT_AFTER_MULT", 3.0)
+EXIT_LOCK_PROFIT_TSL_STEP_PCT = _get_float("EXIT_LOCK_PROFIT_TSL_STEP_PCT", 3.5)
+
+
+# ---------------------------------------------------------------------------
+# Entry momentum guard (used by Strategy / ai_entry_logic pre-gate)
 # ---------------------------------------------------------------------------
 
 # Master ON/OFF for momentum filter.
-# Default: follow AI_MOMO_FILTER if present, else enabled.
 ENTRY_MOMENTUM_ENABLED = _get_bool(
     "ENTRY_MOMENTUM_ENABLED",
     _get_bool("AI_MOMO_FILTER", True),
@@ -313,12 +403,12 @@ ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP = _get_bool(
 
 
 # ---------------------------------------------------------------------------
-# Sniper loop / scanners tuning (matches sniper/sniper.py)
+# Sniper loop / scanners tuning (matches Strategy / scripts.main)
 # ---------------------------------------------------------------------------
 
 # Scan cadence
 SCAN_INTERVAL = _get_int("SCAN_INTERVAL", 60)           # generic
-SCANNER_PERIOD_SEC = _get_int("SCANNER_PERIOD_SEC", 4)  # main loop
+SCANNER_PERIOD_SEC = _get_int("SCANNER_PERIOD_SEC", 4)  # main loop tick
 
 # Buy / concurrency
 BUY_COOLDOWN_SEC = _get_int("BUY_COOLDOWN_SEC", 3)
@@ -367,7 +457,7 @@ MOONSHOT_IMPACT_CUTOFF_BPS = _get_float("MOONSHOT_IMPACT_CUTOFF_BPS", 150.0)
 
 
 # ---------------------------------------------------------------------------
-# Scanners / arbitrage (legacy, still used by some scripts)
+# Scanners / arbitrage (legacy toggles still used)
 # ---------------------------------------------------------------------------
 
 ENABLE_RAYDIUM_SCANNER = _get_bool("ENABLE_RAYDIUM_SCANNER", True)
@@ -404,9 +494,7 @@ REINVESTMENT_CHECK_INTERVAL = _get_int("REINVESTMENT_CHECK_INTERVAL", 60)
 
 
 # ---------------------------------------------------------------------------
-# NEW: PairFilter-centric thresholds (used by utils_pkg.pair_filters)
-# These are the knobs that directly control which coins are considered
-# "viable" and how momentum / risk scoring behaves.
+# PairFilter-centric thresholds (used by utils_pkg.pair_filters)
 # ---------------------------------------------------------------------------
 
 # Hard ranges for liquidity / mcap / age
@@ -440,16 +528,86 @@ PF_RISK_PENALTY_WEIGHT = _get_float("PF_RISK_PENALTY_WEIGHT", 0.6)
 
 
 # ---------------------------------------------------------------------------
-# AI strategy loop
+# AI strategy / entry / sell / buy scoring (used by ai_* modules)
 # ---------------------------------------------------------------------------
 
+AI_ENABLED = _get_bool("AI_ENABLED", True)
+
+# Entry AI / pre-gate
+AI_ENTRY_ENABLED = _get_bool("AI_ENTRY_ENABLED", True)
+AI_ENTRY_MODEL = os.getenv(
+    "AI_ENTRY_MODEL",
+    FINE_TUNED_MODEL or OPENAI_MODEL,
+)
+AI_ENTRY_THRESHOLD = _get_prob("AI_ENTRY_THRESHOLD", 0.62)
+AI_ENTRY_MAX_CONCURRENCY = _get_int("AI_ENTRY_MAX_CONCURRENCY", 8)
+
+# Global entry gate (used by ai_buy_scoring / ai_entry_logic)
+AI_SCORE_GATE = _get_prob("AI_SCORE_GATE", AI_ENTRY_THRESHOLD)
+AI_SCORE_SOFT_FLOOR = _get_prob("AI_SCORE_SOFT_FLOOR", 0.50)
+AI_SCORE_HARD_FLOOR = _get_prob("AI_SCORE_HARD_FLOOR", 0.38)
+
+# Risk capacity gating (used by ai_buy_scoring / ai_entry_logic)
+ENTRY_REQUIRE_RISK_CAPACITY = _get_bool("ENTRY_REQUIRE_RISK_CAPACITY", True)
+ENTRY_RISK_CAPACITY_MIN = _get_prob("ENTRY_RISK_CAPACITY_MIN", 0.30)
+
+# Rug / fraud AI (used by scanners + router guard)
+AI_RUG_ENABLED = _get_bool("AI_RUG_ENABLED", True)
+AI_RUG_MODEL = os.getenv(
+    "AI_RUG_MODEL",
+    FINE_TUNED_MODEL or OPENAI_MODEL,
+)
+AI_RUG_MAX_SCORE = _get_float("AI_RUG_MAX_SCORE", PF_MAX_RUG_RISK_SCORE)
+AI_RUG_MIN_CONFIDENCE = _get_prob("AI_RUG_MIN_CONFIDENCE", 0.55)
+
+# Sell / exit AI
 AI_ADAPTIVE_SELL = _get_bool("AI_ADAPTIVE_SELL", True)
+AI_SELL_ENABLED = _get_bool("AI_SELL_ENABLED", True)
+AI_SELL_MODEL = os.getenv(
+    "AI_SELL_MODEL",
+    FINE_TUNED_MODEL or OPENAI_MODEL,
+)
+AI_SELL_HOLD_THRESHOLD = _get_prob("AI_SELL_HOLD_THRESHOLD", 0.60)
+AI_SELL_TRIM_THRESHOLD = _get_prob("AI_SELL_TRIM_THRESHOLD", 0.72)
+AI_SELL_EXIT_THRESHOLD = _get_prob("AI_SELL_EXIT_THRESHOLD", 0.84)
+
+# Self-learning strategy brain
 STRATEGY_REDIS_PREFIX = os.getenv("STRATEGY_REDIS_PREFIX", "strategy:v1")
 STRATEGY_UPDATE_INTERVAL = _get_int("STRATEGY_UPDATE_INTERVAL", 1800)  # 30 min
 
+# Feature set versions (for AI training / logging)
+AI_FEATURE_VERSION = os.getenv("AI_FEATURE_VERSION", "v3+++")
+AI_BUY_FEATURE_VERSION = os.getenv("AI_BUY_FEATURE_VERSION", AI_FEATURE_VERSION)
+
 
 # ---------------------------------------------------------------------------
-# Whale watch
+# Regime detection (used by utils_pkg.regime.regime_state)
+# ---------------------------------------------------------------------------
+
+REGIME_ENABLED = _get_bool("REGIME_ENABLED", True)
+REGIME_UPDATE_INTERVAL_SEC = _get_int("REGIME_UPDATE_INTERVAL_SEC", 60)
+
+# Basic cutoffs for regimes
+REGIME_SOL_MIN_24H_VOL_USD = _get_float("REGIME_SOL_MIN_24H_VOL_USD", 200_000_000.0)
+REGIME_MEME_MIN_24H_VOL_USD = _get_float("REGIME_MEME_MIN_24H_VOL_USD", 50_000_000.0)
+REGIME_MAX_ACCEPTABLE_RUG_RATE = _get_float("REGIME_MAX_ACCEPTABLE_RUG_RATE", 0.25)
+
+
+# ---------------------------------------------------------------------------
+# AI data logging / training (used by utils_pkg.data_logger / ai_db)
+# ---------------------------------------------------------------------------
+
+LOG_ENTRY_CANDIDATES = _get_bool("LOG_ENTRY_CANDIDATES", True)
+LOG_TRADES = _get_bool("LOG_TRADES", True)
+LOG_REGIME_SNAPSHOTS = _get_bool("LOG_REGIME_SNAPSHOTS", True)
+
+TRAIN_LABEL_WINDOW_MIN = _get_int("TRAIN_LABEL_WINDOW_MIN", 60)
+TRAIN_MIN_HOLD_MIN = _get_int("TRAIN_MIN_HOLD_MIN", 10)
+TRAIN_MAX_HOLD_MIN = _get_int("TRAIN_MAX_HOLD_MIN", 720)
+
+
+# ---------------------------------------------------------------------------
+# Whale watch & smart wallets (used by smart_wallets / scanners)
 # ---------------------------------------------------------------------------
 
 ENABLE_WHALE_FILTERS = _get_bool("ENABLE_WHALE_FILTERS", True)
@@ -472,7 +630,7 @@ DISCORD_SEARCH_CHANNEL_ID = os.getenv("DISCORD_SEARCH_CHANNEL_ID", "")
 
 
 # ---------------------------------------------------------------------------
-# Daytrader (pro)
+# Daytrader (pro / optional)
 # ---------------------------------------------------------------------------
 
 ENABLE_DAYTRADER = _get_bool("ENABLE_DAYTRADER", False)
@@ -498,6 +656,23 @@ DT_STOP_LOSS_BPS = _get_int("DT_STOP_LOSS_BPS", 60)
 DT_TRAILING_BPS = _get_int("DT_TRAILING_BPS", 50)
 DT_COOLDOWN_SEC = _get_int("DT_COOLDOWN_SEC", 60)
 DT_PAPER_TRADING = _get_bool("DT_PAPER_TRADING", True)
+
+
+# ---------------------------------------------------------------------------
+# Backtest / diagnostics
+# ---------------------------------------------------------------------------
+
+BACKTEST_ENABLED = _get_bool("BACKTEST_ENABLED", False)
+BACKTEST_SOURCE = os.getenv("BACKTEST_SOURCE", "pg")  # pg | csv | json
+BACKTEST_MAX_WORKERS = _get_int("BACKTEST_MAX_WORKERS", 4)
+
+# Diagnostics-specific helpers (mirrors scripts/diagnostics.py)
+DIAG_BT_DAYS_BACK = _get_int("DIAG_BT_DAYS_BACK", 5)
+DIAG_BT_LIMIT_CANDIDATES = _get_int("DIAG_BT_LIMIT_CANDIDATES", 200)
+
+# For env summaries in diagnostics
+BT_DAYS_BACK = os.getenv("BT_DAYS_BACK", "")
+BT_LIMIT_CANDIDATES = os.getenv("BT_LIMIT_CANDIDATES", "")
 
 
 # ---------------------------------------------------------------------------
@@ -529,15 +704,16 @@ if _missing and STRICT_CONFIG:
     )
 elif _missing:
     logging.getLogger(__name__).warning(
-        "⚠️ Missing env vars (running in non-strict mode): %s", ", ".join(_missing)
+        ⚠️ Missing env vars (running in non-strict mode): %s",
+        ", ".join(_missing),
     )
 
 
 # ---------------------------------------------------------------------------
-# Summary helper
+# Summary helper (for quick debugging / sanity checks)
 # ---------------------------------------------------------------------------
 
-def summarize():
+def summarize() -> Dict[str, Any]:
     """
     Lightweight summary of the main knobs we care about for debugging
     and sanity checks.  This is only for introspection, not core logic.
@@ -563,6 +739,34 @@ def summarize():
             "entry_momo_min_trades": ENTRY_MOMO_MIN_TRADES,
             "entry_momo_min_up_pct": ENTRY_MOMO_MIN_UP_PCT,
             "entry_momo_allow_no_data_for_pump": ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP,
+        },
+
+        "risk_manager": {
+            "risk_profile": RISK_PROFILE,
+            "risk_mode_override": RISK_MODE_OVERRIDE,
+            "max_equity_pct_per_trade": RISK_MAX_EQUITY_PCT_PER_TRADE,
+            "max_equity_pct_per_coin": RISK_MAX_EQUITY_PCT_PER_COIN,
+            "max_open_positions": RISK_MAX_OPEN_POSITIONS,
+            "max_parallel_buys": RISK_MAX_PARALLEL_BUYS,
+            "max_daily_drawdown_pct": RISK_MAX_DAILY_DRAWDOWN_PCT,
+            "max_daily_loss_sol": RISK_MAX_DAILY_LOSS_SOL,
+            "circuit_breaker_minutes": RISK_CIRCUIT_BREAKER_MINUTES,
+            "hard_kill_on_dd": RISK_HARD_KILL_ON_DRAWNDOWN,
+            "stop_after_daily_profit_pct": STOP_AFTER_DAILY_PROFIT_PCT,
+            "daily_spend_cap_pct": DAILY_SPEND_CAP_PCT,
+        },
+
+        "exit_engine": {
+            "stop_loss_pct": EXIT_STOP_LOSS_PCT,
+            "tp1_pct": EXIT_TP1_PCT,
+            "tp2_pct": EXIT_TP2_PCT,
+            "tp3_pct": EXIT_TP3_PCT,
+            "tsl_enabled": EXIT_TSL_ENABLED,
+            "tsl_arm_pct": EXIT_TSL_ARM_PCT,
+            "tsl_step_pct": EXIT_TSL_STEP_PCT,
+            "stagnant_max_min": EXIT_STAGNANT_MAX_MIN,
+            "stagnant_min_move_pct": EXIT_STAGNANT_MIN_MOVE_PCT,
+            "dead_coin_max_min": EXIT_DEAD_COIN_MAX_MIN,
         },
 
         "scanners_legacy": {
@@ -602,5 +806,29 @@ def summarize():
             "pf_min_momentum_score": PF_MIN_MOMENTUM_SCORE,
             "pf_min_final_score": PF_MIN_FINAL_SCORE,
             "pf_risk_penalty_weight": PF_RISK_PENALTY_WEIGHT,
+        },
+
+        "ai": {
+            "enabled": AI_ENABLED,
+            "entry_enabled": AI_ENTRY_ENABLED,
+            "entry_threshold": AI_ENTRY_THRESHOLD,
+            "score_gate": AI_SCORE_GATE,
+            "score_soft_floor": AI_SCORE_SOFT_FLOOR,
+            "score_hard_floor": AI_SCORE_HARD_FLOOR,
+            "entry_require_risk_capacity": ENTRY_REQUIRE_RISK_CAPACITY,
+            "entry_risk_capacity_min": ENTRY_RISK_CAPACITY_MIN,
+            "rug_enabled": AI_RUG_ENABLED,
+            "rug_max_score": AI_RUG_MAX_SCORE,
+            "adaptive_sell": AI_ADAPTIVE_SELL,
+            "sell_enabled": AI_SELL_ENABLED,
+            "feature_version": AI_FEATURE_VERSION,
+        },
+
+        "regime": {
+            "enabled": REGIME_ENABLED,
+            "update_interval_sec": REGIME_UPDATE_INTERVAL_SEC,
+            "sol_min_24h_vol_usd": REGIME_SOL_MIN_24H_VOL_USD,
+            "meme_min_24h_vol_usd": REGIME_MEME_MIN_24H_VOL_USD,
+            "max_acceptable_rug_rate": REGIME_MAX_ACCEPTABLE_RUG_RATE,
         },
     }

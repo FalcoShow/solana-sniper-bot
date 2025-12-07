@@ -25,30 +25,53 @@ except Exception:  # pragma: no cover
 from utils_pkg.core_utils import AlertManager, redis
 
 """
-scripts/main.py (vNext, part 1)
+scripts/main.py – Part 1
+========================
 
-High-level responsibilities:
-- Hardened startup, logging, and shutdown.
-- DSN normalizer -> asyncpg-safe DSNs from any Render/PG env.
-- Global env config for entry filters, momentum, pools, & cooldowns.
-- Exit env + logging helpers (EXIT_TICK, EXIT_STOP_LOSS, EXIT_TSL_ARM, EXIT_TSL_HIT,
-  EXIT_STAGNANT) so the exit loop (part 2 + utils_pkg.auto_sell) can emit rich
-  telemetry per-position.
-- Unified router buy wrapper (maybe_buy) with rich buy hooks:
-      - _buy_hook_submitted  (logs + alerts)
-      - _buy_hook_filled     (alerts + exit_engine, Notion snapshot)
-      - _buy_hook_failed     (alerts + guardrail telemetry)
-- log_entry_from_meta: normalize entry meta (lamports_in / amount_raw / spend_sol),
-  log structured ENTRY_META_NORMALIZED, and cache in Redis for diagnostics.
-- Momentum/entry env, including ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP.
-- Optional health endpoint (/health) if aiohttp & HEALTH_PORT present.
-- Optional Sentry initialisation when SENTRY_DSN is set.
-- Wires exit_engine + risk_manager + legacy sell_loop (actual loops in part 2).
+V3+++ / quant-grade bootstrap + glue layer.
+
+This section is responsible for:
+
+  • Hardened logging + helpers:
+        - collision-safe .event / .every helpers
+        - safe-logging wrappers that never break trading
+
+  • Env + DSN helpers:
+        - asyncpg-safe DSN normalizer for all PG/Render variants
+        - thin aliases over config.py for ENTRY / EXIT / AI / RISK / MOMENTUM
+        - smart-wallet / risk-capacity / regime toggles shared with Strategy
+
+  • Router BUY wrapper:
+        - auto-detects best buy function from utils_pkg.router
+        - introspects signature & passes only supported kwargs
+        - supports new-style (sig, entry_meta) for Jupiter v6 lightning_impl
+        - normalizes lamports/amount_raw/spend_sol, logs ENTRY_META, caches to Redis
+
+  • BUY hooks:
+        - BUY_SUBMITTED / BUY_FILLED / BUY_FAILED structured logs
+        - AlertManager / Telegram notifications
+        - exit_engine integration (on_buy_filled)
+        - optional Notion intraday PnL snapshots
+
+  • Early candidate filters:
+        - pool allowlist (PF_POOLS)
+        - age / pool-age / min initial buy
+        - Raydium-specific age cap for runners
+        - name/symbol sanity + blacklist
+
+  • Solana RPC helpers:
+        - getSignatureStatuses polling with configurable commitment & timeout
+
+  • Exit logging helpers:
+        - EXIT_TICK / EXIT_STOP_LOSS / EXIT_TSL_ARM / EXIT_TSL_HIT / EXIT_STAGNANT
+
+Strategy, scanner wiring, main event loop, risk manager loop, and
+PnL / Notion helper implementations live in later sections of this file.
 """
 
-# ---------------------------
+# ===========================================================================
 # Optional deps (HTTP / PG / Sentry / Health)
-# ---------------------------
+# ===========================================================================
 try:
     import httpx
 except Exception:  # pragma: no cover
@@ -69,9 +92,9 @@ try:
 except Exception:  # pragma: no cover
     web = None  # type: ignore
 
-# ---------------------------
+# ===========================================================================
 # Config module (feature flags)
-# ---------------------------
+# ===========================================================================
 try:
     C = importlib.import_module("config")
 except Exception:  # pragma: no cover
@@ -81,11 +104,9 @@ except Exception:  # pragma: no cover
 
     C = _C()  # type: ignore
 
-# ---------------------------
+# ===========================================================================
 # Logging (robust + collision-safe helpers)
-# ---------------------------
-
-# Reserved LogRecord keys we must NOT place inside `extra`
+# ===========================================================================
 _RESERVED: set[str] = {
     "name",
     "msg",
@@ -153,14 +174,13 @@ def _attach_log_helpers_base(_log: logging.Logger):
 
 
 try:
-    # Preferred logging setup from logging_setup
     from logging_setup import get_logger, bump, start_global_heartbeat
 
     _base_log = get_logger()
 except Exception:  # pragma: no cover
 
     class DummyLogger(logging.Logger):
-        def __init__(self):
+        def __init__(self) -> None:
             super().__init__("dummy")
 
         def _p(self, lvl: str, msg: str, **fields: Any) -> None:
@@ -192,9 +212,9 @@ except Exception:  # pragma: no cover
 # Final logger used everywhere
 log = _attach_log_helpers_base(_base_log)
 
-# ---------------------------
-# Normalization helpers
-# ---------------------------
+# ===========================================================================
+# Normalization helpers (mints / env)
+# ===========================================================================
 try:
     from scripts.pp_utils import normalize_mint as _pp_normalize
 except Exception:  # pragma: no cover
@@ -228,10 +248,9 @@ def _dryrun_env_on() -> bool:
         or _env_bool("IS_DRYRUN")
     )
 
-
-# ---------------------------
+# ===========================================================================
 # Event source + trading / exit hooks
-# ---------------------------
+# ===========================================================================
 try:
     from utils_pkg.pumpportal_client import PumpPortalClient
 except Exception:  # pragma: no cover
@@ -253,7 +272,7 @@ except Exception:  # pragma: no cover
     _pkg_is_dryrun = True  # type: ignore[assignment]
 
 # Exit engine + worker: the engine enqueues exit_request:* in Redis,
-# and the worker consumes them. (Loops wired in part 2 / auto_sell.)
+# and the worker consumes them. (Loops wired in later sections.)
 try:
     from utils_pkg.auto_exit_worker import exit_worker_loop, exit_engine  # type: ignore
 except Exception:  # pragma: no cover
@@ -268,7 +287,7 @@ except Exception:  # pragma: no cover
 
     exit_engine = _NoopExit()  # type: ignore
 
-# Auto-sell loop (main exit loop; started in part 2 main())
+# Auto-sell loop (main exit loop; started later)
 try:
     from utils_pkg.auto_sell import exit_engine_loop  # type: ignore
 except Exception:  # pragma: no cover
@@ -346,7 +365,9 @@ except Exception:  # pragma: no cover
 
     _route_get_decimals = None  # type: ignore
 
-# ---------- ROUTER BUY WRAPPER ----------
+# ===========================================================================
+# ROUTER BUY WRAPPER
+# ===========================================================================
 
 
 def _safe_log_router_state(event: str, **fields: Any) -> None:
@@ -411,9 +432,12 @@ def _compute_spend_sol(ui: Dict[str, Any]) -> float:
     """
     Decide how much SOL to spend for a buy, preferring explicit UI overrides,
     then env hints, then a tiny default.
+
+    This is shared between live trading and backtest-style simulations
+    (to keep behaviour consistent when Strategy calls maybe_buy()).
     """
     # 1) UI overrides from scanner/strategy
-    for k in ("spend_sol", "buy_size_sol", "amount_sol"):
+    for k in ("spend_sol", "buy_size_sol", "amount_sol", "size_sol"):
         try:
             v = ui.get(k)
             if v is None:
@@ -438,10 +462,24 @@ def _compute_spend_sol(ui: Dict[str, Any]) -> float:
 
 
 def _env_slippage_bps() -> int:
+    """
+    Fallback slippage in bps for router buy, if the router function
+    accepts `slippage_bps`. Prefer explicit env, otherwise derive from
+    JUPITER_MAX_SLIPPAGE if present in config.
+    """
     try:
-        return int(os.getenv("SLIPPAGE_BPS", os.getenv("ENTRY_SLIPPAGE_BPS", "50")))
+        explicit = os.getenv("SLIPPAGE_BPS") or os.getenv("ENTRY_SLIPPAGE_BPS")
+        if explicit is not None:
+            return int(explicit)
+
+        # If config has JUPITER_MAX_SLIPPAGE as a fraction, convert to bps.
+        jup_slip = getattr(C, "JUPITER_MAX_SLIPPAGE", None)
+        if jup_slip is not None:
+            return int(round(float(jup_slip) * 10_000))
+
     except Exception:
-        return 50
+        pass
+    return 50  # 0.5% default
 
 
 def _build_kwargs_for_router(
@@ -581,7 +619,7 @@ async def maybe_buy(
     - If the underlying buy supports `return_meta`, we harvest (sig, entry_meta)
       and normalize it via log_entry_from_meta (lamports_in / amount_raw /
       spend_sol) so Notion/DB/exit-engine stay in sync.
-    - Still returns a plain tx signature string (or None), so Strategy and
+    - Returns a plain tx signature string (or None) so Strategy and
       other callers remain fully compatible.
 
     NOTE:
@@ -621,7 +659,7 @@ async def maybe_buy(
     sig: Optional[str] = None
     entry_meta: Dict[str, Any] = {}
 
-    # Case 1: new-style (sig, entry_meta) from lightning_impl via return_meta=True
+    # Case 1: new-style (sig, entry_meta)
     if isinstance(res, tuple) and len(res) == 2:
         maybe_sig, maybe_meta = res
         if isinstance(maybe_sig, str) and maybe_sig:
@@ -643,7 +681,6 @@ async def maybe_buy(
 
     # If we have entry meta, log and normalize it for downstream consumers.
     if entry_meta:
-        # raw debug log for troubleshooting
         try:
             log.event(
                 "ENTRY_META",
@@ -682,9 +719,9 @@ async def maybe_buy(
 
     return sig
 
-# ---------- /ROUTER BUY WRAPPER ----------
-
+# ===========================================================================
 # Liquidity screen (optional fallback)
+# ===========================================================================
 try:
     from utils_pkg.liquidity import screen_token
 except Exception:  # pragma: no cover
@@ -709,7 +746,7 @@ except Exception:  # pragma: no cover
     _tg_send_text = None  # type: ignore
 
 
-# Raydium scanner (lazy import – actual usage in part 2)
+# Raydium scanner (lazy import – actual usage in later sections)
 def _get_raydium_scanner():
     try:
         from scanner.raydium_scanner import scan_raydium  # type: ignore
@@ -719,17 +756,19 @@ def _get_raydium_scanner():
         return None
 
 
-# --- Solana tx confirmation helpers ---
+# ===========================================================================
+# Solana tx confirmation helpers
+# ===========================================================================
 def _rpc_url() -> str:
     return (
         os.getenv("SOLANA_RPC_URL")
         or os.getenv("RPC_URL")
-        or "https://api.mainnet-beta.solana.com"
+        or getattr(C, "RPC_URL", "https://api.mainnet-beta.solana.com")
     )
 
 
 def _confirm_commitment() -> str:
-    return os.getenv("CONFIRM_COMMITMENT", "confirmed")
+    return os.getenv("CONFIRM_COMMITMENT", getattr(C, "COMMITMENT", "confirmed"))
 
 
 def _confirm_timeout_sec() -> float:
@@ -780,14 +819,26 @@ async def _confirm_sig(sig: str) -> Tuple[bool, Optional[str]]:
 
     return False, "timeout"
 
-# ---------------------------
+# ===========================================================================
 # ENV helpers
-# ---------------------------
-
-
+# ===========================================================================
 def _as_bool(s: str, default: bool = False) -> bool:
     try:
         return s.strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return default
+
+
+def _as_float(val: Any, default: float) -> float:
+    try:
+        return float(val)
+    except Exception:
+        return default
+
+
+def _as_int(val: Any, default: int) -> int:
+    try:
+        return int(val)
     except Exception:
         return default
 
@@ -832,25 +883,9 @@ async def _send_telegram_debug(msg: str) -> None:
                 flush=True,
             )
 
-
-def _as_float(val: Any, default: float) -> float:
-    try:
-        return float(val)
-    except Exception:
-        return default
-
-
-def _as_int(val: Any, default: int) -> int:
-    try:
-        return int(val)
-    except Exception:
-        return default
-
-# ---------------------------
-# DSN normalizer
-# ---------------------------
-
-
+# ===========================================================================
+# DSN NORMALIZER (used by ai_db / backtest / PnL)
+# ===========================================================================
 def _dsn_to_asyncpg(dsn: str | None) -> str:
     """
     Normalize a DSN into something asyncpg understands:
@@ -862,12 +897,10 @@ def _dsn_to_asyncpg(dsn: str | None) -> str:
     s = dsn.strip()
     if not s:
         return ""
-    # Normalize common prefixes
-    s = s.replace("postgres+asyncpg://", "postgres://")
-    s = s.replace("postgresql+asyncpg://", "postgresql://")
-    if s.lower().startswith("postgresql+asyncpg://"):
+    s_low = s.lower()
+    if s_low.startswith("postgresql+asyncpg://"):
         s = "postgresql://" + s.split("://", 1)[1]
-    if s.lower().startswith("postgres+asyncpg://"):
+    elif s_low.startswith("postgres+asyncpg://"):
         s = "postgres://" + s.split("://", 1)[1]
     return s
 
@@ -876,23 +909,33 @@ def _pick_env_dsn() -> Tuple[str, str, str]:
     """
     Choose PnL and generic PG DSNs from env, normalize both for asyncpg, and
     return (pnl_dsn_asyncpg, pg_dsn_asyncpg, masked_host_db).
+
+    Includes Render-style SNIPER_DB_DSN plus generic DATABASE_URL / PG_DSN,
+    as well as config.POSTGRES_DSN.
     """
+    cfg_pg = getattr(C, "POSTGRES_DSN", "") or ""
     raw_candidates = [
         os.getenv("PNL_DSN"),
+        os.getenv("AI_DB_DSN"),
+        os.getenv("SNIPER_DB_DSN"),
         os.getenv("TELEMETRY_PG_DSN"),
         os.getenv("PG_DSN"),
         os.getenv("DATABASE_URL"),
         os.getenv("POSITIONS_PG_DSN"),
         os.getenv("PG_DSN_INTERNAL"),
         os.getenv("PG_DSN_EXTERNAL"),
+        cfg_pg,
     ]
     pnl_raw = next((x for x in raw_candidates if x and x.strip()), "") or ""
+
     pg_raw = (
         os.getenv("PG_DSN")
         or os.getenv("DATABASE_URL")
+        or os.getenv("SNIPER_DB_DSN")
         or os.getenv("PG_DSN_INTERNAL")
         or os.getenv("PG_DSN_EXTERNAL")
         or os.getenv("POSITIONS_PG_DSN")
+        or cfg_pg
         or ""
     ).strip()
 
@@ -915,24 +958,23 @@ def _pick_env_dsn() -> Tuple[str, str, str]:
 
 _PNL_DSN_ASYNC, _PG_DSN_ASYNC, _PG_DSN_MASK = _pick_env_dsn()
 
-# ---------------------------
-# Config (env)
-# ---------------------------
+# ===========================================================================
+# Config (env) – ENTRY, EXIT, RISK, REGIME, AI (thin layer over config.py)
+# ===========================================================================
 
 # Exit engine / auto-sell toggles:
-# We treat any of these as enabling the exit loop:
-#   EXIT_ENGINE_ENABLED=1, EXIT_ENGINE=1, ENABLE_EXIT_ENGINE=1, ENABLE_AUTO_SELL=1.
 _RAW_EXIT_ENABLED = _as_bool(
-    os.getenv("EXIT_ENGINE_ENABLED", os.getenv("EXIT_ENGINE", "1")),
+    os.getenv("EXIT_ENGINE_ENABLED", os.getenv("EXIT_ENGINE", "")),
     True,
 )
-_AUTO_SELL_ENABLED = _as_bool(
-    os.getenv("ENABLE_AUTO_SELL", os.getenv("AUTO_SELL_ENABLED", "0")),
-    False,
+_AUTO_SELL_ENABLED = bool(
+    getattr(C, "AUTO_SELL_ENABLED", _as_bool(os.getenv("AUTO_SELL_ENABLED", "0"), False))
 )
-ENABLE_EXIT_ENGINE = _RAW_EXIT_ENABLED or _AUTO_SELL_ENABLED or _as_bool(
-    os.getenv("ENABLE_EXIT_ENGINE", "0"),
-    False,
+
+ENABLE_EXIT_ENGINE = (
+    _RAW_EXIT_ENABLED
+    or _AUTO_SELL_ENABLED
+    or _as_bool(os.getenv("ENABLE_EXIT_ENGINE", "0"), False)
 )
 EXIT_ENGINE_ENABLED = ENABLE_EXIT_ENGINE
 
@@ -940,11 +982,109 @@ DEDUPE_ENABLED = _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True)
 DEDUPE_TTL_SEC = _as_int(os.getenv("PF_DEDUPE_TTL_SEC", "3600"), 3600)
 LIQ_FILTER_ENABLED = _as_bool(os.getenv("ENTRY_LIQ_FILTER", "1"), True)
 
-# Momentum / entry window (Strategy wiring is in part 2)
-ENTRY_MOMENTUM_ENABLED = _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True)
-ENTRY_MOMO_WINDOW_SEC = _as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10)
-ENTRY_MOMO_MIN_TRADES = _as_int(os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6)
-ENTRY_MOMO_MIN_UP_PCT = _as_float(os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0)
+# Core AI entry / scoring toggles (backed by config.py)
+AI_ENTRY_ENABLED: bool = bool(
+    getattr(C, "AI_ENTRY_ENABLED", _as_bool(os.getenv("AI_ENTRY_ENABLED", "0"), False))
+)
+
+AI_ENTRY_SCORE_MIN: float = float(
+    getattr(
+        C,
+        "AI_SCORE_SOFT_FLOOR",
+        _as_float(os.getenv("AI_ENTRY_SCORE_MIN", "0.0"), 0.0),
+    )
+)
+
+AI_ENTRY_SCORE_HARD_MIN: float = float(
+    getattr(
+        C,
+        "AI_SCORE_HARD_FLOOR",
+        _as_float(os.getenv("AI_ENTRY_SCORE_HARD_MIN", "0.0"), 0.0),
+    )
+)
+
+AI_ENTRY_RISK_ADJ_MIN: float = float(
+    getattr(
+        C,
+        "AI_SCORE_GATE",
+        _as_float(os.getenv("AI_ENTRY_RISK_ADJ_MIN", "0.0"), 0.0),
+    )
+)
+
+# Risk-capacity / smart-wallet gating – shared with ai_entry_logic + backtest
+ENTRY_REQUIRE_RISK_CAPACITY: bool = bool(
+    getattr(
+        C,
+        "ENTRY_REQUIRE_RISK_CAPACITY",
+        _as_bool(os.getenv("ENTRY_REQUIRE_RISK_CAPACITY", "0"), False),
+    )
+)
+ENTRY_MIN_RISK_CAPACITY: float = float(
+    getattr(
+        C,
+        "ENTRY_RISK_CAPACITY_MIN",
+        _as_float(os.getenv("ENTRY_MIN_RISK_CAPACITY", "0.0"), 0.0),
+    )
+)
+ENTRY_MAX_RISK_CAPACITY: float = _as_float(
+    os.getenv("ENTRY_MAX_RISK_CAPACITY", os.getenv("MAX_RISK_CAPACITY", "1.0")),
+    1.0,
+)
+
+SMART_WALLET_FILTER_ENABLED: bool = _as_bool(
+    os.getenv("SMART_WALLET_FILTER_ENABLED", "0"),
+    False,
+)
+SMART_WALLET_MIN_SCORE: float = _as_float(
+    os.getenv("SMART_WALLET_MIN_SCORE", "0.0"),
+    0.0,
+)
+SMART_WALLET_REQUIRE_FLAG: bool = _as_bool(
+    os.getenv("SMART_WALLET_REQUIRE_FLAG", "0"),
+    False,
+)
+
+# Regime-aware sizing & filters (wired to utils_pkg.regime.regime_state later)
+REGIME_AWARE_SIZING_ENABLED: bool = _as_bool(
+    os.getenv("REGIME_AWARE_SIZING_ENABLED", "1"),
+    True,
+)
+REGIME_BLOCK_RISK_OFF_ENTRIES: bool = _as_bool(
+    os.getenv("REGIME_BLOCK_RISK_OFF_ENTRIES", "0"),
+    False,
+)
+REGIME_FORCE_MODE: str = (os.getenv("REGIME_FORCE_MODE") or "").strip().lower()
+# expected values: "", "risk_off", "normal", "risk_on"
+
+# Momentum / entry window (Strategy wiring is later)
+ENTRY_MOMENTUM_ENABLED = bool(
+    getattr(
+        C,
+        "ENTRY_MOMENTUM_ENABLED",
+        _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True),
+    )
+)
+ENTRY_MOMO_WINDOW_SEC = int(
+    getattr(
+        C,
+        "ENTRY_MOMO_WINDOW_SEC",
+        _as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10),
+    )
+)
+ENTRY_MOMO_MIN_TRADES = int(
+    getattr(
+        C,
+        "ENTRY_MOMO_MIN_TRADES",
+        _as_int(os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6),
+    )
+)
+ENTRY_MOMO_MIN_UP_PCT = float(
+    getattr(
+        C,
+        "ENTRY_MOMO_MIN_UP_PCT",
+        _as_float(os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0),
+    )
+)
 ENTRY_MOMO_PRICE_TRIES = _as_int(os.getenv("ENTRY_MOMO_PRICE_TRIES", "4"), 4)
 ENTRY_MOMO_PRICE_DELAY_S = _as_float(
     os.getenv("ENTRY_MOMO_PRICE_DELAY_S", "0.7"), 0.7
@@ -953,21 +1093,30 @@ ENTRY_MOMO_MAX_PARALLEL = max(
     1, _as_int(os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"), 6)
 )
 
-# NEW: allow momentum gate to proceed even if we don't have full data for pump.fun
-# backfill / low-liquidity cases (default false for safety).
-ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP = _as_bool(
-    os.getenv(
+# Allow momentum gate to proceed even if we don't have full pump.fun data.
+ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP = bool(
+    getattr(
+        C,
         "ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP",
-        os.getenv("ENTRY_MOMO_ALLOW_NO_DATA", "0"),
-    ),
-    False,
+        _as_bool(
+            os.getenv(
+                "ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP",
+                os.getenv("ENTRY_MOMO_ALLOW_NO_DATA", "0"),
+            ),
+            False,
+        ),
+    )
 )
 
+# Some early-entry knobs that still live only here:
 MIN_INITIAL_BUY_SOL = _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
 MAX_NAME_LEN = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
 ENTRY_MAX_AGE_MIN = _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20)
-MIN_POOL_AGE_MIN = _as_int(os.getenv("MIN_POOL_AGE_MIN", "3"), 3)
-# NEW – separate cap for Raydium runners (in minutes).
+MIN_POOL_AGE_MIN = _as_int(
+    os.getenv("MIN_POOL_AGE_MIN", str(getattr(C, "MIN_POOL_AGE_MIN", 3))),
+    getattr(C, "MIN_POOL_AGE_MIN", 3),
+)
+# Separate cap for Raydium runners (in minutes) – used only for pool="raydium".
 RAY_MAX_AGE_MIN = _as_float(os.getenv("RAY_MAX_AGE_MIN", "1440"), 1440.0)
 
 SYMBOL_BLACKLIST = {
@@ -976,10 +1125,12 @@ SYMBOL_BLACKLIST = {
     if s.strip()
 }
 
-MAX_CONCURRENCY = max(1, _as_int(os.getenv("PF_MAX_CONCURRENT", "2"), 2))
+MAX_CONCURRENCY = max(
+    1, _as_int(os.getenv("PF_MAX_CONCURRENT", str(getattr(C, "PF_MAX_CONCURRENT", 2))), 2)
+)
 LOOP_COOLDOWN_SEC = _as_float(os.getenv("PF_COOLDOWN_SEC", "15"), 15.0)
 MAX_TRADEABLE = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)  # 0 = unlimited
-PAUSE_TRADING = _as_bool(os.getenv("PAUSE_TRADING", "0"), False)
+PAUSE_TRADING = bool(getattr(C, "PAUSE_TRADING", _as_bool(os.getenv("PAUSE_TRADING", "0"), False)))
 DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
 
 # Pools filter (affects printing and Raydium scanner scheduling)
@@ -1007,7 +1158,7 @@ RAYDIUM_SCAN_INTERVAL_SEC = _as_float(
 PF_GATE_TTL_SEC = _as_int(
     os.getenv(
         "PF_GATE_TTL_SEC",
-        str(max(_as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10) * 2, 60)),
+        str(max(ENTRY_MOMO_WINDOW_SEC * 2, 60)),
     ),
     max(ENTRY_MOMO_WINDOW_SEC * 2, 60),
 )
@@ -1022,43 +1173,56 @@ NOTIFY_BUY_FILLED = _as_bool(os.getenv("NOTIFY_BUY_FILLED", "1"), True)
 HEALTH_PORT = _as_int(os.getenv("HEALTH_PORT", "0"), 0)
 SENTRY_DSN = (os.getenv("SENTRY_DSN") or "").strip()
 
-# Risk manager toggles (loop wired later in part 2)
+# Risk manager toggles (loop wired later)
 RISK_MANAGER_ENABLED = _as_bool(os.getenv("RISK_MANAGER_ENABLED", "1"), True)
 RISK_MANAGER_POLL_SEC = _as_float(
     os.getenv("RISK_MANAGER_POLL_SEC", "60"), 60.0
 )
 
-# ---------------------------
+# ===========================================================================
 # Exit env (shared by Strategy / exit loop) + thresholds
-# ---------------------------
-
+# ===========================================================================
 # Hard stop loss (pct below entry, e.g. 8 => -8%)
-EXIT_STOP_LOSS_PCT = _as_float(
-    os.getenv("EXIT_STOP_LOSS_PCT", os.getenv("PF_SL_PCT", "8.0")),
-    8.0,
+EXIT_STOP_LOSS_PCT = float(
+    getattr(
+        C,
+        "EXIT_STOP_LOSS_PCT",
+        _as_float(os.getenv("EXIT_STOP_LOSS_PCT", os.getenv("PF_SL_PCT", "8.0")), 8.0),
+    )
 )
 
 # Time-based stagnation exit (minutes + min move in either direction)
-EXIT_STAGNANT_MAX_MIN = _as_float(os.getenv("EXIT_STAGNANT_MAX_MIN", "10.0"), 10.0)
-EXIT_STAGNANT_MIN_MOVE_PCT = _as_float(
-    os.getenv("EXIT_STAGNANT_MIN_MOVE_PCT", "5.0"),
-    5.0,
+EXIT_STAGNANT_MAX_MIN = float(
+    getattr(
+        C,
+        "EXIT_STAGNANT_MAX_MIN",
+        _as_float(os.getenv("EXIT_STAGNANT_MAX_MIN", "10.0"), 10.0),
+    )
+)
+EXIT_STAGNANT_MIN_MOVE_PCT = float(
+    getattr(
+        C,
+        "EXIT_STAGNANT_MIN_MOVE_PCT",
+        _as_float(os.getenv("EXIT_STAGNANT_MIN_MOVE_PCT", "5.0"), 5.0),
+    )
 )
 
 # Trailing stop thresholds:
 # - PF_TSL_ARM_PCT: arm trailing stop once peak gain >= this
 # - PF_TSL_PCT: allowed drawdown from hi-water (e.g. 4.5 => sell after -4.5% from peak)
-PF_TSL_ARM_PCT = _as_float(os.getenv("PF_TSL_ARM_PCT", "10.0"), 10.0)
-PF_TSL_PCT = _as_float(os.getenv("PF_TSL_PCT", "4.5"), 4.5)
+PF_TSL_ARM_PCT = float(
+    getattr(C, "PF_TSL_ARM_PCT", _as_float(os.getenv("PF_TSL_ARM_PCT", "10.0"), 10.0))
+)
+PF_TSL_PCT = float(
+    getattr(C, "PF_TSL_PCT", _as_float(os.getenv("PF_TSL_PCT", "4.5"), 4.5))
+)
 
 # Optional take-profit threshold (not mandatory, but useful if exit loop uses it)
 EXIT_TAKE_PROFIT_PCT = _as_float(os.getenv("EXIT_TP_PCT", "0.0"), 0.0)
 
-# ---------------------------
+# ===========================================================================
 # Small helpers
-# ---------------------------
-
-
+# ===========================================================================
 def _get_first(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
     for k in keys:
         if k in d and d[k] is not None:
@@ -1123,15 +1287,14 @@ def _approx_minutes_since(ts_any: Any) -> Optional[float]:
 def utc_today_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).date().isoformat()
 
-# ---------------------------
+# ===========================================================================
 # Basic filters (pre-momentum / pre-expensive work)
-# ---------------------------
-
-
+# ===========================================================================
 def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
     """
     Very early guardrail filter before we do any heavy work.
-    Uses global env-derived thresholds so behaviour is consistent across runtime.
+    Uses global env/config-derived thresholds so behaviour is consistent
+    across runtime.
     """
     pool = str((_get_first(msg, "pool", default="") or "")).strip().lower()
     is_raydium = pool == "raydium"
@@ -1185,7 +1348,7 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
             )
         return False
 
-    # Token age (ENTRY_MAX_AGE_MIN)
+    # Token age (ENTRY_MAX_AGE_MIN, except Raydium where we allow a separate cap)
     mins_since_token = _approx_minutes_since(
         _get_first(
             msg,
@@ -1196,17 +1359,24 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
             default=None,
         )
     )
-    if (
-        mins_since_token is not None
-        and ENTRY_MAX_AGE_MIN > 0
-        and mins_since_token > ENTRY_MAX_AGE_MIN
-    ):
-        if DEBUG_TX:
-            print(
-                f".[filter] token age {mins_since_token:.1f}m > {ENTRY_MAX_AGE_MIN}m — skip",
-                flush=True,
-            )
-        return False
+    if mins_since_token is not None:
+        if is_raydium:
+            # Raydium can be used for mid/late runners; cap separately via RAY_MAX_AGE_MIN
+            if RAY_MAX_AGE_MIN > 0 and mins_since_token > RAY_MAX_AGE_MIN:
+                if DEBUG_TX:
+                    print(
+                        f".[filter] RAY token age {mins_since_token:.1f}m > {RAY_MAX_AGE_MIN}m — skip",
+                        flush=True,
+                    )
+                return False
+        else:
+            if ENTRY_MAX_AGE_MIN > 0 and mins_since_token > ENTRY_MAX_AGE_MIN:
+                if DEBUG_TX:
+                    print(
+                        f".[filter] token age {mins_since_token:.1f}m > {ENTRY_MAX_AGE_MIN}m — skip",
+                        flush=True,
+                    )
+                return False
 
     # Pool age (MIN_POOL_AGE_MIN)
     mins_since_pool = _approx_minutes_since(
@@ -1226,11 +1396,9 @@ def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
 
     return True
 
-# ---------------------------
+# ===========================================================================
 # Post-buy optional immediate sell test
-# ---------------------------
-
-
+# ===========================================================================
 async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
     """
     Optional post-buy path: if POSTBUY_MODE=immediate_sell_test, do a
@@ -1246,11 +1414,9 @@ async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
         if DEBUG_TX:
             traceback.print_exc()
 
-# ---------------------------
+# ===========================================================================
 # Liquidity retry helper
-# ---------------------------
-
-
+# ===========================================================================
 async def _screen_with_retry(
     mint: str,
     tries: int = 3,
@@ -1303,11 +1469,9 @@ async def _await_mint_ready(
         waited += step_s
     return None
 
-# ---------------------------
+# ===========================================================================
 # Boot: ensure keypair file
-# ---------------------------
-
-
+# ===========================================================================
 def _ensure_keypair_file() -> None:
     """
     Make sure ~/.config/solana/id.json exists. If not, and KEYPAIR_JSON /
@@ -1348,11 +1512,9 @@ def _ensure_keypair_file() -> None:
         except Exception:
             print(f"[boot] could not write wallet: {e}", flush=True)
 
-# ---------------------------
+# ===========================================================================
 # BUY HOOKS (submitted / filled / failed)
-# ---------------------------
-
-# cheap singleton to avoid re-creating AlertManager
+# ===========================================================================
 _AM_SINGLETON: Optional[AlertManager] = None
 
 
@@ -1762,11 +1924,9 @@ async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-# ---------------------------
-# Exit logging helpers (used in part 2 exit loop)
-# ---------------------------
-
-
+# ===========================================================================
+# Exit logging helpers (used by exit loop / ai_sell_logic)
+# ===========================================================================
 def exit_log_heartbeat(
     *,
     mint: str,
@@ -1779,8 +1939,8 @@ def exit_log_heartbeat(
     """
     Per-position heartbeat log emitted on each exit tick.
 
-    This is wired from the exit loop (part 2 / auto_sell) right after we
-    compute PnL / hi-water / age, but *before* we apply any exit rules.
+    This is wired from the exit loop right after we compute PnL / hi-water / age,
+    but *before* we apply any exit rules.
     """
     try:
         fields: Dict[str, Any] = {
@@ -1894,6 +2054,36 @@ def exit_log_stagnant(
 # Strategy
 # ---------------------------
 class Strategy:
+    """
+    Core entry / execution engine (V3+++ / quant-grade)
+
+    Responsibilities:
+      - Handles new-token events from scanners (PumpPortal / Raydium / Dexscreener).
+      - Layered gates (in order):
+          1) Regime gate (macro risk-on/off, utils_pkg.regime)
+          2) Top guardrails (PAUSE_TRADING, MAX_TRADEABLE, buys_allowed())
+          3) Risk-capacity gate (ENTRY_REQUIRE_RISK_CAPACITY, min/max bounds)
+          4) Basic filters (age, name, blacklist, scanner metrics)
+          5) Smart-wallet guard (deployers / known bad actors)
+          6) Liquidity screen (utils_pkg.liquidity)
+          7) AI stack:
+               • feature_builder → feature dict
+               • optional ai_buy_scoring pre-gate
+               • ai_entry_logic main AI entry gate
+               • self_learning_ai_strategy hook (for live learning / overrides)
+               • risk-adjusted size (AI + regime + risk capacity)
+          8) Dedupe / momentum gate (pool-aware, windowed)
+          9) Final guardrails + buy via maybe_buy()
+
+      - Diagnostics / quant telemetry:
+          * DIAG_MINUTE
+          * POSITION_HEARTBEAT
+          * REGIME_HEARTBEAT
+          * per-gate rejection stats
+          * AI score buckets, pre-score stats, fast-lane counts
+          * risk-capacity + regime stats
+    """
+
     def __init__(self) -> None:
         # How many buys can run in parallel (use global MAX_CONCURRENCY)
         self._sema = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -1918,14 +2108,134 @@ class Strategy:
         self.momo_price_delay_s: float = float(ENTRY_MOMO_PRICE_DELAY_S)
         self.momo_allow_no_data_pump: bool = bool(ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP)
 
+        # AI / feature gating (quant-grade)
+        self.ai_enabled: bool = bool(AI_ENTRY_ENABLED)
+        self.ai_min_score: float = float(AI_ENTRY_SCORE_MIN)
+        self.ai_hard_min_score: float = float(AI_ENTRY_SCORE_HARD_MIN)
+        self.ai_risk_adj_min: float = float(AI_ENTRY_RISK_ADJ_MIN)
+
+        # Optional "fast lane" for very strong AI scores (0–1 scaled)
+        self.ai_fastlane_score: float = _as_float(
+            os.getenv("AI_ENTRY_FASTLANE_SCORE", "0.9"),
+            0.9,
+        )
+
+        # Optional pre-AI buy scoring gate (utils_pkg.ai_buy_scoring)
+        self.ai_pre_enabled: bool = _as_bool(
+            os.getenv("AI_PRE_SCORE_ENABLED", "1"),
+            True,
+        )
+        self.ai_pre_min_score: float = _as_float(
+            os.getenv("AI_PRE_SCORE_MIN", "0.0"),
+            0.0,
+        )
+
+        # Risk-adjusted sizing (multipliers applied to spend_sol)
+        # final_size_factor ≈ clamp(ai_factor * regime_factor * cap_factor, [size_floor, size_cap])
+        self.size_floor: float = _as_float(
+            os.getenv("AI_ENTRY_SIZE_FLOOR", "0.5"),
+            0.5,
+        )
+        self.size_cap: float = _as_float(
+            os.getenv("AI_ENTRY_SIZE_CAP", "2.0"),
+            2.0,
+        )
+
+        # Regime / macro gate (optional, fail-open)
+        self.regime_enforced: bool = _as_bool(
+            os.getenv("REGIME_ENFORCED", "1"),
+            True,
+        )
+        self.regime_min_risk: float = _as_float(
+            os.getenv("REGIME_MIN_RISK_SCORE", "0.0"),
+            0.0,
+        )
+
+        # Lazy optional modules (all best-effort + fail-safe)
+        self._ai_mod = None
+        self._feat_mod = None
+        self._smart_mod = None
+        self._log_mod = None
+        self._regime_mod = None
+        self._score_mod = None
+        self._sl_mod = None
+        self._risk_mod = None
+
+        try:
+            import utils_pkg.ai_entry_logic as _ai_mod  # type: ignore
+            self._ai_mod = _ai_mod
+        except Exception:
+            self._ai_mod = None
+
+        try:
+            import utils_pkg.feature_builder as _feat_mod  # type: ignore
+            self._feat_mod = _feat_mod
+        except Exception:
+            self._feat_mod = None
+
+        try:
+            import utils_pkg.smart_wallets as _smart_mod  # type: ignore
+            self._smart_mod = _smart_mod
+        except Exception:
+            self._smart_mod = None
+
+        try:
+            import utils_pkg.data_logger as _log_mod  # type: ignore
+            self._log_mod = _log_mod
+        except Exception:
+            self._log_mod = None
+
+        try:
+            import utils_pkg.regime as _regime_mod  # type: ignore
+            self._regime_mod = _regime_mod
+        except Exception:
+            self._regime_mod = None
+
+        try:
+            import utils_pkg.ai_buy_scoring as _score_mod  # type: ignore
+            self._score_mod = _score_mod
+        except Exception:
+            self._score_mod = None
+
+        try:
+            import utils_pkg.self_learning_ai_strategy as _sl_mod  # type: ignore
+            self._sl_mod = _sl_mod
+        except Exception:
+            self._sl_mod = None
+
+        try:
+            import utils_pkg.risk_manager as _risk_mod  # type: ignore
+            self._risk_mod = _risk_mod
+        except Exception:
+            self._risk_mod = None
+
         # Diagnostics (mirrored into DIAG_MINUTE)
         self._diag: Dict[str, int] = {
             "events_total": 0,
             "events_trade": 0,
             "events_new_token": 0,
+            # filter / guardrail rejections
             "rejected_filters": 0,
             "rejected_guardrails": 0,
-            "rejected_momo": 0,  # strict momentum rejections only
+            "rejected_momo": 0,         # strict momentum rejections only
+            "rejected_ai": 0,           # AI gate rejections (incl. risk-adj)
+            "rejected_regime": 0,       # regime-based rejections
+            "rejected_risk_cap": 0,     # risk-capacity rejections
+            # AI stats
+            "ai_allowed": 0,
+            "ai_errors": 0,
+            "ai_score_low": 0,
+            "ai_score_mid": 0,
+            "ai_score_high": 0,
+            "ai_fastlane": 0,
+            "ai_pre_reject": 0,
+            # regime / capacity stats
+            "regime_risk_off": 0,
+            "regime_risk_on": 0,
+            "risk_cap_ok": 0,
+            "risk_cap_low": 0,
+            "risk_cap_high": 0,
+            # buy stats
             "buys_submitted": 0,
             "buys_filled": 0,
         }
@@ -1946,6 +2256,942 @@ class Strategy:
             self._gate_state[mint_raw] = st
         return st
 
+    # ───────────────────────── Regime Gate ──────────────────────────────
+    def _regime_snapshot(self) -> Optional[Dict[str, Any]]:
+        """
+        Best-effort call into utils_pkg.regime (if available).
+
+        Expected (but not required) fields:
+          - state: str ("risk_on" / "risk_off" / ...)
+          - risk_score: float
+          - reason: str
+        """
+        if self._regime_mod is None:
+            return None
+        try:
+            fn = getattr(self._regime_mod, "get_regime_state", None) or getattr(
+                self._regime_mod, "current_regime", None
+            )
+            if not callable(fn):
+                return None
+            snap = fn()  # type: ignore[misc]
+            if not isinstance(snap, dict):
+                return None
+            return snap
+        except Exception:
+            if DEBUG_TX:
+                traceback.print_exc()
+            return None
+
+    def _regime_allows_entry(self, pool: str, symbol: str, mint: str) -> bool:
+        """
+        Regime-aware gate (fail-open):
+
+        - If REGIME_ENFORCED=0 or module missing → allow.
+        - If regime.risk_score < REGIME_MIN_RISK_SCORE → block new tokens.
+        - If regime.state == "risk_off" (or similar) → block, unless
+          REGIME_ALLOW_RAYDIUM_RISK_OFF=1 and pool=raydium.
+        """
+        if not self.regime_enforced or self._regime_mod is None:
+            return True
+
+        snap = self._regime_snapshot()
+        if not snap:
+            return True  # fail-open
+
+        state = str(snap.get("state") or "").lower()
+        risk_score = _as_float(snap.get("risk_score", 0.0), 0.0)
+        reason = str(snap.get("reason") or "").strip()
+
+        if risk_score >= self.regime_min_risk:
+            self._diag["regime_risk_on"] += 1
+        else:
+            self._diag["regime_risk_off"] += 1
+
+        # Allowed Raydium override in "risk_off" regime
+        allow_ray_in_off = _as_bool(
+            os.getenv("REGIME_ALLOW_RAYDIUM_RISK_OFF", "0"),
+            False,
+        )
+
+        is_risk_off = state in {"risk_off", "panic", "halt"} or (
+            risk_score < self.regime_min_risk
+        )
+
+        if not is_risk_off:
+            log.event(
+                "REGIME_ENTRY_OK",
+                pool=pool,
+                mint=mint,
+                symbol=symbol,
+                state=state or "unknown",
+                risk_score=risk_score,
+                min_risk=self.regime_min_risk,
+                reason=reason or "regime_ok",
+            )
+            return True
+
+        # Risk-off regime
+        if pool == "raydium" and allow_ray_in_off:
+            log.event(
+                "REGIME_RISK_OFF_RAYDIUM_BYPASS",
+                pool=pool,
+                mint=mint,
+                symbol=symbol,
+                state=state or "risk_off",
+                risk_score=risk_score,
+                min_risk=self.regime_min_risk,
+                reason=reason or "risk_off_but_raydium_allowed",
+            )
+            return True
+
+        # Block new entries
+        self._diag["rejected_regime"] += 1
+        log.event(
+            "REGIME_ENTRY_BLOCK",
+            pool=pool,
+            mint=mint,
+            symbol=symbol,
+            state=state or "risk_off",
+            risk_score=risk_score,
+            min_risk=self.regime_min_risk,
+            reason=reason or "risk_off",
+        )
+        try:
+            record_buy_result(
+                ok=False,
+                reason="regime_block",
+                regime_state=state,
+                regime_score=risk_score,
+            )
+        except Exception:
+            pass
+        return False
+
+    # ───────────────────── Risk-capacity gate ───────────────────────────
+    async def _risk_capacity_decision(
+        self,
+        *,
+        pool: str,
+        mint: str,
+        symbol: str,
+    ) -> tuple[bool, Optional[float]]:
+        """
+        Risk-capacity gate (fail-open but logged):
+
+        - If ENTRY_REQUIRE_RISK_CAPACITY=0 or no risk module → allow, cap=None.
+        - Otherwise, attempts to fetch a 0–1 style capacity value from
+          utils_pkg.risk_manager and enforce:
+              ENTRY_MIN_RISK_CAPACITY <= cap <= ENTRY_MAX_RISK_CAPACITY
+        """
+        if self._risk_mod is None:
+            return True, None
+
+        cap_val: Optional[float] = None
+        try:
+            fn = (
+                getattr(self._risk_mod, "current_entry_capacity", None)
+                or getattr(self._risk_mod, "current_risk_capacity", None)
+                or getattr(self._risk_mod, "get_entry_capacity", None)
+                or getattr(self._risk_mod, "get_risk_capacity", None)
+            )
+            if callable(fn):
+                res = fn()  # type: ignore[misc]
+                if inspect.isawaitable(res):
+                    res = await res  # type: ignore[assignment]
+                cap_val = float(res)
+        except Exception:
+            if DEBUG_TX:
+                traceback.print_exc()
+            cap_val = None
+
+        if cap_val is None:
+            # no signal → fail-open, but keep feature for AI
+            return True, None
+
+        # clamp to sane range for diagnostics
+        cap_val = max(-10.0, min(10.0, cap_val))
+
+        # record stats
+        if ENTRY_MIN_RISK_CAPACITY <= cap_val <= ENTRY_MAX_RISK_CAPACITY:
+            self._diag["risk_cap_ok"] += 1
+        elif cap_val < ENTRY_MIN_RISK_CAPACITY:
+            self._diag["risk_cap_low"] += 1
+        else:
+            self._diag["risk_cap_high"] += 1
+
+        if not ENTRY_REQUIRE_RISK_CAPACITY:
+            # purely advisory if not enforced
+            log.event(
+                "RISK_CAP_ADVISORY",
+                pool=pool,
+                mint=mint,
+                symbol=symbol,
+                cap=cap_val,
+                min_cap=ENTRY_MIN_RISK_CAPACITY,
+                max_cap=ENTRY_MAX_RISK_CAPACITY,
+            )
+            return True, cap_val
+
+        # Enforced gate
+        if ENTRY_MIN_RISK_CAPACITY <= cap_val <= ENTRY_MAX_RISK_CAPACITY:
+            log.event(
+                "RISK_CAP_ENTRY_OK",
+                pool=pool,
+                mint=mint,
+                symbol=symbol,
+                cap=cap_val,
+                min_cap=ENTRY_MIN_RISK_CAPACITY,
+                max_cap=ENTRY_MAX_RISK_CAPACITY,
+            )
+            return True, cap_val
+
+        # Block new entry
+        self._diag["rejected_risk_cap"] += 1
+        log.event(
+            "RISK_CAP_ENTRY_BLOCK",
+            pool=pool,
+            mint=mint,
+            symbol=symbol,
+            cap=cap_val,
+            min_cap=ENTRY_MIN_RISK_CAPACITY,
+            max_cap=ENTRY_MAX_RISK_CAPACITY,
+        )
+        try:
+            record_buy_result(
+                ok=False,
+                reason="risk_capacity_block",
+                risk_capacity=cap_val,
+            )
+        except Exception:
+            pass
+        return False, cap_val
+
+    # ─────────────── Risk-adjusted sizing (AI + Regime + Cap) ───────────
+    def _risk_adjust_size(
+        self,
+        *,
+        ui: Dict[str, Any],
+        score: Optional[float],
+        regime_snap: Optional[Dict[str, Any]],
+        risk_cap: Optional[float],
+    ) -> None:
+        """
+        Compute a risk-adjusted sizing factor from AI score + regime + capacity.
+
+        Writes:
+          - ui["ai_entry_score"]
+          - ui["ai_size_factor"]
+          - ui["regime_risk_factor"]
+          - ui["risk_cap_factor"]
+          - ui["size_factor"] (final, clamped)
+          - ui["spend_sol"] updated if we can safely scale it.
+        """
+        if score is None:
+            return
+
+        # AI factor: linear-ish from ai_min_score → fastlane
+        try:
+            base_min = max(0.0, self.ai_min_score)
+            base_max = max(base_min + 1e-6, self.ai_fastlane_score)
+            s = max(base_min, min(score, base_max))
+            ai_factor_raw = 0.5 + 1.5 * ((s - base_min) / (base_max - base_min))
+        except Exception:
+            ai_factor_raw = 1.0
+
+        ai_factor = max(0.1, min(ai_factor_raw, 1.5))
+
+        # Regime factor: downscale in risk_off / low scores, upscale in strong regimes
+        regime_factor = 1.0
+        if regime_snap:
+            try:
+                r_score = _as_float(regime_snap.get("risk_score", 0.0), 0.0)
+                state = str(regime_snap.get("state") or "").lower()
+
+                if 0.0 <= r_score <= 1.0:
+                    regime_factor = 0.5 + 1.0 * r_score  # 0.5x → 1.5x
+                else:
+                    regime_factor = 0.5 + 0.5 * max(
+                        0.0, min(1.0, r_score / max(abs(r_score), 1.0))
+                    )
+
+                if state in {"risk_off", "panic", "halt"}:
+                    regime_factor *= 0.6
+            except Exception:
+                regime_factor = 1.0
+
+        # Risk-capacity factor: 0 → highly reduced, 1 → neutral, >1 → slight boost
+        cap_factor = 1.0
+        if risk_cap is not None:
+            try:
+                # Assume cap in [0,1] in the common case
+                if 0.0 <= risk_cap <= 1.0:
+                    cap_factor = 0.3 + 1.0 * risk_cap  # 0.3x → 1.3x
+                else:
+                    cap_factor = 0.5 + 0.5 * max(
+                        0.0, min(1.0, risk_cap / max(abs(risk_cap), 1.0))
+                    )
+            except Exception:
+                cap_factor = 1.0
+
+        size_factor = ai_factor * regime_factor * cap_factor
+        size_factor = max(self.size_floor, min(self.size_cap, size_factor))
+
+        ui["ai_size_factor"] = ai_factor
+        ui["regime_risk_factor"] = regime_factor
+        ui["risk_cap_factor"] = cap_factor
+        ui["size_factor"] = size_factor
+
+        # If we already have a spend_sol hint, scale it
+        try:
+            if "spend_sol" in ui and ui["spend_sol"]:
+                base = float(ui["spend_sol"])
+                scaled = max(0.0, base * size_factor)
+                ui["spend_sol"] = scaled
+        except Exception:
+            pass
+
+    # ────────────── Optional pre-AI buy scoring (ai_buy_scoring) ────────
+    async def _ai_pre_score(
+        self,
+        *,
+        mint_norm: str,
+        pool: str,
+        symbol: str,
+        ui: Dict[str, Any],
+        features: Dict[str, Any],
+        raw_event: Dict[str, Any],
+    ) -> tuple[Optional[float], Optional[bool]]:
+        """
+        Optional pre-AI scoring via utils_pkg.ai_buy_scoring.
+
+        Returns:
+          (score, decision) where:
+            - score: float | None  (for logging / overrides)
+            - decision:
+                • True  → allow
+                • False → block
+                • None  → no opinion (do not gate)
+
+        This is intentionally defensive: if api changes or errors occur,
+        we fall back to (None, None) and DO NOT block.
+        """
+        if not self.ai_pre_enabled or self._score_mod is None:
+            return None, None
+
+        try:
+            Candidate = getattr(self._score_mod, "Candidate", None)
+            pass_gate = getattr(self._score_mod, "pass_gate", None)
+            if Candidate is None or not callable(pass_gate):
+                return None, None
+
+            # Build candidate kwargs generically and filter by annotation keys
+            base_kwargs: Dict[str, Any] = {
+                "mint": mint_norm,
+                "pool": pool,
+                "symbol": symbol,
+                "liq_usd": ui.get("liq_usd")
+                or raw_event.get("liq_usd")
+                or raw_event.get("liq")
+                or 0.0,
+                "vol_5m_usd": ui.get("vol_5m_usd")
+                or raw_event.get("vol_5m_usd")
+                or raw_event.get("vol5")
+                or 0.0,
+                "buys_5m": ui.get("buys_5m")
+                or raw_event.get("buys_5m")
+                or raw_event.get("buys5")
+                or 0,
+                "sells_5m": ui.get("sells_5m")
+                or raw_event.get("sells_5m")
+                or raw_event.get("sells5")
+                or 0,
+                "age_min": raw_event.get("token_age_min")
+                or raw_event.get("age_min")
+                or _approx_minutes_since(
+                    _get_first(
+                        raw_event,
+                        "created_at",
+                        "createdAt",
+                        "timestamp",
+                        "ts",
+                        default=None,
+                    )
+                )
+                or 0.0,
+                "ai_entry_score": ui.get("ai_entry_score"),
+                "risk_capacity": ui.get("risk_capacity"),
+                "regime_score": features.get("regime_score"),
+            }
+
+            cand_kwargs = dict(base_kwargs)
+            ann = getattr(Candidate, "__annotations__", None)
+            if isinstance(ann, dict) and ann:
+                cand_kwargs = {k: v for k, v in base_kwargs.items() if k in ann}
+
+            candidate = Candidate(**cand_kwargs)  # type: ignore[misc]
+            res = pass_gate(candidate)  # type: ignore[misc]
+            if inspect.isawaitable(res):
+                res = await res
+
+            pre_score: Optional[float] = None
+            decision: Optional[bool] = None
+
+            if isinstance(res, (list, tuple)):
+                if len(res) >= 1:
+                    decision = bool(res[0])
+                if len(res) >= 2 and res[1] is not None:
+                    try:
+                        pre_score = float(res[1])
+                    except Exception:
+                        pre_score = None
+            elif isinstance(res, (int, float)):
+                pre_score = float(res)
+
+            # Optional min-score enforcement
+            if pre_score is not None and self.ai_pre_min_score > 0:
+                if pre_score < self.ai_pre_min_score:
+                    decision = False if decision is None else bool(decision and False)
+
+            return pre_score, decision
+        except Exception as e:
+            if DEBUG_TX:
+                traceback.print_exc()
+            try:
+                log.event(
+                    "AI_PRE_SCORE_ERROR",
+                    mint=mint_norm,
+                    pool=pool,
+                    symbol=symbol,
+                    err=str(e)[:200],
+                )
+            except Exception:
+                pass
+            return None, None
+
+    # ───────────── Self-learning strategy hook (optional) ───────────────
+    async def _self_learning_candidate_hook(
+        self,
+        *,
+        mint_norm: str,
+        pool: str,
+        symbol: str,
+        ui: Dict[str, Any],
+        features: Dict[str, Any],
+        ai_score: Optional[float],
+        allow: bool,
+    ) -> None:
+        """
+        Notify utils_pkg.self_learning_ai_strategy about each candidate decision.
+        This gives the self-learning brain a live stream of decisions + features.
+        """
+        if self._sl_mod is None:
+            return
+
+        try:
+            fn = (
+                getattr(self._sl_mod, "on_candidate_decision", None)
+                or getattr(self._sl_mod, "record_candidate_decision", None)
+                or getattr(self._sl_mod, "record_candidate", None)
+            )
+            if not callable(fn):
+                return
+
+            payload = {
+                "mint": mint_norm,
+                "pool": pool,
+                "symbol": symbol,
+                "ui": ui,
+                "features": features,
+                "ai_score": ai_score,
+                "decision": bool(allow),
+            }
+
+            res = fn(**payload) if "mint" in inspect.signature(fn).parameters else fn(
+                payload
+            )  # type: ignore[misc]
+            if inspect.isawaitable(res):
+                await res
+        except Exception:
+            if DEBUG_TX:
+                traceback.print_exc()
+
+    # ─────────────────────── AI / Feature Gate (v3+++) ──────────────────
+    async def _ai_entry_gate(
+        self,
+        *,
+        ui: Dict[str, Any],
+        mint_norm: str,
+        pool: str,
+        raw_event: Dict[str, Any],
+        risk_cap: Optional[float],
+    ) -> bool:
+        """
+        Unified AI / feature gate (fully async, quant-grade):
+
+        Behaviour:
+          - AI_ENTRY_ENABLED=0 or no modules → no-op (allow).
+          - Build features via feature_builder (if present).
+          - Optional pre-AI ai_buy_scoring pass_gate (if present).
+          - Call ai_entry_logic.should_enter_with_ai (preferred), or fall back to
+            ai_entry_logic.evaluate/decide/score if that's what's available.
+          - Expect return of:
+              (allow: bool, score: float | None, meta: dict | None)
+            or a dict with allow/blocked/ok + score.
+          - Enforce:
+              * soft min:  AI_ENTRY_SCORE_MIN
+              * hard min:  AI_ENTRY_SCORE_HARD_MIN
+              * risk-adj: AI_ENTRY_RISK_ADJ_MIN on score * risk_cap
+          - Risk-adjust size using AI score + regime snapshot + risk capacity.
+          - Log candidate + AI decision via utils_pkg.data_logger.log_candidate (async).
+          - Notify self_learning_ai_strategy (if present) so it can learn.
+        """
+        if not self.ai_enabled or self._ai_mod is None:
+            return True
+
+        DEBUG_LOCAL = DEBUG_TX
+        symbol = ui.get("symbol") or ui.get("name") or _extract_symbol(raw_event)
+
+        # Attach basic scanner metrics into UI for AI visibility
+        try:
+            liq = float(
+                raw_event.get("liq_usd")
+                or raw_event.get("liq")
+                or 0.0
+            )
+            vol5 = float(
+                raw_event.get("vol_5m_usd")
+                or raw_event.get("vol5")
+                or 0.0
+            )
+            up5 = float(
+                raw_event.get("price_change_5m_pct")
+                or raw_event.get("chg5")
+                or raw_event.get("up_5m_pct")
+                or 0.0
+            )
+            buys5 = int(raw_event.get("buys_5m") or raw_event.get("buys5") or 0)
+            sells5 = int(raw_event.get("sells_5m") or raw_event.get("sells5") or 0)
+
+            ui.setdefault("liq_usd", liq)
+            ui.setdefault("vol_5m_usd", vol5)
+            ui.setdefault("up_5m_pct", up5)
+            ui.setdefault("buys_5m", buys5)
+            ui.setdefault("sells_5m", sells5)
+        except Exception:
+            if DEBUG_LOCAL:
+                traceback.print_exc()
+
+        # --- Build features (if builder present) ------------------------
+        features: Dict[str, Any] = {}
+        feature_meta: Dict[str, Any] = {}
+
+        try:
+            if self._feat_mod is not None:
+                fb = (
+                    getattr(self._feat_mod, "build_features_for_candidate", None)
+                    or getattr(self._feat_mod, "build_features_for_event", None)
+                    or getattr(self._feat_mod, "build_features", None)
+                )
+                if callable(fb):
+                    try:
+                        res = fb(  # type: ignore[misc]
+                            raw_event=raw_event,
+                            ui=ui,
+                            pool=pool,
+                        )
+                        if inspect.isawaitable(res):
+                            res = await res
+                    except TypeError:
+                        # Fallback to minimal signatures
+                        res = fb(raw_event)  # type: ignore[misc]
+
+                    if isinstance(res, tuple) and len(res) == 2:
+                        features, feature_meta = res  # type: ignore[assignment]
+                    elif isinstance(res, dict):
+                        features = res  # type: ignore[assignment]
+
+            if not isinstance(features, dict):
+                features = {}
+            if not isinstance(feature_meta, dict):
+                feature_meta = {}
+        except Exception:
+            features = {}
+            feature_meta = {}
+            if DEBUG_LOCAL:
+                traceback.print_exc()
+
+        # Add light regime / capacity context into features (if available)
+        regime_snap = self._regime_snapshot()
+        if regime_snap:
+            try:
+                features.setdefault("regime_state", regime_snap.get("state"))
+                features.setdefault("regime_score", regime_snap.get("risk_score"))
+            except Exception:
+                pass
+        if risk_cap is not None:
+            features.setdefault("risk_capacity", risk_cap)
+
+        # --- Optional pre-AI buy scoring gate ---------------------------
+        pre_score, pre_decision = await self._ai_pre_score(
+            mint_norm=mint_norm,
+            pool=pool,
+            symbol=symbol,
+            ui=ui,
+            features=features,
+            raw_event=raw_event,
+        )
+        if pre_score is not None:
+            ui["ai_pre_score"] = float(pre_score)
+
+        if pre_decision is False:
+            # hard block from pre-gate
+            self._diag["ai_pre_reject"] += 1
+            self._diag["rejected_ai"] += 1
+            log.event(
+                "AI_PRE_ENTRY_REJECT",
+                pool=pool,
+                mint=mint_norm,
+                symbol=symbol,
+                pre_score=pre_score,
+                pre_min=self.ai_pre_min_score,
+            )
+            try:
+                record_buy_result(
+                    ok=False,
+                    reason="ai_pre_entry_reject",
+                    ai_pre_score=pre_score,
+                )
+            except Exception:
+                pass
+            return False
+
+        # --- AI evaluator -----------------------------------------------
+        ai_fn = getattr(self._ai_mod, "should_enter_with_ai", None)
+        raw_decision: Any = None
+        allow = True
+        score: Optional[float] = None
+        meta: Dict[str, Any] = {}
+
+        try:
+            if callable(ai_fn):
+                raw_decision = await ai_fn(  # type: ignore[misc]
+                    mint=mint_norm,
+                    pool=pool,
+                    ui=ui,
+                    features=features,
+                    feature_meta=feature_meta,
+                )
+                # expected: (bool, score, meta)
+                if (
+                    isinstance(raw_decision, (list, tuple))
+                    and len(raw_decision) >= 1
+                ):
+                    allow = bool(raw_decision[0])
+                    if len(raw_decision) >= 2 and raw_decision[1] is not None:
+                        try:
+                            score = float(raw_decision[1])
+                        except Exception:
+                            score = None
+                    if (
+                        len(raw_decision) >= 3
+                        and isinstance(raw_decision[2], dict)
+                    ):
+                        meta = raw_decision[2]  # type: ignore[assignment]
+                elif isinstance(raw_decision, dict):
+                    d = raw_decision
+                    if "allow" in d:
+                        allow = bool(d.get("allow"))
+                    elif "ok" in d:
+                        allow = bool(d.get("ok"))
+                    elif "blocked" in d:
+                        allow = not bool(d.get("blocked"))
+                    if d.get("score") is not None:
+                        try:
+                            score = float(d.get("score"))
+                        except Exception:
+                            score = None
+                    if isinstance(d.get("meta"), dict):
+                        meta = d.get("meta")  # type: ignore[assignment]
+
+            else:
+                # Fallback: generic scoring functions
+                fallback = (
+                    getattr(self._ai_mod, "evaluate_candidate", None)
+                    or getattr(self._ai_mod, "decide_entry", None)
+                    or getattr(self._ai_mod, "score_candidate", None)
+                    or getattr(self._ai_mod, "decide", None)
+                )
+                if callable(fallback):
+                    raw_decision = fallback(  # type: ignore[misc]
+                        event=raw_event,
+                        ui=ui,
+                        features=features,
+                        mint=mint_norm,
+                    )
+                    if inspect.isawaitable(raw_decision):
+                        raw_decision = await raw_decision
+
+                    if isinstance(raw_decision, dict):
+                        d = raw_decision
+                        if "allow" in d:
+                            allow = bool(d.get("allow"))
+                        elif "ok" in d:
+                            allow = bool(d.get("ok"))
+                        elif "blocked" in d:
+                            allow = not bool(d.get("blocked"))
+                        if d.get("score") is not None:
+                            try:
+                                score = float(d.get("score"))
+                            except Exception:
+                                score = None
+                        if isinstance(d.get("meta"), dict):
+                            meta = d.get("meta")  # type: ignore[assignment]
+                    elif isinstance(raw_decision, (int, float)):
+                        score = float(raw_decision)
+                        allow = score >= self.ai_min_score
+
+        except Exception as e:
+            self._diag["ai_errors"] += 1
+            log.event(
+                "AI_ENTRY_ERROR",
+                mint=mint_norm,
+                pool=pool,
+                symbol=symbol,
+                err=str(e)[:200],
+            )
+            if DEBUG_LOCAL:
+                traceback.print_exc()
+            # fail-open so we don't brick trading
+            allow = True
+
+        # --- Score-based enforcement & buckets --------------------------
+        if score is not None:
+            ui["ai_entry_score"] = float(score)
+
+            # Hard floor (absolute no-go)
+            if score < self.ai_hard_min_score:
+                allow = False
+
+            # Soft floor
+            if score < self.ai_min_score:
+                allow = False
+
+            # Risk-adjusted score (AI * risk_cap)
+            if risk_cap is not None:
+                try:
+                    cap_clamped = max(0.0, min(1.0, float(risk_cap)))
+                    risk_adj_score = float(score) * cap_clamped
+                except Exception:
+                    risk_adj_score = float(score)
+                ui["ai_risk_adj_score"] = risk_adj_score
+
+                if self.ai_risk_adj_min > 0 and risk_adj_score < self.ai_risk_adj_min:
+                    allow = False
+            else:
+                risk_adj_score = None
+
+            # Diag buckets (0–1 scale-ish, but tolerant)
+            try:
+                if score < max(0.0, self.ai_min_score):
+                    self._diag["ai_score_low"] += 1
+                elif score < self.ai_fastlane_score:
+                    self._diag["ai_score_mid"] += 1
+                else:
+                    self._diag["ai_score_high"] += 1
+            except Exception:
+                pass
+
+        if meta:
+            ui["ai_entry_meta"] = meta
+
+        # --- Risk-adjusted sizing ---------------------------------------
+        try:
+            self._risk_adjust_size(
+                ui=ui,
+                score=score,
+                regime_snap=regime_snap,
+                risk_cap=risk_cap,
+            )
+        except Exception:
+            if DEBUG_LOCAL:
+                traceback.print_exc()
+
+        # --- Data logger hook (async) -----------------------------------
+        try:
+            if self._log_mod is not None:
+                log_fn = getattr(self._log_mod, "log_candidate", None)
+                if callable(log_fn):
+                    await log_fn(  # type: ignore[misc]
+                        mint=mint_norm,
+                        pool=pool,
+                        ui=ui,
+                        features=features,
+                        ai_score=score,
+                        ai_meta=meta,
+                    )
+        except Exception:
+            if DEBUG_LOCAL:
+                traceback.print_exc()
+
+        # --- Self-learning hook -----------------------------------------
+        try:
+            await self._self_learning_candidate_hook(
+                mint_norm=mint_norm,
+                pool=pool,
+                symbol=symbol,
+                ui=ui,
+                features=features,
+                ai_score=score,
+                allow=allow,
+            )
+        except Exception:
+            if DEBUG_LOCAL:
+                traceback.print_exc()
+
+        # --- Decision + metrics -----------------------------------------
+        if allow:
+            self._diag["ai_allowed"] += 1
+
+            # Fastlane flag (for observability / later tweaks)
+            if score is not None and score >= self.ai_fastlane_score:
+                self._diag["ai_fastlane"] += 1
+                ui["ai_fastlane"] = True
+            else:
+                ui["ai_fastlane"] = False
+
+            log.event(
+                "AI_ENTRY_OK",
+                pool=pool,
+                mint=mint_norm,
+                symbol=symbol,
+                score=score,
+                min_score=self.ai_min_score,
+                hard_min=self.ai_hard_min_score,
+                risk_adj_score=ui.get("ai_risk_adj_score"),
+                risk_cap=risk_cap,
+                fastlane=bool(ui.get("ai_fastlane")),
+            )
+            # Optional Telegram debug
+            asyncio.create_task(
+                _send_telegram_debug(
+                    f"AI OK {symbol} ({mint_norm[:6]}…): "
+                    f"score={score:.3f if score is not None else 'None'} "
+                    f"pre={ui.get('ai_pre_score')} cap={risk_cap}"
+                )
+            )
+            return True
+
+        # Rejected
+        self._diag["rejected_ai"] += 1
+        log.event(
+            "AI_ENTRY_REJECT",
+            pool=pool,
+            mint=mint_norm,
+            symbol=symbol,
+            score=score,
+            min_score=self.ai_min_score,
+            hard_min=self.ai_hard_min_score,
+            risk_adj_score=ui.get("ai_risk_adj_score"),
+            risk_cap=risk_cap,
+        )
+        try:
+            record_buy_result(
+                ok=False,
+                reason="ai_entry_reject",
+                ai_score=score,
+                ai_risk_adj=ui.get("ai_risk_adj_score"),
+                risk_capacity=risk_cap,
+            )
+        except Exception:
+            pass
+        return False
+
+    def _smart_wallet_guard(
+        self,
+        *,
+        raw_event: Dict[str, Any],
+        mint_norm: str,
+        pool: str,
+    ) -> bool:
+        """
+        Optional smart-wallet guard (deployers / known bad actors).
+
+        Returns True if candidate is allowed, False if blocked.
+        """
+        if self._smart_mod is None:
+            return True
+
+        try:
+            # Try to infer a "creator" / "deployer" field from the event
+            creator = (
+                raw_event.get("creator")
+                or raw_event.get("deployer")
+                or raw_event.get("owner")
+                or raw_event.get("wallet")
+                or raw_event.get("authority")
+                or ""
+            )
+            creator = str(creator or "").strip()
+            if not creator:
+                return True
+
+            # Common function names
+            is_bad = (
+                getattr(self._smart_mod, "is_wallet_blocked", None)
+                or getattr(self._smart_mod, "is_banned_wallet", None)
+                or getattr(self._smart_mod, "is_bad_actor", None)
+            )
+            if callable(is_bad):
+                try:
+                    blocked = bool(
+                        is_bad(  # type: ignore[misc]
+                            wallet=creator,
+                            mint=mint_norm,
+                            pool=pool,
+                        )
+                    )
+                except TypeError:
+                    blocked = bool(is_bad(creator))  # type: ignore[misc]
+
+                if blocked:
+                    self._diag["rejected_filters"] += 1
+                    log.event(
+                        "ENTRY_SMART_WALLET_REJECT",
+                        pool=pool,
+                        mint=mint_norm,
+                        creator=creator,
+                    )
+                    try:
+                        record_buy_result(
+                            ok=False,
+                            reason="smart_wallet_reject",
+                            creator=creator,
+                        )
+                    except Exception:
+                        pass
+                    return False
+
+            # Optional recorder (pure analytics)
+            rec = (
+                getattr(self._smart_mod, "record_wallet_activity", None)
+                or getattr(self._smart_mod, "track_wallet", None)
+            )
+            if callable(rec):
+                with contextlib.suppress(Exception):
+                    rec(  # type: ignore[misc]
+                        wallet=creator,
+                        mint=mint_norm,
+                        pool=pool,
+                        event="candidate",
+                    )
+
+        except Exception:
+            # Guard must never block trading due to implementation errors
+            if DEBUG_TX:
+                traceback.print_exc()
+        return True
+
     # --- DIAGNOSTICS + POSITION HEARTBEAT ------------------------------- #
     async def diag_loop(
         self,
@@ -1955,7 +3201,11 @@ class Strategy:
         """
         Periodic diagnostics emitter:
           - aggregate event counters
+          - AI score buckets / fastlane stats
+          - risk-capacity / regime stats
           - per-position heartbeat logs
+          - optional regime snapshot
+          - optional self-learning background tick
         """
         last_total = 0
         while not stop_evt.is_set():
@@ -1974,12 +3224,54 @@ class Strategy:
                 rej_filters=self._diag["rejected_filters"],
                 rej_guard=self._diag["rejected_guardrails"],
                 rej_momo=self._diag["rejected_momo"],
+                rej_ai=self._diag["rejected_ai"],
+                rej_regime=self._diag["rejected_regime"],
+                rej_risk_cap=self._diag["rejected_risk_cap"],
+                ai_allowed=self._diag["ai_allowed"],
+                ai_errors=self._diag["ai_errors"],
+                ai_score_low=self._diag["ai_score_low"],
+                ai_score_mid=self._diag["ai_score_mid"],
+                ai_score_high=self._diag["ai_score_high"],
+                ai_fastlane=self._diag["ai_fastlane"],
+                ai_pre_reject=self._diag["ai_pre_reject"],
                 buys_sub=self._diag["buys_submitted"],
                 buys_fill=self._diag["buys_filled"],
+                regime_risk_off=self._diag["regime_risk_off"],
+                regime_risk_on=self._diag["regime_risk_on"],
+                risk_cap_ok=self._diag["risk_cap_ok"],
+                risk_cap_low=self._diag["risk_cap_low"],
+                risk_cap_high=self._diag["risk_cap_high"],
             )
 
+            # Optional regime snapshot log
+            snap = self._regime_snapshot()
+            if snap:
+                with contextlib.suppress(Exception):
+                    log.event(
+                        "REGIME_HEARTBEAT",
+                        state=str(snap.get("state") or ""),
+                        risk_score=_as_float(
+                            snap.get("risk_score", 0.0),
+                            0.0,
+                        ),
+                        reason=str(snap.get("reason") or ""),
+                    )
+
+            # Optional self-learning heartbeat
+            if self._sl_mod is not None:
+                try:
+                    hb = getattr(self._sl_mod, "background_tick", None) or getattr(
+                        self._sl_mod, "on_diag_minute", None
+                    )
+                    if callable(hb):
+                        r = hb(diag=dict(self._diag))  # type: ignore[misc]
+                        if inspect.isawaitable(r):
+                            await r
+                except Exception:
+                    if DEBUG_TX:
+                        traceback.print_exc()
+
             # --- Per-position heartbeat --------------------------------
-            # One log per open position, capped by POSITION_HEARTBEAT_MAX
             try:
                 try:
                     poss = list(all_positions())
@@ -2483,10 +3775,10 @@ class Strategy:
                         where="gate_candidate",
                     )
 
-            # ---- Execute buy via maybe_buy (supports meta return) -------
+            # ---- Execute buy via maybe_buy (signature-only API) ---------
             try:
                 async with self._sema:
-                    result = await maybe_buy(
+                    tx_sig = await maybe_buy(
                         mint=mint_norm,
                         ui=ui | {"dryrun": IS_DRYRUN},
                         on_buy_submitted=_buy_hook_submitted,
@@ -2494,39 +3786,6 @@ class Strategy:
                         on_buy_failed=_buy_hook_failed,
                     )
                     self._diag["buys_submitted"] += 1
-
-                    # Support both:
-                    #   tx_sig = await maybe_buy(...)
-                    #   (tx_sig, meta) = await maybe_buy(...)
-                    tx_sig: Optional[str]
-                    meta: Dict[str, Any] = {}
-                    amount_raw_meta: Optional[int] = None
-
-                    if isinstance(result, tuple) and len(result) == 2:
-                        tx_sig, meta = result  # type: ignore[assignment]
-                        if not isinstance(meta, dict):
-                            meta = {}
-                    elif isinstance(result, str) or result is None:
-                        tx_sig = result  # type: ignore[assignment]
-                    else:
-                        tx_sig = None
-
-                    # ── Extract size from meta and mirror into UI ────────
-                    if isinstance(meta, dict):
-                        for k in (
-                            "amount_raw",
-                            "out_amount",
-                            "raw_out",
-                            "raw_amount_out",
-                            "token_amount_raw",
-                        ):
-                            v = meta.get(k)
-                            if isinstance(v, (int, float)) and v > 0:
-                                amount_raw_meta = int(v)
-                                break
-
-                        if amount_raw_meta and amount_raw_meta > 0:
-                            ui["amount_raw"] = amount_raw_meta
 
                     if tx_sig:
                         # Fire submitted hook again as a safety net (if router didn't)
@@ -2577,25 +3836,24 @@ class Strategy:
                                         "pool": ui.get("pool") or "unknown",
                                     }
 
-                                    # Best-effort amount_raw extraction from meta first, then UI
-                                    amount_raw: Optional[int] = amount_raw_meta
-                                    if amount_raw is None:
-                                        for k in (
-                                            "amount_raw",
-                                            "position_raw",
-                                            "size_raw",
-                                            "raw_out",
-                                            "raw_amount_out",
-                                            "out_amount",
-                                            "token_amount_raw",
-                                        ):
-                                            v = ui.get(k)
-                                            if isinstance(v, int) and v > 0:
-                                                amount_raw = v
-                                                break
-                                            if isinstance(v, float) and v > 0:
-                                                amount_raw = int(v)
-                                                break
+                                    # Best-effort amount_raw extraction from UI
+                                    amount_raw: Optional[int] = None
+                                    for k in (
+                                        "amount_raw",
+                                        "position_raw",
+                                        "size_raw",
+                                        "raw_out",
+                                        "raw_amount_out",
+                                        "out_amount",
+                                        "token_amount_raw",
+                                    ):
+                                        v = ui.get(k)
+                                        if isinstance(v, int) and v > 0:
+                                            amount_raw = v
+                                            break
+                                        if isinstance(v, float) and v > 0:
+                                            amount_raw = int(v)
+                                            break
 
                                     await exit_engine.on_buy_filled(
                                         ev,
@@ -2651,10 +3909,14 @@ class Strategy:
     # --- NEW TOKENS (entry point for gating) -----------------------------
     async def on_new_token(self, raw_event: Dict[str, Any]) -> None:
         """
-        New-token handler from scanners (PumpPortal / Raydium):
+        New-token handler from scanners (PumpPortal / Raydium / Dexscreener):
+          - regime gate
           - top-level guardrails
           - mint normalization + basic filters
+          - risk-capacity gate
+          - smart-wallet guard
           - liquidity screening
+          - AI / feature-based gate
           - dedupe & momentum gate (or direct-buy if disabled)
         """
         DEBUG_LOCAL = DEBUG_TX  # just an alias for readability
@@ -2708,6 +3970,33 @@ class Strategy:
                 )
             return
 
+        # --- Extract and normalise mint early for regime / risk logs ----
+        mint_source = _extract_raw_mint(raw_event)
+        if not mint_source:
+            if DEBUG_LOCAL:
+                print("[strategy] missing mint — skip", flush=True)
+            return
+
+        mint_norm = _normalize_from_source(mint_source)
+        symbol_for_regime = _extract_symbol(raw_event)
+
+        if not _is_probable_mint(mint_norm):
+            if DEBUG_LOCAL:
+                print(
+                    f"[strategy] implausible mint after normalize => skip ({mint_source})",
+                    flush=True,
+                )
+            return
+
+        # --- Regime gate (macro / risk-on/off) --------------------------
+        if not self._regime_allows_entry(
+            pool=pool,
+            symbol=symbol_for_regime,
+            mint=mint_norm,
+        ):
+            # regime gate already logged + diag updated
+            return
+
         # Top-level guardrails
         if PAUSE_TRADING or not buys_allowed():
             if DEBUG_LOCAL:
@@ -2752,20 +4041,14 @@ class Strategy:
             pause=int(PAUSE_TRADING),
         )
 
-        # Extract and normalise mint
-        mint_source = _extract_raw_mint(raw_event)
-        if not mint_source:
-            if DEBUG_LOCAL:
-                print("[strategy] missing mint — skip", flush=True)
-            return
-
-        mint_norm = _normalize_from_source(mint_source)
-        if not _is_probable_mint(mint_norm):
-            if DEBUG_LOCAL:
-                print(
-                    f"[strategy] implausible mint after normalize => skip ({mint_source})",
-                    flush=True,
-                )
+        # --- Risk-capacity gate ----------------------------------------
+        cap_ok, risk_cap = await self._risk_capacity_decision(
+            pool=pool,
+            mint=mint_norm,
+            symbol=symbol_for_regime,
+        )
+        if not cap_ok:
+            # logged + diag updated
             return
 
         # ---------- BASIC FILTERS (age / name / blacklist / scanner metrics)
@@ -2860,6 +4143,15 @@ class Strategy:
                 symbol=_extract_symbol(raw_event),
             )
 
+        # ---------- SMART WALLET GUARD ----------------------------------
+        if not self._smart_wallet_guard(
+            raw_event=raw_event,
+            mint_norm=mint_norm,
+            pool=pool,
+        ):
+            # guard already logged + diag updated
+            return
+
         # ---------- LIQUIDITY SCREEN -----------------------------------
         dec_from_liq: Optional[int] = None
         if LIQ_FILTER_ENABLED and not force_ray:
@@ -2950,12 +4242,29 @@ class Strategy:
         ui["normalized"] = (mint_norm != mint_source)
         if dec_from_liq is not None:
             ui["decimals"] = dec_from_liq
+        if risk_cap is not None:
+            ui["risk_capacity"] = risk_cap
 
         print(
             f"[trade] pool={ui.get('pool','?')} "
             f"symbol={(ui.get('symbol') or '?')} mint={mint_norm}",
             flush=True,
         )
+
+        # --- AI entry gating (unified v3+++ gate) -----------------------
+        ai_ok = True
+        if self.ai_enabled and self._ai_mod is not None:
+            ai_ok = await self._ai_entry_gate(
+                ui=ui,
+                mint_norm=mint_norm,
+                pool=pool,
+                raw_event=raw_event,
+                risk_cap=risk_cap,
+            )
+
+        if not ai_ok:
+            # _ai_entry_gate already logged + diag updated
+            return
 
         # Dedupe gate proposals
         if DEDUPE_ENABLED and self.momo_enabled:
@@ -3064,8 +4373,8 @@ class Strategy:
                         except Exception:
                             pass
 
-                    # Execute buy
-                    result = await maybe_buy(
+                    # Execute buy via maybe_buy (signature-only)
+                    tx_sig = await maybe_buy(
                         mint=mint_norm,
                         ui=ui | {"dryrun": IS_DRYRUN},
                         on_buy_submitted=_buy_hook_submitted,
@@ -3073,37 +4382,6 @@ class Strategy:
                         on_buy_failed=_buy_hook_failed,
                     )
                     self._diag["buys_submitted"] += 1
-
-                    # Parse result
-                    tx_sig: Optional[str] = None
-                    meta: Dict[str, Any] = {}
-                    amount_raw: Optional[int] = None
-
-                    if isinstance(result, tuple) and len(result) == 2:
-                        tx_sig, meta = result  # type: ignore[assignment]
-                        if not isinstance(meta, dict):
-                            meta = {}
-                    elif isinstance(result, str) or result is None:
-                        tx_sig = result  # type: ignore[assignment]
-                    else:
-                        tx_sig = None
-
-                    # Extract size from meta and mirror into UI
-                    if isinstance(meta, dict):
-                        for k in (
-                            "amount_raw",
-                            "out_amount",
-                            "raw_out",
-                            "raw_amount_out",
-                            "token_amount_raw",
-                        ):
-                            v = meta.get(k)
-                            if isinstance(v, (int, float)) and v > 0:
-                                amount_raw = int(v)
-                                break
-
-                        if amount_raw and amount_raw > 0:
-                            ui["amount_raw"] = amount_raw
 
                     if tx_sig:
                         # Fire submitted hook again with enriched UI
@@ -3154,23 +4432,23 @@ class Strategy:
                                     }
 
                                     # ensure amount_raw present
-                                    if amount_raw is None:
-                                        for k in (
-                                            "amount_raw",
-                                            "position_raw",
-                                            "size_raw",
-                                            "raw_out",
-                                            "raw_amount_out",
-                                            "out_amount",
-                                            "token_amount_raw",
-                                        ):
-                                            v = ui.get(k)
-                                            if isinstance(v, int) and v > 0:
-                                                amount_raw = v
-                                                break
-                                            if isinstance(v, float) and v > 0:
-                                                amount_raw = int(v)
-                                                break
+                                    amount_raw: Optional[int] = None
+                                    for k in (
+                                        "amount_raw",
+                                        "position_raw",
+                                        "size_raw",
+                                        "raw_out",
+                                        "raw_amount_out",
+                                        "out_amount",
+                                        "token_amount_raw",
+                                    ):
+                                        v = ui.get(k)
+                                        if isinstance(v, int) and v > 0:
+                                            amount_raw = v
+                                            break
+                                        if isinstance(v, float) and v > 0:
+                                            amount_raw = int(v)
+                                            break
 
                                     # Notify exit engine
                                     try:
@@ -3242,42 +4520,125 @@ class Strategy:
         # Cooldown between processing new tokens
         await asyncio.sleep(LOOP_COOLDOWN_SEC)
 
-
 # ---------------------------
 # Mint normalization wrappers
 # ---------------------------
+
+# Small in-memory caches so we don't hammer pp_normalize / mint_guard
+# for the same mints over and over. This is *especially* helpful when
+# scanners keep revisiting hot tokens.
+_NORMALIZE_CACHE: Dict[str, str] = {}
+_PROB_CACHE: Dict[str, bool] = {}
+_MAX_NORM_CACHE = 4096  # tiny & safe; auto-evicts FIFO-ish
+
+
 def _normalize_from_source(raw: str) -> str:
+    """
+    Normalize any incoming mint-like string into a canonical mint.
+
+    Priority:
+      1. scripts.pp_utils.normalize_mint  (your local normalizer)
+      2. utils_pkg.mint_guard.normalize_from_any (if available)
+      3. raw string fallback (last resort)
+
+    Uses a small LRU-style cache to avoid repeated expensive normalizations.
+
+    V3+++:
+      - Defensive against garbage inputs (None/empty/whitespace).
+      - Bound cache with simple FIFO-ish eviction.
+      - Never raises: always returns a string (possibly raw).
+    """
     if raw is None:
         return ""
     raw = str(raw).strip()
-    m = _pp_normalize(raw)
-    if m:
-        return m
-    if _mg_normalize:
+    if not raw:
+        return ""
+
+    cached = _NORMALIZE_CACHE.get(raw)
+    if cached is not None:
+        return cached
+
+    # Local normalizer first (fast + close to router expectations)
+    try:
+        m = _pp_normalize(raw)
+    except Exception:
+        m = ""
+
+    # Optional mint_guard normalizer for cross-system consistency
+    if (not m) and _mg_normalize:
         try:
             m2 = _mg_normalize(raw)
             if isinstance(m2, str) and m2:
-                return m2
+                m = m2
         except Exception:
-            pass
-    return raw
+            # Best-effort only – never break flow
+            m = raw
+
+    if not m:
+        m = raw
+
+    # Maintain a bounded cache size
+    if len(_NORMALIZE_CACHE) >= _MAX_NORM_CACHE:
+        # crude FIFO-ish eviction: pop an arbitrary item
+        try:
+            _NORMALIZE_CACHE.pop(next(iter(_NORMALIZE_CACHE)))
+        except Exception:
+            _NORMALIZE_CACHE.clear()
+
+    _NORMALIZE_CACHE[raw] = m
+    return m
 
 
 def _is_probable_mint(s: str) -> bool:
+    """
+    Heuristic "is this a real Solana mint?" check.
+
+    Priority:
+      1. utils_pkg.mint_guard.is_probable_mint (if present)
+      2. local pp_normalize truthiness
+
+    V3+++:
+      - Small cache to avoid repeated checks.
+      - Never throws; strictly returns a bool.
+    """
     if not s:
         return False
+
+    cached = _PROB_CACHE.get(s)
+    if cached is not None:
+        return cached
+
+    ok = False
     if _mg_prob:
         try:
-            return bool(_mg_prob(s))
+            ok = bool(_mg_prob(s))
         except Exception:
-            return False
-    return bool(_pp_normalize(s))
+            ok = False
+    else:
+        try:
+            ok = bool(_pp_normalize(s))
+        except Exception:
+            ok = False
+
+    # Small bounded cache for this as well
+    if len(_PROB_CACHE) >= _MAX_NORM_CACHE:
+        try:
+            _PROB_CACHE.pop(next(iter(_PROB_CACHE)))
+        except Exception:
+            _PROB_CACHE.clear()
+    _PROB_CACHE[s] = ok
+    return ok
 
 
 # ---------------------------
 # Entry meta logging (PG + analytics)
 # ---------------------------
+
 _ENTRY_LOG_TABLE_READY: bool = False
+_ENTRY_LOG_PG_ENABLED: bool = _as_bool(
+    os.getenv("ENTRY_PG_ENABLED", "1"),
+    default=True,
+)
 
 
 async def _ensure_entry_log_table() -> None:
@@ -3286,12 +4647,21 @@ async def _ensure_entry_log_table() -> None:
 
     We use the generic PG DSN if present, otherwise fall back to PNL DSN.
     Safe no-op if asyncpg / DSN are missing.
+
+    Table is intentionally minimal + append-only so we can run
+    analytics/backtests on historical entries.
+
+    V3+++:
+      - Adds basic indexes (at_utc, mint) for faster analytics scans.
+      - Safe to call repeatedly; guarded by _ENTRY_LOG_TABLE_READY flag.
     """
     global _ENTRY_LOG_TABLE_READY
 
     if _ENTRY_LOG_TABLE_READY:
         return
     if not asyncpg:
+        return
+    if not _ENTRY_LOG_PG_ENABLED:
         return
 
     dsn = _PG_DSN_ASYNC or _PNL_DSN_ASYNC
@@ -3320,6 +4690,21 @@ async def _ensure_entry_log_table() -> None:
                 );
                 """
             )
+            # Lightweight indexes for analytics
+            try:
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_entry_log_at_utc "
+                    "ON entry_log (at_utc);"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_entry_log_mint_at_utc "
+                    "ON entry_log (mint, at_utc DESC);"
+                )
+            except Exception:
+                # Index creation failure is non-fatal
+                if DEBUG_TX:
+                    traceback.print_exc()
+
             _ENTRY_LOG_TABLE_READY = True
             log.event("ENTRY_PG_READY", dsn=_PG_DSN_MASK or "<dsn>")
         finally:
@@ -3333,8 +4718,16 @@ async def _ensure_entry_log_table() -> None:
 def _spend_from_meta_and_ui(entry_meta: Dict[str, Any], ui: Dict[str, Any]) -> float:
     """
     Derive spend_sol from entry_meta (preferred) and fall back to UI/env.
+
+    Priority:
+      1) lamport-based fields in meta
+      2) SOL-sized fields in meta
+      3) _compute_spend_sol(ui)
+
+    V3+++:
+      - Robust across many possible Jupiter/router shapes.
+      - Never raises; returns 0.0 on failure.
     """
-    # Prefer lamport-sized fields from meta
     lamports_val = None
     for k in (
         "in_amount_raw",
@@ -3356,7 +4749,6 @@ def _spend_from_meta_and_ui(entry_meta: Dict[str, Any], ui: Dict[str, Any]) -> f
         except Exception:
             pass
 
-    # Then SOL-sized fields from meta
     for k in ("spend_sol", "amount_sol", "size_sol", "size_in_sol", "size"):
         v = entry_meta.get(k)
         if v not in (None, ""):
@@ -3365,7 +4757,6 @@ def _spend_from_meta_and_ui(entry_meta: Dict[str, Any], ui: Dict[str, Any]) -> f
             except Exception:
                 pass
 
-    # Finally fall back to UI/env helper
     try:
         return max(0.0, float(_compute_spend_sol(ui)))
     except Exception:
@@ -3383,12 +4774,17 @@ async def log_entry_pg_from_meta(
     Persist a single entry into Postgres (and emit structured logs).
 
     NOTE: This is separate from the Redis/normalization log_entry_from_meta
-    defined in part 1. Call this helper explicitly if you want PG logging.
+    defined earlier in this file. Call this helper explicitly if you want PG logging.
+
+    V3+++:
+      - Slightly smarter meta compaction (caps giant blobs).
+      - Structured event is emitted even when PG is disabled.
+      - Includes AI / regime hints in meta when present in UI.
     """
     if not entry_meta:
         return
 
-    # Structured log for observability
+    # Always emit a structured log for external sinks
     try:
         log.event(
             "ENTRY_META_PLAIN",
@@ -3403,8 +4799,11 @@ async def log_entry_pg_from_meta(
     except Exception:
         pass
 
+    if not _ENTRY_LOG_PG_ENABLED:
+        # PG persistence disabled – log event only
+        return
+
     if not asyncpg:
-        # No PG, nothing else to do
         return
 
     dsn = _PG_DSN_ASYNC or _PNL_DSN_ASYNC
@@ -3415,7 +4814,8 @@ async def log_entry_pg_from_meta(
         await _ensure_entry_log_table()
     except Exception:
         # Table creation failure is non-fatal
-        pass
+        if DEBUG_TX:
+            traceback.print_exc()
 
     pool = ui.get("pool") or "unknown"
     symbol = ui.get("symbol") or ui.get("name") or "?"
@@ -3427,7 +4827,6 @@ async def log_entry_pg_from_meta(
     out_raw = entry_meta.get("amount_raw")
     price_impact = entry_meta.get("priceImpactPct")
 
-    # Normalize for PG
     def _as_num(x: Any) -> Optional[float]:
         if x in (None, "", 0, 0.0):
             return None
@@ -3439,6 +4838,33 @@ async def log_entry_pg_from_meta(
     in_raw_f = _as_num(in_raw)
     out_raw_f = _as_num(out_raw)
     price_imp_f = _as_num(price_impact)
+
+    # Defensive: cap meta size to keep rows small-ish
+    meta_to_store: Dict[str, Any] = dict(entry_meta)
+
+    # Enrich with AI entry hints if present in ui
+    try:
+        if "ai_entry_score" in ui:
+            meta_to_store.setdefault(
+                "ai_entry",
+                {
+                    "score": ui.get("ai_entry_score"),
+                    "fastlane": ui.get("ai_fastlane"),
+                    "size_factor": ui.get("size_factor"),
+                },
+            )
+    except Exception:
+        if DEBUG_TX:
+            traceback.print_exc()
+
+    try:
+        # Drop any giant blobs if present (e.g. raw route, debug tx)
+        for k in ("raw_tx", "route_plan", "full_quote", "debug"):
+            if k in meta_to_store and len(str(meta_to_store[k])) > 20_000:
+                meta_to_store[k] = f"<omitted:{k}:len>"
+    except Exception:
+        if DEBUG_TX:
+            traceback.print_exc()
 
     try:
         conn = await asyncpg.connect(dsn)
@@ -3469,7 +4895,7 @@ async def log_entry_pg_from_meta(
                 in_raw_f,
                 out_raw_f,
                 price_imp_f,
-                json.dumps(entry_meta),
+                json.dumps(meta_to_store),
             )
             log.event(
                 "ENTRY_META_PG_INSERTED",
@@ -3493,6 +4919,7 @@ async def log_entry_pg_from_meta(
 # ---------------------------
 # Daily PnL helpers  (USES NORMALIZED DSN)
 # ---------------------------
+
 def _fmt_sol(x: Optional[float]) -> str:
     if x is None:
         return "—"
@@ -3503,6 +4930,14 @@ def _fmt_sol(x: Optional[float]) -> str:
 
 
 async def _telegram_send(text: str) -> None:
+    """
+    Fire-and-forget Telegram helper.
+
+    Controlled by:
+      - TELEGRAM_BOT_TOKEN
+      - DAILY_PNL_CHAT_ID or TELEGRAM_CHAT_ID
+      - DAILY_PNL_TG_ENABLED (optional, default=1)
+    """
     bot = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     chat = (
         os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or ""
@@ -3510,6 +4945,11 @@ async def _telegram_send(text: str) -> None:
     if not (bot and chat and httpx):
         log.event("DAILY_PNL_TG_SKIP", reason="missing_cfg_or_httpx")
         return
+
+    if not _as_bool(os.getenv("DAILY_PNL_TG_ENABLED", "1"), True):
+        log.event("DAILY_PNL_TG_SKIP", reason="disabled_flag")
+        return
+
     try:
         url = f"https://api.telegram.org/bot{bot}/sendMessage"
         payload = {
@@ -3549,6 +4989,16 @@ async def _pnl_pg_ensure_table() -> None:
                 );
             """
             )
+            # Light index for time-ordered scans
+            try:
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_daily_pnl_at_utc "
+                    "ON daily_pnl (at_utc DESC);"
+                )
+            except Exception:
+                if DEBUG_TX:
+                    traceback.print_exc()
+
             log.event("DAILY_PNL_PG_READY", dsn=_PG_DSN_MASK)
         finally:
             await conn.close()
@@ -3574,9 +5024,17 @@ async def _pnl_pg_insert_row(
         try:
             await conn.execute(
                 """
-                INSERT INTO daily_pnl (at_utc, realized_sol, unrealized_sol, open_positions, wallet_sol, notes)
+                INSERT INTO daily_pnl (
+                    at_utc,
+                    realized_sol,
+                    unrealized_sol,
+                    open_positions,
+                    wallet_sol,
+                    notes
+                )
                 VALUES (NOW() AT TIME ZONE 'UTC', $1, $2, $3, $4, $5::jsonb)
-                """,
+                """
+                ,
                 realized_sol,
                 unrealized_sol,
                 open_positions,
@@ -3598,6 +5056,9 @@ async def _pnl_pg_insert_row(
 
 
 async def _get_wallet_sol_balance() -> Optional[float]:
+    """
+    Best-effort wallet SOL balance helper.
+    """
     try:
         from utils_pkg.wallet import get_sol_balance  # type: ignore
 
@@ -3608,6 +5069,11 @@ async def _get_wallet_sol_balance() -> Optional[float]:
 
 
 async def _estimate_unrealized_from_positions() -> Tuple[float, int, Dict[str, Any]]:
+    """
+    Estimate unrealized PnL and open positions from in-memory positions.
+
+    This is approximate but good enough for daily telemetry.
+    """
     total_unrl = 0.0
     open_n = 0
     details: Dict[str, Any] = {"legs": []}
@@ -3615,6 +5081,7 @@ async def _estimate_unrealized_from_positions() -> Tuple[float, int, Dict[str, A
         poss = list(all_positions())
     except Exception:
         poss = []
+
     for p in poss:
         try:
             mint = str(p.get("mint") or p.get("token") or "")
@@ -3661,6 +5128,14 @@ async def _estimate_unrealized_from_positions() -> Tuple[float, int, Dict[str, A
 
 
 async def _estimate_realized_today() -> Tuple[float, Dict[str, Any]]:
+    """
+    Try multiple sources for realized PnL for the current UTC date.
+
+    Priority:
+      1) utils_pkg.realized.realized_today_sol
+      2) utils_pkg.positions_pg.realized_today_sol
+      3) Fallback 0.0
+    """
     try:
         from utils_pkg.realized import realized_today_sol  # type: ignore
 
@@ -3669,7 +5144,6 @@ async def _estimate_realized_today() -> Tuple[float, Dict[str, Any]]:
     except Exception:
         pass
     try:
-        # NOTE: Postgres-backed realized_from_positions (if implemented)
         from utils_pkg.positions_pg import (  # type: ignore
             realized_today_sol as pg_realized_today_sol,
         )
@@ -3684,11 +5158,73 @@ async def _estimate_realized_today() -> Tuple[float, Dict[str, Any]]:
 
 
 async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
+    """
+    Once-per-day PnL snapshot:
+
+      - realized (closed trades)
+      - unrealized (open positions via pricefeed)
+      - wallet SOL balance
+      - optional regime / risk / smart-wallet / AI diagnostics annotations
+      - Telegram notification
+      - Notion push (via push_daily_pnl)
+      - Postgres insert (daily_pnl table)
+
+    V3+++:
+      - Debounce protection (DAILY_PNL_DEBOUNCE_MIN).
+      - Rich notes payload including regime, smart_wallets, AI day summary,
+        and current Strategy diagnostics (if available).
+    """
     if not DAILY_PNL_ENABLED:
         return
 
     await _pnl_pg_ensure_table()
     _last_sent_ts: Optional[float] = None
+
+    # Optional extra context from regime / risk / smart_wallets / AI stats
+    async def _extra_notes() -> Dict[str, Any]:
+        notes: Dict[str, Any] = {}
+
+        # Regime snapshot (if available)
+        try:
+            from utils_pkg.regime import current_regime_snapshot  # type: ignore[attr-defined]
+
+            snap = current_regime_snapshot()
+            if isinstance(snap, dict):
+                notes["regime"] = snap
+        except Exception:
+            pass
+
+        # Smart-wallets state (if available)
+        try:
+            from utils_pkg.smart_wallets import get_wallet_state  # type: ignore[attr-defined]
+
+            sw = await get_wallet_state()
+            if isinstance(sw, dict):
+                notes["smart_wallets"] = sw
+        except Exception:
+            pass
+
+        # Optional: intraday AI/entry stats summary
+        try:
+            from utils_pkg.data_logger import summarize_trading_day  # type: ignore[attr-defined]
+
+            summary = await summarize_trading_day()
+            if isinstance(summary, dict):
+                notes["ai_day_summary"] = summary
+        except Exception:
+            pass
+
+        # Optional: Strategy diagnostics snapshot (if stream already booted)
+        try:
+            s = globals().get("strat")
+            if s is not None and hasattr(s, "_diag"):
+                # shallow copy to avoid mutation
+                notes["entry_diag"] = dict(getattr(s, "_diag"))
+        except Exception:
+            if DEBUG_TX:
+                traceback.print_exc()
+
+        return notes
 
     async def _once():
         nonlocal _last_sent_ts
@@ -3703,36 +5239,59 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
         unrl_sol, open_n, unrl_details = await _estimate_unrealized_from_positions()
         realized_sol, r_meta = await _estimate_realized_today()
         wallet_sol = await _get_wallet_sol_balance()
+        extra = await _extra_notes()
 
         # --- Notion: push daily snapshot (safe no-op if NOTION_ENABLED != 1)
         try:
-            page = push_daily_pnl(
-                {
-                    "date": utc_today_iso(),
-                    "realized_sol": realized_sol,
-                    "unrealized_sol": unrl_sol,
-                    "open_positions": open_n,
-                    "wallet_sol": wallet_sol,
-                    "net_sol": (realized_sol + unrl_sol),
-                    "note": "Auto-daily sync",
-                }
-            )
-            if page:
-                log.event("NOTION_DAILY_PNL_UPSERTED", page_id=page)
+            if _as_bool(os.getenv("NOTION_ENABLED", "1"), True):
+                page = push_daily_pnl(
+                    {
+                        "date": utc_today_iso(),
+                        "realized_sol": realized_sol,
+                        "unrealized_sol": unrl_sol,
+                        "open_positions": open_n,
+                        "wallet_sol": wallet_sol,
+                        "net_sol": (realized_sol + unrl_sol),
+                        "note": "Auto-daily sync",
+                    }
+                )
+                if page:
+                    log.event("NOTION_DAILY_PNL_UPSERTED", page_id=page)
         except Exception as e:
             log.warning("NOTION_DAILY_PNL_FAILED %s", e)
 
+        # Optional PnL target (for emoji status)
+        target_env = os.getenv("DAILY_PNL_TARGET_SOL")
+        target_emoji = ""
+        try:
+            if target_env is not None:
+                tgt = float(target_env)
+                if realized_sol >= tgt:
+                    target_emoji = " ✅"
+                elif realized_sol >= 0:
+                    target_emoji = " ⚖️"
+                else:
+                    target_emoji = " ⚠️"
+        except Exception:
+            target_emoji = ""
+
         now = _dt.datetime.now(_dt.timezone.utc)
-        hdr = f"📊 <b>Daily PnL</b> — {now.strftime('%Y-%m-%d')} (UTC)"
+        hdr = f"📊 <b>Daily PnL</b> — {now.strftime('%Y-%m-%d')} (UTC){target_emoji}"
         body = (
             f"\nRealized: <b>{_fmt_sol(realized_sol)}</b>"
             f"\nUnrealized: <b>{_fmt_sol(unrl_sol)}</b>"
             f"\nOpen positions: <b>{open_n}</b>"
             f"\nWallet: <b>{_fmt_sol(wallet_sol)}</b>"
         )
+        if extra.get("regime"):
+            body += f"\nRegime: <b>{extra['regime'].get('label','?')}</b>"
         footer = "\n\n<code>src=daily_pnl_loop</code>"
 
-        notes = {"realized_meta": r_meta, "unrealized_details": unrl_details}
+        notes = {
+            "realized_meta": r_meta,
+            "unrealized_details": unrl_details,
+            "extra": extra,
+        }
 
         await _pnl_pg_insert_row(
             realized_sol=realized_sol,
@@ -3781,20 +5340,72 @@ async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
 # ---------------------------
 # Health server (optional)
 # ---------------------------
+
 async def _maybe_start_health_server(
     stop_evt: asyncio.Event,
 ) -> Optional[asyncio.Task]:
+    """
+    Lightweight JSON health endpoint for Render / k8s / uptime checks.
+
+    Exposes:
+      - ok flag
+      - UTC timestamp
+      - dryrun flag
+      - enabled pools
+      - approximate open positions
+      - optional regime label
+      - basic feature flags (AI / liq / exit / risk manager)
+      - optional Strategy diagnostics snapshot (entry engine)
+
+    This is designed to be cheap enough to hit very frequently.
+    """
     if not (web and HEALTH_PORT > 0):
         return None
     app = web.Application()
 
     async def _health(_request):
+        open_n = 0
+        try:
+            open_n = len(list(all_positions()))
+        except Exception:
+            open_n = 0
+
+        regime_label: Optional[str] = None
+        try:
+            from utils_pkg.regime import current_regime_snapshot  # type: ignore[attr-defined]
+
+            snap = current_regime_snapshot()
+            if isinstance(snap, dict):
+                regime_label = snap.get("label") or snap.get("state")
+        except Exception:
+            regime_label = None
+
+        # Optional Strategy diagnostics snapshot
+        diag: Dict[str, Any] = {}
+        try:
+            s = globals().get("strat")
+            if s is not None and hasattr(s, "_diag"):
+                raw_diag = getattr(s, "_diag")
+                if isinstance(raw_diag, dict):
+                    diag = dict(raw_diag)
+        except Exception:
+            if DEBUG_TX:
+                traceback.print_exc()
+
         return web.json_response(
             {
                 "ok": True,
                 "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
                 "dryrun": _dryrun_env_on() or bool(_pkg_is_dryrun),
                 "pools": sorted(POOLS_FILTER) if POOLS_FILTER else ["<all>"],
+                "open_positions": open_n,
+                "regime": regime_label,
+                "ai_entry_enabled": bool(AI_ENTRY_ENABLED),
+                "liq_filter_enabled": bool(LIQ_FILTER_ENABLED),
+                "exit_engine_enabled": bool(EXIT_ENGINE_ENABLED),
+                "risk_manager_enabled": bool(RISK_MANAGER_ENABLED),
+                "version": "v3+++",
+                "diag": diag,
             }
         )
 
@@ -3819,6 +5430,7 @@ async def _maybe_start_health_server(
 # ---------------------------
 # Streaming loop (PumpPortal)
 # ---------------------------
+
 async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
     """
     Robust, version-proof PumpPortal streaming loop:
@@ -3826,9 +5438,14 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
       - Subscribes to trades via client methods if present, or internal helper
       - Gracefully handles reconnects and shutdown
       - Shields Strategy handlers from crashing the stream
+
+    V3+++:
+      - Shares a single Strategy instance globally (`globals()["strat"]`)
+        so other components (Raydium scanner, health, PnL) can introspect
+        diagnostics and regime-aware behaviour.
     """
     strat = Strategy()
-    # Expose this Strategy globally so Raydium scanner can reuse it
+    # Expose this Strategy globally so Raydium scanner and others can reuse it
     globals()["strat"] = strat
 
     local_stop = stop_evt or asyncio.Event()
@@ -3949,10 +5566,15 @@ async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
 # ---------------------------
 # Raydium scanner supervisor
 # ---------------------------
+
 async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
     """
     Periodically run the Raydium scanner and feed its candidates into the
-    Strategy.new_token pipeline as synthetic 'raydium' events.
+    Strategy.on_new_token pipeline as synthetic 'raydium' events.
+
+    V3+++:
+      - Slight jitter per instance to avoid thundering herd.
+      - Robust candidate normalization & logging.
     """
     scan_raydium = _get_raydium_scanner()
     if scan_raydium is None:
@@ -3980,7 +5602,6 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
 
             candidates: list[dict] = []
             if isinstance(runners_raw, dict):
-                # Normal shape: {"pf":[...], "fb":[...]} or {"runners":[...]}
                 if isinstance(runners_raw.get("runners"), (list, tuple)):
                     candidates = list(runners_raw["runners"])  # type: ignore[arg-type]
                 else:
@@ -3991,7 +5612,6 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                     if isinstance(fb, (list, tuple)):
                         candidates.extend(x for x in fb)
             elif isinstance(runners_raw, (list, tuple)):
-                # Already a flat list of runner dicts
                 candidates = list(runners_raw)
 
             log.event(
@@ -3999,7 +5619,6 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                 candidates=len(candidates),
             )
 
-            # 🔑 Get or reuse a Strategy instance for Raydium
             s = globals().get("strat")
             if s is None:
                 try:
@@ -4045,7 +5664,9 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                         chg5 = cand.get("chg5", cand.get("up_5m_pct", 0.0)) or 0.0
                         buys5 = cand.get("buys5", cand.get("buys_5m", 0)) or 0
                         sells5 = cand.get("sells5", cand.get("sells_5m", 0)) or 0
-                        age_min = cand.get("age_min", cand.get("ageMinutes", 0.0)) or 0.0
+                        age_min = (
+                            cand.get("age_min", cand.get("ageMinutes", 0.0)) or 0.0
+                        )
 
                         raw_event: Dict[str, Any] = {
                             "pool": "raydium",
@@ -4066,14 +5687,12 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
                         if ds_url:
                             raw_event["dexscreener_url"] = ds_url
 
-                        # async fire-and-forget into Strategy
                         asyncio.create_task(s.on_new_token(raw_event))
                     except Exception as e:
                         if DEBUG_TX:
                             print(f"[raydium] candidate build error: {e}", flush=True)
                         continue
 
-            # Normal interval with jitter
             if base_interval > 0:
                 jitter = 0.15 * base_interval * jitter_seed
                 await asyncio.sleep(base_interval + jitter)
@@ -4090,11 +5709,25 @@ async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
 
 
 # ---------------------------
-# Background tasks: scanners, PnL, exit worker, risk manager, health
+# Background tasks: scanners, PnL, exit worker, risk manager, health, AI loops
 # ---------------------------
+
 async def _start_background_tasks(
     stop_evt: asyncio.Event,
 ) -> Dict[str, asyncio.Task]:
+    """
+    Schedule all long-lived background loops:
+
+      - Raydium scanner
+      - Daily PnL snapshot
+      - Exit worker (sell executor)
+      - Portfolio risk manager
+      - Optional AI / data logger / regime / smart-wallet loops
+      - Optional self-learning AI loop
+      - Health server
+
+    Every loop is optional and guarded so a missing module never breaks boot.
+    """
     tasks: Dict[str, asyncio.Task] = {}
 
     # Raydium scanner
@@ -4125,7 +5758,6 @@ async def _start_background_tasks(
         )
 
     # Auto-exit worker: processes exit_request:* in Redis and executes sells.
-    # This is the "exit loop" and drives EXIT_TICK / EXIT_* logs from exit_engine.
     if _as_bool(os.getenv("EXIT_WORKER_ENABLED", "1"), True):
         if redis is None:
             log.event(
@@ -4156,6 +5788,78 @@ async def _start_background_tasks(
             poll_sec=RISK_MANAGER_POLL_SEC,
         )
 
+    # Optional AI / data / regime / smart-wallet loops
+    # All are best-effort; missing modules will be logged but won't crash.
+    try:
+        from utils_pkg.data_logger import data_logger_loop  # type: ignore[attr-defined]
+
+        if callable(data_logger_loop):
+            t = asyncio.create_task(
+                data_logger_loop(stop_evt),
+                name="telemetry.data_logger",
+            )
+            tasks["telemetry.data_logger"] = t
+            log.event("DATA_LOGGER_SCHEDULED")
+    except Exception:
+        log.event("DATA_LOGGER_UNAVAILABLE")
+
+    try:
+        from utils_pkg.regime import regime_loop  # type: ignore[attr-defined]
+
+        if callable(regime_loop):
+            t = asyncio.create_task(
+                regime_loop(stop_evt),
+                name="regime.loop",
+            )
+            tasks["regime.loop"] = t
+            log.event("REGIME_LOOP_SCHEDULED")
+    except Exception:
+        log.event("REGIME_LOOP_UNAVAILABLE")
+
+    try:
+        from utils_pkg.smart_wallets import smart_wallets_loop  # type: ignore[attr-defined]
+
+        if callable(smart_wallets_loop):
+            t = asyncio.create_task(
+                smart_wallets_loop(stop_evt),
+                name="smart_wallets.loop",
+            )
+            tasks["smart_wallets.loop"] = t
+            log.event("SMART_WALLETS_LOOP_SCHEDULED")
+    except Exception:
+        log.event("SMART_WALLETS_LOOP_UNAVAILABLE")
+
+    # Optional: AI maintenance / model-refresh loop if present
+    try:
+        from utils_pkg.ai_entry_logic import ai_maintenance_loop  # type: ignore[attr-defined]
+
+        if callable(ai_maintenance_loop):
+            t = asyncio.create_task(
+                ai_maintenance_loop(stop_evt),
+                name="ai.maintenance",
+            )
+            tasks["ai.maintenance"] = t
+            log.event("AI_MAINTENANCE_SCHEDULED")
+    except Exception:
+        log.event("AI_MAINTENANCE_UNAVAILABLE")
+
+    # Optional: self-learning strategy loop (quant-grade auto-tuner)
+    try:
+        from utils_pkg.self_learning_ai_strategy import (  # type: ignore[attr-defined]
+            self_learning_loop as _self_learning_loop,
+        )
+
+        if callable(_self_learning_loop):
+            t = asyncio.create_task(
+                _self_learning_loop(stop_evt),
+                name="self_learning.loop",
+            )
+            tasks["self_learning.loop"] = t
+            log.event("SELF_LEARNING_LOOP_SCHEDULED")
+    except Exception:
+        # If module/name not present, we just log an info-level hint.
+        log.event("SELF_LEARNING_LOOP_UNAVAILABLE")
+
     # Health server
     ht = await _maybe_start_health_server(stop_evt)
     if ht:
@@ -4169,6 +5873,13 @@ async def _graceful_shutdown(
     sell_task: Optional[asyncio.Task],
     bg_tasks: Dict[str, asyncio.Task],
 ) -> None:
+    """
+    Coordinated shutdown:
+      - Signal all tasks to stop
+      - Cancel background tasks
+      - Stop legacy sell loop
+      - Shutdown router + pricefeed
+    """
     stop_evt.set()
 
     for _name, t in list(bg_tasks.items()):
@@ -4191,6 +5902,7 @@ async def _graceful_shutdown(
 # ---------------------------
 # Sentry (optional)
 # ---------------------------
+
 def _maybe_init_sentry() -> None:
     if not (SENTRY_DSN and sentry_sdk):
         return
@@ -4209,6 +5921,7 @@ def _maybe_init_sentry() -> None:
 # ---------------------------
 # Main
 # ---------------------------
+
 def _boot_banner() -> None:
     pools = ",".join(sorted(POOLS_FILTER)) if POOLS_FILTER else "<all>"
     effective_dryrun = _dryrun_env_on() or bool(_pkg_is_dryrun)
@@ -4225,6 +5938,7 @@ def _boot_banner() -> None:
         f"min_trades={ENTRY_MOMO_MIN_TRADES} "
         f"min_up={ENTRY_MOMO_MIN_UP_PCT}% "
         f"allow_no_data_pump={int(ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP)}\n"
+        f"AI_ENTRY={int(AI_ENTRY_ENABLED)} | "
         f"LIQ_FILTER={int(LIQ_FILTER_ENABLED)} | "
         f"EXIT_ENGINE={int(EXIT_ENGINE_ENABLED)} | "
         f"EXIT_WORKER={int(exit_worker_enabled)} | "
@@ -4271,7 +5985,7 @@ async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
     _env_hints()
     _ensure_keypair_file()
 
-    # Optional router pre-init
+    # Optional router pre-init (Jupiter / routing warmup)
     try:
         if router and hasattr(router, "start"):
             await router.start()
