@@ -19,7 +19,7 @@ import argparse
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Iterable
+from typing import Any, Dict, Iterable
 
 import psycopg2
 import psycopg2.extras
@@ -27,16 +27,15 @@ import psycopg2.extras
 # -------------------------------------------------------------------
 # Table configuration
 # -------------------------------------------------------------------
-# These defaults match what you just inspected:
+# These defaults match what you inspected:
 #   public.entry_candidates
 #   public.entry_outcomes
-# You can override via env if needed later.
 CANDIDATES_TABLE = os.getenv("ENTRY_CANDIDATES_TABLE", "public.entry_candidates")
 OUTCOMES_TABLE = os.getenv("ENTRY_OUTCOMES_TABLE", "public.entry_outcomes")
 
 
 # -------------------------------------------------------------------
-# DSN helpers (shared with quick inspect script)
+# DSN helpers
 # -------------------------------------------------------------------
 
 
@@ -48,18 +47,13 @@ def _get_raw_dsn() -> str:
         1) SNIPER_DB_DSN
         2) DATABASE_URL
         3) PNL_DB_DSN
-
-    We intentionally accept the async-style DSN (postgresql+asyncpg://)
-    and normalize it for psycopg2.
     """
     env_keys = ["SNIPER_DB_DSN", "DATABASE_URL", "PNL_DB_DSN"]
     for k in env_keys:
         v = os.getenv(k)
         if v:
             return v
-    raise SystemExit(
-        "No DB DSN found in SNIPER_DB_DSN / DATABASE_URL / PNL_DB_DSN"
-    )
+    raise SystemExit("No DB DSN found in SNIPER_DB_DSN / DATABASE_URL / PNL_DB_DSN")
 
 
 def _normalize_dsn_for_psycopg2(raw: str) -> str:
@@ -99,18 +93,19 @@ def _extract_features(row: Dict[str, Any]) -> Dict[str, Any]:
 
     Strategy:
       1) Prefer known key names in a fixed priority list.
-      2) If none present, fall back to "any column whose name contains
-         'feature' and looks like JSON / dict".
+      2) If none present, fall back to any column whose name contains
+         'feature' and looks like JSON / dict.
       3) Ensure we always return a dict (possibly empty).
     """
     # First: explicit candidate keys in priority order
+    val = None
     for key in _FEATURE_CANDIDATE_KEYS:
         if key in row and row[key] is not None:
             val = row[key]
             break
-    else:
-        # Fallback: any column containing "feature" in its name
-        val = None
+
+    # Fallback: any column containing "feature" in its name
+    if val is None:
         for k, v in row.items():
             if "feature" in k and v is not None:
                 val = v
@@ -129,7 +124,6 @@ def _extract_features(row: Dict[str, Any]) -> Dict[str, Any]:
             parsed = json.loads(val)
             if isinstance(parsed, dict):
                 return parsed
-            # If it's a list or something else, wrap it
             return {"_raw_features": parsed}
         except Exception:
             return {}
@@ -148,12 +142,13 @@ def make_label(row: Dict[str, Any]) -> Dict[str, Any]:
     - 'buy' if decent upside and not nuked.
     - 'pass' otherwise.
 
-    Uses realized_pnl_pct / max_runup_pct / max_drawdown_pct / holding_minutes.
+    Uses realized_pnl_pct / max_runup_pct / max_drawdown_pct / holding_minutes
+    when available; missing fields default to 0.
     """
-    pnl = (row.get("realized_pnl_pct") or 0.0) * 1.0
-    runup = (row.get("max_runup_pct") or 0.0) * 1.0
-    drawdown = (row.get("max_drawdown_pct") or 0.0) * 1.0
-    hold_min = (row.get("holding_minutes") or 0.0) * 1.0
+    pnl = float(row.get("realized_pnl_pct") or 0.0)
+    runup = float(row.get("max_runup_pct") or 0.0)
+    drawdown = float(row.get("max_drawdown_pct") or 0.0)
+    hold_min = float(row.get("holding_minutes") or 0.0)
 
     good = False
 
@@ -170,7 +165,6 @@ def make_label(row: Dict[str, Any]) -> Dict[str, Any]:
         good = False
 
     verdict = "buy" if good else "pass"
-    # Soft label score; can be used as a regression target or weight
     score = 0.8 if good else 0.2
 
     return {
@@ -193,14 +187,15 @@ def _iter_rows(
 ) -> Iterable[Dict[str, Any]]:
     """
     Generator over joined candidate/outcome rows.
+
+    NOTE: we select c.* and o.* instead of naming specific columns so
+    that missing columns (like holding_minutes) don't break the query.
+    Python will simply see row.get("holding_minutes") as None.
     """
     query = f"""
         SELECT
             c.*,
-            o.realized_pnl_pct,
-            o.max_runup_pct,
-            o.max_drawdown_pct,
-            o.holding_minutes
+            o.*
         FROM {CANDIDATES_TABLE} c
         JOIN {OUTCOMES_TABLE} o
           ON o.candidate_id = c.id
@@ -212,7 +207,7 @@ def _iter_rows(
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(query, (since, limit))
         for row in cur:
-            yield row
+            return row
 
 
 def main() -> None:
