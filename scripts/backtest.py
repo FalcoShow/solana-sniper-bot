@@ -80,6 +80,7 @@ from utils_pkg import ai_db  # for ping / describe_backend / stats
 
 log = get_logger(__name__)
 
+
 # =============================================================================
 # Env helpers
 # =============================================================================
@@ -1837,8 +1838,6 @@ def _print_group_summary_for_field(
 
         row: List[str] = [str(key), str(n_cfg), f"{sum_trades:.1f}", f"{avg_trades:.2f}"]
 
-
-
         for m in metrics:
             if m == "n_trades":
                 continue
@@ -2405,7 +2404,7 @@ async def _run_backtests(args: argparse.Namespace) -> None:
     min_pnl_dd_ratio = args.min_pnl_dd_ratio
     min_calmar = args.min_calmar
     min_win_loss_ratio = args.min_win_loss_ratio
-    min_expectancy_pct = args.min_expectancy_pct
+    min_expectancy_pct = args.min_expectancy_p
     min_kelly_fraction = args.min_kelly_fraction
     min_kelly_safe_fraction = args.min_kelly_safe_fraction
     min_trades_per_day = args.min_trades_per_day

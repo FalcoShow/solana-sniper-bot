@@ -51,6 +51,8 @@ Design
       * Flow regime (accumulation vs panic dump) & buy-pressure score
       * Structural quality & entry_risk_score as final sanity guards
       * Optional self-learning overrides via Candidate.meta
+      * Infra flags (e.g. pump.fun liquidity `infra_no_account`),
+        handled as a **soft** liquidity guard with a small penalty.
 
 Extra outputs (for logs / dashboards / backtests)
 -------------------------------------------------
@@ -62,6 +64,7 @@ Extra outputs (for logs / dashboards / backtests)
       "parts": {component -> 0..1},
       "whale_bonus": float,
       "safety_bonus": float,
+      "infra_penalty": float,
       "raw_score": float,
       "score": float,
       "entry_quality": float,          # 0..1.5
@@ -72,6 +75,7 @@ Extra outputs (for logs / dashboards / backtests)
       "entry_tier": float,             # 0..3
       "position_size_tier": float,     # 0..3
       "source": str | None,
+      "infra_no_account": bool,
     }
 
 `gate_feature_vector(feats)` writes the key outputs back into the feature dict:
@@ -97,6 +101,11 @@ V3+++ additions vs older generations
   `regime_entry_gate_factor`) to bias size & gate threshold.
 - Optional self-learning nudges via Candidate.meta
   (`sl_entry_boost`, `sl_entry_gate_offset`, `sl_entry_block`, etc.).
+- **Infra-aware pump.fun handling**:
+  - `infra_no_account` propagated into Candidate (from features / snapshots).
+  - For Pump-only, low-liquidity hard filter is softened when `infra_no_account`
+    is true (no hard fail, just softer trust).
+  - A small AI penalty is applied when `infra_no_account` is set (Pump-only).
 """
 
 import json
@@ -194,6 +203,17 @@ def _sigmoid(x: float) -> float:
         return 1.0 / (1.0 + math.exp(-x))
     except OverflowError:
         return 1.0 if x > 0 else 0.0
+
+
+def _is_pump_source(source: Optional[str]) -> bool:
+    """
+    Helper to detect Pump / pump.fun style sources.
+    We keep this loose so it works for "pump", "pumpfun", "pf_pump", etc.
+    """
+    if not source:
+        return False
+    key = str(source).lower()
+    return "pump" in key
 
 
 # =============================================================================
@@ -327,6 +347,9 @@ class Candidate:
     # Misc / future extensions (e.g. extra self-learning data)
     meta: Dict[str, Any] = field(default_factory=dict)
 
+    # Infra flags (e.g. liquidity infra "no_account", mostly Pump / pump.fun)
+    infra_no_account: Optional[bool] = None
+
 
 # =============================================================================
 # Env-driven thresholds & weights
@@ -386,6 +409,14 @@ AI_BUY_SELF_LEARN_GATE_WEIGHT = _env_float(
 # Regime gate factor usage (from ai_risk_model)
 AI_USE_REGIME_GATE_FACTOR = _env_bool("AI_USE_REGIME_GATE_FACTOR", True)
 AI_REGIME_GATE_FACTOR_STRENGTH = _env_float("AI_REGIME_GATE_FACTOR_STRENGTH", 0.30)
+
+# Infra / Pump-specific controls
+AI_INFRA_NO_ACCOUNT_SOFT_LIQ = _env_bool(
+    "AI_INFRA_NO_ACCOUNT_SOFT_LIQ", True
+)  # if True: for Pump+infra_no_account, do NOT hard-fail low_liq
+AI_INFRA_NO_ACCOUNT_PENALTY = _env_float(
+    "AI_INFRA_NO_ACCOUNT_PENALTY", -0.03
+)  # small global score penalty when infra_no_account (Pump-only)
 
 # --- Soft score gate -------------------------------------------------- #
 AI_SCORE_GATE = _env_float("AI_SCORE_GATE", 0.58)
@@ -496,8 +527,22 @@ def _hard_filters(c: Candidate) -> Tuple[bool, List[str]]:
             f"pool_too_new({c.pool_age_min:.1f}m < {AI_MIN_POOL_AGE_MIN:.1f}m)"
         )
 
+    # Liquidity guard with Pump + infra_no_account softening
     if c.liq_usd < AI_MIN_LIQ_USD:
-        reasons.append(f"low_liq(${c.liq_usd:,.0f} < ${AI_MIN_LIQ_USD:,.0f})")
+        if (
+            AI_INFRA_NO_ACCOUNT_SOFT_LIQ
+            and bool(c.infra_no_account)
+            and _is_pump_source(c.source)
+        ):
+            # Infra "no_account" for Pump: treat as soft warning, not hard fail.
+            # The candidate will still get a small global penalty in the score,
+            # but we do NOT reject purely on low_liq when infra says "no_account".
+            # (We intentionally do NOT append a hard reason here.)
+            pass
+        else:
+            reasons.append(
+                f"low_liq(${c.liq_usd:,.0f} < ${AI_MIN_LIQ_USD:,.0f})"
+            )
 
     if c.impact_1k_bps > AI_MAX_IMPACT_1K_BPS:
         reasons.append(
@@ -1325,6 +1370,12 @@ def score_only(c: Candidate) -> Dict[str, Any]:
     )
     raw_score += whale_bonus + safety_bonus
 
+    # Infra penalty: only applies when infra_no_account is true AND this is Pump.
+    infra_penalty = 0.0
+    if bool(c.infra_no_account) and _is_pump_source(c.source):
+        infra_penalty = AI_INFRA_NO_ACCOUNT_PENALTY
+        raw_score += infra_penalty
+
     # Normalize by weight sum to keep in a sane 0..1 band even if weights change
     score = _clamp(raw_score / max(AI_WEIGHT_NORM, 1e-6), 0.0, 1.0)
 
@@ -1339,26 +1390,30 @@ def score_only(c: Candidate) -> Dict[str, Any]:
     if AI_BUY_DEBUG_LOG:
         try:
             log.debug(
-                "BUY_SCORING sym=%s mint=%s src=%s score=%.3f size=%.3f gate=%.3f parts=%s hard_ok=%s reasons=%s",
+                "BUY_SCORING sym=%s mint=%s src=%s score=%.3f size=%.3f gate=%.3f "
+                "infra_no_account=%s parts=%s hard_ok=%s reasons=%s",
                 c.symbol,
                 c.mint,
                 c.source,
                 score,
                 size_scalar,
                 _source_gate_threshold(c.source),
+                bool(c.infra_no_account),
                 {k: round(v, 3) for k, v in parts.items()},
                 hard_ok,
                 "; ".join(hard_reasons),
             )
         except Exception:
             log.debug(
-                "BUY_SCORING sym=%s mint=%s src=%s score=%.3f size=%.3f gate=%.3f hard_ok=%s reasons=%s",
+                "BUY_SCORING sym=%s mint=%s src=%s score=%.3f size=%.3f gate=%.3f "
+                "infra_no_account=%s hard_ok=%s reasons=%s",
                 c.symbol,
                 c.mint,
                 c.source,
                 score,
                 size_scalar,
                 _source_gate_threshold(c.source),
+                bool(c.infra_no_account),
                 hard_ok,
                 "; ".join(hard_reasons),
             )
@@ -1369,6 +1424,7 @@ def score_only(c: Candidate) -> Dict[str, Any]:
         "parts": parts,
         "whale_bonus": whale_bonus,
         "safety_bonus": safety_bonus,
+        "infra_penalty": infra_penalty,
         "raw_score": raw_score,
         "score": score,
         "entry_quality": entry_quality,
@@ -1379,6 +1435,7 @@ def score_only(c: Candidate) -> Dict[str, Any]:
         "entry_tier": _nz(c.entry_tier_bucket, 0.0),
         "position_size_tier": _nz(c.position_size_bucket, 0.0),
         "source": c.source,
+        "infra_no_account": bool(c.infra_no_account),
     }
 
     if AI_BUY_ATTACH_PARTS:
@@ -1406,10 +1463,14 @@ def pass_gate(c: Candidate) -> Tuple[bool, float, str]:
 
     # Hard filters first (structural / risk / AI fraud / dead / entry_block_flag etc.)
     if not detail["ok_hard"]:
+        reason = "; ".join(detail["hard_reasons"])
+        # If we softened liquidity due to Pump+infra_no_account, hint that in reason.
+        if bool(c.infra_no_account) and _is_pump_source(c.source):
+            reason += " [infra_no_account_soft_liq]"
         return (
             False,
             detail["score"],
-            "; ".join(detail["hard_reasons"]),
+            reason,
         )
 
     score = detail["score"]
@@ -1458,12 +1519,16 @@ def pass_gate(c: Candidate) -> Tuple[bool, float, str]:
             f"ai_entry={parts['ai_entry']:.2f}, "
             f"buy_pressure={parts['buy_pressure']:.2f})"
         )
+        if bool(c.infra_no_account) and _is_pump_source(c.source):
+            reason += " [infra_no_account_soft_liq]"
         if sl_note:
             reason += f" [self_learning:{sl_note}]"
         return True, score, reason
 
     # Reject path
     rej_reason = f"below_gate(score={score:.3f} < {threshold:.3f})"
+    if bool(c.infra_no_account) and _is_pump_source(c.source):
+        rej_reason += " [infra_no_account_soft_liq]"
     if sl_note:
         rej_reason += f" [self_learning:{sl_note}]"
 
@@ -1614,6 +1679,7 @@ def from_pool_snapshot(d: Dict[str, Any]) -> Candidate:
         self_learn_entry_block=d.get("self_learn_entry_block"),
         source=d.get("source"),
         meta=meta,
+        infra_no_account=d.get("infra_no_account"),
     )
 
 
@@ -1747,6 +1813,7 @@ def from_feature_vector(feats: Dict[str, Any]) -> Candidate:
         self_learn_entry_block=feats.get("self_learn_entry_block"),
         source=feats.get("scanner_source") or feats.get("source"),
         meta=meta,
+        infra_no_account=feats.get("infra_no_account"),
     )
 
 
