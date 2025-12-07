@@ -2653,6 +2653,24 @@ class Strategy:
                 if pre_score < self.ai_pre_min_score:
                     decision = False if decision is None else bool(decision and False)
 
+            # Optional logging hook
+            try:
+                log.event(
+                    "AI_PRE_SCORE",
+                    pool=pool,
+                    mint=mint_norm,
+                    symbol=symbol,
+                    pre_score=pre_score,
+                    pre_min=self.ai_pre_min_score,
+                    decision=(
+                        "allow" if decision is True
+                        else "block" if decision is False
+                        else "none"
+                    ),
+                )
+            except Exception:
+                pass
+
             return pre_score, decision
         except Exception as e:
             if DEBUG_TX:
@@ -2707,9 +2725,12 @@ class Strategy:
                 "decision": bool(allow),
             }
 
-            res = fn(**payload) if "mint" in inspect.signature(fn).parameters else fn(
-                payload
-            )  # type: ignore[misc]
+            sig = inspect.signature(fn)
+            if "mint" in sig.parameters:
+                res = fn(**payload)  # type: ignore[misc]
+            else:
+                res = fn(payload)  # type: ignore[misc]
+
             if inspect.isawaitable(res):
                 await res
         except Exception:
@@ -2966,6 +2987,7 @@ class Strategy:
             allow = True
 
         # --- Score-based enforcement & buckets --------------------------
+        risk_adj_score: Optional[float] = None
         if score is not None:
             ui["ai_entry_score"] = float(score)
 
@@ -2988,8 +3010,6 @@ class Strategy:
 
                 if self.ai_risk_adj_min > 0 and risk_adj_score < self.ai_risk_adj_min:
                     allow = False
-            else:
-                risk_adj_score = None
 
             # Diag buckets (0–1 scale-ish, but tolerant)
             try:
@@ -3072,14 +3092,25 @@ class Strategy:
                 risk_cap=risk_cap,
                 fastlane=bool(ui.get("ai_fastlane")),
             )
-            # Optional Telegram debug
-            asyncio.create_task(
-                _send_telegram_debug(
-                    f"AI OK {symbol} ({mint_norm[:6]}…): "
-                    f"score={score:.3f if score is not None else 'None'} "
-                    f"pre={ui.get('ai_pre_score')} cap={risk_cap}"
-                )
-            )
+
+            # Optional Telegram debug (defensive: only if helper exists)
+            try:
+                send_dbg = globals().get("_send_telegram_debug")
+                if callable(send_dbg):
+                    score_str = "None" if score is None else f"{score:.3f}"
+                    pre_val = ui.get("ai_pre_score")
+                    pre_str = "None" if pre_val is None else f"{float(pre_val):.3f}"
+                    cap_str = "None" if risk_cap is None else f"{float(risk_cap):.3f}"
+
+                    msg = (
+                        f"AI OK {symbol} ({mint_norm[:6]}…): "
+                        f"score={score_str} pre={pre_str} cap={cap_str}"
+                    )
+                    asyncio.create_task(send_dbg(msg))
+            except Exception:
+                if DEBUG_LOCAL:
+                    traceback.print_exc()
+
             return True
 
         # Rejected
