@@ -43,8 +43,8 @@ import psycopg2.extras
 # Config: tweak these if your table/column names differ
 # ───────────────────────────────────────────────────────────
 
-CANDIDATES_TABLE = "ai_entry_candidates"
-OUTCOMES_TABLE = "ai_entry_outcomes"
+CANDIDATES_TABLE = "public.entry_candidates"
+OUTCOMES_TABLE   = "public.entry_outcomes"
 
 # Column assumptions:
 # - candidates: id, created_at, src, mint, symbol, features_json (JSON or JSONB)
