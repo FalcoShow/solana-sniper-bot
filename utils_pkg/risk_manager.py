@@ -1,3 +1,4 @@
+# utils_pkg/risk_manager.py
 from __future__ import annotations
 
 """
@@ -53,7 +54,7 @@ Central portfolio risk brain. Single source of truth for:
         - plan bias (ahead-of-plan → shrink; behind → slight boost)
 
   • Publishing a lightweight risk:ctx hash for:
-        - FeatureBuilder / ai_entry_logic / scanners
+        - FeatureBuilder / ai_entry_logic / ai_buy_scoring / scanners
         - Strategy / dashboards / self-learning feedback
         - reinvestor / exit_engine / ai_sell_logic
 
@@ -109,9 +110,9 @@ Background loops
   async monitor_positions_loop(...)
   async risk_manager_loop(stop_evt)
 
-All other modules (Strategy, scanners, ai_entry_logic, self_learning_ai_strategy,
-reinvestor, ai_sell_logic, exit_engine) should treat THIS as the canonical
-risk brain.
+All other modules (Strategy, scanners, ai_entry_logic, ai_buy_scoring,
+self_learning_ai_strategy, reinvestor, ai_sell_logic, exit_engine)
+should treat THIS as the canonical risk brain.
 """
 
 import asyncio
@@ -167,7 +168,6 @@ except Exception:  # pragma: no cover
 try:
     from utils_pkg.data_logger import log_event  # type: ignore
 except Exception:  # pragma: no cover
-
     async def log_event(*_: Any, **__: Any) -> None:
         return
 

@@ -143,7 +143,10 @@ from utils_pkg.core_utils import (
 
 # Infra health (RPC / JUP) — may be missing in older setups
 try:
-    from utils_pkg.infra_guard import infra_features, should_block_entries as infra_should_block_entries  # type: ignore
+    from utils_pkg.infra_guard import (
+        infra_features,
+        should_block_entries as infra_should_block_entries,
+    )  # type: ignore
 except Exception:  # pragma: no cover
 
     async def infra_features(redis=None) -> Dict[str, float]:

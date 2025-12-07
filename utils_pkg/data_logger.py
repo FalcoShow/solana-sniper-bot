@@ -114,10 +114,11 @@ def _env_float(key: str, default: float) -> float:
 PG_ENABLED = _env_bool("PG_ENABLED", True)
 
 # Base feature version (bump when you change FeatureBuilder semantics)
-FEATURE_VERSION = _env_int("AI_FEATURE_VERSION", 1)
+# This is a *logging schema*/feature-vector version label.
+FEATURE_VERSION = _env_int("AI_FEATURE_VERSION", 3)
 
 # Optional per-src / per-regime overrides via JSON:
-#   AI_FEATURE_VERSION_MAP='{"raydium_live": 2, "pumpfun_live": 3, "src:pumpfun": 2}'
+#   AI_FEATURE_VERSION_MAP='{"raydium_live": 3, "pumpfun_live": 3, "src:pumpfun": 3}'
 _feature_version_map_raw = os.getenv("AI_FEATURE_VERSION_MAP", "")
 _FEATURE_VERSION_MAP: Dict[str, int] = {}
 if _feature_version_map_raw.strip():

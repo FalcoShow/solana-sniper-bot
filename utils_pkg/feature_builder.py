@@ -3,8 +3,8 @@ from __future__ import annotations
 """
 utils_pkg/feature_builder.py
 
-Feature builder for AI models (V3+++ / quant-grade).
-====================================================
+Canonical feature builder for AI models (V3+++ / quant-grade).
+==============================================================
 
 Central place to turn a raw scanner / meta snapshot into a dense, numeric
 feature dict that is consumed by:
@@ -13,7 +13,8 @@ feature dict that is consumed by:
   - utils_pkg.ai_entry_logic._heuristic_score(...)
   - utils_pkg.ai_buy_scoring.from_feature_vector(...)
   - utils_pkg.self_learning_ai_strategy (policy updates)
-  - scripts/backtest.py and fine-tuning pipelines
+  - utils_pkg.risk_manager (capacity / Kelly / daily controls)
+  - scripts/backtest.py & fine-tuning pipelines
 
 Design goals
 ------------
@@ -21,33 +22,51 @@ Design goals
 - Robust to missing fields (defaults, fallbacks, clamping).
 - Rich derived feature set:
     * liquidity / mcap / fdv (levels + logs + normalized/buckets)
-    * age bands (very new / newish / old)
+    * age bands (very new / newish / mid / old / super-early)
     * volumes across horizons + ratios & intensity
     * orderflow (buy ratios, skew, net buys, vol per tx, buy pressure)
     * holders & whales (growth, whale share, whales per holder)
-    * smart-wallet & whale alignment (from smart_wallets)
+    * smart-wallet & whale alignment (from smart_wallets / scanner)
     * smart accumulation / panic dump / whale footprint / flow conflict
-    * regime alignment (trend, liquidity, manipulation risk, volatility)
+    * regime alignment (trend, liquidity, manipulation, volatility)
     * rug / impact normalization (AI fraud score, impact_1k_bps)
     * PF scores + risk-adjusted composites + micro-alpha score
-    * microstructure from short-term history (returns, vol, trend flags,
-      trend consistency vs chop)
-    * risk context (open positions, DD, risk mode, capacity, RR/SL/TP,
-      rolling win rate, Kelly-style fraction hint)
-    * high-level entry_quality / position_size / block / risk composites
+    * microstructure from short-term history (returns, vol, trend flags)
+    * risk context (open positions, DD, capacity, RR/SL/TP, Kelly hint)
+    * high-level composites:
+        - entry_quality_score
+        - position_size_scalar
+        - position_size_kelly_scalar
+        - entry_risk_score
+        - entry_block_flag / entry_soft_block_flag
+        - entry_tier_bucket / position_size_bucket
     * scanner metadata (raydium / dexscreener / pumpfun / momo)
-    * hooks for self-learning AI signals (entry score, confidence, segment)
+    * AI hooks (ai_buy_score, ai_entry_score, ai_confidence, etc.)
     * liquidity_regime_score + micro_risk_on_score/flag
-    * entry/size aliases for stable ML feature names
+    * stable aliases: entry_score_v1 / size_scalar_v1
 
 Backwards-compat:
-- Public API stays the same:
-    build_features(snapshot) -> dict
-    FeatureBuilder().build(...) -> dict
+-----------------
+Public API remains:
+
+    build_features(snapshot: Mapping[str, Any]) -> Dict[str, float]
+
+    fb = FeatureBuilder()
+    feats = fb.build(
+        symbol="ABC",
+        mint=mint_str,
+        snapshot=last_snapshot_dict,
+        history=recent_snapshots_list,   # optional
+        regime=regime_state,             # optional (RegimeState)
+        wallet_signals=wallet_dict,      # optional (from smart_wallets)
+        ai_signals=ai_dict,              # optional (AI fraud/entry outputs)
+        scanner_source="raydium",        # optional
+        risk_context=risk_ctx_dict,      # optional (open positions, DD, etc.),
+    )
 """
 
 import math
-from typing import Any, Dict, Mapping, Sequence, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from logging_setup import get_logger
 
@@ -167,9 +186,9 @@ def _net_minus_one_to_one(pos: float, neg: float) -> float:
 # ============================================================================ #
 
 
-def build_features(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
+def build_features(snapshot: Mapping[str, Any]) -> Dict[str, float]:
     """
-    Convert a raw PF/snapshot dict into a dense feature map.
+    Convert a raw PF/snapshot dict into a dense numeric feature map.
 
     Expected snapshot fields (best-effort, all optional):
 
@@ -207,7 +226,7 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
 
     # Meta / versioning – bump this when feature semantics change materially.
     # Keep this in sync with ai_entry_logic / ai_buy_scoring expectations.
-    feats["feature_version"] = 3.30  # V3+++ feature vector (quant-grade, extended)
+    feats["feature_version"] = 3.50  # V3+++ feature vector (quant-grade, extended)
 
     # ------------------------------------------------------------------ #
     # Core size / age
@@ -233,20 +252,20 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     feats["log_fdv_usd"] = _log1p_pos(fdv_usd)
 
     # Normalized size (rough reference scales tuned for Solana meme land)
-    feats["liq_norm"] = _norm_log_scale(liq_usd, 1_000_000.0)      # ref 1M liq
-    feats["mcap_norm"] = _norm_log_scale(mcap_usd, 10_000_000.0)   # ref 10M mcap
-    feats["fdv_norm"] = _norm_log_scale(fdv_usd, 20_000_000.0)     # ref 20M fdv
+    feats["liq_norm"] = _norm_log_scale(liq_usd, 1_000_000.0)  # ref 1M liq
+    feats["mcap_norm"] = _norm_log_scale(mcap_usd, 10_000_000.0)  # ref 10M mcap
+    feats["fdv_norm"] = _norm_log_scale(fdv_usd, 20_000_000.0)  # ref 20M fdv
 
     # Age buckets
     is_very_new = 1.0 if token_age_min <= 30 else 0.0
     is_newish = 1.0 if (30 < token_age_min <= 180) else 0.0
-    is_old = 1.0 if token_age_min > 240 else 0.0
+    is_mid = 1.0 if (180 < token_age_min <= 720) else 0.0
+    is_old = 1.0 if token_age_min > 240 else 0.0  # note: overlaps mid for 240..720
 
     feats["is_very_new"] = is_very_new
     feats["is_newish"] = is_newish
+    feats["is_mid_age"] = is_mid
     feats["is_old"] = is_old
-
-    # Extra “super early” flag (for pump-fun / fresh Ray pools)
     feats["is_super_early"] = 1.0 if token_age_min <= 10 else 0.0
 
     # ------------------------------------------------------------------ #
@@ -275,6 +294,9 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     feats["vol_15m_usd"] = vol_15m
     feats["vol_1h_usd"] = vol_1h
     feats["vol_24h_usd"] = vol_24h
+
+    feats["log_vol_5m_usd"] = _log1p_pos(vol_5m)
+    feats["log_vol_24h_usd"] = _log1p_pos(vol_24h)
 
     # Ratios (short-term vs higher TF)
     feats["vol_ratio_5m_1h"] = _safe_ratio(vol_5m, max(vol_1h, 1.0))
@@ -323,6 +345,7 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
 
     vol_per_tx_5m = vol_5m / max(txns_5m, 1.0)
     feats["vol_per_tx_5m_usd"] = vol_per_tx_5m
+    feats["liq_per_trade_5m_usd"] = _safe_ratio(liq_usd, max(txns_5m, 1.0))
 
     # Base buy pressure (before smart/whale overlay)
     base_buy_press = (
@@ -450,7 +473,7 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     smart_vs_whale_conflict = _f(raw, "smart_vs_whale_conflict", 0.0)
     smart_accumulation_score = _f(raw, "smart_accumulation_score", 0.0)
     smart_panic_dump_score = _f(raw, "smart_panic_dump_score", 0.0)
-    whale_liquidity_footprint = _f(raw, "whale_liquidity_footprint", 0.0)
+    whale_liquidity_footprint_raw = _f(raw, "whale_liquidity_footprint", 0.0)
 
     # Approximate net sides if missing but we have buy/sell scores
     if smart_net_side_5m == 0.0 and (smart_buy_score_5m or smart_sell_score_5m):
@@ -487,7 +510,7 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     feats["smart_vs_whale_conflict"] = smart_vs_whale_conflict
     feats["smart_accumulation_score"] = smart_accumulation_score
     feats["smart_panic_dump_score"] = smart_panic_dump_score
-    feats["whale_liquidity_footprint"] = whale_liquidity_footprint
+    feats["whale_liquidity_footprint"] = _clip01(whale_liquidity_footprint_raw)
 
     # Derived: smart/whale alignment & participation (legacy-style composite)
     smart_bias_01 = 0.5 * (max(-1.0, min(1.0, smart_flow_raw)) + 1.0)
@@ -509,14 +532,14 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     whale_net_bias = _clip(whale_net_side_5m, -1.0, 1.0)
 
     smart_whale_alignment_legacy = (
-        0.20 * smart_wallet_score +
-        0.15 * smart_buy_term -
-        0.10 * smart_sell_term +
-        0.20 * whale_buy_score -
-        0.10 * whale_sell_score +
-        0.15 * _clip01(buy_ratio_5m) +
-        0.10 * (0.5 * (smart_net_bias + 1.0)) +  # map [-1,1]→[0,1]
-        0.10 * (0.5 * (whale_net_bias + 1.0))
+        0.20 * smart_wallet_score
+        + 0.15 * smart_buy_term
+        - 0.10 * smart_sell_term
+        + 0.20 * whale_buy_score
+        - 0.10 * whale_sell_score
+        + 0.15 * _clip01(buy_ratio_5m)
+        + 0.10 * (0.5 * (smart_net_bias + 1.0))  # map [-1,1]→[0,1]
+        + 0.10 * (0.5 * (whale_net_bias + 1.0))
     )
     feats["smart_whale_alignment"] = _clip(smart_whale_alignment_legacy, 0.0, 1.5)
 
@@ -533,20 +556,27 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
 
     # Flow regime flags: accumulation vs dump vs conflict (for heuristics / AI)
     feats["flow_accumulation_score"] = _clip01(
-        smart_accumulation_score if smart_accumulation_score > 0.0
+        smart_accumulation_score
+        if smart_accumulation_score > 0.0
         else max(0.0, smart_net_bias) * max(0.0, whale_net_bias)
     )
     feats["flow_panic_dump_score"] = _clip01(
-        smart_panic_dump_score if smart_panic_dump_score > 0.0
+        smart_panic_dump_score
+        if smart_panic_dump_score > 0.0
         else max(0.0, -smart_net_bias) * max(0.0, -whale_net_bias)
     )
     feats["flow_conflict_score"] = _clip01(smart_vs_whale_conflict)
-    feats["whale_liquidity_footprint"] = _clip01(whale_liquidity_footprint)
 
     # Binary flags from flow scores
-    feats["flow_is_strong_accum"] = 1.0 if feats["flow_accumulation_score"] >= 0.6 else 0.0
-    feats["flow_is_panic_dump"] = 1.0 if feats["flow_panic_dump_score"] >= 0.6 else 0.0
-    feats["flow_is_conflicting"] = 1.0 if feats["flow_conflict_score"] >= 0.6 else 0.0
+    feats["flow_is_strong_accum"] = (
+        1.0 if feats["flow_accumulation_score"] >= 0.6 else 0.0
+    )
+    feats["flow_is_panic_dump"] = (
+        1.0 if feats["flow_panic_dump_score"] >= 0.6 else 0.0
+    )
+    feats["flow_is_conflicting"] = (
+        1.0 if feats["flow_conflict_score"] >= 0.6 else 0.0
+    )
 
     # ------------------------------------------------------------------ #
     # Rug / impact normalization
@@ -593,11 +623,11 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
 
     # Entry micro-alpha: local momentum + orderflow + smart/whale alignment + alpha flow
     entry_micro = (
-        0.25 * _clip01(short_mom / 50.0) +
-        0.20 * _clip01(mid_mom / 80.0) +
-        0.20 * _clip01(base_buy_press) +
-        0.20 * _clip01(consolidated_align) +
-        0.15 * _clip01(alpha_flow_boost)
+        0.25 * _clip01(short_mom / 50.0)
+        + 0.20 * _clip01(mid_mom / 80.0)
+        + 0.20 * _clip01(base_buy_press)
+        + 0.20 * _clip01(consolidated_align)
+        + 0.15 * _clip01(alpha_flow_boost)
     )
     feats["entry_micro_alpha"] = _clip(entry_micro, 0.0, 1.5)
     # Alias for AI models / clarity
@@ -621,7 +651,7 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     feats["regime_liquidity"] = _clip01(regime_liquidity)
     feats["regime_manipulation_risk"] = _clip01(regime_manip)
 
-    # Regime “volatility” proxy from volume + price swings (for ai_entry_logic)
+    # Regime “volatility” proxy from volume + price swings
     vol_norm = _norm_log_scale(vol_5m, max(vol_24h, 1.0))
     mom_norm = _clip01(abs(chg_5m_c) / 80.0)
     feats["regime_volatility"] = _clip01(0.5 * vol_norm + 0.5 * mom_norm)
@@ -909,9 +939,15 @@ class FeatureBuilder:
                 # Optional AI-provided “segment/head” for model routing:
                 if "risk_profile" in ai_signals:
                     rp = str(ai_signals["risk_profile"]).lower()
-                    feats["risk_profile_conservative"] = 1.0 if rp == "conservative" else 0.0
-                    feats["risk_profile_balanced"] = 1.0 if rp == "balanced" else 0.0
-                    feats["risk_profile_aggressive"] = 1.0 if rp == "aggressive" else 0.0
+                    feats["risk_profile_conservative"] = (
+                        1.0 if rp == "conservative" else 0.0
+                    )
+                    feats["risk_profile_balanced"] = (
+                        1.0 if rp == "balanced" else 0.0
+                    )
+                    feats["risk_profile_aggressive"] = (
+                        1.0 if rp == "aggressive" else 0.0
+                    )
 
             # Risk context enrichment (from risk_manager / core_utils.load_position_context)
             if risk_context:
@@ -931,8 +967,13 @@ class FeatureBuilder:
                 stop_loss_pct = _f(risk_context, "default_stop_loss_pct", 0.0)
                 take_profit_pct = _f(risk_context, "default_take_profit_pct", 0.0)
 
+                # Optional daily trades context
+                trades_count = _f(risk_context, "daily_trades_count", 0.0)
+                trades_limit = _f(risk_context, "daily_trades_limit", 0.0)
+
                 frac_open = _safe_ratio(open_pos, max(max_pos, 1.0), 0.0)
                 exposure_frac = _safe_ratio(exposure_usd, max(eq_usd, 1.0), 0.0)
+                trades_frac = _safe_ratio(trades_count, max(trades_limit, 1.0), 0.0)
 
                 # risk_* naming for dashboards / logging
                 feats["risk_open_positions"] = open_pos
@@ -948,6 +989,9 @@ class FeatureBuilder:
                 feats["risk_expected_rr_ratio"] = rr_target
                 feats["risk_stop_loss_pct"] = stop_loss_pct
                 feats["risk_take_profit_pct"] = take_profit_pct
+                feats["risk_daily_trades_count"] = trades_count
+                feats["risk_daily_trades_limit"] = trades_limit
+                feats["risk_daily_trades_frac"] = _clip01(trades_frac)
 
                 # Optional high-level risk profile tag (0/1 one-hots)
                 rp = str(risk_context.get("risk_profile", "")).lower()
@@ -976,6 +1020,9 @@ class FeatureBuilder:
                 feats["ctx_expected_rr_ratio"] = rr_target
                 feats["ctx_stop_loss_pct"] = stop_loss_pct
                 feats["ctx_take_profit_pct"] = take_profit_pct
+                feats["ctx_daily_trades_count"] = trades_count
+                feats["ctx_daily_trades_limit"] = trades_limit
+                feats["ctx_daily_trades_frac"] = _clip01(trades_frac)
 
                 # Mode one-hots: 0=off,1=normal,2=aggressive,3=defensive (convention)
                 feats["risk_mode_raw"] = mode
@@ -985,7 +1032,9 @@ class FeatureBuilder:
                 feats["risk_mode_defensive"] = 1.0 if mode == 3 else 0.0
 
                 # Capacity scalar: how much room we have to add risk today
-                capacity = (1.0 - _clip01(frac_open)) * (1.0 - _clip01(dd_pct / max_dd_pct))
+                capacity = (1.0 - _clip01(frac_open)) * (
+                    1.0 - _clip01(dd_pct / max_dd_pct)
+                )
                 feats["risk_capacity_score"] = _clip(capacity, 0.0, 1.0)
 
                 # Reward-to-risk attractiveness scalar
@@ -1073,12 +1122,9 @@ class FeatureBuilder:
 
         # Optional: scanner / segment hints (numeric only, for routing / stats)
         segment = str(snapshot.get("segment", "")).lower()
-        if segment == "pumpfun":
-            feats["segment_pumpfun"] = 1.0
-        elif segment == "raydium":
-            feats["segment_raydium"] = 1.0
-        elif segment == "momo":
-            feats["segment_momo"] = 1.0
+        feats["segment_pumpfun"] = 1.0 if segment == "pumpfun" else 0.0
+        feats["segment_raydium"] = 1.0 if segment == "raydium" else 0.0
+        feats["segment_momo"] = 1.0 if segment == "momo" else 0.0
 
     @staticmethod
     def _enrich_short_term_history(
@@ -1190,8 +1236,12 @@ class FeatureBuilder:
                 last = prices[-1]
                 p_min = min(prices)
                 p_max = max(prices)
-                feats["price_from_intraday_min_pct"] = _pct(last, p_min) if p_min > 0 else 0.0
-                feats["price_from_intraday_max_pct"] = _pct(last, p_max) if p_max > 0 else 0.0
+                feats["price_from_intraday_min_pct"] = (
+                    _pct(last, p_min) if p_min > 0 else 0.0
+                )
+                feats["price_from_intraday_max_pct"] = (
+                    _pct(last, p_max) if p_max > 0 else 0.0
+                )
             except Exception:
                 pass
 
@@ -1217,6 +1267,7 @@ class FeatureBuilder:
           - position_size_scalar (0..1)
           - position_size_kelly_scalar (0..1)  [Kelly-aware sizing hint]
           - entry_block_flag (0 or 1)
+          - entry_soft_block_flag (0 or 1)
           - entry_risk_score (0..1)
           - entry_tier_bucket (0,1,2,3)
           - position_size_bucket (0,1,2,3)
@@ -1257,7 +1308,7 @@ class FeatureBuilder:
             + 0.05 * rr_attract
         )
         regime_boost = 1.0 + 0.20 * max(regime_score, 0.0)  # extra when risk-on
-        rug_penalty = 1.0 - 0.7 * ai_rug                      # strong penalty if ruggy
+        rug_penalty = 1.0 - 0.7 * ai_rug  # strong penalty if ruggy
 
         # Flow-aware tweaks: boost on accumulation, penalize on dumps
         flow_boost = 1.0 + 0.15 * flow_accum - 0.15 * flow_dump
