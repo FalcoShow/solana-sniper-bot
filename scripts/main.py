@@ -2766,15 +2766,9 @@ class Strategy:
                 decision=decision_str,
             )
 
-            # ──────────────────────────────────────────────────────────
             # Pump.fun: do NOT let AI hard-block entries (for now).
-            #
-            #  - We still log the original "block" decision
-            #  - We emit a specific AI_PRE_PUMP_BYPASS event
-            #  - We override `decision` → True so downstream logic
-            #    treats this as "allowed" and continues the pipeline.
-            # Raydium / others keep full AI gating.
-            # ──────────────────────────────────────────────────────────
+            # We still log the original "block" decision and emit a synthetic
+            # AI_PRE_PUMP_BYPASS event, but then flip `decision` to True.
             if pool == "pump" and decision is False:
                 log.event(
                     "AI_PRE_PUMP_BYPASS",
