@@ -2740,10 +2740,11 @@ class Strategy:
             elif isinstance(res, bool):
                 decision = res
 
-            # ---------- Optional min-score enforcement ----------
-            if pre_score is not None and self.ai_pre_min_score > 0:
-                if pre_score < self.ai_pre_min_score:
-                    decision = False if decision is None else bool(decision and False)
+        # ---------- Optional min-score enforcement ----------
+        if pre_score is not None and self.ai_pre_min_score > 0:
+            if pre_score < self.ai_pre_min_score:
+                # Below minimum → treat as hard-block unless already blocked
+                decision = False if decision is None else bool(decision and False)
 
         # ---------- Logging ----------
         try:
@@ -2789,23 +2790,6 @@ class Strategy:
 
         # Final output of the pre-gate: score + (possibly overridden) decision
         return pre_score, decision
-
-    except Exception as e:
-        # Outer safety net around the whole AI pre-gate
-        if DEBUG_TX:
-            traceback.print_exc()
-        try:
-            log.event(
-                "AI_PRE_SCORE_ERROR",
-                mint=mint_norm,
-                pool=pool,
-                symbol=symbol,
-                err=str(e)[:200],
-            )
-        except Exception:
-            if DEBUG_TX:
-                traceback.print_exc()
-        return None, None
 
     # ───────────── Self-learning strategy hook (optional) ───────────────
     async def _self_learning_candidate_hook(
