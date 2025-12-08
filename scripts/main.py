@@ -1133,6 +1133,11 @@ MAX_TRADEABLE = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)  # 0 = unlimited
 PAUSE_TRADING = bool(getattr(C, "PAUSE_TRADING", _as_bool(os.getenv("PAUSE_TRADING", "0"), False)))
 DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
 
+# ---- AI OK notification controls ----
+AI_NOTIFY_MIN_SCORE = float(os.getenv("AI_NOTIFY_MIN_SCORE", "0.60"))
+AI_NOTIFY_MIN_PRE_SCORE = float(os.getenv("AI_NOTIFY_MIN_PRE_SCORE", "0.40"))
+TG_AI_OK_NOTIFY = os.getenv("TG_AI_OK_NOTIFY", "1")
+
 # Pools filter (affects printing and Raydium scanner scheduling)
 _POOLS_ENV = [
     p.strip().lower()
@@ -3215,20 +3220,62 @@ class Strategy:
                 fastlane=bool(ui.get("ai_fastlane")),
             )
 
-            # Optional Telegram debug (defensive: only if helper exists)
+            # Optional Telegram debug (defensive + thresholded)
             try:
                 send_dbg = globals().get("_send_telegram_debug")
-                if callable(send_dbg):
-                    score_str = "None" if score is None else f"{score:.3f}"
-                    pre_val = ui.get("ai_pre_score")
-                    pre_str = "None" if pre_val is None else f"{float(pre_val):.3f}"
-                    cap_str = "None" if risk_cap is None else f"{float(risk_cap):.3f}"
+                if not callable(send_dbg):
+                    return True  # no debug helper wired → silently skip
 
-                    msg = (
-                        f"AI OK {symbol} ({mint_norm[:6]}…): "
-                        f"score={score_str} pre={pre_str} cap={cap_str}"
-                    )
-                    asyncio.create_task(send_dbg(msg))
+                # Respect global toggle from env
+                if TG_AI_OK_NOTIFY != "1":
+                    return True
+
+                # Normalize main AI score
+                main_score: Optional[float]
+                if isinstance(score, (int, float)):
+                    main_score = float(score)
+                else:
+                    main_score = None
+
+                # Normalize pre-score (from UI dict)
+                pre_raw = ui.get("ai_pre_score")
+                pre_score: Optional[float]
+                try:
+                    pre_score = float(pre_raw) if pre_raw is not None else None
+                except Exception:
+                    pre_score = None
+
+                # Normalize risk capacity
+                cap_val: Optional[float]
+                if isinstance(risk_cap, (int, float)):
+                    cap_val = float(risk_cap)
+                else:
+                    cap_val = None
+
+                # Decide if this is interesting enough to notify
+                should_notify = False
+                if main_score is not None:
+                    if main_score >= AI_NOTIFY_MIN_SCORE:
+                        should_notify = True
+                elif pre_score is not None:
+                    if pre_score >= AI_NOTIFY_MIN_PRE_SCORE:
+                        should_notify = True
+
+                # If neither score passes thresholds, don't spam Telegram
+                if not should_notify:
+                    return True
+
+                # Format safe strings for the message
+                score_str = f"{main_score:.3f}" if main_score is not None else "None"
+                pre_str = f"{pre_score:.3f}" if pre_score is not None else "None"
+                cap_str = f"{cap_val:.3f}" if cap_val is not None else "None"
+
+                msg = (
+                    f"AI OK {symbol} ({mint_norm[:6]}…): "
+                    f"score={score_str} pre={pre_str} cap={cap_str}"
+                )
+                asyncio.create_task(send_dbg(msg))
+
             except Exception:
                 if DEBUG_LOCAL:
                     traceback.print_exc()
