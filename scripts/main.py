@@ -2585,6 +2585,7 @@ class Strategy:
             return None, None
 
         try:
+            # Pull main symbols from scoring module
             Candidate = getattr(self._score_mod, "Candidate", None)
             pass_gate = getattr(self._score_mod, "pass_gate", None)
             if Candidate is None or not callable(pass_gate):
@@ -2740,56 +2741,73 @@ class Strategy:
             elif isinstance(res, bool):
                 decision = res
 
-        # ---------- Optional min-score enforcement ----------
-        if pre_score is not None and self.ai_pre_min_score > 0:
-            if pre_score < self.ai_pre_min_score:
-                # Below minimum → treat as hard-block unless already blocked
-                decision = False if decision is None else bool(decision and False)
+            # ---------- Optional min-score enforcement ----------
+            if pre_score is not None and self.ai_pre_min_score > 0:
+                if pre_score < self.ai_pre_min_score:
+                    # Below minimum → treat as hard-block unless already blocked
+                    decision = False if decision is None else bool(decision and False)
 
-        # ---------- Logging ----------
-        try:
-            # Normalize decision flag to a clean string for logs
-            if decision is True:
-                decision_str = "allow"
-            elif decision is False:
-                decision_str = "block"
-            else:
-                decision_str = "none"
+            # ---------- Logging ----------
+            try:
+                # Normalize decision flag to a clean string for logs
+                if decision is True:
+                    decision_str = "allow"
+                elif decision is False:
+                    decision_str = "block"
+                else:
+                    decision_str = "none"
 
-            # Main AI pre-score event
-            log.event(
-                "AI_PRE_SCORE",
-                pool=pool,
-                mint=mint_norm,
-                symbol=symbol,
-                pre_score=pre_score,
-                pre_min=self.ai_pre_min_score,
-                decision=decision_str,
-            )
-
-            # Pump.fun: do NOT let AI hard-block entries (for now).
-            # We still log the original "block" decision and emit a synthetic
-            # AI_PRE_PUMP_BYPASS event, but then flip `decision` to True.
-            if pool == "pump" and decision is False:
+                # Main AI pre-score event
                 log.event(
-                    "AI_PRE_PUMP_BYPASS",
+                    "AI_PRE_SCORE",
                     pool=pool,
                     mint=mint_norm,
                     symbol=symbol,
                     pre_score=pre_score,
                     pre_min=self.ai_pre_min_score,
-                    original_decision=decision_str,
+                    decision=decision_str,
                 )
-                # Force allow for pump while we debug/tune AI
-                decision = True
 
-        except Exception:
-            # Never let logging break the trade pipeline
+                # Pump.fun: do NOT let AI hard-block entries (for now).
+                # We still log the original "block" decision and emit a synthetic
+                # AI_PRE_PUMP_BYPASS event, but then flip `decision` to True.
+                if pool == "pump" and decision is False:
+                    log.event(
+                        "AI_PRE_PUMP_BYPASS",
+                        pool=pool,
+                        mint=mint_norm,
+                        symbol=symbol,
+                        pre_score=pre_score,
+                        pre_min=self.ai_pre_min_score,
+                        original_decision=decision_str,
+                    )
+                    # Force allow for pump while we debug/tune AI
+                    decision = True
+
+            except Exception:
+                # Never let logging break the trade pipeline
+                if DEBUG_TX:
+                    traceback.print_exc()
+
+            # Final output of the pre-gate: score + (possibly overridden) decision
+            return pre_score, decision
+
+        except Exception as e:
+            # Outer safety net around the whole AI pre-gate
             if DEBUG_TX:
                 traceback.print_exc()
-
-        # Final output of the pre-gate: score + (possibly overridden) decision
-        return pre_score, decision
+            try:
+                log.event(
+                    "AI_PRE_SCORE_ERROR",
+                    mint=mint_norm,
+                    pool=pool,
+                    symbol=symbol,
+                    err=str(e)[:200],
+                )
+            except Exception:
+                if DEBUG_TX:
+                    traceback.print_exc()
+            return None, None
 
     # ───────────── Self-learning strategy hook (optional) ───────────────
     async def _self_learning_candidate_hook(
