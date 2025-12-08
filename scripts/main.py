@@ -4280,63 +4280,91 @@ class Strategy:
 
         # ---------- LIQUIDITY SCREEN -----------------------------------
         dec_from_liq: Optional[int] = None
-        if LIQ_FILTER_ENABLED and not force_ray:
-            ok, rep = await _screen_with_retry(mint_norm, tries=3, first_wait=0.8)
-            if not ok and str((rep or {}).get("reason")) == "no_account":
-                # Fresh bond curve: wait a bit for mint to become readable
-                dec_from_liq = await _await_mint_ready(
-                    mint_norm,
-                    max_wait_s=45,
-                    step_s=3.0,
-                )
-                if dec_from_liq is not None:
-                    ok = True
-                    rep = {
-                        "ok": True,
-                        "reason": "await_mint_ready",
-                        "decimals": dec_from_liq,
-                    }
 
-            if not ok:
+        if LIQ_FILTER_ENABLED and not force_ray:
+            # For non-pump pools we enforce JUP / router-based liquidity screen.
+            if pool != "pump":
+                ok, rep = await _screen_with_retry(mint_norm, tries=3, first_wait=0.8)
+
+                # If JUP says "no_account", we optionally wait for the mint to become readable
+                if not ok and str((rep or {}).get("reason")) == "no_account":
+                    # Fresh bond curve: wait a bit for mint to become readable
+                    dec_from_liq = await _await_mint_ready(
+                        mint_norm,
+                        max_wait_s=45,
+                        step_s=3.0,
+                    )
+                    if dec_from_liq is not None:
+                        ok = True
+                        rep = {
+                            "ok": True,
+                            "reason": "await_mint_ready",
+                            "decimals": dec_from_liq,
+                        }
+
+                # Still not OK → hard reject for non-pump pools
+                if not ok:
+                    if DEBUG_LOCAL:
+                        print(
+                            f"[liquidity] screen failed for {mint_norm}: {rep}",
+                            flush=True,
+                        )
+                    self._diag["rejected_filters"] += 1
+                    log.event(
+                        "ENTRY_LIQ_REJECT",
+                        pool=pool,
+                        mint=mint_norm,
+                        reason=str((rep or {}).get("reason")),
+                    )
+                    log.event(
+                        "RULE_LIQ_FILTER_FAIL",
+                        pool=pool,
+                        mint=mint_norm,
+                        reason=str((rep or {}).get("reason")),
+                    )
+                    try:
+                        record_buy_result(ok=False, reason="liquidity_reject")
+                    except Exception:
+                        pass
+                    return
+
+                # Success path for non-pump pools
+                if dec_from_liq is None:
+                    dec_from_liq = (rep or {}).get("decimals")
+
+                log.event(
+                    "ENTRY_LIQ_OK",
+                    mint=mint_norm,
+                    priceImpactPct=(rep or {}).get("priceImpactPct"),
+                    dec=dec_from_liq,
+                )
+                log.event(
+                    "RULE_LIQ_FILTER_OK",
+                    pool=pool,
+                    mint=mint_norm,
+                    dec=dec_from_liq,
+                )
+
+            else:
+                # Pump.fun: JUP often has no route / account yet for ultra-early mints.
+                # We rely on Pump's own liq/vol filters + AI / risk guardrails instead.
+                log.event(
+                    "ENTRY_LIQ_BYPASS_PUMP",
+                    pool=pool,
+                    mint=mint_norm,
+                    reason="skip_jup_for_pump",
+                )
+                log.event(
+                    "RULE_LIQ_FILTER_BYPASS",
+                    pool=pool,
+                    mint=mint_norm,
+                    reason="pump_skip",
+                )
                 if DEBUG_LOCAL:
                     print(
-                        f"[liquidity] screen failed for {mint_norm}: {rep}",
+                        f"[ENTRY_LIQ_BYPASS_PUMP] sym={_extract_symbol(raw_event)} mint={mint_norm}",
                         flush=True,
                     )
-                self._diag["rejected_filters"] += 1
-                log.event(
-                    "ENTRY_LIQ_REJECT",
-                    pool=pool,
-                    mint=mint_norm,
-                    reason=str((rep or {}).get("reason")),
-                )
-                log.event(
-                    "RULE_LIQ_FILTER_FAIL",
-                    pool=pool,
-                    mint=mint_norm,
-                    reason=str((rep or {}).get("reason")),
-                )
-                try:
-                    record_buy_result(ok=False, reason="liquidity_reject")
-                except Exception:
-                    pass
-                return
-
-            if dec_from_liq is None:
-                dec_from_liq = (rep or {}).get("decimals")
-
-            log.event(
-                "ENTRY_LIQ_OK",
-                mint=mint_norm,
-                priceImpactPct=(rep or {}).get("priceImpactPct"),
-                dec=dec_from_liq,
-            )
-            log.event(
-                "RULE_LIQ_FILTER_OK",
-                pool=pool,
-                mint=mint_norm,
-                dec=dec_from_liq,
-            )
 
         elif LIQ_FILTER_ENABLED and force_ray:
             # Skip liq screen entirely in force-ray mode
