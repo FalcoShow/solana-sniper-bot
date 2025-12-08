@@ -106,6 +106,14 @@ V3+++ additions vs older generations
   - For Pump-only, low-liquidity hard filter is softened when `infra_no_account`
     is true (no hard fail, just softer trust).
   - A small AI penalty is applied when `infra_no_account` is set (Pump-only).
+
+V3+++ test-mode addition
+------------------------
+- Env flag `AI_PRE_BYPASS_FOR_TEST`:
+    * When =1 and hard filters pass, we **bypass the score gate** and always
+      return ok=True so we can verify:
+          scanner → buy → position tracking → exit engine → Telegram
+    * Hard filters (honeypot, extreme fraud, etc.) still apply.
 """
 
 import json
@@ -511,6 +519,11 @@ AI_SIZE_SCALAR_EXP = _env_float("AI_SIZE_SCALAR_EXP", 1.0)  # 1.0 = linear
 
 AI_BUY_DEBUG_LOG = _env_bool("AI_BUY_DEBUG_LOG", False)
 AI_BUY_ATTACH_PARTS = _env_bool("AI_BUY_ATTACH_PARTS", False)
+
+# --- Test-mode soft-gate bypass -------------------------------------- #
+# If set to 1 and hard filters pass, pass_gate() *always* returns ok=True.
+# This is intended ONLY for DRYRUN / paper-testing end-to-end wiring.
+AI_PRE_BYPASS_FOR_TEST = _env_bool("AI_PRE_BYPASS_FOR_TEST", False)
 
 
 # =============================================================================
@@ -1456,6 +1469,7 @@ def pass_gate(c: Candidate) -> Tuple[bool, float, str]:
     Returns (ok, score, reason).
 
     ok:     True if candidate passes hard filters + score >= (possibly tightened) gate
+            OR if AI_PRE_BYPASS_FOR_TEST=1 and hard filters pass.
     score:  final [0,1] score
     reason: human summary (reject reason(s) or short “pass” summary)
     """
@@ -1476,6 +1490,33 @@ def pass_gate(c: Candidate) -> Tuple[bool, float, str]:
     score = detail["score"]
     threshold = float(detail["gate_threshold"])
     parts = detail["parts"]
+
+    # ──────────────────────────────────────────────────────────────
+    # TEST MODE: bypass soft gate but still respect hard filters
+    # ──────────────────────────────────────────────────────────────
+    if AI_PRE_BYPASS_FOR_TEST:
+        eq = detail["entry_quality"]
+        size_scalar = detail["size_scalar"]
+        reason = (
+            f"pass TEST_BYPASS score={score:.3f} thr={threshold:.3f} "
+            f"size={size_scalar:.2f} eq={eq:.2f} "
+            f"(liq={parts['liq']:.2f}, impact={parts['impact']:.2f}, "
+            f"trend={parts['trend']:.2f}, flow={parts['flow']:.2f}, "
+            f"book={parts['book']:.2f}, pf={parts['pf']:.2f}, "
+            f"fraud_safety={parts['fraud_safety']:.2f}, "
+            f"regime_ctx={parts['regime_ctx']:.2f}, "
+            f"entry_quality_norm={parts['entry_quality']:.2f}, "
+            f"smart_whale_align={parts['smart_whale_align']:.2f}, "
+            f"mcap={parts['mcap']:.2f}, "
+            f"tier={parts['tier']:.2f}, "
+            f"ai_entry={parts['ai_entry']:.2f}, "
+            f"buy_pressure={parts['buy_pressure']:.2f})"
+        )
+        if bool(c.infra_no_account) and _is_pump_source(c.source):
+            reason += " [infra_no_account_soft_liq]"
+        reason += " [AI_PRE_BYPASS_FOR_TEST=1]"
+        return True, score, reason
+    # ──────────────────────────────────────────────────────────────
 
     # Regime-aware tightening (must align with ai_entry_logic + ai_risk_model)
     if AI_REGIME_TIGHTEN_ENABLED:
