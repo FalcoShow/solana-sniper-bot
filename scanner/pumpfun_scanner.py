@@ -15,6 +15,7 @@
 #       • Optional AI fraud ("rug") scoring (ai_fraud_score).
 #       • Optional whale presence (is_whale_wallet + smart_wallet tags).
 #       • Optional AI entry scoring via feature_builder + ai_entry_logic.
+#       • Optional risk-manager aware shrink of runners (capacity / shutdown).
 #   - Select runner candidates using rank_score (PF + AI + volume + whales).
 #   - Emit:
 #       • MOMO_OK alerts for top runners via AlertManager.
@@ -114,6 +115,18 @@ try:
     from utils_pkg import regime as _regime  # type: ignore
 except Exception:  # pragma: no cover
     _regime = None  # type: ignore
+
+# Risk manager snapshot (capacity / shutdown); safe dummy fallback
+try:
+    from utils_pkg.risk_manager import risk_capacity_snapshot  # type: ignore
+except Exception:  # pragma: no cover
+
+    async def risk_capacity_snapshot(_redis=None) -> Dict[str, Any]:  # type: ignore
+        return {
+            "risk_capacity": 1.0,         # 0..1 fraction of "allowed risk"
+            "risk_shutdown": False,       # if True → exit early
+            "risk_mode": "normal",        # "panic", "cooldown", etc.
+        }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -284,6 +297,9 @@ SOFT_MAX_AGE_MIN = _f(
 # PF bypass / fallback behaviour
 PUMP_BYPASS_PF = _b("PUMP_BYPASS_PF", False)          # default: use PF
 PUMP_ENABLE_FALLBACK = _b("PUMP_ENABLE_FALLBACK", True)
+
+# Risk-aware shrink toggle (post PF/fallback)
+PUMP_RISK_SHRINK_ENABLED = _b("PUMP_RISK_SHRINK_ENABLED", True)
 
 PUMP_FB_MIN_BUYS_5M = _i("PUMP_FB_MIN_BUYS_5M", 1)
 PUMP_FB_MIN_VOL5_USD = _f("PUMP_FB_MIN_VOL5_USD", 200.0)
@@ -468,6 +484,25 @@ def _norm_mint(val: Any) -> str:
     val = val.strip().replace(" ", "")
     m = BASE58_RE.search(val)
     return m.group(0) if m else ""
+
+
+def _attach_risk(
+    metas: List[Dict[str, Any]],
+    risk_ctx: Optional[Dict[str, Any]],
+) -> None:
+    """
+    Attach risk manager context (capacity / mode) to each meta, if available.
+    """
+    if not metas or not risk_ctx:
+        return
+    try:
+        cap = float(risk_ctx.get("risk_capacity", 1.0) or 1.0)
+    except Exception:
+        cap = 1.0
+    mode = risk_ctx.get("risk_mode", "normal")
+    for m in metas:
+        m.setdefault("risk_capacity", cap)
+        m.setdefault("risk_mode", mode)
 
 
 def _extract_metrics_from_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
@@ -1394,21 +1429,7 @@ async def _html_next_fallback(
                                 "fb_runners": len(fb_runners),
                                 "runners": len(runners),
                                 "regime": dict(regime),
-                                "config": {
-                                    "SOFT_MIN_LIQ_USD": SOFT_MIN_LIQ_USD,
-                                    "SOFT_MIN_MCAP_USD": SOFT_MIN_MCAP_USD,
-                                    "SOFT_MAX_AGE_MIN": SOFT_MAX_AGE_MIN,
-                                    "PUMP_BYPASS_PF": PUMP_BYPASS_PF,
-                                    "PUMP_ENABLE_FALLBACK": PUMP_ENABLE_FALLBACK,
-                                    "PUMP_FB_MIN_BUYS_5M": PUMP_FB_MIN_BUYS_5M,
-                                    "PUMP_FB_MIN_VOL5_USD": PUMP_FB_MIN_VOL5_USD,
-                                    "PUMP_FB_MAX_RUNNERS": PUMP_FB_MAX_RUNNERS,
-                                    "PUMP_FB_MAX_IMPACT_1K_BPS": PUMP_FB_MAX_IMPACT_1K_BPS,
-                                    "PUMP_AI_RUG_ENABLED": PUMP_AI_RUG_ENABLED,
-                                    "PUMP_MAX_AI_RUG": PUMP_MAX_AI_RUG,
-                                    "PUMP_AI_ENTRY_ENABLED": PUMP_AI_ENTRY_ENABLED,
-                                    "PUMP_REQUIRE_AI_ENTRY_FOR_RUNNERS": PUMP_REQUIRE_AI_ENTRY_FOR_RUNNERS,
-                                },
+                                # risk is not wired here (no redis context in this helper)
                             },
                         )
                     )
@@ -1598,6 +1619,7 @@ async def _scan_inner(
     fb_min_vol5: float,
     fb_max_impact_bps: float,
     regime: Dict[str, Any],
+    risk_ctx: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Full Pump.fun scan using:
@@ -1625,6 +1647,8 @@ async def _scan_inner(
                         )
                         if meta:
                             metas.append(meta)
+
+                _attach_risk(metas, risk_ctx)
 
                 with contextlib.suppress(Exception):
                     await _enrich_ai_whales_entry(metas, regime=regime)
@@ -1657,6 +1681,7 @@ async def _scan_inner(
                                         "fb_runners": len(fb_runners),
                                         "runners": len(runners),
                                         "regime": dict(regime),
+                                        "risk": dict(risk_ctx or {}),
                                     },
                                 )
                             )
@@ -1684,6 +1709,8 @@ async def _scan_inner(
                         )
                         if meta:
                             metas.append(meta)
+
+                _attach_risk(metas, risk_ctx)
 
                 with contextlib.suppress(Exception):
                     await _enrich_ai_whales_entry(metas, regime=regime)
@@ -1716,6 +1743,7 @@ async def _scan_inner(
                                         "fb_runners": len(fb_runners),
                                         "runners": len(runners),
                                         "regime": dict(regime),
+                                        "risk": dict(risk_ctx or {}),
                                     },
                                 )
                             )
@@ -1747,6 +1775,7 @@ async def _scan_inner(
                             "fb_runners": 0,
                             "runners": 0,
                             "regime": dict(regime),
+                            "risk": dict(risk_ctx or {}),
                         },
                     )
                 )
@@ -1765,7 +1794,9 @@ async def _scan_inner(
             }
             for m in metas[:5]
         ]
-        LOG.info("PUMP_META_SAMPLE count=%d first=%s", len(metas), sample)
+    LOG.info("PUMP_META_SAMPLE count=%d first=%s", len(metas), sample)
+
+    _attach_risk(metas, risk_ctx)
 
     with contextlib.suppress(Exception):
         await _enrich_ai_whales_entry(metas, regime=regime)
@@ -1813,6 +1844,7 @@ async def _scan_inner(
                         "fb_runners": len(fb_runners),
                         "runners": len(runners),
                         "regime": dict(regime),
+                        "risk": dict(risk_ctx or {}),
                     },
                 )
             )
@@ -1932,6 +1964,8 @@ async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
                 "ai_entry_reason": c.get("ai_entry_reason"),
                 "ai_rug_score": c.get("ai_rug_score"),
                 "rank_score": c.get("rank_score"),
+                "risk_capacity": c.get("risk_capacity"),
+                "risk_mode": c.get("risk_mode"),
                 "reason": (
                     f"pumpfun runner liq=${c.get('liq_usd', 0):.0f} "
                     f"vol5=${c.get('vol_5m_usd', 0):.0f} "
@@ -1963,10 +1997,34 @@ async def scan_pumpfun(*args):
     Returns a list of runner candidates (each is a meta dict).
     """
     sess: Optional[aiohttp.ClientSession] = None
+    redis = None
+
     if len(args) >= 2 and isinstance(args[1], aiohttp.ClientSession):
+        redis = args[0]
         sess = args[1]
-    elif len(args) == 1 and isinstance(args[0], aiohttp.ClientSession):
-        sess = args[0]
+    elif len(args) == 1:
+        if isinstance(args[0], aiohttp.ClientSession):
+            sess = args[0]
+        else:
+            redis = args[0]
+
+    # Risk snapshot once per scan
+    try:
+        risk_ctx = await risk_capacity_snapshot(redis)
+    except Exception:
+        risk_ctx = None
+
+    risk_capacity = float((risk_ctx or {}).get("risk_capacity", 1.0) or 1.0)
+    risk_shutdown = bool((risk_ctx or {}).get("risk_shutdown", False))
+
+    if risk_shutdown or risk_capacity <= 0.0:
+        LOG.warning(
+            "scanner.pumpfun: risk manager requested shutdown "
+            "(risk_shutdown=%s risk_capacity=%.3f); returning no runners.",
+            risk_shutdown,
+            risk_capacity,
+        )
+        return []
 
     # Regime snapshot once per scan
     regime = await _regime_snapshot()
@@ -2006,6 +2064,23 @@ async def scan_pumpfun(*args):
         except Exception:
             sess = None
 
+    async def _apply_risk_shrink(runners: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not runners or not PUMP_RISK_SHRINK_ENABLED:
+            return runners
+        raw_n = len(runners)
+        allowed = int(raw_n * risk_capacity)
+        if risk_capacity > 0.0 and allowed < 1:
+            allowed = 1
+        if allowed < raw_n:
+            LOG.info(
+                "scanner.pumpfun: risk shrink runners %d → %d (risk_capacity=%.3f)",
+                raw_n,
+                allowed,
+                risk_capacity,
+            )
+            return runners[:allowed]
+        return runners
+
     if sess is not None:
         try:
             runners = await _scan_inner(
@@ -2016,7 +2091,9 @@ async def scan_pumpfun(*args):
                 fb_min_vol5=tuned_fb_min_vol5,
                 fb_max_impact_bps=tuned_fb_max_impact,
                 regime=regime,
+                risk_ctx=risk_ctx,
             ) or []
+            runners = await _apply_risk_shrink(runners)
             await _send_momo_for_runners(runners)
             _log_candidates_for_training(runners)
             LOG.info("scanner.pumpfun: %s final runner candidates", len(runners))
@@ -2044,7 +2121,9 @@ async def scan_pumpfun(*args):
                 fb_min_vol5=tuned_fb_min_vol5,
                 fb_max_impact_bps=tuned_fb_max_impact,
                 regime=regime,
+                risk_ctx=risk_ctx,
             ) or []
+            runners = await _apply_risk_shrink(runners)
             await _send_momo_for_runners(runners)
             _log_candidates_for_training(runners)
             LOG.info("scanner.pumpfun: %s final runner candidates", len(runners))
