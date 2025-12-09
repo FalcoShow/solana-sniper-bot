@@ -1,22 +1,22 @@
 # scanner/raydium_scanner.py
 #
-# Raydium scanner via Dexscreener — V3+++ quant-grade version.
+# Raydium scanner via Dexscreener — V3+++ quant-grade version, wired into
+# utils_pkg.scoring_service.
 #
 # Responsibilities:
-#   - Pull Raydium pairs from Dexscreener search.
-#   - Normalize into "meta" dicts compatible with utils_pkg.pair_filters.
-#   - Apply:
-#       * Regime + risk-aware soft prefilters (liq / age / basic flow).
-#       * Optional PF-based scoring via is_viable_pair / compute_*_score.
-#       * Optional AI fraud ("rug") scoring.
-#       * Optional whale & smart-wallet enrichment.
-#       * Optional AI entry scoring via feature_builder + ai_entry_logic
-#         (regime + risk-aware).
-#   - Rank and select runner candidates with rank_score.
+#   - Pull Raydium pairs from Dexscreener.
+#   - Normalize into "meta" dicts.
+#   - Soft prefilters (liq / age) + optional AI rug / whales / smart wallets.
+#   - Call scoring_service.score_candidate() for top activity pools.
+#   - Gate by:
+#       * combined score
+#       * label (RED/YELLOW/GREEN)
+#       * AI entry / AI rug
+#       * risk manager (capacity / shutdown)
 #   - Emit:
 #       * MOMO_OK alerts for top runners.
-#       * AI training rows via log_raydium_candidate.
-#       * Optional scan summary into data_logger.log_event (for dashboards).
+#       * AI training rows via log_raydium_candidate & log_scored_token.
+#       * scan summaries into data_logger.log_event.
 #
 # Public API (flexible signature):
 #   async def scan_raydium(*args) -> List[Dict[str, Any]]
@@ -25,13 +25,6 @@
 #   - scan_raydium(redis)
 #   - scan_raydium(redis, session)
 #   - scan_raydium(session)
-#
-# Notes:
-#   - This module is designed to be "best-effort". If any optional AI/DB/whale
-#     components fail, scanning still returns runners instead of dying.
-#   - All thresholds are controlled via env vars and PF_* globals from config.
-#   - Risk manager can shrink runner output or fully shut down scanning if
-#     risk_shutdown / risk_capacity == 0.
 
 from __future__ import annotations
 
@@ -59,23 +52,37 @@ except Exception:  # pragma: no cover
     PF_SCAN_MIN_WHALE_SIZE_SOL = 3.0  # reasonable default
 
 from utils_pkg.alert_manager import AlertManager
-from utils_pkg.pair_filters import (
-    is_viable_pair,
-    compute_momentum_score,
-    compute_final_score,
-)
+
+# PF gating only; scoring_service does heavy lifting now
+try:
+    from utils_pkg.pair_filters import is_viable_pair  # type: ignore
+except Exception:  # pragma: no cover
+    def is_viable_pair(_meta: Dict[str, Any]) -> bool:  # type: ignore
+        return True
+
+# Unified quant-grade scoring layer
+try:
+    from utils_pkg.scoring_service import score_candidate, ScoredToken  # type: ignore
+except Exception:  # pragma: no cover
+    score_candidate = None  # type: ignore
+    ScoredToken = None  # type: ignore
 
 # Structured logging for AI / analytics
 try:
     from utils_pkg.data_logger import log_raydium_candidate, log_event  # type: ignore
 except Exception:  # pragma: no cover
-
     def log_raydium_candidate(*_: Any, **__: Any) -> None:  # type: ignore
         return None
 
     async def log_event(*_: Any, **__: Any) -> None:  # type: ignore
         return None
 
+# Optional scored-token logger (quant-grade archives)
+try:
+    from utils_pkg.data_logger import log_scored_token  # type: ignore
+except Exception:  # pragma: no cover
+    def log_scored_token(*_: Any, **__: Any) -> None:  # type: ignore
+        return None
 
 # Regime state (risk_on / normal / risk_off); safe dummy fallback
 try:  # pragma: no cover - optional safety
@@ -107,9 +114,9 @@ except Exception:  # pragma: no cover
 
     async def risk_capacity_snapshot(_redis=None) -> Dict[str, Any]:
         return {
-            "risk_capacity": 1.0,         # 0..1 fraction of "allowed risk"
-            "risk_shutdown": False,       # if True → exit early
-            "risk_mode": "normal",        # "panic", "cooldown", etc.
+            "risk_capacity": 1.0,  # 0..1 fraction of "allowed risk"
+            "risk_shutdown": False,  # if True → exit early
+            "risk_mode": "normal",  # "panic", "cooldown", etc.
         }
 
 logger = logging.getLogger("scanner.raydium")
@@ -150,7 +157,7 @@ def _f(name: str, default: float) -> float:
 
 
 # -----------------------------------------------------------------------------
-# Config / env (Raydium-specific tuning on top of global PF_* thresholds)
+# Config / env
 # -----------------------------------------------------------------------------
 
 UA = _s(
@@ -162,8 +169,24 @@ BASE = _s("DEXSCREENER_BASE_URL", "https://api.dexscreener.com").rstrip("/")
 # Dexscreener search limit per query (higher = more raw pairs to evaluate)
 SEARCH_LIMIT = max(50, _i("RAYDIUM_SEARCH_LIMIT", 250))
 
-# How many top candidates PF is allowed to keep per scan (pre risk shrink)
+# --- Scoring-service integration ---
+SCORING_ENABLED = _b("RAYDIUM_SCORING_ENABLED", True)
+SCORING_MAX_PER_SCAN = max(5, _i("RAYDIUM_SCORING_MAX_PER_SCAN", 80))
+SCORING_CONCURRENCY = max(1, _i("RAYDIUM_SCORING_CONCURRENCY", 6))
+SCORING_MIN_COMBINED = _f("RAYDIUM_SCORING_MIN_COMBINED", 55.0)
+SCORING_MIN_LABEL = _s("RAYDIUM_SCORING_MIN_LABEL", "YELLOW").upper().strip()
+SCORING_USE_PF_GATING = _b("RAYDIUM_SCORING_USE_PF_GATING", True)
+
+# Legacy AI-entry envs (still honored as extra gates)
+AI_ENTRY_ENV_MIN = _f("RAYDIUM_MIN_AI_ENTRY", 0.0)
+RAYDIUM_REQUIRE_AI_ENTRY_FOR_RUNNERS = _b(
+    "RAYDIUM_REQUIRE_AI_ENTRY_FOR_RUNNERS",
+    False,
+)
+
+# Raydium runner caps
 LIMIT = _i("RAYDIUM_LIMIT", 40)
+RAYDIUM_MAX_RUNNERS = _i("RAYDIUM_MAX_RUNNERS", LIMIT)
 
 TIMEOUT_S = _f("RAYDIUM_HTTP_TIMEOUT_SEC", 12.0)
 RETRIES = max(1, _i("RAYDIUM_HTTP_RETRIES", 3))
@@ -174,33 +197,19 @@ TRUST_ENV = _b("RAYDIUM_TRUST_ENV", True)
 SEND_MOMO_ALERTS = _b("RAYDIUM_SEND_MOMO_ALERTS", True)
 MAX_ALERTS_PER_SCAN = _i("RAYDIUM_MAX_ALERTS_PER_SCAN", 3)
 
-# Optional AI / whales enrichment toggles. Safe to leave off if infra is not ready.
+# Optional AI rug / whales enrichment toggles.
 AI_RUG_ENABLED = _b("RAYDIUM_AI_RUG_ENABLED", False)
 AI_RUG_MAX_PER_SCAN = _i("RAYDIUM_AI_RUG_MAX_PER_SCAN", 15)
-# Hard ceiling for AI rug score; fallback/PF will skip anything above this.
 RAYDIUM_MAX_AI_RUG = _f("RAYDIUM_MAX_AI_RUG", 0.88)
 
 WHALES_ENABLED = _b("RAYDIUM_WHALES_ENABLED", False)
-
-# Optional AI entry scoring (via feature_builder + ai_entry_logic)
-AI_ENTRY_ENABLED = _b("RAYDIUM_AI_ENTRY_ENABLED", True)
-AI_ENTRY_MAX_PER_SCAN = _i("RAYDIUM_AI_ENTRY_MAX_PER_SCAN", 40)
-RAYDIUM_MIN_AI_ENTRY = _f("RAYDIUM_MIN_AI_ENTRY", 0.0)
-RAYDIUM_REQUIRE_AI_ENTRY_FOR_RUNNERS = _b(
-    "RAYDIUM_REQUIRE_AI_ENTRY_FOR_RUNNERS",
-    False,
-)
-
-# Optional global rank score guardrail for PF runners
-RAYDIUM_MIN_RANK_SCORE = _f("RAYDIUM_MIN_RANK_SCORE", 0.0)
-RAYDIUM_MAX_RUNNERS = _i("RAYDIUM_MAX_RUNNERS", LIMIT)
 
 # Risk-aware output shrink (0..1 multiplier on runner count)
 RAYDIUM_RISK_SHRINK_ENABLED = _b("RAYDIUM_RISK_SHRINK_ENABLED", True)
 
 # Debug / diagnostics
 DEBUG_META_SAMPLE = _b("RAYDIUM_DEBUG_META_SAMPLE", True)
-DEBUG_PF_RESULT = _b("RAYDIUM_DEBUG_PF_RESULT", True)
+DEBUG_SCORE_RESULT = _b("RAYDIUM_DEBUG_SCORE_RESULT", True)
 
 # Diagnostic scan summary logging → data_logger.log_event("raydium_scan_summary", ...)
 RAYDIUM_LOG_SCAN_SUMMARY = _b("RAYDIUM_LOG_SCAN_SUMMARY", True)
@@ -212,25 +221,13 @@ SEARCH_QUERIES = [
     if q.strip()
 ]
 
-# Raydium ↔ PF interaction flags
-RAYDIUM_BYPASS_PF = _b("RAYDIUM_BYPASS_PF", True)
-RAYDIUM_ENABLE_FALLBACK = _b("RAYDIUM_ENABLE_FALLBACK", True)
-
-# Fallback tuning
-RAYDIUM_FB_MIN_BUYS_5M = _i("RAYDIUM_FB_MIN_BUYS_5M", 1)
-RAYDIUM_FB_MIN_VOL5_USD = _f("RAYDIUM_FB_MIN_VOL5_USD", 300.0)
-RAYDIUM_FB_MAX_RUNNERS = max(1, _i("RAYDIUM_FB_MAX_RUNNERS", 3))
-
-# -------------------------------------------------------------------------
-# Soft prefilters BEFORE PF_* (to cut truly dead dust but let more pass)
-# -------------------------------------------------------------------------
+# Soft prefilters BEFORE scoring (to cut truly dead dust but let more pass)
 _BASE_SOFT_LIQ_DEFAULT = max(0.0, PF_SCAN_MIN_LIQ_USD * 0.25)
 _BASE_SOFT_MAX_AGE_DEFAULT = (
     PF_SCAN_MAX_TOKEN_AGE_MIN * 1.5 if PF_SCAN_MAX_TOKEN_AGE_MIN > 0 else 0.0
 )
 
 SOFT_MIN_LIQ_USD = _f("RAYDIUM_SOFT_MIN_LIQ_USD", _BASE_SOFT_LIQ_DEFAULT)
-# NOTE: we do NOT soft-filter on mcap anymore; too many SOL/RAY new tokens have 0 mcap in Dexscreener.
 SOFT_MAX_AGE_MIN = _f("RAYDIUM_SOFT_MAX_AGE_MIN", _BASE_SOFT_MAX_AGE_DEFAULT)
 
 # Hard Raydium age cap (in minutes) – configurable (e.g. 1440)
@@ -341,7 +338,7 @@ async def _regime_snapshot() -> Dict[str, Any]:
 
 def _regime_tune_thresholds(
     base_soft_liq: float,
-    base_fb_min_vol5: float,
+    base_min_vol5: float,
     regime: Dict[str, Any],
 ) -> Tuple[float, float]:
     """
@@ -353,20 +350,18 @@ def _regime_tune_thresholds(
     manip = float(regime.get("manipulation_risk", 0.0))
 
     soft_liq = base_soft_liq
-    fb_min_vol5 = base_fb_min_vol5
+    min_vol5 = base_min_vol5
 
     if ln >= 0.7 and manip < 0.6:
-        # risk-on: allow slightly lower liq/vol so we can pick more early runners
         soft_liq *= 0.7
-        fb_min_vol5 *= 0.7
+        min_vol5 *= 0.7
     elif ln <= -0.7 or manip >= 0.8:
-        # risk-off or high manipulation: tighten
         soft_liq *= 1.4
-        fb_min_vol5 *= 1.3
+        min_vol5 *= 1.3
 
     soft_liq = max(0.0, soft_liq)
-    fb_min_vol5 = max(0.0, fb_min_vol5)
-    return soft_liq, fb_min_vol5
+    min_vol5 = max(0.0, min_vol5)
+    return soft_liq, min_vol5
 
 
 # -----------------------------------------------------------------------------
@@ -397,6 +392,7 @@ async def _fetch_json(
                         return await r.json(content_type=None), status, first
                     except Exception:
                         import json as _json
+
                         try:
                             return _json.loads(text), status, first
                         except Exception:
@@ -470,19 +466,18 @@ async def _fetch_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------------
-# Metric extraction & normalization ⇒ PF meta
+# Metric extraction & normalization ⇒ meta
 # -----------------------------------------------------------------------------
 
 def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
     """
     Extract raw numeric metrics from a Dexscreener Raydium pair and map them
-    into the names expected by utils_pkg.pair_filters.
+    into scanner-level meta fields.
     """
     liq = pair.get("liquidity") or {}
     liq_usd = _nz_float(liq.get("usd"), 0.0)
 
     fdv_usd = _nz_float(pair.get("fdv"), 0.0)
-    # Market cap is often missing for fresh SOL/RAY pools; don't be strict here.
     mcap_usd = _nz_float(
         pair.get("marketCap")
         or pair.get("marketCapUsd")
@@ -591,7 +586,7 @@ def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
 def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Normalize raw Dexscreener Raydium pair into the "meta" dict that
-    utils_pkg.pair_filters expects.
+    scoring_service expects (and our scanners / traders can consume).
     """
     try:
         if (pair.get("chainId") or "").lower() != "solana":
@@ -623,22 +618,19 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         meta: Dict[str, Any] = {
             # identity / source
             "dex": "raydium",
-            "chain": "solana",
+            "chain": "SOL",
             "source": "raydium",
             "scanner": "raydium_scanner",
             "mint": mint,
             "symbol": symbol,
             "pair_url": url,
             "scan_ts": ts,
-
             # core liquidity / size
             "liq_usd": metrics["liq_usd"],
             "mcap_usd": metrics["mcap_usd"],
             "fdv_usd": metrics["fdv_usd"],
-
             # age
             "token_age_min": metrics["token_age_min"],
-
             # recent activity
             "vol_5m_usd": metrics["vol_5m_usd"],
             "vol_1h_usd": metrics["vol_1h_usd"],
@@ -648,26 +640,20 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "txns_5m": buys_5m + sells_5m,
             "txns_1h": metrics["buys_1h"] + metrics["sells_1h"],
             "buy_ratio_5m": buy_ratio_5m,
-
             # price action
             "price_usd": metrics["price_usd"],
             "price_change_5m_pct": metrics["price_change_5m_pct"],
             "price_change_15m_pct": metrics["price_change_15m_pct"],
             "price_change_1h_pct": metrics["price_change_1h_pct"],
-
             # holders
             "holders": metrics["holders"],
             "holders_5m_change": metrics["holders_5m_change"],
-
             # whale / AI fields
             "whales_5m": metrics["whales_5m"],
             "whale_vol_5m_usd": metrics["whale_vol_5m_usd"],
             "largest_buy_5m_sol": metrics["largest_buy_5m_sol"],
-            "ai_rug_score": 0.0,           # updated by AI if enabled
-            "ai_entry_score": None,        # updated by AI entry logic if enabled
-            "ai_entry_reason": None,       # optional human-readable entry reason
-            "rank_score": None,            # final ranking / tie-breaker score
-
+            "ai_rug_score": 0.0,      # updated by AI if enabled
+            "rank_score": None,       # final ranking / tie-breaker score
             # security flags (no direct info here, so defaults are safe-ish)
             "is_honeypot": False,
             "trading_paused": False,
@@ -685,27 +671,19 @@ def _normalize_to_meta(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------------
-# Optional AI / whales / entry enrichment
+# Optional AI rug / whales / entry enrichment (no scoring here)
 # -----------------------------------------------------------------------------
 
-async def _enrich_ai_whales_entry(
-    metas: List[Dict[str, Any]],
-    regime: Dict[str, Any],
-    risk_ctx: Optional[Dict[str, Any]],
-) -> None:
+async def _enrich_ai_and_whales(metas: List[Dict[str, Any]]) -> None:
     """
     Best-effort enrichment of meta with:
       - ai_rug_score (0–1) via utils_pkg.core_utils.ai_fraud_score
       - basic whale signal via utils_pkg.core_utils.is_whale_wallet
-      - ai_entry_score via feature_builder + ai_entry_logic (regime + risk-aware)
       - smart wallet tags if utils_pkg.smart_wallets is present
-
-    All imports and calls are optional; failures are swallowed.
     """
     if not metas:
         return
 
-    # Optional imports (all guarded)
     try:
         from utils_pkg.core_utils import ai_fraud_score, is_whale_wallet  # type: ignore
     except Exception:  # pragma: no cover
@@ -713,40 +691,24 @@ async def _enrich_ai_whales_entry(
         is_whale_wallet = None  # type: ignore
 
     try:
-        from utils_pkg import feature_builder as FB  # type: ignore
-    except Exception:  # pragma: no cover
-        FB = None  # type: ignore
-
-    try:
-        from utils_pkg import ai_entry_logic as AI_ENTRY  # type: ignore
-    except Exception:  # pragma: no cover
-        AI_ENTRY = None  # type: ignore
-
-    try:
         from utils_pkg import smart_wallets as SW  # type: ignore
     except Exception:  # pragma: no cover
         SW = None  # type: ignore
 
-    # Concurrency caps
-    ai_conc = _i("RAYDIUM_AI_CONCURRENCY", 5)
-    sem = asyncio.Semaphore(max(1, ai_conc))
+    ai_targets = metas[: AI_RUG_MAX_PER_SCAN] if (AI_RUG_ENABLED and ai_fraud_score) else []
+    whale_targets = metas if (WHALES_ENABLED and is_whale_wallet) else []
 
-    to_rug = metas[: AI_RUG_MAX_PER_SCAN] if (AI_RUG_ENABLED and ai_fraud_score) else []
-    to_entry = metas[: AI_ENTRY_MAX_PER_SCAN] if (AI_ENTRY_ENABLED and FB) else metas[:0]
+    conc = max(1, _i("RAYDIUM_AI_CONCURRENCY", 5))
+    sem = asyncio.Semaphore(conc)
 
     async def _handle(meta: Dict[str, Any]) -> None:
         mint = meta.get("mint")
         if not isinstance(mint, str) or not mint:
             return
 
-        # Attach risk context snapshot to meta for downstream logging / AI
-        if risk_ctx:
-            meta["risk_capacity"] = float(risk_ctx.get("risk_capacity", 1.0) or 1.0)
-            meta["risk_mode"] = risk_ctx.get("risk_mode", "normal")
-
         async with sem:
-            # AI rug score
-            if meta in to_rug and ai_fraud_score:
+            # AI rug
+            if meta in ai_targets and ai_fraud_score:
                 try:
                     s01 = await ai_fraud_score(mint)
                     if s01 is not None:
@@ -754,11 +716,10 @@ async def _enrich_ai_whales_entry(
                 except Exception:
                     pass
 
-            # Whale presence (coarse)
-            if WHALES_ENABLED and is_whale_wallet:
+            # whales
+            if meta in whale_targets and is_whale_wallet:
                 try:
                     px = float(meta.get("price_usd") or 0.0)
-                    # If price unknown, fall back to a big USD threshold.
                     thresh_usd = (
                         float(PF_SCAN_MIN_WHALE_SIZE_SOL) * px if px > 0 else 50_000.0
                     )
@@ -768,10 +729,9 @@ async def _enrich_ai_whales_entry(
                 except Exception:
                     pass
 
-            # Smart wallet tags (best effort)
+            # smart wallets
             if SW is not None:
                 try:
-                    # We don't assume an exact API; try the obvious ones.
                     fn = getattr(SW, "enrich_meta", None) or getattr(
                         SW, "annotate_meta", None
                     )
@@ -783,230 +743,171 @@ async def _enrich_ai_whales_entry(
                 except Exception:
                     pass
 
-            # AI entry scoring
-            if (
-                AI_ENTRY_ENABLED
-                and FB is not None
-                and AI_ENTRY is not None
-                and meta in to_entry
-            ):
-                try:
-                    # Feature builder: prefer build_features_for_meta, fall back to build_features
-                    fb_fn = getattr(FB, "build_features_for_meta", None) or getattr(
-                        FB, "build_features", None
-                    )
-                    if not callable(fb_fn):
-                        return
-
-                    # Try with risk context, fall back without if signature is older
-                    try:
-                        feats = fb_fn(meta, regime=regime, risk=risk_ctx)  # type: ignore[arg-type]
-                    except TypeError:
-                        feats = fb_fn(meta, regime=regime)  # type: ignore[arg-type]
-
-                    meta["_features"] = feats
-
-                    score = None
-                    reason = None
-
-                    async def _call(fn, *a, **k):
-                        if asyncio.iscoroutinefunction(fn):
-                            return await fn(*a, **k)
-                        return await asyncio.to_thread(fn, *a, **k)
-
-                    # Try flexible AI entry APIs in priority order:
-                    #   1) score_candidate(meta=..., features=..., regime=..., risk=...)
-                    #   2) score_entry(features=..., meta=..., regime=..., risk=...)
-                    #   3) score_entry(features)
-                    #   4) compute_entry(meta, features, regime, risk) -> {"score":..,"reason":..}
-                    score_fn = getattr(AI_ENTRY, "score_candidate", None)
-                    if callable(score_fn):
-                        try:
-                            score = await _call(
-                                score_fn,
-                                meta=meta,
-                                features=feats,
-                                regime=regime,
-                                risk=risk_ctx,
-                            )
-                        except TypeError:
-                            score = await _call(
-                                score_fn,
-                                meta=meta,
-                                features=feats,
-                                regime=regime,
-                            )
-
-                        reason_fn = getattr(AI_ENTRY, "explain_candidate", None)
-                        if callable(reason_fn):
-                            try:
-                                reason_val = await _call(
-                                    reason_fn,
-                                    meta=meta,
-                                    features=feats,
-                                    regime=regime,
-                                    risk=risk_ctx,
-                                )
-                                reason = str(reason_val)
-                            except Exception:
-                                reason = None
-                    else:
-                        score_entry_fn = getattr(AI_ENTRY, "score_entry", None)
-                        compute_entry_fn = getattr(AI_ENTRY, "compute_entry", None)
-
-                        if callable(score_entry_fn):
-                            try:
-                                score = await _call(
-                                    score_entry_fn,
-                                    feats,
-                                    meta=meta,
-                                    regime=regime,
-                                    risk=risk_ctx,
-                                )
-                            except TypeError:
-                                # Maybe signature is score_entry(features) only
-                                score = await _call(score_entry_fn, feats)
-
-                        if score is None and callable(compute_entry_fn):
-                            try:
-                                info = await _call(
-                                    compute_entry_fn, meta, feats, regime, risk_ctx
-                                )
-                                if isinstance(info, dict):
-                                    score = info.get("score")
-                                    reason_val = info.get("reason")
-                                    if isinstance(reason_val, str):
-                                        reason = reason_val
-                            except Exception:
-                                pass
-
-                    if score is not None:
-                        meta["ai_entry_score"] = float(score)
-                    if reason is not None:
-                        meta["ai_entry_reason"] = str(reason)
-                except Exception:
-                    # AI entry is always best-effort
-                    pass
-
     tasks = [asyncio.create_task(_handle(m)) for m in metas]
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # -----------------------------------------------------------------------------
-# PF-based filtering & ranking + fallback picker
+# Scoring helper (via scoring_service)
 # -----------------------------------------------------------------------------
 
-def _apply_pf(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+_LABEL_LEVEL = {"RED": 0, "YELLOW": 1, "GREEN": 2}
+_REQUIRED_LABEL_LEVEL = _LABEL_LEVEL.get(SCORING_MIN_LABEL, 0)
+
+
+def _ai_entry_threshold_0_100() -> float:
     """
-    Apply PF filters & scoring and return top LIMIT by rank_score.
-
-    rank_score is a blend of:
-      - PF final_score
-      - PF momentum_score
-      - optional ai_entry_score
-      - optional whale presence
-
-    Note: we only run this when RAYDIUM_BYPASS_PF=0.
+    Translate legacy AI-entry env threshold (0–1 or 0–100) into 0–100 scale.
     """
-    from math import log1p
+    raw = float(AI_ENTRY_ENV_MIN or 0.0)
+    if raw <= 0.0:
+        return 0.0
+    if raw <= 1.0:
+        return raw * 100.0
+    return raw
 
-    out: List[Dict[str, Any]] = []
 
-    for meta in metas:
+async def _score_metas_with_service(
+    metas: List[Dict[str, Any]],
+    regime: Dict[str, Any],
+    risk_ctx: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Central scoring integration:
+
+      - Optionally gate via is_viable_pair (cheap PF check).
+      - Skip anything already flagged as high rug.
+      - Sort by (vol_5m, buys_5m) and score top N.
+      - Attach ScoredToken fields to meta.
+    """
+    if not SCORING_ENABLED or not metas or score_candidate is None:
+        return []
+
+    # PF gating (cheap) before we spend AI / feature budget
+    pf_filtered: List[Dict[str, Any]] = []
+    for m in metas:
         try:
-            # Apply rug guardrail first if AI rug is active
-            rug = float(meta.get("ai_rug_score") or 0.0)
+            if SCORING_USE_PF_GATING and not is_viable_pair(m):
+                continue
+            rug = float(m.get("ai_rug_score") or 0.0)
             if AI_RUG_ENABLED and rug >= RAYDIUM_MAX_AI_RUG:
                 continue
+            pf_filtered.append(m)
+        except Exception:
+            continue
 
-            if not is_viable_pair(meta):
-                continue
+    if not pf_filtered:
+        pf_filtered = metas
 
-            momentum = compute_momentum_score(meta)
-            final = compute_final_score(meta)
+    # Sort so highest activity pools get scored first
+    def _activity_key(m: Dict[str, Any]) -> Tuple[float, int]:
+        return (
+            float(m.get("vol_5m_usd") or 0.0),
+            int(m.get("buys_5m") or 0),
+        )
 
-            ai_entry = meta.get("ai_entry_score")
-            whales = int(meta.get("whales_5m") or 0)
-            vol5 = float(meta.get("vol_5m_usd") or 0.0)
+    pf_filtered.sort(key=_activity_key, reverse=True)
+    targets = pf_filtered[:SCORING_MAX_PER_SCAN]
 
-            # Optional AI entry gating
-            if RAYDIUM_REQUIRE_AI_ENTRY_FOR_RUNNERS:
-                if not isinstance(ai_entry, (int, float)):
-                    continue
-                if ai_entry < RAYDIUM_MIN_AI_ENTRY:
-                    continue
-            elif isinstance(ai_entry, (int, float)) and ai_entry < 0.0:
-                # Sanity clamp if some weird negative score slipped in
-                ai_entry = 0.0
+    conc = SCORING_CONCURRENCY
+    sem = asyncio.Semaphore(conc)
 
-            # Base rank from PF
-            rank = float(final)
+    scored: List[Dict[str, Any]] = []
 
-            # Small bonus for momentum and whales
-            rank += 0.2 * float(momentum)
-            if whales > 0:
-                rank += 0.15
+    async def _score_one(meta: Dict[str, Any]) -> None:
+        raw = dict(meta)
 
-            # AI entry override if present: treat like an extra strong signal
-            if isinstance(ai_entry, (int, float)):
-                vol_boost = max(1.0, log1p(max(vol5, 1.0)) / 5.0)
-                rank = (0.6 * rank + 0.4 * float(ai_entry)) * vol_boost
+        # Aliases for backwards compat / nice scoring_service view
+        if "token_age_min" in raw and "age_min" not in raw:
+            raw["age_min"] = raw["token_age_min"]
+        if "price_change_5m_pct" in raw and "chg5" not in raw:
+            raw["chg5"] = raw["price_change_5m_pct"]
+        if "buys_5m" in raw and "buys5" not in raw:
+            raw["buys5"] = raw["buys_5m"]
+        if "sells_5m" in raw and "sells5" not in raw:
+            raw["sells5"] = raw["sells_5m"]
+        if not raw.get("chain"):
+            raw["chain"] = "SOL"
 
-            # Global rank guardrail if configured
-            if RAYDIUM_MIN_RANK_SCORE > 0.0 and rank < RAYDIUM_MIN_RANK_SCORE:
-                continue
+        ctx = {
+            "source": "raydium",
+            "scanner": "raydium_scanner",
+            "regime": dict(regime),
+            "risk": dict(risk_ctx or {}),
+        }
 
-            m = dict(meta)
-            m["momentum_score"] = float(momentum)
-            m["final_score"] = float(final)
-            m["rank_score"] = float(rank)
-            out.append(m)
-        except Exception as e:
-            logger.debug(
-                "Raydium PF filter error for %s: %s", meta.get("mint"), e
-            )
+        async with sem:
+            try:
+                st: ScoredToken = await score_candidate(raw, context=ctx)  # type: ignore
+            except Exception as exc:
+                logger.warning(
+                    "Raydium scoring error for %s: %s", meta.get("mint"), exc
+                )
+                return
 
-    out.sort(key=lambda x: x.get("rank_score", x.get("final_score", 0.0)), reverse=True)
-    if RAYDIUM_MAX_RUNNERS > 0:
-        out = out[: min(LIMIT, RAYDIUM_MAX_RUNNERS)]
-    else:
-        out = out[:LIMIT]
-    return out
+        m = dict(meta)
+        m["score_combined"] = float(st.combined_score)
+        m["score_label"] = st.label
+        m["score_momentum"] = float(st.momentum_score)
+        m["score_risk"] = float(st.risk_score)
+        m["score_quality"] = float(st.quality_score)
+        m["score_ai"] = float(st.ai_score)
+        m["score_reasons"] = st.reasons
+        m["score_is_trade_viable"] = bool(st.is_trade_viable)
+        m["score_trade_gate_reason"] = st.trade_gate_reason
 
+        # Back-compat aliases
+        m["rank_score"] = float(st.combined_score)
+        m["ai_entry_score"] = float(st.ai_score)
+        m["ai_entry_reason"] = st.reasons
+
+        # Whole ScoredToken snapshot (dict) for downstream / logging
+        m["scored_token"] = st.to_dict()
+        scored.append(m)
+
+        # Optional scored-token DB log
+        try:
+            log_scored_token(st.to_dict(), source="raydium")  # type: ignore
+        except TypeError:
+            try:
+                log_scored_token(st.to_dict())  # type: ignore
+            except Exception:
+                pass
+
+    tasks = [asyncio.create_task(_score_one(m)) for m in targets]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return scored
+
+
+# -----------------------------------------------------------------------------
+# Fallback picker (if scoring yields nothing)
+# -----------------------------------------------------------------------------
 
 def _fallback_pick_metas(
     metas: List[Dict[str, Any]],
     *,
-    log: logging.Logger,
     why: str = "fb",
     fb_min_vol5_usd: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """
     Very simple, permissive Raydium fallback:
-    - PF scoring is skipped (upstream age/liq filters already applied)
+    - scoring_service is skipped (upstream age/liq filters already applied)
     - keep anything with decent 5m volume + at least 1 buy
     - skip anything with ai_rug_score above RAYDIUM_MAX_AI_RUG
-    - optionally gate on ai_entry_score if require flag is set
     - sort by (whales_5m desc, vol_5m_usd desc) and cap by env limit
-
-    Controlled by:
-      - RAYDIUM_FB_MIN_BUYS_5M
-      - RAYDIUM_FB_MIN_VOL5_USD (possibly regime-tuned)
-      - RAYDIUM_FB_MAX_RUNNERS
-      - RAYDIUM_MAX_AI_RUG
-      - RAYDIUM_REQUIRE_AI_ENTRY_FOR_RUNNERS / RAYDIUM_MIN_AI_ENTRY
     """
-    if not RAYDIUM_ENABLE_FALLBACK or not metas:
+    if not metas:
         return []
 
-    fb_min_buys = int(RAYDIUM_FB_MIN_BUYS_5M)
-    fb_min_vol = (
-        float(fb_min_vol5_usd)
+    fb_min_buys = int(_i("RAYDIUM_FB_MIN_BUYS_5M", 1))
+    fb_min_vol = float(
+        fb_min_vol5_usd
         if fb_min_vol5_usd is not None
-        else float(RAYDIUM_FB_MIN_VOL5_USD)
+        else _f("RAYDIUM_FB_MIN_VOL5_USD", 300.0)
     )
-    fb_max = int(RAYDIUM_FB_MAX_RUNNERS)
+    fb_max = int(_i("RAYDIUM_FB_MAX_RUNNERS", 3))
 
     candidates: List[Dict[str, Any]] = []
     for m in metas:
@@ -1023,20 +924,12 @@ def _fallback_pick_metas(
             if AI_RUG_ENABLED and rug >= RAYDIUM_MAX_AI_RUG:
                 continue
 
-            # Optional AI entry gating on fallback too
-            ai_entry = m.get("ai_entry_score")
-            if RAYDIUM_REQUIRE_AI_ENTRY_FOR_RUNNERS:
-                if not isinstance(ai_entry, (int, float)):
-                    continue
-                if ai_entry < RAYDIUM_MIN_AI_ENTRY:
-                    continue
-
             candidates.append(m)
         except Exception:
             continue
 
     if not candidates:
-        log.info(
+        logger.info(
             "Raydium fallback[%s]: 0 metas matched (fb_min_buys=%d fb_min_vol=%.1f "
             "ai_rug_max=%.2f) from %d metas",
             why,
@@ -1047,9 +940,6 @@ def _fallback_pick_metas(
         )
         return []
 
-    # Prefer:
-    #   1) presence of whales_5m (if enriched)
-    #   2) higher 5m volume
     def _fb_key(m: Dict[str, Any]) -> Tuple[int, float]:
         whales = int(m.get("whales_5m") or 0)
         vol5 = float(m.get("vol_5m_usd") or 0.0)
@@ -1058,7 +948,7 @@ def _fallback_pick_metas(
     candidates.sort(key=_fb_key, reverse=True)
     picked = candidates[:fb_max]
 
-    log.info(
+    logger.info(
         "Raydium fallback[%s]: picked %d/%d metas (fb_min_buys=%d fb_min_vol=%.1f "
         "fb_max=%d ai_rug_max=%.2f)",
         why,
@@ -1106,8 +996,13 @@ async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
                 "liq_usd": c.get("liq_usd"),
                 "vol_5m": c.get("vol_5m_usd"),
                 "up_pct": c.get("price_change_5m_pct"),
-                "ai_entry_score": c.get("ai_entry_score"),
-                "ai_entry_reason": c.get("ai_entry_reason"),
+                # expose scoring-service signals in MOMO context
+                "score_combined": c.get("score_combined"),
+                "score_label": c.get("score_label"),
+                "score_ai": c.get("score_ai"),
+                "score_risk": c.get("score_risk"),
+                "score_quality": c.get("score_quality"),
+                "score_momentum": c.get("score_momentum"),
                 "ai_rug_score": c.get("ai_rug_score"),
                 "rank_score": c.get("rank_score"),
                 "risk_capacity": c.get("risk_capacity"),
@@ -1115,7 +1010,8 @@ async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
                     f"raydium runner liq=${c.get('liq_usd', 0):.0f} "
                     f"vol5=${c.get('vol_5m_usd', 0):.0f} "
                     f"up5={c.get('price_change_5m_pct', 0):.2f}% "
-                    f"ai={c.get('ai_entry_score', 0)!r}"
+                    f"score={c.get('score_combined', 0):.1f} "
+                    f"label={c.get('score_label')}"
                 ),
             }
             await am.send_momo_event("MOMO_OK", ctx)
@@ -1137,8 +1033,8 @@ def _log_ai_candidates(
     """
     Log runner candidates into Postgres via utils_pkg.data_logger.
 
-    This builds a compact Raydium-style meta snapshot for each runner and
-    calls log_raydium_candidate(...). Any failures are logged but ignored
+    This builds a meta snapshot for each runner and calls
+    log_raydium_candidate(...). Any failures are logged but ignored
     so scanning is never blocked by DB issues.
     """
     if not RAYDIUM_LOG_CANDIDATES or not runners:
@@ -1165,7 +1061,6 @@ def _log_ai_candidates(
             if not isinstance(mint, str) or not mint:
                 continue
 
-            # Build the minimal "meta" shape expected by log_raydium_candidate
             meta = {
                 "liq": float(r.get("liq_usd") or 0.0),
                 "vol5": float(r.get("vol_5m_usd") or 0.0),
@@ -1176,7 +1071,6 @@ def _log_ai_candidates(
                 "scan_ts": float(r.get("scan_ts") or time.time()),
             }
 
-            # Optional extras
             if "mcap_usd" in r:
                 meta["mcap"] = float(r.get("mcap_usd") or 0.0)
             if "vol_1h_usd" in r:
@@ -1185,18 +1079,30 @@ def _log_ai_candidates(
                 meta["buys1"] = int(r.get("buys_1h") or 0)
             if "sells_1h" in r:
                 meta["sells1"] = int(r.get("sells_1h") or 0)
-            if "ai_entry_score" in r and r["ai_entry_score"] is not None:
-                meta["ai_entry_score"] = float(r["ai_entry_score"])
             if "ai_rug_score" in r:
-                meta["ai_rug_score"] = float(r["ai_rug_score"])
+                meta["ai_rug_score"] = float(r.get("ai_rug_score") or 0.0)
             if "rank_score" in r and r["rank_score"] is not None:
                 meta["rank_score"] = float(r["rank_score"])
+
+            # scoring-service extras
+            if "score_combined" in r:
+                meta["score_combined"] = float(r.get("score_combined") or 0.0)
+            if "score_label" in r:
+                meta["score_label"] = str(r.get("score_label") or "")
+            if "score_ai" in r:
+                meta["score_ai"] = float(r.get("score_ai") or 0.0)
+            if "score_risk" in r:
+                meta["score_risk"] = float(r.get("score_risk") or 0.0)
+            if "score_quality" in r:
+                meta["score_quality"] = float(r.get("score_quality") or 0.0)
+            if "score_momentum" in r:
+                meta["score_momentum"] = float(r.get("score_momentum") or 0.0)
+
             if risk_capacity is not None:
                 meta["risk_capacity"] = float(risk_capacity)
             if risk_mode is not None:
                 meta["risk_mode"] = str(risk_mode)
 
-            # Stash full meta as well for future feature changes
             meta["raw_meta"] = dict(r)
 
             log_raydium_candidate(
@@ -1226,7 +1132,8 @@ async def scan_raydium(*args):
 
     Only an aiohttp.ClientSession (if provided) is used for HTTP,
     and a redis handle (if provided) is used for risk manager & logging.
-    Returns a list of runner candidates (each is a meta dict).
+    Returns a list of runner candidates (each is a meta dict enriched with
+    scoring_service fields when enabled).
     """
     redis = None
     sess: Optional[aiohttp.ClientSession] = None
@@ -1238,7 +1145,6 @@ async def scan_raydium(*args):
         else:
             redis = args[0]
     elif len(args) >= 2:
-        # Assume (redis, session) ordering if both are present
         redis = args[0]
         if isinstance(args[1], aiohttp.ClientSession):
             sess = args[1]
@@ -1270,7 +1176,7 @@ async def scan_raydium(*args):
     pairs: List[Dict[str, Any]] = []
     metas: List[Dict[str, Any]] = []
     soft_metas: List[Dict[str, Any]] = []
-    pf_runners: List[Dict[str, Any]] = []
+    scored_metas: List[Dict[str, Any]] = []
     fb_metas: List[Dict[str, Any]] = []
     runners: List[Dict[str, Any]] = []
 
@@ -1295,26 +1201,25 @@ async def scan_raydium(*args):
             )
             return []
 
-        # Regime snapshot once per scan (used for tuning + logging + AI entry)
+        # Regime snapshot once per scan (used for tuning + logging + AI)
         regime = await _regime_snapshot()
         tuned_soft_liq, tuned_fb_min_vol5 = _regime_tune_thresholds(
             SOFT_MIN_LIQ_USD,
-            RAYDIUM_FB_MIN_VOL5_USD,
+            _f("RAYDIUM_FB_MIN_VOL5_USD", 300.0),
             regime,
         )
 
         logger.info(
             "scanner.raydium: starting scan; queries=%s soft_min_liq=$%.0f "
-            "pf_min_liq=$%.0f limit=%d search_limit=%d bypass_pf=%s fallback=%s "
-            "regime_label=%.2f manip=%.2f tuned_soft_liq=$%.0f tuned_fb_min_vol5=$%.0f "
+            "pf_min_liq=$%.0f limit=%d search_limit=%d scoring_enabled=%s "
+            "regime_label=%.2f manip=%.2f tuned_soft_liq=$%.0f tuned_min_vol5=$%.0f "
             "risk_capacity=%.3f risk_mode=%s",
             ",".join(SEARCH_QUERIES),
             SOFT_MIN_LIQ_USD,
             PF_SCAN_MIN_LIQ_USD,
             LIMIT,
             SEARCH_LIMIT,
-            RAYDIUM_BYPASS_PF,
-            RAYDIUM_ENABLE_FALLBACK,
+            SCORING_ENABLED,
             regime.get("label_numeric", 0.0),
             regime.get("manipulation_risk", 0.0),
             tuned_soft_liq,
@@ -1328,7 +1233,7 @@ async def scan_raydium(*args):
         for p in pairs:
             m = _normalize_to_meta(p)
             if m:
-                # attach regime + risk so downstream filters can see it
+                # attach regime + risk so downstream scoring sees it too
                 m["regime"] = regime.get("label", "unknown")
                 m["regime_numeric"] = float(regime.get("label_numeric", 0.0))
                 m["regime_manipulation"] = float(
@@ -1360,12 +1265,12 @@ async def scan_raydium(*args):
         if not soft_metas and metas:
             logger.info(
                 "scanner.raydium: soft filters removed all metas (raw=%d); "
-                "falling back to raw metas for PF/fallback",
+                "falling back to raw metas for scoring.",
                 total_metas,
             )
             soft_metas = metas
 
-        # --- hard age cap using RAY_MAX_AGE_MIN (applies to PF and fallback) ---
+        # --- hard age cap using RAY_MAX_AGE_MIN (applies to scoring & fallback) ---
         if RAY_MAX_AGE_MIN > 0.0 and soft_metas:
             before = len(soft_metas)
             age_filtered: List[Dict[str, Any]] = []
@@ -1410,50 +1315,84 @@ async def scan_raydium(*args):
                     "RAY_META_SAMPLE count=0 (soft=0, raw=%d)", total_metas
                 )
 
-        # Optional AI / whale / entry enrichment (no-op if disabled or imports fail).
+        # Optional AI rug / whale / smart-wallet enrichment (no scoring here).
         with contextlib.suppress(Exception):
-            await _enrich_ai_whales_entry(soft_metas, regime=regime, risk_ctx=risk_ctx)
+            await _enrich_ai_and_whales(soft_metas)
 
-        if not RAYDIUM_BYPASS_PF:
-            pf_runners = _apply_pf(soft_metas)
+        # --- main quant-grade scoring path ---
+        scored_metas = await _score_metas_with_service(
+            soft_metas, regime=regime, risk_ctx=risk_ctx
+        )
 
-        if pf_runners:
-            runners = pf_runners
-        else:
+        runners = []
+        ai_thr = _ai_entry_threshold_0_100()
+
+        for m in scored_metas:
+            try:
+                label = str(m.get("score_label") or "").upper() or "YELLOW"
+                combined = float(m.get("score_combined") or 0.0)
+                ai_score = float(m.get("score_ai") or 0.0)
+                trade_ok = bool(m.get("score_is_trade_viable", True))
+
+                if not trade_ok:
+                    continue
+                if combined < SCORING_MIN_COMBINED:
+                    continue
+
+                lvl = _LABEL_LEVEL.get(label, 0)
+                if lvl < _REQUIRED_LABEL_LEVEL:
+                    continue
+
+                if RAYDIUM_REQUIRE_AI_ENTRY_FOR_RUNNERS and ai_thr > 0.0:
+                    if ai_score < ai_thr:
+                        continue
+
+                if AI_RUG_ENABLED:
+                    rug = float(m.get("ai_rug_score") or 0.0)
+                    if rug >= RAYDIUM_MAX_AI_RUG:
+                        continue
+
+                runners.append(m)
+            except Exception:
+                continue
+
+        # --- Fallback if scoring produced 0 runners ---
+        if not runners:
             fb_metas = _fallback_pick_metas(
-                soft_metas,
-                log=logger,
-                why="ray",
-                fb_min_vol5_usd=tuned_fb_min_vol5,
+                soft_metas, why="ray-score-fb", fb_min_vol5_usd=tuned_fb_min_vol5
             )
-            if not fb_metas and soft_metas:
-                logger.warning(
-                    "Raydium: PF produced 0 runners and fallback found nothing from "
-                    "%d metas (soft-filtered + age-capped)",
-                    len(soft_metas),
-                )
             runners = fb_metas
 
-        # Risk-aware shrink of runner count (post PF/fallback)
-        if runners and RAYDIUM_RISK_SHRINK_ENABLED:
-            raw_n = len(runners)
-            # e.g. risk_capacity=0.5 → take ~50% of max, but at least 1 when >0
-            allowed = int(raw_n * risk_capacity)
-            if risk_capacity > 0.0 and allowed < 1:
-                allowed = 1
-            if allowed < raw_n:
-                logger.info(
-                    "scanner.raydium: risk shrink runners %d → %d (risk_capacity=%.3f)",
-                    raw_n,
-                    allowed,
-                    risk_capacity,
-                )
-                runners = runners[:allowed]
+        # --- Sort + caps + risk shrink ---
+        if runners:
+            runners.sort(
+                key=lambda x: x.get("score_combined", x.get("rank_score", 0.0)),
+                reverse=True,
+            )
 
-        if DEBUG_PF_RESULT:
+            max_allowed = RAYDIUM_MAX_RUNNERS if RAYDIUM_MAX_RUNNERS > 0 else LIMIT
+            runners = runners[:max_allowed]
+
+            # Risk-aware shrink of runner count
+            if RAYDIUM_RISK_SHRINK_ENABLED:
+                raw_n = len(runners)
+                # e.g. risk_capacity=0.5 → take ~50% of max, but at least 1 when >0
+                allowed = int(raw_n * risk_capacity)
+                if risk_capacity > 0.0 and allowed < 1:
+                    allowed = 1
+                if allowed < raw_n:
+                    logger.info(
+                        "scanner.raydium: risk shrink runners %d → %d (risk_capacity=%.3f)",
+                        raw_n,
+                        allowed,
+                        risk_capacity,
+                    )
+                    runners = runners[:allowed]
+
+        if DEBUG_SCORE_RESULT:
             logger.info(
-                "RAY_PF_RESULT pf=%d fb=%d metas=%d pairs=%d runners=%d",
-                len(pf_runners),
+                "RAY_SCORE_RESULT scored=%d fb=%d metas=%d pairs=%d runners=%d",
+                len(scored_metas),
                 len(fb_metas),
                 len(soft_metas),
                 len(pairs),
@@ -1483,7 +1422,7 @@ async def scan_raydium(*args):
                         "raw_pairs": len(pairs),
                         "metas": len(metas),
                         "soft_metas": len(soft_metas),
-                        "pf_runners": len(pf_runners),
+                        "scored_metas": len(scored_metas),
                         "fb_runners": len(fb_metas),
                         "runners": len(runners),
                         "regime": dict(regime),
@@ -1492,15 +1431,12 @@ async def scan_raydium(*args):
                             "SOFT_MIN_LIQ_USD": SOFT_MIN_LIQ_USD,
                             "SOFT_MAX_AGE_MIN": SOFT_MAX_AGE_MIN,
                             "RAY_MAX_AGE_MIN": RAY_MAX_AGE_MIN,
-                            "RAYDIUM_BYPASS_PF": RAYDIUM_BYPASS_PF,
-                            "RAYDIUM_ENABLE_FALLBACK": RAYDIUM_ENABLE_FALLBACK,
-                            "RAYDIUM_FB_MIN_BUYS_5M": RAYDIUM_FB_MIN_BUYS_5M,
-                            "RAYDIUM_FB_MIN_VOL5_USD": RAYDIUM_FB_MIN_VOL5_USD,
-                            "RAYDIUM_FB_MAX_RUNNERS": RAYDIUM_FB_MAX_RUNNERS,
+                            "SCORING_ENABLED": SCORING_ENABLED,
+                            "SCORING_MAX_PER_SCAN": SCORING_MAX_PER_SCAN,
+                            "SCORING_MIN_COMBINED": SCORING_MIN_COMBINED,
+                            "SCORING_MIN_LABEL": SCORING_MIN_LABEL,
                             "AI_RUG_ENABLED": AI_RUG_ENABLED,
                             "RAYDIUM_MAX_AI_RUG": RAYDIUM_MAX_AI_RUG,
-                            "AI_ENTRY_ENABLED": AI_ENTRY_ENABLED,
-                            "RAYDIUM_REQUIRE_AI_ENTRY_FOR_RUNNERS": RAYDIUM_REQUIRE_AI_ENTRY_FOR_RUNNERS,
                             "RAYDIUM_RISK_SHRINK_ENABLED": RAYDIUM_RISK_SHRINK_ENABLED,
                         },
                     },

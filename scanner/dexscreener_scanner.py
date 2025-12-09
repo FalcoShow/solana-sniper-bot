@@ -790,9 +790,12 @@ def _normalize_to_meta(
             "symbol": symbol,
             "pair_url": url,
             "scan_ts": time.time(),
+
+            # regime
             "regime": cur_regime_label,
             "regime_numeric": cur_regime_numeric,
             "regime_manipulation": cur_regime_manip,
+            "regime_ctx": dict(regime),
 
             # core liquidity / size
             "liq_usd": metrics["liq_usd"],
