@@ -1892,13 +1892,58 @@ async def get_wallet_tokens(wallet_pubkey: str) -> List[Dict[str, Any]]:
         return []
 
 
-async def get_sol_balance(wallet_address: str) -> float:
-    if not solana_client:
-        return 0.0
+# --- SOL balance helper (patched) -----------------------------------------
+async def get_sol_balance(pubkey) -> float:
+    """
+    Return the SOL balance (in SOL) for a given pubkey.
+
+    This version directly calls the RPC and works with both Solders Pubkey
+    objects and string addresses. It should never raise; on error it logs
+    and returns 0.0.
+    """
+    # Local imports so we don't depend on global import ordering
+    from solana.rpc.async_api import AsyncClient
+    from solders.pubkey import Pubkey
+    import os
+
     try:
-        res = await solana_client.get_balance(PublicKey.from_string(wallet_address))
-        return (res.value or 0) / 1e9
-    except Exception:
+        # Accept either a Pubkey or a base58 string
+        if isinstance(pubkey, str):
+            pk = Pubkey.from_string(pubkey)
+        else:
+            pk = pubkey
+
+        # Prefer module-level RPC_URL, then env var, then mainnet default
+        url = globals().get("RPC_URL") or os.environ.get("RPC_URL") \
+            or "https://api.mainnet-beta.solana.com"
+
+        async with AsyncClient(url) as client:
+            resp = await client.get_balance(pk)
+
+        # solana-py >= 0.30 returns a dataclass with .value
+        lamports = getattr(resp, "value", None)
+
+        # Fallbacks for any older/different response shape
+        if lamports is None:
+            try:
+                lamports = resp["result"]["value"]  # dict-like
+            except Exception:
+                try:
+                    lamports = resp.get("result", {}).get("value")
+                except Exception:
+                    if "log" in globals():
+                        log.error(
+                            "get_sol_balance: unexpected RPC response %r", resp
+                        )
+                    return 0.0
+
+        return float(lamports) / 1_000_000_000.0
+
+    except Exception as e:
+        if "log" in globals():
+            log.error("get_sol_balance error: %s", e)
+        else:
+            print("get_sol_balance error:", e)
         return 0.0
 
 
