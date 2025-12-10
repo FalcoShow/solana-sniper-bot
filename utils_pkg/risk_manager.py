@@ -1,4 +1,3 @@
-# utils_pkg/risk_manager.py
 from __future__ import annotations
 
 """
@@ -39,7 +38,7 @@ Central portfolio risk brain. Single source of truth for:
         - optional equity floor guardrail (RISK_MIN_EQUITY_USD)
         - optional sandbox mode (RISK_SANDBOX_MODE) for low-risk live testing
         - optional synthetic equity override (RISK_EQUITY_OVERRIDE_USD)
-        - NEW: trading-window gating (UTC hours + allowed weekdays)
+        - trading-window gating (UTC hours + allowed weekdays)
 
   • How we compress performance + regime + plan → capacity
         - winrate-20
@@ -66,12 +65,11 @@ Central portfolio risk brain. Single source of truth for:
         - consecutive-loss & DD-based cooldown management
         - daily trades counter (for RISK_MAX_DAILY_TRADES)
 
-  • Optional legacy per-position exit guardrail (non-AI path):
-        - trailing/stop-loss
-        - target profit
-        - max-hold
-        - Jupiter sell + reinvest + self-learning closure hook
-
+  • Optional legacy per-position exit guardrail:
+        - trailing/stop-loss / target profit / max-hold *advisory alerts*
+        - NOTE: in the V3+++ stack, actual sells are executed by
+          `ai_sell_logic` / `exit_engine`. The guardrail here is an
+          extra *alerting* layer, not a direct seller.
 
 Public API
 ----------
@@ -98,6 +96,10 @@ Public API
   # High-level diagnostics:
   async risk_health(redis=None) -> dict   # aggregate risk_snapshot + entry_gate_debug
 
+  # Loops:
+  async monitor_positions_loop(...)
+  async risk_manager_loop(stop_evt)
+
   # Extra helpers for ops / dashboards:
   async set_manual_block(on: bool = True, redis=None) -> None
   async clear_manual_block(redis=None) -> None
@@ -105,23 +107,21 @@ Public API
   async force_risk_mode(mode: int | None, redis=None) -> None
   async set_risk_profile_override(profile: str | None, redis=None) -> None
 
-Background loops
-----------------
-  async monitor_positions_loop(...)
-  async risk_manager_loop(stop_evt)
-
 All other modules (Strategy, scanners, ai_entry_logic, ai_buy_scoring,
 self_learning_ai_strategy, reinvestor, ai_sell_logic, exit_engine)
-should treat THIS as the canonical risk brain.
+should treat THIS as the canonical risk brain for sizing / gating.
 """
 
 import asyncio
+import contextlib
+import json
 import logging
 import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple, List
+from utils_pkg.ai_risk_model import predict_capacity_adjustment
 
 # Optional standalone redis client (fallback if core_utils.redis is None)
 try:  # pragma: no cover – optional dependency
@@ -146,7 +146,7 @@ from utils_pkg.self_learning_ai_strategy import (
 from utils_pkg.core_utils import (
     get_token_price,             # returns USD price from Dexscreener/Birdeye
     get_wallet_tokens,           # wallet SPL tokens
-    swap_token_jupiter,          # Jupiter-based swap helper
+    swap_token_jupiter,          # Jupiter-based swap helper (used by other modules primarily)
     convert_sol_to_usd_amount,   # SOL amount -> USD
     send_telegram,
     log_to_notion,
@@ -241,7 +241,7 @@ def _env_str(key: str, default: str = "") -> str:
     return os.getenv(key, default).strip()
 
 
-# ---- Legacy per-position exit knobs (kept for backward compat) ----
+# ---- Legacy per-position exit knobs (kept for backward compat / advisory alerts) ----
 
 TRAILING_STOP_ENABLED = _env_bool("TRAILING_STOP_ENABLED", True)
 DEFAULT_STOP_LOSS_PERCENT = _env_float("STOP_LOSS_PERCENT", 12.0)
@@ -382,6 +382,8 @@ RISK_CAPACITY_TICKET_EXP_BASE = _env_float("RISK_CAPACITY_TICKET_EXP", 0.9)
 EQUITY_KILL_SWITCH_DD_PCT = _env_float("EQUITY_KILL_SWITCH_DD_PCT", 0.0)  # 0 = disabled
 
 # Whether legacy per-position selling from this file is enabled
+# NOTE: in V3+++, this only controls *advisory alerts* in handle_position /
+# monitor_positions_loop. Actual sells are done by ai_sell_logic / exit_engine.
 RISK_LEGACY_SELL_ENABLED = _env_bool("RISK_LEGACY_SELL_ENABLED", True)
 
 # Consecutive-loss cooldown: after N losses in a row, block new entries for X minutes
@@ -445,7 +447,7 @@ RISK_KELLY_DEFAULT_R = _env_float("RISK_KELLY_DEFAULT_R", 1.5)     # avg win/los
 RISK_KELLY_MAX_FRACTION = _env_float("RISK_KELLY_MAX_FRACTION", 0.05)
 RISK_KELLY_MIN_FRACTION = _env_float("RISK_KELLY_MIN_FRACTION", 0.005)
 
-# NEW: Trading window controls (UTC-based)
+# Trading window controls (UTC-based)
 RISK_TRADING_WINDOW_ENABLED = _env_bool("RISK_TRADING_WINDOW_ENABLED", False)
 RISK_TRADING_START_HOUR_UTC = _env_int("RISK_TRADING_START_HOUR_UTC", 0)   # [0, 23]
 RISK_TRADING_END_HOUR_UTC = _env_int("RISK_TRADING_END_HOUR_UTC", 24)      # [0, 24], end-exclusive
@@ -454,7 +456,10 @@ RISK_TRADING_DAYS = _env_str(
     "",  # empty = all days; otherwise comma-separated: "mon,tue,wed,fri" or "0,1,2,3,4"
 ).lower()
 
-# Local cooldowns for sell alerts per-mint (in-memory only)
+# Risk manager loop cadence (for keeping risk:ctx fresh)
+RISK_MANAGER_LOOP_INTERVAL = _env_int("RISK_MANAGER_LOOP_INTERVAL_SEC", 5)
+
+# Local cooldowns for sell/guardrail alerts per-mint (in-memory only)
 _COOLDOWNS: Dict[str, float] = {}
 
 # Track last broadcast risk_mode to avoid spammy alerts
@@ -609,6 +614,25 @@ def _trading_window_status() -> Tuple[bool, str]:
             return False, f"hour {hour} outside overnight window {start}→{end} UTC"
 
     return True, "within_trading_window"
+
+
+def _cooldown_key(token: str) -> str:
+    return str(token)
+
+
+def _alert_ok(token: str) -> bool:
+    """
+    In-memory per-token cooldown for Telegram alerts to avoid spam.
+    """
+    if ALERT_COOLDOWN_SECONDS <= 0:
+        return True
+    key = _cooldown_key(token)
+    now = _now_ts()
+    until = _COOLDOWNS.get(key)
+    if until is not None and until > now:
+        return False
+    _COOLDOWNS[key] = now + ALERT_COOLDOWN_SECONDS
+    return True
 
 
 # ============================================================================ #
@@ -1681,7 +1705,7 @@ async def current_limits(redis=None) -> Dict[str, Any]:
 
     capacity_raw = _clamp(capacity_raw + ai_capacity_delta, 0.0, 1.0)
 
-    # NEW: apply regime_gate_factor as final pre-mode gate on capacity
+    # Apply regime_gate_factor as final pre-mode gate on capacity
     capacity_raw = _clamp(capacity_raw * regime_gate_factor, 0.0, 1.0)
 
     capacity, risk_mode, override_mode, halt_reason = await _risk_mode_with_override(
@@ -1717,9 +1741,6 @@ async def current_limits(redis=None) -> Dict[str, Any]:
         max_conc = min(max_conc, 1)
 
     # --- Equity utilization guardrail (quant-style sanity) --- #
-    # If equity is non-zero, ensure ticket * max_conc doesn’t exceed the
-    # configured fraction of equity. This is a *soft clamp* which scales
-    # ticket (and daily_spend) down if needed.
     equity_utilization_pct = 0.0
     if equity > 0 and max_conc > 0:
         potential_notional = ticket * max_conc
@@ -1727,7 +1748,6 @@ async def current_limits(redis=None) -> Dict[str, Any]:
         if max_notional > 0 and potential_notional > max_notional:
             scale = max_notional / potential_notional
             ticket *= max(0.0, scale)
-            # Also don’t let daily spend exceed that upper budget
             daily_spend_usd = min(daily_spend_usd, max_notional)
         equity_utilization_pct = min(
             100.0,
@@ -2312,6 +2332,18 @@ async def note_trade_result(
         except Exception:
             pass
 
+        # 8) Self-learning strategy hook (best-effort)
+        try:
+            await process_trade_closure(
+                token_address=token_address,
+                profit_usd=profit_usd,
+                equity_after_usd=equity_after_usd,
+                meta=meta or {},
+                redis=redis,
+            )
+        except Exception:
+            pass
+
     except Exception as e:
         logger.warning("[RISK] note_trade_result failed for %s: %s", token_address, e)
 
@@ -2338,7 +2370,8 @@ async def should_allow_new_entry(redis=None) -> bool:
       - strategy HARD_HALT flag
       - strategy plan hard-stop when far ahead of plan (optional)
       - regime_state hard risk_off flag
-      - NEW: trading window closed (UTC hours + weekdays)
+      - trading window closed (UTC hours + weekdays)
+      - NEW: concurrency guard (open_positions >= max_concurrent)
 
     NOTE: Regime / performance are already reflected in ticket size & concurrency
     via current_limits(), not here.
@@ -2361,6 +2394,23 @@ async def should_allow_new_entry(redis=None) -> bool:
     daily_spend = limits["daily_spend_usd"]
     risk_mode = limits.get("risk_mode", 1)
     capacity = float(limits.get("risk_capacity", 1.0))
+    max_conc = int(limits.get("max_concurrent", 0))
+
+    # NEW: hard concurrency guard (belt + suspenders with Strategy semaphore)
+    open_positions = 0
+    try:
+        positions = load_positions()
+        open_positions = len(positions) if positions else 0
+    except Exception:
+        open_positions = 0
+
+    if max_conc > 0 and open_positions >= max_conc:
+        logger.info(
+            "[RISK] open_positions=%d ≥ max_concurrent=%d -> blocking new entries",
+            open_positions,
+            max_conc,
+        )
+        return False
 
     # Also pull strategy for balance floor, plan, and HARD_HALT
     try:
@@ -2520,7 +2570,6 @@ async def should_allow_new_entry(redis=None) -> bool:
 
     return True
 
-
 async def entry_gate_debug(redis=None) -> Dict[str, Any]:
     """
     Debug helper: run the same gating logic as should_allow_new_entry(), but
@@ -2530,6 +2579,12 @@ async def entry_gate_debug(redis=None) -> Dict[str, Any]:
       - scripts/diagnostics.py
       - healthcheck endpoints
       - "why am I seeing no buys?" Telegram debugging
+
+    NEW (V3+++ upgrade):
+      - Includes concurrency context:
+            • open_positions
+            • max_concurrent
+            • positions_open_ge_max (bool)
     """
     if redis is None:
         redis = await _get_redis()
@@ -2543,6 +2598,8 @@ async def entry_gate_debug(redis=None) -> Dict[str, Any]:
     spent_usd = 0.0
     sol_balance = 0.0
     trades_today = 0
+    open_positions = 0
+    positions_open_ge_max = False
 
     # Active risk profile (for debug)
     profile_name, _profile_cfg = await _effective_risk_profile(redis)
@@ -2553,6 +2610,20 @@ async def entry_gate_debug(redis=None) -> Dict[str, Any]:
     daily_spend_cap = float(limits["daily_spend_usd"])
     risk_mode = int(limits.get("risk_mode", 1))
     capacity = float(limits.get("risk_capacity", 1.0))
+    max_conc = int(limits.get("max_concurrent", 0))
+
+    # NEW: observe current open positions vs max_concurrent
+    try:
+        positions = load_positions()
+        open_positions = len(positions) if positions else 0
+    except Exception:
+        open_positions = 0
+
+    if max_conc > 0 and open_positions >= max_conc:
+        positions_open_ge_max = True
+        reasons.append(
+            f"open_positions {open_positions} ≥ max_concurrent {max_conc}"
+        )
 
     # Strategy params
     try:
@@ -2726,6 +2797,10 @@ async def entry_gate_debug(redis=None) -> Dict[str, Any]:
         "trading_window_open": bool(trading_window_open),
         "trading_window_reason": tw_reason,
         "risk_engine_version": RISK_ENGINE_VERSION,
+        # NEW: concurrency context
+        "open_positions": int(open_positions),
+        "max_concurrent": int(max_conc),
+        "positions_open_ge_max": bool(positions_open_ge_max),
     }
 
 
@@ -2813,7 +2888,7 @@ async def risk_snapshot(redis=None) -> Dict[str, Any]:
     plan_gap_pct = float(strat_params.get("PLAN_GAP_PCT", 0.0))
     plan_status = strat_params.get("PLAN_STATUS")
 
-    # NEW: self-learning caps for visibility
+    # Self-learning caps for visibility
     strat_daily_spend_cap_pct = float(strat_params.get("DAILY_SPEND_CAP_PCT", 0.0))
     strat_daily_spend_cap_usd = float(strat_params.get("DAILY_SPEND_CAP_USD", 0.0))
     try:
@@ -2944,281 +3019,244 @@ async def risk_snapshot(redis=None) -> Dict[str, Any]:
 
 
 # ============================================================================ #
-# Sell-side logic (per-position legacy guardrail)
+# Sell-side logic (per-position legacy guardrail — ADVISORY ONLY)
 # ============================================================================ #
 
-def _cooldown_ok(mint: str) -> bool:
-    last = _COOLDOWNS.get(mint, 0.0)
-    now = _now_ts()
-    if now - last >= ALERT_COOLDOWN_SECONDS:
-        _COOLDOWNS[mint] = now
-        return True
-    return False
-
-
-async def _find_wallet_token_balance(mint: str) -> float:
-    if not WALLET_PUBKEY:
-        logger.warning("WALLET_PUBKEY not set; cannot query wallet token balances.")
-        return 0.0
-    try:
-        tokens = await get_wallet_tokens(WALLET_PUBKEY)
-        for t in tokens or []:
-            if t.get("mint") == mint:
-                return float(t.get("balance", 0.0))
-    except Exception as e:
-        logger.warning("get_wallet_tokens failed: %s", e)
-    return 0.0
-
-
-def _parse_buy_time(position: Dict[str, Any]) -> Optional[datetime]:
-    ts = position.get("timestamp")
-    if not ts:
-        return None
-    try:
-        ts_norm = str(ts).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(ts_norm)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
-
-
-async def _token_price_in_sol(token_address: str) -> float:
+def _position_age_minutes(position: Dict[str, Any], now: Optional[datetime] = None) -> float:
     """
-    Convert token USD price to SOL-based price, so we stay consistent with
-    older positions that stored buy_price in SOL.
-
-    token_price_sol = token_price_usd / sol_usd
+    Best-effort position age in minutes, given heterogeneous timestamp formats.
     """
-    try:
-        px_usd = await get_token_price(token_address)
-        if px_usd <= 0:
-            return 0.0
-        sol_usd = await convert_sol_to_usd_amount(1.0)
-        if sol_usd <= 0:
-            return 0.0
-        return px_usd / sol_usd
-    except Exception:
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    ts_raw = (
+        position.get("opened_at")
+        or position.get("open_time")
+        or position.get("timestamp")
+        or position.get("ts")
+    )
+    if ts_raw is None:
         return 0.0
 
-
-async def _sell_all_token(
-    mint: str,
-    token_balance: float,
-    slippage: float,
-) -> Tuple[bool, str]:
-    if token_balance <= 0:
-        return False, ""
+    dt: Optional[datetime] = None
     try:
-        ok, tx_sig = await swap_token_jupiter(
-            mint,
-            SOL_MINT,
-            amount_float=token_balance,
-            buy=False,
-            slippage=slippage,
+        if isinstance(ts_raw, (int, float)):
+            dt = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
+        elif isinstance(ts_raw, str):
+            # try ISO, else numeric
+            try:
+                dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except Exception:
+                dt = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
+    except Exception:
+        dt = None
+
+    if dt is None:
+        return 0.0
+
+    return max(0.0, (now - dt).total_seconds() / 60.0)
+
+
+async def _position_pnl(
+    position: Dict[str, Any],
+    *,
+    px_usd: Optional[float] = None,
+) -> Tuple[float, float, float]:
+    """
+    Best-effort (value_now_usd, entry_usd, pnl_pct).
+
+    Uses:
+      - amount * get_token_price
+      - entry_value_usd / notional_usd / initial_notional_usd, or
+      - amount * entry_price_usd, or
+      - falls back to "flat" (pnl=0) if we can't infer.
+    """
+    mint = (
+        position.get("mint")
+        or position.get("token_address")
+        or position.get("token")
+        or position.get("address")
+    )
+    amount = float(position.get("amount") or position.get("size") or 0.0)
+    if not mint or amount <= 0:
+        return 0.0, 0.0, 0.0
+
+    if px_usd is None:
+        try:
+            px_usd = await get_token_price(mint)
+        except Exception:
+            px_usd = 0.0
+    if px_usd is None or px_usd <= 0:
+        return 0.0, 0.0, 0.0
+
+    value_now = amount * float(px_usd)
+
+    entry_usd = float(
+        position.get("entry_value_usd")
+        or position.get("notional_usd")
+        or position.get("initial_notional_usd")
+        or 0.0
+    )
+    if entry_usd <= 0:
+        # attempt to infer from entry_price_usd
+        entry_px = float(
+            position.get("entry_price_usd")
+            or position.get("entry_price")
+            or position.get("entry")
+            or 0.0
         )
-        return ok, tx_sig
-    except TypeError:
-        # fallback to older signature
-        ok, tx_sig = await swap_token_jupiter(
-            mint,
-            SOL_MINT,
-            token_balance,
-            False,
-            slippage,
-        )
-        return ok, tx_sig
+        if entry_px > 0:
+            entry_usd = entry_px * amount
+
+    if entry_usd <= 0:
+        # Can't estimate – treat as flat to avoid bogus signals
+        return value_now, value_now, 0.0
+
+    pnl_usd = value_now - entry_usd
+    pnl_pct = (pnl_usd / entry_usd) * 100.0 if entry_usd > 0 else 0.0
+    return value_now, entry_usd, pnl_pct
 
 
 async def handle_position(
-    token_address: str,
     position: Dict[str, Any],
+    *,
     redis=None,
-) -> None:
+    now: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
     """
-    Core per-position risk logic (legacy, non-AI path):
+    Legacy per-position guardrail (ADVISORY ONLY in V3+++).
 
-      - trailing stop maintenance
-      - stop-loss / target-profit / max-hold exits
-      - sell via Jupiter
-      - metrics + PnL logging + reinvest queue
-      - self-learning strategy closure hook
+    What it does:
+      - Computes PnL% and age for the position.
+      - Evaluates simple thresholds:
+            • hard stop-loss (DEFAULT_STOP_LOSS_PERCENT)
+            • target profit (DEFAULT_TARGET_PROFIT_PERCENT)
+            • max hold (DEFAULT_MAX_HOLD_MINUTES)
+      - If a trigger hits, sends a Telegram alert + structured log_event.
 
-    RISK_LEGACY_SELL_ENABLED can be set to 0/false to effectively turn this
-    off and let utils_pkg.exit_engine + ai_sell_logic handle all exits.
+    What it does *NOT* do:
+      - It does NOT execute a sell or mutate positions.
+      - It does NOT call Jupiter directly.
+
+    Actual sells should be driven by:
+      - ai_sell_logic / exit_engine
+      - or your own higher-level exit engine.
+
+    Return:
+      - dict with advisory info if a guardrail fired, else None.
     """
     if not RISK_LEGACY_SELL_ENABLED:
-        return
+        return None
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    mint = (
+        position.get("mint")
+        or position.get("token_address")
+        or position.get("token")
+        or position.get("address")
+    )
+    if not mint:
+        return None
+
+    symbol = (
+        position.get("symbol")
+        or position.get("sym")
+        or str(mint)[:6]
+    )
+
+    # Config (allow per-position overrides)
+    sl_pct = float(
+        position.get("stop_loss_pct")
+        or position.get("sl_pct")
+        or DEFAULT_STOP_LOSS_PERCENT
+    )
+    tp_pct = float(
+        position.get("take_profit_pct")
+        or position.get("tp_pct")
+        or DEFAULT_TARGET_PROFIT_PERCENT
+    )
+    max_hold_min = int(
+        position.get("max_hold_minutes")
+        or position.get("max_hold_min")
+        or DEFAULT_MAX_HOLD_MINUTES
+    )
+
+    # Compute age & pnl
+    age_min = _position_age_minutes(position, now)
+    px_usd = None
+    try:
+        px_usd = await get_token_price(mint)
+    except Exception:
+        px_usd = None
+
+    value_now, entry_usd, pnl_pct = await _position_pnl(position, px_usd=px_usd)
+
+    if entry_usd <= 0 or value_now <= 0:
+        # Not enough info to make a meaningful guardrail call
+        return None
+
+    # Decide if any guardrail should *advise* an exit
+    reason: Optional[str] = None
+    # Priority: deep loss > big win > max-hold
+    if sl_pct > 0 and pnl_pct <= -abs(sl_pct):
+        reason = f"stop_loss_{sl_pct:.1f}%"
+    elif tp_pct > 0 and pnl_pct >= tp_pct:
+        reason = f"target_profit_{tp_pct:.1f}%"
+    elif max_hold_min > 0 and age_min >= max_hold_min:
+        reason = f"max_hold_{max_hold_min}min"
+
+    if reason is None:
+        return None
+
+    # Cooldown to avoid spammy alerts
+    if not _alert_ok(mint):
+        return None
+
+    advisory = {
+        "mint": mint,
+        "symbol": symbol,
+        "reason": reason,
+        "age_min": float(age_min),
+        "pnl_pct": float(pnl_pct),
+        "value_now_usd": float(value_now),
+        "entry_usd": float(entry_usd),
+        "ts": now.isoformat(),
+    }
+
+    # Telegram + structured log
+    try:
+        msg = (
+            "⚠️ *LEGACY GUARDRAIL ADVISORY*\n"
+            f"• {symbol} ({mint[:6]}…)\n"
+            f"• reason: `{reason}`\n"
+            f"• pnl: {pnl_pct:.2f}%  (now ${value_now:.2f}, entry ${entry_usd:.2f})\n"
+            f"• age: {age_min:.1f} min\n"
+            "_Note: advisory only — actual exit via ai_sell_logic / exit_engine._"
+        )
+        await send_telegram(msg)
+    except Exception:
+        pass
 
     try:
-        if redis is None:
-            redis = await _get_redis()
-
-        params = await get_strategy_params(redis)
-        stop_loss_pct = float(
-            params.get("STOP_LOSS_PERCENT", DEFAULT_STOP_LOSS_PERCENT)
+        await log_event(
+            "legacy_guardrail_advisory",
+            {
+                "mint": mint,
+                "symbol": symbol,
+                "reason": reason,
+                "age_min": age_min,
+                "pnl_pct": pnl_pct,
+                "value_now_usd": value_now,
+                "entry_usd": entry_usd,
+                "sandbox_mode": RISK_SANDBOX_MODE,
+            },
         )
-        target_profit_pct = float(
-            params.get("TARGET_PROFIT_PERCENT", DEFAULT_TARGET_PROFIT_PERCENT)
-        )
-        max_hold_minutes = int(
-            params.get("MAX_HOLD_TIME_MINUTES", DEFAULT_MAX_HOLD_MINUTES)
-        )
-        slippage = float(params.get("SLIPPAGE", DEFAULT_SLIPPAGE))
-        trailing_on = bool(
-            params.get("TRAILING_STOP_ENABLED", TRAILING_STOP_ENABLED)
-        )
+    except Exception:
+        pass
 
-        buy_price = float(position.get("buy_price", 0.0))  # price in SOL-equivalent
-        if buy_price <= 0:
-            return
-
-        # Price in SOL-equivalent using USD+SOL conversions
-        current_price = await _token_price_in_sol(token_address)
-        if current_price <= 0:
-            return
-
-        # Maintain trailing stop on new highs
-        trailing_stop = float(
-            position.get(
-                "trailing_stop",
-                buy_price * (1 - stop_loss_pct / 100.0),
-            )
-        )
-        if trailing_on and current_price > buy_price:
-            new_trailing = current_price * (1 - stop_loss_pct / 100.0)
-            if new_trailing > trailing_stop:
-                trailing_stop = new_trailing
-                position["trailing_stop"] = trailing_stop
-                save_position(token_address, position)
-                logger.info(
-                    "[TSL] %s raised trailing_stop -> %.10f",
-                    token_address,
-                    trailing_stop,
-                )
-
-        pct_change = ((current_price - buy_price) / buy_price) * 100.0
-        buy_dt = _parse_buy_time(position)
-        hold_minutes = 0.0
-        if buy_dt:
-            hold_minutes = (
-                datetime.now(timezone.utc) - buy_dt
-            ).total_seconds() / 60.0
-
-        # Exit checks
-        do_sell = False
-        reason = ""
-
-        if current_price <= trailing_stop:
-            do_sell = True
-            reason = f"Trailing/Stop-Loss hit (≤ {stop_loss_pct:.1f}%)"
-
-        if (not do_sell) and target_profit_pct > 0 and pct_change >= target_profit_pct:
-            do_sell = True
-            reason = f"Target profit reached (≥ {target_profit_pct:.1f}%)"
-
-        if (not do_sell) and max_hold_minutes > 0 and hold_minutes >= max_hold_minutes:
-            do_sell = True
-            reason = f"Max hold time exceeded ({hold_minutes:.0f}m)"
-
-        # If no sell trigger or alert cooldown not satisfied, bail
-        if not do_sell or not _cooldown_ok(token_address):
-            return
-
-        token_balance = await _find_wallet_token_balance(token_address)
-        if token_balance <= 0:
-            logger.info(
-                "[SELL] %s: no wallet balance; assuming already sold.",
-                token_address,
-            )
-            remove_position(token_address)
-            return
-
-        ok, tx_sig = await _sell_all_token(token_address, token_balance, slippage)
-        if not ok:
-            logger.warning("[SELL] Jupiter sell failed for %s", token_address)
-            return
-
-        # Price is in SOL-equivalent; convert everything to USD for metrics
-        proceeds_sol = token_balance * current_price
-        usd_proceeds = await convert_sol_to_usd_amount(proceeds_sol)
-        sol_usd_1 = await convert_sol_to_usd_amount(1.0)
-        profit_usd = (
-            (current_price - buy_price)
-            * token_balance
-            * float(sol_usd_1 or 0.0)
-        )
-
-        # Alerts / Notion log
-        await send_telegram(
-            f"🔴 Sold {token_address[:6]}… — {reason}\n"
-            f"• Δ {pct_change:+.2f}%  • Proceeds ≈ {proceeds_sol:.4f} SOL (${usd_proceeds:.2f})\n"
-            f"• Entry {buy_price:.10f} → Exit {current_price:.10f}\n"
-            f"• Tx: {tx_sig}"
-        )
-        try:
-            await log_to_notion(
-                token=token_address,
-                symbol=token_address[:6],
-                balance=token_balance,
-                entry=buy_price,
-                current=current_price,
-                profit=(current_price - buy_price) * token_balance,
-                reason=reason,
-            )
-        except Exception:
-            pass
-
-        # Self-learning strategy closure hook
-        try:
-            sell_time = datetime.now(timezone.utc)
-            await process_trade_closure(
-                token_address=token_address,
-                buy_price=buy_price,
-                sell_price=current_price,
-                amount=token_balance,
-                partial=False,
-                timestamp=sell_time.isoformat(),
-            )
-        except Exception as e:
-            logger.debug("process_trade_closure failed: %s", e)
-
-        # Metrics & realized PnL via central hook
-        try:
-            await note_trade_result(
-                token_address,
-                profit_usd=float(profit_usd),
-                equity_after_usd=None,  # let note_trade_result recompute
-                meta={
-                    "symbol": token_address[:6],
-                    "amount": token_balance,
-                    "entry": buy_price,
-                    "exit": current_price,
-                    "reason": reason,
-                },
-                redis=redis,
-            )
-        except Exception:
-            pass
-
-        remove_position(token_address)
-
-        # Queue reinvestment (do local import to avoid circulars)
-        try:
-            from utils_pkg import reinvestor as _reinvestor  # type: ignore
-            await _reinvestor.queue_reinvest(
-                proceeds_sol,
-                meta={
-                    "from": "risk_manager",
-                    "reason": reason,
-                    "pct_change": pct_change,
-                },
-                redis=redis,
-            )
-        except Exception as e:
-            logger.warning("Queue reinvest failed: %s", e)
-
-    except Exception as e:
-        logger.error("[RISK] Error handling %s: %s", token_address, e, exc_info=True)
+    return advisory
 
 
 # ============================================================================ #
@@ -3226,82 +3264,97 @@ async def handle_position(
 # ============================================================================ #
 
 async def monitor_positions_loop(
+    *,
     redis=None,
-    interval: Optional[int] = None,
     stop_evt: Optional[asyncio.Event] = None,
+    interval_sec: Optional[int] = None,
 ) -> None:
     """
-    Generic monitor loop (can be used standalone).
+    Background loop that monitors open positions and runs the legacy guardrail.
 
-    If stop_evt is provided, exits when stop_evt.is_set().
+    In V3+++:
+      - This loop is *optional* and only emits advisory alerts via Telegram /
+        data_logger when RISK_LEGACY_SELL_ENABLED=1.
+      - It does NOT execute sells. ai_sell_logic / exit_engine are the primary
+        exit engines.
+
+    Recommended:
+      - Enable when you want an extra "seatbelt" of alerts if a position is
+        sitting in a big loss for too long, etc.
+      - Disable via RISK_LEGACY_SELL_ENABLED=0 if all exits are 100% AI-based.
     """
+    if interval_sec is None:
+        interval_sec = POSITION_CHECK_INTERVAL
+
     if redis is None:
         redis = await _get_redis()
-    sleep_s = int(interval or POSITION_CHECK_INTERVAL)
-    logger.info("📊 Risk monitor started (interval=%ss, sandbox=%s, engine=%s)",
-                sleep_s, RISK_SANDBOX_MODE, RISK_ENGINE_VERSION)
-    while True:
-        if stop_evt is not None and stop_evt.is_set():
-            logger.info("📊 Risk monitor stopping on stop_evt.")
-            break
+
+    if not RISK_LEGACY_SELL_ENABLED:
+        logger.info("[RISK] monitor_positions_loop: RISK_LEGACY_SELL_ENABLED=0 → no-op")
+        # Keep loop alive but don't do per-position scans
+        while not (stop_evt and stop_evt.is_set()):
+            await asyncio.sleep(interval_sec)
+        return
+
+    logger.info("[RISK] monitor_positions_loop started (interval=%ss)", interval_sec)
+
+    while not (stop_evt and stop_evt.is_set()):
         try:
             positions = load_positions()
-            if positions and RISK_LEGACY_SELL_ENABLED:
-                await asyncio.gather(
-                    *(
-                        handle_position(mint, pos, redis=redis)
-                        for mint, pos in positions.items()
-                    )
-                )
         except Exception as e:
-            logger.error("[RISK] monitor loop error: %s", e, exc_info=True)
-        await asyncio.sleep(sleep_s)
+            logger.warning("[RISK] monitor_positions_loop: load_positions failed: %s", e)
+            positions = []
+
+        now = datetime.now(timezone.utc)
+
+        for pos in positions or []:
+            try:
+                await handle_position(pos, redis=redis, now=now)
+            except Exception as e:
+                logger.warning(
+                    "[RISK] monitor_positions_loop: handle_position failed: %s", e
+                )
+
+        await asyncio.sleep(interval_sec)
+
+    logger.info("[RISK] monitor_positions_loop stopped")
 
 
 async def risk_manager_loop(stop_evt: asyncio.Event) -> None:
     """
-    Entry point used by scripts/main.py:
+    Master risk loop.
 
-        from utils_pkg.risk_manager import risk_manager_loop
-        ...
-        asyncio.create_task(risk_manager_loop(stop_evt), name="risk.manager")
-
-    Thin wrapper around monitor_positions_loop with its own poll interval knob.
-    It also refreshes `current_limits` periodically so the risk:ctx hash stays
-    hot even when there are no open positions.
+    Responsibilities:
+      - Periodically recompute `current_limits()` to keep risk:ctx fresh for
+        scanners / AI modules / dashboards.
+      - Optionally run `monitor_positions_loop` in the background for legacy
+        per-position guardrail advisories.
     """
-    poll = float(os.getenv("RISK_MANAGER_POLL_SEC", str(POSITION_CHECK_INTERVAL)))
     redis = await _get_redis()
-    logger.info("📊 risk_manager_loop started (poll=%ss, sandbox=%s, engine=%s)",
-                poll, RISK_SANDBOX_MODE, RISK_ENGINE_VERSION)
-    while not stop_evt.is_set():
-        try:
-            # 1) keep risk context updated (even if no new entries)
+    interval = max(1, int(RISK_MANAGER_LOOP_INTERVAL))
+
+    monitor_task: Optional[asyncio.Task] = None
+    if RISK_LEGACY_SELL_ENABLED:
+        monitor_task = asyncio.create_task(
+            monitor_positions_loop(redis=redis, stop_evt=stop_evt)
+        )
+
+    logger.info("[RISK] risk_manager_loop started (interval=%ss)", interval)
+
+    try:
+        while not stop_evt.is_set():
             try:
                 await current_limits(redis)
-            except Exception:
-                pass
-
-            # 2) legacy per-position guardrail
-            positions = load_positions()
-            if positions and RISK_LEGACY_SELL_ENABLED:
-                await asyncio.gather(
-                    *(
-                        handle_position(mint, pos, redis=redis)
-                        for mint, pos in positions.items()
-                    )
-                )
-        except Exception as e:
-            logger.error("[RISK] risk_manager_loop error: %s", e, exc_info=True)
-
-        # Sleep in small chunks so we respond promptly to stop_evt
-        remaining = poll
-        while remaining > 0 and not stop_evt.is_set():
-            step = min(remaining, 1.0)
-            await asyncio.sleep(step)
-            remaining -= step
-    logger.info("📊 risk_manager_loop exiting (stop_evt set, sandbox=%s, engine=%s).",
-                RISK_SANDBOX_MODE, RISK_ENGINE_VERSION)
+            except Exception as e:
+                logger.warning("[RISK] risk_manager_loop: current_limits failed: %s", e)
+            await asyncio.sleep(interval)
+    finally:
+        logger.info("[RISK] risk_manager_loop stopping")
+        if monitor_task:
+            monitor_task.cancel()
+            with contextlib.suppress(Exception):
+                await monitor_task
+        logger.info("[RISK] risk_manager_loop stopped")
 
 
 # ============================================================================ #
@@ -3310,7 +3363,9 @@ async def risk_manager_loop(stop_evt: asyncio.Event) -> None:
 
 async def set_manual_block(on: bool = True, redis=None) -> None:
     """
-    Set or clear the global manual entry block (risk:manual_block).
+    Turn the manual block on/off (risk:manual_block).
+
+    When ON (1), should_allow_new_entry() will hard-block new entries.
     """
     if redis is None:
         redis = await _get_redis()
@@ -3321,20 +3376,25 @@ async def set_manual_block(on: bool = True, redis=None) -> None:
             await redis.set(RISK_MANUAL_BLOCK_KEY, "1")
         else:
             await redis.delete(RISK_MANUAL_BLOCK_KEY)
+        await log_event(
+            "risk_manual_block",
+            {"on": bool(on)},
+        )
     except Exception:
         pass
 
 
 async def clear_manual_block(redis=None) -> None:
     """
-    Convenience wrapper around set_manual_block(False).
+    Convenience wrapper: clear manual block.
     """
-    await set_manual_block(False, redis=redis)
+    await set_manual_block(on=False, redis=redis)
 
 
 async def clear_risk_cooldown(redis=None) -> None:
     """
-    Clear any active loss/DD cooldown (risk:cooldown_until_ts).
+    Clear any active loss/DD-based cooldown so entries are immediately allowed
+    (subject to other gates).
     """
     if redis is None:
         redis = await _get_redis()
@@ -3342,14 +3402,18 @@ async def clear_risk_cooldown(redis=None) -> None:
         return
     try:
         await redis.delete(RISK_COOLDOWN_UNTIL_KEY)
+        await log_event("risk_cooldown_cleared", {})
     except Exception:
         pass
 
 
-async def force_risk_mode(mode: Optional[int], redis=None) -> None:
+async def force_risk_mode(mode: int | None, redis=None) -> None:
     """
-    Force a specific risk_mode via Redis override (0..3),
-    or clear override if mode is None.
+    Force risk_mode via OVERRIDE_MODE_KEY.
+
+      mode ∈ {0,1,2,3} or None to clear.
+
+    0 = OFF, 1 = NORMAL, 2 = AGGRESSIVE, 3 = DEFENSIVE
     """
     if redis is None:
         redis = await _get_redis()
@@ -3359,20 +3423,20 @@ async def force_risk_mode(mode: Optional[int], redis=None) -> None:
         if mode is None:
             await redis.delete(OVERRIDE_MODE_KEY)
         else:
-            if mode not in (0, 1, 2, 3):
-                raise ValueError("mode must be one of 0,1,2,3 or None")
             await redis.set(OVERRIDE_MODE_KEY, str(int(mode)))
+        await log_event(
+            "risk_mode_override",
+            {"mode": mode},
+        )
     except Exception:
         pass
 
 
-async def set_risk_profile_override(profile: Optional[str], redis=None) -> None:
+async def set_risk_profile_override(profile: str | None, redis=None) -> None:
     """
-    Override RISK_PROFILE at runtime via Redis.
+    Override RISK_PROFILE at runtime via redis, or clear override.
 
-    profile:
-      - 'conservative' / 'balanced' / 'aggressive' / 'auto'
-      - None -> clear override and fall back to env RISK_PROFILE.
+      profile ∈ {'conservative','balanced','aggressive','auto'} or None.
     """
     if redis is None:
         redis = await _get_redis()
@@ -3382,13 +3446,11 @@ async def set_risk_profile_override(profile: Optional[str], redis=None) -> None:
         if profile is None:
             await redis.delete(RISK_PROFILE_OVERRIDE_KEY)
         else:
-            p = str(profile).strip().lower()
-            if p not in (*RISK_PROFILE_CONFIG.keys(), "auto"):
-                raise ValueError(
-                    f"invalid profile {profile!r}; expected one of "
-                    f"{list(RISK_PROFILE_CONFIG.keys()) + ['auto']}"
-                )
-            await redis.set(RISK_PROFILE_OVERRIDE_KEY, p)
+            await redis.set(RISK_PROFILE_OVERRIDE_KEY, str(profile).strip().lower())
+        await log_event(
+            "risk_profile_override",
+            {"profile": profile},
+        )
     except Exception:
         pass
 
@@ -3399,25 +3461,32 @@ async def set_risk_profile_override(profile: Optional[str], redis=None) -> None:
 
 async def risk_health(redis=None) -> Dict[str, Any]:
     """
-    High-level health view for dashboards / CLI / alerts.
+    Aggregate "health" helper combining:
 
-    Combines:
-      • risk_snapshot()  → regime + limits + performance
-      • entry_gate_debug() → whether entries are allowed + reasons
+      - risk_snapshot()        → limits, performance, regime, caps
+      - entry_gate_debug()     → whether entries are allowed + reasons
+      - risk_capacity_snapshot() → compressed capacity model details
 
-    Schema:
-      {
-        "snapshot": { ... },       # output of risk_snapshot()
-        "entry_gate": { ... },     # output of entry_gate_debug()
-      }
+    Useful for:
+      - dashboards
+      - /healthcheck endpoints
+      - quick diagnostics scripts
     """
     if redis is None:
         redis = await _get_redis()
-    snap = await risk_snapshot(redis)
+
+    snapshot = await risk_snapshot(redis)
     gate = await entry_gate_debug(redis)
+    capacity = await risk_capacity_snapshot(redis)
+
+    ok = bool(gate.get("allowed", True))
+
     return {
-        "snapshot": snap,
+        "ok": ok,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "snapshot": snapshot,
         "entry_gate": gate,
+        "capacity": capacity,
     }
 
 
@@ -3426,5 +3495,12 @@ async def risk_health(redis=None) -> Dict[str, Any]:
 # ============================================================================ #
 
 if __name__ == "__main__":
-    # Standalone: python -m utils_pkg.risk_manager
-    asyncio.run(monitor_positions_loop())
+    async def _main() -> None:
+        """
+        Simple CLI debug: print aggregate risk health as JSON.
+        """
+        redis = await _get_redis()
+        health = await risk_health(redis)
+        print(json.dumps(health, indent=2, default=str))
+
+    asyncio.run(_main())

@@ -112,8 +112,8 @@ def _mask_dsn(raw: str) -> str:
 
     Examples:
         postgres://user:pass@host:5432/db  -> host:5432/db
-        postgresql://user@host/db?ssl...  -> host/db?ssl...
-        postgresql+asyncpg://user@h/db   -> h/db
+        postgresql://user@host/db?ssl...   -> host/db?ssl...
+        postgresql+asyncpg://user@h/db     -> h/db
     """
     if not raw:
         return "<empty>"
@@ -475,6 +475,13 @@ def ensure_ai_tables() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_entry_outcomes_label_ts
             ON entry_outcomes (label, ts DESC);
+            """
+        )
+        # Extra: many quant queries filter by o.ts, so index it explicitly
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_entry_outcomes_ts
+            ON entry_outcomes (ts DESC);
             """
         )
 
@@ -1861,7 +1868,7 @@ def fetch_label_distribution(
     days_back = max(1, min(int(days_back), 365))
 
     clauses: List[str] = ["o.ts >= now() - (%s::interval)"]
-    params: List[Any] = [f"{days_back} days"]
+    params: List[Any] = [f"{days_back} days"]]
 
     if src:
         clauses.append("c.src = %s")

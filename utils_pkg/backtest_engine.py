@@ -1,3 +1,4 @@
+# utils_pkg/backtest_engine.py
 from __future__ import annotations
 
 """
@@ -44,7 +45,6 @@ Core responsibilities
       - BT_LOG_EQUITY_SERIES (optional equity curve logging)
       - BT_RESULT_SEGMENT (optional: "train" / "test" segment filter)
       - BT_ALLOC_MODE (optional: "simple" | "risk_capacity")
-      - BT_REQUIRE_POSITIVE_RC   (extra RC guard, optional)
       - BT_EQUITY_INIT           (initial equity, default 1.0)
       - BT_EQUITY_CAP_MULT       (cap equity at init * multiplier; 0/None = no cap)
       - BT_START_TS / BT_END_TS  (optional time-window filter on created_at)
@@ -1684,12 +1684,12 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
             cost_pct = total_cost_bps / 100.0
             # Cost always drags returns regardless of direction
             if trade_cost_mode == "half_side":
-                # Approximate: apply half the cost per "entry/exit", still constant
-                pnl_pct -= cost_pct
-            else:
-                # per_trade: apply full round-trip cost
-                pnl_pct -= cost_pct
-            cost_sum_pct += cost_pct
+                # model roughly half the configured round-trip as effective drag
+                effective_cost = cost_pct * 0.5
+            else:  # "per_trade" (default)
+                effective_cost = cost_pct
+            pnl_pct -= effective_cost
+            cost_sum_pct += effective_cost
 
         pnl_list.append(pnl_pct)
 

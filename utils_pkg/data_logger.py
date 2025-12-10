@@ -25,7 +25,7 @@ Centralized logger for everything the bot "sees" and "does":
   • Optional extras
       - Trade executions (fills)
       - Regime snapshots (market state over time)
-      - RL episode / step markers for self_learning_ai_strategy
+      - AI events (risk halts, parameter tunes, self-learning steps)
 
 Plus ergonomic wrappers per source:
 
@@ -74,6 +74,7 @@ __all__ = [
     # optional advanced helpers (no-op if ai_db doesn’t support them)
     "log_trade_execution",
     "log_regime_snapshot",
+    "log_ai_event",
 ]
 
 # Global, shared FeatureBuilder instance (quant-grade, V3+++)
@@ -155,6 +156,10 @@ if AI_LOG_REGIME_FILTER:
 # 1.0 = log everything, 0.1 = log ~10% of candidates.
 AI_LOG_SAMPLE_RATE = _env_float("AI_LOG_SAMPLE_RATE", 1.0)
 
+# Optional: separate sampling for SKIPs (often the largest firehose).
+# Defaults to AI_LOG_SAMPLE_RATE if not explicitly set.
+AI_LOG_SAMPLE_RATE_SKIPS = _env_float("AI_LOG_SAMPLE_RATE_SKIPS", AI_LOG_SAMPLE_RATE)
+
 # Optional: if false, SKIP decisions are *not* logged via log_skip_candidate.
 AI_LOG_SKIPS = _env_bool("AI_LOG_SKIPS", True)
 
@@ -188,6 +193,10 @@ AI_LOG_STDOUT_BRIEF = _env_bool("AI_LOG_STDOUT_BRIEF", False)
 AI_LOG_EXECUTIONS = _env_bool("AI_LOG_EXECUTIONS", True)
 AI_LOG_REGIME_SNAPSHOTS = _env_bool("AI_LOG_REGIME_SNAPSHOTS", False)
 
+# Optional: hard filters at logger-level to avoid logging pure dust.
+AI_LOG_MIN_LIQ_USD = _env_float("AI_LOG_MIN_LIQ_USD", 0.0)
+AI_LOG_MIN_VOL5_USD = _env_float("AI_LOG_MIN_VOL5_USD", 0.0)
+
 
 # ============================================================================ #
 # Internal helpers
@@ -219,21 +228,23 @@ def _feature_version_for(src: str, regime: Optional[str]) -> int:
     return FEATURE_VERSION
 
 
-def _should_sample(candidate_hash: str) -> bool:
+def _should_sample(candidate_hash: str, *, rate: float) -> bool:
     """
     Deterministic sampling based on hash, so we always keep a stable slice
     of candidates when AI_LOG_SAMPLE_RATE < 1.0.
 
     This avoids needing random; you can reproduce which rows were kept.
     """
-    if AI_LOG_SAMPLE_RATE >= 0.999:
+    if rate >= 0.999:
         return True
+    if rate <= 0.0:
+        return False
     try:
         h = 0
         for ch in candidate_hash:
             h = (h * 31 + ord(ch)) & 0xFFFFFFFF
         frac = (h % 10_000) / 10_000.0
-        return frac < AI_LOG_SAMPLE_RATE
+        return frac < rate
     except Exception:
         # fallback: log it
         return True
@@ -605,11 +616,59 @@ def log_entry_candidate(
         )
         return 0
 
-    # Optional deterministic sampling
+    # Optional deterministic sampling (BUY vs SKIP can share same base hash)
     cand_hash = candidate_key or f"{src}:{regime or ''}:{mint}"
-    if not _should_sample(cand_hash):
-        log.debug("data_logger: sampled-out candidate src=%s mint=%s", src, mint)
+
+    # Hard filters on micro liquidity / micro volume if configured
+    try:
+        liq_usd = float(
+            snapshot.get("liq_usd")
+            or snapshot.get("liq")
+            or snapshot.get("liqUsd")
+            or 0.0
+        )
+    except Exception:
+        liq_usd = 0.0
+
+    try:
+        vol5_usd = float(
+            snapshot.get("vol_5m_usd")
+            or snapshot.get("vol5")
+            or snapshot.get("volume_5m_usd")
+            or 0.0
+        )
+    except Exception:
+        vol5_usd = 0.0
+
+    if AI_LOG_MIN_LIQ_USD > 0.0 and liq_usd < AI_LOG_MIN_LIQ_USD:
+        log.debug(
+            "data_logger: liq_usd=%.2f < AI_LOG_MIN_LIQ_USD=%.2f – skip src=%s mint=%s",
+            liq_usd,
+            AI_LOG_MIN_LIQ_USD,
+            src,
+            mint,
+        )
         return 0
+
+    if AI_LOG_MIN_VOL5_USD > 0.0 and vol5_usd < AI_LOG_MIN_VOL5_USD:
+        log.debug(
+            "data_logger: vol_5m_usd=%.2f < AI_LOG_MIN_VOL5_USD=%.2f – skip src=%s mint=%s",
+            vol5_usd,
+            AI_LOG_MIN_VOL5_USD,
+            src,
+            mint,
+        )
+        return 0
+
+    # Sampling: SKIPs can be downsampled more aggressively than BUYs.
+    if str(decision or "").upper() == "SKIP":
+        if not _should_sample(cand_hash, rate=AI_LOG_SAMPLE_RATE_SKIPS):
+            log.debug("data_logger: sampled-out SKIP candidate src=%s mint=%s", src, mint)
+            return 0
+    else:
+        if not _should_sample(cand_hash, rate=AI_LOG_SAMPLE_RATE):
+            log.debug("data_logger: sampled-out candidate src=%s mint=%s", src, mint)
+            return 0
 
     if _FB is None:
         log.warning("FeatureBuilder not available – skipping candidate log")
@@ -1030,7 +1089,7 @@ def log_entry_outcome(
     Typical call site: exit_engine / auto-sell logic when a position is closed.
 
     `extra` is the place to stuff quant-grade outcome details, e.g.:
-      - "max_runup_pct", "max_drawdown_pct"
+      - "max_runup_pct", "max_dd_pct"
       - "exit_policy", "exit_trigger", "exit_engine_version"
       - "slippage_bps", "fees_pct", "final_r_multiple"
       - "reentry_count", "trail_hits", "reward_proxy", etc.
@@ -1096,7 +1155,7 @@ def log_entry_outcome(
 
 
 # ============================================================================ #
-# Optional advanced helpers (executions, regime snapshots)
+# Optional advanced helpers (executions, regime snapshots, AI events)
 # ============================================================================ #
 
 
@@ -1208,6 +1267,57 @@ def log_regime_snapshot(
         return row_id
     except Exception:
         log.exception("Failed to log regime snapshot regime=%s", regime)
+        if AI_LOG_STRICT:
+            raise
+        return -1
+
+
+def log_ai_event(
+    *,
+    event_type: str,
+    policy_version: Optional[str] = None,
+    experiment_tag: Optional[str] = None,
+    src: Optional[str] = None,
+    regime: Optional[str] = None,
+    payload: Optional[Mapping[str, Any]] = None,
+) -> int:
+    """
+    Thin wrapper around ai_db.log_ai_event (if present).
+
+    Used by:
+      - risk_manager (risk_halt_triggered / cleared, Kelly clamp changes)
+      - self_learning_ai_strategy (parameter_tune, best_config_selected)
+      - reinvestor (soft_stop / hard_stop)
+      - monitoring / backtest drivers
+    """
+    if not PG_ENABLED:
+        return 0
+
+    fn = getattr(ai_db, "log_ai_event", None)
+    if not callable(fn):
+        return 0
+
+    try:
+        row_id = fn(
+            event_type=event_type,
+            policy_version=policy_version or AI_POLICY_VERSION or None,
+            experiment_tag=experiment_tag or AI_EXPERIMENT_TAG or None,
+            src=src,
+            regime=regime,
+            payload=payload or {},
+        )
+        log.debug(
+            "Logged ai_event id=%s type=%s policy=%s exp=%s src=%s regime=%s",
+            row_id,
+            event_type,
+            policy_version or AI_POLICY_VERSION,
+            experiment_tag or AI_EXPERIMENT_TAG,
+            src,
+            regime,
+        )
+        return row_id
+    except Exception:
+        log.exception("Failed to log ai_event type=%s", event_type)
         if AI_LOG_STRICT:
             raise
         return -1
