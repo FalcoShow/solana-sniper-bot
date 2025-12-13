@@ -1,22 +1,23 @@
+# utils_pkg/ai_db.py
 from __future__ import annotations
 
 """
 utils_pkg/ai_db.py
 
-Postgres helpers for AI logging & quant analytics (V3+++ / quant-grade).
-=======================================================================
+God-Tier AI DB brain (V3+++ / quant-grade)
+==========================================
 
 High-level role
 ---------------
-Central DB utility for all AI / quant / analytics layers:
+Central Postgres utility for all AI / quant / analytics layers:
 
-• DSN resolution / normalization (Render-friendly, SQLAlchemy-friendly).
+• DSN resolution / normalization (Render-friendly; SQLAlchemy/async-friendly).
 • Safe, minimal connection helpers (no fancy pooling; not a hot QPS path).
-• Table creation & migrations for:
+• Schema & migrations for:
 
     - entry_candidates      (raw decision context / features)
-    - entry_outcomes        (labels / PnL / drawdowns / hold time)
-    - trade_executions      (per-fill executions, slippage / fees)
+    - entry_outcomes        (labels / PnL / drawdowns / hold time / notes)
+    - trade_executions      (per-fill executions, slippage / fees / router stats)
     - regime_snapshots      (regime state time series)
     - ai_events             (high-level AI / risk / strategy events)
 
@@ -25,24 +26,79 @@ Central DB utility for all AI / quant / analytics layers:
     - self_learning_ai_strategy
     - risk_manager / reinvestor
     - backtest_engine
-    - offline training scripts
+    - offline training / fine-tuning scripts
 
 • Quant-grade helpers:
     - Training row fetchers / iterators
     - Backtest row iterator with flexible filters
-    - Performance breakdowns by regime / src / policy_version / experiment_tag
-    - Equity curve approximations
-    - Drawdown stats (dd tail risk)
-    - Label distribution / label “quality”
+    - Label & PnL distributions / quality stats
+    - Performance breakdowns by regime / src / wallet_tag / policy_version
+      / experiment_tag
+    - Daily equity curve approximations
+    - Drawdown stats (tail risk from max_dd_pct)
     - Outcome coverage (label health)
     - Kelly-style stats for risk sizing (V3+++)
     - Simple Sharpe-like time-bucketed summary (V3+++)
+    - Combined “dashboard” snapshot for strategy health
+    - JSONL exporters for offline AI training
+    - PnL time-series helper for streak / risk analysis
 
 Design philosophy
 -----------------
-• Keep this module *boring* and stable.
-• Provide narrow, well-documented functions called by more complex layers.
-• Fail fast on DSN issues; be forgiving on analytic helpers.
+• Keep this module *boring* and stable: pure DB plumbing + small aggregations.
+• Provide narrow, well-documented functions called by smarter layers.
+• Fail fast on DSN issues; be forgiving on analytic helpers (never crash the bot).
+
+Master Roadmap – Phase mapping (0–7)
+------------------------------------
+Phase 0: DSN + health
+    - DSN env resolution / normalization / masking
+    - ping(), describe_backend(), describe_dsn_sources()
+
+Phase 1: Schema / migrations
+    - ensure_ai_tables()
+
+Phase 2: Raw candidate logging
+    - insert_entry_candidate(), fetch_*_candidates(), update_entry_decision()
+
+Phase 3: Outcomes / labels / executions / regimes
+    - insert_entry_outcome(), mark_outcome_for_candidate(), fetch_recent_outcomes()
+    - insert_trade_execution(), fetch_recent_trade_executions()
+    - insert_regime_snapshot(), fetch_recent_regime_snapshots()
+    - log_ai_event(), fetch_recent_ai_events(), fetch_ai_event_summary()
+
+Phase 4: Backtest / training data access
+    - fetch_training_rows(), iter_training_rows()
+    - iter_backtest_rows()
+    - iter_training_jsonl(), dump_training_jsonl_to_file()
+
+Phase 5: Quant stats & series (PnL, label quality, perf splits)
+    - fetch_basic_stats(), fetch_label_distribution()
+    - fetch_perf_by_regime(), fetch_perf_by_src()
+    - fetch_outcome_coverage()
+    - fetch_perf_by_policy_version(), fetch_perf_by_experiment_tag()
+    - fetch_daily_equity_curve(), fetch_drawdown_stats()
+    - fetch_label_quality_stats(), fetch_pnl_time_series()
+
+Phase 6: Risk / Kelly / Sharpe & health snapshot
+    - fetch_kelly_stats(), fetch_daily_sharpe_like()
+    - fetch_overall_health_snapshot()
+    - prune_old_ai_data()
+
+Phase 7: Dashboard / AI-events / env-scoped snapshot
+    - log_ai_event(), fetch_recent_ai_events(), fetch_ai_event_summary()
+    - fetch_quant_dashboard()
+    - get_env_scoped_dashboard()  ← one-shot env-driven dashboard
+
+Env-scoped feature gating (V3+++)
+---------------------------------
+Most quant / training helpers accept `min_feature_version`. If not provided,
+they fall back to `AI_DB_MIN_FEATURE_VERSION` (env). This lets you say:
+
+    AI_DB_MIN_FEATURE_VERSION=300
+
+and have all stats / dashboards / training views automatically focus on the
+"modern brain" era, without changing caller code.
 """
 
 import json
@@ -68,14 +124,17 @@ from logging_setup import get_logger
 
 log = get_logger(__name__)
 
+Row = Dict[str, Any]
+
 # =============================================================================
-# DSN env configuration
+# Env config for DSN + quant defaults
 # =============================================================================
 
 # Primary env var used everywhere (Render secret + local .env)
 _DSN_ENV_PRIMARY = "SNIPER_DB_DSN"
 
-# Additional env vars we accept as fallbacks (in priority order)
+# Additional env vars we accept as fallbacks (in priority order).
+# These are intentionally Render / Postgres friendly and cover local dev too.
 _DSN_ENV_CANDIDATES: List[str] = [
     _DSN_ENV_PRIMARY,
     "SNIPER_DB_URL",
@@ -97,12 +156,58 @@ AI_DB_IDLE_IN_TX_TIMEOUT_MS = int(
     os.getenv("AI_DB_IDLE_IN_TX_TIMEOUT_MS", "0") or "0"
 )
 
+# Quant / dashboard env defaults (for “env-scoped” helpers)
+AI_DB_DEFAULT_SRC = os.getenv("AI_DB_DEFAULT_SRC") or None
+AI_DB_DEFAULT_REGIME = os.getenv("AI_DB_DEFAULT_REGIME") or None
+AI_DB_DEFAULT_WALLET_TAG = os.getenv("AI_DB_DEFAULT_WALLET_TAG") or None
+
+_AI_DB_MIN_FEATURE_VERSION_ENV = os.getenv("AI_DB_MIN_FEATURE_VERSION", "").strip()
+if _AI_DB_MIN_FEATURE_VERSION_ENV:
+    try:
+        AI_DB_MIN_FEATURE_VERSION: Optional[int] = int(_AI_DB_MIN_FEATURE_VERSION_ENV)
+    except Exception:
+        log.warning(
+            "AI_DB_MIN_FEATURE_VERSION is not a valid int: %r",
+            _AI_DB_MIN_FEATURE_VERSION_ENV,
+        )
+        AI_DB_MIN_FEATURE_VERSION = None
+else:
+    AI_DB_MIN_FEATURE_VERSION = None
+
 # Small module-level cache so we only normalize DSN once
 _NORMALIZED_DSN: Optional[str] = None
 
+# Env-configurable mapping of "win labels"
+# Example: AI_DB_WIN_LABELS="good,win,green,mega_win"
+_WIN_LABELS_DEFAULT = {"good", "win", "green", "profit"}
+_AI_DB_WIN_LABELS_ENV = os.getenv("AI_DB_WIN_LABELS", "")
+if _AI_DB_WIN_LABELS_ENV.strip():
+    WIN_LABELS: set[str] = {
+        s.strip().lower()
+        for s in _AI_DB_WIN_LABELS_ENV.split(",")
+        if s.strip()
+    }
+else:
+    WIN_LABELS = _WIN_LABELS_DEFAULT
+
+
+def _effective_min_feature_version(explicit: Optional[int]) -> Optional[int]:
+    """
+    Central helper for feature-version gating.
+
+    If the caller passes an explicit `min_feature_version`, that wins.
+    Otherwise we fall back to the env-driven AI_DB_MIN_FEATURE_VERSION.
+
+    This lets you "flip" the whole analytics stack to only look at the
+    modern feature regime without touching every caller.
+    """
+    if explicit is not None:
+        return explicit
+    return AI_DB_MIN_FEATURE_VERSION
+
 
 # =============================================================================
-# DSN helpers
+# DSN helpers (Phase 0)
 # =============================================================================
 
 
@@ -218,8 +323,47 @@ def get_normalized_dsn_for_debug() -> str:
     return _mask_dsn(_get_dsn())
 
 
+def describe_dsn_sources() -> Dict[str, Any]:
+    """
+    God-tier helper: introspect which env var is providing the DSN.
+
+    Returns a dict like:
+      {
+        "selected": "host:5432/db?sslmode=require",
+        "candidates": {
+          "SNIPER_DB_DSN": "host:5432/db?sslmode=require",
+          "DATABASE_URL": "<present>",
+          ...
+        },
+        "used_fallback": false
+      }
+
+    All DSNs are masked (no user/pass).
+    """
+    candidates: Dict[str, str] = {}
+    for key in _DSN_ENV_CANDIDATES:
+        raw = os.environ.get(key)
+        if raw and raw.strip():
+            candidates[key] = _mask_dsn(raw.strip())
+
+    used_fallback = False
+    try:
+        selected_masked = _mask_dsn(_get_dsn())
+    except Exception:
+        selected_masked = "<unresolved>"
+
+    if not candidates and DB_URL_FALLBACK:
+        used_fallback = True
+
+    return {
+        "selected": selected_masked,
+        "candidates": candidates,
+        "used_fallback": used_fallback,
+    }
+
+
 # =============================================================================
-# Core connection helpers
+# Core connection helpers (Phase 0)
 # =============================================================================
 
 
@@ -281,7 +425,7 @@ def cursor_only() -> Iterable[_PGCursor]:
 
 
 # =============================================================================
-# Health check / simple utilities
+# Health check / simple utilities (Phase 0)
 # =============================================================================
 
 
@@ -333,7 +477,7 @@ def _jsonb(obj: Mapping[str, Any] | Sequence[Any] | None) -> str:
 
 
 # =============================================================================
-# Table creation / migrations helper
+# Table creation / migrations (Phase 1)
 # =============================================================================
 
 
@@ -562,7 +706,7 @@ def ensure_ai_tables() -> None:
 
 
 # =============================================================================
-# entry_candidates helpers (training input)
+# entry_candidates helpers (training input) – Phase 2
 # =============================================================================
 
 
@@ -613,7 +757,8 @@ def fetch_latest_candidates(
     limit: int = 50,
     src: Optional[str] = None,
     regime: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+    wallet_tag: Optional[str] = None,
+) -> List[Row]:
     """
     Convenience helper used by scripts/show_latest_candidates.py etc.
     """
@@ -628,6 +773,9 @@ def fetch_latest_candidates(
     if regime:
         clauses.append("regime = %s")
         params.append(regime)
+    if wallet_tag:
+        clauses.append("wallet_tag = %s")
+        params.append(wallet_tag)
 
     where_sql = ""
     if clauses:
@@ -643,7 +791,7 @@ def fetch_latest_candidates(
     """
     params.append(limit)
 
-    out: List[Dict[str, Any]] = []
+    out: List[Row] = []
     with cursor_only() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
@@ -696,7 +844,7 @@ def fetch_latest_candidates(
     return out
 
 
-def fetch_candidate_by_id(candidate_id: int) -> Optional[Dict[str, Any]]:
+def fetch_candidate_by_id(candidate_id: int) -> Optional[Row]:
     """
     Small helper for backtests / debugging: fetch a single entry_candidates row.
     """
@@ -805,7 +953,7 @@ def update_entry_decision(
 
 
 # =============================================================================
-# entry_outcomes helpers (training labels)
+# entry_outcomes helpers (training labels) – Phase 3
 # =============================================================================
 
 
@@ -893,7 +1041,7 @@ def fetch_recent_outcomes(
     *,
     limit: int = 100,
     since_candidate_id: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+) -> List[Row]:
     """
     Fetch recent outcomes, most recent first.
     """
@@ -919,7 +1067,7 @@ def fetch_recent_outcomes(
     """
     params.append(limit)
 
-    out: List[Dict[str, Any]] = []
+    out: List[Row] = []
     with cursor_only() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
@@ -951,7 +1099,7 @@ def fetch_recent_outcomes(
 
 
 # =============================================================================
-# Executions & regime snapshots (for data_logger optional hooks)
+# Executions & regime snapshots (Phase 3)
 # =============================================================================
 
 
@@ -1009,7 +1157,7 @@ def fetch_recent_trade_executions(
     limit: int = 200,
     trade_id: Optional[str] = None,
     candidate_id: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+) -> List[Row]:
     """
     Fetch recent trade_executions rows for debugging / slippage stats.
     """
@@ -1039,7 +1187,7 @@ def fetch_recent_trade_executions(
     """
     params.append(limit)
 
-    out: List[Dict[str, Any]] = []
+    out: List[Row] = []
     with cursor_only() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
@@ -1125,7 +1273,7 @@ def fetch_recent_regime_snapshots(
     *,
     limit: int = 200,
     regime: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+) -> List[Row]:
     """
     Fetch recent regime snapshots for dashboards / self-learning AI.
     """
@@ -1151,7 +1299,7 @@ def fetch_recent_regime_snapshots(
     """
     params.append(limit)
 
-    out: List[Dict[str, Any]] = []
+    out: List[Row] = []
     with cursor_only() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
@@ -1190,7 +1338,7 @@ def fetch_recent_regime_snapshots(
 
 
 # =============================================================================
-# Quant / training helpers (joined candidates + outcomes)
+# Quant / training helpers (joined candidates + outcomes) – Phase 4
 # =============================================================================
 
 
@@ -1204,7 +1352,8 @@ def fetch_training_rows(
     policy_version: Optional[str] = None,
     experiment_tag: Optional[str] = None,
     label_in: Optional[Sequence[str]] = None,
-) -> List[Dict[str, Any]]:
+    wallet_tag: Optional[str] = None,
+) -> List[Row]:
     """
     Fetch joined candidate+outcome rows for training / backtests.
 
@@ -1224,6 +1373,7 @@ def fetch_training_rows(
       }
     """
     limit = max(1, min(int(limit), 10_000))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: List[str] = []
     params: List[Any] = []
@@ -1236,6 +1386,9 @@ def fetch_training_rows(
     if regime:
         clauses.append("c.regime = %s")
         params.append(regime)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
@@ -1277,7 +1430,7 @@ def fetch_training_rows(
     """
     params.append(limit)
 
-    out: List[Dict[str, Any]] = []
+    out: List[Row] = []
     with cursor_only() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
@@ -1346,7 +1499,8 @@ def fetch_unlabeled_candidates(
     src: Optional[str] = None,
     regime: Optional[str] = None,
     min_age_seconds: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+    wallet_tag: Optional[str] = None,
+) -> List[Row]:
     """
     Fetch candidates that do not yet have an outcome row.
 
@@ -1359,6 +1513,7 @@ def fetch_unlabeled_candidates(
       This avoids labeling trades too early when PnL is still forming.
     """
     limit = max(1, min(int(limit), 5_000))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: List[str] = []
     params: List[Any] = []
@@ -1369,6 +1524,9 @@ def fetch_unlabeled_candidates(
     if regime:
         clauses.append("c.regime = %s")
         params.append(regime)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
@@ -1408,7 +1566,7 @@ def fetch_unlabeled_candidates(
     """
     params.append(limit)
 
-    out: List[Dict[str, Any]] = []
+    out: List[Row] = []
     with cursor_only() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
@@ -1462,7 +1620,7 @@ def fetch_unlabeled_candidates(
 
 
 # =============================================================================
-# Backtest iterators (used by backtest_engine.run_backtest)
+# Backtest iterators – Phase 4
 # =============================================================================
 
 
@@ -1516,6 +1674,14 @@ def iter_backtest_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
         if config.get("BT_MIN_FEATURE_VERSION") is not None
         else config.get("min_feature_version")
     )
+
+    if min_feature_version is not None:
+        try:
+            min_feature_version = int(min_feature_version)
+        except Exception:
+            min_feature_version = None
+
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     src = config.get("src")
     regime = config.get("regime")
@@ -1574,12 +1740,8 @@ def iter_backtest_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
         clauses.append("c.wallet_tag = %s")
         params.append(wallet_tag)
     if min_feature_version is not None:
-        try:
-            fv = int(min_feature_version)
-            clauses.append("c.feature_version >= %s")
-            params.append(fv)
-        except Exception:
-            pass
+        clauses.append("c.feature_version >= %s")
+        params.append(int(min_feature_version))
     if policy_version:
         clauses.append("c.raw->'_decision_meta'->>'ai_policy_version' = %s")
         params.append(policy_version)
@@ -1693,7 +1855,7 @@ def iter_backtest_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
         }
 
 
-def iter_training_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]:
+def iter_training_rows(config: Mapping[str, Any]) -> Iterator[Row]:
     """
     Thin wrapper exposing fetch_training_rows as an iterator.
 
@@ -1701,7 +1863,7 @@ def iter_training_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
         - limit
         - require_outcome
         - min_feature_version / BT_MIN_FEATURE_VERSION
-        - src, regime
+        - src, regime, wallet_tag
         - policy_version, experiment_tag
         - label_in
     """
@@ -1713,6 +1875,13 @@ def iter_training_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
         if config.get("BT_MIN_FEATURE_VERSION") is not None
         else config.get("min_feature_version")
     )
+    if min_feature_version is not None:
+        try:
+            min_feature_version = int(min_feature_version)
+        except Exception:
+            min_feature_version = None
+
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     rows = fetch_training_rows(
         limit=limit,
@@ -1720,6 +1889,7 @@ def iter_training_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
         min_feature_version=min_feature_version,
         src=config.get("src"),
         regime=config.get("regime"),
+        wallet_tag=config.get("wallet_tag"),
         policy_version=config.get("policy_version"),
         experiment_tag=config.get("experiment_tag"),
         label_in=config.get("label_in"),
@@ -1730,21 +1900,50 @@ def iter_training_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
 
 
 # =============================================================================
-# Quant-grade stats helpers
+# JSONL helpers for fine-tuning / ML pipelines – Phase 4
 # =============================================================================
 
-# Env-configurable mapping of "win labels"
-# Example: AI_DB_WIN_LABELS="good,win,green"
-_WIN_LABELS_DEFAULT = {"good", "win", "green", "profit"}
-_AI_DB_WIN_LABELS_ENV = os.getenv("AI_DB_WIN_LABELS", "")
-if _AI_DB_WIN_LABELS_ENV.strip():
-    WIN_LABELS: set[str] = {
-        s.strip().lower()
-        for s in _AI_DB_WIN_LABELS_ENV.split(",")
-        if s.strip()
-    }
-else:
-    WIN_LABELS = _WIN_LABELS_DEFAULT
+
+def iter_training_jsonl(config: Mapping[str, Any]) -> Iterator[str]:
+    """
+    Yield JSON Lines strings for training rows (for fine-tuning / ML pipelines).
+
+    This is a pure-reader helper: it wraps iter_training_rows(config) and
+    normalizes datetime fields into ISO strings so the output is immediately
+    serializable to JSONL without custom encoders.
+    """
+    for row in iter_training_rows(config):
+        obj = dict(row)  # shallow copy
+
+        ts_val = obj.get("ts")
+        if isinstance(ts_val, datetime):
+            obj["ts"] = ts_val.isoformat()
+
+        created_at = obj.get("created_at")
+        if isinstance(created_at, datetime):
+            obj["created_at"] = created_at.isoformat()
+
+        yield json.dumps(obj, separators=(",", ":"), default=str)
+
+
+def dump_training_jsonl_to_file(path: str, config: Mapping[str, Any]) -> int:
+    """
+    Convenience helper for scripts: write training rows to a JSONL file.
+
+    Returns number of lines written.
+    """
+    n = 0
+    with open(path, "w", encoding="utf-8") as f:
+        for line in iter_training_jsonl(config):
+            f.write(line + "\n")
+            n += 1
+    log.info("dump_training_jsonl_to_file: wrote %s rows to %s", n, path)
+    return n
+
+
+# =============================================================================
+# Quant-grade stats helpers – Phase 5
+# =============================================================================
 
 
 def _is_win_label(label: Optional[str]) -> Optional[bool]:
@@ -1762,6 +1961,7 @@ def fetch_basic_stats(
     src: Optional[str] = None,
     regime: Optional[str] = None,
     min_feature_version: Optional[int] = None,
+    wallet_tag: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Quant-grade helper: returns basic aggregated stats for a time window.
@@ -1779,6 +1979,7 @@ def fetch_basic_stats(
       }
     """
     days_back = max(1, min(int(days_back), 365))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: List[str] = ["o.ts >= now() - (%s::interval)"]
     params: List[Any] = [f"{days_back} days"]
@@ -1789,6 +1990,9 @@ def fetch_basic_stats(
     if regime:
         clauses.append("c.regime = %s")
         params.append(regime)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
@@ -1858,6 +2062,7 @@ def fetch_label_distribution(
     src: Optional[str] = None,
     regime: Optional[str] = None,
     min_feature_version: Optional[int] = None,
+    wallet_tag: Optional[str] = None,
 ) -> Dict[str, int]:
     """
     Return a label -> count mapping over a given window.
@@ -1866,9 +2071,10 @@ def fetch_label_distribution(
     examples you have for training.
     """
     days_back = max(1, min(int(days_back), 365))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: List[str] = ["o.ts >= now() - (%s::interval)"]
-    params: List[Any] = [f"{days_back} days"]]
+    params: List[Any] = [f"{days_back} days"]
 
     if src:
         clauses.append("c.src = %s")
@@ -1876,6 +2082,9 @@ def fetch_label_distribution(
     if regime:
         clauses.append("c.regime = %s")
         params.append(regime)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
@@ -1907,11 +2116,13 @@ def fetch_perf_by_regime(
     days_back: int = 30,
     min_feature_version: Optional[int] = None,
     src: Optional[str] = None,
+    wallet_tag: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Optional quant helper: PnL & win-rate per regime.
     """
     days_back = max(1, min(int(days_back), 365))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: List[str] = ["o.ts >= now() - (%s::interval)"]
     params: List[Any] = [f"{days_back} days"]
@@ -1919,6 +2130,9 @@ def fetch_perf_by_regime(
     if src:
         clauses.append("c.src = %s")
         params.append(src)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
@@ -1976,11 +2190,13 @@ def fetch_perf_by_src(
     days_back: int = 30,
     min_feature_version: Optional[int] = None,
     regime: Optional[str] = None,
+    wallet_tag: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Optional quant helper: PnL & win-rate per src (scanner).
     """
     days_back = max(1, min(int(days_back), 365))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: List[str] = ["o.ts >= now() - (%s::interval)"]
     params: List[Any] = [f"{days_back} days"]
@@ -1988,6 +2204,9 @@ def fetch_perf_by_src(
     if regime:
         clauses.append("c.regime = %s")
         params.append(regime)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
@@ -2046,6 +2265,7 @@ def fetch_outcome_coverage(
     min_feature_version: Optional[int] = None,
     src: Optional[str] = None,
     regime: Optional[str] = None,
+    wallet_tag: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Quant helper: what fraction of candidates have outcomes in a window?
@@ -2061,6 +2281,7 @@ def fetch_outcome_coverage(
       }
     """
     days_back = max(1, min(int(days_back), 365))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: List[str] = ["c.ts >= now() - (%s::interval)"]
     params: List[Any] = [f"{days_back} days"]
@@ -2071,6 +2292,9 @@ def fetch_outcome_coverage(
     if regime:
         clauses.append("c.regime = %s")
         params.append(regime)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
@@ -2118,6 +2342,7 @@ def fetch_perf_by_policy_version(
     min_feature_version: Optional[int] = None,
     src: Optional[str] = None,
     regime: Optional[str] = None,
+    wallet_tag: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Quant helper: PnL & win-rate per ai_policy_version.
@@ -2125,6 +2350,7 @@ def fetch_perf_by_policy_version(
     Used by self_learning_ai_strategy to compare policy variants.
     """
     days_back = max(1, min(int(days_back), 365))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: List[str] = ["o.ts >= now() - (%s::interval)"]
     params: List[Any] = [f"{days_back} days"]
@@ -2135,6 +2361,9 @@ def fetch_perf_by_policy_version(
     if regime:
         clauses.append("c.regime = %s")
         params.append(regime)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
@@ -2193,6 +2422,7 @@ def fetch_perf_by_experiment_tag(
     min_feature_version: Optional[int] = None,
     src: Optional[str] = None,
     regime: Optional[str] = None,
+    wallet_tag: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Quant helper: PnL & win-rate per ai_experiment_tag.
@@ -2200,6 +2430,7 @@ def fetch_perf_by_experiment_tag(
     Lets you A/B compare experiment cohorts ("A", "B", "golden", etc).
     """
     days_back = max(1, min(int(days_back), 365))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: List[str] = ["o.ts >= now() - (%s::interval)"]
     params: List[Any] = [f"{days_back} days"]
@@ -2210,6 +2441,9 @@ def fetch_perf_by_experiment_tag(
     if regime:
         clauses.append("c.regime = %s")
         params.append(regime)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
@@ -2263,7 +2497,7 @@ def fetch_perf_by_experiment_tag(
 
 
 # =============================================================================
-# V3+++ extras: equity curve / drawdown / label quality / AI events
+# Equity curve / drawdown / label quality / PnL series – Phase 5
 # =============================================================================
 
 
@@ -2272,6 +2506,7 @@ def fetch_daily_equity_curve(
     days_back: int = 90,
     src: Optional[str] = None,
     regime: Optional[str] = None,
+    wallet_tag: Optional[str] = None,
     min_feature_version: Optional[int] = None,
     base_equity: float = 1.0,
 ) -> List[Dict[str, Any]]:
@@ -2287,20 +2522,9 @@ def fetch_daily_equity_curve(
 
     This is *approximate* (it assumes "1x" normalized exposure per day),
     but it's super useful for dashboards / regime health.
-
-    Returns ascending by date:
-      [
-        {
-          "date": "2025-01-01",
-          "n_trades": 12,
-          "avg_pnl_pct": 3.1,
-          "sum_pnl_pct": 37.2,
-          "equity": 1.031,
-        },
-        ...
-      ]
     """
     days_back = max(1, min(int(days_back), 730))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: List[str] = ["o.ts >= now() - (%s::interval)"]
     params: List[Any] = [f"{days_back} days"]
@@ -2311,6 +2535,9 @@ def fetch_daily_equity_curve(
     if regime:
         clauses.append("c.regime = %s")
         params.append(regime)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
@@ -2359,6 +2586,7 @@ def fetch_drawdown_stats(
     days_back: int = 30,
     src: Optional[str] = None,
     regime: Optional[str] = None,
+    wallet_tag: Optional[str] = None,
     min_feature_version: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
@@ -2366,19 +2594,11 @@ def fetch_drawdown_stats(
 
     Expects extra->'max_dd_pct' per trade (as logged by exit_engine /
     risk_manager / data_logger).
-
-    Returns something like:
-      {
-        "days_back": 30,
-        "n_trades": 120,
-        "avg_dd_pct": 8.3,
-        "p95_dd_pct": 19.7,
-        "p99_dd_pct": 28.4,
-      }
     """
     days_back = max(1, min(int(days_back), 365))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
-    clauses: List[str] = ["o.ts >= now() - (%s::interval)"]
+    clauses: List[str] = ["o.ts >= now() - (%s::interval)", "(o.extra->>'max_dd_pct') IS NOT NULL"]
     params: List[Any] = [f"{days_back} days"]
 
     if src:
@@ -2387,12 +2607,12 @@ def fetch_drawdown_stats(
     if regime:
         clauses.append("c.regime = %s")
         params.append(regime)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
-
-    # Only include rows that actually have a numeric max_dd_pct
-    clauses.append("(o.extra->>'max_dd_pct') IS NOT NULL")
 
     where_sql = "WHERE " + " AND ".join(clauses)
 
@@ -2440,6 +2660,7 @@ def fetch_label_quality_stats(
     days_back: int = 60,
     src: Optional[str] = None,
     regime: Optional[str] = None,
+    wallet_tag: Optional[str] = None,
     min_feature_version: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -2447,19 +2668,9 @@ def fetch_label_quality_stats(
 
     This is super useful when designing label schemes like:
         - mega_win, win, scratch, loss, disaster
-
-    Returns rows like:
-      {
-        "label": "mega_win",
-        "n": 42,
-        "share": 0.18,
-        "avg_pnl_pct": 63.2,
-        "median_pnl_pct": 57.1,
-        "avg_hold_sec": 320,
-        "is_win_label": true,
-      }
     """
     days_back = max(1, min(int(days_back), 365))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: List[str] = ["o.ts >= now() - (%s::interval)"]
     params: List[Any] = [f"{days_back} days"]
@@ -2470,6 +2681,9 @@ def fetch_label_quality_stats(
     if regime:
         clauses.append("c.regime = %s")
         params.append(regime)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
@@ -2533,8 +2747,97 @@ def fetch_label_quality_stats(
     return out
 
 
+def fetch_pnl_time_series(
+    *,
+    days_back: int = 60,
+    src: Optional[str] = None,
+    regime: Optional[str] = None,
+    wallet_tag: Optional[str] = None,
+    min_feature_version: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    God-tier helper: per-trade PnL% time series for streak / risk analysis.
+
+    Output (ascending by ts):
+      [
+        {
+          "ts": ...,
+          "pnl_pct": float,
+          "label": "mega_win" | "loss" | ... | None,
+          "candidate_id": int,
+          "src": "raydium" | "pumpfun" | ...,
+          "regime": "hot" | "cold" | ... | None,
+          "wallet_tag": "...",
+          "feature_version": int,
+        },
+        ...
+      ]
+    """
+    days_back = max(1, min(int(days_back), 365))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
+
+    clauses: List[str] = [
+        "o.ts >= now() - (%s::interval)",
+        "o.pnl_pct IS NOT NULL",
+    ]
+    params: List[Any] = [f"{days_back} days"]
+
+    if src:
+        clauses.append("c.src = %s")
+        params.append(src)
+    if regime:
+        clauses.append("c.regime = %s")
+        params.append(regime)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
+    if min_feature_version is not None:
+        clauses.append("c.feature_version >= %s")
+        params.append(int(min_feature_version))
+
+    where_sql = "WHERE " + " AND ".join(clauses)
+
+    sql = f"""
+        SELECT
+            o.ts,
+            o.pnl_pct,
+            o.label,
+            c.id AS candidate_id,
+            c.src,
+            c.regime,
+            c.wallet_tag,
+            c.feature_version
+        FROM entry_outcomes o
+        JOIN entry_candidates c
+          ON c.id = o.candidate_id
+        {where_sql}
+        ORDER BY o.ts ASC, o.id ASC
+    """
+
+    out: List[Dict[str, Any]] = []
+    with cursor_only() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    for ts, pnl_pct, label, cid, src_val, regime_val, wallet_tag_val, feat_ver in rows:
+        out.append(
+            {
+                "ts": ts,
+                "pnl_pct": float(pnl_pct) if pnl_pct is not None else None,
+                "label": label,
+                "candidate_id": int(cid),
+                "src": src_val,
+                "regime": regime_val,
+                "wallet_tag": wallet_tag_val,
+                "feature_version": int(feat_ver),
+            }
+        )
+
+    return out
+
+
 # =============================================================================
-# AI events logging (hook for self_learning_ai_strategy / monitoring)
+# AI events logging – Phase 7 core primitive
 # =============================================================================
 
 
@@ -2561,8 +2864,6 @@ def log_ai_event(
 
     The self_learning_ai_strategy, risk_manager, reinvestor, or backtest drivers
     can call this to create a durable audit trail of high-level events.
-
-    Returns the newly inserted ai_events.id.
     """
     payload_json = _jsonb(payload or {})
 
@@ -2669,8 +2970,57 @@ def fetch_recent_ai_events(
     return out
 
 
+def fetch_ai_event_summary(
+    *,
+    days_back: int = 30,
+    event_types: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    God-tier helper: summarize AI events by type over a window.
+    """
+    days_back = max(1, min(int(days_back), 365))
+
+    clauses: List[str] = ["ts >= now() - (%s::interval)"]
+    params: List[Any] = [f"{days_back} days"]
+
+    if event_types:
+        clauses.append("event_type = ANY(%s)")
+        params.append(list(event_types))
+
+    where_sql = "WHERE " + " AND ".join(clauses)
+
+    sql = f"""
+        SELECT
+            event_type,
+            count(*) AS n_events,
+            min(ts) AS first_ts,
+            max(ts) AS last_ts
+        FROM ai_events
+        {where_sql}
+        GROUP BY event_type
+        ORDER BY event_type
+    """
+
+    out: List[Dict[str, Any]] = []
+    with cursor_only() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    for event_type, n_events, first_ts, last_ts in rows:
+        out.append(
+            {
+                "event_type": event_type,
+                "n_events": int(n_events or 0),
+                "first_ts": first_ts.isoformat() if isinstance(first_ts, datetime) else str(first_ts),
+                "last_ts": last_ts.isoformat() if isinstance(last_ts, datetime) else str(last_ts),
+            }
+        )
+
+    return out
+
+
 # =============================================================================
-# V3+++ small extras: housekeeping & combined health snapshot
+# Housekeeping & health snapshot – Phase 6
 # =============================================================================
 
 
@@ -2708,6 +3058,7 @@ def fetch_overall_health_snapshot(
     days_back_coverage: int = 7,
     src: Optional[str] = None,
     regime: Optional[str] = None,
+    wallet_tag: Optional[str] = None,
     min_feature_version: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
@@ -2718,28 +3069,28 @@ def fetch_overall_health_snapshot(
       - basic_stats        (PnL, win-rate, avg hold)
       - outcome_coverage   (how many candidates have labels)
       - drawdown_stats     (avg / p95 / p99 per-trade DD)
-
-    So your AI brain can quickly answer:
-      • Are we making money?
-      • Are labels healthy and dense?
-      • Are tails (DD) under control?
     """
+    min_feature_version = _effective_min_feature_version(min_feature_version)
+
     basic = fetch_basic_stats(
         days_back=days_back_core,
         src=src,
         regime=regime,
+        wallet_tag=wallet_tag,
         min_feature_version=min_feature_version,
     )
     coverage = fetch_outcome_coverage(
         days_back=days_back_coverage,
         src=src,
         regime=regime,
+        wallet_tag=wallet_tag,
         min_feature_version=min_feature_version,
     )
     dd_stats = fetch_drawdown_stats(
         days_back=days_back_dd,
         src=src,
         regime=regime,
+        wallet_tag=wallet_tag,
         min_feature_version=min_feature_version,
     )
 
@@ -2751,7 +3102,7 @@ def fetch_overall_health_snapshot(
 
 
 # =============================================================================
-# V3+++: Kelly / Sharpe-style helpers for risk_manager & reinvestor
+# Kelly / Sharpe-style helpers – Phase 6
 # =============================================================================
 
 
@@ -2760,6 +3111,7 @@ def fetch_kelly_stats(
     days_back: int = 60,
     src: Optional[str] = None,
     regime: Optional[str] = None,
+    wallet_tag: Optional[str] = None,
     min_feature_version: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
@@ -2775,6 +3127,7 @@ def fetch_kelly_stats(
         - reinvestor sizing caps
     """
     days_back = max(1, min(int(days_back), 365))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: List[str] = [
         "o.ts >= now() - (%s::interval)",
@@ -2788,6 +3141,9 @@ def fetch_kelly_stats(
     if regime:
         clauses.append("c.regime = %s")
         params.append(regime)
+    if wallet_tag:
+        clauses.append("c.wallet_tag = %s")
+        params.append(wallet_tag)
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
@@ -2851,6 +3207,7 @@ def fetch_daily_sharpe_like(
     days_back: int = 90,
     src: Optional[str] = None,
     regime: Optional[str] = None,
+    wallet_tag: Optional[str] = None,
     min_feature_version: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
@@ -2864,11 +3221,13 @@ def fetch_daily_sharpe_like(
     Good for a single scalar “strategy health” metric next to equity curve.
     """
     days_back = max(1, min(int(days_back), 730))
+    min_feature_version = _effective_min_feature_version(min_feature_version)
 
     eq_rows = fetch_daily_equity_curve(
         days_back=days_back,
         src=src,
         regime=regime,
+        wallet_tag=wallet_tag,
         min_feature_version=min_feature_version,
         base_equity=1.0,
     )
@@ -2906,3 +3265,186 @@ def fetch_daily_sharpe_like(
         "sigma_daily": sigma,
         "sharpe_like": sharpe_like,
     }
+
+
+# =============================================================================
+# God-Tier helper: one-shot quant dashboard snapshot – Phase 7
+# =============================================================================
+
+
+def fetch_quant_dashboard(
+    *,
+    src: Optional[str] = None,
+    regime: Optional[str] = None,
+    wallet_tag: Optional[str] = None,
+    min_feature_version: Optional[int] = None,
+    days_back_core: int = 7,
+    days_back_dd: int = 30,
+    days_back_coverage: int = 7,
+    days_back_label_dist: int = 30,
+    days_back_label_quality: int = 60,
+    days_back_perf_regime: int = 30,
+    days_back_perf_src: int = 30,
+    days_back_policy: int = 30,
+    days_back_experiment: int = 30,
+    days_back_equity: int = 90,
+    days_back_kelly: int = 60,
+    days_back_sharpe: int = 90,
+    days_back_events: int = 30,
+) -> Dict[str, Any]:
+    """
+    Ultra-high-level snapshot for dashboards / self-learning brain.
+
+    This composes most of the helpers above into a single dict so callers
+    don't need to orchestrate multiple round-trips.
+
+    It is intentionally read-only and safe: failures in individual pieces
+    should not crash the whole bot; callers can always handle partial data.
+    """
+    min_feature_version = _effective_min_feature_version(min_feature_version)
+
+    def safe(fn, **kwargs):
+        try:
+            return fn(**kwargs)
+        except Exception:
+            log.exception("fetch_quant_dashboard: sub-call failed: %s", fn.__name__)
+            return None
+
+    core = safe(
+        fetch_basic_stats,
+        days_back=days_back_core,
+        src=src,
+        regime=regime,
+        wallet_tag=wallet_tag,
+        min_feature_version=min_feature_version,
+    )
+    coverage = safe(
+        fetch_outcome_coverage,
+        days_back=days_back_coverage,
+        src=src,
+        regime=regime,
+        wallet_tag=wallet_tag,
+        min_feature_version=min_feature_version,
+    )
+    dd_stats = safe(
+        fetch_drawdown_stats,
+        days_back=days_back_dd,
+        src=src,
+        regime=regime,
+        wallet_tag=wallet_tag,
+        min_feature_version=min_feature_version,
+    )
+    label_dist = safe(
+        fetch_label_distribution,
+        days_back=days_back_label_dist,
+        src=src,
+        regime=regime,
+        wallet_tag=wallet_tag,
+        min_feature_version=min_feature_version,
+    )
+    label_quality = safe(
+        fetch_label_quality_stats,
+        days_back=days_back_label_quality,
+        src=src,
+        regime=regime,
+        wallet_tag=wallet_tag,
+        min_feature_version=min_feature_version,
+    )
+    perf_regime = safe(
+        fetch_perf_by_regime,
+        days_back=days_back_perf_regime,
+        src=src,
+        wallet_tag=wallet_tag,
+        min_feature_version=min_feature_version,
+    )
+    perf_src = safe(
+        fetch_perf_by_src,
+        days_back=days_back_perf_src,
+        regime=regime,
+        wallet_tag=wallet_tag,
+        min_feature_version=min_feature_version,
+    )
+    perf_policy = safe(
+        fetch_perf_by_policy_version,
+        days_back=days_back_policy,
+        src=src,
+        regime=regime,
+        wallet_tag=wallet_tag,
+        min_feature_version=min_feature_version,
+    )
+    perf_experiment = safe(
+        fetch_perf_by_experiment_tag,
+        days_back=days_back_experiment,
+        src=src,
+        regime=regime,
+        wallet_tag=wallet_tag,
+        min_feature_version=min_feature_version,
+    )
+    equity = safe(
+        fetch_daily_equity_curve,
+        days_back=days_back_equity,
+        src=src,
+        regime=regime,
+        wallet_tag=wallet_tag,
+        min_feature_version=min_feature_version,
+        base_equity=1.0,
+    )
+    kelly = safe(
+        fetch_kelly_stats,
+        days_back=days_back_kelly,
+        src=src,
+        regime=regime,
+        wallet_tag=wallet_tag,
+        min_feature_version=min_feature_version,
+    )
+    sharpe_like = safe(
+        fetch_daily_sharpe_like,
+        days_back=days_back_sharpe,
+        src=src,
+        regime=regime,
+        wallet_tag=wallet_tag,
+        min_feature_version=min_feature_version,
+    )
+    ai_events_summary = safe(
+        fetch_ai_event_summary,
+        days_back=days_back_events,
+    )
+
+    return {
+        "core": core,
+        "coverage": coverage,
+        "drawdown": dd_stats,
+        "label_distribution": label_dist,
+        "label_quality": label_quality,
+        "perf_by_regime": perf_regime,
+        "perf_by_src": perf_src,
+        "perf_by_policy_version": perf_policy,
+        "perf_by_experiment_tag": perf_experiment,
+        "equity_curve": equity,
+        "kelly_stats": kelly,
+        "sharpe_like": sharpe_like,
+        "ai_events_summary": ai_events_summary,
+    }
+
+
+def get_env_scoped_dashboard() -> Dict[str, Any]:
+    """
+    Convenience helper for “brain” / risk_manager / cron:
+
+    Uses env defaults:
+      - AI_DB_DEFAULT_SRC
+      - AI_DB_DEFAULT_REGIME
+      - AI_DB_DEFAULT_WALLET_TAG
+      - AI_DB_MIN_FEATURE_VERSION
+
+    So you can do:
+
+        from utils_pkg import ai_db
+        snapshot = ai_db.get_env_scoped_dashboard()
+    """
+    return fetch_quant_dashboard(
+        src=AI_DB_DEFAULT_SRC or None,
+        regime=AI_DB_DEFAULT_REGIME or None,
+        wallet_tag=AI_DB_DEFAULT_WALLET_TAG or None,
+        min_feature_version=AI_DB_MIN_FEATURE_VERSION,
+    )

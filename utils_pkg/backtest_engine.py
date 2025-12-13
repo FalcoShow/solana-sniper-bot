@@ -1,73 +1,49 @@
-# utils_pkg/backtest_engine.py
 from __future__ import annotations
 
 """
 utils_pkg/backtest_engine.py
 
-Quant-grade backtest engine for AI entry / risk / reinvestor configs (V3+++).
-=============================================================================
+God-Tier Quant Backtest Engine (V3+++ / Phase 0-7)
+==================================================
 
 Single public entrypoint:
 
-    async run_backtest(config: dict) -> dict
+    async run_backtest(config: Mapping[str, Any]) -> dict
 
-Core responsibilities
----------------------
-• Pull historical candidate rows from Postgres via utils_pkg.ai_db
-• Use the SAME entry stack as live trading (configurable engine):
+Design goals
+------------
+• EXACT same entry stack as live:
       - Default: utils_pkg.ai_entry_logic.score_entry(...)
-      - Optional: utils_pkg.ai_buy_scoring.score_only(...)
+      - Optional: utils_pkg.ai_buy_scoring.score_only(...) (V3+++ buy engine)
 
-• Apply config-driven gates:
-      - ENTRY_SCORE_MIN                 (raw heuristic gate)
-      - ENTRY_MIN_SCORE                 (blended gate)
-      - max_positions                   (capacity / equity scaling)
-      - risk_mult_override              (global risk multiplier)
-      - RISK_PROFILE                    (conservative/balanced/aggressive)
-      - regime_risk_mode_lock           (force risk_off/normal/risk_on)
-      - ENTRY_REQUIRE_RISK_CAPACITY
-      - BT_MIN_RISK_CAPACITY / BT_MAX_RISK_CAPACITY
-      - BT_REQUIRE_POSITIVE_RC
-      - BT_MAX_TRADES cap
-      - limit_candidates / BT_LIMIT_CANDIDATES
-      - label_include / label_exclude
-      - BT_MIN_SMART_WALLET_SCORE / BT_REQUIRE_SMART_WALLET_FLAG
-      - BT_DEDUP_MODE / BT_DEDUP_WINDOW_SEC (mint-level deduplication)
-      - BT_SAMPLE_WEIGHT_MODE / BT_LABEL_WEIGHTS_JSON
-      - BT_USE_LIVE_RISK_MANAGER (allocation from risk_capacity_score)
-      - BT_RISK_EQUITY_HALT_DD (equity drawdown kill switch)
-      - BT_ENABLE_SELF_LEARNING (+ BT_SELF_LEARN_* knobs)
-      - BT_ENABLE_REINVESTOR (+ BT_REINVEST_* knobs)
-      - BT_USE_AI_RISK_MODEL (+ BT_AI_RISK_* knobs, if ai_risk_model present)
-      - BT_TRADE_COST_BPS / BT_JITO_TIP_BPS (microstructure cost model)
-      - BT_TRADE_COST_MODE ("per_trade" vs "half_side")
-      - BT_LOG_TRADES / BT_LOG_FEATURES
-      - BT_LOG_EQUITY_SERIES (optional equity curve logging)
-      - BT_RESULT_SEGMENT (optional: "train" / "test" segment filter)
-      - BT_ALLOC_MODE (optional: "simple" | "risk_capacity")
-      - BT_EQUITY_INIT           (initial equity, default 1.0)
-      - BT_EQUITY_CAP_MULT       (cap equity at init * multiplier; 0/None = no cap)
-      - BT_START_TS / BT_END_TS  (optional time-window filter on created_at)
-      - BT_SCORE_ENGINE          ("entry_logic" | "ai_buy_scoring")
-      - BT_USE_AI_BUY_SCORING    (bool flag to force ai_buy_scoring engine)
+• Config-driven risk & AI wiring:
+      - ENTRY_SCORE_MIN / ENTRY_MIN_SCORE / ENTRY_AI_WEIGHT
+      - BT_SCORE_ENGINE / BT_USE_AI_BUY_SCORING
+      - RISK_PROFILE, risk_mult_override, regime_risk_mode_lock
+      - Risk capacity gating + risk-capacity alloc mode
+      - Smart-wallet gating
+      - AI risk overlay (filter or sizer)
 
-Extra V3+++ quant helpers
--------------------------
-• Exposure metrics:
-      - avg_exposure, p95_exposure (notional fraction-of-equity per trade)
-• Microstructure cost analytics:
-      - trade_cost_total_pct, trade_cost_avg_pct
-• Risk multiplier diagnostics:
-      - avg_risk_mult_effective (risk_mult_override * profile * regime * AI sizer)
-• Risk capacity bucket performance:
-      - rc_bucket_stats (PnL & win-rate per RC bucket)
-• Equity-path risk:
-      - ulcer_index_pct, ulcer_perf_ratio, equity_vol_pct
-• Tail & run diagnostics:
-      - pnl_p05_pct / pnl_p95_pct / pnl_cvar_p05_pct
-      - max_consec_wins / max_consec_losses
-      - skewness / kurtosis_excess
-      - rolling_sharpe_50 / rolling_sharpe_100
+• Portfolio simulation:
+      - Equity curve with max drawdown / run-up
+      - Trade-cost model: BT_TRADE_COST_BPS / BT_JITO_TIP_BPS
+      - Alloc modes: simple | risk_capacity | optional live risk_manager
+
+• Self-learning + reinvestor hooks:
+      - Lightweight backtest-only self-tuning (score gates + risk_mult)
+      - Optional hooks into self_learning_ai_strategy & reinvestor
+
+• Quant-grade metrics:
+      - PnL distribution, Sharpe / Sortino / CVaR / Kelly
+      - Equity-path risk: ulcer index, equity vol, rolling Sharpes
+      - Risk-capacity bucket stats, regime stats, hour-of-day stats
+      - Score buckets vs PnL (score_bucket_stats)
+      - Time in drawdown (time_in_drawdown_frac)
+      - Geometric daily / weekly / monthly / annual PnL based on equity curve
+      - AI-risk overlay diagnostics
+      - Best / worst trade stats
+      - Explicit target metric for sweeps: BT_TARGET_METRIC / target_metric
+
 
 Assumptions about ai_db
 -----------------------
@@ -96,12 +72,7 @@ Optionally:
     - "ai_risk_conf"    : float       (optional confidence 0..1)
     - "segment"         : str         ("train","test",...) if you want BT_RESULT_SEGMENT
 
-If your column names differ, adapt `_normalize_row()` and `_extract_mint()` only.
-
-Public API
-----------
-    async run_backtest(config: dict) -> dict
-        Returns a flat metrics dict suitable for printing / CSV export.
+If your column names differ, ONLY edit `_normalize_row()` / `_extract_mint()`.
 """
 
 import asyncio
@@ -116,7 +87,12 @@ from logging_setup import get_logger
 from utils_pkg import ai_db
 from utils_pkg import ai_entry_logic as _entry
 
-# Optional modules (all guarded; backtest still works if missing)
+log = get_logger(__name__)
+
+ENGINE_NAME = "backtest_engine"
+ENGINE_VERSION = "V3+++_Phase0_7_GodTier"
+
+# Optional modules (all guarded; engine still works if missing)
 try:  # ai_risk_model overlay (backtest + live share the same brain)
     from utils_pkg import ai_risk_model as _ai_risk_model  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover
@@ -142,17 +118,15 @@ try:  # optional risk manager (to keep backtest & live risk in sync if desired)
 except Exception:  # pragma: no cover
     _rm = None  # type: ignore[assignment]
 
-try:  # optional reinvestor module (for deeper reinvest simulation)
-    from utils_pkg import reinvestor as _reinv  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-    _reinv = None  # type: ignore[assignment]
-
 try:  # optional V3+++ buy-scoring engine shared with live entry stack
     from utils_pkg import ai_buy_scoring as _buy_scorer  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover
     _buy_scorer = None  # type: ignore[assignment]
 
-log = get_logger(__name__)
+try:  # optional reinvestor module (shared with live reinvestor)
+    from utils_pkg import reinvestor as _reinv  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    _reinv = None  # type: ignore[assignment]
 
 
 # =============================================================================
@@ -244,7 +218,7 @@ def _normalize_row(row: Mapping[str, Any]) -> Optional[BacktestRow]:
 
     This is the ONLY place you should edit if your schema changes.
     """
-    # Features
+    # Features payload
     feats_raw = (
         row.get("features")
         or row.get("feature_json")
@@ -433,7 +407,7 @@ async def _iter_rows_from_ai_db(config: Mapping[str, Any]) -> AsyncIterator[Back
 
 
 # =============================================================================
-# Scoring helpers: use ai_entry_logic V3+++ stack / ai_buy_scoring V3+++
+# Scoring helpers: ai_entry_logic V3+++ stack / ai_buy_scoring V3+++
 # =============================================================================
 
 
@@ -455,7 +429,9 @@ async def _compute_scores_entry_logic(
     if hasattr(_entry, "score_entry"):
         try:
             # Try with explicit ctx first
-            res = _entry.score_entry(features, ctx={"mode": "backtest", "config": cfg})  # type: ignore[attr-defined]
+            res = _entry.score_entry(
+                features, ctx={"mode": "backtest", "config": cfg}
+            )  # type: ignore[attr-defined]
         except TypeError:
             # Fallback: legacy signature score_entry(features)
             res = _entry.score_entry(features)  # type: ignore[attr-defined]
@@ -539,7 +515,9 @@ async def _compute_scores_ai_buy_scoring(
         if hasattr(_buy_scorer, "Candidate"):
             Cand = getattr(_buy_scorer, "Candidate")
             try:
-                candidate = Cand(features=features, ctx={"mode": "backtest", "config": cfg})
+                candidate = Cand(
+                    features=features, ctx={"mode": "backtest", "config": cfg}
+                )
             except TypeError:
                 # Fallback: some versions may only accept features
                 try:
@@ -567,7 +545,7 @@ async def _compute_scores_ai_buy_scoring(
             blended = float(res[0])
             # heur/ai will be inferred as blended for safety
             heur = blended if heur is None else heur
-            ai = ai  # leave None if not present
+            # ai stays None unless present
 
         # Final sanity
         if blended is None:
@@ -580,7 +558,10 @@ async def _compute_scores_ai_buy_scoring(
         return heur_f, ai_f, blended_f
 
     except Exception:
-        log.debug("backtest_engine: ai_buy_scoring scoring failed; falling back to entry_logic.", exc_info=True)
+        log.debug(
+            "backtest_engine: ai_buy_scoring scoring failed; falling back to entry_logic.",
+            exc_info=True,
+        )
         return None
 
 
@@ -700,10 +681,14 @@ def _regime_mult_from_features(
     if _regime_mod is not None and hasattr(_regime_mod, "risk_mult_from_features"):
         try:
             return float(
-                _regime_mod.risk_mult_from_features(features, regime_mode_lock)  # type: ignore[attr-defined]
+                _regime_mod.risk_mult_from_features(
+                    features, regime_mode_lock
+                )  # type: ignore[attr-defined]
             )
         except Exception:  # pragma: no cover
-            log.debug("regime.risk_mult_from_features failed, falling back.", exc_info=True)
+            log.debug(
+                "regime.risk_mult_from_features failed, falling back.", exc_info=True
+            )
 
     # 2) explicit lock
     if regime_mode_lock in (0, 1, 2):
@@ -938,8 +923,9 @@ class _SelfLearningState:
         self.last_tune_ts = created_at or self.last_tune_ts
 
         log.info(
-            "backtest_engine.self_learning: tune #%d (win_rate=%.3f, window_pnl=%.2f, "
-            "score_min=%.3f→%.3f, blended_gate=%.3f→%.3f, risk_mult=%.3f→%.3f)",
+            "backtest_engine.self_learning: tune #%d "
+            "(win_rate=%.3f, window_pnl=%.2f, score_min=%.3f→%.3f, "
+            "blended_gate=%.3f→%.3f, risk_mult=%.3f→%.3f)",
             self.tune_count,
             win_rate,
             window_pnl,
@@ -964,7 +950,10 @@ class _SelfLearningState:
                         created_at=created_at,
                     )
             except Exception:  # pragma: no cover
-                log.debug("self_learning_ai_strategy.record_backtest_tune failed", exc_info=True)
+                log.debug(
+                    "self_learning_ai_strategy.record_backtest_tune failed",
+                    exc_info=True,
+                )
 
         # Reset window post-tune
         self.window_pnls.clear()
@@ -1096,7 +1085,10 @@ async def _maybe_ai_risk_score(
                     if len(res) >= 2:
                         conf = _maybe_float(res[1])
         except Exception:  # pragma: no cover
-            log.debug("ai_risk_model scoring failed; ignoring overlay for this row.", exc_info=True)
+            log.debug(
+                "ai_risk_model scoring failed; ignoring overlay for this row.",
+                exc_info=True,
+            )
 
     return score, conf
 
@@ -1156,6 +1148,7 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
         BT_EQUITY_CAP_MULT / equity_cap_mult
         BT_START_TS / BT_END_TS / start_ts / end_ts
         config_tag / BT_TAG_PREFIX
+        BT_TARGET_METRIC / target_metric  (preferred optimization metric key)
 
     All other keys are passed straight through to ai_db.iter_backtest_rows(...).
 
@@ -1164,9 +1157,11 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
     Flat dict of metrics suitable for scripts/backtest.py:
         - tag, n_candidates, n_trades, n_wins, n_losses, n_flats, win_rate
         - avg_pnl_pct, median_pnl_pct, pnl_total_pct, pnl_vol_pct, pnl_std_error_pct
-        - net_pnl_pct, equity_final, max_drawdown_pct, max_runup_pct, sharpe, sortino
+        - net_pnl_pct, equity_final, equity_max, max_drawdown_pct, max_runup_pct
+        - sharpe, sortino, downside_dev_pct
         - equity_vol_pct, avg_equity_return_per_trade_pct
         - gross_win_pct, gross_loss_pct, profit_factor
+        - best_trade_pct, worst_trade_pct
         - avg_dd_trade_pct, p95_drawdown_trade_pct
         - avg_hold_sec, median_hold_sec, p95_hold_sec
         - risk_capacity_avg, risk_capacity_p05, risk_capacity_p95
@@ -1175,13 +1170,16 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
         - avg_heur_score, avg_ai_score
         - avg_win_pct, avg_loss_pct, expectancy_pct, pnl_per_trade_pct
         - days_span, daily_pnl_pct, trade_density_per_day
+        - daily_pnl_geo_pct, weekly_pnl_geo_pct, monthly_pnl_geo_pct, annual_pnl_geo_pct
         - label_counts (dict[str,int])
         - label_pnl_sum (dict[str,float])
         - label_avg_pnl_pct (dict[str,float])
         - label_win_rate (dict[str,float])
         - label_loss_rate (dict[str,float])
+        - regime_stats (per regime_label or numeric bucket)
+        - hour_of_day_stats (0-23 buckets)
         - self_learning_tune_count, self_learning_use_llm
-        - reinvest_count, reinvest_pnl_pct
+        - reinvest_count, reinvest_pnl_pct, net_pnl_with_reinvest_pct
         - equity_halt_triggered, equity_halt_dd_pct
         - ai_risk_score_avg, ai_risk_score_med, ai_risk_reject_rate
         - pnl_dd_ratio, calmar_ratio, win_loss_ratio
@@ -1190,16 +1188,20 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
         - pnl_skew, pnl_kurtosis_excess
         - max_consec_wins, max_consec_losses
         - rolling_sharpe_50, rolling_sharpe_100
-        - ulcer_index_pct, ulcer_perf_ratio
+        - ulcer_index_pct, ulcer_perf_ratio, time_in_drawdown_frac
         - avg_exposure, p95_exposure
         - avg_risk_mult_effective
         - trade_cost_total_pct, trade_cost_avg_pct
         - rc_bucket_stats (performance per RC bucket)
+        - score_bucket_stats (performance per blended-score bucket)
         - score_min_initial / score_min_final
         - entry_min_score_initial / entry_min_score_final
         - risk_profile, risk_profile_mult, risk_mult_override_final
         - equity_init, equity_cap_mult
         - trade_cost_bps_cfg, jito_tip_bps_cfg, trade_cost_mode_cfg
+        - alloc_mode, use_live_risk_manager
+        - engine_name, engine_version
+        - target_metric_key, target_metric_value
         - trades (optional, if BT_LOG_TRADES is enabled)
         - equity_series (optional, if BT_LOG_EQUITY_SERIES is enabled)
     """
@@ -1237,9 +1239,11 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
     max_positions = max(1, _get_cfg_int(config, "max_positions", default=1))
 
     risk_mult_override = _get_cfg_float(config, "risk_mult_override", default=1.0)
-    risk_profile = str(
-        config.get("RISK_PROFILE") or config.get("risk_profile") or ""
-    ).strip() or None
+    risk_profile = (
+        str(config.get("RISK_PROFILE") or config.get("risk_profile") or "")
+        .strip()
+        or None
+    )
     risk_profile_mult = _risk_profile_scale(risk_profile)
 
     regime_mode_lock_raw = config.get("regime_risk_mode_lock")
@@ -1273,7 +1277,9 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
     max_trades = int(max_trades_cfg) if max_trades_cfg else None
 
     # Extra candidate cap (safety / speed)
-    limit_candidates_cfg = config.get("limit_candidates", config.get("BT_LIMIT_CANDIDATES"))
+    limit_candidates_cfg = config.get(
+        "limit_candidates", config.get("BT_LIMIT_CANDIDATES")
+    )
     try:
         limit_candidates: Optional[int] = (
             int(limit_candidates_cfg) if limit_candidates_cfg else None
@@ -1346,11 +1352,16 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
                 str(k): float(v) for k, v in json.loads(str(lw_raw)).items()
             }
         except Exception:
-            log.warning("backtest_engine: could not parse label_weights_json; ignoring.")
+            log.warning(
+                "backtest_engine: could not parse label_weights_json; ignoring."
+            )
 
-    sample_weight_mode = str(
-        config.get("BT_SAMPLE_WEIGHT_MODE") or config.get("sample_weight_mode") or ""
-    ).strip() or None
+    sample_weight_mode = (
+        str(
+            config.get("BT_SAMPLE_WEIGHT_MODE") or config.get("sample_weight_mode") or ""
+        ).strip()
+        or None
+    )
 
     # Logging controls
     log_trades = _get_cfg_bool(config, "BT_LOG_TRADES", "log_trades", default=False)
@@ -1375,7 +1386,9 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
     else:
         alloc_mode = alloc_mode_raw
 
-    eq_halt_dd_cfg = config.get("BT_RISK_EQUITY_HALT_DD", config.get("risk_equity_halt_dd_pct"))
+    eq_halt_dd_cfg = config.get(
+        "BT_RISK_EQUITY_HALT_DD", config.get("risk_equity_halt_dd_pct")
+    )
     try:
         equity_halt_dd_pct: Optional[float] = (
             float(eq_halt_dd_cfg) if eq_halt_dd_cfg is not None else None
@@ -1454,7 +1467,9 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
     if not math.isfinite(equity_init) or equity_init <= 0.0:
         equity_init = 1.0
 
-    equity_cap_mult_cfg = config.get("BT_EQUITY_CAP_MULT") or config.get("equity_cap_mult")
+    equity_cap_mult_cfg = config.get("BT_EQUITY_CAP_MULT") or config.get(
+        "equity_cap_mult"
+    )
     try:
         equity_cap_mult: Optional[float] = (
             float(equity_cap_mult_cfg) if equity_cap_mult_cfg is not None else None
@@ -1463,6 +1478,18 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
             equity_cap_mult = None
     except Exception:
         equity_cap_mult = None
+
+    # Quick run header log
+    log.info(
+        "backtest_engine: starting run (tag=%s, max_trades=%s, limit_candidates=%s, "
+        "start=%s, end=%s, risk_profile=%s)",
+        tag or "<none>",
+        max_trades,
+        limit_candidates,
+        start_dt,
+        end_dt,
+        risk_profile or "<default>",
+    )
 
     # -------------------------------------------------------------------------
     # Iterate rows & simulate portfolio
@@ -1533,6 +1560,21 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
         (0.75, 1.01, "0.75-1.00"),
     ]
     rc_bucket_acc: Dict[str, Dict[str, Any]] = {}
+
+    # Score buckets (based on blended entry score)
+    score_bucket_defs: List[Tuple[float, float, str]] = [
+        (0.0, 0.70, "0.00-0.70"),
+        (0.70, 0.80, "0.70-0.80"),
+        (0.80, 0.90, "0.80-0.90"),
+        (0.90, 1.01, "0.90-1.00"),
+    ]
+    score_bucket_acc: Dict[str, Dict[str, Any]] = {}
+
+    # Regime stats (label or numeric bucket)
+    regime_bucket_acc: Dict[str, Dict[str, Any]] = {}
+
+    # Hour-of-day stats (0–23)
+    hour_bucket_acc: Dict[int, Dict[str, Any]] = {}
 
     async for row in _iter_rows_from_ai_db(config):
         # Hard candidate cap (safety)
@@ -1715,7 +1757,9 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
             rc_exec_list.append(rc_val)
             # RC bucket stats
             for lo, hi, name in rc_bucket_defs:
-                if (rc_val >= lo and rc_val < hi) or (name.endswith("1.00") and rc_val <= hi):
+                if (rc_val >= lo and rc_val < hi) or (
+                    name.endswith("1.00") and rc_val <= hi
+                ):
                     bucket = rc_bucket_acc.setdefault(
                         name,
                         {"count": 0, "pnl_sum": 0.0, "win_count": 0, "rc_sum": 0.0},
@@ -1727,6 +1771,22 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
                         bucket["win_count"] += 1
                     break
 
+        # Score bucket stats (based on blended entry score)
+        for lo, hi, name in score_bucket_defs:
+            if (blended >= lo and blended < hi) or (
+                name.endswith("1.00") and blended <= hi
+            ):
+                sb = score_bucket_acc.setdefault(
+                    name,
+                    {"count": 0, "pnl_sum": 0.0, "win_count": 0},
+                )
+                sb["count"] += 1
+                sb["pnl_sum"] += pnl_pct
+                if pnl_pct > 0:
+                    sb["win_count"] += 1
+                break
+
+        # Label-category stats
         if row.label:
             label_counts[row.label] = label_counts.get(row.label, 0) + 1
             label_pnl_sum[row.label] = label_pnl_sum.get(row.label, 0.0) + pnl_pct
@@ -1734,6 +1794,47 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
                 label_win_counts[row.label] = label_win_counts.get(row.label, 0) + 1
             elif pnl_pct < 0:
                 label_loss_counts[row.label] = label_loss_counts.get(row.label, 0) + 1
+
+        # Regime stats
+        regime_key: Optional[str] = None
+        if "regime_label" in feats and feats["regime_label"]:
+            regime_key = str(feats["regime_label"]).strip().lower()
+        elif (
+            "regime_label_numeric" in feats
+            and feats["regime_label_numeric"] is not None
+        ):
+            try:
+                rn = float(feats["regime_label_numeric"])
+                regime_key = f"num_{rn:+.1f}"
+            except Exception:
+                pass
+        if not regime_key:
+            regime_key = "unknown"
+
+        reg_bucket = regime_bucket_acc.setdefault(
+            regime_key,
+            {"count": 0, "pnl_sum": 0.0, "win_count": 0, "loss_count": 0},
+        )
+        reg_bucket["count"] += 1
+        reg_bucket["pnl_sum"] += pnl_pct
+        if pnl_pct > 0:
+            reg_bucket["win_count"] += 1
+        elif pnl_pct < 0:
+            reg_bucket["loss_count"] += 1
+
+        # Hour-of-day stats
+        if row.created_at is not None:
+            hour = row.created_at.hour
+            hb = hour_bucket_acc.setdefault(
+                hour,
+                {"count": 0, "pnl_sum": 0.0, "win_count": 0, "loss_count": 0},
+            )
+            hb["count"] += 1
+            hb["pnl_sum"] += pnl_pct
+            if pnl_pct > 0:
+                hb["win_count"] += 1
+            elif pnl_pct < 0:
+                hb["loss_count"] += 1
 
         # Portfolio equity simulation
         r_raw = pnl_pct / 100.0
@@ -1774,7 +1875,7 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
         exposure_list.append(effective_exposure)
         risk_mult_effective_sum += risk_mult_effective
 
-        equity *= (1.0 + r_alloc)
+        equity *= 1.0 + r_alloc
 
         # Apply optional equity cap
         if equity_cap_mult is not None:
@@ -1800,7 +1901,9 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
                     "trade_index": n_trades,
                     "equity": equity,
                     "drawdown": drawdown,
-                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                    "created_at": row.created_at.isoformat()
+                    if row.created_at
+                    else None,
                 }
             )
 
@@ -1830,10 +1933,21 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
         # Reinvestor approx simulation
         if enable_reinvestor and pnl_pct > 0:
             qualifies = True
-            if reinvest_dd_hard_stop_pct > 0 and (drawdown * 100.0) >= reinvest_dd_hard_stop_pct:
+            # Hard/soft DD stops measured on equity path
+            if reinvest_dd_hard_stop_pct > 0 and (
+                drawdown * 100.0
+            ) >= reinvest_dd_hard_stop_pct:
                 qualifies = False
-            if reinvest_dd_soft_stop_pct > 0 and (drawdown * 100.0) >= reinvest_dd_soft_stop_pct:
+            if reinvest_dd_soft_stop_pct > 0 and (
+                drawdown * 100.0
+            ) >= reinvest_dd_soft_stop_pct:
                 qualifies = False
+
+            # Optional future hook: qualify by profit magnitude or label
+            if reinvest_min_profit_sol > 0:
+                # Approx: gate by pnl_pct magnitude – DB rows don't know SOL notional
+                if pnl_pct < 0:
+                    qualifies = False
 
             if qualifies:
                 reinvest_count += 1
@@ -1902,7 +2016,10 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
             )
             # Store as dict for more JSON-friendly output
             trade_dict = {
-                **{k: getattr(trade_rec, k) for k in trade_rec.__dataclass_fields__},  # type: ignore[attr-defined]
+                **{
+                    k: getattr(trade_rec, k)
+                    for k in trade_rec.__dataclass_fields__  # type: ignore[attr-defined]
+                },
                 "created_at": trade_rec.created_at.isoformat()
                 if trade_rec.created_at
                 else None,
@@ -1918,7 +2035,9 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
                             trade=trade_dict,
                         )
                 except Exception:  # pragma: no cover
-                    log.debug("data_logger.record_backtest_trade failed", exc_info=True)
+                    log.debug(
+                        "data_logger.record_backtest_trade failed", exc_info=True
+                    )
 
             if _sl_mod is not None:
                 try:
@@ -1928,7 +2047,10 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
                             trade=trade_dict,
                         )
                 except Exception:  # pragma: no cover
-                    log.debug("self_learning_ai_strategy.record_backtest_trade failed", exc_info=True)
+                    log.debug(
+                        "self_learning_ai_strategy.record_backtest_trade failed",
+                        exc_info=True,
+                    )
 
         # Self-learning simulation (backtest-only adaptive tuning)
         (
@@ -1956,12 +2078,14 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
 
     stats: Dict[str, Any] = {}
     stats["tag"] = tag
+    stats["engine_name"] = ENGINE_NAME
+    stats["engine_version"] = ENGINE_VERSION
     stats["n_candidates"] = n_candidates
     stats["n_trades"] = n_trades
     stats["n_wins"] = n_wins
     stats["n_losses"] = n_losses
     stats["n_flats"] = max(0, n_trades - n_wins - n_losses)
-    stats["win_rate"] = n_wins / n_trades if n_trades > 0 else 0.0
+    stats["win_rate"] = n_trades > 0 and (n_wins / n_trades) or 0.0
 
     # Basic PnL aggregates
     if pnl_list:
@@ -1982,14 +2106,25 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
         stats["pnl_vol_pct"] = 0.0
         stats["pnl_std_error_pct"] = 0.0
 
+    # Best / worst trade helpers
+    if pnl_list:
+        stats["best_trade_pct"] = max(pnl_list)
+        stats["worst_trade_pct"] = min(pnl_list)
+    else:
+        stats["best_trade_pct"] = 0.0
+        stats["worst_trade_pct"] = 0.0
+
     # Equity / drawdown
     stats["net_pnl_pct"] = (equity - equity_init) / equity_init * 100.0
     stats["equity_final"] = equity
+    stats["equity_max"] = hwm
     stats["max_drawdown_pct"] = max_dd * 100.0
     stats["max_runup_pct"] = max_runup * 100.0
     stats["sharpe"] = _compute_sharpe(equity_returns)
     if equity_returns:
-        stats["avg_equity_return_per_trade_pct"] = statistics.mean(equity_returns) * 100.0
+        stats["avg_equity_return_per_trade_pct"] = (
+            statistics.mean(equity_returns) * 100.0
+        )
         if len(equity_returns) > 1:
             stats["equity_vol_pct"] = statistics.pstdev(equity_returns) * 100.0
         else:
@@ -2005,6 +2140,14 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
     else:
         ulcer_index = 0.0
     stats["ulcer_index_pct"] = ulcer_index
+
+    # Fraction of trades spent in drawdown (time under water)
+    if eq_drawdowns_pct:
+        trades_in_dd = sum(1 for d in eq_drawdowns_pct if d > 0)
+        stats["time_in_drawdown_frac"] = trades_in_dd / float(len(eq_drawdowns_pct))
+    else:
+        stats["time_in_drawdown_frac"] = 0.0
+
     net_pnl_pct = float(stats["net_pnl_pct"])
     if ulcer_index > 0:
         stats["ulcer_perf_ratio"] = net_pnl_pct / ulcer_index
@@ -2061,6 +2204,49 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
             "avg_rc": agg["rc_sum"] / float(cnt),
         }
     stats["rc_bucket_stats"] = rc_bucket_stats
+
+    # Score bucket performance (blended entry score deciles-ish)
+    score_bucket_stats: Dict[str, Any] = {}
+    for name, agg in score_bucket_acc.items():
+        cnt = agg["count"]
+        if cnt <= 0:
+            continue
+        score_bucket_stats[name] = {
+            "n_trades": cnt,
+            "avg_pnl_pct": agg["pnl_sum"] / float(cnt),
+            "win_rate": agg["win_count"] / float(cnt),
+        }
+    stats["score_bucket_stats"] = score_bucket_stats
+
+    # Regime stats summary
+    regime_stats: Dict[str, Any] = {}
+    for key, agg in regime_bucket_acc.items():
+        cnt = agg["count"]
+        if cnt <= 0:
+            continue
+        wins = agg["win_count"]
+        losses = agg["loss_count"]
+        regime_stats[key] = {
+            "n_trades": cnt,
+            "avg_pnl_pct": agg["pnl_sum"] / float(cnt),
+            "win_rate": wins / float(cnt),
+            "loss_rate": losses / float(cnt),
+        }
+    stats["regime_stats"] = regime_stats
+
+    # Hour-of-day stats summary
+    hour_stats: Dict[str, Any] = {}
+    for hour, agg in sorted(hour_bucket_acc.items()):
+        cnt = agg["count"]
+        if cnt <= 0:
+            continue
+        hour_stats[str(hour)] = {
+            "n_trades": cnt,
+            "avg_pnl_pct": agg["pnl_sum"] / float(cnt),
+            "win_rate": agg["win_count"] / float(cnt),
+            "loss_rate": agg["loss_count"] / float(cnt),
+        }
+    stats["hour_of_day_stats"] = hour_stats
 
     # Exposure metrics
     if exposure_list:
@@ -2148,6 +2334,29 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
         stats["daily_pnl_pct"] = 0.0
         stats["trade_density_per_day"] = 0.0
 
+    # Geometric daily / weekly / monthly / annualized PnL based on equity curve
+    if stats["days_span"] > 0 and equity_init > 0 and equity > 0:
+        growth_factor = equity / equity_init
+        if growth_factor > 0:
+            daily_geo_factor = growth_factor ** (1.0 / stats["days_span"])
+            stats["daily_pnl_geo_pct"] = (daily_geo_factor - 1.0) * 100.0
+            weekly_geo_factor = daily_geo_factor ** 7.0
+            monthly_geo_factor = daily_geo_factor ** 30.0
+            stats["weekly_pnl_geo_pct"] = (weekly_geo_factor - 1.0) * 100.0
+            stats["monthly_pnl_geo_pct"] = (monthly_geo_factor - 1.0) * 100.0
+            annual_geo_factor = daily_geo_factor ** 365.0
+            stats["annual_pnl_geo_pct"] = (annual_geo_factor - 1.0) * 100.0
+        else:
+            stats["daily_pnl_geo_pct"] = 0.0
+            stats["weekly_pnl_geo_pct"] = 0.0
+            stats["monthly_pnl_geo_pct"] = 0.0
+            stats["annual_pnl_geo_pct"] = 0.0
+    else:
+        stats["daily_pnl_geo_pct"] = 0.0
+        stats["weekly_pnl_geo_pct"] = 0.0
+        stats["monthly_pnl_geo_pct"] = 0.0
+        stats["annual_pnl_geo_pct"] = 0.0
+
     # Label distribution + per-label pnl sum + per-label avg + win/loss-rate
     stats["label_counts"] = dict(label_counts)
     stats["label_pnl_sum"] = dict(label_pnl_sum)
@@ -2190,6 +2399,7 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
     stats["reinvest_max_single_usd"] = reinvest_max_single_usd
     stats["reinvest_dd_soft_stop_pct"] = reinvest_dd_soft_stop_pct
     stats["reinvest_dd_hard_stop_pct"] = reinvest_dd_hard_stop_pct
+    stats["net_pnl_with_reinvest_pct"] = float(stats["net_pnl_pct"]) + reinvest_pnl_pct
 
     # AI risk overlay diagnostics
     stats["ai_risk_overlay_enabled"] = bool(use_ai_risk_overlay)
@@ -2283,6 +2493,36 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
     stats["alloc_mode"] = alloc_mode
     stats["use_live_risk_manager"] = bool(use_live_rm)
 
+    # Target metric helper for sweeps
+    target_metric_key_raw = (
+        config.get("BT_TARGET_METRIC") or config.get("target_metric") or ""
+    )
+    target_metric_key = str(target_metric_key_raw).strip() or None
+
+    if not target_metric_key:
+        # Sensible default priority stack
+        for candidate in (
+            "annual_pnl_geo_pct",
+            "net_pnl_with_reinvest_pct",
+            "net_pnl_pct",
+            "sharpe",
+        ):
+            if isinstance(stats.get(candidate), (int, float)):
+                target_metric_key = candidate
+                break
+
+    if target_metric_key is not None:
+        val = stats.get(target_metric_key)
+        if isinstance(val, (int, float)):
+            stats["target_metric_key"] = target_metric_key
+            stats["target_metric_value"] = float(val)
+        else:
+            stats["target_metric_key"] = target_metric_key
+            stats["target_metric_value"] = 0.0
+    else:
+        stats["target_metric_key"] = None
+        stats["target_metric_value"] = 0.0
+
     # Optional per-trade log
     if log_trades:
         stats["trades"] = trades_for_log
@@ -2316,6 +2556,22 @@ async def run_backtest(config: Mapping[str, Any]) -> Dict[str, Any]:
                     stats=stats,
                 )
         except Exception:  # pragma: no cover
-            log.debug("self_learning_ai_strategy.record_backtest_summary failed", exc_info=True)
+            log.debug(
+                "self_learning_ai_strategy.record_backtest_summary failed",
+                exc_info=True,
+            )
+
+    log.info(
+        "backtest_engine: finished run (tag=%s, n_trades=%d, net_pnl=%.2f%%, "
+        "max_dd=%.2f%%, sharpe=%.3f, kelly=%.3f, target=%s: %.3f)",
+        tag or "<none>",
+        n_trades,
+        stats["net_pnl_pct"],
+        stats["max_drawdown_pct"],
+        stats["sharpe"],
+        stats["kelly_fraction_est"],
+        stats.get("target_metric_key") or "<none>",
+        stats.get("target_metric_value") or 0.0,
+    )
 
     return stats

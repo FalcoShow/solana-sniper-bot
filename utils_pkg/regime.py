@@ -3,15 +3,17 @@ from __future__ import annotations
 """
 utils_pkg/regime.py
 
-Global market regime engine (V3+++ / quant-grade)
-=================================================
+Global market regime engine (V3+++ / quant-grade / God-Tier)
+===========================================================
 
-This module turns *macro + meme market + account + smart-wallet + infra* context into:
+Role
+----
+Turns macro + meme market + smart-wallets + account + infra context into:
 
   Discrete regime:
     - "risk_off" / "normal" / "risk_on"
 
-  Continuous regime features:
+  Continuous regime features (numeric-only, for AI / FeatureBuilder):
     - trend_score                 ∈ [-1, +1]
     - volatility_score            ∈ [0, 1]
     - liquidity_score             ∈ [0, 1]
@@ -27,59 +29,43 @@ This module turns *macro + meme market + account + smart-wallet + infra* context
     - infra_degraded_score        ∈ [0, 1]
 
   Regime-aware risk knobs:
-    - regime_risk_mode            ∈ {0,1,2}  (risk_off / normal / risk_on)
-    - regime_risk_multiplier      ≈ [0.4, 1.6] (configurable)
-    - regime_entry_tighten        ≈ [0.4, 1.5] (depends on regime & stress)
-    - entry_gate_factor           ≈ [0.2, 1.5] (extra scalar for AI entry logic)
+    - regime_risk_mode            ∈ {0,1,2}
+    - regime_risk_multiplier      ≈ [0.4, 1.6]
+    - regime_entry_tighten        ≈ [0.4, 1.5]
+    - regime_entry_gate_factor    ≈ [0.2, 1.5]
+    - regime_slippage_hint_bps    ≈ [MIN_BPS, MAX_BPS]
     - risk_profile_hint           ∈ {"conservative","balanced","aggressive"}
     - regime_should_throttle_entries ∈ {0,1}
     - regime_should_pause_new_entries ∈ {0,1}
+    - regime_is_warmup            ∈ {0,1}
 
   Meta-safety / health:
-    - regime_last_change_sec_ago  ≥ 0
-    - regime_last_eval_sec_ago    ≥ 0
-    - regime_is_stale             ∈ {0,1}
-    - regime_hard_stop            ∈ {0,1} (account or infra kill-switch)
-    - infra_hard_block            ∈ {0,1} (from infra_guard)
+    - regime_last_change_sec_ago
+    - regime_last_eval_sec_ago
+    - regime_is_stale
+    - regime_hard_stop
+    - infra_hard_block
 
-Inputs
-------
+Design principles (God-tier):
+-----------------------------
+- Deterministic + stable: we smooth scores (EMA) and use hysteresis.
+- PnL-positive safety: warmup + stale clamps always reduce risk.
+- Backwards-compatible outputs: same singleton + helper functions.
+- Async safe: one lock, minimal work under lock.
+- “Strict inputs, graceful degradation”: normalize DD sign; tolerate missing scanner stats.
 
-  • SOL/USD price stream (async) via core_utils.get_sol_usd().
-
-  • Scanner aggregates:
-        update_from_scanner_batch(...):
-          meme breadth / liq / rug / pump + smart/whale regime stats.
-
-  • Smart-wallet global regime stats:
-        update_from_smart_wallets_global(...):
-          direct feed from smart_wallets.TRACKER.global_regime_hint().
-
-  • Account stats (PnL / DD / streak):
-        update_from_account(...).
-
-  • Infra health (from infra_guard):
-        update_from_infra(...):
-          infra_degraded_score ∈ [0,1], infra_hard_block flag.
-
-  • External / AI overrides:
-        apply_external_macro_hint(...):
-          soft macro bias & optional forced risk_off flag.
-        apply_ai_macro_hint(...):
-          alias for self_learning_ai_strategy / dashboards.
-
-Outputs are consumed by:
-  - Strategy / risk_manager (size / concurrency scaling, guards)
-  - ai_entry_logic / ai_buy_scoring / ai_sell_logic (tighten/loosen gates)
-  - feature_builder (regime-related AI features)
-  - self_learning_ai_strategy (filters, macro bias)
-  - infra_guard (optional: can read debug_summary / features)
+Consumed by:
+- risk_manager / Strategy (size, concurrency, throttles)
+- ai_entry_logic / ai_buy_scoring / ai_sell_logic
+- feature_builder / self_learning_ai_strategy
+- infra_guard
 """
 
 import asyncio
 import os
 import statistics
 import time
+from bisect import bisect_left
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from logging_setup import get_logger
@@ -90,10 +76,9 @@ log = get_logger("sniper.regime")
 Regime = Literal["risk_on", "normal", "risk_off"]
 
 
-# ────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Env helpers
-# ────────────────────────────────────────────────────────────────────────
-
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _env_float(key: str, default: float) -> float:
     try:
@@ -116,16 +101,87 @@ def _env_bool(key: str, default: bool = False) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def _norm_between(x: float, lo: float, hi: float) -> float:
+    """Normalize x from [lo, hi] → [0,1], clipped."""
+    if hi <= lo:
+        return 0.5
+    return _clamp((x - lo) / (hi - lo), 0.0, 1.0)
+
+
+def _ema(prev: float, new: float, alpha: float) -> float:
+    a = _clamp(alpha, 0.0, 1.0)
+    return (1.0 - a) * prev + a * new
+
+
+def _pct_ret(new: float, old: float) -> float:
+    try:
+        if old <= 0.0:
+            return 0.0
+        return (new / old - 1.0) * 100.0
+    except Exception:
+        return 0.0
+
+
+def _utc_hour(ts: Optional[float] = None) -> int:
+    if ts is None:
+        ts = time.time()
+    return int((ts // 3600) % 24)
+
+
+def _utc_weekday(ts: Optional[float] = None) -> int:
+    # 1970-01-01 was a Thursday (weekday=3 if Monday=0). We keep it simple:
+    if ts is None:
+        ts = time.time()
+    days = int(ts // 86400)
+    return int((days + 3) % 7)  # Monday=0 approx
+
+
+def _session_of_day(ts: Optional[float] = None) -> str:
+    """Lightweight UTC-session detector: 'asia' / 'eu' / 'us'."""
+    h = _utc_hour(ts)
+    if 0 <= h < 8:
+        return "asia"
+    if 8 <= h < 16:
+        return "eu"
+    return "us"
+
+
+def _weekend_factor(ts: Optional[float] = None) -> float:
+    """1.0 weekdays; ~0.7 on weekend (Sat/Sun) when enabled."""
+    wd = _utc_weekday(ts)
+    if wd in (5, 6):  # Sat/Sun (approx)
+        return 0.7
+    return 1.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Core toggles
+# ──────────────────────────────────────────────────────────────────────────────
+
 REGIME_ENABLED = _env_bool("REGIME_ENABLED", True)
 
 # Poll / history
 REGIME_POLL_SEC = max(5, _env_int("REGIME_POLL_SEC", 60))
 REGIME_HISTORY_HORIZON_SEC = _env_int("REGIME_HISTORY_HORIZON_SEC", 7200)  # 2h
 REGIME_MIN_OBS_SEC = _env_int("REGIME_MIN_OBS_SEC", 600)  # 10m warmup
-REGIME_HISTORY_MAX_POINTS = _env_int("REGIME_HISTORY_MAX_POINTS", 800)
+REGIME_HISTORY_MAX_POINTS = _env_int("REGIME_HISTORY_MAX_POINTS", 900)
 
-# Trend bands (% returns for SOL)
+# SOL tape thresholds (%)
 SOL_RISK_ON_RET_1H = _env_float("REGIME_SOL_RISK_ON_RET_1H", 3.0)
 SOL_RISK_ON_RET_5M = _env_float("REGIME_SOL_RISK_ON_RET_5M", 1.0)
 SOL_RISK_OFF_RET_1H = _env_float("REGIME_SOL_RISK_OFF_RET_1H", -3.0)
@@ -133,10 +189,19 @@ SOL_RISK_OFF_RET_5M = _env_float("REGIME_SOL_RISK_OFF_RET_5M", -1.5)
 
 # Volatility band (%)
 REGIME_VOL_5M_HIGH_PCT = _env_float("REGIME_VOL_5M_HIGH_PCT", 2.5)
-REGIME_SMOOTH_SEC = _env_int("REGIME_SMOOTH_SEC", 300)
 
-# Time until we consider the regime engine "stale"
+# Hysteresis / smoothing
+REGIME_SMOOTH_SEC = _env_int("REGIME_SMOOTH_SEC", 300)  # min time between flips
+REGIME_SCORE_EMA_ALPHA = _env_float("REGIME_SCORE_EMA_ALPHA", 0.25)  # smooth scores
+REGIME_SWITCH_MIN_CONF = _env_float("REGIME_SWITCH_MIN_CONF", 0.55)  # require confidence to flip
+REGIME_SWITCH_MIN_SIG = _env_float("REGIME_SWITCH_MIN_SIG", 0.45)
+
+# Stale detection
 REGIME_STALE_SEC = _env_int("REGIME_STALE_SEC", REGIME_POLL_SEC * 4)
+
+# SOL fetch timeout / failure behavior
+REGIME_SOL_FETCH_TIMEOUT_S = _env_float("REGIME_SOL_FETCH_TIMEOUT_S", 3.0)
+REGIME_SOL_MAX_CONSEC_FAIL = _env_int("REGIME_SOL_MAX_CONSEC_FAIL", 5)
 
 # Scanner-based normalization (meme market)
 MEME_HIGH_LIQ_USD = _env_float("REGIME_MEME_HIGH_LIQ_USD", 200_000.0)
@@ -146,22 +211,20 @@ MEME_RUG_RATE_HI = _env_float("REGIME_MEME_RUG_RATE_HI", 0.20)
 MEME_BREADTH_BULLISH = _env_float("REGIME_MEME_BREADTH_BULLISH", 0.60)
 MEME_BREADTH_BEARISH = _env_float("REGIME_MEME_BREADTH_BEARISH", 0.40)
 
-# Risk multipliers (for position size / concurrency)
+# Risk multipliers
 RISK_MULT_RISK_OFF = _env_float("REGIME_RISK_MULT_RISK_OFF", 0.55)
 RISK_MULT_NORMAL = _env_float("REGIME_RISK_MULT_NORMAL", 1.0)
 RISK_MULT_RISK_ON = _env_float("REGIME_RISK_MULT_RISK_ON", 1.25)
 
-# Hard clamp on risk multiplier (for safety)
 RISK_MULT_MIN_CAP = _env_float("REGIME_RISK_MULT_MIN_CAP", 0.4)
 RISK_MULT_MAX_CAP = _env_float("REGIME_RISK_MULT_MAX_CAP", 1.6)
 
-# Dynamic modulation of risk multiplier (macro_signal span)
 REGIME_DYNAMIC_MULT_SPAN = _env_float("REGIME_DYNAMIC_MULT_SPAN", 0.25)
 
 # Manipulation-driven forced risk_off
 REGIME_MANIP_RISK_OFF_THRESH = _env_float("REGIME_MANIP_RISK_OFF_THRESH", 0.75)
 
-# Account-level risk settings (percent)
+# Account-level (%)
 ACCOUNT_DD_RISK_OFF = _env_float("REGIME_ACCOUNT_DD_RISK_OFF", 8.0)
 ACCOUNT_DD_HARD_STOP = _env_float("REGIME_ACCOUNT_DD_HARD_STOP", 15.0)
 ACCOUNT_PNL_RISK_ON = _env_float("REGIME_ACCOUNT_PNL_RISK_ON", 5.0)
@@ -172,217 +235,141 @@ REGIME_ENTRY_TIGHTEN_MAX = _env_float("REGIME_ENTRY_TIGHTEN_MAX", 0.5)
 REGIME_ENTRY_LOOSEN_MAX = _env_float("REGIME_ENTRY_LOOSEN_MAX", 0.2)
 
 # Scanner smoothing
-REGIME_SCANNER_EMA_ALPHA = _env_float("REGIME_SCANNER_EMA_ALPHA", 0.3)
-if REGIME_SCANNER_EMA_ALPHA < 0.0:
-    REGIME_SCANNER_EMA_ALPHA = 0.0
-if REGIME_SCANNER_EMA_ALPHA > 1.0:
-    REGIME_SCANNER_EMA_ALPHA = 1.0
+REGIME_SCANNER_EMA_ALPHA = _env_float("REGIME_SCANNER_EMA_ALPHA", 0.30)
+REGIME_SCANNER_EMA_ALPHA = _clamp(REGIME_SCANNER_EMA_ALPHA, 0.0, 1.0)
 
 # Optional override / debug
 REGIME_FORCE_LABEL_RAW = os.getenv("REGIME_FORCE_LABEL", "").strip().lower()
-if REGIME_FORCE_LABEL_RAW not in ("", "risk_on", "normal", "risk_off"):
-    REGIME_FORCE_LABEL = ""
-else:
-    REGIME_FORCE_LABEL: str = REGIME_FORCE_LABEL_RAW
-
+REGIME_FORCE_LABEL = REGIME_FORCE_LABEL_RAW if REGIME_FORCE_LABEL_RAW in ("", "risk_on", "normal", "risk_off") else ""
 REGIME_DEBUG_LOG = _env_bool("REGIME_DEBUG_LOG", False)
 
-# V3+++ extras: session-of-day bias (Asia / EU / US), weekend clamp, etc.
+# Session / weekend extras
 REGIME_SESSION_BIAS_ENABLED = _env_bool("REGIME_SESSION_BIAS_ENABLED", True)
 REGIME_WEAK_WEEKEND_MODE = _env_bool("REGIME_WEAK_WEEKEND_MODE", True)
 
-# How strongly account state impacts macro_risk_score (0..1)
-REGIME_ACCOUNT_INFLUENCE = _env_float("REGIME_ACCOUNT_INFLUENCE", 0.8)
-REGIME_ACCOUNT_INFLUENCE = max(0.0, min(1.0, REGIME_ACCOUNT_INFLUENCE))
+# Influence weights (0..1)
+REGIME_ACCOUNT_INFLUENCE = _clamp(_env_float("REGIME_ACCOUNT_INFLUENCE", 0.8), 0.0, 1.0)
+REGIME_INFRA_INFLUENCE = _clamp(_env_float("REGIME_INFRA_INFLUENCE", 0.6), 0.0, 1.0)
 
-# Infra influence on stress / tradeability (0..1)
-REGIME_INFRA_INFLUENCE = _env_float("REGIME_INFRA_INFLUENCE", 0.6)
-REGIME_INFRA_INFLUENCE = max(0.0, min(1.0, REGIME_INFRA_INFLUENCE))
-
-# Tradeability thresholds for gating
+# Tradeability gating
 REGIME_TRADEABILITY_HARD_MIN = _env_float("REGIME_TRADEABILITY_HARD_MIN", 0.15)
 REGIME_TRADEABILITY_SOFT_MIN = _env_float("REGIME_TRADEABILITY_SOFT_MIN", 0.30)
 
-# Whether infra hard block should participate in kill-switch
+# Infra kill-switch participation
 REGIME_PAUSE_ON_INFRA_HARD = _env_bool("REGIME_PAUSE_ON_INFRA_HARD", True)
 
+# Slippage hints (bps)
+REGIME_SLIPPAGE_HINT_MIN_BPS = max(1, _env_int("REGIME_SLIPPAGE_HINT_MIN_BPS", 40))
+REGIME_SLIPPAGE_HINT_MAX_BPS = max(REGIME_SLIPPAGE_HINT_MIN_BPS, _env_int("REGIME_SLIPPAGE_HINT_MAX_BPS", 200))
 
-# ────────────────────────────────────────────────────────────────────────
-# Low-level helpers
-# ────────────────────────────────────────────────────────────────────────
+# Warmup & stale clamps
+REGIME_WARMUP_RISK_CLAMP = _clamp(_env_float("REGIME_WARMUP_RISK_CLAMP", 0.75), 0.1, 1.0)
+REGIME_STALE_RISK_CLAMP = _clamp(_env_float("REGIME_STALE_RISK_CLAMP", 0.70), 0.1, 1.0)
+REGIME_WARMUP_ENTRY_TIGHTEN_CAP = _clamp(_env_float("REGIME_WARMUP_ENTRY_TIGHTEN_CAP", 0.90), 0.6, 1.0)
 
 
-def _pct_ret(new: float, old: float) -> float:
-    try:
-        if old <= 0:
-            return 0.0
-        return (new / old - 1.0) * 100.0
-    except Exception:
+# ──────────────────────────────────────────────────────────────────────────────
+# History helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _rolling_return(history: List[Tuple[float, float]], horizon_sec: float) -> float:
+    """
+    % return over horizon using the first obs with ts >= now - horizon.
+    Uses binary search for speed.
+    """
+    if len(history) < 2:
         return 0.0
+    now_ts = history[-1][0]
+    target_ts = now_ts - float(horizon_sec)
+    newest = history[-1][1]
+
+    ts_list = [t for (t, _) in history]
+    idx = bisect_left(ts_list, target_ts)
+    if idx <= 0:
+        ref = history[0][1]
+    elif idx >= len(history):
+        ref = history[-1][1]
+    else:
+        ref = history[idx][1]
+    return _pct_ret(newest, ref)
 
 
-def _rolling_return(series: List[Tuple[float, float]], horizon_sec: float) -> float:
-    """
-    Compute % return over `horizon_sec` using earliest obs >= now - horizon_sec.
-    """
-    if not series:
-        return 0.0
-    now = series[-1][0]
-    target_ts = now - horizon_sec
-    newest_price = series[-1][1]
-
-    ref_price: Optional[float] = None
-    for ts, px in series:
-        if ts >= target_ts:
-            ref_price = px
-            break
-    if ref_price is None:
-        ref_price = series[0][1]
-
-    return _pct_ret(newest_price, ref_price)
-
-
-def _window_ret_series(
-    series: List[Tuple[float, float]],
-    max_gap_sec: float,
-) -> List[float]:
-    """
-    Stepwise returns for realized-vol estimate. Skips huge gaps.
-    """
-    if len(series) < 2:
+def _step_returns(history: List[Tuple[float, float]], max_gap_sec: float) -> List[float]:
+    """Stepwise returns for realized-vol estimates. Skips huge gaps."""
+    if len(history) < 2:
         return []
     out: List[float] = []
-    for i in range(1, len(series)):
-        ts, px = series[i]
-        prev_ts, prev_px = series[i - 1]
-        if ts - prev_ts > max_gap_sec:
-            continue
-        out.append(_pct_ret(px, prev_px))
+    prev_ts, prev_px = history[0]
+    for ts, px in history[1:]:
+        if ts - prev_ts <= max_gap_sec and prev_px > 0:
+            out.append(_pct_ret(px, prev_px))
+        prev_ts, prev_px = ts, px
     return out
 
 
-def _clamp(x: float, lo: float, hi: float) -> float:
-    if x < lo:
-        return lo
-    if x > hi:
-        return hi
-    return x
-
-
-def _norm_between(x: float, lo: float, hi: float) -> float:
-    """
-    Normalize x from [lo, hi] → [0, 1], clipped.
-    """
-    if hi <= lo:
-        return 0.5
-    return _clamp((x - lo) / (hi - lo), 0.0, 1.0)
-
-
-def _session_of_day(ts: Optional[float] = None) -> str:
-    """
-    Lightweight UTC-session detector: "asia" / "eu" / "us".
-    """
-    if ts is None:
-        ts = time.time()
-    hour = int((ts / 3600) % 24)
-    if 0 <= hour < 8:
-        return "asia"
-    if 8 <= hour < 16:
-        return "eu"
-    return "us"
-
-
-def _weekend_factor(ts: Optional[float] = None) -> float:
-    """
-    1.0 on weekdays, ~0.7 on weekend when enabled.
-    """
-    if ts is None:
-        ts = time.time()
-    # Monday = 0; Sunday = 6 (approximate; just for soft bias)
-    day = int((ts // 86400 + 3) % 7)
-    if day in (5, 6):  # Sat/Sun
-        return 0.7
-    return 1.0
-
-
-# ────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Regime engine
-# ────────────────────────────────────────────────────────────────────────
-
+# ──────────────────────────────────────────────────────────────────────────────
 
 class RegimeState:
     """
     Global macro + memecoin + infra regime engine.
-
-    Maintains:
-      - Discrete regime label.
-      - Continuous scores (trend/vol/liq/manip/meme/acc/infra).
-      - Risk knobs used everywhere else.
-
-    Updated by:
-      - refresh_loop / refresh_once: SOL macro tape
-      - update_from_scanner_batch: meme market aggregates
-      - update_from_smart_wallets_global: global smart/whale regime hints
-      - update_from_account: account state (DD / streak / PnL)
-      - update_from_infra: infra health (latency/errors/degraded routes)
-      - apply_external_macro_hint / apply_ai_macro_hint: soft macro overrides
-
-    V3+++ additions:
-      - session-of-day bias & weekend throttling
-      - tradeability_score for AI & risk_manager
-      - infra_degraded_score and infra_hard_block for infra_guard
-      - staleness / hard-stop / pause-new-entries flags for safety
     """
 
     def __init__(self) -> None:
-        # Discrete regime + transition hysteresis
+        # Discrete regime
         self._regime: Regime = "normal"
         self._last_change_ts: float = time.time()
-        self._last_eval_ts: float = 0.0  # last time we recomputed scores
+        self._last_eval_ts: float = 0.0
 
-        # SOL price history: [(ts, px)]
+        # SOL price history
         self._history: List[Tuple[float, float]] = []
         self._last_px: float = 0.0
+        self._consec_sol_fail: int = 0
 
-        # Continuous scores
-        self.trend_score: float = 0.0          # -1..+1
-        self.volatility_score: float = 0.0     # 0..1
-        self.liquidity_score: float = 0.5      # 0..1
-        self.manipulation_risk: float = 0.0    # 0..1
-        self.choppy_score: float = 0.0         # 0..1
-        self.confidence_score: float = 0.5     # 0..1
-        self.meme_heat: float = 0.5            # 0..1
+        # Continuous scores (smoothed)
+        self.trend_score: float = 0.0
+        self.volatility_score: float = 0.0
+        self.liquidity_score: float = 0.5
+        self.manipulation_risk: float = 0.0
+        self.choppy_score: float = 0.0
+        self.confidence_score: float = 0.5
+        self.meme_heat: float = 0.5
 
-        # Scanner aggregates (EMA-smoothed)
-        self._meme_liq_score: float = 0.5        # 0..1
-        self._meme_breadth_up_ratio: float = 0.5 # 0..1
-        self._meme_pump_density: float = 0.0     # 0..1
-        self._meme_rug_rate: float = 0.0         # 0..1
+        # Scanner aggregates (EMA)
+        self._meme_liq_score: float = 0.5
+        self._meme_breadth_up_ratio: float = 0.5
+        self._meme_pump_density: float = 0.0
+        self._meme_rug_rate: float = 0.0
 
-        # Smart/whale regime-side aggregates from smart_wallets (optional)
-        self._scanner_smart_accum: float = 0.0       # 0..1
-        self._scanner_smart_panic: float = 0.0       # 0..1
-        self._scanner_whale_dom: float = 0.0         # 0..1
-        self._scanner_smart_conflict: float = 0.0    # 0..1
+        # Smart/whale aggregates (EMA)
+        self._scanner_smart_accum: float = 0.0
+        self._scanner_smart_panic: float = 0.0
+        self._scanner_whale_dom: float = 0.0
+        self._scanner_smart_conflict: float = 0.0
+        self._global_smart_risk: float = 0.0
 
-        # Account-level stats
+        # Account state (normalized)
         self.account_daily_pnl_pct: float = 0.0
-        self.account_daily_dd_pct: float = 0.0
+        self.account_daily_dd_pct: float = 0.0  # negative drawdown (e.g., -3.2)
         self.account_consec_losses: int = 0
-        self.account_risk_bias: float = 0.0  # -1..+1
+        self.account_risk_bias: float = 0.0
+        self.account_equity_slope: float = 0.0
+        self.account_intraday_vol: float = 0.0
+        self.account_kelly_hint: float = 0.0
 
-        # Infra health (from infra_guard)
-        self.infra_degraded_score: float = 0.0   # 0..1
+        # Infra
+        self.infra_degraded_score: float = 0.0
         self.infra_hard_block: bool = False
 
-        # Combined macro risk, stress, signal strength, tradeability
-        self.macro_risk_score: float = 0.0       # -1..+1
-        self.regime_stress_score: float = 0.0    # 0..1
-        self.regime_signal_strength: float = 0.0 # 0..1
-        self.tradeability_score: float = 0.0     # 0..1
+        # Combined
+        self.macro_risk_score: float = 0.0
+        self.regime_stress_score: float = 0.0
+        self.regime_signal_strength: float = 0.0
+        self.tradeability_score: float = 0.0
 
-        # External / AI macro overrides (optional soft inputs)
-        self._external_macro_bias: float = 0.0   # -1..+1 (from LLM / dashboards)
+        # External overrides
+        self._external_macro_bias: float = 0.0
         self._external_risk_off_flag: bool = False
 
         # Internal
@@ -390,9 +377,9 @@ class RegimeState:
         self._running_task: Optional[asyncio.Task] = None
         self._force_label_logged: bool = False
 
-    # ------------------------------------------------------------------ #
-    # Basic accessors / knobs
-    # ------------------------------------------------------------------ #
+    # ────────────────────────────────────────────────────────────────────
+    # Basic accessors
+    # ────────────────────────────────────────────────────────────────────
 
     def get(self) -> Regime:
         return self._regime
@@ -404,9 +391,6 @@ class RegimeState:
         return {"risk_off": -1.0, "normal": 0.0, "risk_on": 1.0}[self._regime]
 
     def risk_mode(self) -> int:
-        """
-        0 = risk_off, 1 = normal, 2 = risk_on
-        """
         return {"risk_off": 0, "normal": 1, "risk_on": 2}[self._regime]
 
     def is_risk_on(self) -> bool:
@@ -416,10 +400,39 @@ class RegimeState:
         return self._regime == "risk_off"
 
     def is_infra_blocked(self) -> bool:
-        """
-        True if infra_guard reports hard-block state.
-        """
         return bool(self.infra_hard_block)
+
+    def is_warmup(self) -> bool:
+        if not REGIME_ENABLED:
+            return False
+        if len(self._history) < 2:
+            return True
+        span = self._history[-1][0] - self._history[0][0]
+        return span < float(REGIME_MIN_OBS_SEC)
+
+    def is_stale(self) -> bool:
+        if not REGIME_ENABLED:
+            return False
+        if self._last_eval_ts <= 0:
+            return False
+        return (time.time() - self._last_eval_ts) >= float(max(10, REGIME_STALE_SEC))
+
+    def is_hard_stop(self) -> bool:
+        # account dd_pct stored negative
+        if self.account_daily_dd_pct <= -abs(ACCOUNT_DD_HARD_STOP):
+            return True
+        if REGIME_PAUSE_ON_INFRA_HARD and self.infra_hard_block:
+            return True
+        return False
+
+    def is_hard_risk_off(self) -> bool:
+        if self._external_risk_off_flag:
+            return True
+        return self._regime == "risk_off" and self.regime_stress_score >= 0.6
+
+    # ────────────────────────────────────────────────────────────────────
+    # Risk knobs
+    # ────────────────────────────────────────────────────────────────────
 
     def _base_risk_mult(self) -> float:
         if self._regime == "risk_off":
@@ -428,154 +441,105 @@ class RegimeState:
             return max(0.0, RISK_MULT_RISK_ON)
         return max(0.0, RISK_MULT_NORMAL)
 
-    def is_hard_risk_off(self) -> bool:
-        """
-        Convenience: strong "cut risk" regime flag, combining label + stress +
-        external risk_off.
-        """
-        if self._external_risk_off_flag:
-            return True
-        return self._regime == "risk_off" and self.regime_stress_score >= 0.6
-
     def risk_multiplier(self) -> float:
-        """
-        Regime-aware multiplicative factor for size / concurrency.
-
-        Typical usage:
-            final_pos_size = base_size * regime_state.risk_multiplier()
-            max_concurrent = int(base_concurrent * regime_state.risk_multiplier())
-
-        Combines:
-            - base multiplier from discrete regime,
-            - dynamic macro signal (liquidity minus manipulation),
-            - account_risk_bias (DD / streaks / PnL),
-            - soft external bias (from AI or UI),
-            - session / weekend bias.
-        """
         base = self._base_risk_mult()
 
-        # Macro dynamic modulation (liquidity minus manipulation).
         liq = _clamp(self.liquidity_score, 0.0, 1.0)
         manip = _clamp(self.manipulation_risk, 0.0, 1.0)
-        macro_signal = liq - manip  # ~ [-1, +1]
+        macro_signal = liq - manip  # [-1, +1]-ish
 
         span = max(0.0, REGIME_DYNAMIC_MULT_SPAN)
-        dynamic_mod = 1.0 + span * macro_signal  # approx [1-span, 1+span]
+        dynamic_mod = 1.0 + span * macro_signal
 
-        # Account modulation: account_risk_bias ∈ [-1, +1] → ~[0.7, 1.3]
         account_bias = _clamp(self.account_risk_bias, -1.0, 1.0)
-        account_mod = 1.0 + 0.3 * account_bias
+        account_mod = 1.0 + 0.30 * account_bias
 
-        # External bias: ∈ [-1, +1] → ~[0.8, 1.2]
         ext_bias = _clamp(self._external_macro_bias, -1.0, 1.0)
-        external_mod = 1.0 + 0.2 * ext_bias
+        external_mod = 1.0 + 0.20 * ext_bias
 
         raw = base * dynamic_mod * account_mod * external_mod
 
-        # Session + weekend throttling (soft)
+        # Session/weekend soft bias
         if REGIME_SESSION_BIAS_ENABLED or REGIME_WEAK_WEEKEND_MODE:
             now = time.time()
             if REGIME_SESSION_BIAS_ENABLED:
                 session = _session_of_day(now)
                 if session == "asia":
-                    raw *= 0.9  # thinner liq on average
+                    raw *= 0.90
                 elif session == "us":
-                    raw *= 1.05  # often more liq
+                    raw *= 1.05
             if REGIME_WEAK_WEEKEND_MODE:
                 raw *= _weekend_factor(now)
+
+        # Warmup/stale clamps (PnL-positive safety)
+        if self.is_warmup():
+            raw *= REGIME_WARMUP_RISK_CLAMP
+        if self.is_stale():
+            raw *= REGIME_STALE_RISK_CLAMP
 
         return _clamp(raw, RISK_MULT_MIN_CAP, RISK_MULT_MAX_CAP)
 
     def entry_tighten(self) -> float:
-        """
-        Tightening/loosening factor for entry thresholds.
-
-        Used by AI entry logic:
-            effective = base_threshold * regime_state.entry_tighten()
-
-        - risk_off + high stress → 0.4–1.0 (tighter).
-        - clean, strong risk_on → 1.0–1.5 (slightly looser).
-        - normal → ~0.7–1.2 depending on stress & signal.
-        """
         stress = _clamp(self.regime_stress_score, 0.0, 1.0)
         signal = _clamp(self.regime_signal_strength, 0.0, 1.0)
 
         if self._external_risk_off_flag:
-            return 0.4
-
-        if self._regime == "risk_off":
+            val = 0.40
+        elif self._regime == "risk_off":
             tighten_span = max(0.0, REGIME_ENTRY_TIGHTEN_MAX)
-            return _clamp(1.0 - tighten_span * stress, 0.4, 1.0)
-
-        if self._regime == "risk_on":
+            val = _clamp(1.0 - tighten_span * stress, 0.4, 1.0)
+        elif self._regime == "risk_on":
             loosen_span = max(0.0, REGIME_ENTRY_LOOSEN_MAX)
-            return _clamp(1.0 + loosen_span * signal, 1.0, 1.5)
+            val = _clamp(1.0 + loosen_span * signal, 1.0, 1.5)
+        else:
+            tighten_span = max(0.0, REGIME_ENTRY_TIGHTEN_MAX * 0.5)
+            loosen_span = max(0.0, REGIME_ENTRY_LOOSEN_MAX * 0.5)
+            val = _clamp(1.0 - tighten_span * stress + loosen_span * signal, 0.7, 1.2)
 
-        # normal regime
-        tighten_span = max(0.0, REGIME_ENTRY_TIGHTEN_MAX * 0.5)
-        loosen_span = max(0.0, REGIME_ENTRY_LOOSEN_MAX * 0.5)
-        val = 1.0 - tighten_span * stress + loosen_span * signal
-        return _clamp(val, 0.7, 1.2)
+        # Warmup safety: never loosen too much early
+        if self.is_warmup() and val > REGIME_WARMUP_ENTRY_TIGHTEN_CAP:
+            val = REGIME_WARMUP_ENTRY_TIGHTEN_CAP
+
+        return val
 
     def entry_gate_factor(self) -> float:
-        """
-        Extra scalar for AI entry logic / Strategy gating, ∈ [0.2, 1.5].
-
-        Intuition:
-          - Combine risk_multiplier + entry_tighten + stress penalty
-          - Use wherever you want a single "how open should the gate be?" scalar.
-
-        Typical usage in ai_entry_logic:
-            gate = regime_state.entry_gate_factor()
-            final_score = base_score * gate
-        """
-        rm = self.risk_multiplier()          # ~0.4..1.6
-        tighten = self.entry_tighten()       # ~0.4..1.5
+        rm = self.risk_multiplier()
+        tighten = self.entry_tighten()
         stress = _clamp(self.regime_stress_score, 0.0, 1.0)
 
-        # Stress penalty (up to -40% when regime_stress_score == 1)
-        stress_penalty = 1.0 - 0.4 * stress
-
+        stress_penalty = 1.0 - 0.40 * stress
         raw = rm * tighten * stress_penalty
         return _clamp(raw, 0.2, 1.5)
 
-    def should_throttle_entries(self) -> bool:
-        """
-        Boolean helper: "should we be picky as hell right now?"
+    def slippage_hint_bps(self) -> int:
+        vol = _clamp(self.volatility_score, 0.0, 1.0)
+        manip = _clamp(self.manipulation_risk, 0.0, 1.0)
+        liq = _clamp(self.liquidity_score, 0.0, 1.0)
+        stress = _clamp(self.regime_stress_score, 0.0, 1.0)
 
-        True when:
-          - hard risk_off, OR
-          - very high stress, OR
-          - strongly negative macro_risk_score with weak signal, OR
-          - tradeability_score below soft minimum, OR
-          - regime features are stale.
-        """
+        dirtiness = _clamp(
+            0.35 * vol + 0.30 * manip + 0.20 * stress + 0.15 * (1.0 - liq),
+            0.0,
+            1.0,
+        )
+        lo = float(REGIME_SLIPPAGE_HINT_MIN_BPS)
+        hi = float(REGIME_SLIPPAGE_HINT_MAX_BPS)
+        return int(round(lo + (hi - lo) * dirtiness))
+
+    def should_throttle_entries(self) -> bool:
         if self.is_hard_risk_off():
             return True
-
         if self.regime_stress_score >= 0.75:
             return True
-
         if self.macro_risk_score <= -0.5 and self.regime_signal_strength <= 0.4:
             return True
-
         if self.tradeability_score <= REGIME_TRADEABILITY_SOFT_MIN:
             return True
-
-        if self.is_stale():
+        if self.is_stale() or self.is_warmup():
             return True
-
         return False
 
     def should_pause_all_new_entries(self) -> bool:
-        """
-        Stronger gate on *new* entries only (existing positions can still be
-        managed by exit_engine / ai_sell_logic).
-
-        True when:
-          - hard stop (account DD / infra kill-switch), OR
-          - tradeability_score below hard minimum.
-        """
         if self.is_hard_stop():
             return True
         if REGIME_PAUSE_ON_INFRA_HARD and self.infra_hard_block:
@@ -584,69 +548,26 @@ class RegimeState:
             return True
         return False
 
-    # ------------------------------------------------------------------ #
-    # Risk-profile hint + ctx export for risk_manager / AI modules
-    # ------------------------------------------------------------------ #
-
     def risk_profile_hint(self) -> str:
-        """
-        Suggest a risk profile string based purely on regime + account context.
-
-        "conservative" | "balanced" | "aggressive"
-
-        This is *advisory*: risk_manager can override/merge with manual profile.
-        """
-        # If stress is high or macro is nasty → conservative
         if self.regime_stress_score >= 0.6 or self.macro_risk_score <= -0.4:
             return "conservative"
-
-        # If macro ultra-strong & low stress → aggressive
         if self.macro_risk_score >= 0.6 and self.regime_stress_score <= 0.35:
             return "aggressive"
-
         return "balanced"
 
-    def is_stale(self) -> bool:
-        """
-        True if the regime engine hasn't recomputed in a while (API dead, etc).
-
-        risk_manager / Strategy can use this to auto-clamp risk if macro loop
-        silently dies.
-        """
-        if not REGIME_ENABLED:
-            return False
-        if self._last_eval_ts <= 0:
-            return False
-        age = time.time() - self._last_eval_ts
-        return age >= float(max(10, REGIME_STALE_SEC))
-
-    def is_hard_stop(self) -> bool:
-        """
-        True if account is in "kill switch" territory based on DD or infra.
-
-        Risk manager can treat this as a red-line state.
-        """
-        if self.account_daily_dd_pct <= -abs(ACCOUNT_DD_HARD_STOP):
-            return True
-        if REGIME_PAUSE_ON_INFRA_HARD and self.infra_hard_block:
-            return True
-        return False
+    # ────────────────────────────────────────────────────────────────────
+    # Export ctx
+    # ────────────────────────────────────────────────────────────────────
 
     def to_risk_ctx(self) -> Dict[str, Any]:
-        """
-        Export regime info as a dict for risk_manager to blend into risk:ctx.
-
-        risk_manager can merge this with leverage limits, capital usage, etc.
-        """
         return {
-            # core label + knobs
             "regime_label": self.label(),
             "regime_label_numeric": self.as_numeric(),
             "regime_risk_mode": self.risk_mode(),
             "regime_risk_multiplier": self.risk_multiplier(),
             "regime_entry_tighten": self.entry_tighten(),
             "regime_entry_gate_factor": self.entry_gate_factor(),
-            # main scores
+            "regime_slippage_hint_bps": float(self.slippage_hint_bps()),
             "regime_trend": float(self.trend_score),
             "regime_volatility": float(self.volatility_score),
             "regime_liquidity": float(self.liquidity_score),
@@ -657,28 +578,24 @@ class RegimeState:
             "tradeability_score": float(self.tradeability_score),
             "macro_risk_score": float(self.macro_risk_score),
             "infra_degraded_score": float(self.infra_degraded_score),
-            # account + profile
             "account_risk_bias": float(self.account_risk_bias),
             "account_daily_dd_pct": float(self.account_daily_dd_pct),
             "account_daily_pnl_pct": float(self.account_daily_pnl_pct),
+            "account_equity_slope": float(self.account_equity_slope),
+            "account_intraday_vol": float(self.account_intraday_vol),
+            "account_kelly_hint": float(self.account_kelly_hint),
             "risk_profile_hint": self.risk_profile_hint(),
-            # helper booleans
             "regime_should_throttle_entries": 1.0 if self.should_throttle_entries() else 0.0,
             "regime_should_pause_new_entries": 1.0 if self.should_pause_all_new_entries() else 0.0,
             "regime_is_risk_on": 1.0 if self.is_risk_on() else 0.0,
             "regime_is_risk_off": 1.0 if self.is_risk_off() else 0.0,
             "regime_is_stale": 1.0 if self.is_stale() else 0.0,
+            "regime_is_warmup": 1.0 if self.is_warmup() else 0.0,
             "regime_hard_stop": 1.0 if self.is_hard_stop() else 0.0,
             "infra_hard_block": 1.0 if self.infra_hard_block else 0.0,
         }
 
     def to_entry_ctx(self) -> Dict[str, float]:
-        """
-        Slim context for entry engines (ai_entry_logic / ai_buy_scoring):
-
-            gate = ctx["regime_entry_gate_factor"]
-            if ctx["regime_should_pause_new_entries"]: skip etc.
-        """
         return {
             "regime_label_numeric": self.as_numeric(),
             "regime_risk_mode": float(self.risk_mode()),
@@ -692,31 +609,30 @@ class RegimeState:
             "regime_should_throttle_entries": 1.0 if self.should_throttle_entries() else 0.0,
             "regime_should_pause_new_entries": 1.0 if self.should_pause_all_new_entries() else 0.0,
             "regime_is_stale": 1.0 if self.is_stale() else 0.0,
+            "regime_is_warmup": 1.0 if self.is_warmup() else 0.0,
             "infra_degraded_score": float(self.infra_degraded_score),
             "infra_hard_block": 1.0 if self.infra_hard_block else 0.0,
         }
 
     async def features(self) -> Dict[str, float]:
-        """
-        Snapshot regime features for feature_builder / logging / AI.
-
-        Returns numeric-only dict; any "label" is encoded as -1/0/1
-        under `regime_label` / `regime_label_numeric`.
-        """
         async with self._lock:
-            hist = list(self._history)
             regime = self._regime
+            last_change_ts = self._last_change_ts
+            last_eval_ts = self._last_eval_ts
+            last_px = self._last_px
 
+            # copy scores
             trend = float(self.trend_score)
-            vol_score = float(self.volatility_score)
-            liq_score = float(self.liquidity_score)
-            manip_score = float(self.manipulation_risk)
+            vol = float(self.volatility_score)
+            liq = float(self.liquidity_score)
+            manip = float(self.manipulation_risk)
             choppy = float(self.choppy_score)
             conf = float(self.confidence_score)
             meme_heat = float(self.meme_heat)
-            macro_risk = float(self.macro_risk_score)
+
+            macro = float(self.macro_risk_score)
             stress = float(self.regime_stress_score)
-            sig_strength = float(self.regime_signal_strength)
+            sig = float(self.regime_signal_strength)
             tradeable = float(self.tradeability_score)
 
             meme_breadth = float(self._meme_breadth_up_ratio)
@@ -728,150 +644,117 @@ class RegimeState:
             smart_panic = float(self._scanner_smart_panic)
             whale_dom = float(self._scanner_whale_dom)
             smart_conflict = float(self._scanner_smart_conflict)
+            smart_risk = float(self._global_smart_risk)
 
             acc_pnl = float(self.account_daily_pnl_pct)
             acc_dd = float(self.account_daily_dd_pct)
             acc_losses = float(self.account_consec_losses)
             acc_bias = float(self.account_risk_bias)
+            acc_eq_slope = float(self.account_equity_slope)
+            acc_eq_vol = float(self.account_intraday_vol)
+            acc_kelly = float(self.account_kelly_hint)
 
-            last_change_ts = float(self._last_change_ts)
-            last_px = float(self._last_px)
-            last_eval_ts = float(self._last_eval_ts)
-
-            external_bias = float(self._external_macro_bias)
-            external_risk_off = 1.0 if self._external_risk_off_flag else 0.0
+            ext_bias = float(self._external_macro_bias)
+            ext_risk_off = 1.0 if self._external_risk_off_flag else 0.0
 
             infra_deg = float(self.infra_degraded_score)
             infra_block = 1.0 if self.infra_hard_block else 0.0
 
-        numeric = self.as_numeric()
-        risk_mode = self.risk_mode()
-        risk_mult = self.risk_multiplier()
-        entry_t = self.entry_tighten()
-        gate_factor = self.entry_gate_factor()
+            hist = list(self._history)
 
         now = time.time()
         last_change_ago = max(0.0, now - last_change_ts)
         last_eval_ago = max(0.0, now - last_eval_ts) if last_eval_ts > 0 else 1e9
-        stale_flag = 1.0 if self.is_stale() else 0.0
-        hard_stop_flag = 1.0 if self.is_hard_stop() else 0.0
 
-        # Session / weekend helper (call once)
-        session = _session_of_day()
-        week_factor = _weekend_factor()
+        numeric = {"risk_off": -1.0, "normal": 0.0, "risk_on": 1.0}[regime]
+        session = _session_of_day(now)
+        week_factor = _weekend_factor(now)
 
         payload: Dict[str, float] = {
-            # Label / regime meta
-            "regime_label_numeric": numeric,
-            "regime_numeric": numeric,
-            "regime_score": numeric,
-            "regime_risk_mode": float(risk_mode),
-            "regime_risk_multiplier": float(risk_mult),
-            "regime_entry_tighten": float(entry_t),
-            "regime_entry_gate_factor": float(gate_factor),
+            "regime_label_numeric": float(numeric),
+            "regime_numeric": float(numeric),
+            "regime_score": float(numeric),
+            "regime_risk_mode": float({"risk_off": 0, "normal": 1, "risk_on": 2}[regime]),
+            "regime_risk_multiplier": float(self.risk_multiplier()),
+            "regime_entry_tighten": float(self.entry_tighten()),
+            "regime_entry_gate_factor": float(self.entry_gate_factor()),
+            "regime_slippage_hint_bps": float(self.slippage_hint_bps()),
             "regime_is_risk_on": 1.0 if regime == "risk_on" else 0.0,
             "regime_is_risk_off": 1.0 if regime == "risk_off" else 0.0,
-            "regime_label": {"risk_off": -1.0, "normal": 0.0, "risk_on": 1.0}[regime],
+            "regime_label": float(numeric),
             "regime_last_change_sec_ago": float(last_change_ago),
             "regime_last_eval_sec_ago": float(last_eval_ago),
-            "regime_is_stale": stale_flag,
-            "regime_hard_stop": hard_stop_flag,
-            # Main continuous scores
+            "regime_is_stale": 1.0 if self.is_stale() else 0.0,
+            "regime_is_warmup": 1.0 if self.is_warmup() else 0.0,
+            "regime_hard_stop": 1.0 if self.is_hard_stop() else 0.0,
             "trend_score": trend,
-            "volatility_score": vol_score,
-            "liquidity_score": liq_score,
-            "manipulation_risk": manip_score,
+            "volatility_score": vol,
+            "liquidity_score": liq,
+            "manipulation_risk": manip,
             "regime_choppy_score": choppy,
             "regime_confidence": conf,
             "regime_meme_heat": meme_heat,
-            "macro_risk_score": macro_risk,
+            "macro_risk_score": macro,
             "regime_stress_score": stress,
-            "regime_signal_strength": sig_strength,
+            "regime_signal_strength": sig,
             "tradeability_score": tradeable,
-            # Aliases used by feature_builder / ai_entry_logic
             "regime_trend": trend,
-            "regime_volatility": vol_score,
-            "regime_liquidity": liq_score,
-            "regime_manipulation_risk": manip_score,
-            # Meme aggregates
+            "regime_volatility": vol,
+            "regime_liquidity": liq,
+            "regime_manipulation_risk": manip,
             "meme_breadth_up_ratio": meme_breadth,
             "meme_liq_score": meme_liq,
             "meme_pump_density": meme_pump,
             "meme_rug_rate": meme_rug,
-            # Smart/whale regime extras (for quant AI features)
             "regime_smart_accum_avg": smart_acc,
             "regime_smart_panic_avg": smart_panic,
             "regime_whale_dom_avg": whale_dom,
             "regime_smart_conflict_avg": smart_conflict,
-            # Account-level features
+            "regime_smart_risk_avg": smart_risk,
             "account_daily_pnl_pct": acc_pnl,
             "account_daily_dd_pct": acc_dd,
             "account_consec_losses": acc_losses,
             "account_risk_bias": acc_bias,
-            # Session & weekend helpers
+            "account_equity_slope": acc_eq_slope,
+            "account_intraday_vol": acc_eq_vol,
+            "account_kelly_hint": acc_kelly,
             "regime_session_is_asia": 1.0 if session == "asia" else 0.0,
             "regime_session_is_eu": 1.0 if session == "eu" else 0.0,
             "regime_session_is_us": 1.0 if session == "us" else 0.0,
-            "regime_weekend_factor": week_factor,
-            # External overrides (for AI / dashboards)
-            "regime_external_macro_bias": external_bias,
-            "regime_external_risk_off_flag": external_risk_off,
-            # Infra features
+            "regime_weekend_factor": float(week_factor),
+            "regime_external_macro_bias": ext_bias,
+            "regime_external_risk_off_flag": ext_risk_off,
             "infra_degraded_score": infra_deg,
             "infra_hard_block": infra_block,
-            # Extra binary-ish helpers for models:
             "regime_is_choppy": 1.0 if choppy >= 0.6 else 0.0,
-            "regime_is_high_manip": 1.0 if manip_score >= 0.6 else 0.0,
-            "regime_is_high_vol": 1.0 if vol_score >= 0.7 else 0.0,
+            "regime_is_high_manip": 1.0 if manip >= 0.6 else 0.0,
+            "regime_is_high_vol": 1.0 if vol >= 0.7 else 0.0,
             "regime_is_hot_meme": 1.0 if meme_heat >= 0.65 else 0.0,
-            # Entry gating booleans for AI
             "regime_should_throttle_entries": 1.0 if self.should_throttle_entries() else 0.0,
             "regime_should_pause_new_entries": 1.0 if self.should_pause_all_new_entries() else 0.0,
-            # Latest SOL price (for completeness)
-            "sol_last_px": last_px,
+            "sol_last_px": float(last_px),
         }
 
-        if not hist or len(hist) < 2:
-            payload.update(
-                {
-                    "sol_ret_5m_pct": 0.0,
-                    "sol_ret_1h_pct": 0.0,
-                    "sol_vol_5m_pct": 0.0,
-                }
-            )
+        if len(hist) < 2:
+            payload.update({"sol_ret_5m_pct": 0.0, "sol_ret_1h_pct": 0.0, "sol_vol_5m_pct": 0.0})
             return payload
 
         ret_5m = _rolling_return(hist, 5 * 60)
         ret_1h = _rolling_return(hist, 60 * 60)
-        step_rets_5m = _window_ret_series(hist, 5 * 60)
+        step_rets_5m = _step_returns(hist, 5 * 60)
         vol_5m = float(statistics.pstdev(step_rets_5m)) if step_rets_5m else 0.0
-
-        payload.update(
-            {
-                "sol_ret_5m_pct": float(ret_5m),
-                "sol_ret_1h_pct": float(ret_1h),
-                "sol_vol_5m_pct": float(vol_5m),
-            }
-        )
+        payload.update({"sol_ret_5m_pct": float(ret_5m), "sol_ret_1h_pct": float(ret_1h), "sol_vol_5m_pct": float(vol_5m)})
         return payload
 
     async def snapshot_features(self) -> Dict[str, float]:
-        """
-        Alias for callers that just want a quick numeric feature snapshot.
-        """
         return await self.features()
 
     async def attach_features_to_meta(self, meta: Dict[str, Any]) -> None:
-        """
-        Convenience helper for FeatureBuilder: mutate `meta` in place with
-        regime features (safe numeric keys only).
-        """
-        feats = await self.features()
-        meta.update(feats)
+        meta.update(await self.features())
 
-    # ------------------------------------------------------------------ #
-    # External / AI override integration
-    # ------------------------------------------------------------------ #
+    # ────────────────────────────────────────────────────────────────────
+    # External / AI hints
+    # ────────────────────────────────────────────────────────────────────
 
     async def apply_external_macro_hint(
         self,
@@ -879,15 +762,6 @@ class RegimeState:
         macro_bias: Optional[float] = None,
         force_risk_off: Optional[bool] = None,
     ) -> None:
-        """
-        Soft hook for self_learning_ai_strategy or dashboards to nudge regime:
-
-          macro_bias   ∈ [-1, +1]  (negative = more defensive)
-          force_risk_off: if True → treat as hard risk_off for throttling.
-
-        This never directly flips the discrete label; it only influences
-        risk_multiplier / entry_tighten / gate_factor.
-        """
         async with self._lock:
             if macro_bias is not None:
                 self._external_macro_bias = _clamp(float(macro_bias), -1.0, 1.0)
@@ -900,252 +774,92 @@ class RegimeState:
         macro_bias: Optional[float] = None,
         force_risk_off: Optional[bool] = None,
     ) -> None:
-        """
-        Alias for AI strategy modules; forwards to apply_external_macro_hint.
-        """
-        await self.apply_external_macro_hint(
-            macro_bias=macro_bias,
-            force_risk_off=force_risk_off,
-        )
+        await self.apply_external_macro_hint(macro_bias=macro_bias, force_risk_off=force_risk_off)
 
-    # ------------------------------------------------------------------ #
-    # Background macro loop
-    # ------------------------------------------------------------------ #
+    # ────────────────────────────────────────────────────────────────────
+    # Core recompute + regime decision
+    # ────────────────────────────────────────────────────────────────────
 
-    async def refresh_once(self) -> None:
-        """
-        One macro update step:
-          - fetch SOL price
-          - update history
-          - recompute scores & regime
-        """
-        if not REGIME_ENABLED:
-            return
-
-        px = await get_sol_usd()
-        if px <= 0:
-            # External API down; keep last regime and scores.
-            return
-
-        now = time.time()
-        async with self._lock:
-            self._last_px = float(px)
-            self._history.append((now, float(px)))
-
-            # Trim history to horizon
-            cutoff = now - float(REGIME_HISTORY_HORIZON_SEC)
-            while len(self._history) > 2 and self._history[0][0] < cutoff:
-                self._history.pop(0)
-
-            # Hard cap on number of points (safety against weird polling)
-            if REGIME_HISTORY_MAX_POINTS > 0:
-                overflow = len(self._history) - REGIME_HISTORY_MAX_POINTS
-                if overflow > 0:
-                    self._history = self._history[overflow:]
-
-            span = self._history[-1][0] - self._history[0][0]
-            if span < float(REGIME_MIN_OBS_SEC):
-                # Warmup: not enough history yet.
-                self._recompute_scores_unlocked(ret_5m=0.0, ret_1h=0.0, vol_5m=0.0)
-                self._last_eval_ts = now
-                if REGIME_DEBUG_LOG:
-                    log.debug(
-                        "regime warmup: span=%.1fs (<%ss) label=%s",
-                        span,
-                        REGIME_MIN_OBS_SEC,
-                        self._regime,
-                    )
-                return
-
-            # Compute SOL diagnostics
-            ret_5m = _rolling_return(self._history, 5 * 60)
-            ret_1h = _rolling_return(self._history, 60 * 60)
-            step_rets_5m = _window_ret_series(self._history, 5 * 60)
-            vol_5m = float(statistics.pstdev(step_rets_5m)) if step_rets_5m else 0.0
-
-            new_regime = self._decide_regime(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
-            self._apply_regime_unlocked(new_regime, ret_5m, ret_1h, vol_5m)
-            self._last_eval_ts = now
-
-            if REGIME_DEBUG_LOG:
-                log.debug(
-                    "regime step: px=%.4f ret_5m=%.3f ret_1h=%.3f vol_5m=%.3f "
-                    "trend=%.3f vol_score=%.3f liq=%.3f manip=%.3f label=%s "
-                    "acc_dd=%.2f acc_pnl=%.2f acc_bias=%.2f infra_deg=%.2f",
-                    px,
-                    ret_5m,
-                    ret_1h,
-                    vol_5m,
-                    self.trend_score,
-                    self.volatility_score,
-                    self.liquidity_score,
-                    self.manipulation_risk,
-                    self._regime,
-                    self.account_daily_dd_pct,
-                    self.account_daily_pnl_pct,
-                    self.account_risk_bias,
-                    self.infra_degraded_score,
-                )
-
-    def _apply_regime_unlocked(
-        self,
-        new_regime: Regime,
-        ret_5m: float,
-        ret_1h: float,
-        vol_5m: float,
-    ) -> None:
-        """
-        With lock held: recompute continuous scores and maybe flip discrete regime.
-        """
-        # Always recompute continuous scores
-        self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
-
-        if new_regime == self._regime:
-            return
-
-        now = time.time()
-
-        # Hysteresis: don't flip too often unless signal is strong
-        if now - self._last_change_ts < float(REGIME_SMOOTH_SEC):
-            if not self._is_strong_switch(
-                current=self._regime,
-                target=new_regime,
-                ret_5m=ret_5m,
-                ret_1h=ret_1h,
-            ):
-                return
-
-        old = self._regime
-        self._regime = new_regime
-        self._last_change_ts = now
-
-        if hasattr(log, "event"):
-            log.event(
-                "REGIME_SWITCH",
-                old=old,
-                new=new_regime,
-                ret_5m=ret_5m,
-                ret_1h=ret_1h,
-                vol_5m=vol_5m,
-                account_dd=self.account_daily_dd_pct,
-                account_pnl=self.account_daily_pnl_pct,
-                account_bias=self.account_risk_bias,
-                infra_deg=self.infra_degraded_score,
-                infra_block=self.infra_hard_block,
-            )
-        else:  # pragma: no cover
-            log.info(
-                "REGIME_SWITCH old=%s new=%s ret_5m=%.3f ret_1h=%.3f vol_5m=%.3f "
-                "acc_dd=%.2f acc_pnl=%.2f acc_bias=%.2f infra_deg=%.2f infra_block=%d",
-                old,
-                new_regime,
-                ret_5m,
-                ret_1h,
-                vol_5m,
-                self.account_daily_dd_pct,
-                self.account_daily_pnl_pct,
-                self.account_risk_bias,
-                self.infra_degraded_score,
-                int(self.infra_hard_block),
-            )
-
-    def _decide_regime(
-        self,
-        *,
-        ret_5m: float,
-        ret_1h: float,
-        vol_5m: float,
-    ) -> Regime:
-        """
-        Discrete regime rule-set:
-
-          1) Optional hard override (REGIME_FORCE_LABEL).
-          2) Hard risk_off on:
-                - big account drawdown,
-                - severe SOL dump,
-                - high manipulation risk,
-                - high vol + negative trend, or
-                - infra hard block (via infra_guard).
-          3) Risk_on on:
-                - aligned upside (5m + 1h),
-                - acceptable vol,
-                - non-awful breadth/liquidity,
-                - account not in DD.
-          4) Otherwise normal.
-        """
-        # Manual override (for experiments)
+    def _decide_regime(self, *, ret_5m: float, ret_1h: float, vol_5m: float) -> Regime:
+        # Manual override
         if REGIME_FORCE_LABEL:
             if not self._force_label_logged:
                 self._force_label_logged = True
                 if hasattr(log, "event"):
                     log.event("REGIME_FORCE_LABEL", label=REGIME_FORCE_LABEL)
-                else:  # pragma: no cover
+                else:
                     log.warning("REGIME_FORCE_LABEL=%s (override)", REGIME_FORCE_LABEL)
             return REGIME_FORCE_LABEL  # type: ignore[return-value]
 
-        # External hard risk_off (from AI / dashboard)
+        # External hard risk_off
         if self._external_risk_off_flag:
             return "risk_off"
 
-        # Infra hard block → immediate risk_off flavor
+        # Infra hard block
         if REGIME_PAUSE_ON_INFRA_HARD and self.infra_hard_block:
             return "risk_off"
 
-        # Account hard stop → immediate risk_off
+        # Account hard stop
         if self.account_daily_dd_pct <= -abs(ACCOUNT_DD_HARD_STOP):
             return "risk_off"
 
-        # Hard macro risk_off: severe SOL drawdown
+        # Hard macro dump
         if ret_1h <= SOL_RISK_OFF_RET_1H or ret_5m <= SOL_RISK_OFF_RET_5M:
             return "risk_off"
 
-        # Manipulation regime: tape is too sketchy
+        # Manipulation
         if self.manipulation_risk >= REGIME_MANIP_RISK_OFF_THRESH:
             return "risk_off"
 
-        # High vol + negative trend → defensive
+        # High vol + negative trend
         if ret_1h < 0.0 and vol_5m >= REGIME_VOL_5M_HIGH_PCT:
             return "risk_off"
 
-        # Softer DD / long loss streak → risk_off bias
-        if (
-            self.account_daily_dd_pct <= -abs(ACCOUNT_DD_RISK_OFF)
-            or self.account_consec_losses >= ACCOUNT_CONSEC_LOSS_RISK_OFF
-        ):
+        # Softer DD / streak
+        if (self.account_daily_dd_pct <= -abs(ACCOUNT_DD_RISK_OFF)) or (self.account_consec_losses >= ACCOUNT_CONSEC_LOSS_RISK_OFF):
             return "risk_off"
 
-        # Risk_on if upside trend + okay vol + not-awful breadth/liquidity
+        # risk_on: aligned upside + ok vol + non-awful meme tape + not in DD
         breadth = self._meme_breadth_up_ratio
         liq_score = self._meme_liq_score
-        acc_ok = self.account_daily_dd_pct > -ACCOUNT_DD_RISK_OFF
+        acc_ok = self.account_daily_dd_pct > -abs(ACCOUNT_DD_RISK_OFF)
 
         if (
             ret_1h >= SOL_RISK_ON_RET_1H
             and ret_5m >= SOL_RISK_ON_RET_5M
             and vol_5m <= REGIME_VOL_5M_HIGH_PCT * 1.5
             and breadth >= MEME_BREADTH_BEARISH
-            and liq_score >= 0.3
+            and liq_score >= 0.30
             and acc_ok
         ):
             return "risk_on"
 
         return "normal"
 
-    def _recompute_scores_unlocked(
-        self,
-        *,
-        ret_5m: float,
-        ret_1h: float,
-        vol_5m: float,
-    ) -> None:
+    def _is_strong_switch(self, *, current: Regime, target: Regime, ret_5m: float, ret_1h: float) -> bool:
+        # Always allow into risk_off if nuking
+        if target == "risk_off":
+            return (
+                ret_1h <= SOL_RISK_OFF_RET_1H * 1.5
+                or ret_5m <= SOL_RISK_OFF_RET_5M * 2.0
+                or self.account_daily_dd_pct <= -abs(ACCOUNT_DD_HARD_STOP)
+                or (REGIME_PAUSE_ON_INFRA_HARD and self.infra_hard_block)
+            )
+
+        if target == "risk_on" and current != "risk_on":
+            return (
+                ret_1h >= SOL_RISK_ON_RET_1H * 1.5
+                and ret_5m >= SOL_RISK_ON_RET_5M * 1.5
+                and self.account_daily_dd_pct > -abs(ACCOUNT_DD_RISK_OFF)
+            )
+
+        return False
+
+    def _recompute_scores_unlocked(self, *, ret_5m: float, ret_1h: float, vol_5m: float) -> None:
         """
-        With lock held: recompute continuous regime scores from:
-          - SOL returns & realized vol
-          - scanner aggregates (liq/breadth/rugs/pumps/smart flow)
-          - account state (DD / streak / PnL)
-          - infra state (degraded score)
+        With lock held: recompute continuous regime scores and smooth them.
         """
-        # Trend: fuse 5m & 1h returns, scaled against target bands.
+        # Trend (-1..+1): scale by target bands
         pos_5m = max(SOL_RISK_ON_RET_5M, 1e-6)
         pos_1h = max(SOL_RISK_ON_RET_1H, 1e-6)
         neg_5m = min(SOL_RISK_OFF_RET_5M, -1e-6)
@@ -1161,150 +875,136 @@ class RegimeState:
         else:
             t1 = -_clamp(ret_1h / neg_1h, 0.0, 1.5)
 
-        trend = (t5 + t1) / 2.0
-        self.trend_score = _clamp(trend, -1.0, 1.0)
+        trend_raw = _clamp((t5 + t1) / 2.0, -1.0, 1.0)
+        self.trend_score = _ema(self.trend_score, trend_raw, REGIME_SCORE_EMA_ALPHA)
 
-        # Volatility: realized vol over 5m steps, normalized.
-        if vol_5m <= 0:
-            vol_score = 0.0
-        else:
-            vol_score = _norm_between(vol_5m, 0.0, REGIME_VOL_5M_HIGH_PCT * 2.0)
-        self.volatility_score = vol_score
+        # Volatility (0..1)
+        vol_raw = 0.0 if vol_5m <= 0 else _norm_between(vol_5m, 0.0, REGIME_VOL_5M_HIGH_PCT * 2.0)
+        self.volatility_score = _ema(self.volatility_score, vol_raw, REGIME_SCORE_EMA_ALPHA)
 
-        # Liquidity: scanner liq + slight trend boost.
-        base_liq = self._meme_liq_score
-        liq_score = _clamp(base_liq + 0.2 * self.trend_score, 0.0, 1.0)
-        self.liquidity_score = liq_score
+        # Liquidity (0..1): scanner liq plus slight trend boost
+        base_liq = _clamp(self._meme_liq_score, 0.0, 1.0)
+        liq_raw = _clamp(base_liq + 0.2 * self.trend_score, 0.0, 1.0)
+        self.liquidity_score = _ema(self.liquidity_score, liq_raw, REGIME_SCORE_EMA_ALPHA)
 
-        # Choppy: high when vol high but trend near 0.
+        # Choppy: high vol with neutral trend
         neutral_trend = 1.0 - abs(self.trend_score)
-        self.choppy_score = _clamp(vol_score * neutral_trend, 0.0, 1.0)
+        choppy_raw = _clamp(self.volatility_score * neutral_trend, 0.0, 1.0)
+        self.choppy_score = _ema(self.choppy_score, choppy_raw, REGIME_SCORE_EMA_ALPHA)
 
-        # Manipulation risk:
-        #   - high vol with neutral trend,
-        #   - pump density & rug rate,
-        #   - smart/whale conflict & domination from scanners.
-        pump_term = _clamp(
-            self._meme_pump_density / max(MEME_PUMP_DENSITY_HI, 1e-6),
-            0.0,
-            2.0,
-        )
-        rug_term = _clamp(
-            self._meme_rug_rate / max(MEME_RUG_RATE_HI, 1e-6),
-            0.0,
-            2.0,
-        )
-        vol_term = vol_score * neutral_trend
+        # Manipulation risk (0..1)
+        pump_term = _clamp(self._meme_pump_density / max(MEME_PUMP_DENSITY_HI, 1e-6), 0.0, 2.0)
+        rug_term = _clamp(self._meme_rug_rate / max(MEME_RUG_RATE_HI, 1e-6), 0.0, 2.0)
+        vol_term = _clamp(self.volatility_score * neutral_trend, 0.0, 1.0)
 
         smart_conflict_term = _clamp(self._scanner_smart_conflict, 0.0, 1.0)
         whale_dom_term = _clamp(self._scanner_whale_dom, 0.0, 1.0)
 
-        manip = (
+        manip_raw = _clamp(
             0.30 * vol_term
             + 0.25 * pump_term
             + 0.20 * rug_term
             + 0.15 * smart_conflict_term
-            + 0.10 * whale_dom_term
-        )
-        self.manipulation_risk = _clamp(manip, 0.0, 1.0)
-
-        # Meme heat: "good" environment for meme trading.
-        breadth = self._meme_breadth_up_ratio
-        breadth_pos = _norm_between(breadth, 0.5, MEME_BREADTH_BULLISH)
-        liq_good = liq_score
-        rug_penalty = 1.0 - _clamp(
-            self._meme_rug_rate / max(MEME_RUG_RATE_HI, 1e-6),
+            + 0.10 * whale_dom_term,
             0.0,
-            1.5,
+            1.0,
         )
+        self.manipulation_risk = _ema(self.manipulation_risk, manip_raw, REGIME_SCORE_EMA_ALPHA)
+
+        # Meme heat (0..1)
+        breadth = _clamp(self._meme_breadth_up_ratio, 0.0, 1.0)
+        breadth_pos = _norm_between(breadth, 0.50, MEME_BREADTH_BULLISH)
+        rug_penalty = 1.0 - _clamp(self._meme_rug_rate / max(MEME_RUG_RATE_HI, 1e-6), 0.0, 1.5)
 
         smart_acc = _clamp(self._scanner_smart_accum, 0.0, 1.0)
         smart_panic = _clamp(self._scanner_smart_panic, 0.0, 1.0)
 
-        self.meme_heat = _clamp(
+        meme_heat_raw = _clamp(
             0.40 * breadth_pos
-            + 0.30 * liq_good
+            + 0.30 * self.liquidity_score
             + 0.15 * (1.0 - smart_panic)
             + 0.10 * smart_acc
             + 0.05 * rug_penalty,
             0.0,
             1.0,
         )
+        self.meme_heat = _ema(self.meme_heat, meme_heat_raw, REGIME_SCORE_EMA_ALPHA)
 
-        # Regime confidence: clear trend, low choppy, low manipulation.
-        self.confidence_score = _clamp(
+        # Confidence (0..1): clear trend + low choppy + low manipulation
+        conf_raw = _clamp(
             0.40 * (1.0 - self.choppy_score)
             + 0.35 * abs(self.trend_score)
             + 0.25 * (1.0 - self.manipulation_risk),
             0.0,
             1.0,
         )
+        self.confidence_score = _ema(self.confidence_score, conf_raw, REGIME_SCORE_EMA_ALPHA)
 
-        # Account risk bias: negative with DD/streak, positive with good PnL.
-        dd = self.account_daily_dd_pct
-        pnl = self.account_daily_pnl_pct
-        losses = self.account_consec_losses
+        # Account risk bias (-1..+1)
+        dd = float(self.account_daily_dd_pct)      # negative
+        pnl = float(self.account_daily_pnl_pct)
+        losses = int(self.account_consec_losses)
+        eq_slope = float(self.account_equity_slope)
+        eq_vol = float(self.account_intraday_vol)
+        kelly_hint = _clamp(float(self.account_kelly_hint), 0.0, 1.0)
 
-        # DD bias: [-1, 0]
         dd_bias = 0.0
         if dd < 0.0:
-            dd_bias = -_clamp(
-                abs(dd) / max(ACCOUNT_DD_HARD_STOP, 1e-6),
-                0.0,
-                1.0,
-            )
+            dd_bias = -_clamp(abs(dd) / max(abs(ACCOUNT_DD_HARD_STOP), 1e-6), 0.0, 1.0)
 
-        # PnL bias: [0, +1]
         pnl_bias = 0.0
         if pnl > 0.0:
-            pnl_bias = _clamp(
-                pnl / max(ACCOUNT_PNL_RISK_ON, 1e-6),
-                0.0,
-                1.0,
-            )
+            pnl_bias = _clamp(pnl / max(ACCOUNT_PNL_RISK_ON, 1e-6), 0.0, 1.0)
 
-        # Loss streak bias: pushes negative
         loss_bias = 0.0
         if losses >= ACCOUNT_CONSEC_LOSS_RISK_OFF:
-            loss_bias = -_clamp(
-                (losses - ACCOUNT_CONSEC_LOSS_RISK_OFF + 1) / 3.0,
-                0.0,
-                1.0,
-            )
+            loss_bias = -_clamp((losses - ACCOUNT_CONSEC_LOSS_RISK_OFF + 1) / 3.0, 0.0, 1.0)
 
-        combined = 0.5 * dd_bias + 0.3 * loss_bias + 0.2 * pnl_bias
-        self.account_risk_bias = _clamp(combined, -1.0, 1.0)
+        slope_bias = 0.0
+        if eq_slope > 0.0:
+            slope_bias = _clamp(eq_slope / 4.0, 0.0, 1.0)
+        elif eq_slope < 0.0:
+            slope_bias = -_clamp(abs(eq_slope) / 4.0, 0.0, 1.0)
 
-        # Macro risk score: global context for risk_manager / AI.
+        vol_penalty = 0.0
+        if eq_vol > 0.0:
+            vol_penalty = _clamp(eq_vol / 5.0, 0.0, 1.0)
+
+        acc_bias_raw = _clamp(
+            0.45 * dd_bias + 0.20 * loss_bias + 0.20 * pnl_bias + 0.10 * slope_bias - 0.05 * vol_penalty,
+            -1.0,
+            1.0,
+        )
+        self.account_risk_bias = _ema(self.account_risk_bias, acc_bias_raw, REGIME_SCORE_EMA_ALPHA)
+
+        # Macro risk (-1..+1)
         macro_core = (
             0.35 * self.trend_score
             - 0.20 * self.volatility_score
             - 0.20 * self.manipulation_risk
             + 0.15 * (self.meme_heat - 0.5) * 2.0
         )
+
+        # External + Kelly hint (gentle)
         macro_core += 0.20 * self._external_macro_bias
+        macro_core += 0.05 * ((kelly_hint - 0.5) * 2.0)
 
-        # Blend in account state with configurable influence
+        # Smart-risk is exposed for AI; keep rule-based impact very mild:
+        macro_core += 0.03 * ((smart_acc - smart_panic) * 2.0)
+        macro_core -= 0.02 * self._global_smart_risk
+
         macro_acc = 0.40 * self.account_risk_bias
-        macro = (1.0 - REGIME_ACCOUNT_INFLUENCE) * macro_core + REGIME_ACCOUNT_INFLUENCE * (
-            macro_core + macro_acc
-        )
+        macro_raw = (1.0 - REGIME_ACCOUNT_INFLUENCE) * macro_core + REGIME_ACCOUNT_INFLUENCE * (macro_core + macro_acc)
+        self.macro_risk_score = _ema(self.macro_risk_score, _clamp(macro_raw, -1.0, 1.0), REGIME_SCORE_EMA_ALPHA)
 
-        self.macro_risk_score = _clamp(macro, -1.0, 1.0)
-
-        # Regime stress: dangerous conditions + infra degraded.
-        stress_dd = _clamp(abs(dd) / max(ACCOUNT_DD_HARD_STOP, 1e-6), 0.0, 1.0)
-        stress_losses = _clamp(
-            losses / max(ACCOUNT_CONSEC_LOSS_RISK_OFF, 1),
-            0.0,
-            2.0,
-        )
-        stress_losses = _clamp(stress_losses, 0.0, 1.0)
+        # Stress (0..1)
+        stress_dd = _clamp(abs(dd) / max(abs(ACCOUNT_DD_HARD_STOP), 1e-6), 0.0, 1.0)
+        stress_losses = _clamp(losses / max(ACCOUNT_CONSEC_LOSS_RISK_OFF, 1), 0.0, 1.0)
 
         infra = _clamp(self.infra_degraded_score, 0.0, 1.0)
         infra_term = REGIME_INFRA_INFLUENCE * infra
 
-        self.regime_stress_score = _clamp(
+        stress_raw = _clamp(
             0.30 * self.volatility_score
             + 0.25 * self.manipulation_risk
             + 0.20 * stress_dd
@@ -1313,60 +1013,134 @@ class RegimeState:
             0.0,
             1.0,
         )
+        self.regime_stress_score = _ema(self.regime_stress_score, stress_raw, REGIME_SCORE_EMA_ALPHA)
 
-        # Signal strength: how "clean" / tradeable the tape is.
-        self.regime_signal_strength = _clamp(
-            0.40 * abs(self.trend_score)
-            + 0.40 * self.confidence_score
-            + 0.20 * (1.0 - self.choppy_score),
+        # Signal strength (0..1)
+        sig_raw = _clamp(
+            0.40 * abs(self.trend_score) + 0.40 * self.confidence_score + 0.20 * (1.0 - self.choppy_score),
             0.0,
             1.0,
         )
+        self.regime_signal_strength = _ema(self.regime_signal_strength, sig_raw, REGIME_SCORE_EMA_ALPHA)
 
-        # Tradeability score: "how attractive is this tape to trade"
-        self.tradeability_score = _clamp(
+        # Tradeability (0..1)
+        trade_raw = _clamp(
             0.40 * self.regime_signal_strength
-            + 0.25 * (self.meme_heat)
+            + 0.25 * self.meme_heat
             + 0.20 * (1.0 - self.regime_stress_score)
             + 0.15 * max(0.0, self.account_risk_bias),
             0.0,
             1.0,
         )
+        self.tradeability_score = _ema(self.tradeability_score, trade_raw, REGIME_SCORE_EMA_ALPHA)
 
-    def _is_strong_switch(
-        self,
-        *,
-        current: Regime,
-        target: Regime,
-        ret_5m: float,
-        ret_1h: float,
-    ) -> bool:
-        """
-        Allow regime flip inside hysteresis window only if signal is strong.
-        """
-        # Always allow flips into hard risk_off when nuking.
-        if target == "risk_off":
-            return (
-                ret_1h <= SOL_RISK_OFF_RET_1H * 1.5
-                or ret_5m <= SOL_RISK_OFF_RET_5M * 2.0
-                or self.account_daily_dd_pct <= -ACCOUNT_DD_HARD_STOP
-                or (REGIME_PAUSE_ON_INFRA_HARD and self.infra_hard_block)
+    def _apply_regime_unlocked(self, new_regime: Regime, ret_5m: float, ret_1h: float, vol_5m: float) -> None:
+        self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
+
+        if new_regime == self._regime:
+            return
+
+        now = time.time()
+
+        # Confidence gates (God-tier stability): require minimum confidence/signal to flip unless strong switch
+        if not self._is_strong_switch(current=self._regime, target=new_regime, ret_5m=ret_5m, ret_1h=ret_1h):
+            if self.confidence_score < REGIME_SWITCH_MIN_CONF or self.regime_signal_strength < REGIME_SWITCH_MIN_SIG:
+                return
+
+        # Hysteresis time gate
+        if (now - self._last_change_ts) < float(REGIME_SMOOTH_SEC):
+            if not self._is_strong_switch(current=self._regime, target=new_regime, ret_5m=ret_5m, ret_1h=ret_1h):
+                return
+
+        old = self._regime
+        self._regime = new_regime
+        self._last_change_ts = now
+
+        if hasattr(log, "event"):
+            log.event(
+                "REGIME_SWITCH",
+                old=old,
+                new=new_regime,
+                ret_5m=ret_5m,
+                ret_1h=ret_1h,
+                vol_5m=vol_5m,
+                confidence=self.confidence_score,
+                sig_strength=self.regime_signal_strength,
+                account_dd=self.account_daily_dd_pct,
+                account_pnl=self.account_daily_pnl_pct,
+                account_bias=self.account_risk_bias,
+                infra_deg=self.infra_degraded_score,
+                infra_block=self.infra_hard_block,
             )
+        else:
+            log.info("REGIME_SWITCH old=%s new=%s ret_5m=%.3f ret_1h=%.3f vol_5m=%.3f",
+                     old, new_regime, ret_5m, ret_1h, vol_5m)
 
-        # risk_on: strong upside impulse + not in DD
-        if target == "risk_on" and current != "risk_on":
-            return (
-                ret_1h >= SOL_RISK_ON_RET_1H * 1.5
-                and ret_5m >= SOL_RISK_ON_RET_5M * 1.5
-                and self.account_daily_dd_pct > -ACCOUNT_DD_RISK_OFF
-            )
+    # ────────────────────────────────────────────────────────────────────
+    # Macro loop
+    # ────────────────────────────────────────────────────────────────────
 
-        return False
+    async def refresh_once(self) -> None:
+        if not REGIME_ENABLED:
+            return
+
+        px: float = 0.0
+        try:
+            if REGIME_SOL_FETCH_TIMEOUT_S > 0:
+                px = float(await asyncio.wait_for(get_sol_usd(), timeout=REGIME_SOL_FETCH_TIMEOUT_S))
+            else:
+                px = float(await get_sol_usd())
+        except Exception:
+            px = 0.0
+
+        now = time.time()
+
+        async with self._lock:
+            if px <= 0.0:
+                self._consec_sol_fail += 1
+                # if we keep failing, let stale logic clamp risk automatically
+                if self._consec_sol_fail >= REGIME_SOL_MAX_CONSEC_FAIL and REGIME_DEBUG_LOG:
+                    log.warning("REGIME_SOL_FETCH_FAIL consec=%s (px=0)", self._consec_sol_fail)
+                return
+
+            self._consec_sol_fail = 0
+            self._last_px = px
+            self._history.append((now, px))
+
+            # Trim to horizon + hard cap
+            cutoff = now - float(REGIME_HISTORY_HORIZON_SEC)
+            while len(self._history) > 2 and self._history[0][0] < cutoff:
+                self._history.pop(0)
+            if REGIME_HISTORY_MAX_POINTS > 0 and len(self._history) > REGIME_HISTORY_MAX_POINTS:
+                self._history = self._history[-REGIME_HISTORY_MAX_POINTS :]
+
+            span = self._history[-1][0] - self._history[0][0]
+            if span < float(REGIME_MIN_OBS_SEC):
+                self._recompute_scores_unlocked(ret_5m=0.0, ret_1h=0.0, vol_5m=0.0)
+                self._last_eval_ts = now
+                if REGIME_DEBUG_LOG:
+                    log.debug("regime warmup: span=%.1fs label=%s", span, self._regime)
+                return
+
+            ret_5m = _rolling_return(self._history, 5 * 60)
+            ret_1h = _rolling_return(self._history, 60 * 60)
+            step_rets_5m = _step_returns(self._history, 5 * 60)
+            vol_5m = float(statistics.pstdev(step_rets_5m)) if step_rets_5m else 0.0
+
+            new_regime = self._decide_regime(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
+            self._apply_regime_unlocked(new_regime, ret_5m, ret_1h, vol_5m)
+            self._last_eval_ts = now
+
+            if REGIME_DEBUG_LOG:
+                log.debug(
+                    "regime step: px=%.4f ret_5m=%.3f ret_1h=%.3f vol_5m=%.3f "
+                    "trend=%.3f vol=%.3f liq=%.3f manip=%.3f conf=%.3f label=%s tradeable=%.3f",
+                    px, ret_5m, ret_1h, vol_5m,
+                    self.trend_score, self.volatility_score, self.liquidity_score,
+                    self.manipulation_risk, self.confidence_score, self._regime, self.tradeability_score
+                )
 
     async def refresh_loop(self) -> None:
-        """
-        Long-running macro loop. Should be started once at bootstrap.
-        """
         if not REGIME_ENABLED:
             if hasattr(log, "event"):
                 log.event("REGIME_LOOP_DISABLED")
@@ -1375,22 +1149,14 @@ class RegimeState:
             return
 
         if hasattr(log, "event"):
-            log.event(
-                "REGIME_LOOP_START",
-                poll_sec=REGIME_POLL_SEC,
-                hist_sec=REGIME_HISTORY_HORIZON_SEC,
-            )
-        else:  # pragma: no cover
-            log.info(
-                "REGIME_LOOP_START poll_sec=%s hist_sec=%s",
-                REGIME_POLL_SEC,
-                REGIME_HISTORY_HORIZON_SEC,
-            )
+            log.event("REGIME_LOOP_START", poll_sec=REGIME_POLL_SEC, hist_sec=REGIME_HISTORY_HORIZON_SEC)
+        else:
+            log.info("REGIME_LOOP_START poll_sec=%s hist_sec=%s", REGIME_POLL_SEC, REGIME_HISTORY_HORIZON_SEC)
 
         while True:
             try:
                 await self.refresh_once()
-            except Exception as e:  # pragma: no cover
+            except Exception as e:
                 if hasattr(log, "event"):
                     log.event("REGIME_LOOP_ERROR", error=str(e)[:200])
                 else:
@@ -1398,22 +1164,18 @@ class RegimeState:
             await asyncio.sleep(max(5, REGIME_POLL_SEC))
 
     def ensure_background_task(self) -> None:
-        """
-        Call once from main.py to ensure the regime loop is running.
-        """
         if not REGIME_ENABLED:
             return
         if self._running_task is None or self._running_task.done():
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
-                # No running loop (e.g., tests / CLI); ignore.
                 return
             self._running_task = loop.create_task(self.refresh_loop())
 
-    # ------------------------------------------------------------------ #
+    # ────────────────────────────────────────────────────────────────────
     # Scanner integration
-    # ------------------------------------------------------------------ #
+    # ────────────────────────────────────────────────────────────────────
 
     async def update_from_scanner_batch(
         self,
@@ -1425,72 +1187,53 @@ class RegimeState:
         avg_liq_usd: float,
         pump_density: float = 0.0,
         rug_rate: float = 0.0,
-        # V3+++ / quant-grade extras from smart_wallets / TRACKER.global_regime_hint:
         smart_accum_avg: float = 0.0,
         smart_panic_avg: float = 0.0,
         whale_dom_avg: float = 0.0,
         smart_conflict_avg: float = 0.0,
     ) -> None:
-        """
-        Called by scanners with aggregate stats over a recent window.
-
-        Example from a scanner:
-            await regime_state.update_from_scanner_batch(
-                source="raydium",
-                total_tokens=len(sample),
-                up_tokens=cnt_up,
-                down_tokens=cnt_down,
-                avg_liq_usd=avg_liq,
-                pump_density=pump_like / max(1, len(sample)),
-                rug_rate=rug_like / max(1, total_recent_trades),
-                smart_accum_avg=avg_smart_accum,
-                smart_panic_avg=avg_smart_panic,
-                whale_dom_avg=avg_whale_dom,
-                smart_conflict_avg=avg_smart_conflict,
-            )
-
-        All params are best-effort; pass 0 when unknown.
-        """
         if total_tokens <= 0:
             return
 
+        up_ratio = _clamp(up_tokens / float(max(total_tokens, 1)), 0.0, 1.0)
+        liq_score = _norm_between(avg_liq_usd, MEME_LOW_LIQ_USD, MEME_HIGH_LIQ_USD)
+
+        pump_d = _clamp(_safe_float(pump_density), 0.0, 1.0)
+        rug_r = _clamp(_safe_float(rug_rate), 0.0, 1.0)
+
+        s_acc = _clamp(_safe_float(smart_accum_avg), 0.0, 1.0)
+        s_panic = _clamp(_safe_float(smart_panic_avg), 0.0, 1.0)
+        w_dom = _clamp(_safe_float(whale_dom_avg), 0.0, 1.0)
+        s_conf = _clamp(_safe_float(smart_conflict_avg), 0.0, 1.0)
+
         async with self._lock:
-            up_ratio = _clamp(up_tokens / float(max(total_tokens, 1)), 0.0, 1.0)
-            liq_score = _norm_between(avg_liq_usd, MEME_LOW_LIQ_USD, MEME_HIGH_LIQ_USD)
-            pump_d = _clamp(pump_density, 0.0, 1.0)
-            rug_r = _clamp(rug_rate, 0.0, 1.0)
+            a = REGIME_SCANNER_EMA_ALPHA
+            self._meme_breadth_up_ratio = _ema(self._meme_breadth_up_ratio, up_ratio, a)
+            self._meme_liq_score = _ema(self._meme_liq_score, liq_score, a)
+            self._meme_pump_density = _ema(self._meme_pump_density, pump_d, a)
+            self._meme_rug_rate = _ema(self._meme_rug_rate, rug_r, a)
 
-            s_acc = _clamp(smart_accum_avg, 0.0, 1.0)
-            s_panic = _clamp(smart_panic_avg, 0.0, 1.0)
-            w_dom = _clamp(whale_dom_avg, 0.0, 1.0)
-            s_conf = _clamp(smart_conflict_avg, 0.0, 1.0)
+            self._scanner_smart_accum = _ema(self._scanner_smart_accum, s_acc, a)
+            self._scanner_smart_panic = _ema(self._scanner_smart_panic, s_panic, a)
+            self._scanner_whale_dom = _ema(self._scanner_whale_dom, w_dom, a)
+            self._scanner_smart_conflict = _ema(self._scanner_smart_conflict, s_conf, a)
 
-            alpha = REGIME_SCANNER_EMA_ALPHA
-
-            # EMA smoothing across scanners
-            self._meme_breadth_up_ratio = (
-                (1 - alpha) * self._meme_breadth_up_ratio + alpha * up_ratio
-            )
-            self._meme_liq_score = (1 - alpha) * self._meme_liq_score + alpha * liq_score
-            self._meme_pump_density = (1 - alpha) * self._meme_pump_density + alpha * pump_d
-            self._meme_rug_rate = (1 - alpha) * self._meme_rug_rate + alpha * rug_r
-
-            self._scanner_smart_accum = (1 - alpha) * self._scanner_smart_accum + alpha * s_acc
-            self._scanner_smart_panic = (1 - alpha) * self._scanner_smart_panic + alpha * s_panic
-            self._scanner_whale_dom = (1 - alpha) * self._scanner_whale_dom + alpha * w_dom
-            self._scanner_smart_conflict = (1 - alpha) * self._scanner_smart_conflict + alpha * s_conf
-
-            # Recompute continuous scores from latest SOL stats if available.
-            if self._history and len(self._history) >= 2:
+            # Recompute using latest SOL stats if present
+            if len(self._history) >= 2:
                 ret_5m = _rolling_return(self._history, 5 * 60)
                 ret_1h = _rolling_return(self._history, 60 * 60)
-                step_rets_5m = _window_ret_series(self._history, 5 * 60)
+                step_rets_5m = _step_returns(self._history, 5 * 60)
                 vol_5m = float(statistics.pstdev(step_rets_5m)) if step_rets_5m else 0.0
-                self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
             else:
-                self._recompute_scores_unlocked(ret_5m=0.0, ret_1h=0.0, vol_5m=0.0)
+                ret_5m = ret_1h = vol_5m = 0.0
 
+            self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
             self._last_eval_ts = time.time()
+
+            if REGIME_DEBUG_LOG:
+                log.debug("scanner_regime_update src=%s up=%.2f liq=%.2f pump=%.2f rug=%.2f",
+                          source, self._meme_breadth_up_ratio, self._meme_liq_score,
+                          self._meme_pump_density, self._meme_rug_rate)
 
     async def update_from_smart_wallets_global(
         self,
@@ -1503,85 +1246,55 @@ class RegimeState:
         smart_conflict_global: float,
         smart_risk_global: float,
     ) -> None:
-        """
-        Direct hook for smart_wallets.TRACKER.global_regime_hint() output.
-
-        Usage:
-
-            from utils_pkg.smart_wallets import TRACKER as SMART_TRACKER
-            global_hint = await SMART_TRACKER.global_regime_hint()
-            await regime_state.update_from_smart_wallets_global(**global_hint)
-
-        This keeps the regime engine in sync with where the smart money is
-        *globally* concentrating risk / panic / conflict.
-        """
         async with self._lock:
-            # Blend into existing scanner_smart_* aggregates (EMA-style)
-            alpha = REGIME_SCANNER_EMA_ALPHA
+            a = REGIME_SCANNER_EMA_ALPHA
 
-            # Treat smart_accum as "heat * positive side" (only buy-side smart)
-            accum = max(0.0, smart_side_global) * max(0.0, smart_heat_global)
-            panic = _clamp(smart_panic_global, 0.0, 1.0)
-            w_dom = _clamp(whale_heat_global, 0.0, 1.0)
-            conflict = _clamp(smart_conflict_global, 0.0, 1.0)
+            accum = max(0.0, _safe_float(smart_side_global)) * max(0.0, _safe_float(smart_heat_global))
+            panic = _clamp(_safe_float(smart_panic_global), 0.0, 1.0)
+            w_dom = _clamp(_safe_float(whale_heat_global), 0.0, 1.0)
+            conflict = _clamp(_safe_float(smart_conflict_global), 0.0, 1.0)
+            s_risk = _clamp(_safe_float(smart_risk_global), 0.0, 1.0)
 
-            self._scanner_smart_accum = (1 - alpha) * self._scanner_smart_accum + alpha * accum
-            self._scanner_smart_panic = (1 - alpha) * self._scanner_smart_panic + alpha * panic
-            self._scanner_whale_dom = (1 - alpha) * self._scanner_whale_dom + alpha * w_dom
-            self._scanner_smart_conflict = (1 - alpha) * self._scanner_smart_conflict + alpha * conflict
+            self._scanner_smart_accum = _ema(self._scanner_smart_accum, accum, a)
+            self._scanner_smart_panic = _ema(self._scanner_smart_panic, panic, a)
+            self._scanner_whale_dom = _ema(self._scanner_whale_dom, w_dom, a)
+            self._scanner_smart_conflict = _ema(self._scanner_smart_conflict, conflict, a)
+            self._global_smart_risk = _ema(self._global_smart_risk, s_risk, a)
 
-            # Recompute continuous scores using latest SOL stats if possible
-            if self._history and len(self._history) >= 2:
+            if len(self._history) >= 2:
                 ret_5m = _rolling_return(self._history, 5 * 60)
                 ret_1h = _rolling_return(self._history, 60 * 60)
-                step_rets_5m = _window_ret_series(self._history, 5 * 60)
+                step_rets_5m = _step_returns(self._history, 5 * 60)
                 vol_5m = float(statistics.pstdev(step_rets_5m)) if step_rets_5m else 0.0
-                self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
             else:
-                self._recompute_scores_unlocked(ret_5m=0.0, ret_1h=0.0, vol_5m=0.0)
+                ret_5m = ret_1h = vol_5m = 0.0
 
+            self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
             self._last_eval_ts = time.time()
 
-    # ------------------------------------------------------------------ #
-    # Infra-level integration (for infra_guard)
-    # ------------------------------------------------------------------ #
+    # ────────────────────────────────────────────────────────────────────
+    # Infra integration
+    # ────────────────────────────────────────────────────────────────────
 
-    async def update_from_infra(
-        self,
-        *,
-        infra_degraded_score: float,
-        infra_hard_block: bool,
-    ) -> None:
-        """
-        Called by infra_guard with current infra health.
-
-          infra_degraded_score ∈ [0,1]:
-              0   → infra perfect
-              0.5 → mildly degraded (some retries / latency)
-              1   → extremely degraded (timeouts / failures)
-
-          infra_hard_block: True if infra_guard thinks we must NOT open new
-          positions (e.g., routing unreliable, tx failures, RPC outage).
-        """
+    async def update_from_infra(self, *, infra_degraded_score: float, infra_hard_block: bool) -> None:
         async with self._lock:
             self.infra_degraded_score = _clamp(float(infra_degraded_score), 0.0, 1.0)
             self.infra_hard_block = bool(infra_hard_block)
 
-            # Recompute continuous scores using latest SOL stats if possible
-            if self._history and len(self._history) >= 2:
+            if len(self._history) >= 2:
                 ret_5m = _rolling_return(self._history, 5 * 60)
                 ret_1h = _rolling_return(self._history, 60 * 60)
-                step_rets_5m = _window_ret_series(self._history, 5 * 60)
+                step_rets_5m = _step_returns(self._history, 5 * 60)
                 vol_5m = float(statistics.pstdev(step_rets_5m)) if step_rets_5m else 0.0
-                self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
             else:
-                self._recompute_scores_unlocked(ret_5m=0.0, ret_1h=0.0, vol_5m=0.0)
+                ret_5m = ret_1h = vol_5m = 0.0
 
+            self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
             self._last_eval_ts = time.time()
 
-    # ------------------------------------------------------------------ #
-    # Account-level integration
-    # ------------------------------------------------------------------ #
+    # ────────────────────────────────────────────────────────────────────
+    # Account integration
+    # ────────────────────────────────────────────────────────────────────
 
     async def update_from_account(
         self,
@@ -1589,38 +1302,46 @@ class RegimeState:
         daily_realized_pnl_pct: float,
         daily_drawdown_pct: float,
         consecutive_losses: int,
+        equity_curve_slope: Optional[float] = None,
+        equity_intraday_vol: Optional[float] = None,
+        kelly_fraction_hint: Optional[float] = None,
     ) -> None:
         """
-        Called by risk_manager / Strategy with current account state.
-
-        This lets regime:
-          - push into risk_off when YOU are in DD even if SOL is fine,
-          - slightly loosen risk when you're printing safely.
+        IMPORTANT: daily_drawdown_pct is normalized to NEGATIVE internally.
+        If caller passes +3.2 meaning "3.2% drawdown", we convert to -3.2.
         """
+        pnl = float(daily_realized_pnl_pct)
+        dd_in = float(daily_drawdown_pct)
+        dd = -abs(dd_in) if dd_in > 0 else float(dd_in)
+
         async with self._lock:
-            self.account_daily_pnl_pct = float(daily_realized_pnl_pct)
-            self.account_daily_dd_pct = float(daily_drawdown_pct)
+            self.account_daily_pnl_pct = pnl
+            self.account_daily_dd_pct = dd
             self.account_consec_losses = max(0, int(consecutive_losses))
 
-            if self._history and len(self._history) >= 2:
+            if equity_curve_slope is not None:
+                self.account_equity_slope = float(equity_curve_slope)
+            if equity_intraday_vol is not None:
+                self.account_intraday_vol = float(equity_intraday_vol)
+            if kelly_fraction_hint is not None:
+                self.account_kelly_hint = _clamp(float(kelly_fraction_hint), 0.0, 1.0)
+
+            if len(self._history) >= 2:
                 ret_5m = _rolling_return(self._history, 5 * 60)
                 ret_1h = _rolling_return(self._history, 60 * 60)
-                step_rets_5m = _window_ret_series(self._history, 5 * 60)
+                step_rets_5m = _step_returns(self._history, 5 * 60)
                 vol_5m = float(statistics.pstdev(step_rets_5m)) if step_rets_5m else 0.0
-                self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
             else:
-                self._recompute_scores_unlocked(ret_5m=0.0, ret_1h=0.0, vol_5m=0.0)
+                ret_5m = ret_1h = vol_5m = 0.0
 
+            self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
             self._last_eval_ts = time.time()
 
-    # ------------------------------------------------------------------ #
-    # Human-readable summary (for logs / Telegram debug)
-    # ------------------------------------------------------------------ #
+    # ────────────────────────────────────────────────────────────────────
+    # Debug summary
+    # ────────────────────────────────────────────────────────────────────
 
     def debug_summary(self) -> str:
-        """
-        Lightweight one-liner with key regime context, for logs / alerts.
-        """
         return (
             f"regime={self._regime} "
             f"trend={self.trend_score:+.2f} "
@@ -1630,12 +1351,17 @@ class RegimeState:
             f"meme_heat={self.meme_heat:.2f} "
             f"macro={self.macro_risk_score:+.2f} "
             f"stress={self.regime_stress_score:.2f} "
+            f"sig={self.regime_signal_strength:.2f} "
             f"tradeable={self.tradeability_score:.2f} "
+            f"acc_dd={self.account_daily_dd_pct:+.2f} "
+            f"acc_pnl={self.account_daily_pnl_pct:+.2f} "
             f"infra_deg={self.infra_degraded_score:.2f} "
             f"risk_mult={self.risk_multiplier():.2f} "
             f"gate={self.entry_gate_factor():.2f} "
+            f"slip_bps={self.slippage_hint_bps()} "
             f"throttle={int(self.should_throttle_entries())} "
             f"pause_new={int(self.should_pause_all_new_entries())} "
+            f"warmup={int(self.is_warmup())} "
             f"stale={int(self.is_stale())} "
             f"hard_stop={int(self.is_hard_stop())}"
         )
@@ -1645,31 +1371,16 @@ class RegimeState:
 regime_state = RegimeState()
 
 
-# Convenience helpers (for callers that don't want to import RegimeState)
+# Convenience helpers
 def regime_risk_ctx() -> Dict[str, Any]:
-    """
-    Small helper for risk_manager:
-
-        ctx = base_ctx | regime_risk_ctx()
-    """
     return regime_state.to_risk_ctx()
 
 
 def regime_entry_ctx() -> Dict[str, float]:
-    """
-    Small helper for entry engines:
-
-        entry_ctx = regime_entry_ctx()
-    """
     return regime_state.to_entry_ctx()
 
 
 async def regime_features() -> Dict[str, float]:
-    """
-    Small helper for feature_builder / AI modules:
-
-        feats = await regime_features()
-    """
     return await regime_state.features()
 
 

@@ -3,16 +3,16 @@ from __future__ import annotations
 """
 utils_pkg/data_logger.py
 
-V3+++ data logger for AI training, quant analytics & self-learning.
-===================================================================
+God-Tier V3+++ data logger for AI training, quant analytics & self-learning.
+===========================================================================
 
 High-level responsibilities
 ---------------------------
-Centralized logger for everything the bot "sees" and "does":
+Centralized logger for everything the stack *sees* and *does*:
 
   • Entry candidates
-      - what we *considered* buying (PF meta + regime/wallet/AI context)
-      - normalized into feature vectors via FeatureBuilder
+      - what we *considered* buying (PF meta + regime / wallet / AI context)
+      - normalized into feature vectors via FeatureBuilder (V3+++)
 
   • Decisions
       - BUY / SKIP / TEST_BUY + scores, reasons, risk context, AI meta
@@ -26,8 +26,11 @@ Centralized logger for everything the bot "sees" and "does":
       - Trade executions (fills)
       - Regime snapshots (market state over time)
       - AI events (risk halts, parameter tunes, self-learning steps)
+      - Equity curve points (account-level PnL / equity tracking)
+      - Risk-manager snapshots (risk mode, capacity, drawdown, halts)
+      - Reinvestor snapshots (soft/hard stops, kelly/target profiles)
 
-Plus ergonomic wrappers per source:
+Plus ergonomic per-source wrappers:
 
   - log_raydium_candidate(...)
   - log_pumpfun_candidate(...)
@@ -45,7 +48,21 @@ Design goals
   • Safe + configurable:
         - PG_ENABLED / AI_LOG_* flags control behavior
         - DB errors swallowed in non-strict mode (AI_LOG_STRICT=0)
+        - optional auto-schema init via ai_db.ensure_ai_tables()
   • Backwards compatible with existing call sites.
+  • Extra helpers are "soft-hooks":
+        - They no-op cleanly if ai_db does not expose corresponding functions.
+
+This module is the Phase-0/1 backbone for the "God-Tier Overhaul" roadmap:
+
+  Phase 0  – DB & schema bootstrap (ai_db.ensure_ai_tables)
+  Phase 1  – Rich candidate/outcome logging (this module + FeatureBuilder)
+  Phase 2  – AI entry/sell logic training data (ai_entry_logic/ai_sell_logic)
+  Phase 3  – Risk manager & reinvestor analytics
+  Phase 4  – Self-learning policy search (self_learning_ai_strategy)
+  Phase 5  – Regime-aware analytics and dashboards
+  Phase 6  – Quant-grade backtesting & policy evaluation
+  Phase 7  – Continuous online learning / live A/B experiments
 """
 
 import json
@@ -53,7 +70,6 @@ import os
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 from logging_setup import get_logger
-
 from utils_pkg import ai_db
 from utils_pkg import feature_builder
 
@@ -75,6 +91,9 @@ __all__ = [
     "log_trade_execution",
     "log_regime_snapshot",
     "log_ai_event",
+    "log_equity_curve_point",
+    "log_risk_manager_snapshot",
+    "log_reinvestor_snapshot",
 ]
 
 # Global, shared FeatureBuilder instance (quant-grade, V3+++)
@@ -179,9 +198,15 @@ AI_ENTRY_MODEL_NAME = (
 AI_CODE_VERSION = os.getenv("AI_CODE_VERSION", "").strip()  # e.g. git SHA
 AI_STACK_PROFILE = os.getenv("AI_STACK_PROFILE", "").strip()  # e.g. "render_prod"
 
+# Outcome-labeling strategy version (so we can change buckets later).
+AI_LABELING_VERSION = os.getenv("AI_LABELING_VERSION", "").strip()  # e.g. "v1"
+
 # Optional: log raw history sequence into `raw` payload for deeper offline work.
 AI_LOG_HISTORY_IN_RAW = _env_bool("AI_LOG_HISTORY_IN_RAW", False)
 AI_LOG_HISTORY_MAX_LEN = _env_int("AI_LOG_HISTORY_MAX_LEN", 120)  # candles/events
+
+# Optional: capture full feature vector into raw payload for easier offline export.
+AI_LOG_FEATURES_IN_RAW = _env_bool("AI_LOG_FEATURES_IN_RAW", False)
 
 # Optional: log full ai_buy_scoring / gate detail into `raw` payload when present.
 AI_LOG_GATE_DETAIL = _env_bool("AI_LOG_GATE_DETAIL", True)
@@ -193,14 +218,63 @@ AI_LOG_STDOUT_BRIEF = _env_bool("AI_LOG_STDOUT_BRIEF", False)
 AI_LOG_EXECUTIONS = _env_bool("AI_LOG_EXECUTIONS", True)
 AI_LOG_REGIME_SNAPSHOTS = _env_bool("AI_LOG_REGIME_SNAPSHOTS", False)
 
+# Optional: per-channel sampling for heavy streams
+AI_LOG_EXEC_SAMPLE_RATE = _env_float("AI_LOG_EXEC_SAMPLE_RATE", 1.0)
+AI_LOG_OUTCOME_SAMPLE_RATE = _env_float("AI_LOG_OUTCOME_SAMPLE_RATE", 1.0)
+AI_LOG_EVENT_SAMPLE_RATE = _env_float("AI_LOG_EVENT_SAMPLE_RATE", 1.0)
+
 # Optional: hard filters at logger-level to avoid logging pure dust.
 AI_LOG_MIN_LIQ_USD = _env_float("AI_LOG_MIN_LIQ_USD", 0.0)
 AI_LOG_MIN_VOL5_USD = _env_float("AI_LOG_MIN_VOL5_USD", 0.0)
+
+# Optional: auto schema init on first DB touch (Phase 0 bootstrap).
+AI_DB_AUTO_INIT = _env_bool("AI_DB_AUTO_INIT", True)
+
+# Optional: equity / risk / reinvestor specific toggles (Phase 3/4/5 helpers)
+AI_LOG_EQUITY = _env_bool("AI_LOG_EQUITY", True)
+AI_LOG_RISK_SNAPSHOTS = _env_bool("AI_LOG_RISK_SNAPSHOTS", True)
+AI_LOG_REINVESTOR_SNAPSHOTS = _env_bool("AI_LOG_REINVESTOR_SNAPSHOTS", True)
+
+AI_LOG_EQUITY_SAMPLE_RATE = _env_float("AI_LOG_EQUITY_SAMPLE_RATE", 1.0)
+AI_LOG_RISK_SAMPLE_RATE = _env_float("AI_LOG_RISK_SAMPLE_RATE", 1.0)
+AI_LOG_REINVESTOR_SAMPLE_RATE = _env_float("AI_LOG_REINVESTOR_SAMPLE_RATE", 1.0)
 
 
 # ============================================================================ #
 # Internal helpers
 # ============================================================================ #
+
+_SCHEMA_INIT_DONE = False
+
+
+def _ensure_ai_schema_once() -> None:
+    """
+    Best-effort call into ai_db.ensure_ai_tables() exactly once per process.
+
+    This keeps app code clean: data_logger sits on the hot path and guarantees
+    the AI tables exist as soon as we try to write anything, *if* the ai_db
+    module exposes ensure_ai_tables().
+    """
+    global _SCHEMA_INIT_DONE
+
+    if _SCHEMA_INIT_DONE or not PG_ENABLED or not AI_DB_AUTO_INIT:
+        return
+
+    fn = getattr(ai_db, "ensure_ai_tables", None)
+    if not callable(fn):
+        _SCHEMA_INIT_DONE = True
+        return
+
+    try:
+        fn()
+        log.debug("data_logger: ensure_ai_tables() completed")
+    except Exception:
+        log.exception("data_logger: ensure_ai_tables() failed during auto-init")
+        if AI_LOG_STRICT:
+            # Fail loudly in strict mode so we notice schema drift.
+            raise
+    finally:
+        _SCHEMA_INIT_DONE = True
 
 
 def _src_regime_allowed(src: str, regime: Optional[str]) -> bool:
@@ -228,26 +302,32 @@ def _feature_version_for(src: str, regime: Optional[str]) -> int:
     return FEATURE_VERSION
 
 
-def _should_sample(candidate_hash: str, *, rate: float) -> bool:
+def _stable_hash(s: str) -> float:
     """
-    Deterministic sampling based on hash, so we always keep a stable slice
-    of candidates when AI_LOG_SAMPLE_RATE < 1.0.
+    Deterministic hash → [0, 1) float.
 
-    This avoids needing random; you can reproduce which rows were kept.
+    Used for sampling so that repeated runs keep/skip the same rows.
+    """
+    try:
+        h = 0
+        for ch in s:
+            h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+        return (h % 10_000) / 10_000.0
+    except Exception:
+        # Fallback: always keep if we somehow fail
+        return 0.0
+
+
+def _should_sample(key: str, *, rate: float) -> bool:
+    """
+    Deterministic sampling based on key, so we always keep a stable slice
+    of events when rate < 1.0.
     """
     if rate >= 0.999:
         return True
     if rate <= 0.0:
         return False
-    try:
-        h = 0
-        for ch in candidate_hash:
-            h = (h * 31 + ord(ch)) & 0xFFFFFFFF
-        frac = (h % 10_000) / 10_000.0
-        return frac < rate
-    except Exception:
-        # fallback: log it
-        return True
+    return _stable_hash(key) < rate
 
 
 def _normalize_rug(raw: Any) -> float:
@@ -585,6 +665,8 @@ def log_entry_candidate(
     ts: Optional[Any] = None,
     # Raw extras (debug / extended context):
     extra_raw: Optional[Mapping[str, Any]] = None,
+    # Advanced override: force a specific feature_version if needed.
+    feature_version_override: Optional[int] = None,
 ) -> int:
     """
     High-level helper: take a raw scanner snapshot, build features, write to DB.
@@ -616,7 +698,10 @@ def log_entry_candidate(
         )
         return 0
 
-    # Optional deterministic sampling (BUY vs SKIP can share same base hash)
+    # Ensure schema once before first write (Phase 0 bootstrap).
+    _ensure_ai_schema_once()
+
+    # Optional deterministic sampling (BUY vs SKIP can be downsampled separately)
     cand_hash = candidate_key or f"{src}:{regime or ''}:{mint}"
 
     # Hard filters on micro liquidity / micro volume if configured
@@ -877,7 +962,7 @@ def log_entry_candidate(
         # ------------------------------------------------------------------ #
         # 7) Feature version & linking identifiers
         # ------------------------------------------------------------------ #
-        fv = _feature_version_for(src, regime)
+        fv = feature_version_override or _feature_version_for(src, regime)
 
         if trade_id is not None:
             # Numeric marker so model knows row has a trade link
@@ -940,6 +1025,13 @@ def log_entry_candidate(
                     )
             except Exception:
                 log.debug("data_logger: failed to attach history to raw payload")
+
+        # Optional: snapshot of the numeric feature vector for offline export
+        if AI_LOG_FEATURES_IN_RAW:
+            try:
+                raw_payload.setdefault("_features_snapshot", dict(feats))
+            except Exception:
+                log.debug("data_logger: failed to attach features snapshot to raw")
 
         # ------------------------------------------------------------------ #
         # 9) Write to Postgres via ai_db helper
@@ -1037,6 +1129,8 @@ def log_entry_decision_update(
     if not PG_ENABLED:
         return 0
 
+    _ensure_ai_schema_once()
+
     update_fn = getattr(ai_db, "update_entry_decision", None)
     if not callable(update_fn):
         # No DB support in current ai_db version; keep silent.
@@ -1116,12 +1210,24 @@ def log_entry_outcome(
         )
         return 0
 
+    # Optional sampling for ultra-high-frequency backtests
+    if not _should_sample(f"outcome:{candidate_id}", rate=AI_LOG_OUTCOME_SAMPLE_RATE):
+        log.debug(
+            "data_logger: sampled-out outcome for candidate_id=%s", candidate_id
+        )
+        return 0
+
+    _ensure_ai_schema_once()
+
     try:
         effective_label = label or _safe_label_from_pnl(pnl_pct, got_stopped)
         merged_extra: Dict[str, Any] = {
             "got_stopped": bool(got_stopped),
             "ai_policy_version": AI_POLICY_VERSION or None,
             "ai_experiment_tag": AI_EXPERIMENT_TAG or None,
+            "label_version": AI_LABELING_VERSION or None,
+            # Keep exact hold seconds for RL even if DB stores int.
+            "hold_sec_exact": float(hold_seconds),
         }
         if extra:
             merged_extra.update(dict(extra))
@@ -1155,7 +1261,8 @@ def log_entry_outcome(
 
 
 # ============================================================================ #
-# Optional advanced helpers (executions, regime snapshots, AI events)
+# Optional advanced helpers (executions, regime snapshots, AI events, equity,
+# risk manager, reinvestor)
 # ============================================================================ #
 
 
@@ -1187,6 +1294,13 @@ def log_trade_execution(
     """
     if not PG_ENABLED or not AI_LOG_EXECUTIONS:
         return 0
+
+    # Optional sampling for high-traffic streams
+    if not _should_sample(f"exec:{trade_id}:{side}", rate=AI_LOG_EXEC_SAMPLE_RATE):
+        log.debug("data_logger: sampled-out execution trade_id=%s", trade_id)
+        return 0
+
+    _ensure_ai_schema_once()
 
     fn = getattr(ai_db, "insert_trade_execution", None)
     if not callable(fn):
@@ -1244,7 +1358,11 @@ def log_regime_snapshot(
     if not PG_ENABLED or not AI_LOG_REGIME_SNAPSHOTS:
         return 0
 
+    _ensure_ai_schema_once()
+
     fn = getattr(ai_db, "insert_regime_snapshot", None)
+    if not callable(fn):
+        fn = getattr(ai_db, "log_regime_snapshot", None)
     if not callable(fn):
         return 0
 
@@ -1293,6 +1411,14 @@ def log_ai_event(
     if not PG_ENABLED:
         return 0
 
+    # Optional sampling in case of very chatty self-learning loops.
+    sample_key = f"event:{event_type}:{src or ''}:{regime or ''}"
+    if not _should_sample(sample_key, rate=AI_LOG_EVENT_SAMPLE_RATE):
+        log.debug("data_logger: sampled-out ai_event type=%s", event_type)
+        return 0
+
+    _ensure_ai_schema_once()
+
     fn = getattr(ai_db, "log_ai_event", None)
     if not callable(fn):
         return 0
@@ -1318,6 +1444,236 @@ def log_ai_event(
         return row_id
     except Exception:
         log.exception("Failed to log ai_event type=%s", event_type)
+        if AI_LOG_STRICT:
+            raise
+        return -1
+
+
+def log_equity_curve_point(
+    *,
+    ts: Optional[Any] = None,
+    equity_usd: Optional[float] = None,
+    balance_sol: Optional[float] = None,
+    pnl_day_pct: Optional[float] = None,
+    pnl_total_pct: Optional[float] = None,
+    session_id: Optional[str] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> int:
+    """
+    Phase 3+ helper: log account-level equity curve points.
+
+    Intended caller: reinvestor / risk_manager / periodic equity cron.
+
+    Fields:
+      - equity_usd: total account equity snapshot in USD
+      - balance_sol: wallet SOL balance snapshot
+      - pnl_day_pct: realized+unrealized PnL today (pct of equity or base)
+      - pnl_total_pct: total PnL vs baseline (optional)
+      - extra: any extra metrics (e.g. 'base_equity_usd', 'open_risk_usd')
+
+    This function is a soft hook: if ai_db has no matching function, this
+    returns 0 without error.
+    """
+    if not PG_ENABLED or not AI_LOG_EQUITY:
+        return 0
+
+    sample_key = f"equity:{session_id or ''}:{ts or ''}"
+    if not _should_sample(sample_key, rate=AI_LOG_EQUITY_SAMPLE_RATE):
+        log.debug("data_logger: sampled-out equity point session=%s", session_id)
+        return 0
+
+    _ensure_ai_schema_once()
+
+    fn = getattr(ai_db, "insert_equity_curve_point", None)
+    if not callable(fn):
+        fn = getattr(ai_db, "log_equity_curve_point", None)
+    if not callable(fn):
+        return 0
+
+    payload: Dict[str, Any] = {
+        "ts": ts,
+        "equity_usd": float(equity_usd) if equity_usd is not None else None,
+        "balance_sol": float(balance_sol) if balance_sol is not None else None,
+        "pnl_day_pct": float(pnl_day_pct) if pnl_day_pct is not None else None,
+        "pnl_total_pct": float(pnl_total_pct) if pnl_total_pct is not None else None,
+        "session_id": session_id,
+        "extra": dict(extra) if extra else {},
+    }
+
+    try:
+        row_id = fn(**payload)
+        log.debug(
+            "Logged equity_curve_point id=%s equity_usd=%s balance_sol=%s session_id=%s",
+            row_id,
+            equity_usd,
+            balance_sol,
+            session_id,
+        )
+        return row_id
+    except Exception:
+        log.exception("Failed to log equity_curve_point session_id=%s", session_id)
+        if AI_LOG_STRICT:
+            raise
+        return -1
+
+
+def log_risk_manager_snapshot(
+    *,
+    ts: Optional[Any] = None,
+    regime: Optional[str] = None,
+    risk_mode: Optional[str] = None,
+    capacity_score: Optional[float] = None,
+    daily_drawdown_pct: Optional[float] = None,
+    daily_realized_pnl_pct: Optional[float] = None,
+    max_positions: Optional[int] = None,
+    open_positions: Optional[int] = None,
+    hard_halt: Optional[bool] = None,
+    soft_halt: Optional[bool] = None,
+    session_id: Optional[str] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> int:
+    """
+    Phase 3/5 helper: snapshot of risk_manager state.
+
+    Intended caller: risk_manager's periodic tick or when key events occur.
+
+    Fields:
+      - regime: label or key (e.g. "risk_on", "risk_off", "mixed")
+      - risk_mode: string description of active mode / profile
+      - capacity_score: 0..1 capacity / Kelly-style scalar
+      - daily_drawdown_pct: today's drawdown vs equity high
+      - daily_realized_pnl_pct: realized PnL for the day
+      - max_positions, open_positions: current/max concurrency
+      - hard_halt / soft_halt: flags if trading is stopped or clamped
+    """
+    if not PG_ENABLED or not AI_LOG_RISK_SNAPSHOTS:
+        return 0
+
+    sample_key = f"risk:{session_id or ''}:{regime or ''}"
+    if not _should_sample(sample_key, rate=AI_LOG_RISK_SAMPLE_RATE):
+        log.debug("data_logger: sampled-out risk snapshot session=%s", session_id)
+        return 0
+
+    _ensure_ai_schema_once()
+
+    fn = getattr(ai_db, "insert_risk_snapshot", None)
+    if not callable(fn):
+        fn = getattr(ai_db, "log_risk_snapshot", None)
+    if not callable(fn):
+        return 0
+
+    payload: Dict[str, Any] = {
+        "ts": ts,
+        "regime": regime,
+        "risk_mode": risk_mode,
+        "capacity_score": float(capacity_score) if capacity_score is not None else None,
+        "daily_drawdown_pct": float(daily_drawdown_pct)
+        if daily_drawdown_pct is not None
+        else None,
+        "daily_realized_pnl_pct": float(daily_realized_pnl_pct)
+        if daily_realized_pnl_pct is not None
+        else None,
+        "max_positions": int(max_positions) if max_positions is not None else None,
+        "open_positions": int(open_positions) if open_positions is not None else None,
+        "hard_halt": bool(hard_halt) if hard_halt is not None else None,
+        "soft_halt": bool(soft_halt) if soft_halt is not None else None,
+        "session_id": session_id,
+        "extra": dict(extra) if extra else {},
+    }
+
+    try:
+        row_id = fn(**payload)
+        log.debug(
+            "Logged risk_manager_snapshot id=%s regime=%s risk_mode=%s session_id=%s",
+            row_id,
+            regime,
+            risk_mode,
+            session_id,
+        )
+        return row_id
+    except Exception:
+        log.exception("Failed to log risk_manager_snapshot session_id=%s", session_id)
+        if AI_LOG_STRICT:
+            raise
+        return -1
+
+
+def log_reinvestor_snapshot(
+    *,
+    ts: Optional[Any] = None,
+    profile: Optional[str] = None,
+    account_equity_usd: Optional[float] = None,
+    base_capital_usd: Optional[float] = None,
+    kelly_fraction: Optional[float] = None,
+    risk_budget_pct: Optional[float] = None,
+    soft_stop_active: Optional[bool] = None,
+    hard_stop_active: Optional[bool] = None,
+    session_id: Optional[str] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> int:
+    """
+    Phase 3/4 helper: snapshot of reinvestor state.
+
+    Intended caller: reinvestor.py whenever it recalculates targets / clamps.
+
+    Fields:
+      - profile: string describing active reinvestor profile (e.g. "growth_v1")
+      - account_equity_usd: current equity
+      - base_capital_usd: baseline / starting capital for PnL reference
+      - kelly_fraction: Kelly-style fraction used for target risk
+      - risk_budget_pct: risk budget vs equity (e.g. max daily loss)
+      - soft_stop_active / hard_stop_active: protective modes
+    """
+    if not PG_ENABLED or not AI_LOG_REINVESTOR_SNAPSHOTS:
+        return 0
+
+    sample_key = f"reinv:{session_id or ''}:{profile or ''}"
+    if not _should_sample(sample_key, rate=AI_LOG_REINVESTOR_SAMPLE_RATE):
+        log.debug("data_logger: sampled-out reinvestor snapshot session=%s", session_id)
+        return 0
+
+    _ensure_ai_schema_once()
+
+    fn = getattr(ai_db, "insert_reinvestor_snapshot", None)
+    if not callable(fn):
+        fn = getattr(ai_db, "log_reinvestor_snapshot", None)
+    if not callable(fn):
+        return 0
+
+    payload: Dict[str, Any] = {
+        "ts": ts,
+        "profile": profile,
+        "account_equity_usd": float(account_equity_usd)
+        if account_equity_usd is not None
+        else None,
+        "base_capital_usd": float(base_capital_usd)
+        if base_capital_usd is not None
+        else None,
+        "kelly_fraction": float(kelly_fraction) if kelly_fraction is not None else None,
+        "risk_budget_pct": float(risk_budget_pct)
+        if risk_budget_pct is not None
+        else None,
+        "soft_stop_active": bool(soft_stop_active)
+        if soft_stop_active is not None
+        else None,
+        "hard_stop_active": bool(hard_stop_active)
+        if hard_stop_active is not None
+        else None,
+        "session_id": session_id,
+        "extra": dict(extra) if extra else {},
+    }
+
+    try:
+        row_id = fn(**payload)
+        log.debug(
+            "Logged reinvestor_snapshot id=%s profile=%s session_id=%s",
+            row_id,
+            profile,
+            session_id,
+        )
+        return row_id
+    except Exception:
+        log.exception("Failed to log reinvestor_snapshot session_id=%s", session_id)
         if AI_LOG_STRICT:
             raise
         return -1
@@ -1350,6 +1706,8 @@ def log_raydium_candidate(
     step_idx: Optional[int] = None,
     strategy_profile: Optional[str] = None,
     gate_detail: Optional[Mapping[str, Any]] = None,
+    # Advanced override:
+    feature_version_override: Optional[int] = None,
 ) -> int:
     """
     Convenience wrapper for logging Raydium pool candidates.
@@ -1379,6 +1737,7 @@ def log_raydium_candidate(
         step_idx=step_idx,
         strategy_profile=strategy_profile,
         gate_detail=gate_detail,
+        feature_version_override=feature_version_override,
     )
 
 
@@ -1402,6 +1761,7 @@ def log_pumpfun_candidate(
     step_idx: Optional[int] = None,
     strategy_profile: Optional[str] = None,
     gate_detail: Optional[Mapping[str, Any]] = None,
+    feature_version_override: Optional[int] = None,
 ) -> int:
     """
     Wrapper for Pump.fun PF meta dicts (bonding-curve / early-phase coins).
@@ -1428,6 +1788,7 @@ def log_pumpfun_candidate(
         step_idx=step_idx,
         strategy_profile=strategy_profile,
         gate_detail=gate_detail,
+        feature_version_override=feature_version_override,
     )
 
 
@@ -1451,6 +1812,7 @@ def log_dexscreener_candidate(
     step_idx: Optional[int] = None,
     strategy_profile: Optional[str] = None,
     gate_detail: Optional[Mapping[str, Any]] = None,
+    feature_version_override: Optional[int] = None,
 ) -> int:
     """
     Wrapper for Dexscreener PF meta dicts.
@@ -1477,6 +1839,7 @@ def log_dexscreener_candidate(
         step_idx=step_idx,
         strategy_profile=strategy_profile,
         gate_detail=gate_detail,
+        feature_version_override=feature_version_override,
     )
 
 
@@ -1500,6 +1863,7 @@ def log_momo_candidate(
     step_idx: Optional[int] = None,
     strategy_profile: Optional[str] = None,
     gate_detail: Optional[Mapping[str, Any]] = None,
+    feature_version_override: Optional[int] = None,
 ) -> int:
     """
     Wrapper for MOMO / pure-momentum candidates (if you want a dedicated src).
@@ -1526,4 +1890,5 @@ def log_momo_candidate(
         step_idx=step_idx,
         strategy_profile=strategy_profile,
         gate_detail=gate_detail,
+        feature_version_override=feature_version_override,
     )
