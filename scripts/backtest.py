@@ -3,27 +3,39 @@ from __future__ import annotations
 """
 scripts/backtest.py
 
-Quant-grade backtest runner for AI entry/exit + risk configs (V3+++).
-=====================================================================
+God-Tier Backtest Runner (V3+++ / Quant-Grade / Master Roadmap Phases 5–7)
+==========================================================================
 
-High-level:
+High-level role (Phases 5–7):
     • Build a GRID of BacktestConfig points (score thresholds, risk knobs,
       AI knobs, feature modes, smart-wallet modes, regime modes, self-learning
-      toggles, reinvestor toggles, AI risk overlay, etc.).
+      toggles, reinvestor toggles, AI risk overlay, cost model, etc.).
     • For each config:
-          - Call utils_pkg.backtest_engine.run_backtest(...).
+          - Call utils_pkg.backtest_engine.run_backtest(**cfg_dict).
           - Let the engine talk to:
-                ai_db / FeatureBuilder / ai_entry_logic / smart_wallets /
-                regime / risk_manager / ai_risk_model /
-                self_learning_ai_strategy / reinvestor / data_logger.
+                ai_db
+                FeatureBuilder (V3+++)
+                ai_entry_logic / ai_buy_scoring (V3+++)
+                smart_wallets (alpha / whale filters)
+                regime (risk-on/off / feature richness)
+                risk_manager (Kelly-aware / guardrails)
+                ai_risk_model (overlay)
+                self_learning_ai_strategy (online tuning in backtest)
+                reinvestor (compounding / drawdown stops)
+                data_logger (for notebooks / dashboards)
     • Optionally run in parallel with a concurrency cap.
-    • Augment stats with derived quant metrics (edge_score, pnl_dd_ratio, calmar,
-      win_loss_ratio, expectancy_pct, kelly_fraction, kelly_safe_fraction,
-      trades_per_day, etc.).
-    • Apply result-level filters (min trades, max DD, min Sharpe, min edge_score,
-      min pnl_dd_ratio, min calmar_ratio, min win_loss_ratio, min expectancy_pct,
-      min kelly_fraction, min_kelly_safe_fraction, min_trades_per_day, ...).
-    • Pretty-print a comparison table.
+    • Augment stats with derived quant metrics:
+          edge_score, pnl_dd_ratio, calmar_ratio, win_loss_ratio,
+          expectancy_pct, kelly_fraction, kelly_safe_fraction,
+          daily_pnl_pct, monthly_pnl_pct, monthly_pnl_compound_pct,
+          trades_per_day, cagr_annual_pct, etc.
+    • Apply result-level filters:
+          min trades, max DD, min Sharpe, min edge_score,
+          min pnl_dd_ratio, min calmar_ratio, min win_loss_ratio,
+          min expectancy_pct, min kelly_fraction, min_kelly_safe_fraction,
+          min_trades_per_day, min_monthly_pnl_pct, min_monthly_pnl_compound_pct,
+          min_cagr_annual_pct, ...
+    • Pretty-print a comparison table (ranked by best metric).
     • Optionally:
           - export aggregated results JSON
           - export flattened CSV (config + stats)
@@ -38,29 +50,33 @@ Everything is CLI + ENV driven – no code edits required for new experiments.
 Usage examples
 --------------
 
-# Simple sweep with defaults over last 14 days
+# Simple sweep with defaults over last 14 days:
     python -m scripts.backtest
 
-# Focus on pumpfun regime, require minimum win rate and Sharpe, export CSV
+# Focus on pumpfun regime, require minimum win rate and Sharpe, export CSV:
     BT_REGIME_WHITELIST=pumpfun_live \
     BT_MIN_WIN_RATE=0.55 \
     BT_MIN_SHARPE=1.2 \
       python -m scripts.backtest --export-csv backtests_pumpfun.csv
 
-# Use parallel mode with limited concurrency
+# Use parallel mode with limited concurrency:
     BT_PARALLEL=1 BT_PARALLEL_LIMIT=4 python -m scripts.backtest
 
 # Walk-forward or split mode controlling engine_mode / split_mode via base JSON:
     BT_BASE_CONFIG_JSON=config/backtest_base.json python -m scripts.backtest
 
-# Example: random sample 30% of grid, shuffled (for quick scouting)
+# Example: random sample 30% of grid, shuffled (for quick scouting):
     BT_SAMPLE_CONFIG_FRACTION=0.3 BT_SHUFFLE_CONFIGS=1 python -m scripts.backtest
 
-# Example: group summary by risk_profile and exit_policy_name
+# Example: group summary by risk_profile and exit_policy_name:
     BT_GROUP_SUMMARY_BY=risk_profile,exit_policy_name python -m scripts.backtest
 
-# Example: also export best config to .env-style file
+# Example: also export best config to .env-style file:
     BT_EXPORT_ENV_BEST=backtest_best.env python -m scripts.backtest
+
+# Example: explicitly target ~30%/month configs (research sugar):
+    BT_TARGET_MONTHLY_PNL_PCT=30 \
+      python -m scripts.backtest --sort-key edge_score --top-n 15
 """
 
 import argparse
@@ -940,6 +956,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Minimum daily_pnl_pct (0 = disabled).",
     )
     p.add_argument(
+        "--min-monthly-pnl-pct",
+        type=float,
+        default=_env_float("BT_MIN_MONTHLY_PNL_PCT", 0.0),
+        help="Minimum approximated monthly_pnl_pct (daily_pnl_pct * 30). 0 = disabled.",
+    )
+    # NEW: compounding-focused monthly PnL filter
+    p.add_argument(
+        "--min-monthly-pnl-compound-pct",
+        type=float,
+        default=_env_float("BT_MIN_MONTHLY_PNL_COMPOUND_PCT", 0.0),
+        help="Minimum monthly_pnl_compound_pct required (0 = disabled).",
+    )
+    p.add_argument(
         "--min-equity-final-pct",
         type=float,
         default=_env_float("BT_MIN_EQUITY_FINAL_PCT", 0.0),
@@ -951,6 +980,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=_env_float("BT_MIN_EQUITY_FINAL_PCT", 0.0),
         help=argparse.SUPPRESS,
+    )
+    # NEW: CAGR/annual growth filter
+    p.add_argument(
+        "--min-cagr-annual-pct",
+        type=float,
+        default=_env_float("BT_MIN_CAGR_ANNUAL_PCT", 0.0),
+        help="Minimum cagr_annual_pct required (0 = disabled).",
     )
     p.add_argument(
         "--min-net-pnl-pct",
@@ -1024,6 +1060,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--metrics",
         default=_env_str("BT_METRICS", ""),
         help='Comma-separated metric names for the table (e.g. "n_trades,win_rate,pnl_total_pct,sharpe,edge_score").',
+    )
+
+    # Target monthly PnL helper (Phase 6+ ROI sugar)
+    p.add_argument(
+        "--target-monthly-pnl-pct",
+        type=float,
+        default=_env_float("BT_TARGET_MONTHLY_PNL_PCT", 0.0),
+        help=(
+            "Optional target monthly_pnl_pct used for commentary on best config "
+            "(does NOT filter – use BT_MIN_MONTHLY_PNL_PCT for hard gating)."
+        ),
     )
 
     # Export knobs
@@ -1164,9 +1211,7 @@ def build_config_grid(args: argparse.Namespace) -> List[BacktestConfig]:
 
     regime_modes_raw = _parse_csv_ints(args.regime_risk_mode)
     if regime_modes_raw:
-        regime_modes: List[Optional[int]] = [
-            m for m in regime_modes_raw if m in (0, 1, 2)
-        ] or [None]
+        regime_modes: List[Optional[int]] = [m for m in regime_modes_raw if m in (0, 1, 2)] or [None]
     else:
         regime_modes = [None]
 
@@ -1474,8 +1519,8 @@ def _pick_sort_key_name(
     # Preferred PnL / risk metrics
     preferred = [
         "edge_score",        # composite metric if present
-        "pnl_total_pct",
         "net_pnl_pct",
+        "pnl_total_pct",
         "equity_final_pct",
         "equity_final",
         "net_pnl",
@@ -1525,6 +1570,8 @@ def _pick_metric_keys(
         "expectancy_pct",
         "pnl_per_trade_pct",
         "daily_pnl_pct",
+        "monthly_pnl_pct",
+        "monthly_pnl_compound_pct",
         "trades_per_day",
         "edge_score",
         "pnl_dd_ratio",
@@ -1532,6 +1579,7 @@ def _pick_metric_keys(
         "win_loss_ratio",
         "kelly_fraction",
         "kelly_safe_fraction",
+        "cagr_annual_pct",
         "risk_capacity_avg",
         "risk_capacity_p05",
         "risk_capacity_p95",
@@ -1565,6 +1613,8 @@ def _augment_stats(stats: Dict[str, Any]) -> None:
         - pnl_per_trade_pct
         - expectancy_pct
         - daily_pnl_pct
+        - monthly_pnl_pct  (approx daily_pnl_pct * 30)
+        - monthly_pnl_compound_pct (compounded from daily_pnl_pct)
         - trades_per_day
         - sortino (if downside dev present)
         - pnl_dd_ratio (PnL / |DD|)
@@ -1572,6 +1622,7 @@ def _augment_stats(stats: Dict[str, Any]) -> None:
         - calmar_ratio: net_pnl_pct / |max_drawdown_pct|
         - kelly_fraction, kelly_safe_fraction (approx Kelly sizing on PnL%)
         - edge_score: composite PnL vs drawdown vs Sharpe metric
+        - cagr_annual_pct (annualized growth from net_pnl_pct + days_span)
     """
     # win_rate
     try:
@@ -1630,8 +1681,8 @@ def _augment_stats(stats: Dict[str, Any]) -> None:
         pass
 
     # daily_pnl_pct and trades_per_day if we have a span in days
+    days = None
     try:
-        days = None
         for key in ("days_span", "days", "window_days"):
             if key in stats and isinstance(stats[key], (int, float)):
                 days = float(stats[key])
@@ -1642,6 +1693,41 @@ def _augment_stats(stats: Dict[str, Any]) -> None:
                 stats["daily_pnl_pct"] = float(stats["pnl_total_pct"]) / days
             if "trades_per_day" not in stats and "n_trades" in stats:
                 stats["trades_per_day"] = float(stats.get("n_trades", 0) or 0.0) / days
+    except Exception:
+        pass
+
+    # monthly_pnl_pct (approx: daily * 30)
+    try:
+        if "monthly_pnl_pct" not in stats and "daily_pnl_pct" in stats:
+            stats["monthly_pnl_pct"] = float(stats["daily_pnl_pct"]) * 30.0
+    except Exception:
+        pass
+
+    # Compounding-style monthly and annualized growth (CAGR) estimates
+    try:
+        # Annualized CAGR based on net_pnl_pct and days_span-style keys
+        days_val: Optional[float] = None
+        for key in ("days_span", "days", "window_days"):
+            v = stats.get(key)
+            if isinstance(v, (int, float)):
+                days_val = float(v)
+                break
+
+        if days_val and days_val > 0:
+            npct = float(stats.get("net_pnl_pct", stats.get("pnl_total_pct", 0.0)) or 0.0)
+            gross = 1.0 + npct / 100.0
+            if gross > 0:
+                years = max(1e-9, days_val / 365.0)
+                cagr = (gross ** (1.0 / years) - 1.0) * 100.0
+                if "cagr_annual_pct" not in stats:
+                    stats["cagr_annual_pct"] = cagr
+
+        # Monthly compounded PnL from daily_pnl_pct if available
+        if "monthly_pnl_compound_pct" not in stats and "daily_pnl_pct" in stats:
+            d = float(stats.get("daily_pnl_pct", 0.0) or 0.0)
+            gross_d = 1.0 + d / 100.0
+            if gross_d > 0:
+                stats["monthly_pnl_compound_pct"] = ((gross_d ** 30.0) - 1.0) * 100.0
     except Exception:
         pass
 
@@ -1818,6 +1904,9 @@ def _print_group_summary_for_field(
         "pnl_dd_ratio",
         "calmar_ratio",
         "trades_per_day",
+        "monthly_pnl_pct",
+        "monthly_pnl_compound_pct",
+        "cagr_annual_pct",
     ]
 
     # Compute aggregates
@@ -2391,12 +2480,16 @@ async def _run_backtests(args: argparse.Namespace) -> None:
     min_avg_pnl_pct = args.min_avg_pnl_pct
     min_sortino = args.min_sortino
     min_daily_pnl_pct = args.min_daily_pnl_pct
+    min_monthly_pnl_pct = args.min_monthly_pnl_pct
+    # NEW thresholds: compounding monthly PnL and annual CAGR
+    min_monthly_pnl_compound_pct = args.min_monthly_pnl_compound_pct
     # defensive: support historical typo min_equity_final_pcnt as well
     min_equity_final_pct = (
         args.min_equity_final_pcnt
         if hasattr(args, "min_equity_final_pcnt")
         else args.min_equity_final_pct
     )
+    min_cagr_annual_pct = args.min_cagr_annual_pct
     min_net_pnl_pct = args.min_net_pnl_pct
     min_reinvest_count = int(args.min_reinvest_count or 0)
     min_self_learn_tunes = int(args.min_self_learn_tunes or 0)
@@ -2404,7 +2497,7 @@ async def _run_backtests(args: argparse.Namespace) -> None:
     min_pnl_dd_ratio = args.min_pnl_dd_ratio
     min_calmar = args.min_calmar
     min_win_loss_ratio = args.min_win_loss_ratio
-    min_expectancy_pct = args.min_expectancy_pct  # FIXED: correct attribute name
+    min_expectancy_pct = args.min_expectancy_pct
     min_kelly_fraction = args.min_kelly_fraction
     min_kelly_safe_fraction = args.min_kelly_safe_fraction
     min_trades_per_day = args.min_trades_per_day
@@ -2426,8 +2519,14 @@ async def _run_backtests(args: argparse.Namespace) -> None:
         min_sortino = None
     if min_daily_pnl_pct <= 0.0:
         min_daily_pnl_pct = None
+    if min_monthly_pnl_pct <= 0.0:
+        min_monthly_pnl_pct = None
+    if min_monthly_pnl_compound_pct <= 0.0:
+        min_monthly_pnl_compound_pct = None
     if min_equity_final_pct <= 0.0:
         min_equity_final_pct = None
+    if min_cagr_annual_pct <= 0.0:
+        min_cagr_annual_pct = None
     if min_net_pnl_pct <= 0.0:
         min_net_pnl_pct = None
     if min_edge_score <= 0.0:
@@ -2508,10 +2607,28 @@ async def _run_backtests(args: argparse.Namespace) -> None:
             if dp < float(min_daily_pnl_pct):
                 continue
 
+        # monthly_pnl_pct filter (compounding / growth focused)
+        if min_monthly_pnl_pct is not None:
+            mp = float(stats.get("monthly_pnl_pct", 0.0) or 0.0)
+            if mp < float(min_monthly_pnl_pct):
+                continue
+
+        # NEW: monthly_pnl_compound_pct filter
+        if min_monthly_pnl_compound_pct is not None:
+            mpc = float(stats.get("monthly_pnl_compound_pct", 0.0) or 0.0)
+            if mpc < float(min_monthly_pnl_compound_pct):
+                continue
+
         # equity_final_pct filter
         if min_equity_final_pct is not None:
             ef = float(stats.get("equity_final_pct", 0.0) or 0.0)
             if ef < float(min_equity_final_pct):
+                continue
+
+        # NEW: cagr_annual_pct filter
+        if min_cagr_annual_pct is not None:
+            cagr = float(stats.get("cagr_annual_pct", 0.0) or 0.0)
+            if cagr < float(min_cagr_annual_pct):
                 continue
 
         # net_pnl_pct filter
@@ -2609,6 +2726,30 @@ async def _run_backtests(args: argparse.Namespace) -> None:
         top_n=top_n,
         metrics_override=metrics_override,
     )
+
+    # Target monthly PnL commentary (Phase 6+ ROI helper)
+    if args.target_monthly_pnl_pct > 0:
+        best_pair = _pick_best_pair(
+            filtered_configs,
+            filtered_stats,
+            sort_key_override=sort_key_override,
+            sort_ascending=sort_asc,
+        )
+        if best_pair is not None:
+            best_cfg, best_stats = best_pair
+            best_monthly = float(
+                best_stats.get(
+                    "monthly_pnl_pct",
+                    best_stats.get("net_pnl_pct", 0.0),
+                )
+                or 0.0
+            )
+            best_dd = float(best_stats.get("max_drawdown_pct", 0.0) or 0.0)
+            print(
+                f"Target monthly_pnl_pct: {args.target_monthly_pnl_pct:.2f}% | "
+                f"best config: {best_cfg.tag or ''} → "
+                f"monthly_pnl_pct≈{best_monthly:.2f}%, max_dd≈{best_dd:.2f}%"
+            )
 
     # Group summaries (optional)
     if args.group_summary_by:

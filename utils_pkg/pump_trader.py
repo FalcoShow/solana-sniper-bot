@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 """
-utils_pkg/pump_trader.py — vNext (full rewrite)
+utils_pkg/pump_trader.py — vNext (God-Tier Overhaul)
 
 Key features
 ------------
 - Primary path: Jupiter lightning buy; fallbacks: PumpPortal remote → local, with retries.
 - Buy hooks: on_buy_submitted / on_buy_filled / on_buy_failed (fully wired, resilient).
 - Momentum gate + liquidity-aware sizing + wallet-risk autosizer + per-mint cooldowns.
+- NEW: AI / quant-aware sizing:
+    * Respects UI hints from strategy/AI:
+        - position_size_kelly_scalar
+        - position_size_scalar
+        - size_scalar_v1
+        - size_scalar
+    * Optional explicit overrides: size_sol_override / spend_sol_override / size_sol / spend_sol.
 - Global guardrails integration (buys_allowed) + optional external routeguard preflight.
 - Dedupe support (optional): prevents duplicate buys per mint for a TTL.
 - Jito / priority-fee knobs, slippage bps override, compute unit limit knob (optional).
@@ -19,7 +26,7 @@ Key features
     * buy_pump_token(mint, sol_amount, slippage_bps)
     * buy_direct_lamports(mint, in_amount_lamports, slippage_bps)
   for router’s Jupiter→Pump fallback.
-- NEW: On successful BUY, upsert an open row into Postgres `positions` table via
+- On successful BUY, upserts an open row into Postgres `positions` table via
   utils_pkg.core_utils.pg_upsert_position (wallet+mint+pool is unique key).
 """
 
@@ -331,6 +338,7 @@ async def _liquidity_size_boost(mint: str, base_sol: float) -> float:
         return base_sol
     ok, rep = await screen_token(mint)
     if not ok:
+        # Soft cut on failures: shrink slightly but don’t nuke the trade entirely.
         return min(base_sol, 0.75 * base_sol)
 
     liq_usd = float(rep.get("liqUsd") or rep.get("liq_usd") or 0.0)
@@ -346,8 +354,10 @@ async def _liquidity_size_boost(mint: str, base_sol: float) -> float:
         if ENTRY_MIN_IMPACT_BPS <= imp_bps <= ENTRY_MAX_IMPACT_BPS:
             boost = 1.0
         elif imp_bps < ENTRY_MIN_IMPACT_BPS:
+            # Very deep & low impact → allow mild size boost
             boost = 1.20
         else:
+            # Too much impact → trim size
             boost = 0.70
 
     sized = base_sol * boost
@@ -367,6 +377,102 @@ async def _autosize_by_wallet(owner: str) -> float:
     base = _cached_wallet_sol * max(0.0, min(1.0, RISK_PCT_OF_WALLET))
     base = min(MAX_SOL_PER_TRADE, max(MIN_SOL_PER_TRADE, base))
     return _round_step(base, STEP_SOL)
+
+
+# =============================================================================
+# AI / quant-aware size derivation
+# =============================================================================
+async def _derive_spend_sol(
+    *,
+    owner: str,
+    wallet_bal_sol: float,
+    mint: str,
+    ui: Dict[str, Any],
+) -> float:
+    """
+    God-tier sizing engine:
+
+    Priority:
+      1) Explicit overrides in ui:
+            - size_sol_override / spend_sol_override / size_sol / spend_sol
+      2) External sizer.suggest_trade_sol() if available
+      3) Wallet % sizing via _autosize_by_wallet(owner)
+
+    Then:
+      - Applies AI/quant size scalars if present on ui:
+            - position_size_kelly_scalar
+            - position_size_scalar
+            - size_scalar_v1
+            - size_scalar
+      - Respects wallet balance + MIN_SOL_BALANCE buffer
+      - Passes through _liquidity_size_boost
+      - Clamps to [MIN_SOL_PER_TRADE, MAX_SOL_PER_TRADE]
+    """
+    # 1) Explicit overrides from Strategy / AI layer
+    override_keys = (
+        "size_sol_override",
+        "spend_sol_override",
+        "size_sol",
+        "spend_sol",
+    )
+    base: Optional[float] = None
+    for k in override_keys:
+        v = ui.get(k)
+        if v is None:
+            continue
+        try:
+            base = float(v)
+            break
+        except Exception:
+            continue
+
+    # 2) External sizer (kelly / account-aware) or wallet % sizing
+    if base is None:
+        if _auto_size_sol:
+            try:
+                base = float(_auto_size_sol())  # type: ignore[call-arg]
+            except Exception:
+                base = None
+        if base is None:
+            base = await _autosize_by_wallet(owner)
+
+    # 3) AI / quant scalars (0..1..3x) from upstream feature/AI modules
+    scalar_candidates: List[float] = []
+    for k in (
+        "position_size_kelly_scalar",
+        "position_size_scalar",
+        "size_scalar_v1",
+        "size_scalar",
+    ):
+        v = ui.get(k)
+        if v is None:
+            continue
+        try:
+            scalar_candidates.append(float(v))
+        except Exception:
+            continue
+
+    scalar = 1.0
+    if scalar_candidates:
+        raw = max(scalar_candidates)
+        if not math.isfinite(raw):
+            raw = 1.0
+        # Keep sane: never fully zero out, never > 3x
+        scalar = max(0.05, min(3.0, raw))
+
+    base *= scalar
+
+    # 4) Respect wallet balance and safety buffer
+    # Small buffer so we never drain to absolute MIN_SOL_BALANCE.
+    max_affordable = max(0.0, wallet_bal_sol - MIN_SOL_BALANCE * 0.25)
+    if max_affordable > 0:
+        base = min(base, max_affordable)
+
+    # 5) Clamp and apply liquidity boost
+    base = min(MAX_SOL_PER_TRADE, max(MIN_SOL_PER_TRADE, base))
+    sized = await _liquidity_size_boost(mint, base)
+    sized = min(MAX_SOL_PER_TRADE, max(MIN_SOL_PER_TRADE, sized))
+    return sized
 
 
 # =============================================================================
@@ -587,6 +693,14 @@ async def maybe_buy(
     Tries Jupiter first for real SPL mints; if no route/pseudo id, falls back to PumpPortal.
     Returns signature on success, or None if skipped/failed.
 
+    UI / AI hints (optional keys in `ui`):
+        - pool, symbol, rawMint/raw
+        - size_sol_override / spend_sol_override / size_sol / spend_sol
+        - position_size_kelly_scalar
+        - position_size_scalar
+        - size_scalar_v1
+        - size_scalar
+
     Hook payloads:
 
     on_buy_submitted: {
@@ -658,18 +772,25 @@ async def maybe_buy(
         record_buy_result(ok=False, reason="momo_reject")
         return None
 
-    # Size ticket
-    if _auto_size_sol:
-        try:
-            spend_sol = float(_auto_size_sol())
-        except Exception:
-            spend_sol = MIN_SOL_PER_TRADE
-    else:
-        spend_sol = await _autosize_by_wallet(owner)
-
-    spend_sol = await _liquidity_size_boost(mint, spend_sol)
+    # Size ticket (God-tier AI/quant-size derivation)
+    spend_sol = await _derive_spend_sol(
+        owner=owner,
+        wallet_bal_sol=bal,
+        mint=mint,
+        ui=ui,
+    )
     spend_sol = min(MAX_SOL_PER_TRADE, max(MIN_SOL_PER_TRADE, spend_sol))
     lamports_in = int(spend_sol * LAMPORTS_PER_SOL)
+
+    log.event(
+        "BUY_SIZE_DECISION",
+        mint=mint,
+        pool=pool,
+        spend_sol=spend_sol,
+        wallet_sol=bal,
+        min_trade_sol=MIN_SOL_PER_TRADE,
+        max_trade_sol=MAX_SOL_PER_TRADE,
+    )
 
     # DRYRUN: pretend success path for accounting; do not actually buy or fire hooks
     if IS_DRYRUN:

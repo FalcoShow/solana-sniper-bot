@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 """
-AI Buy Scoring — V3+++ (quant-grade)
-------------------------------------
+AI Buy Scoring — V3+++ (God-Tier / quant-grade)
+-----------------------------------------------
 
 Backwards-compatible scorer used by sniper / scanners / reinvestor:
 
@@ -21,7 +21,7 @@ This module runs just *ahead* of the actual entry engine and acts as a
   • Gate          (score >= AI_SCORE_GATE, plus optional extra guards)
 
 It is the deterministic “bouncer at the door”. The smarter AI brain
-(`ai_entry_logic.py` + models + self_learning_ai_strategy) sits behind
+(`ai_entry_logic.py` + models + `self_learning_ai_strategy.py`) sits behind
 this and uses the outputs:
 
     - ai_buy_score
@@ -53,6 +53,8 @@ Design
       * Optional self-learning overrides via Candidate.meta
       * Infra flags (e.g. pump.fun liquidity `infra_no_account`),
         handled as a **soft** liquidity guard with a small penalty.
+      * Historical / self-learning edge overlays from data_logger /
+        self_learning_ai_strategy (win-rate, R:R, hist_edge_score).
 
 Extra outputs (for logs / dashboards / backtests)
 -------------------------------------------------
@@ -106,6 +108,9 @@ V3+++ additions vs older generations
   - For Pump-only, low-liquidity hard filter is softened when `infra_no_account`
     is true (no hard fail, just softer trust).
   - A small AI penalty is applied when `infra_no_account` is set (Pump-only).
+- **Historical edge overlays (backtest/live PnL)**:
+  - `hist_edge_score`, `hist_win_rate`, `hist_rr_ratio`, `exploration_score`
+    used as a soft scoring component and optional hard floor.
 
 V3+++ test-mode addition
 ------------------------
@@ -225,7 +230,7 @@ def _is_pump_source(source: Optional[str]) -> bool:
 
 
 # =============================================================================
-# Candidate schema (V3+++)
+# Candidate schema (V3+++ God-Tier)
 # =============================================================================
 
 
@@ -334,6 +339,11 @@ class Candidate:
     ctx_win_rate_pct: Optional[float] = None            # rolling win rate (%)
     ctx_recent_loss_streak: Optional[int] = None        # consecutive loss count
 
+    # Global risk manager overlays / bucket-level capacity
+    ctx_global_block_flag: Optional[float] = None       # 0 or 1 (global kill-switch hint)
+    risk_bucket_utilization: Optional[float] = None     # 0..1 (per-bucket usage)
+    risk_bucket_capacity_score: Optional[float] = None  # 0..1 (remaining bucket capacity)
+
     # Optional risk-profile tags from FeatureBuilder / AI
     risk_profile_conservative: Optional[float] = None   # 0 or 1
     risk_profile_balanced: Optional[float] = None       # 0 or 1
@@ -348,6 +358,12 @@ class Candidate:
     self_learn_entry_boost: Optional[float] = None      # -1..+1 (score adjustment)
     self_learn_entry_gate_offset: Optional[float] = None  # additive gate offset
     self_learn_entry_block: Optional[float] = None      # 0 or 1 (hard block hint)
+
+    # Historical / self-learning edge overlays (Phase 5–7)
+    hist_edge_score: Optional[float] = None             # 0..1 overall edge strength
+    hist_win_rate: Optional[float] = None               # 0..1 or 0..100 (%)
+    hist_rr_ratio: Optional[float] = None               # expected reward:risk ratio
+    exploration_score: Optional[float] = None           # 0..1 exploration hint
 
     # Source hint (e.g. "raydium", "pumpfun", "momo", etc.)
     source: Optional[str] = None
@@ -401,6 +417,13 @@ AI_USE_ENTRY_BLOCK_FLAG = _env_bool("AI_USE_ENTRY_BLOCK_FLAG", True)
 AI_USE_RISK_CAPACITY_GUARD = _env_bool("AI_USE_RISK_CAPACITY_GUARD", True)
 AI_MIN_RISK_CAPACITY = _env_float("AI_MIN_RISK_CAPACITY", 0.02)     # minimal room
 AI_MIN_ENTRY_TIER = _env_float("AI_MIN_ENTRY_TIER", 0.0)            # 0..3 (0 disables)
+
+# Per-bucket capacity guards (risk_manager Phase 4/5)
+AI_USE_BUCKET_CAPACITY_GUARD = _env_bool("AI_USE_BUCKET_CAPACITY_GUARD", True)
+AI_MIN_BUCKET_CAPACITY = _env_float("AI_MIN_BUCKET_CAPACITY", 0.05)  # 5% remaining capacity
+
+# Historical edge floor (from self-learning / backtests)
+AI_MIN_HIST_EDGE = _env_float("AI_MIN_HIST_EDGE", 0.0)              # 0 disables
 
 # Self-learning overrides
 AI_BUY_SELF_LEARN_ENABLED = _env_bool("AI_BUY_SELF_LEARN_ENABLED", True)
@@ -459,6 +482,7 @@ W_MCAP = _env_float("AI_W_MCAP", 0.06)            # mcap sweet-spot term
 W_AI_ENTRY = _env_float("AI_W_AI_ENTRY", 0.08)    # AI entry prob/score
 W_TIER = _env_float("AI_W_TIER", 0.05)            # tier-based quality
 W_BUY_PRESS = _env_float("AI_W_BUY_PRESS", 0.06)  # buy-pressure component
+W_HIST_EDGE = _env_float("AI_W_HIST_EDGE", 0.05)  # historical/self-learning edge
 
 # Normalization so we get a stable 0..1-ish score range even if weights change.
 _WEIGHT_SUM = (
@@ -481,6 +505,7 @@ _WEIGHT_SUM = (
     + W_AI_ENTRY
     + W_TIER
     + W_BUY_PRESS
+    + W_HIST_EDGE
 )
 AI_WEIGHT_NORM = _env_float("AI_WEIGHT_NORM", max(_WEIGHT_SUM, 1.0))
 
@@ -700,12 +725,36 @@ def _hard_filters(c: Candidate) -> Tuple[bool, List[str]]:
                 f"{AI_MIN_RISK_CAPACITY:.3f})"
             )
 
+    # Per-bucket capacity guard (optional, from risk_manager / FeatureBuilder)
+    if AI_USE_BUCKET_CAPACITY_GUARD:
+        util = _nz(c.risk_bucket_utilization, 0.0)
+        cap_score = _nz(c.risk_bucket_capacity_score, 1.0)
+        if util >= 1.0:
+            reasons.append("risk_bucket_full")
+        elif cap_score < AI_MIN_BUCKET_CAPACITY:
+            reasons.append(
+                f"risk_bucket_no_capacity({cap_score:.3f}<"
+                f"{AI_MIN_BUCKET_CAPACITY:.3f})"
+            )
+
+    # Global risk kill-switch (optional, from risk_manager)
+    if _nz(c.ctx_global_block_flag, 0.0) >= 0.5:
+        reasons.append("global_risk_block")
+
     # Entry quality floor (optional, separate from final gate)
     if AI_MIN_ENTRY_QUALITY > 0.0 and c.entry_quality_score is not None:
         if _nz(c.entry_quality_score, 0.0) < AI_MIN_ENTRY_QUALITY:
             reasons.append(
                 f"low_entry_quality({c.entry_quality_score:.3f}"
                 f"<{AI_MIN_ENTRY_QUALITY:.3f})"
+            )
+
+    # Historical edge floor (optional, driven by self-learning / backtests)
+    if AI_MIN_HIST_EDGE > 0.0:
+        he = _historical_edge_component(c)
+        if he < AI_MIN_HIST_EDGE:
+            reasons.append(
+                f"hist_edge_low({he:.3f}<{AI_MIN_HIST_EDGE:.3f})"
             )
 
     # Self-learning explicit block (if provided)
@@ -945,6 +994,36 @@ def _fraud_component(ai_fraud_score: Optional[float]) -> float:
     return _clamp(1.0 - f)
 
 
+def _historical_edge_component(c: Candidate) -> float:
+    """
+    Blend of backtested / self-learning edge metrics.
+
+    Centered around 0.5 (neutral). Values >0.5 mean historically strong edge;
+    <0.5 mean historically weak / unproven edge. This is meant to be fully
+    deterministic and sourced from data_logger + self_learning_ai_strategy.
+    """
+    # Primary signal from hist_edge_score if present
+    if c.hist_edge_score is not None:
+        h = _nz(c.hist_edge_score, 0.5)
+    else:
+        # Reconstruct from win-rate + R:R if available
+        win = _nz(c.hist_win_rate, 0.5)
+        if win > 1.5:  # allow 0..100%
+            win = win / 100.0
+        win = _clamp(win, 0.0, 1.0)
+
+        rr = _nz(c.hist_rr_ratio, 1.0)
+        # Treat ~0.8x-2.8x RR as [0,1] band, beyond that saturates
+        rr_norm = _clamp((rr - 0.8) / 2.0, 0.0, 1.0)
+
+        h = 0.65 * win + 0.35 * rr_norm
+
+    # Exploration_score can slightly tilt in favour of under-explored regions.
+    expl = _clamp(_nz(c.exploration_score, 0.5), 0.0, 1.0)
+    h = _clamp(0.9 * h + 0.1 * expl, 0.0, 1.0)
+    return h
+
+
 def _regime_ctx_component(c: Candidate) -> float:
     """
     Rich context component that blends:
@@ -1141,6 +1220,16 @@ def _size_scalar_from_candidate(c: Candidate, entry_quality: float) -> float:
         size *= (1.0 + max(cap_delta / 0.6, -1.0))  # shrink up to full if extremely negative
     elif cap_delta > 0:
         size *= (1.0 + min(cap_delta / 0.6, 0.25))  # at most +25%
+
+    # Per-bucket utilization / remaining capacity
+    util = _clamp(_nz(c.risk_bucket_utilization, 0.0), 0.0, 1.5)
+    bucket_cap = _clamp(_nz(c.risk_bucket_capacity_score, 1.0), 0.0, 1.0)
+    if util > 0.7:
+        # smoothly reduce from 1.0 at 0.7 to ~0.4 at 1.0
+        shrink = 1.0 - 0.6 * min((util - 0.7) / 0.3, 1.0)
+        size *= max(0.4, shrink)
+    # bucket_cap acts as a mild scalar (0.7..1.0 for normal ranges)
+    size *= (0.7 + 0.3 * bucket_cap)
 
     # Regime adjustment: risk-off shrinks, strong risk-on mildly boosts
     reg = _clamp(_nz(c.regime_score, _nz(c.regime_trend, 0.0)), -1.0, 1.0)
@@ -1355,6 +1444,9 @@ def score_only(c: Candidate) -> Dict[str, Any]:
     # Buy pressure from FeatureBuilder
     parts["buy_pressure"] = _buy_pressure_component(c.buy_pressure_score)
 
+    # Historical / self-learning edge component
+    parts["hist_edge"] = _historical_edge_component(c)
+
     # Weighted linear combo (then normalized / clamped)
     raw_score = (
         W_POOL_AGE * parts["pool_age"]
@@ -1376,6 +1468,7 @@ def score_only(c: Candidate) -> Dict[str, Any]:
         + W_AI_ENTRY * parts["ai_entry"]
         + W_TIER * parts["tier"]
         + W_BUY_PRESS * parts["buy_pressure"]
+        + W_HIST_EDGE * parts["hist_edge"]
     )
 
     whale_bonus = min(
@@ -1444,6 +1537,9 @@ def score_only(c: Candidate) -> Dict[str, Any]:
         "size_scalar": size_scalar,
         "entry_block_flag": _nz(c.entry_block_flag, 0.0),
         "risk_capacity": risk_capacity,
+        "risk_bucket_capacity": _clamp(_nz(c.risk_bucket_capacity_score, 1.0), 0.0, 1.0),
+        "risk_bucket_utilization": _clamp(_nz(c.risk_bucket_utilization, 0.0), 0.0, 2.0),
+        "ctx_global_block_flag": _nz(c.ctx_global_block_flag, 0.0),
         "gate_threshold": _source_gate_threshold(c.source),
         "entry_tier": _nz(c.entry_tier_bucket, 0.0),
         "position_size_tier": _nz(c.position_size_bucket, 0.0),
@@ -1510,7 +1606,8 @@ def pass_gate(c: Candidate) -> Tuple[bool, float, str]:
             f"mcap={parts['mcap']:.2f}, "
             f"tier={parts['tier']:.2f}, "
             f"ai_entry={parts['ai_entry']:.2f}, "
-            f"buy_pressure={parts['buy_pressure']:.2f})"
+            f"buy_pressure={parts['buy_pressure']:.2f}, "
+            f"hist_edge={parts['hist_edge']:.2f})"
         )
         if bool(c.infra_no_account) and _is_pump_source(c.source):
             reason += " [infra_no_account_soft_liq]"
@@ -1558,7 +1655,8 @@ def pass_gate(c: Candidate) -> Tuple[bool, float, str]:
             f"mcap={parts['mcap']:.2f}, "
             f"tier={parts['tier']:.2f}, "
             f"ai_entry={parts['ai_entry']:.2f}, "
-            f"buy_pressure={parts['buy_pressure']:.2f})"
+            f"buy_pressure={parts['buy_pressure']:.2f}, "
+            f"hist_edge={parts['hist_edge']:.2f})"
         )
         if bool(c.infra_no_account) and _is_pump_source(c.source):
             reason += " [infra_no_account_soft_liq]"
@@ -1700,16 +1798,20 @@ def from_pool_snapshot(d: Dict[str, Any]) -> Candidate:
         regime_manipulation_risk=d.get("regime_manipulation_risk"),
         regime_score=d.get("regime_score") or d.get("regime_numeric"),
         regime_volatility=d.get("regime_volatility"),
-        ctx_open_positions=d.get("ctx_open_positions"),
-        ctx_max_positions=d.get("ctx_max_positions"),
-        ctx_daily_drawdown_pct=d.get("ctx_daily_drawdown_pct"),
-        ctx_daily_pnl_pct=d.get("ctx_daily_pnl_pct"),
-        ctx_risk_mode=d.get("ctx_risk_mode"),
-        ctx_exposure_frac=d.get("ctx_exposure_frac"),
-        ctx_exposure_usd=d.get("ctx_exposure_usd"),
-        ctx_win_rate_pct=d.get("ctx_win_rate_pct"),
-        ctx_recent_loss_streak=d.get("ctx_recent_loss_streak"),
-        risk_profile_conservative=d.get("risk_profile_conservative"),
+                   ctx_open_positions=d.get("ctx_open_positions"),
+                   ctx_max_positions=d.get("ctx_max_positions"),
+                   ctx_daily_drawdown_pct=d.get("ctx_daily_drawdown_pct"),
+                   ctx_daily_pnl_pct=d.get("ctx_daily_pnl_pct"),
+                   ctx_risk_mode=d.get("ctx_risk_mode"),
+                   ctx_exposure_frac=d.get("ctx_exposure_frac"),
+                   ctx_exposure_usd=d.get("ctx_exposure_usd"),
+                   ctx_win_rate_pct=d.get("ctx_win_rate_pct"),
+                   ctx_recent_loss_streak=d.get("ctx_recent_loss_streak"),
+                   ctx_global_block_flag=d.get("ctx_global_block_flag")
+                   or d.get("global_entry_block_flag"),
+                   risk_bucket_utilization=d.get("risk_bucket_utilization"),
+                   risk_bucket_capacity_score=d.get("risk_bucket_capacity_score"),
+                   risk_profile_conservative=d.get("risk_profile_conservative"),
         risk_profile_balanced=d.get("risk_profile_balanced"),
         risk_profile_aggressive=d.get("risk_profile_aggressive"),
         ai_capacity_delta=d.get("ai_capacity_delta"),
@@ -1718,6 +1820,10 @@ def from_pool_snapshot(d: Dict[str, Any]) -> Candidate:
         self_learn_entry_boost=d.get("self_learn_entry_boost"),
         self_learn_entry_gate_offset=d.get("self_learn_entry_gate_offset"),
         self_learn_entry_block=d.get("self_learn_entry_block"),
+        hist_edge_score=d.get("hist_edge_score"),
+        hist_win_rate=d.get("hist_win_rate"),
+        hist_rr_ratio=d.get("hist_rr_ratio") or d.get("hist_rr"),
+        exploration_score=d.get("exploration_score") or d.get("explore_score"),
         source=d.get("source"),
         meta=meta,
         infra_no_account=d.get("infra_no_account"),
@@ -1831,19 +1937,23 @@ def from_feature_vector(feats: Dict[str, Any]) -> Candidate:
         regime_manipulation_risk=feats.get("regime_manipulation_risk"),
         regime_score=feats.get("regime_score") or feats.get("regime_numeric"),
         regime_volatility=feats.get("regime_volatility"),
-        ctx_open_positions=feats.get("ctx_open_positions"),
-        ctx_max_positions=feats.get("ctx_max_positions"),
-        ctx_daily_drawdown_pct=feats.get("ctx_daily_drawdown_pct"),
-        ctx_daily_pnl_pct=feats.get("ctx_daily_realized_pnl_pct")
-        or feats.get("ctx_daily_pnl_pct"),
-        ctx_risk_mode=feats.get("ctx_risk_mode"),
-        ctx_exposure_frac=feats.get("ctx_exposure_frac"),
-        ctx_exposure_usd=feats.get("ctx_exposure_usd"),
-        ctx_win_rate_pct=feats.get("risk_win_rate_pct")
-        or feats.get("ctx_win_rate_pct"),
-        ctx_recent_loss_streak=feats.get("risk_loss_streak")
-        or feats.get("ctx_recent_loss_streak"),
-        risk_profile_conservative=feats.get("risk_profile_conservative"),
+                   ctx_open_positions=feats.get("ctx_open_positions"),
+                   ctx_max_positions=feats.get("ctx_max_positions"),
+                   ctx_daily_drawdown_pct=feats.get("ctx_daily_drawdown_pct"),
+                   ctx_daily_pnl_pct=feats.get("ctx_daily_realized_pnl_pct")
+                   or feats.get("ctx_daily_pnl_pct"),
+                   ctx_risk_mode=feats.get("ctx_risk_mode"),
+                   ctx_exposure_frac=feats.get("ctx_exposure_frac"),
+                   ctx_exposure_usd=feats.get("ctx_exposure_usd"),
+                   ctx_win_rate_pct=feats.get("risk_win_rate_pct")
+                   or feats.get("ctx_win_rate_pct"),
+                   ctx_recent_loss_streak=feats.get("risk_loss_streak")
+                   or feats.get("ctx_recent_loss_streak"),
+                   ctx_global_block_flag=feats.get("ctx_global_block_flag")
+                   or feats.get("global_entry_block_flag"),
+                   risk_bucket_utilization=feats.get("risk_bucket_utilization"),
+                   risk_bucket_capacity_score=feats.get("risk_bucket_capacity_score"),
+                   risk_profile_conservative=feats.get("risk_profile_conservative"),
         risk_profile_balanced=feats.get("risk_profile_balanced"),
         risk_profile_aggressive=feats.get("risk_profile_aggressive"),
         ai_capacity_delta=feats.get("ai_capacity_delta"),
@@ -1852,6 +1962,11 @@ def from_feature_vector(feats: Dict[str, Any]) -> Candidate:
         self_learn_entry_boost=feats.get("self_learn_entry_boost"),
         self_learn_entry_gate_offset=feats.get("self_learn_entry_gate_offset"),
         self_learn_entry_block=feats.get("self_learn_entry_block"),
+        hist_edge_score=feats.get("hist_edge_score"),
+        hist_win_rate=feats.get("hist_win_rate") or feats.get("sl_hist_win_rate"),
+        hist_rr_ratio=feats.get("hist_rr_ratio") or feats.get("sl_hist_rr"),
+        exploration_score=feats.get("exploration_score")
+        or feats.get("sl_exploration_score"),
         source=feats.get("scanner_source") or feats.get("source"),
         meta=meta,
         infra_no_account=feats.get("infra_no_account"),

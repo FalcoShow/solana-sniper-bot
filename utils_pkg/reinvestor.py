@@ -1,57 +1,88 @@
+# utils_pkg/reinvestor.py
 from __future__ import annotations
 
 """
 utils_pkg/reinvestor.py
 
-Quant-grade reinvestment engine (V3+++)
-======================================
+God-tier reinvestment flywheel (V4 / V3+++ / Phase 6–7)
+=======================================================
 
-High-level role
----------------
-Decides what to do with *realized proceeds in SOL* after a winning (or partial)
-exit:
+Role
+----
+Turns *realized SOL profits* into a compounding engine that is:
 
-    • How much to send to savings
-    • How much (if any) to recycle into new entries
-    • When to skip reinvestment entirely and just bank profits
+  • Risk-aware        → respects global risk capacity, DD, trade caps & equity
+  • Strategy-aware    → follows self-learning plan, Kelly, equity curve
+  • Regime-aware      → scales aggressiveness by market regime & stress
+  • Tail-risk-aware   → leans harder to savings when tail risk is elevated
+  • Budget-aware      → respects spend budgets from risk_manager (if provided)
+  • AI-aware          → uses AI capacity signals & edge quality
+  • Infra-aware       → doesn’t push size when RPC/JUP infra is unhealthy
+  • Mode-aware        → snowball / balanced / harvest / repair / off
+  • Self-learning     → journals decisions & results back into the strategy brain
+  • Analytics-first   → exposes preview/explain endpoints for dashboards/backtests
 
-Design goals
-------------
-    • Fully *risk-aware*:
-        - Pulls global risk context from utils_pkg.risk_manager:
-            » risk_capacity / risk_mode / risk_mode_override
-            » daily PnL / rolling DD / equity
-            » regime label / stress / signal / entry_gate_factor
-            » Kelly diagnostics, AI capacity delta, halt_reason
-            » daily_trades caps, sandbox_mode, etc.
+Core behaviour
+--------------
+Given realized proceeds in SOL:
 
-    • Fully *strategy-aware*:
-        - Pulls knobs + performance from utils_pkg.self_learning_ai_strategy:
-            » REINVEST_PERCENT, MAX_RISK_PER_TRADE, STRAT_MODE, HARD_HALT
-            » Plan status/gap, APR target, perf snapshot, Sharpe-like stats
-            » Kelly suggestion / confidence for position sizing
+    1) Enforce global guards:
+         - min profit (SOL / USD)
+         - daily DD / PnL locks
+         - equity floor (env + risk_manager flags)
+         - daily reinvest count caps
+         - min minutes between reinvests
+         - risk_manager.should_allow_new_entry + mode/capacity
+         - spend budget from risk_manager (if present)
+         - infra_guard blocks (halt/degrade)
+         - tail-risk hard gate (optional)
+         - capital mode → “off / repair / harvest / balanced / snowball”
+         - optional risk tags from risk_manager: e.g. "halt_all", "reinvestor_off"
 
-    • Infra-aware:
-        - Reads infra health from utils_pkg.infra_guard:
-            » infra_health_score / infra_rpc_latency_ms / infra_jup_latency_ms
-            » infra_state flags (healthy/degraded/halted)
-            » optional gating via REINVEST_INFRA_MIN_HEALTH / infra_block flags
+    2) Build a ReinvestContext from:
+         - risk_manager.risk_capacity_snapshot(...)
+         - self_learning_ai_strategy.get_strategy_params / get_perf_snapshot
+         - infra_guard.infra_features(...)
+         - plan / Kelly / regime / AI capacity snapshot
+         - spend budget / equity floor flags (if risk_manager exposes them)
 
-    • Self-learning feedback loop:
-        - note_reinvest_decision(...) BEFORE executing
-        - note_reinvest_result(...) AFTER success/fail
-        - note_reinvest_skipped(...) for gated / skipped cases
+    3) Compute effective reinvest % (eff_pct) via scaling stack:
+           base REINVEST_PERCENT (from strategy brain / risk_manager)
+         × capacity_scale(risk_capacity, risk_mode, STRAT_MODE)
+         × dd_scale(daily DD band)
+         × kelly_scale(Kelly suggestion + confidence)
+         × plan_scale(plan_gap / status)
+         × regime_scale(regime label/stress/signal/gate)
+         × ai_scale(ai_capacity_delta)
+         × perf_scale(winrate + Sharpe-like)
+         × profile_scale(meta.profile/bucket)
+         × mode_scale(capital mode: snowball/harvest/repair/off)
+         × infra_scale(infra health / halted / degraded)
+         × tail_scale(tail_risk_score from risk_manager, if present)
 
-    • Smart target selection:
-        0) meta["force_token_mint"]       → absolute override (same token / backtests)
-        1) utils_pkg.smart_wallets.pick_reinvestment_target (whales / AI alpha)
-        2) legacy find_reinvestment_token scanner (volume + honeypot filtering)
+    4) Apply:
+         - ALWAYS savings skim (%)
+         - meta overrides (force_eff_pct, min/max_eff_pct)
+         - global clamps (REINVEST_MIN_EFF_PCT / REINVEST_MAX_EFF_PCT)
+         - equity-based caps (MAX_RISK_PER_TRADE * equity)
+         - USD caps (REINVEST_MAX_SINGLE_USD)
+         - optional budget fraction gate vs spend_remaining_usd
 
-    • Execution:
-        - Buys executed via Jupiter router (swap_token_jupiter)
-        - Positions persisted via positions.save_position
-        - Risk budget accounted via risk_manager.note_spend
-        - Structured logs → utils_pkg.data_logger.log_event + Notion + Telegram
+    5) Split:
+         • savings_sol  = proceeds_sol - reinvest_sol
+         • reinvest_sol = proceeds_sol * eff_pct
+
+       Send savings to savings wallet (best-effort),
+       pick reinvest mint via:
+         0) meta["force_token_mint"] / ["target_mint"] override
+         1) smart_wallets.pick_reinvestment_target(...)
+         2) legacy find_reinvestment_token(...)
+
+    6) Execute buy via Jupiter router, persist position, journal to:
+         • self_learning_ai_strategy (note_reinvest_decision / result / skipped)
+         • Notion (log_to_notion)
+         • data_logger (log_event)
+         • Telegram alert
 
 Public API
 ----------
@@ -86,7 +117,7 @@ Public API
         meta: dict | None = None,
         redis=None,
     ) -> dict | None
-        → Human-friendly explanation for dashboards / CLI.
+
 
 Meta fields
 -----------
@@ -96,19 +127,18 @@ meta can optionally contain:
     • sandbox: bool                     → force sandbox/dry-run behaviour
     • force_eff_pct: float              → override effective reinvest % (0–100)
     • min_eff_pct / max_eff_pct: float  → local clamps on eff %
-    • force_token_mint: str             → reinvest into a specific token
+    • force_token_mint: str             → reinvest into a specific token mint
     • ignore_health_gate: bool          → allow even if health score is low
-    • ignore_time_gate: bool            → bypass "minutes between reinvests" gate
+    • ignore_time_gate: bool            → bypass min-minutes-between-reinvests
     • ignore_infra_gate: bool           → bypass infra health gates
     • force_reinvest_even_if_risk_blocked: bool
-        - For *backtests / simulations only*:
-          let reinvest proceed even if should_allow_new_entry() == False
-          (still respects deep DD, HARD_HALT, etc.)
+        - *For backtests / simulations only*: allow reinvest even if
+          should_allow_new_entry() == False (still respects DD hard stops, etc.)
+    • mode / reinvest_mode: str         → per-job capital mode override
 
     • tag: str                          → source tag for position payload / logs
     • profile / bucket / reinvest_profile: str
         - "core", "growth", "explore", "defensive", "degen" etc.
-        - used to nudge aggressiveness up/down
     • origin_trade_id / origin_position_id: str
     • cycle_id / strategy_version / debug tags: any extra labels for self-learning
 """
@@ -141,7 +171,7 @@ from utils_pkg.core_utils import (
     redis as shared_redis,
 )
 
-# Infra health (RPC / JUP) — may be missing in older setups
+# Infra health (RPC / JUP) — may be absent in older setups
 try:
     from utils_pkg.infra_guard import (
         infra_features,
@@ -150,7 +180,7 @@ try:
 except Exception:  # pragma: no cover
 
     async def infra_features(redis=None) -> Dict[str, float]:
-        # Conservative "OK-ish" default if infra_guard is not present
+        # Conservative "OK-ish" default if infra_guard not installed
         return {
             "infra_rpc_latency_ms": 0.0,
             "infra_jup_latency_ms": 0.0,
@@ -251,6 +281,13 @@ except Exception:  # pragma: no cover
             "kelly_raw": 0.0,
             "kelly_pos_pct_cap": 0.0,
             "equity_override_usd": 0.0,
+            "tail_risk_score": 0.0,
+            "daily_spend_remaining_usd": 1e12,
+            "spend_budget_block": False,
+            "equity_floor_usd": 0.0,
+            "equity_below_floor": False,
+            # optional tags for higher-level control
+            "risk_tags": [],
         }
 
     async def should_allow_new_entry(_redis=None) -> bool:
@@ -274,7 +311,7 @@ except Exception:  # pragma: no cover
 
     def save_position(mint: str, data: Dict[str, Any]) -> None:
         """
-        Simple JSON-file fallback; prod uses DB-backed positions.
+        Simple JSON-file fallback; prod should use DB-backed positions.
         """
         os.makedirs("data", exist_ok=True)
         path = os.path.join("data", "positions.json")
@@ -363,9 +400,17 @@ SAVINGS_WALLET = os.getenv("SAVINGS_WALLET") or os.getenv("SAVINGS_WALLET_ADDRES
 REINVEST_MIN_CAPACITY = float(os.getenv("REINVEST_MIN_CAPACITY", "0.15"))
 REINVEST_DEFENSIVE_CAPACITY = float(os.getenv("REINVEST_DEF_CAPACITY", "0.40"))
 REINVEST_MAX_EFF_PCT = float(os.getenv("REINVEST_MAX_EFF_PCT", "95.0"))
+# Global lower bound for eff % (0 = allow full shrink)
+REINVEST_MIN_EFF_PCT = float(os.getenv("REINVEST_MIN_EFF_PCT", "0.0"))
 
 # Hard-cap the USD size of any single reinvestment (0 = off)
 REINVEST_MAX_SINGLE_USD = float(os.getenv("REINVEST_MAX_SINGLE_USD", "0"))
+
+# Optional: max fraction of *remaining* daily budget any single reinvest
+# is allowed to consume. 0 = disabled.
+REINVEST_MAX_BUDGET_FRACTION = float(
+    os.getenv("REINVEST_MAX_BUDGET_FRACTION", "0.0")
+)
 
 # Daily drawdown soft / hard stops (magnitudes in %)
 REINVEST_DD_HARD_STOP_PCT = float(
@@ -414,9 +459,6 @@ REINVEST_HEALTH_MIN_RECENT_WINRATE = float(
 REINVEST_HEALTH_MIN_SHARPE = float(
     os.getenv("REINVEST_HEALTH_MIN_SHARPE", "-0.2")
 )
-REINVEST_HEALTH_MAX_DD = float(
-    os.getenv("REINVEST_HEALTH_MAX_DD", "25.0")
-)
 
 # Aggregate health score gate (0–100, 0 = disabled)
 REINVEST_HEALTH_MIN_SCORE = float(
@@ -449,6 +491,17 @@ REINVEST_MAX_REINVESTS_PER_DAY = int(
 REINVEST_MIN_MINUTES_BETWEEN_REINVESTS = float(
     os.getenv("REINVEST_MIN_MINUTES_BETWEEN_REINVESTS", "0.0")
 )
+
+# Tail-risk scaling thresholds for the new tail_scale
+# tail_risk_score is assumed in [0,1]; higher = more tail risk.
+REINVEST_TAIL_RISK_SOFT = float(os.getenv("REINVEST_TAIL_RISK_SOFT", "0.60"))
+REINVEST_TAIL_RISK_HARD = float(os.getenv("REINVEST_TAIL_RISK_HARD", "0.85"))
+
+# Optional hard gate: if tail_risk_score >= this, route 100% to savings (0 = disabled)
+REINVEST_TAIL_RISK_GATE = float(os.getenv("REINVEST_TAIL_RISK_GATE", "0.0"))
+
+# Capital mode: snowball / balanced / harvest / repair / off / ...
+REINVEST_MODE = os.getenv("REINVEST_MODE", "balanced").strip().lower()
 
 # ============================================================================ #
 # Dataclasses / context
@@ -506,6 +559,15 @@ class ReinvestContext:
     sharpe_like: float
     recent_sharpe_like: float
 
+    # Tail risk (optional, 0..1; higher = more tail risk)
+    tail_risk_score: float
+
+    # Budget / equity floor (optional, from risk_manager)
+    spend_remaining_usd: float
+    spend_budget_block: bool
+    equity_floor_usd: float
+    equity_below_floor: bool
+
     # Infra / infra_guard
     infra_health_score: float
     infra_rpc_latency_ms: float
@@ -538,7 +600,9 @@ class ReinvestScales:
     ai_scale: float
     perf_scale: float
     profile_scale: float
+    mode_scale: float
     infra_scale: float
+    tail_scale: float  # tail-risk scaling factor
 
     @property
     def eff_pct(self) -> float:
@@ -552,7 +616,9 @@ class ReinvestScales:
             * self.ai_scale
             * self.perf_scale
             * self.profile_scale
+            * self.mode_scale
             * self.infra_scale
+            * self.tail_scale
         )
 
     def as_dict(self) -> Dict[str, float]:
@@ -566,7 +632,9 @@ class ReinvestScales:
             "ai_scale": self.ai_scale,
             "perf_scale": self.perf_scale,
             "profile_scale": self.profile_scale,
+            "mode_scale": self.mode_scale,
             "infra_scale": self.infra_scale,
+            "tail_scale": self.tail_scale,
             "eff_pct": self.eff_pct,
         }
 
@@ -798,7 +866,15 @@ async def _build_context(
     meta = meta or {}
 
     # Risk context snapshot (risk_manager.risk_capacity_snapshot)
-    risk_ctx = await risk_capacity_snapshot(redis)
+    try:
+        # Newer risk_manager may support a `source` kwarg for analytics / logging
+        risk_ctx = await risk_capacity_snapshot(redis, source="reinvestor")  # type: ignore[arg-type]
+    except TypeError:
+        # Backwards compat with older signature
+        try:
+            risk_ctx = await risk_capacity_snapshot(redis)
+        except TypeError:
+            risk_ctx = await risk_capacity_snapshot()
 
     # Robust field extraction with sane fallbacks
     risk_capacity = float(risk_ctx.get("risk_capacity", 1.0))
@@ -806,8 +882,19 @@ async def _build_context(
     risk_mode_override = risk_ctx.get("risk_mode_override")
     halt_reason = risk_ctx.get("halt_reason")
 
-    daily_pnl_pct = float(risk_ctx.get("daily_realized_pnl_pct", 0.0))
-    daily_dd_pct = float(risk_ctx.get("daily_drawdown_pct", 0.0))
+    daily_pnl_pct = float(
+        risk_ctx.get("daily_realized_pnl_pct")
+        or risk_ctx.get("pnl_day_pct")
+        or 0.0
+    )
+
+    daily_dd_pct = float(
+        risk_ctx.get("daily_drawdown_pct")
+        or risk_ctx.get("daily_dd_pct")
+        or risk_ctx.get("rolling_dd_pct")
+        or 0.0
+    )
+
     equity_usd = float(risk_ctx.get("equity_usd", 0.0))
 
     sandbox_mode = bool(risk_ctx.get("sandbox_mode", False))
@@ -828,6 +915,15 @@ async def _build_context(
         risk_ctx.get("regime_risk_multiplier", 1.0)
     )
 
+    # Tail risk / budgets / floors from risk_manager (optional)
+    tail_risk_score = float(risk_ctx.get("tail_risk_score", 0.0) or 0.0)
+    spend_remaining_usd = float(
+        risk_ctx.get("daily_spend_remaining_usd", 1e12) or 1e12
+    )
+    spend_budget_block = bool(risk_ctx.get("spend_budget_block", False))
+    equity_floor_usd = float(risk_ctx.get("equity_floor_usd", 0.0) or 0.0)
+    equity_below_floor = bool(risk_ctx.get("equity_below_floor", False))
+
     # Derive equity_sol if possible (for max_risk_per_trade cap)
     try:
         sol_usd = await convert_sol_to_usd_amount(1.0)
@@ -839,7 +935,11 @@ async def _build_context(
     params = await get_strategy_params(redis)
     perf = await get_perf_snapshot(redis)
 
-    base_reinvest_pct = float(params.get("REINVEST_PERCENT", 75.0))
+    # Base reinvest % can come from brain or risk layer override
+    base_reinvest_pct = float(
+        risk_ctx.get("reinvest_base_pct")
+        or params.get("REINVEST_PERCENT", 75.0)
+    )
     stop_loss_percent = float(params.get("STOP_LOSS_PERCENT", 18.0))
     slippage = float(params.get("SLIPPAGE", 0.005))
     min_sol_balance = float(
@@ -935,6 +1035,11 @@ async def _build_context(
         pnl_std=pnl_std,
         sharpe_like=sharpe_like,
         recent_sharpe_like=recent_sharpe_like,
+        tail_risk_score=tail_risk_score,
+        spend_remaining_usd=spend_remaining_usd,
+        spend_budget_block=spend_budget_block,
+        equity_floor_usd=equity_floor_usd,
+        equity_below_floor=equity_below_floor,
         infra_health_score=infra_health_score,
         infra_rpc_latency_ms=infra_rpc_latency_ms,
         infra_jup_latency_ms=infra_jup_latency_ms,
@@ -962,22 +1067,36 @@ def _compute_health_score(ctx: ReinvestContext) -> float:
         • risk capacity (how much room is left)
         • Sharpe-like risk-adjusted returns
         • infra health (RPC / JUP quality)
+        • tail risk (if risk_manager exposes tail_risk_score ∈ [0,1])
 
-    This is used both for:
-        • diagnostics / dashboards
-        • optional gating via REINVEST_HEALTH_MIN_SCORE
+    If risk_manager already computed a global / reinvestor health_score, re-use it.
     """
+
+    # If risk_manager exposes a pre-computed health score, prefer that
+    try:
+        pre = ctx.risk_ctx_raw.get("reinvest_health_score") or ctx.risk_ctx_raw.get(
+            "global_health_score"
+        )
+        if isinstance(pre, (int, float)) and pre >= 0:
+            return float(pre)
+    except Exception:
+        pass
+
     # Winrate: clamp to [0, 1] then map [0.30..0.70] → [0..1]
     wr = max(0.0, min(1.0, ctx.win_rate))
     wr_score = max(0.0, min(1.0, (wr - 0.30) / (0.70 - 0.30))) * 100.0
 
     # Drawdown: 0% DD == 1, ≥ REINVEST_HEALTH_MAX_DD == 0
     dd = max(0.0, ctx.daily_dd_pct)
+    # use env max DD as in soft/hard band; default 25% if not overridden
+    max_dd_for_score = max(
+        REINVEST_DD_HARD_STOP_PCT, REINVEST_DD_SOFT_STOP_PCT, 25.0
+    )
     dd_score = 100.0
-    if REINVEST_HEALTH_MAX_DD > 0:
+    if max_dd_for_score > 0:
         dd_norm = max(
             0.0,
-            1.0 - min(dd, REINVEST_HEALTH_MAX_DD) / REINVEST_HEALTH_MAX_DD,
+            1.0 - min(dd, max_dd_for_score) / max_dd_for_score,
         )
         dd_score = dd_norm * 100.0
 
@@ -995,13 +1114,28 @@ def _compute_health_score(ctx: ReinvestContext) -> float:
     # Infra health: already in [0,1]
     infra_score = max(0.0, min(1.0, ctx.infra_health_score)) * 100.0
 
-    # Blend: slightly more weight on winrate, DD, and capacity; Sharpe + infra as tie-breakers.
+    # Tail risk: if tail_risk_score not present, treat as no penalty (score=100)
+    tail_raw = getattr(ctx, "tail_risk_score", None)
+    if tail_raw is None:
+        tail_score = 100.0
+    else:
+        try:
+            t = float(tail_raw)
+        except Exception:
+            t = 0.0
+        t = max(0.0, min(1.0, t))
+        # High tail risk → lower score. t=0 → 100, t=1 → 0
+        tail_score = (1.0 - t) * 100.0
+
+    # Blend: slightly more weight on winrate, DD, capacity; Sharpe + infra + tail as
+    # tie-breakers / stability controls.
     health_score = float(
-        0.32 * wr_score
-        + 0.22 * dd_score
-        + 0.22 * cap_score
-        + 0.12 * sharpe_score
-        + 0.12 * infra_score
+        0.28 * wr_score
+        + 0.20 * dd_score
+        + 0.20 * cap_score
+        + 0.10 * sharpe_score
+        + 0.10 * infra_score
+        + 0.12 * tail_score
     )
     return health_score
 
@@ -1066,6 +1200,13 @@ async def _update_reinvest_health(
             "infra_state_is_degraded": ctx.infra_state_is_degraded,
             "infra_state_is_halted": ctx.infra_state_is_halted,
             "infra_stability_score": ctx.infra_stability_score,
+            "tail_risk_score": getattr(
+                ctx, "tail_risk_score", ctx.risk_ctx_raw.get("tail_risk_score", 0.0)
+            ),
+            "spend_remaining_usd": getattr(ctx, "spend_remaining_usd", None),
+            "spend_budget_block": getattr(ctx, "spend_budget_block", False),
+            "equity_floor_usd": getattr(ctx, "equity_floor_usd", 0.0),
+            "equity_below_floor": getattr(ctx, "equity_below_floor", False),
             "health_score": health_score,
         }
 
@@ -1288,6 +1429,63 @@ def _profile_scale(meta: Dict[str, Any]) -> float:
     return max(0.5, min(1.2, scale))
 
 
+def _mode_scale(ctx: ReinvestContext) -> float:
+    """
+    Capital mode scaling layer on top of everything else.
+
+    Mode resolution priority:
+        1) meta["mode"] / meta["reinvest_mode"]
+        2) risk_ctx["reinvest_mode"] / risk_ctx["capital_mode"]
+        3) env REINVEST_MODE (default "balanced")
+
+    Modes (suggested semantics, but backward-compatible):
+        • "off", "savings_only"      →  very low reinvest (0x..0.1x)
+        • "repair", "rebuild"        →  shrink heavily, prioritise savings
+        • "harvest", "cashout"       →  moderate shrink vs balanced
+        • "balanced", "default"      →  neutral (1.0x)
+        • "snowball", "growth", "hyper" → mild boost (max ~1.12x)
+    """
+    # 1) meta override
+    meta = ctx.meta or {}
+    raw = meta.get("mode") or meta.get("reinvest_mode")
+
+    # 2) risk_manager hint
+    if not raw:
+        raw = (
+            ctx.risk_ctx_raw.get("reinvest_mode")
+            or ctx.risk_ctx_raw.get("capital_mode")
+        )
+
+    # 3) env fallback
+    if not raw:
+        raw = REINVEST_MODE
+
+    try:
+        mode = str(raw).strip().lower()
+    except Exception:
+        mode = "balanced"
+
+    # Default neutral
+    scale = 1.0
+
+    if mode in ("off", "savings_only", "halt", "park"):
+        # Effectively turn off reinvest, but keep logic paths the same.
+        scale = 0.05
+    elif mode in ("repair", "rebuild", "recover", "capital_preserve"):
+        scale = 0.4
+    elif mode in ("harvest", "cashout", "skim"):
+        scale = 0.6
+    elif mode in ("balanced", "default", "normal"):
+        scale = 1.0
+    elif mode in ("snowball", "growth", "hyper", "aggressive_compound"):
+        scale = 1.12
+    else:
+        # Unknown modes default to neutral-ish
+        scale = 1.0
+
+    return max(0.0, min(1.25, scale))
+
+
 def _infra_scale(ctx: ReinvestContext) -> float:
     """
     Infra-based scaling:
@@ -1312,6 +1510,46 @@ def _infra_scale(ctx: ReinvestContext) -> float:
     return 1.0
 
 
+def _tail_risk_scale(ctx: ReinvestContext) -> float:
+    """
+    Tail-risk scaling:
+        Uses ctx.tail_risk_score (0..1, higher = more tail risk)
+        if provided by risk_manager. If not present, returns 1.0 (no change).
+
+        • Below ~0.2 → slight boost (comfy environment)
+        • Between SOFT/HARD thresholds → linear shrink
+        • Above HARD → aggressive shrink to protect capital
+    """
+    raw = getattr(ctx, "tail_risk_score", None)
+    if raw is None:
+        return 1.0
+    try:
+        t = float(raw)
+    except Exception:
+        return 1.0
+
+    t = max(0.0, min(1.0, t))
+    soft = max(0.0, min(1.0, REINVEST_TAIL_RISK_SOFT))
+    hard = max(soft, min(1.0, REINVEST_TAIL_RISK_HARD))
+
+    # Very low tail risk → tiny boost
+    if t <= 0.2:
+        return 1.05
+
+    # Very high tail risk → strong shrink
+    if t >= hard:
+        return 0.5
+
+    # Mid band [soft, hard): smooth decay from 1.0 → 0.7
+    if t >= soft:
+        span = max(hard - soft, 1e-6)
+        frac = (t - soft) / span
+        return max(0.7, 1.0 - 0.3 * frac)
+
+    # Between 0.2 and soft, small neutral/slightly negative tilt
+    return 0.95
+
+
 def _compute_scales(ctx: ReinvestContext) -> ReinvestScales:
     """
     Compute all the scaling factors and return a ReinvestScales object so we can
@@ -1325,7 +1563,9 @@ def _compute_scales(ctx: ReinvestContext) -> ReinvestScales:
     ai_scale = _ai_capacity_scale(ctx)
     perf_scale = _perf_scale(ctx)
     profile_scale = _profile_scale(ctx.meta)
+    mode_scale = _mode_scale(ctx)
     infra_scale = _infra_scale(ctx)
+    tail_scale = _tail_risk_scale(ctx)
 
     return ReinvestScales(
         base_pct=ctx.base_reinvest_pct,
@@ -1337,31 +1577,32 @@ def _compute_scales(ctx: ReinvestContext) -> ReinvestScales:
         ai_scale=ai_scale,
         perf_scale=perf_scale,
         profile_scale=profile_scale,
+        mode_scale=mode_scale,
         infra_scale=infra_scale,
+        tail_scale=tail_scale,
     )
 
 
 def _apply_meta_eff_overrides(eff_pct: float, meta: Dict[str, Any]) -> float:
     """
-    Apply meta-based clamps (min/max) and hard override (force_eff_pct).
+    Apply meta-based clamps (min/max) and hard override (force_eff_pct)
+    + global REINVEST_MIN_EFF_PCT / REINVEST_MAX_EFF_PCT bounds.
     """
     # Hard override wins (for backtests / experiments)
     if "force_eff_pct" in meta:
         try:
             forced = float(meta["force_eff_pct"])
-            return max(0.0, min(REINVEST_MAX_EFF_PCT, forced))
+            return max(REINVEST_MIN_EFF_PCT, min(REINVEST_MAX_EFF_PCT, forced))
         except Exception:
             pass
 
-    min_eff = float(meta.get("min_eff_pct", 0.0) or 0.0)
-    max_eff_local = float(meta.get("max_eff_pct", REINVEST_MAX_EFF_PCT) or 0.0)
+    # Local meta min/max, falling back to global bounds
+    min_eff = float(meta.get("min_eff_pct", REINVEST_MIN_EFF_PCT) or REINVEST_MIN_EFF_PCT)
+    max_eff_local = float(meta.get("max_eff_pct", REINVEST_MAX_EFF_PCT) or REINVEST_MAX_EFF_PCT)
 
+    # clamp in correct order
     eff_pct = max(min_eff, eff_pct)
-    eff_pct = min(
-        REINVEST_MAX_EFF_PCT,
-        max_eff_local or REINVEST_MAX_EFF_PCT,
-        eff_pct,
-    )
+    eff_pct = min(REINVEST_MAX_EFF_PCT, max_eff_local, eff_pct)
     return max(0.0, eff_pct)
 
 
@@ -1408,6 +1649,12 @@ async def _journal_skip(
             "infra_health_score": getattr(ctx, "infra_health_score", 1.0),
             "infra_state_is_halted": getattr(ctx, "infra_state_is_halted", 0.0),
             "infra_state_is_degraded": getattr(ctx, "infra_state_is_degraded", 0.0),
+            "tail_risk_score": getattr(
+                ctx, "tail_risk_score", ctx.risk_ctx_raw.get("tail_risk_score", 0.0)
+            ),
+            "spend_remaining_usd": getattr(ctx, "spend_remaining_usd", None),
+            "spend_budget_block": getattr(ctx, "spend_budget_block", False),
+            "risk_tags": ctx.risk_ctx_raw.get("risk_tags", []),
         }
 
     try:
@@ -1587,11 +1834,26 @@ async def reinvest(
     strat_mode = ctx.strat_mode
     hard_halt = ctx.hard_halt
 
+    tail_risk_score = getattr(ctx, "tail_risk_score", 0.0)
+    spend_remaining_usd = getattr(ctx, "spend_remaining_usd", float("inf"))
+    spend_budget_block = bool(getattr(ctx, "spend_budget_block", False))
+    equity_floor_usd = getattr(ctx, "equity_floor_usd", 0.0)
+    equity_below_floor = bool(getattr(ctx, "equity_below_floor", False))
+
     regime_label = ctx.regime_label_numeric
     regime_stress = ctx.regime_stress_score
     regime_signal = ctx.regime_signal_strength
     regime_gate = ctx.regime_entry_gate_factor
     ai_capacity_delta = ctx.risk_ctx_raw.get("ai_capacity_delta", 0.0)
+
+    # Risk tags from risk_manager (optional, for higher-level control)
+    risk_tags_raw = ctx.risk_ctx_raw.get("risk_tags", [])
+    if isinstance(risk_tags_raw, str):
+        risk_tags = [risk_tags_raw]
+    elif isinstance(risk_tags_raw, (list, tuple, set)):
+        risk_tags = [str(x) for x in risk_tags_raw]
+    else:
+        risk_tags = []
 
     # Daily trades cap from risk layer
     daily_trades_count = ctx.daily_trades_count
@@ -1607,8 +1869,26 @@ async def reinvest(
         logger.info("[REINVEST] sandbox_mode=1 from risk_ctx; forcing dry_run.")
         meta["dry_run"] = True
 
-    # Optional equity floor: if account is very small, focus on rebuilding balance
-    if REINVEST_MIN_EQUITY_SOL > 0 and equity_sol > 0 and equity_sol < REINVEST_MIN_EQUITY_SOL:
+    # Optional equity floor from risk_manager: if flagged, route straight to savings
+    if equity_below_floor and not meta.get("ignore_health_gate"):
+        logger.info(
+            "[REINVEST] equity_below_floor flag from risk_manager "
+            "(floor_usd=%.2f); routing %.6f SOL to savings.",
+            equity_floor_usd,
+            proceeds_sol,
+        )
+        await _journal_skip(
+            "equity_below_floor_flag", proceeds_sol, ctx, meta, redis=redis
+        )
+        await _send_to_savings(proceeds_sol)
+        return None
+
+    # Optional equity floor (env-level): if account is very small, focus on rebuilding
+    if (
+        REINVEST_MIN_EQUITY_SOL > 0
+        and equity_sol > 0
+        and equity_sol < REINVEST_MIN_EQUITY_SOL
+    ):
         logger.info(
             "[REINVEST] Equity %.4f SOL below REINVEST_MIN_EQUITY_SOL %.4f; "
             "routing %.6f SOL to savings only.",
@@ -1617,7 +1897,7 @@ async def reinvest(
             proceeds_sol,
         )
         await _journal_skip(
-            "equity_below_min", proceeds_sol, ctx, meta, redis=redis
+            "equity_below_min_env", proceeds_sol, ctx, meta, redis=redis
         )
         await _send_to_savings(proceeds_sol)
         return None
@@ -1651,15 +1931,24 @@ async def reinvest(
                 return None
 
     # ------------------------------------------------------------------ #
-    # Risk gating: HARD_HALT + capacity + risk_mode + trade caps
+    # Risk gating: HARD_HALT + capacity + risk_mode + trade caps + budgets
     # ------------------------------------------------------------------ #
-    allow_entry = await should_allow_new_entry(redis)
+    try:
+        # newer risk_manager may support a "source" argument for analytics
+        allow_entry = await should_allow_new_entry(redis, source="reinvestor")  # type: ignore[arg-type]
+    except TypeError:
+        # backwards compat: older signature without source kwarg
+        allow_entry = await should_allow_new_entry(redis)
+    except Exception:
+        logger.warning("[REINVEST] should_allow_new_entry failed; defaulting allow=True")
+        allow_entry = True
+
     force_reinvest_even_if_risk_blocked = bool(
         meta.get("force_reinvest_even_if_risk_blocked", False)
     )
 
     # Strategy-level hard halt from self-learning brain
-    if hard_halt:
+    if hard_halt and not force_reinvest_even_if_risk_blocked:
         logger.info(
             "[REINVEST] HARD_HALT from strategy params; routing %.6f SOL to savings.",
             proceeds_sol,
@@ -1667,6 +1956,42 @@ async def reinvest(
         await _journal_skip("hard_halt", proceeds_sol, ctx, meta, redis=redis)
         await _send_to_savings(proceeds_sol)
         return None
+
+    # Risk tags: allow risk_manager to hard/soft-disable reinvestor
+    if not force_reinvest_even_if_risk_blocked:
+        # Hard halts: anything that implies "reinvestor OFF"
+        if any(
+            tag in ("halt_all", "reinvestor_off", "reinvestor_hard_off", "halt_reinvestor")
+            for tag in risk_tags
+        ):
+            logger.info(
+                "[REINVEST] Risk tags %s request hard halt; "
+                "routing %.6f SOL to savings.",
+                risk_tags,
+                proceeds_sol,
+            )
+            await _journal_skip(
+                "risk_tag_halt", proceeds_sol, ctx, meta, redis=redis
+            )
+            await _send_to_savings(proceeds_sol)
+            return None
+
+        # Soft halts: prefer savings for now (e.g. drawdown cooldown)
+        if any(
+            tag in ("reinvestor_soft_off", "cooldown_reinvestor")
+            for tag in risk_tags
+        ):
+            logger.info(
+                "[REINVEST] Risk tags %s request soft halt; "
+                "routing %.6f SOL to savings.",
+                risk_tags,
+                proceeds_sol,
+            )
+            await _journal_skip(
+                "risk_tag_soft_halt", proceeds_sol, ctx, meta, redis=redis
+            )
+            await _send_to_savings(proceeds_sol)
+            return None
 
     # Global trades cap from risk layer
     if (
@@ -1683,6 +2008,33 @@ async def reinvest(
         )
         await _journal_skip(
             "daily_trades_cap_reached", proceeds_sol, ctx, meta, redis=redis
+        )
+        await _send_to_savings(proceeds_sol)
+        return None
+
+    # Budget-based gating from risk_manager (if provided)
+    if spend_budget_block and not force_reinvest_even_if_risk_blocked:
+        logger.info(
+            "[REINVEST] Spend budget block from risk_manager; sending %.6f SOL to savings.",
+            proceeds_sol,
+        )
+        await _journal_skip(
+            "spend_budget_block", proceeds_sol, ctx, meta, redis=redis
+        )
+        await _send_to_savings(proceeds_sol)
+        return None
+
+    if (
+        spend_remaining_usd is not None
+        and spend_remaining_usd <= 0.0
+        and not force_reinvest_even_if_risk_blocked
+    ):
+        logger.info(
+            "[REINVEST] No spend budget remaining (<=0 USD); sending %.6f SOL to savings.",
+            proceeds_sol,
+        )
+        await _journal_skip(
+            "spend_budget_exhausted", proceeds_sol, ctx, meta, redis=redis
         )
         await _send_to_savings(proceeds_sol)
         return None
@@ -1792,6 +2144,24 @@ async def reinvest(
         await _send_to_savings(proceeds_sol)
         return None
 
+    # Tail-risk hard gate (optional)
+    if (
+        REINVEST_TAIL_RISK_GATE > 0.0
+        and not meta.get("ignore_health_gate")
+        and tail_risk_score >= REINVEST_TAIL_RISK_GATE
+    ):
+        logger.info(
+            "[REINVEST] Tail risk high (%.2f ≥ %.2f); sending %.6f SOL to savings.",
+            tail_risk_score,
+            REINVEST_TAIL_RISK_GATE,
+            proceeds_sol,
+        )
+        await _journal_skip(
+            "tail_risk_high", proceeds_sol, ctx, meta, redis=redis
+        )
+        await _send_to_savings(proceeds_sol)
+        return None
+
     # ------------------------------------------------------------------ #
     # Infra gating on top of risk_manager (via infra_guard)
     # ------------------------------------------------------------------ #
@@ -1893,6 +2263,36 @@ async def reinvest(
     reinvest_sol = proceeds_sol * (eff_pct / 100.0)
     savings_sol = max(0.0, proceeds_sol - reinvest_sol)
 
+    # Optional: block if this one trade would eat too much of remaining budget
+    if (
+        REINVEST_MAX_BUDGET_FRACTION > 0.0
+        and spend_remaining_usd is not None
+        and spend_remaining_usd > 0.0
+    ):
+        usd_for_reinvest = await _sol_to_usd(reinvest_sol)
+        frac_of_budget = usd_for_reinvest / max(spend_remaining_usd, 1e-9)
+        if frac_of_budget > REINVEST_MAX_BUDGET_FRACTION:
+            logger.info(
+                "[REINVEST] Planned reinvest uses %.1f%% of remaining budget "
+                "(frac=%.3f > max=%.3f); sending %.6f SOL to savings.",
+                frac_of_budget * 100.0,
+                frac_of_budget,
+                REINVEST_MAX_BUDGET_FRACTION,
+                proceeds_sol,
+            )
+            await _journal_skip(
+                "reinvest_would_use_too_much_budget",
+                proceeds_sol,
+                ctx,
+                meta,
+                redis=redis,
+            )
+            await _send_to_savings(proceeds_sol)
+            await _update_reinvest_health(
+                redis, ctx, eff_pct=0.0, reinvest_sol=0.0, savings_sol=proceeds_sol
+            )
+            return None
+
     # Self-learning hook: log decision BEFORE caps
     try:
         await note_reinvest_decision(
@@ -1924,6 +2324,10 @@ async def reinvest(
                 "infra_state_is_degraded": infra_degraded,
                 "daily_trades_count": daily_trades_count,
                 "daily_trades_cap": daily_trades_cap,
+                "tail_risk_score": tail_risk_score,
+                "spend_remaining_usd": spend_remaining_usd,
+                "spend_budget_block": spend_budget_block,
+                "risk_tags": risk_tags,
             },
             meta=ctx.meta,
             redis=redis,
@@ -1969,8 +2373,8 @@ async def reinvest(
         "kelly=%.3f | reinvest=%.6f SOL | savings=%.6f SOL | "
         "dailyPnL=%.2f%% | dailyDD=%.2f%% | plan_status=%s (gap=%.2f%%) "
         "| regime=(%.2f, stress=%.2f, signal=%.2f, gate=%.2f) | ai_cap_delta=%.3f "
-        "| infra_health=%.2f (halted=%s, degraded=%s) | sandbox_mode=%s "
-        "| health_score=%.1f | dailyTrades=%d/%d",
+        "| tail_risk=%.2f | infra_health=%.2f (halted=%s, degraded=%s) "
+        "| sandbox_mode=%s | health_score=%.1f | dailyTrades=%d/%d | risk_tags=%s",
         proceeds_sol,
         proceeds_usd,
         ctx.base_reinvest_pct,
@@ -1990,6 +2394,7 @@ async def reinvest(
         regime_signal,
         regime_gate,
         ai_capacity_delta,
+        tail_risk_score,
         infra_health_score,
         infra_halted,
         infra_degraded,
@@ -1997,6 +2402,7 @@ async def reinvest(
         health_score,
         daily_trades_count,
         daily_trades_cap,
+        risk_tags,
     )
 
     # If reinvest leg is too tiny, favour savings
@@ -2053,7 +2459,10 @@ async def reinvest(
                 eff_pct=0.0,
                 success=False,
                 tx_sig=None,
-                ctx={"health_score": health_score},
+                ctx={
+                    "health_score": health_score,
+                    "tail_risk_score": tail_risk_score,
+                },
                 redis=redis,
             )
         except Exception:
@@ -2098,7 +2507,10 @@ async def reinvest(
                 eff_pct=0.0,
                 success=False,
                 tx_sig=None,
-                ctx={"health_score": health_score},
+                ctx={
+                    "health_score": health_score,
+                    "tail_risk_score": tail_risk_score,
+                },
                 redis=redis,
             )
         except Exception:
@@ -2153,6 +2565,10 @@ async def reinvest(
             "infra_rpc_latency_ms": ctx.infra_rpc_latency_ms,
             "infra_jup_latency_ms": ctx.infra_jup_latency_ms,
             "infra_stability_score": ctx.infra_stability_score,
+            "tail_risk_score": tail_risk_score,
+            "spend_remaining_usd": spend_remaining_usd,
+            "spend_budget_block": spend_budget_block,
+            "risk_tags": risk_tags,
             "scales": scales.as_dict(),
         },
     }
@@ -2162,7 +2578,11 @@ async def reinvest(
     try:
         usd_spent = await _sol_to_usd(reinvest_sol)
         if usd_spent > 0:
-            await note_spend(redis, usd_spent)
+            try:
+                await note_spend(redis, usd_spent, source="reinvestor")  # type: ignore[arg-type]
+            except TypeError:
+                # backwards compat: old note_spend signature
+                await note_spend(redis, usd_spent)
     except Exception:
         pass
 
@@ -2188,10 +2608,14 @@ async def reinvest(
         f"• Regime: label={ctx.regime_label} num={regime_label:+.2f}, "
         f"stress={regime_stress:.2f}, signal={regime_signal:.2f}, gate={regime_gate:.2f}  "
         f"(ai_cap_delta={ai_capacity_delta:+.3f}, sandbox={ctx.sandbox_mode})\n"
+        f"• Tail risk: {tail_risk_score:.2f} "
+        f"(soft={REINVEST_TAIL_RISK_SOFT:.2f}, hard={REINVEST_TAIL_RISK_HARD:.2f}, "
+        f"gate={REINVEST_TAIL_RISK_GATE:.2f})\n"
         f"• Infra: health={infra_health_score:.2f}, "
         f"rpc={ctx.infra_rpc_latency_ms:.0f}ms, jup={ctx.infra_jup_latency_ms:.0f}ms, "
         f"halted={infra_halted}, degraded={infra_degraded}\n"
         f"• Health score: {health_score:.1f} | DailyTrades={daily_trades_count}/{daily_trades_cap}\n"
+        f"• Risk tags: {risk_tags}\n"
         f"• Tx: `{tx_sig}`"
     )
 
@@ -2210,10 +2634,15 @@ async def reinvest(
                 f"plan={ctx.plan_status}, gap={ctx.plan_gap_pct:+.2f}%, "
                 f"regime={ctx.regime_label}:{regime_label:+.2f}/"
                 f"{regime_stress:.2f}/{regime_signal:.2f}, ai_cap_delta={ai_capacity_delta:+.3f}, "
+                f"tail_risk={tail_risk_score:.2f}, "
                 f"infra_health={infra_health_score:.2f}, rpc={ctx.infra_rpc_latency_ms:.0f}ms, "
                 f"jup={ctx.infra_jup_latency_ms:.0f}ms, sandbox={ctx.sandbox_mode}, "
                 f"health_score={health_score:.1f}, "
                 f"dailyTrades={daily_trades_count}/{daily_trades_cap}, "
+                f"spend_remaining_usd={spend_remaining_usd:.2f}, "
+                f"spend_budget_block={spend_budget_block}, "
+                f"risk_tags={risk_tags}, "
+                f"mode={ctx.meta.get('mode') or ctx.meta.get('reinvest_mode') or ctx.risk_ctx_raw.get('reinvest_mode') or REINVEST_MODE}, "
                 f"scales={scales.as_dict()})"
             ),
         )
@@ -2232,6 +2661,7 @@ async def reinvest(
                 "eff_pct": eff_pct,
                 "health_score": health_score,
                 "infra_health_score": infra_health_score,
+                "tail_risk_score": tail_risk_score,
                 "infra": ctx.infra_raw,
                 "scales": scales.as_dict(),
                 "params": {
@@ -2258,11 +2688,19 @@ async def reinvest(
                     "REINVEST_BLOCK_IF_INFRA_HALTED": REINVEST_BLOCK_IF_INFRA_HALTED,
                     "REINVEST_BLOCK_IF_INFRA_DEGRADED": REINVEST_BLOCK_IF_INFRA_DEGRADED,
                     "REINVESTMENT_MIN_PROFIT_USD": REINVESTMENT_MIN_PROFIT_USD,
+                    "REINVEST_TAIL_RISK_SOFT": REINVEST_TAIL_RISK_SOFT,
+                    "REINVEST_TAIL_RISK_HARD": REINVEST_TAIL_RISK_HARD,
+                    "REINVEST_TAIL_RISK_GATE": REINVEST_TAIL_RISK_GATE,
+                    "REINVEST_MIN_EFF_PCT": REINVEST_MIN_EFF_PCT,
+                    "REINVEST_MAX_EFF_PCT": REINVEST_MAX_EFF_PCT,
+                    "REINVEST_MAX_BUDGET_FRACTION": REINVEST_MAX_BUDGET_FRACTION,
+                    "REINVEST_MODE": REINVEST_MODE,
                 },
                 "risk_ctx": ctx.risk_ctx_raw,
                 "perf": ctx.perf_raw,
                 "tx_sig": tx_sig,
                 "meta": ctx.meta,
+                "risk_tags": risk_tags,
             },
         )
     except Exception:
@@ -2291,6 +2729,10 @@ async def reinvest(
                 "infra_health_score": infra_health_score,
                 "daily_trades_count": daily_trades_count,
                 "daily_trades_cap": daily_trades_cap,
+                "tail_risk_score": tail_risk_score,
+                "spend_remaining_usd": spend_remaining_usd,
+                "spend_budget_block": spend_budget_block,
+                "risk_tags": risk_tags,
             },
             redis=redis,
         )
@@ -2417,6 +2859,9 @@ async def preview_reinvest_split(
         - health_score
         - scales breakdown
         - compact context excerpt
+
+    NOTE: this does *not* replay all hard risk/infra/tail gates from reinvest(). 
+    It is meant as a *local* eff_pct / scales inspector.
     """
     meta = dict(meta or {})
     meta.setdefault("sandbox", True)  # ensure we never trade
@@ -2470,6 +2915,11 @@ async def preview_reinvest_split(
             "daily_trades_cap": ctx.daily_trades_cap,
             "infra_state_is_halted": ctx.infra_state_is_halted,
             "infra_state_is_degraded": ctx.infra_state_is_degraded,
+            "tail_risk_score": getattr(
+                ctx, "tail_risk_score", ctx.risk_ctx_raw.get("tail_risk_score", 0.0)
+            ),
+            "spend_remaining_usd": getattr(ctx, "spend_remaining_usd", None),
+            "spend_budget_block": getattr(ctx, "spend_budget_block", False),
         },
     }
 
@@ -2497,6 +2947,7 @@ async def explain_reinvest_decision(
     outcome = preview.get("outcome")
     reason = preview.get("reason")
     scales = (preview.get("scales") or {}) if isinstance(preview, dict) else {}
+    ctx = preview.get("ctx") or {}
 
     # Identify top boosters / suppressors among scales
     base_pct = scales.get("base_pct", 0.0)
@@ -2510,10 +2961,16 @@ async def explain_reinvest_decision(
         "ai_scale",
         "perf_scale",
         "profile_scale",
+        "mode_scale",
         "infra_scale",
+        "tail_scale",  # expose tail-risk influence
     ):
         v = float(scales.get(k, 1.0))
         deltas[k] = v - 1.0
+
+    def _fmt_scale(name: str) -> str:
+        name = name.replace("_scale", "")
+        return name
 
     boost = sorted(
         [(k, v) for k, v in deltas.items() if v > 0],
@@ -2525,10 +2982,6 @@ async def explain_reinvest_decision(
         key=lambda kv: kv[1],
     )[:2]
 
-    def _fmt_scale(name: str) -> str:
-        name = name.replace("_scale", "")
-        return name
-
     boosts_text = ", ".join(
         f"{_fmt_scale(k)}({v:+.2f})" for k, v in boost
     ) or "none"
@@ -2539,13 +2992,18 @@ async def explain_reinvest_decision(
     eff_pct = preview.get("eff_pct_final", 0.0)
     health = preview.get("health_score", 0.0)
     infra_health = preview.get("infra_health_score", 0.0)
-    ctx = preview.get("ctx") or {}
+    tail_val = ctx.get("tail_risk_score", None)
+    try:
+        tail_str = f"{float(tail_val):.2f}" if tail_val is not None else "n/a"
+    except Exception:
+        tail_str = "n/a"
 
     explanation = (
         f"Outcome: {outcome} "
         f"(reason={reason or 'n/a'}), "
         f"base={base_pct:.1f}%, eff={eff_pct:.1f}%, "
-        f"health={health:.1f}, infra_health={infra_health:.1f}. "
+        f"health={health:.1f}, infra_health={infra_health:.1f}, "
+        f"tail_risk={tail_str}. "
         f"Top boosts: {boosts_text}. "
         f"Top suppressors: {suppress_text}. "
         f"RiskCap={ctx.get('risk_capacity', 0):.2f}, "
@@ -2564,6 +3022,7 @@ async def explain_reinvest_decision(
 # ============================================================================ #
 # CLI / manual test
 # ============================================================================ #
+
 
 if __name__ == "__main__":  # simple local demo
     async def _demo():

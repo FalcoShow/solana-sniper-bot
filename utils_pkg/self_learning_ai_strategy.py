@@ -3,28 +3,41 @@ from __future__ import annotations
 """
 utils_pkg/self_learning_ai_strategy.py
 
-Self-learning strategy brain (V3+++ / quant-grade)
-==================================================
+Self-learning strategy brain (God Tier V4+++ / quant-grade)
+===========================================================
 
 High-level role
 ---------------
 Central "brain" that auto-tunes strategy knobs based on:
 
   • Trade-level performance (per-trade P&L in %)
-  • Recent / long-horizon stats (winrate, Sharpe-ish, downside dev)
+  • Recent / long-horizon stats (winrate, Sharpe-ish, downside dev, streaks)
   • Kelly-style risk suggestion (clipped & smoothed)
   • Regime & risk context from risk_manager (risk:ctx in Redis)
-  • Equity-curve "plan" tracking (PLAN_* fields)
+  • Equity-curve "plan" tracking (PLAN_* fields, 4-year plan aware)
   • Optional OpenAI (LLM) refinements with HARD numeric safety bounds
   • Global health score (0..100) for dashboards / HARD_HALT gating
+  • Reinvest feedback from reinvestor (decision/result/skip event stream)
   • Hard “risk API contract” with risk_manager / reinvestor:
         this module will *never* emit params that exceed risk API
         ceilings (max_risk_per_trade, min_sol_balance, hard_halt).
 
-Design goals
-------------
+Design goals (Phase 0→7 of the Master Roadmap)
+----------------------------------------------
+  0) Hard safety & risk API contract (risk_manager ceilings).
+  1) Rich stats / equity-curve view (trade history → stats).
+  2) Plan-aware equity trajectory (PLAN_* & plan_gap_pct).
+  3) Kelly-style risk sizing with confidence damping.
+  4) Regime + streak + DD-aware rule-based tuning.
+  5) Optional LLM micro-nudges with tight value bands + bounds.
+  6) Plan catch-up / ahead-of-plan biasing (but never YOLO).
+  7) Observability: health score, history, TG/Notion/log events +
+     reinvest feedback stream for future upgrades.
+
+Core principles:
   • Slow, mean-reverting updates (no per-trade jitter).
   • Tight numeric BOUNDS on all tunables.
+  • Streak-aware, regime-aware, plan-aware tuning (no YOLO pivots).
   • Fully usable without Redis (falls back to in-memory).
   • Explainable core: rule-based logic + Kelly + plan; LLM is a tiny nudge.
   • First-class coupling with:
@@ -43,11 +56,13 @@ Design goals
             • HOLD_IF_SCORE_ABOVE
             • MIN_PROFIT_THRESHOLD
             • PARTIAL_TP_CHUNKS
-        - utils_pkg.ai_entry_logic
+        - utils_pkg.ai_entry_logic / ai_buy_scoring
             • ENTRY_SCORE_GATE
             • ENTRY_MAX_PARALLEL (optional)
+            • ENTRY_RISK_BOOST_FACTOR
         - utils_pkg.reinvestor
             • REINVEST_PERCENT
+            • note_reinvest_decision / result / skipped (feedback)
 
 Public API
 ----------
@@ -73,11 +88,20 @@ Public API
 
     async def get_health_snapshot(redis=None) -> dict
 
-    # Optional helpers for dashboards / tools:
     async def get_plan_snapshot(redis=None) -> dict
     async def get_param_history(redis=None, limit: int = 50) -> list[dict]
+
+    # Reinvest feedback hooks (used by reinvestor.py)
+    async def note_reinvest_decision(redis, payload: dict) -> None
+    async def note_reinvest_result(redis, payload: dict) -> None
+    async def note_reinvest_skipped(redis, payload: dict) -> None
+    async def get_reinvest_history(redis=None, limit: int = 100) -> list[dict]
+
     async def get_strategy_with_risk(redis=None) -> dict
         # { "params": ..., "risk_ctx": ..., "health": ... }
+
+    async def get_full_debug_snapshot(redis=None) -> dict
+        # super-concise, all-in-one view for debugging dashboards/CLI
 
 Redis keys
 ----------
@@ -88,6 +112,7 @@ Redis keys
   strategy:last_llm_ts        -> float timestamp (seconds)
   strategy:param_history      -> LIST of compact param diffs
   strategy:health             -> JSON health snapshot
+  strategy:reinvest_history   -> LIST of reinvest events (decision/result/skip)
 
 This module is fully usable without Redis (falls back to in-memory).
 """
@@ -137,10 +162,10 @@ try:
     from utils_pkg.core_utils import send_telegram, log_to_notion  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover
 
-    async def send_telegram(msg: str) -> None:
+    async def send_telegram(msg: str) -> None:  # type: ignore[override]
         logger.info("[TG] %s", msg)
 
-    async def log_to_notion(**_: Any) -> None:
+    async def log_to_notion(**_: Any) -> None:  # type: ignore[override]
         return
 
 # Structured logger (optional)
@@ -148,7 +173,7 @@ try:
     from utils_pkg.data_logger import log_event  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover
 
-    async def log_event(*_: Any, **__: Any) -> None:
+    async def log_event(*_: Any, **__: Any) -> None:  # type: ignore[override]
         return
 
 
@@ -165,6 +190,7 @@ LAST_TUNE_TS_KEY = "strategy:last_tune_ts"
 LAST_LLM_TS_KEY = "strategy:last_llm_ts"
 PARAM_HISTORY_KEY = "strategy:param_history"
 HEALTH_KEY = "strategy:health"
+REINVEST_HISTORY_KEY = "strategy:reinvest_history"
 
 # Cadence and history
 LEARNING_INTERVAL_SECONDS = int(
@@ -174,8 +200,10 @@ LLM_MIN_INTERVAL_SECONDS = int(
     os.getenv("LLM_MIN_INTERVAL_SECONDS", "3600")   # default ~60m
 )
 MIN_TRADES_FOR_TUNING = int(os.getenv("MIN_TRADES_FOR_TUNING", "12"))
+MIN_TRADES_FOR_LLM = int(os.getenv("STRAT_MIN_TRADES_FOR_LLM", "30"))
 MAX_TRADES_KEEP = int(os.getenv("MAX_TRADES_KEEP", "2000"))
 MAX_PARAM_HISTORY_KEEP = int(os.getenv("MAX_PARAM_HISTORY_KEEP", "200"))
+MAX_REINVEST_HISTORY_KEEP = int(os.getenv("MAX_REINVEST_HISTORY_KEEP", "400"))
 
 # How many most-recent trades to emphasize for "recent" stats
 RECENT_WINDOW = int(os.getenv("STRAT_RECENT_WINDOW", "30"))
@@ -192,6 +220,9 @@ DEFENSIVE_DD_THRESHOLD = float(os.getenv("STRAT_DEFENSIVE_DD_THRESHOLD", "12.0")
 # Optional: enable aggressive boost when things are very good
 AGGRESSIVE_MIN_WINRATE = float(os.getenv("STRAT_AGG_WINRATE", "0.68"))
 AGGRESSIVE_MIN_MEAN = float(os.getenv("STRAT_AGG_MEAN", "18.0"))
+
+# Streak-based slowdown threshold (how many consecutive losses before extra defense)
+LOSS_STREAK_SLOWDOWN = int(os.getenv("STRAT_LOSS_STREAK_SLOWDOWN", "3"))
 
 # Health gating for super-defensive HARD_HALT
 HEALTH_HARD_HALT_WR = float(os.getenv("STRAT_HEALTH_HARD_HALT_WR", "0.28"))
@@ -218,7 +249,7 @@ HEALTH_ALERT_INTERVAL_SEC = int(os.getenv("STRAT_HEALTH_ALERT_INTERVAL_SEC", "36
 
 
 # =============================================================================
-# Parameter schema (V3+++)
+# Parameter schema (God Tier V4+++)
 # =============================================================================
 
 # Hard numeric bounds for *all* tunable parameters
@@ -234,7 +265,7 @@ BOUNDS: Dict[str, Tuple[float, float]] = {
     "MAX_RISK_PER_TRADE": (0.01, 0.12),     # fraction of equity
     "MIN_SOL_BALANCE": (0.05, 3.0),
 
-    # AI / entry interaction (ai_sell_logic / ai_entry_logic)
+    # AI / entry interaction (ai_sell_logic / ai_entry_logic / ai_buy_scoring)
     "HOLD_IF_SCORE_ABOVE": (0.60, 0.99),
     "MIN_PROFIT_THRESHOLD": (3.0, 30.0),
     "PARTIAL_TP_CHUNKS": (2.0, 8.0),
@@ -253,9 +284,9 @@ BOUNDS: Dict[str, Tuple[float, float]] = {
     "EXIT_TP_3_SIZE": (0.05, 0.80),
 
     # Equity-plan tuning knobs
-    "PLAN_TARGET_APR_PCT": (20.0, 400.0),          # desired APR
+    "PLAN_TARGET_APR_PCT": (20.0, 400.0),          # desired APR (4-year plan aware)
     "PLAN_START_EQUITY_USD": (0.0, 1_000_000_000.0),
-    "PLAN_START_TS": (0.0, 4_000_000_000.0),       # unix seconds
+    "PLAN_START_TS": (0.0, 4_000_000_000.0),       # unix seconds,
 }
 
 # Default starting values (safe + reasonable for micro-caps)
@@ -300,6 +331,17 @@ DEFAULTS: Dict[str, Any] = {
     # Global emergency brake toggled by self-learning
     "HARD_HALT": False,
 }
+
+# Optional: allow overriding target APR default via env (your 4-year plan, etc.)
+try:
+    _env_plan_apr = os.getenv("STRAT_PLAN_TARGET_APR_PCT")
+    if _env_plan_apr is not None:
+        _env_plan_apr_f = float(_env_plan_apr)
+        lo_apr, hi_apr = BOUNDS["PLAN_TARGET_APR_PCT"]
+        DEFAULTS["PLAN_TARGET_APR_PCT"] = max(lo_apr, min(_env_plan_apr_f, hi_apr))
+except Exception:
+    # If env is garbage, silently ignore.
+    pass
 
 # In-memory fallbacks when Redis is absent
 _mem_params: Dict[str, Any] = DEFAULTS.copy()
@@ -522,7 +564,7 @@ def _equity_curve_metrics(pnl: List[float]) -> Dict[str, float]:
     Build simple equity curve from per-trade percent PnL and compute:
       - cumulative return %
       - max_drawdown %
-    Assumes sequential trades in order.
+    Assumes sequential trades in order (oldest→newest).
     """
     if not pnl:
         return {"equity_cum_return_pct": 0.0, "equity_max_dd_pct": 0.0}
@@ -531,7 +573,8 @@ def _equity_curve_metrics(pnl: List[float]) -> Dict[str, float]:
     peak = 1.0
     max_dd = 0.0
 
-    for p in reversed(pnl):  # oldest→newest for curve
+    # pnl is newest-first; reverse to oldest-first
+    for p in reversed(pnl):
         equity *= (1.0 + p / 100.0)
         peak = max(peak, equity)
         dd = (equity - peak) / peak  # negative
@@ -577,6 +620,10 @@ async def _recompute_and_store_stats(redis) -> None:
                     "recent_sharpe_like": 0.0,
                     "equity_cum_return_pct": 0.0,
                     "equity_max_dd_pct": 0.0,
+                    "profit_factor": 0.0,
+                    "recent_profit_factor": 0.0,
+                    "current_win_streak": 0,
+                    "current_loss_streak": 0,
                 },
             )
             return
@@ -608,6 +655,15 @@ async def _recompute_and_store_stats(redis) -> None:
         ddev = _downside_deviation(pnl, threshold=0.0)
         sharpe = _sharpe_like(mu, std)
 
+        # Profit factor (total gains / total losses magnitude)
+        total_profit = sum(x for x in pnl if x > 0)
+        total_loss = sum(x for x in pnl if x < 0)
+        if total_loss < 0:
+            profit_factor = float(total_profit / abs(total_loss))
+        else:
+            profit_factor = 0.0
+
+        # Recent window (newest-first)
         recent = pnl[: min(RECENT_WINDOW, len(pnl))]
         r_wins = [x for x in recent if x >= win_cut]
         r_losses = [x for x in recent if x < win_cut]
@@ -615,6 +671,13 @@ async def _recompute_and_store_stats(redis) -> None:
         rvar = _safe_mean([(x - rmu) ** 2 for x in recent])
         rstd = math.sqrt(rvar)
         rsharpe = _sharpe_like(rmu, rstd)
+
+        recent_profit = sum(x for x in recent if x > 0)
+        recent_loss = sum(x for x in recent if x < 0)
+        if recent_loss < 0:
+            recent_profit_factor = float(recent_profit / abs(recent_loss))
+        else:
+            recent_profit_factor = 0.0
 
         # Kelly-style suggestion (fraction of equity) on full sample
         if std > 1e-9 and ENABLE_KELLY:
@@ -647,6 +710,21 @@ async def _recompute_and_store_stats(redis) -> None:
 
         eq_metrics = _equity_curve_metrics(pnl)
 
+        # Current streaks (newest-first)
+        current_win_streak = 0
+        current_loss_streak = 0
+        for p in pnl:
+            if p >= win_cut:
+                if current_loss_streak > 0:
+                    break
+                current_win_streak += 1
+            elif p < win_cut:
+                if current_win_streak > 0:
+                    break
+                current_loss_streak += 1
+            else:
+                break
+
         stats = {
             "trades": len(pnl),
             "wins": len(wins),
@@ -670,6 +748,10 @@ async def _recompute_and_store_stats(redis) -> None:
             "recent_sharpe_like": rsharpe,
             "equity_cum_return_pct": eq_metrics["equity_cum_return_pct"],
             "equity_max_dd_pct": eq_metrics["equity_max_dd_pct"],
+            "profit_factor": profit_factor,
+            "recent_profit_factor": recent_profit_factor,
+            "current_win_streak": current_win_streak,
+            "current_loss_streak": current_loss_streak,
         }
 
         await _store_stats(redis, stats)
@@ -772,32 +854,9 @@ async def _read_risk_ctx(redis) -> Dict[str, Any]:
     """
     Pull risk:ctx from risk_manager if present; otherwise best-effort defaults.
 
-    EXPECTED UNITS (V3+++):
+    EXPECTED UNITS (God Tier V4+++):
       • daily_realized_pnl_pct: +10.0 means +10% realized today
       • daily_drawdown_pct:    -8.0 means -8% from today's peak
-
-    Expected fields (but we guard against missing ones):
-
-      Core:
-        risk_capacity          (0..1)
-        risk_mode              (0..3)
-        daily_realized_pnl_pct (percent)
-        daily_drawdown_pct     (percent; negative == drawdown)
-        open_positions
-        max_positions
-        equity_usd
-
-      Extra fields (if risk_manager publishes them):
-        risk_profile
-        max_risk_per_trade
-        min_sol_balance
-        plan_equity_today_usd, plan_gap_pct, plan_status
-        ai_capacity_delta
-        hard_halt (bool-ish, if risk API decides everything must stop)
-
-      Optional regime-aware extras (future use):
-        regime_label_numeric, regime_stress_score,
-        regime_signal_strength, regime_entry_gate_factor
     """
     base: Dict[str, Any] = {
         "risk_capacity": 1.0,
@@ -839,7 +898,7 @@ async def _read_risk_ctx(redis) -> Dict[str, Any]:
         base["max_positions"] = int(float(h.get("max_positions", 0))) if "max_positions" in h else 0
         base["equity_usd"] = _f("equity_usd", 0.0)
 
-        # Daily PnL / DD already in percent space (V3+++ risk_manager)
+        # Daily PnL / DD already in percent space
         base["daily_realized_pnl_pct"] = _f("daily_realized_pnl_pct", 0.0)
         base["daily_drawdown_pct"] = _f("daily_drawdown_pct", 0.0)
 
@@ -862,7 +921,7 @@ async def _read_risk_ctx(redis) -> Dict[str, Any]:
         base["max_risk_per_trade"] = _f("max_risk_per_trade", 0.0)
         base["min_sol_balance"] = _f("min_sol_balance", 0.0)
 
-        # Hard kill-switch from risk API (e.g. if DB / infra is stressed)
+        # Hard kill-switch from risk API (e.g. infra stressed)
         if "hard_halt" in h:
             try:
                 hv = h.get("hard_halt")
@@ -892,6 +951,7 @@ def _rule_based_adjust(
 
     Rough heuristics:
       - Low winrate / big downside → tighten stops, reduce TP, reduce reinvest.
+      - Streaks of losses → extra defensive layer on top of DD checks.
       - Strong winrate & stable → loosen a little, increase reinvest.
       - If capacity or risk_mode from risk_manager is low → defensive tweaks.
       - Kelly suggestion nudges max risk per trade.
@@ -899,6 +959,9 @@ def _rule_based_adjust(
       - STRAT_MODE (0/1/2) summarizes the overall stance for downstream modules.
       - In extreme bad health, we may toggle HARD_HALT for risk_manager.
       - ENTRY_MAX_PARALLEL is scaled to risk_capacity & regime.
+      - PLAN_*:
+            • If far AHEAD of plan → bias slightly more conservative.
+            • If far BEHIND but regime healthy → gentle catch-up scaling.
     """
     out = dict(params)
 
@@ -910,6 +973,10 @@ def _rule_based_adjust(
     sharpe = float(stats.get("sharpe_like", 0.0))
     recent_sharpe = float(stats.get("recent_sharpe_like", 0.0))
     equity_max_dd = float(stats.get("equity_max_dd_pct", 0.0))
+    profit_factor = float(stats.get("profit_factor", 0.0))
+    recent_profit_factor = float(stats.get("recent_profit_factor", 0.0))
+    cur_win_streak = int(stats.get("current_win_streak", 0))
+    cur_loss_streak = int(stats.get("current_loss_streak", 0))
 
     risk_capacity = float(risk_ctx.get("risk_capacity", 1.0))
     risk_mode = int(risk_ctx.get("risk_mode", 1))
@@ -959,6 +1026,7 @@ def _rule_based_adjust(
         or regime_stress > 0.7
         or regime_label < -0.4
         or equity_max_dd <= -25.0
+        or recent_profit_factor < 1.0  # losing efficiency of wins vs losses
     )
     if losing_regime:
         mode = 0  # DEFENSIVE
@@ -1001,6 +1069,21 @@ def _rule_based_adjust(
             BOUNDS["ENTRY_RISK_BOOST_FACTOR"][0],
             out["ENTRY_RISK_BOOST_FACTOR"] - 0.05,
         )
+
+        # Streak-aware slowdown on top of losing regime
+        if cur_loss_streak >= LOSS_STREAK_SLOWDOWN:
+            out["MAX_RISK_PER_TRADE"] = max(
+                BOUNDS["MAX_RISK_PER_TRADE"][0],
+                out["MAX_RISK_PER_TRADE"] - 0.005,
+            )
+            out["REINVEST_PERCENT"] = max(
+                BOUNDS["REINVEST_PERCENT"][0],
+                out["REINVEST_PERCENT"] - 3.0,
+            )
+            out["ENTRY_SCORE_GATE"] = min(
+                BOUNDS["ENTRY_SCORE_GATE"][1],
+                out["ENTRY_SCORE_GATE"] + 0.01,
+            )
 
     # Hard defensive if deep drawdown / tiny capacity / awful regime
     extreme_bad = (
@@ -1052,6 +1135,7 @@ def _rule_based_adjust(
         and regime_label > 0.3
         and regime_signal > 0.4
         and regime_stress < 0.5
+        and profit_factor > 1.4
     )
     # Plan context: if massively ahead of plan, bias slightly DOWN even if strong.
     if plan_gap_pct > 10.0:
@@ -1085,6 +1169,47 @@ def _rule_based_adjust(
         )
         # If conditions are great, make sure HARD_HALT is off
         out["HARD_HALT"] = False
+
+        # Extra push only when we also have a small win streak
+        if cur_win_streak >= 3 and daily_dd_pct > -3.0:
+            out["REINVEST_PERCENT"] = min(
+                BOUNDS["REINVEST_PERCENT"][1],
+                out["REINVEST_PERCENT"] + 2.0,
+            )
+            out["ENTRY_SCORE_GATE"] = max(
+                BOUNDS["ENTRY_SCORE_GATE"][0],
+                out["ENTRY_SCORE_GATE"] - 0.003,
+            )
+
+    # --- 3b) Plan catch-up mode: behind plan but regime decent → mild scaling ---
+    # This gives a tiny bias to catch up when you're *behind* the equity curve,
+    # but only when the regime is not red and risk capacity is decent.
+    if (
+        plan_gap_pct < -8.0
+        and not losing_regime
+        and risk_capacity > 0.7
+        and sharpe > 0.0
+        and daily_dd_pct > -DEFENSIVE_DD_THRESHOLD
+        and regime_stress < 0.6
+    ):
+        # Keep at least NEUTRAL, occasionally AGGRESSIVE if really solid
+        if mode < 1:
+            mode = 1
+        if sharpe > 0.4 and profit_factor > 1.3 and regime_label > 0.1:
+            mode = max(mode, 2)
+
+        out["REINVEST_PERCENT"] = min(
+            BOUNDS["REINVEST_PERCENT"][1],
+            out["REINVEST_PERCENT"] + 2.0,
+        )
+        out["ENTRY_MAX_PARALLEL"] = min(
+            BOUNDS["ENTRY_MAX_PARALLEL"][1],
+            out["ENTRY_MAX_PARALLEL"] + 1,
+        )
+        out["ENTRY_SCORE_GATE"] = max(
+            BOUNDS["ENTRY_SCORE_GATE"][0],
+            out["ENTRY_SCORE_GATE"] - 0.003,
+        )
 
     # --- 4) If mean pnl is weak, shorten max hold a bit ---
     if stats.get("pnl_mean", 0.0) < 5.0 and out["MAX_HOLD_TIME_MINUTES"] > 45:
@@ -1187,7 +1312,10 @@ def _enforce_risk_api_contract(params: Dict[str, Any], risk_ctx: Dict[str, Any])
         # Clamp to both the strategy bound and the risk API ceiling
         out["MAX_RISK_PER_TRADE"] = max(
             lo,
-            min(float(out.get("MAX_RISK_PER_TRADE", DEFAULTS["MAX_RISK_PER_TRADE"])), min(hi, api_max_risk)),
+            min(
+                float(out.get("MAX_RISK_PER_TRADE", DEFAULTS["MAX_RISK_PER_TRADE"])),
+                min(hi, api_max_risk),
+            ),
         )
 
     # Respect explicit min_sol_balance floor if risk API publishes it
@@ -1199,7 +1327,10 @@ def _enforce_risk_api_contract(params: Dict[str, Any], risk_ctx: Dict[str, Any])
         lo, hi = BOUNDS["MIN_SOL_BALANCE"]
         out["MIN_SOL_BALANCE"] = max(
             lo,
-            min(max(float(out.get("MIN_SOL_BALANCE", DEFAULTS["MIN_SOL_BALANCE"])), api_min_sol), hi),
+            min(
+                max(float(out.get("MIN_SOL_BALANCE", DEFAULTS["MIN_SOL_BALANCE"])), api_min_sol),
+                hi,
+            ),
         )
 
     # If risk API advertises hard_halt, we *always* mirror it here
@@ -1217,11 +1348,14 @@ def _update_equity_plan(
     """
     Maintain PLAN_* fields used by risk_manager for plan-aware risk capacity.
 
-    We keep a simple continuous-compounding equity curve:
+    We keep a simple equity curve with annualized APR and continuous compounding:
 
         target_equity(t) = PLAN_START_EQUITY_USD * (1 + APR) ** (days/365)
 
     and track today's PLAN_EQUITY_TODAY_USD, PLAN_GAP_PCT and PLAN_STATUS.
+
+    Risk profile (conservative/balanced/aggressive) from risk_ctx is allowed to
+    nudge PLAN_TARGET_APR_PCT inside BOUNDS (4-year master plan aware).
     """
     out = dict(params)
     if not PLAN_ENABLED:
@@ -1235,6 +1369,17 @@ def _update_equity_plan(
     apr = float(out.get("PLAN_TARGET_APR_PCT", DEFAULTS["PLAN_TARGET_APR_PCT"]))
     start_eq = float(out.get("PLAN_START_EQUITY_USD", 0.0))
     start_ts = float(out.get("PLAN_START_TS", 0.0))
+
+    # Profile-aware APR nudge (very small, still capped by BOUNDS)
+    profile = str(risk_ctx.get("risk_profile", "balanced")).lower()
+    if profile == "conservative":
+        apr *= 0.7
+    elif profile == "aggressive":
+        apr *= 1.2
+
+    lo_apr, hi_apr = BOUNDS["PLAN_TARGET_APR_PCT"]
+    apr = max(lo_apr, min(apr, hi_apr))
+    out["PLAN_TARGET_APR_PCT"] = apr
 
     now_ts = time.time()
 
@@ -1306,7 +1451,8 @@ async def _maybe_llm_adjust(
         if now - last_ts < LLM_MIN_INTERVAL_SECONDS:
             return params
 
-        if int(stats.get("trades", 0)) < max(MIN_TRADES_FOR_TUNING, 8):
+        # Require a decent sample size before letting the LLM nudge anything
+        if int(stats.get("trades", 0)) < max(MIN_TRADES_FOR_LLM, MIN_TRADES_FOR_TUNING, 8):
             return params
 
         client = AsyncOpenAI()
@@ -1422,6 +1568,10 @@ async def _record_param_history(
             risk_ctx.get("daily_realized_pnl_pct", 0.0)
         ),
         "daily_drawdown_pct": float(risk_ctx.get("daily_drawdown_pct", 0.0)),
+        "profit_factor": float(stats.get("profit_factor", 0.0)),
+        "recent_profit_factor": float(stats.get("recent_profit_factor", 0.0)),
+        "current_win_streak": int(stats.get("current_win_streak", 0)),
+        "current_loss_streak": int(stats.get("current_loss_streak", 0)),
     }
 
     try:
@@ -1435,32 +1585,52 @@ async def _record_param_history(
 def _health_score(stats: Dict[str, Any], risk_ctx: Dict[str, Any]) -> float:
     """
     Compressed 0..100 health score for dashboards / sanity checks.
+
+    Components (0..100 each):
+      • winrate      (WR)
+      • Sharpe-like  (risk-adjusted quality)
+      • daily DD     (today's damage)
+      • capacity     (how "open" the risk system is)
+      • equity DD    (max historical drawdown)
+      • plan_gap     (how close to the equity plan you are)
     """
     wr = float(stats.get("win_rate", 0.0))
     sharpe = float(stats.get("sharpe_like", 0.0))
     dd = float(risk_ctx.get("daily_drawdown_pct", 0.0))  # negative when bad
     capacity = float(risk_ctx.get("risk_capacity", 1.0))
     eq_max_dd = float(stats.get("equity_max_dd_pct", 0.0))
+    plan_gap = float(risk_ctx.get("plan_gap_pct", 0.0))
 
-    # Map each piece to 0..100 then average
     # winrate: 30% → 0, 70% → 100
     wr_score = max(0.0, min(1.0, (wr - 0.30) / (0.70 - 0.30))) * 100.0
     # sharpe: -0.5 → 0, 1.5 → 100
     s_clamped = max(-0.5, min(1.5, sharpe))
     sharpe_score = (s_clamped + 0.5) / 2.0 * 100.0
-    # drawdown: -30% → 0, 0% → 100
+    # daily drawdown: -30% → 0, 0% → 100
     dd_score = max(0.0, min(1.0, (30.0 + dd) / 30.0)) * 100.0
     # capacity directly 0..1 → 0..100
     cap_score = max(0.0, min(1.0, capacity)) * 100.0
     # equity max DD: -50% → 0, 0% → 100
     eq_dd_score = max(0.0, min(1.0, (50.0 + eq_max_dd) / 50.0)) * 100.0
+    # plan gap: within ±5% → ~100, large negative or positive → lower
+    # (we penalize being far behind more than being ahead)
+    if abs(plan_gap) <= 5.0:
+        plan_score = 100.0
+    elif plan_gap < -5.0:
+        # behind: -50% → 0, -5% → 80
+        plan_score = max(0.0, min(1.0, (50.0 + plan_gap) / 45.0)) * 80.0
+    else:
+        # ahead: +50% → 60, +5% → 100
+        plan_score = max(0.0, min(1.0, (50.0 - plan_gap) / 45.0)) * 40.0 + 60.0
 
+    # Weighted blend (sums to 1.0)
     return float(
-        0.30 * wr_score
-        + 0.25 * sharpe_score
-        + 0.20 * dd_score
-        + 0.15 * cap_score
-        + 0.10 * eq_dd_score
+        0.27 * wr_score
+        + 0.23 * sharpe_score
+        + 0.18 * dd_score
+        + 0.14 * cap_score
+        + 0.08 * eq_dd_score
+        + 0.10 * plan_score
     )
 
 
@@ -1483,8 +1653,8 @@ async def _update_health(redis, stats: Dict[str, Any], risk_ctx: Dict[str, Any])
         "pnl_downside_dev": float(stats.get("pnl_downside_dev", 0.0)),
         "sharpe_like": float(stats.get("sharpe_like", 0.0)),
         "recent_sharpe_like": float(stats.get("recent_sharpe_like", 0.0)),
-        "kelly_suggestion": float(stats.get("kelly_suggestion", 0.02)),
-        "recent_kelly_suggestion": float(stats.get("recent_kelly_suggestion", 0.02)),
+        "kelly_suggestion": float(stats.get("kelly_suggestion", 0.0)),
+        "recent_kelly_suggestion": float(stats.get("recent_kelly_suggestion", 0.0)),
         "kelly_confidence": float(stats.get("kelly_confidence", 0.0)),
         "equity_cum_return_pct": float(stats.get("equity_cum_return_pct", 0.0)),
         "equity_max_dd_pct": float(stats.get("equity_max_dd_pct", 0.0)),
@@ -1501,7 +1671,12 @@ async def _update_health(redis, stats: Dict[str, Any], risk_ctx: Dict[str, Any])
         ),
         "tag_counts": stats.get("tag_counts", {}),
         "recent_tag_counts": stats.get("recent_tag_counts", {}),
+        "profit_factor": float(stats.get("profit_factor", 0.0)),
+        "recent_profit_factor": float(stats.get("recent_profit_factor", 0.0)),
+        "current_win_streak": int(stats.get("current_win_streak", 0)),
+        "current_loss_streak": int(stats.get("current_loss_streak", 0)),
         "health_score": health_score,
+        "risk_profile": str(risk_ctx.get("risk_profile", "balanced")),
     }
 
     # Also include latest PLAN_* from params if available
@@ -1607,6 +1782,103 @@ async def get_param_history(redis=None, limit: int = 50) -> List[Dict[str, Any]]
         return []
 
 
+# =============================================================================
+# Reinvest feedback from reinvestor (Phase 6–7 coupling)
+# =============================================================================
+
+async def _store_reinvest_event(redis, event: Dict[str, Any]) -> None:
+    """
+    Internal helper: persist a single reinvest event (decision/result/skip)
+    and fan it out to structured logging for future analytics / AI features.
+    """
+    try:
+        if redis is None:
+            redis = await _get_redis()
+        event = dict(event)
+        event.setdefault("ts", time.time())
+        if redis:
+            await redis.lpush(REINVEST_HISTORY_KEY, json.dumps(event))
+            await redis.ltrim(REINVEST_HISTORY_KEY, 0, MAX_REINVEST_HISTORY_KEEP - 1)
+    except Exception:
+        pass
+
+    # Best-effort structured event
+    try:
+        await log_event("reinvest_event", event)
+    except Exception:
+        pass
+
+
+async def note_reinvest_decision(redis, payload: Dict[str, Any]) -> None:
+    """
+    Called by utils_pkg.reinvestor *before* a reinvest entry is attempted.
+
+    `payload` is intentionally free-form but typically includes:
+      • "kind": "decision"
+      • "token", "mint", "symbol"
+      • "alloc_usd", "alloc_sol"
+      • "reason", "health_score", "tail_risk_score"
+      • "risk_ctx", "strategy_params" (optional snapshots)
+    """
+    event = {"kind": "decision"}
+    event.update(payload or {})
+    await _store_reinvest_event(redis, event)
+
+
+async def note_reinvest_result(redis, payload: Dict[str, Any]) -> None:
+    """
+    Called by utils_pkg.reinvestor after a reinvest entry resolves
+    (TX succeeded / failed, etc.).
+
+    Typical fields in `payload`:
+      • "kind": "result"
+      • "token", "mint", "symbol"
+      • "tx_sig", "status" ("ok" / "failed" / "timeout" / ...)
+      • "alloc_usd", "alloc_sol"
+      • "reason", "error", "slippage_bps", ...
+    """
+    event = {"kind": "result"}
+    event.update(payload or {})
+    await _store_reinvest_event(redis, event)
+
+
+async def note_reinvest_skipped(redis, payload: Dict[str, Any]) -> None:
+    """
+    Called by utils_pkg.reinvestor when a reinvest opportunity is *skipped* due
+    to risk / infra / plan / budget guards.
+
+    Typical fields in `payload`:
+      • "kind": "skipped"
+      • "reason_code" (e.g. "risk_capacity_low", "budget_exhausted", ...)
+      • "health_score", "risk_capacity", "daily_dd_pct", ...
+    """
+    event = {"kind": "skipped"}
+    event.update(payload or {})
+    await _store_reinvest_event(redis, event)
+
+
+async def get_reinvest_history(redis=None, limit: int = 100) -> List[Dict[str, Any]]:
+    """
+    Read back the last N reinvest events (decision/result/skip) for dashboards
+    and analytics. Newest-first.
+    """
+    if limit <= 0:
+        return []
+    try:
+        if redis is None:
+            redis = await _get_redis()
+        if not redis:
+            return []
+        raw = await redis.lrange(REINVEST_HISTORY_KEY, 0, limit - 1)
+        return [json.loads(x) for x in raw]
+    except Exception:
+        return []
+
+
+# =============================================================================
+# Strategy + risk snapshot helpers
+# =============================================================================
+
 async def get_strategy_with_risk(redis=None) -> Dict[str, Any]:
     """
     Convenience helper to give other AI modules a single call to get:
@@ -1624,6 +1896,33 @@ async def get_strategy_with_risk(redis=None) -> Dict[str, Any]:
     health = await get_health_snapshot(redis)
     return {
         "params": params,
+        "risk_ctx": risk_ctx,
+        "health": health,
+    }
+
+
+async def get_full_debug_snapshot(redis=None) -> Dict[str, Any]:
+    """
+    Ultra-handy one-shot snapshot for CLI / dashboards when debugging:
+
+        {
+          "params": ...,
+          "stats": ...,
+          "risk_ctx": ...,
+          "health": ...,
+        }
+
+    Safe to call anywhere; falls back gracefully if Redis is missing.
+    """
+    if redis is None:
+        redis = await _get_redis()
+    params = await get_strategy_params(redis)
+    stats = await get_perf_snapshot(redis)
+    risk_ctx = await _read_risk_ctx(redis)
+    health = await get_health_snapshot(redis)
+    return {
+        "params": params,
+        "stats": stats,
         "risk_ctx": risk_ctx,
         "health": health,
     }
@@ -1664,13 +1963,14 @@ async def _apply_and_announce(
         mode = int(new.get("STRAT_MODE", 1))
         mode_label = {0: "DEFENSIVE", 1: "NEUTRAL", 2: "AGGRESSIVE"}.get(mode, "NEUTRAL")
         lines = [
-            "🤖 Strategy auto-tuned (V3+++):",
+            "🤖 Strategy auto-tuned (God Tier V4+++):",
             (
                 f"Mode={mode_label}  Trades={stats.get('trades', 0)}  "
                 f"WinRate={stats.get('win_rate', 0.0):.2%}  "
                 f"μ={stats.get('pnl_mean', 0.0):+.2f}%  "
                 f"σ={stats.get('pnl_std', 0.0):.2f}%  "
-                f"Sharpe≈{stats.get('sharpe_like', 0.0):+.2f}"
+                f"Sharpe≈{stats.get('sharpe_like', 0.0):+.2f}  "
+                f"PF={stats.get('profit_factor', 0.0):.2f}"
             ),
             (
                 f"Risk capacity={risk_ctx.get('risk_capacity', 1.0):.3f}  "
@@ -1686,6 +1986,8 @@ async def _apply_and_announce(
             f"Kelly={stats.get('kelly_suggestion', 0.02):.3f}  "
             f"recent={stats.get('recent_kelly_suggestion', 0.02):.3f}  "
             f"conf={stats.get('kelly_confidence', 0.0):.2f}",
+            f"Streak: wins={stats.get('current_win_streak', 0)}, "
+            f"losses={stats.get('current_loss_streak', 0)}",
             "",
         ]
         for k, (a, b) in diffs.items():
@@ -1791,7 +2093,7 @@ async def run_self_learning_loop(redis=None) -> None:
     """
     Long-running loop; safe to fire from scripts/main.py:
 
-        from utils_pkg.self_learning_ai_strategy import run_self_learning_ai_strategy_loop
+        from utils_pkg.self_learning_ai_strategy import run_self_learning_loop
         ...
         asyncio.create_task(run_self_learning_loop(redis), name="self.learning")
     """
@@ -1819,6 +2121,10 @@ if __name__ == "__main__":  # manual debugging
         r = await _get_redis()
         await tune_once(r)
         snap = await get_perf_snapshot(r)
+        health = await get_health_snapshot(r)
+        params = await get_strategy_params(r)
         print("perf_snapshot:", json.dumps(snap, indent=2))
+        print("health_snapshot:", json.dumps(health, indent=2))
+        print("params:", json.dumps(params, indent=2))
 
     asyncio.run(_demo())

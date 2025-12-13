@@ -31,3 +31,8 @@ keypair.json
 pf-profile/
 etc/secrets/
 
+
+# local backups / audits
+*.BROKEN_COPY
+MAIN_WIRING_AUDIT.txt
+

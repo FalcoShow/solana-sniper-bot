@@ -3,53 +3,76 @@ from __future__ import annotations
 """
 utils_pkg/ai_risk_model.py
 
-AI risk overlay / capacity delta model (V3+++ / quant-grade)
-============================================================
+AI risk overlay / capacity + candidate model (V3+++ / quant-grade)
+==================================================================
 
 High-level role
 ---------------
-This module is a PURE, side-effect-free "risk overlay" that takes:
+This module has TWO related jobs:
 
-    • risk snapshot    (what risk_manager already knows)
-    • performance snap (from self_learning_ai_strategy.get_perf_snapshot)
-    • regime snapshot  (from utils_pkg.regime / risk_manager, optional)
+(1) Account / regime overlay  (slow, session-level):
+    Takes:
+        • risk snapshot    (what risk_manager already knows)
+        • performance snap (from self_learning_ai_strategy.get_perf_snapshot)
+        • regime snapshot  (from utils_pkg.regime / risk_manager, optional)
 
-and returns a small set of AI-style overlays that risk_manager / strategy can
-merge into risk:ctx and use to bias capacity, gates, and risk profile:
+    and returns a small set of AI-style overlays that risk_manager / strategy
+    can merge into risk:ctx and use to bias capacity, gates, and risk profile:
 
-    • ai_capacity_delta        in [-0.6, +0.6]      (capacity tilt)
-    • risk_profile             in {"ultra_defensive","defensive",
-                                   "balanced","aggressive","degenerate"}
-    • regime_entry_gate_factor in [0.2, 1.6]        (entry gate multiplier)
-    • risk_mode                in {0, 1, 2}         (0=risk_off,1=normal,2=risk_on)
-    • block_new_entries        bool                 (hard circuit-breaker)
-    • recommend_max_pos_mult   in [0.2, 1.8]        (max positions / size tilt)
-    • ai_risk_model_version    str                  (for debugging/backtests)
+        • ai_capacity_delta        in [-0.6, +0.6]      (capacity tilt)
+        • risk_profile             in {"ultra_defensive","defensive",
+                                       "balanced","aggressive","degenerate"}
+        • regime_entry_gate_factor in [0.2, 1.6]        (entry gate multiplier)
+        • risk_mode                in {0, 1, 2}         (0=risk_off,1=normal,2=risk_on)
+        • block_new_entries        bool                 (hard circuit-breaker)
+        • recommend_max_pos_mult   in [0.2, 1.8]        (max positions / size tilt)
+        • ai_risk_model_version    str                  (for debugging/backtests)
+
+(2) Candidate-level risk score  (fast, per-trade):
+    Takes a single feature dict (FeatureBuilder output) and returns:
+
+        • score  in [0,1]   (0 = safest, 1 = highest rug / fraud risk)
+        • conf   in [0,1]   (how confident we are in this score)
+        • label  str        ("safe","ok","elevated","critical")
+
+    This is used by:
+        • utils_pkg.backtest_engine._maybe_ai_risk_score(...)
+        • entry / scanner guardrails (via _ai_risk_model.* hooks)
 
 Design goals
 ------------
     • PURE / deterministic: takes dicts, returns dict; no Redis, IO, or logging.
     • Fully safe if some fields are missing (uses defaults).
     • Tuned for PnL / DD / regime-aware behavior & equity-curve gap.
-    • Interpretable: no black-box LLM; just rules & smooth scaling.
-    • Easy to plug into risk_manager without rewrites:
-          - risk_manager can ignore any keys it doesn’t care about.
-          - predict_capacity_adjustment() is a thin adapter for current_limits().
+    • Interpretable heuristics (no black-box LLM inside this module).
+    • Safe backward-compat:
+          - compute_ai_overlay / predict_capacity_adjustment are drop-in for old code.
+          - Candidate API exposes: score_candidate / score_entry / score / evaluate
+            so callers can choose any of them.
 
 Public API
 ----------
+Account / regime overlay:
     compute_ai_overlay(risk_snapshot, perf_snapshot=None, regime_snapshot=None) -> dict
-    predict_capacity_adjustment(features) -> float  # compact adapter for risk_manager
+    predict_capacity_adjustment(features) -> float
 
-Both are synchronous and side-effect-free.
+Candidate-level risk score:
+    score_candidate(features, config=None) -> dict  # {"score","conf","label"}
+    score_entry(features, config=None) -> dict      # alias
+    score(features, config=None) -> dict            # alias
+    evaluate(features, config=None) -> dict         # alias
 """
 
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Mapping
 
 __all__ = [
     "compute_ai_overlay",
     "predict_capacity_adjustment",
+    "score_candidate",
+    "score_entry",
+    "score",
+    "evaluate",
 ]
 
 AI_RISK_MODEL_VERSION = "v3+++"  # bump when behavior changes
@@ -106,11 +129,28 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return float(max(lo, min(hi, x)))
 
 
-def _safe_float(d: Dict[str, Any], key: str, default: float = 0.0) -> float:
+def _safe_float(d: Mapping[str, Any], key: str, default: float = 0.0) -> float:
     try:
-        return float(d.get(key, default))
+        v = d.get(key, default)
+        if v is None:
+            return default
+        return float(v)
     except Exception:
         return default
+
+
+def _safe_bool(d: Mapping[str, Any], key: str, default: bool = False) -> bool:
+    v = d.get(key, default)
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
 
 
 def _logistic(x: float, k: float = 1.0) -> float:
@@ -136,7 +176,7 @@ def _map_linear(x: float, x0: float, x1: float) -> float:
 
 
 # =============================================================================
-# Core scoring pieces
+# Core scoring pieces for overlay
 # =============================================================================
 
 def _score_pnl_and_dd(risk_snapshot: Dict[str, Any]) -> Dict[str, float]:
@@ -481,7 +521,7 @@ def _compute_risk_mode_and_block(
     if dd_pct > 0:
         dd_pct = -abs(dd_pct)
 
-    circuit_tripped = bool(risk_snapshot.get("circuit_breaker_tripped"))
+    circuit_tripped = _safe_bool(risk_snapshot, "circuit_breaker_tripped", False)
     # Fallback: use "hard" DD and stress to trigger circuit
     hard_dd_hit = dd_pct <= DD_HARD_CRASH
     extreme_stress = stress >= 0.95
@@ -554,7 +594,7 @@ def _compute_max_pos_mult(
 
 
 # =============================================================================
-# Public API
+# Public API – overlay
 # =============================================================================
 
 def compute_ai_overlay(
@@ -693,7 +733,7 @@ def _build_risk_snapshot_from_features(features: Dict[str, Any]) -> Dict[str, An
     regime_mult = _safe_float(features, "regime_mult", 1.0)
     plan_gap = _safe_float(features, "plan_gap_pct", 0.0)
     base_capacity = _safe_float(features, "risk_capacity", 0.5)
-    circuit_tripped = bool(features.get("circuit_breaker_tripped", False))
+    circuit_tripped = _safe_bool(features, "circuit_breaker_tripped", False)
 
     # Convert to percent space
     if eq > 0:
@@ -810,9 +850,273 @@ def predict_capacity_adjustment(features: Dict[str, Any]) -> float:
         return 0.0
 
 
+# =============================================================================
+# Candidate-level risk scoring (per-token rug / fraud risk)
+# =============================================================================
+
+def _first_present_float(features: Mapping[str, Any], keys, default: float = 0.0) -> float:
+    """
+    Return the first non-None, float-convertible value for any key in `keys`.
+    """
+    for k in keys:
+        if k in features and features[k] is not None:
+            try:
+                return float(features[k])
+            except Exception:
+                continue
+    return float(default)
+
+
+def _candidate_heuristics(features: Mapping[str, Any]) -> Dict[str, float]:
+    """
+    Build a heuristic rug / fraud risk score in [0,1].
+
+    We deliberately keep this VERY tolerant of missing fields so that it
+    never throws even if FeatureBuilder evolves.
+    """
+    # --- Age risk (younger → higher structural risk) ---
+    age_keys = ("age_min", "age_minutes", "pool_age_min")
+    age_min = _first_present_float(features, age_keys, 60.0)
+    # Map age: 0–5min ≈ 1.0 (max risk), ≥180min ≈ 0.0 (low structural risk)
+    age_risk = _map_linear(age_min, 180.0, 5.0)
+
+    # --- Liquidity risk (thinner liq → more fragile) ---
+    liq_keys = ("liq_usd", "liquidity_usd", "pool_liquidity_usd", "liq_total_usd")
+    liq_usd = _first_present_float(features, liq_keys, 50_000.0)
+    # Interpret tiny numbers as very risky, big liq as safer.
+    liq_risk = _map_linear(liq_usd, 50_000.0, 500.0)
+
+    # --- Holder concentration risk ---
+    conc_keys = ("top10_holder_pct", "top10_holder_share", "holder_concentration", "top10_pct")
+    top10 = _first_present_float(features, conc_keys, 0.7)
+    # Normalize potential 0..100 → 0..1
+    if top10 > 1.0:
+        top10 /= 100.0
+    conc_risk = _clamp(top10, 0.0, 1.0)
+
+    # --- Honeypot / rug flag risk ---
+    # Hard boolean flags
+    honeypot_flag = any(
+        _safe_bool(features, key, False)
+        for key in ("honeypot_flag", "is_honeypot", "is_scam", "is_rug")
+    )
+    if honeypot_flag:
+        hp_risk = 1.0
+    else:
+        # Soft scores: 0..1 or 0..100
+        hp_score_keys = (
+            "honeypot_score",
+            "honeypot_prob",
+            "rug_score",
+            "fraud_score",
+            "ai_risk_score",
+        )
+        raw_hp = _first_present_float(features, hp_score_keys, 0.0)
+        if raw_hp > 1.0 and raw_hp <= 100.0:
+            raw_hp = raw_hp / 100.0
+        hp_risk = _clamp(raw_hp, 0.0, 1.0)
+
+    # --- Dev / deployer behavior risk (if present) ---
+    dev_sell_keys = ("dev_sell_5m_usd", "deployer_sell_5m_usd")
+    dev_hold_keys = ("dev_hold_pct", "deployer_hold_pct", "creator_hold_pct")
+
+    dev_sell_5m = _first_present_float(features, dev_sell_keys, 0.0)
+    dev_hold_pct = _first_present_float(features, dev_hold_keys, 0.10)
+    if dev_hold_pct > 1.0:
+        dev_hold_pct /= 100.0
+
+    # If dev is dumping hard and still owns a lot → very suspicious
+    if dev_sell_5m > 0:
+        # Soft scale ~log with cap
+        dev_risk_sell = _clamp(math.log10(dev_sell_5m + 1.0) / 3.0, 0.0, 1.0)
+        dev_risk_hold = _clamp(dev_hold_pct * 1.5, 0.0, 1.0)
+        dev_risk = _clamp(0.5 * dev_risk_sell + 0.5 * dev_risk_hold, 0.0, 1.0)
+    else:
+        dev_risk = _clamp(dev_hold_pct * 0.6, 0.0, 1.0)
+
+    # --- Combine into heuristic risk score ---
+    heur_score = (
+        0.22 * age_risk
+        + 0.24 * liq_risk
+        + 0.18 * conc_risk
+        + 0.24 * hp_risk
+        + 0.12 * dev_risk
+    )
+    heur_score = _clamp(heur_score, 0.0, 1.0)
+
+    # --- Confidence: more real signals → higher confidence ---
+    signal_count = 0
+    if any(k in features for k in age_keys):
+        signal_count += 1
+    if any(k in features for k in liq_keys):
+        signal_count += 1
+    if any(k in features for k in conc_keys):
+        signal_count += 1
+    if any(k in features for k in dev_sell_keys + dev_hold_keys):
+        signal_count += 1
+    if any(
+        k in features
+        for k in (
+            "honeypot_flag",
+            "is_honeypot",
+            "is_scam",
+            "is_rug",
+            "honeypot_score",
+            "honeypot_prob",
+            "rug_score",
+            "fraud_score",
+            "ai_risk_score",
+        )
+    ):
+        signal_count += 1
+
+    # base 0.2–0.9 depending on how many non-default pieces we had
+    conf_heur = _clamp(0.2 + 0.14 * signal_count, 0.2, 0.9)
+
+    return {
+        "heur_score": heur_score,
+        "heur_conf": conf_heur,
+        "hp_risk": hp_risk,
+        "age_risk": age_risk,
+        "liq_risk": liq_risk,
+        "conc_risk": conc_risk,
+        "dev_risk": dev_risk,
+    }
+
+
+def score_candidate(
+    features: Dict[str, Any],
+    config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Candidate-level rug / fraud risk score.
+
+    This is intentionally:
+        • fast (pure Python math, no network / IO)
+        • tolerant of missing fields
+        • monotone: higher score means *higher* risk.
+
+    Returns dict:
+        {
+            "score": float in [0,1],
+            "conf":  float in [0,1],
+            "label": "safe" | "ok" | "elevated" | "critical",
+        }
+
+    Backtest / entry callers can also pass config with optional overrides:
+
+        AI_RISK_HEUR_WEIGHT   (0..1, default 0.7)
+        AI_RISK_MIN_CLIP      (0..1, default 0.0)
+        AI_RISK_MAX_CLIP      (0..1, default 1.0)
+    """
+    if features is None:
+        features = {}
+
+    heur = _candidate_heuristics(features)
+    heur_score = heur["heur_score"]
+    heur_conf = heur["heur_conf"]
+
+    # Precomputed score hints (e.g. from LLM / external API)
+    pre_score: Optional[float] = None
+    pre_conf: Optional[float] = None
+
+    for key in ("ai_risk_score", "fraud_score", "rug_score", "security_risk_score"):
+        if key in features and features[key] is not None:
+            try:
+                raw = float(features[key])
+            except Exception:
+                continue
+            if raw > 1.0 and raw <= 100.0:
+                raw = raw / 100.0
+            pre_score = _clamp(raw, 0.0, 1.0)
+            break
+
+    for key in ("ai_risk_conf", "fraud_conf", "rug_conf", "security_risk_confidence"):
+        if key in features and features[key] is not None:
+            try:
+                raw = float(features[key])
+            except Exception:
+                continue
+            if raw > 1.0 and raw <= 100.0:
+                raw = raw / 100.0
+            pre_conf = _clamp(raw, 0.0, 1.0)
+            break
+
+    # Weight between heuristic and precomputed
+    heur_weight = 0.7
+    if config is not None:
+        try:
+            val = float(config.get("AI_RISK_HEUR_WEIGHT", heur_weight))
+            heur_weight = _clamp(val, 0.0, 1.0)
+        except Exception:
+            pass
+
+    if pre_score is not None:
+        score = heur_weight * heur_score + (1.0 - heur_weight) * pre_score
+        # confidence: combine heur_conf and pre_conf if present
+        if pre_conf is not None:
+            conf = _clamp(0.5 * heur_conf + 0.5 * pre_conf, 0.0, 1.0)
+        else:
+            conf = heur_conf
+    else:
+        score = heur_score
+        conf = heur_conf
+
+    # Optional clips from config
+    if config is not None:
+        try:
+            mn = float(config.get("AI_RISK_MIN_CLIP", 0.0))
+            mx = float(config.get("AI_RISK_MAX_CLIP", 1.0))
+            if mx < mn:
+                mx = mn
+            score = _clamp(score, mn, mx)
+        except Exception:
+            score = _clamp(score, 0.0, 1.0)
+    else:
+        score = _clamp(score, 0.0, 1.0)
+
+    # Simple label mapping
+    if score < 0.25:
+        label = "safe"
+    elif score < 0.45:
+        label = "ok"
+    elif score < 0.7:
+        label = "elevated"
+    else:
+        label = "critical"
+
+    return {
+        "score": float(score),
+        "conf": float(conf),
+        "label": label,
+    }
+
+
+# Backward-compatible aliases used by backtest_engine._maybe_ai_risk_score()
+def score_entry(
+    features: Dict[str, Any],
+    config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    return score_candidate(features, config)
+
+
+def score(
+    features: Dict[str, Any],
+    config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    return score_candidate(features, config)
+
+
+def evaluate(
+    features: Dict[str, Any],
+    config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    return score_candidate(features, config)
+
+
 # Simple CLI / debug usage
 if __name__ == "__main__":
-    # Tiny smoke test
+    # Tiny smoke test for overlay + capacity adjustment
     base_features = {
         "equity_usd": 1_000.0,
         "winrate20": 0.62,
@@ -835,3 +1139,15 @@ if __name__ == "__main__":
         perf_snapshot=_build_perf_snapshot_from_features(base_features),
     )
     print("overlay:", overlay)
+
+    # Candidate-level smoke test
+    candidate_feats = {
+        "age_min": 3.0,
+        "liq_usd": 1500.0,
+        "top10_holder_pct": 92.0,
+        "dev_sell_5m_usd": 500.0,
+        "dev_hold_pct": 40.0,
+        "honeypot_score": 0.8,
+    }
+    cand = score_candidate(candidate_feats, config={"AI_RISK_HEUR_WEIGHT": 0.7})
+    print("candidate_score:", cand)

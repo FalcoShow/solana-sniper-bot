@@ -1,75 +1,66 @@
+# utils_pkg/risk_manager.py
 from __future__ import annotations
 
 """
 utils_pkg/risk_manager.py
 
-Quant-grade portfolio risk manager (V3+++)
-=========================================
+Quant-grade portfolio risk manager (V3+++ / God-Tier / Phase 0–7)
+=================================================================
 
-High-level role
----------------
-Central portfolio risk brain. Single source of truth for:
+MASTER ROLE IN THE STACK
+------------------------
+This is the single “risk brain” for the whole system. It glues together:
 
-  • How big we trade
-        - ticket size (USD)
-        - per-position % of equity cap
-        - max concurrent positions
-        - daily spend cap (USD / % of equity)
-        - optional global equity drawdown kill-switch
-        - ticket min/max clamps for UX
-        - Kelly-style safety clamp for per-trade risk
-        - Equity utilization guardrail (ticket * concurrency vs equity)
-        - Liquidity-aware ticket sizing (vs pool_depth)
+  • Wallet + equity sensing        (live equity, SOL floor, synthetic equity)
+  • Performance sensing            (winrate-20, rolling DD, daily PnL)
+  • Regime engine                  (regime_state: risk_on/off, volatility, chop)
+  • Self-learning strategy         (equity plan, caps, HARD_HALT, MIN_SOL_BALANCE)
+  • AI capacity overlay            (ai_risk_model: capacity nudges)
+  • Kelly-style safety clamp       (fraction of equity per trade)
+  • Live overrides                 (Redis knobs for ops / dashboards)
+  • Sandbox mode                   (low-risk “flight simulator” mode)
+  • Equity utilization guardrail   (ticket * concurrency vs equity)
+  • Trading window gating          (UTC hours + allowed weekdays)
 
-  • When we are allowed to open new positions
+And produces, for the rest of the system:
+
+  • Global risk limits:
+        - ticket_usd (base position size)
+        - pos_pct_cap (max per-position risk vs equity)
+        - max_concurrent (hard cap on open positions)
+        - daily_spend_usd (daily notional budget)
         - risk_capacity ∈ [0,1]
-        - risk_mode (0=OFF, 1=NORMAL, 2=AGGRESSIVE, 3=DEFENSIVE)
-        - infra halt flags ("infra:halt")
-        - daily profit / loss caps
-        - daily USD spend budget
-        - daily max trades cap
-        - consecutive-loss cooldown windows
-        - DD-based cooldown windows
-        - SOL balance floor via self-learning MIN_SOL_BALANCE
-        - strategy “plan awareness” (ahead/behind equity curve)
-        - optional HARD_HALT from self-learning strategy
-        - optional manual/ops-level block ("risk:manual_block")
-        - regime_state hard risk-off flag
-        - optional equity floor guardrail (RISK_MIN_EQUITY_USD)
-        - optional sandbox mode (RISK_SANDBOX_MODE) for low-risk live testing
-        - optional synthetic equity override (RISK_EQUITY_OVERRIDE_USD)
-        - trading-window gating (UTC hours + allowed weekdays)
+        - risk_mode ∈ {0=OFF,1=NORMAL,2=AGGRESSIVE,3=DEFENSIVE}
+        - risk_profile (conservative / balanced / aggressive / auto)
+        - equity_utilization_pct (how “loaded” we are)
 
-  • How we compress performance + regime + plan → capacity
-        - winrate-20
-        - rolling DD vs equity HWM
-        - daily realized PnL vs daily target
-        - regime_state risk multiplier (risk_off/normal/risk_on)
-        - volatility / choppiness penalties
-        - AI risk overlay (ai_risk_model)
-        - regime_gate_factor from regime_state (extra gate)
-        - optional equity kill-switch
-        - Kelly-style sanity fraction for per-trade risk
-        - plan bias (ahead-of-plan → shrink; behind → slight boost)
+  • Entry gate decisions:
+        - should_allow_new_entry()             → True/False
+        - entry_gate_debug()                   → detailed reasons
 
-  • Publishing a lightweight risk:ctx hash for:
-        - FeatureBuilder / ai_entry_logic / ai_buy_scoring / scanners
-        - Strategy / dashboards / self-learning feedback
-        - reinvestor / exit_engine / ai_sell_logic
+  • Context for AI / feature layers:
+        - risk_capacity_snapshot()
+        - read_risk_ctx_hash() (Redis hash for FeatureBuilder / ai_entry_logic /
+          ai_buy_scoring / scanners / reinvestor / self_learning_ai_strategy)
 
-  • Central trade result hook (note_trade_result) for:
-        - metrics / DD / winrate
-        - Notion logging
-        - self-learning strategy updates
-        - regime_state account update
-        - consecutive-loss & DD-based cooldown management
-        - daily trades counter (for RISK_MAX_DAILY_TRADES)
+  • Trade result ingestion:
+        - note_trade_result() updates:
+              * daily realized PnL
+              * winrate-20
+              * rolling drawdown vs equity HWM
+              * daily trades count
+              * cooldowns on losing streak / DD
+              * regime_state account-awareness
+              * self_learning_ai_strategy.process_trade_closure()
+              * Notion / data_logger analytics
+              * (indirectly via data_logger → ai_db training rows)
 
-  • Optional legacy per-position exit guardrail:
-        - trailing/stop-loss / target profit / max-hold *advisory alerts*
-        - NOTE: in the V3+++ stack, actual sells are executed by
-          `ai_sell_logic` / `exit_engine`. The guardrail here is an
-          extra *alerting* layer, not a direct seller.
+  • Health + diagnostics:
+        - risk_snapshot() / risk_budget_summary()
+        - risk_health() (aggregate health block for dashboards / healthcheck)
+
+In other words: **everything that wants to know “can we trade and how big?” talks
+to THIS module**, not to random env vars.
 
 Public API
 ----------
@@ -84,32 +75,47 @@ Public API
   async risk_capacity_score(redis=None) -> float
   async read_risk_ctx_hash(redis=None) -> dict[str, float]
 
-  async note_trade_result(...)
-  async note_spend(redis, usd: float) -> None
-  async risk_budget_summary(redis=None) -> dict
   async estimate_equity_usd() -> float
 
-  # Pair-level helper:
-  async pair_limits_for_depth(pool_depth_usd: Optional[float], redis=None) -> dict
-  def liq_aware_ticket_usd(base_ticket_usd: float, pool_depth_usd: Optional[float]) -> float
+  async note_trade_result(...)
+  async note_spend(redis, usd: float) -> None
 
-  # High-level diagnostics:
-  async risk_health(redis=None) -> dict   # aggregate risk_snapshot + entry_gate_debug
+  async pair_limits_for_depth(pool_depth_usd, redis=None) -> dict
+  def  liq_aware_ticket_usd(base_ticket_usd, pool_depth_usd) -> float
 
-  # Loops:
   async monitor_positions_loop(...)
   async risk_manager_loop(stop_evt)
 
-  # Extra helpers for ops / dashboards:
-  async set_manual_block(on: bool = True, redis=None) -> None
+  async set_manual_block(on=True, redis=None) -> None
   async clear_manual_block(redis=None) -> None
   async clear_risk_cooldown(redis=None) -> None
   async force_risk_mode(mode: int | None, redis=None) -> None
   async set_risk_profile_override(profile: str | None, redis=None) -> None
 
+  async risk_health(redis=None) -> dict
+
 All other modules (Strategy, scanners, ai_entry_logic, ai_buy_scoring,
 self_learning_ai_strategy, reinvestor, ai_sell_logic, exit_engine)
 should treat THIS as the canonical risk brain for sizing / gating.
+
+God-Tier Phases (how this file maps to Phase 0–7)
+-------------------------------------------------
+Phase 0 – Wiring / Infra:
+    Redis, equity sensing, metrics keys, trading window, cooldown keys.
+Phase 1 – Observability:
+    risk_snapshot(), risk_budget_summary(), risk_health(), risk:ctx hash.
+Phase 2 – Dynamic Sizing:
+    current_limits(), tier schedule, regime scaling, equity utilization guardrail.
+Phase 3 – Performance-Aware:
+    winrate-20, rolling DD, daily PnL → risk_capacity in [0,1].
+Phase 4 – AI / Kelly Layer:
+    Kelly clamp, ai_risk_model capacity nudges, regime_gate_factor, risk_profile auto.
+Phase 5 – Self-Learning:
+    get_strategy_params(), plan_gap_pct, HARD_HALT, self-learning caps, note_trade_result().
+Phase 6 – Guardrails:
+    daily loss/ profit stop, cooldowns, equity floor, SOL floor, trading window, infra:halt.
+Phase 7 – Autopilot Diagnostics:
+    entry_gate_debug(), risk_health(), rich risk:ctx for FeatureBuilder / AI brain.
 """
 
 import asyncio
@@ -121,7 +127,6 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple, List
-from utils_pkg.ai_risk_model import predict_capacity_adjustment
 
 # Optional standalone redis client (fallback if core_utils.redis is None)
 try:  # pragma: no cover – optional dependency
@@ -164,7 +169,7 @@ try:  # pragma: no cover - optional
 except Exception:  # pragma: no cover
     _predict_capacity_adjustment = None  # type: ignore[assignment]
 
-# Optional structured logger (linked to data_logger)
+# Optional structured logger (linked to data_logger → ai_db)
 try:
     from utils_pkg.data_logger import log_event  # type: ignore
 except Exception:  # pragma: no cover
@@ -177,7 +182,7 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
 # Version tag for dashboards / debugging / AI
-RISK_ENGINE_VERSION = "3+++"  # keep in sync with other V3+++ modules
+RISK_ENGINE_VERSION = "3+++_GOD_TIER_PHASE0_7"  # keep in sync with other V3+++ modules
 
 __all__ = [
     # sizing / gating
@@ -185,6 +190,7 @@ __all__ = [
     "should_allow_new_entry",
     "entry_gate_debug",
     "recommend_ticket_usd",
+    "equity_and_ticket", 
     "risk_snapshot",
     "risk_capacity_snapshot",
     "risk_capacity_score",
@@ -294,7 +300,7 @@ RISK_MAX_TICKET_USD = _env_float("RISK_MAX_TICKET_USD", 5_000.0)
 # (ticket_usd * max_concurrent <= equity * RISK_MAX_EQUITY_UTILIZATION_PCT/100)
 RISK_MAX_EQUITY_UTILIZATION_PCT = _env_float(
     "RISK_MAX_EQUITY_UTILIZATION_PCT",
-    25.0,  # default: at most 25% of equity notionally at work across open tickets
+    25.0,  # ~25% of equity notionally at work across open tickets
 )
 
 # ---- Adaptive throttle thresholds ----
@@ -1235,6 +1241,7 @@ async def _update_risk_context_hash(
     regime_gate_factor: float,
     equity_utilization_pct: float,
     trading_window_open: bool,
+    trading_window_reason: str,
 ) -> None:
     """
     Publish risk:ctx for FeatureBuilder / scanners / self-learning:
@@ -1267,6 +1274,7 @@ async def _update_risk_context_hash(
       - risk_profile_env        (env default)
       - equity_override_usd     (synthetic equity in use, if any)
       - trading_window_open     (0/1, UTC-based)
+      - trading_window_reason   (string, e.g. "within_trading_window")
       - halt_reason (if any)
       - risk_engine_version
       - equity_hwm_usd
@@ -1351,6 +1359,7 @@ async def _update_risk_context_hash(
         "equity_hwm_usd": f"{float(equity_hwm):.4f}",
         "equity_override_usd": f"{float(RISK_EQUITY_OVERRIDE_USD):.4f}",
         "trading_window_open": "1" if trading_window_open else "0",
+        "trading_window_reason": trading_window_reason,
         "last_update_ts": datetime.now(timezone.utc).isoformat(),
     }
     if strat_mode is not None:
@@ -1391,6 +1400,7 @@ async def _update_risk_context_hash(
                 "regime_gate_factor": regime_gate_factor,
                 "equity_utilization_pct": equity_utilization_pct,
                 "trading_window_open": trading_window_open,
+                "trading_window_reason": trading_window_reason,
                 "risk_engine_version": RISK_ENGINE_VERSION,
             },
         )
@@ -1527,7 +1537,7 @@ async def current_limits(redis=None) -> Dict[str, Any]:
     Compute risk limits from equity + tier + regime + throttle + risk capacity
     + overrides + self-learning strategy constraints + plan-aware & AI overlays
     + Kelly-style safety clamp, synthetic equity override, regime_gate_factor,
-    equity utilization guardrail, and trading-window status.
+    equity utilization guardrail, trading-window status & concurrency context.
 
     Returns dict with:
       equity_usd, ticket_usd, pos_pct_cap, max_concurrent,
@@ -1679,7 +1689,7 @@ async def current_limits(redis=None) -> Dict[str, Any]:
             # ahead of plan → shrink risk, up to -0.3
             plan_bias = -min(abs(plan_gap_pct) / 100.0 * 0.3, 0.3)
         else:
-            # behind plan → can gently boost risk, up to +0.2
+            # behind plan → gently boost risk, up to +0.2
             plan_bias = min(abs(plan_gap_pct) / 100.0 * 0.2, 0.2)
     capacity_raw = _clamp(capacity_raw + plan_bias, 0.0, 1.0)
 
@@ -1777,7 +1787,13 @@ async def current_limits(redis=None) -> Dict[str, Any]:
     max_conc = int(overrides["max_concurrent"])
     daily_spend_usd = float(overrides["daily_spend_usd"])
 
-    # After overrides, recompute equity utilization for diagnostics
+    # FINAL per-trade safety clamp: ticket must respect per-trade risk fraction.
+    if equity > 0 and pos_pct_cap > 0:
+        max_ticket_from_pos_pct = equity * pos_pct_cap
+        if ticket > max_ticket_from_pos_pct:
+            ticket = max_ticket_from_pos_pct
+
+    # After overrides + final clamp, recompute equity utilization for diagnostics
     if equity > 0 and max_conc > 0:
         equity_utilization_pct = min(
             100.0,
@@ -1839,7 +1855,7 @@ async def current_limits(redis=None) -> Dict[str, Any]:
             cooldown_until_ts = None
 
     # Trading window open/closed status (UTC)
-    trading_window_open, _tw_reason = _trading_window_status()
+    trading_window_open, tw_reason = _trading_window_status()
 
     # Publish risk:ctx for FeatureBuilder / ai_buy_scoring + self-learning
     try:
@@ -1866,6 +1882,7 @@ async def current_limits(redis=None) -> Dict[str, Any]:
             regime_gate_factor=regime_gate_factor,
             equity_utilization_pct=equity_utilization_pct,
             trading_window_open=trading_window_open,
+            trading_window_reason=tw_reason,
         )
     except Exception:
         pass
@@ -1895,6 +1912,26 @@ async def recommend_ticket_usd(redis=None) -> float:
     limits = await current_limits(redis)
     return float(limits["ticket_usd"])
 
+async def equity_and_ticket(redis=None) -> Dict[str, Any]:
+    """
+    Micro-helper for any module that just wants the core sizing snapshot
+    without dealing with the full current_limits() dict.
+
+    Returns:
+      {
+        "equity_usd": float,
+        "ticket_usd": float,
+        "risk_capacity": float,
+        "risk_mode": int,
+      }
+    """
+    limits = await current_limits(redis)
+    return {
+        "equity_usd": float(limits["equity_usd"]),
+        "ticket_usd": float(limits["ticket_usd"]),
+        "risk_capacity": float(limits["risk_capacity"]),
+        "risk_mode": int(limits["risk_mode"]),
+    }
 
 # ============================================================================ #
 # Risk capacity public APIs (for FeatureBuilder / ai_entry_logic / reinvestor)
@@ -2369,7 +2406,7 @@ async def should_allow_new_entry(redis=None) -> bool:
       - wallet SOL balance < MIN_SOL_BALANCE from self-learning strategy
       - strategy HARD_HALT flag
       - strategy plan hard-stop when far ahead of plan (optional)
-      - regime_state hard risk_off flag
+      - regime_state hard risk-off flag
       - trading window closed (UTC hours + weekdays)
       - NEW: concurrency guard (open_positions >= max_concurrent)
 
@@ -2569,6 +2606,7 @@ async def should_allow_new_entry(redis=None) -> bool:
             return False
 
     return True
+
 
 async def entry_gate_debug(redis=None) -> Dict[str, Any]:
     """
@@ -3273,7 +3311,7 @@ async def monitor_positions_loop(
     Background loop that monitors open positions and runs the legacy guardrail.
 
     In V3+++:
-      - This loop is *optional* and only emits advisory alerts via Telegram /
+      - This loop is *optional* and only emits advisory alerts via Telegram / 
         data_logger when RISK_LEGACY_SELL_ENABLED=1.
       - It does NOT execute sells. ai_sell_logic / exit_engine are the primary
         exit engines.
@@ -3299,6 +3337,7 @@ async def monitor_positions_loop(
     logger.info("[RISK] monitor_positions_loop started (interval=%ss)", interval_sec)
 
     while not (stop_evt and stop_evt.is_set()):
+
         try:
             positions = load_positions()
         except Exception as e:
@@ -3498,6 +3537,9 @@ if __name__ == "__main__":
     async def _main() -> None:
         """
         Simple CLI debug: print aggregate risk health as JSON.
+
+        Usage:
+          python -m utils_pkg.risk_manager
         """
         redis = await _get_redis()
         health = await risk_health(redis)

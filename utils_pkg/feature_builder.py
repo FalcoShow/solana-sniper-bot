@@ -3,8 +3,9 @@ from __future__ import annotations
 """
 utils_pkg/feature_builder.py
 
-Canonical feature builder for AI models (V3+++ / quant-grade).
-==============================================================
+Canonical feature builder for AI models
+(God-Tier Overhaul – V3+++ / quant-grade / Pump-aware / Phase 0–7).
+===================================================================
 
 Central place to turn a raw scanner / meta snapshot into a dense, numeric
 feature dict that is consumed by:
@@ -32,21 +33,35 @@ Design goals
     * rug / impact normalization (AI fraud score, impact_1k_bps)
     * PF scores + risk-adjusted composites + micro-alpha score
     * microstructure from short-term history (returns, vol, trend flags)
-    * risk context (open positions, DD, capacity, RR/SL/TP, Kelly hint)
+    * risk context (open positions, DD, capacity, RR/SL/TP, Kelly hints)
     * high-level composites:
         - entry_quality_score
-        - position_size_scalar
-        - position_size_kelly_scalar
+        - entry_quality_risk_adjusted
+        - entry_quality_kelly_adjusted
         - entry_risk_score
+        - entry_grade_bucket
+        - entry_quality_vs_degen
+        - position_size_scalar
+        - position_size_raw_scalar
+        - position_size_capacity_scalar
+        - position_size_kelly_scalar
+        - risk_capacity_score / risk_kelly_fraction_hint
         - entry_block_flag / entry_soft_block_flag
+        - gate_*_ok flags (mirrors ai_buy_scoring pre-gates)
         - entry_tier_bucket / position_size_bucket
+        - entry_score_v1 / size_scalar_v1 (stable aliases)
+        - risk_daily_state & labels (recovery / neutral / heat)
     * scanner metadata (raydium / dexscreener / pumpfun / momo)
     * AI hooks (ai_buy_score, ai_entry_score, ai_confidence, etc.)
     * liquidity_regime_score + micro_risk_on_score/flag
-    * stable aliases: entry_score_v1 / size_scalar_v1
+    * Pump.fun 60s flow & stage features for dead-coin avoidance:
+        - pump_stage_01 / pump_stage
+        - pump_buyers_60s / pump_buys_60s / pump_sol_60s
+        - pump_idle_sec / pump_is_idle_heavy
+        - pump_velocity_score
 
-Backwards-compat:
------------------
+Backwards-compat
+----------------
 Public API remains:
 
     build_features(snapshot: Mapping[str, Any]) -> Dict[str, float]
@@ -63,6 +78,9 @@ Public API remains:
         scanner_source="raydium",        # optional
         risk_context=risk_ctx_dict,      # optional (open positions, DD, etc.),
     )
+
+Anything that already depended on the old feature names keeps working.
+We only add new fields; we do not rename or remove existing ones.
 """
 
 import math
@@ -77,6 +95,13 @@ try:  # pragma: no cover
     from utils_pkg.regime import RegimeState  # type: ignore
 except Exception:  # pragma: no cover
     RegimeState = None  # type: ignore
+
+
+# Bump when adding / changing composite logic (NOT on every tiny tweak).
+# This is the canonical feature-vector version the rest of the stack uses.
+FEATURE_VERSION: float = 7.00  # God-Tier V3+++ / quant-grade (Phase 0–7 final)
+FEATURE_SCHEMA_NAME: str = "god_tier_v3_quant_phase0_7"
+FEATURE_PHASE: float = 7.0  # numeric tag for Phase 0–7 stack
 
 
 # ============================================================================ #
@@ -192,7 +217,7 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, float]:
 
     Expected snapshot fields (best-effort, all optional):
 
-      liq_usd, mcap_usd, fdv_usd, token_age_min/age_min/ageMinutes
+      liq_usd, mcap_usd, fdv_usd, token_age_min/age_min/ageMinutes/age
       vol_1m_usd, vol_5m_usd/vol5, vol_15m_usd, vol_1h_usd/vol1h, vol_24h_usd/vol24h
       buys_1m, sells_1m, buys_5m/buys5, sells_5m/sells5, txns_5m
       price_usd/px_usd/price/p
@@ -219,14 +244,23 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, float]:
 
       pf_momentum_score, pf_final_score, pf_risk_adjusted_final
 
+      Pump.fun-specific (optional, used by pump_filters & AI):
+      -------------------------------------------------------
+      pump_stage, pump_stage_01, pf_stage, pf_curve_progress
+      pump_buyers_60s, buyers_60s
+      pump_buys_60s, buys_60s
+      pump_sol_60s, vol_60s_sol, vol_60s_base
+      pump_idle_sec, idle_sec, secs_since_last_trade
+
     We tolerate missing fields and derive as many stable features as possible.
     """
     raw = dict(snapshot)  # shallow copy for safety
     feats: Dict[str, Any] = {}
 
-    # Meta / versioning – bump this when feature semantics change materially.
-    # Keep this in sync with ai_entry_logic / ai_buy_scoring expectations.
-    feats["feature_version"] = 3.50  # V3+++ feature vector (quant-grade, extended)
+    # Meta / versioning – keep version stable, extend vector only
+    feats["feature_version"] = FEATURE_VERSION
+    feats["feature_schema"] = FEATURE_SCHEMA_NAME
+    feats["feature_phase"] = FEATURE_PHASE
 
     # ------------------------------------------------------------------ #
     # Core size / age
@@ -239,22 +273,26 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, float]:
         "token_age_min",
         _f(raw, "age_min", _f(raw, "ageMinutes", _f(raw, "age", 0.0))),
     )
+    if token_age_min < 0:
+        token_age_min = 0.0
     token_age_hr = token_age_min / 60.0 if token_age_min > 0 else 0.0
+    token_age_sec = token_age_min * 60.0 if token_age_min > 0 else 0.0
 
     feats["liq_usd"] = liq_usd
     feats["mcap_usd"] = mcap_usd
     feats["fdv_usd"] = fdv_usd
     feats["token_age_min"] = token_age_min
     feats["token_age_hr"] = token_age_hr
+    feats["token_age_sec"] = token_age_sec
 
     feats["log_liq_usd"] = _log1p_pos(liq_usd)
     feats["log_mcap_usd"] = _log1p_pos(mcap_usd)
     feats["log_fdv_usd"] = _log1p_pos(fdv_usd)
 
     # Normalized size (rough reference scales tuned for Solana meme land)
-    feats["liq_norm"] = _norm_log_scale(liq_usd, 1_000_000.0)  # ref 1M liq
-    feats["mcap_norm"] = _norm_log_scale(mcap_usd, 10_000_000.0)  # ref 10M mcap
-    feats["fdv_norm"] = _norm_log_scale(fdv_usd, 20_000_000.0)  # ref 20M fdv
+    feats["liq_norm"] = _norm_log_scale(liq_usd, 1_000_000.0)        # ref 1M liq
+    feats["mcap_norm"] = _norm_log_scale(mcap_usd, 10_000_000.0)     # ref 10M mcap
+    feats["fdv_norm"] = _norm_log_scale(fdv_usd, 20_000_000.0)       # ref 20M fdv
 
     # Age buckets
     is_very_new = 1.0 if token_age_min <= 30 else 0.0
@@ -621,13 +659,75 @@ def build_features(snapshot: Mapping[str, Any]) -> Dict[str, float]:
         feats["pf_momentum_score"] * (1.0 - ai_rug_01)
     )
 
-    # Entry micro-alpha: local momentum + orderflow + smart/whale alignment + alpha flow
+    # ------------------------------------------------------------------ #
+    # Pump.fun dynamic flow / idle extras (for pump_filters & AI)
+    # ------------------------------------------------------------------ #
+    # Stage may come as 0..1, 0..100, or similar; normalize to 0..1.
+    pump_stage_raw = _f(
+        raw,
+        "pump_stage",
+        _f(raw, "pump_stage_01", _f(raw, "pf_stage", _f(raw, "pf_curve_progress", 0.0))),
+    )
+    if pump_stage_raw > 1.0:
+        if pump_stage_raw <= 100.0:
+            pump_stage_01 = pump_stage_raw / 100.0
+        else:
+            pump_stage_01 = pump_stage_raw / 1000.0
+    else:
+        pump_stage_01 = pump_stage_raw
+    pump_stage_01 = _clip01(pump_stage_01)
+
+    pump_buyers_60s = _i(raw, "pump_buyers_60s", _i(raw, "buyers_60s", 0))
+    pump_buys_60s = _i(raw, "pump_buys_60s", _i(raw, "buys_60s", 0))
+    pump_sol_60s = _f(
+        raw,
+        "pump_sol_60s",
+        _f(raw, "vol_60s_sol", _f(raw, "vol_60s_base", 0.0)),
+    )
+    pump_idle_sec = _f(
+        raw,
+        "pump_idle_sec",
+        _f(raw, "idle_sec", _f(raw, "secs_since_last_trade", 0.0)),
+    )
+
+    feats["pump_stage_01"] = pump_stage_01
+    feats["pump_stage"] = pump_stage_01 * 100.0
+    feats["pump_buyers_60s"] = pump_buyers_60s
+    feats["pump_buys_60s"] = pump_buys_60s
+    feats["pump_sol_60s"] = pump_sol_60s
+    feats["pump_idle_sec"] = pump_idle_sec
+    feats["pump_is_idle_heavy"] = 1.0 if pump_idle_sec >= 120.0 else 0.0
+
+    # Velocity: how "alive" is the pump in the last 60s.
+    vel = 0.0
+    vel += _safe_ratio(pump_buys_60s, 10.0, 0.0)    # 10+ buys/min is strong
+    vel += _safe_ratio(pump_buyers_60s, 5.0, 0.0)   # buyer diversity
+    vel += _safe_ratio(pump_sol_60s, 5.0, 0.0)      # raw SOL flow
+
+    # Early-stage boost, late-stage penalty.
+    early_factor = 1.0 + (1.0 - pump_stage_01)
+    # Idle penalty (heavy idle kills velocity).
+    if pump_idle_sec > 0.0:
+        idle_pen = _clip01(pump_idle_sec / 120.0)  # 2m idle → ~1
+        early_factor *= (1.0 - 0.5 * idle_pen)
+
+    vel *= early_factor
+    pump_velocity_score = _clip(vel, 0.0, 20.0)
+    feats["pump_velocity_score"] = pump_velocity_score
+
+    # ------------------------------------------------------------------ #
+    # Entry micro-alpha: local momentum + orderflow + smart/whale alignment
+    #                    + alpha flow + (optional) pump velocity.
+    # ------------------------------------------------------------------ #
+    pump_vel_norm = _clip01(_safe_ratio(pump_velocity_score, 10.0, 0.0))
+
     entry_micro = (
-        0.25 * _clip01(short_mom / 50.0)
+        0.22 * _clip01(short_mom / 50.0)
         + 0.20 * _clip01(mid_mom / 80.0)
-        + 0.20 * _clip01(base_buy_press)
-        + 0.20 * _clip01(consolidated_align)
-        + 0.15 * _clip01(alpha_flow_boost)
+        + 0.18 * _clip01(base_buy_press)
+        + 0.18 * _clip01(consolidated_align)
+        + 0.12 * _clip01(alpha_flow_boost)
+        + 0.10 * pump_vel_norm
     )
     feats["entry_micro_alpha"] = _clip(entry_micro, 0.0, 1.5)
     # Alias for AI models / clarity
@@ -804,6 +904,7 @@ class FeatureBuilder:
         # older caller passed unexpected parameters.
         self.new_age_threshold_min = float(new_age_threshold_min)
 
+    # Public entrypoint
     def build(
         self,
         *,
@@ -829,6 +930,7 @@ class FeatureBuilder:
 
             # Attach symbol / mint as numeric markers (real strings live in raw JSON/logs)
             if symbol is not None:
+                # keep as numeric stub for ML frameworks that expect purely numeric arrays
                 feats["symbol"] = 0.0
             if mint is not None:
                 feats["mint"] = 0.0
@@ -887,6 +989,13 @@ class FeatureBuilder:
                     "smart_accumulation_score",
                     "smart_panic_dump_score",
                     "whale_liquidity_footprint",
+                    # Pump extras if wallet tracker knows about them:
+                    "pump_buyers_60s",
+                    "pump_buys_60s",
+                    "pump_sol_60s",
+                    "pump_idle_sec",
+                    "pump_stage_01",
+                    "pump_velocity_score",
                 ):
                     if k in wallet_signals:
                         feats[k] = _nan_zero(wallet_signals[k])
@@ -1032,9 +1141,17 @@ class FeatureBuilder:
                 feats["risk_mode_defensive"] = 1.0 if mode == 3 else 0.0
 
                 # Capacity scalar: how much room we have to add risk today
-                capacity = (1.0 - _clip01(frac_open)) * (
+                base_capacity = (1.0 - _clip01(frac_open)) * (
                     1.0 - _clip01(dd_pct / max_dd_pct)
                 )
+                mode_scalar = 1.15 if mode == 2 else 1.0  # aggressive a bit more
+                if mode == 3:  # defensive
+                    mode_scalar = 0.6
+
+                feats["risk_capacity_base"] = _clip01(base_capacity)
+                feats["risk_capacity_mode_scalar"] = _clip(mode_scalar, 0.3, 1.5)
+
+                capacity = base_capacity * mode_scalar
                 feats["risk_capacity_score"] = _clip(capacity, 0.0, 1.0)
 
                 # Reward-to-risk attractiveness scalar
@@ -1062,6 +1179,28 @@ class FeatureBuilder:
                 feats["risk_hit_daily_trades_limit"] = _b(
                     risk_context, "hit_daily_trades_limit", False
                 )
+
+                # PnL bias hint: used by AI layers to lean risk-on/risk-off per day
+                # Negative PnL → tilt toward defensive; positive → allow more aggression.
+                pnl_norm = _clip(
+                    pnl_pct / max(max_dd_pct, 1.0), -2.0, 2.0
+                )  # -200%..+200% of daily DD
+                feats["pnl_bias_hint"] = pnl_norm  # keep signed; downstream can map
+
+                # Map daily PnL into a compact regime-style state for self-learning:
+                #  -1 = recovery / drawdown mode
+                #   0 = neutral
+                #  +1 = green-day / heat mode
+                if pnl_norm <= -0.5:
+                    daily_state = -1.0
+                elif pnl_norm >= 0.5:
+                    daily_state = 1.0
+                else:
+                    daily_state = 0.0
+                feats["risk_daily_state"] = daily_state
+                feats["risk_daily_state_defensive"] = 1.0 if daily_state < 0.0 else 0.0
+                feats["risk_daily_state_neutral"] = 1.0 if daily_state == 0.0 else 0.0
+                feats["risk_daily_state_aggressive"] = 1.0 if daily_state > 0.0 else 0.0
 
             # Scanner metadata (numeric id + momentum flag)
             self._enrich_scanner_metadata(feats, snapshot, scanner_source)
@@ -1092,21 +1231,22 @@ class FeatureBuilder:
         snapshot: Mapping[str, Any],
         scanner_source: str | None,
     ) -> None:
+        src = (scanner_source or "").lower().strip()
         mapping = {
-            None: 0.0,
+            "": 0.0,
             "raydium": 1.0,
             "dexscreener": 2.0,
             "pumpfun": 3.0,
             "momo": 4.0,
         }
-        code = mapping.get(scanner_source, 0.0)
+        code = mapping.get(src, 0.0)
         feats["scanner_source_id"] = code
 
         # One-hots for routing / stats
-        feats["scanner_is_raydium"] = 1.0 if scanner_source == "raydium" else 0.0
-        feats["scanner_is_dexscreener"] = 1.0 if scanner_source == "dexscreener" else 0.0
-        feats["scanner_is_pumpfun"] = 1.0 if scanner_source == "pumpfun" else 0.0
-        feats["scanner_is_momo"] = 1.0 if scanner_source == "momo" else 0.0
+        feats["scanner_is_raydium"] = 1.0 if src == "raydium" else 0.0
+        feats["scanner_is_dexscreener"] = 1.0 if src == "dexscreener" else 0.0
+        feats["scanner_is_pumpfun"] = 1.0 if src == "pumpfun" else 0.0
+        feats["scanner_is_momo"] = 1.0 if src == "momo" else 0.0
 
         mom_ok = (
             snapshot.get("scanner_momentum_ok")
@@ -1125,6 +1265,7 @@ class FeatureBuilder:
         feats["segment_pumpfun"] = 1.0 if segment == "pumpfun" else 0.0
         feats["segment_raydium"] = 1.0 if segment == "raydium" else 0.0
         feats["segment_momo"] = 1.0 if segment == "momo" else 0.0
+        feats["segment_dexscreener"] = 1.0 if segment == "dexscreener" else 0.0
 
     @staticmethod
     def _enrich_short_term_history(
@@ -1265,13 +1406,23 @@ class FeatureBuilder:
         Build high-level composites for:
           - entry_quality_score (0..1.5)
           - position_size_scalar (0..1)
+          - position_size_raw_scalar (0..1)
+          - position_size_capacity_scalar (0..1)
           - position_size_kelly_scalar (0..1)  [Kelly-aware sizing hint]
           - entry_block_flag (0 or 1)
           - entry_soft_block_flag (0 or 1)
           - entry_risk_score (0..1)
           - entry_tier_bucket (0,1,2,3)
           - position_size_bucket (0,1,2,3)
-          - plus stable aliases for ML (entry_score_v1 / size_scalar_v1)
+          - entry_score_v1 / size_scalar_v1
+          - God-tier extras:
+              * entry_quality_risk_adjusted
+              * entry_quality_kelly_adjusted
+              * slippage_risk_score
+              * entry_grade_bucket
+              * entry_quality_vs_degen
+              * gate_*_ok flags (soft pre-gates mirrored by ai_buy_scoring)
+              * risk_daily_state-aware labels (recovery / neutral / heat)
         """
         structural_quality = _nan_zero(feats.get("structural_quality_score", 0.0))
         entry_micro = _nan_zero(feats.get("entry_micro_alpha", 0.0))
@@ -1281,6 +1432,17 @@ class FeatureBuilder:
         is_dead_like = _nan_zero(feats.get("is_dead_like", 0.0))
         liq_ultra_low = _nan_zero(feats.get("liq_bucket_ultra_low", 0.0))
         liq_sweet = _nan_zero(feats.get("liq_bucket_sweet", 0.0))
+
+        # Pump / curve risk extras
+        pf_curve_danger = _clip01(
+            _nan_zero(feats.get("pf_curve_danger_score", 0.0))
+        )
+        pump_stage_01 = _clip01(_nan_zero(feats.get("pump_stage_01", 0.0)))
+        pump_idle_sec = _nan_zero(feats.get("pump_idle_sec", 0.0))
+        pump_idle_long = 1.0 if pump_idle_sec >= 120.0 else 0.0
+        pump_vel_norm = _clip01(
+            _safe_ratio(_nan_zero(feats.get("pump_velocity_score", 0.0)), 10.0, 0.0)
+        )
 
         # Optional smart/whale extras for finer sizing
         smart_alpha_boost = _clip01(_nan_zero(feats.get("smart_alpha_flow_boost", 0.0)))
@@ -1312,9 +1474,37 @@ class FeatureBuilder:
 
         # Flow-aware tweaks: boost on accumulation, penalize on dumps
         flow_boost = 1.0 + 0.15 * flow_accum - 0.15 * flow_dump
-        entry_quality = base_quality * regime_boost * rug_penalty * flow_boost
+
+        # Pump stage: prefer early-stage Pump.fun; penalize late curve/late stage
+        stage_penalty = 1.0 - 0.3 * pump_stage_01
+        stage_penalty = _clip(stage_penalty, 0.4, 1.1)
+
+        entry_quality = (
+            base_quality * regime_boost * rug_penalty * flow_boost * stage_penalty
+        )
         entry_quality = _clip(entry_quality, 0.0, 1.5)
         feats["entry_quality_score"] = entry_quality
+
+        # -------------------------------------------------------------- #
+        # Soft pre-gates — mirrored by ai_buy_scoring gate layout
+        # (kept as features so AI / dashboards can see them directly).
+        # -------------------------------------------------------------- #
+        gate_structural = 1.0 if (structural_quality >= 0.35 and liq_ultra_low == 0.0) else 0.0
+        gate_flow = 1.0 if flow_dump <= 0.7 else 0.0
+        gate_rug = 1.0 if ai_rug <= 0.75 else 0.0
+        gate_pump = 1.0 if (pf_curve_danger <= 0.8 and pump_stage_01 <= 0.97) else 0.0
+        gate_context = 1.0 if risk_capacity >= 0.2 else 0.0
+
+        feats["gate_structural_ok"] = gate_structural
+        feats["gate_flow_ok"] = gate_flow
+        feats["gate_rug_ok"] = gate_rug
+        feats["gate_pump_ok"] = gate_pump
+        feats["gate_context_ok"] = gate_context
+        feats["gate_all_soft_ok"] = (
+            1.0
+            if (gate_structural and gate_flow and gate_rug and gate_pump and gate_context)
+            else 0.0
+        )
 
         # Hard block conditions: don't even consider entries here
         block_hard = False
@@ -1325,6 +1515,12 @@ class FeatureBuilder:
         if liq_ultra_low >= 1.0 and liq_sweet == 0.0:
             block_hard = True
         if flow_dump >= 0.9:  # strong panic dump
+            block_hard = True
+        # Very dangerous pump situations:
+        if pf_curve_danger >= 0.9:
+            block_hard = True
+        # Very late stage + low current velocity + idle → likely dead pump
+        if pump_stage_01 >= 0.98 and pump_vel_norm <= 0.2 and pump_idle_long >= 0.5:
             block_hard = True
 
         feats["entry_block_flag"] = 1.0 if block_hard else 0.0
@@ -1343,11 +1539,22 @@ class FeatureBuilder:
             + flow_accum * 0.2
         )
         tilt = _clip01(tilt)
+
+        # Pump-specific tilt: only boost if stage is early and velocity is good
+        if pump_stage_01 <= 0.7 and pump_vel_norm >= 0.3:
+            tilt += 0.15 * pump_vel_norm
+        tilt = _clip01(tilt)
+
         raw_size = raw_size * (1.0 + 0.3 * tilt)
 
         # Whale footprint: if whales are dominating, but not dumpy, allow slightly larger size
         if whale_liq_fp > 0.5 and flow_dump < 0.4:
             raw_size *= 1.0 + 0.1 * (whale_liq_fp - 0.5)
+
+        # Late-stage pump penalty on size even if we didn't hard-block it
+        late_penalty = 1.0 - 0.5 * pump_stage_01
+        late_penalty = _clip(late_penalty, 0.3, 1.0)
+        raw_size = raw_size * late_penalty
 
         raw_size = _clip01(raw_size)
         pos_size = raw_size * risk_capacity
@@ -1356,6 +1563,8 @@ class FeatureBuilder:
             pos_size = 0.0
 
         feats["position_size_scalar"] = _clip01(pos_size)
+        feats["position_size_raw_scalar"] = _clip01(raw_size)
+        feats["position_size_capacity_scalar"] = _clip01(risk_capacity)
 
         # Kelly-aware suggested size scalar (for self-learning / dashboards)
         # Use Kelly as a soft modifier on the base scalar (never totally zero).
@@ -1368,12 +1577,16 @@ class FeatureBuilder:
 
         # Optional: entry_risk_score (0..1) for dashboards / AI models
         entry_risk = (
-            0.5 * ai_rug
-            + 0.2 * _clip01(is_dead_like)
-            + 0.15 * _clip01(liq_ultra_low)
-            + 0.10 * _clip01(whale_share * 1.5)
-            + 0.05 * flow_dump
+            0.45 * ai_rug
+            + 0.18 * _clip01(is_dead_like)
+            + 0.10 * _clip01(liq_ultra_low)
+            + 0.07 * _clip01(whale_share * 1.5)
+            + 0.07 * flow_dump
+            + 0.08 * pf_curve_danger
+            + 0.05 * pump_stage_01
         )
+        # Extra bump for very idle pumps
+        entry_risk += 0.05 * pump_idle_long
         feats["entry_risk_score"] = _clip01(entry_risk)
 
         # Discrete tiers for downstream routing / analysis
@@ -1404,10 +1617,65 @@ class FeatureBuilder:
         # Stable aliases for ML / AI layers (so we don't depend on internal names):
         feats["entry_score_v1"] = feats["entry_quality_score"]
         feats["size_scalar_v1"] = feats["position_size_scalar"]
-        feats["entry_soft_block_flag"] = 1.0 if (entry_risk >= 0.85) else 0.0
+        feats["entry_soft_block_flag"] = (
+            1.0 if (feats["entry_risk_score"] >= 0.85) else 0.0
+        )
+
+        # ------------------------------------------------------------------ #
+        # God-tier extra composites: risk-adjusted quality, slippage risk,
+        # PnL-friendly grade, and quality-vs-degen slider.
+        # ------------------------------------------------------------------ #
+        eq = feats["entry_quality_score"]
+        risk = feats["entry_risk_score"]
+
+        # Risk-adjusted entry quality (still ~0..1.5)
+        eq_risk_adj = eq * (1.0 - 0.6 * risk)
+        feats["entry_quality_risk_adjusted"] = _clip(eq_risk_adj, 0.0, 1.5)
+
+        # Kelly-adjusted view of risk-adjusted quality
+        eq_kelly_adj = eq_risk_adj * (0.4 + 0.6 * kelly_hint)
+        feats["entry_quality_kelly_adjusted"] = _clip(eq_kelly_adj, 0.0, 1.5)
+
+        # Slippage risk from impact + liquidity
+        impact_pct = _clip01(_nan_zero(feats.get("impact_1k_pct", 0.0)) / 5.0)  # 5%+ bad
+        liq_norm = _clip01(_nan_zero(feats.get("liq_norm", 0.0)))
+        slippage_risk = _clip01(0.7 * impact_pct + 0.3 * (1.0 - liq_norm))
+        feats["slippage_risk_score"] = slippage_risk
+
+        # Grade bucket 0..3: 0=skip, 1=ok/degen edge, 2=good, 3=elite
+        if block_hard or eq < 0.3 or risk >= 0.9:
+            grade = 0.0
+        elif eq < 0.7 or risk >= 0.7:
+            grade = 1.0
+        elif eq < 1.1 or risk >= 0.5:
+            grade = 2.0
+        else:
+            grade = 3.0
+        feats["entry_grade_bucket"] = grade
+
+        # Quality vs degen slider: -1 = pure degen, +1 = pristine quality
+        # We want high quality, low rug, reasonable risk.
+        quality_term = _clip01(eq / 1.5)
+        safety_term = 1.0 - ai_rug
+        qv = quality_term * safety_term * (1.0 - 0.5 * risk)
+        # map [0,1] → [-1,1] so models can see direction
+        feats["entry_quality_vs_degen"] = _clip(2.0 * qv - 1.0, -1.0, 1.0)
+
+        # PnL-aware trade labels (for self-learning / analytics only).
+        daily_state = _nan_zero(feats.get("risk_daily_state", 0.0))
+        is_recovery = 1.0 if (daily_state < 0.0 and eq > 0.0 and pos_size > 0.0) else 0.0
+        is_heat = 1.0 if (daily_state > 0.0 and pos_size > 0.0) else 0.0
+        is_neutral = 1.0 if (daily_state == 0.0 and pos_size > 0.0) else 0.0
+
+        feats["entry_label_recovery_trade"] = is_recovery
+        feats["entry_label_heat_trade"] = is_heat
+        feats["entry_label_neutral_trade"] = is_neutral
 
 
 __all__ = [
     "build_features",
     "FeatureBuilder",
+    "FEATURE_VERSION",
+    "FEATURE_SCHEMA_NAME",
+    "FEATURE_PHASE",
 ]
