@@ -2,9 +2,9 @@
 # start.sh — God-Tier Bootstrap (Phase 0–7 LOCK-IN)
 #
 # CONTROL PLANE ONLY:
-#   - secret-safe env loading (no eval by default)
-#   - deterministic DSN selection (Render internal vs local external)
-#   - wallet materialization
+#   - bulletproof env loading (dotenv-safe; never source secrets as shell)
+#   - deterministic DSN selection (Render internal vs external/local)
+#   - wallet materialization to a private file
 #   - check_env + preflight gates
 #   - crash supervision + signal forwarding
 
@@ -16,7 +16,6 @@ shopt -s inherit_errexit 2>/dev/null || true
 ts()  { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log() { printf '[start] %s %s\n' "$(ts)" "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
-
 trap 'rc=$?; log "ERROR rc=$rc line=$LINENO"; exit $rc' ERR
 
 is_true() {
@@ -26,42 +25,9 @@ is_true() {
   esac
 }
 
-usage() {
-  cat >&2 <<'TXT'
-[start] Usage:
-  ./start.sh
-  ./start.sh check-env [args...]
-  ./start.sh preflight [args...]
-  ./start.sh healthcheck [args...]
-  ./start.sh smoke [args...]
-  ./start.sh canary [args...]
-  ./start.sh canary-quote [args...]
-
-Key env:
-  START_STRICT=0|1                 (default: 1 on Render, 0 local)
-  START_PRECHECKS=0|1              (default: 1)
-  START_PRECHECKS_STRICT=0|1       (default: START_STRICT)
-  START_RUN_CHECK_ENV=0|1          (default: 1)
-
-  START_ALLOW_SOURCE_ENV=0|1       (default: 0; safe parsing)
-  START_ENV_OVERRIDE=0|1           (default: 0; env wins over file)
-
-  # DSN routing
-  SKIP_DSN_REQUIRED=0|1
-  PG_DSN_INTERNAL=...              (Render internal)
-  PG_DSN_EXTERNAL=...              (External)
-  PNL_DSN=...                      (External asyncpg)
-  DATABASE_URL / POSTGRES_DSN=...  (SQLAlchemy async)
-TXT
-}
-
-log "────────────────────────────────"
-log "   Solana Sniper Bootstrap V3+++"
-log "────────────────────────────────"
-
-# =============================================================================
+# -----------------------------------------------------------------------------
 # 0) REPO ROOT + RENDER DETECT
-# =============================================================================
+# -----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 export REPO_ROOT="${REPO_ROOT:-$SCRIPT_DIR}"
@@ -73,84 +39,133 @@ elif is_true "${RENDER:-}"; then
   is_render=1
 fi
 
-# =============================================================================
-# 0.1) ENV LOADING (SECRET-SAFE)
-# =============================================================================
-: "${START_ALLOW_SOURCE_ENV:=0}"
-: "${START_ENV_OVERRIDE:=0}"
+log "────────────────────────────────"
+log "   Solana Sniper Bootstrap V3+++"
+log "────────────────────────────────"
+log "Boot: RENDER=${is_render} cwd=${REPO_ROOT}"
 
-_load_env_safe() {
+# -----------------------------------------------------------------------------
+# 1) PYTHON SELECTION (deterministic, minimal assumptions)
+# -----------------------------------------------------------------------------
+PYTHON="${PYTHON:-python3}"
+if command -v "$PYTHON" >/dev/null 2>&1; then
+  :
+elif command -v python >/dev/null 2>&1; then
+  PYTHON="python"
+else
+  die "Python executable not found (python3/python)"
+fi
+
+# Prefer venv python if present (harmless on Render; useful locally)
+if [[ -x ".venv/bin/python" ]]; then
+  PYTHON=".venv/bin/python"
+elif [[ -x ".venv/Scripts/python.exe" ]]; then
+  PYTHON=".venv/Scripts/python.exe"
+fi
+
+export PYTHONUNBUFFERED=1
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+
+log "Using python: $($PYTHON -V 2>&1)"
+
+# -----------------------------------------------------------------------------
+# 2) BULLETPROOF ENV LOADER (dotenv → exports; NEVER source secrets directly)
+# -----------------------------------------------------------------------------
+: "${START_ENV_OVERRIDE:=0}"          # 1 => file overrides existing env
+: "${START_ENV_LINT:=1}"              # 1 => print loaded count + ignored lines summary
+
+# Parses KEY=VALUE lines, emits: export KEY='value'
+# - ignores invalid lines
+# - strips CRLF + BOM
+# - supports optional "export KEY=..."
+# - strips matching surrounding quotes on values (single/double)
+# - does NOT execute anything, no $(...), no backticks, no redirects
+dotenv_to_exports() {
   local f="$1"
   [[ -z "$f" || ! -f "$f" ]] && return 0
 
-  log "Loading env file (safe): $f"
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line//$'\r'/}"
-    [[ -z "$line" ]] && continue
-    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+  "$PYTHON" - <<'PY' "$f" "${START_ENV_OVERRIDE:-0}" "${START_ENV_LINT:-1}"
+import os, re, shlex, sys
 
-    line="${line#"${line%%[![:space:]]*}"}"
-    [[ "$line" == export\ * ]] && line="${line#export }"
-    [[ "$line" != *"="* ]] && continue
+path = sys.argv[1]
+override = sys.argv[2] == "1"
+lint = sys.argv[3] == "1"
 
-    local k="${line%%=*}"
-    local v="${line#*=}"
+key_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-    k="${k%"${k##*[![:space:]]}"}"
-    k="${k#"${k%%[![:space:]]*}"}"
-    [[ -z "$k" ]] && continue
-    [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+loaded = 0
+ignored = 0
+ignored_samples = []
 
-    if [[ "${START_ENV_OVERRIDE}" != "1" && -n "${!k:-}" ]]; then
+def strip_bom(s: str) -> str:
+  return s[1:] if s.startswith("\ufeff") else s
+
+with open(path, "r", encoding="utf-8", errors="ignore") as f:
+  for lineno, raw in enumerate(f, 1):
+    raw = raw.replace("\r", "")
+    s = strip_bom(raw).strip()
+    if not s or s.startswith("#"):
       continue
-    fi
+    if s.startswith("export "):
+      s = s[7:].lstrip()
+    if "=" not in s:
+      ignored += 1
+      if len(ignored_samples) < 5:
+        ignored_samples.append((lineno, raw.rstrip("\n")))
+      continue
 
-    v="${v#"${v%%[![:space:]]*}"}"
+    k, v = s.split("=", 1)
+    k = k.strip()
+    if not key_re.match(k):
+      ignored += 1
+      if len(ignored_samples) < 5:
+        ignored_samples.append((lineno, raw.rstrip("\n")))
+      continue
 
-    if [[ "${v:0:1}" != "'" && "${v:0:1}" != '"' ]]; then
-      v="${v%%[[:space:]]#*}"
-      v="${v%%#*}"
-      v="${v%"${v##*[![:space:]]}"}"
-    fi
+    if (not override) and (k in os.environ) and os.environ.get(k, "") != "":
+      continue
 
-    if [[ "${v:0:1}" == "\"" && "${v: -1}" == "\"" ]]; then
-      v="${v:1:-1}"
-    elif [[ "${v:0:1}" == "'" && "${v: -1}" == "'" ]]; then
-      v="${v:1:-1}"
-    fi
+    v = v.lstrip()
 
-    export "$k=$v"
-  done <"$f"
-}
+    # If the value is quoted, strip surrounding quotes only.
+    if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+      v = v[1:-1]
 
-_load_env_source() {
-  local f="$1"
-  [[ -z "$f" || ! -f "$f" ]] && return 0
-  log "Loading env file (source): $f"
-  set -a
-  # shellcheck disable=SC1090
-  . "$f"
-  set +a
+    print(f"export {k}={shlex.quote(v)}")
+    loaded += 1
+
+if lint:
+  # Write lint info to stderr so it shows in logs but doesn't affect sourcing
+  sys.stderr.write(f"[start] dotenv: {path} loaded={loaded} ignored={ignored}\n")
+  if ignored_samples:
+    sys.stderr.write("[start] dotenv: ignored sample lines (lineno: text):\n")
+    for ln, txt in ignored_samples:
+      sys.stderr.write(f"[start]   {ln}: {txt}\n")
+PY
 }
 
 load_env_file() {
   local f="$1"
   [[ -z "$f" || ! -f "$f" ]] && return 0
-  if is_true "${START_ALLOW_SOURCE_ENV}"; then
-    _load_env_source "$f"
-  else
-    _load_env_safe "$f"
-  fi
+  log "Loading env file (dotenv-safe): $f"
+  local tmp="/tmp/env_export_$(basename "$f").sh"
+  dotenv_to_exports "$f" >"$tmp"
+  # shellcheck disable=SC1090
+  source "$tmp"
+  rm -f "$tmp" || true
 }
 
+# Load order (Render secret files first)
 load_env_file "/etc/secrets/.env.extra"
 load_env_file "/etc/secrets/.env"
 load_env_file "./.env.extra"
 load_env_file "./.env"
 
-# =============================================================================
-# 1) HARD DEFAULTS (LOCK-IN)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# 3) HARD DEFAULTS (LOCK-IN)
+# -----------------------------------------------------------------------------
 : "${MASTER_PHASE:=7}"
 
 : "${MAIN_MODULE:=scripts.main}"
@@ -172,80 +187,45 @@ fi
 
 : "${START_RUN_CHECK_ENV:=1}"
 : "${START_CHECK_ENV_STRICT:=$START_STRICT}"
-: "${START_CHECK_ENV_JSON_FILE:=}"
-: "${START_CHECK_ENV_SHOW_ENV:=0}"
 
 : "${START_PRECHECKS:=1}"
 : "${START_PRECHECKS_STRICT:=$START_STRICT}"
 : "${START_PRECHECKS_CANARY:=0}"
 
-: "${START_COMPILEALL:=0}"
-
 export MASTER_PHASE MAIN_MODULE MAIN_ARGS MAIN_ARGS_JSON MAIN_ARGS_FILE \
   MAIN_RESTART_ON_CRASH MAIN_MAX_RESTARTS MAIN_RESTART_BACKOFF_S MAIN_RESTART_MAX_BACKOFF_S MAIN_RESTART_JITTER_S MAIN_USE_SETSID MAIN_NO_RESTART_EXIT_CODES \
-  START_STRICT START_RUN_CHECK_ENV START_CHECK_ENV_STRICT START_CHECK_ENV_JSON_FILE START_CHECK_ENV_SHOW_ENV \
-  START_PRECHECKS START_PRECHECKS_STRICT START_PRECHECKS_CANARY START_COMPILEALL
+  START_STRICT START_RUN_CHECK_ENV START_CHECK_ENV_STRICT \
+  START_PRECHECKS START_PRECHECKS_STRICT START_PRECHECKS_CANARY
 
-log "Boot flags: RENDER=${is_render} PHASE=${MASTER_PHASE} MAIN=${MAIN_MODULE} STRICT=${START_STRICT}"
+log "Flags: PHASE=${MASTER_PHASE} MAIN=${MAIN_MODULE} STRICT=${START_STRICT}"
 
-# =============================================================================
-# 2) PYTHON SELECTION (deterministic)
-# =============================================================================
-PYTHON="${PYTHON:-python}"
-
-if [[ -x ".venv/bin/python" ]]; then
-  PYTHON=".venv/bin/python"
-elif [[ -x ".venv/Scripts/python.exe" ]]; then
-  PYTHON=".venv/Scripts/python.exe"
-elif command -v "$PYTHON" >/dev/null 2>&1; then
-  :
-elif command -v python3 >/dev/null 2>&1; then
-  PYTHON="python3"
-elif command -v python >/dev/null 2>&1; then
-  PYTHON="python"
-else
-  die "Python executable not found (python/python3/.venv/bin/python)"
-fi
-
-export PYTHONUNBUFFERED=1
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
-export PYTHONUTF8="${PYTHONUTF8:-1}"
-
-PY_PATHS=("$SCRIPT_DIR")
-[[ -d "$SCRIPT_DIR/src" ]] && PY_PATHS+=("$SCRIPT_DIR/src")
-if [[ -n "${PYTHONPATH:-}" ]]; then
-  export PYTHONPATH="$(IFS=:; echo "${PY_PATHS[*]}"):$PYTHONPATH"
-else
-  export PYTHONPATH="$(IFS=:; echo "${PY_PATHS[*]}")"
-fi
-
-log "Using python: $($PYTHON -V 2>&1)"
-
-if is_true "${START_COMPILEALL}"; then
-  log "compileall enabled (best-effort)"
-  "$PYTHON" -m compileall -q . || die "compileall failed"
-fi
-
-# =============================================================================
-# 3) COMMAND MODE
-# =============================================================================
+# -----------------------------------------------------------------------------
+# 4) COMMAND MODE (utility entrypoints)
+# -----------------------------------------------------------------------------
 cmd="${1:-}"
 case "$cmd" in
-  -h|--help|help) usage; exit 0 ;;
+  -h|--help|help)
+    cat >&2 <<'TXT'
+[start] Commands:
+  ./start.sh
+  ./start.sh check-env [args...]
+  ./start.sh preflight [args...]
+  ./start.sh healthcheck [args...]
+  ./start.sh smoke [args...]
+  ./start.sh canary [args...]
+TXT
+    exit 0
+    ;;
   check-env|check_env) shift || true; exec "$PYTHON" -m scripts.check_env "$@" ;;
-  preflight)        shift || true; exec "$PYTHON" -m scripts.preflight "$@" ;;
-  healthcheck)      shift || true; exec "$PYTHON" -m scripts.healthcheck "$@" ;;
+  preflight)           shift || true; exec "$PYTHON" -m scripts.preflight "$@" ;;
+  healthcheck)         shift || true; exec "$PYTHON" -m scripts.healthcheck "$@" ;;
   smoke|smoke_lightning) shift || true; exec "$PYTHON" -m scripts.smoke_lightning "$@" ;;
   canary|canary_trade) shift || true; exec "$PYTHON" -m scripts.canary_trade "$@" ;;
-  canary-quote|canary_quote)
-    shift || true
-    CANARY_MODE=dryrun DRYRUN=1 exec "$PYTHON" -m scripts.canary_trade --stage quote "$@" ;;
 esac
 
-# =============================================================================
-# 4) RUNTIME DIRS (Render + local safe)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# 5) RUNTIME DIRS (Render + local safe)
+# -----------------------------------------------------------------------------
 DATA_DIR="${DATA_DIR:-/opt/render/data}"
 SECRETS_DIR="${SECRETS_DIR:-/opt/render/.secrets}"
 TMP_DIR="${TMP_DIR:-/tmp}"
@@ -276,9 +256,9 @@ export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$DATA_DIR/.config}"
 mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" 2>/dev/null || true
 chmod 700 "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" 2>/dev/null || true
 
-# =============================================================================
-# 5) Masking + DSN normalization
-# =============================================================================
+# -----------------------------------------------------------------------------
+# 6) DSN NORMALIZATION + ROUTING (Render-first)
+# -----------------------------------------------------------------------------
 mask_url() {
   local u="${1:-}"
   [[ -z "$u" ]] && { printf '%s' ""; return; }
@@ -299,20 +279,10 @@ extract_host() {
 }
 
 is_render_internal_host() {
-  # Render internal postgres host often looks like: dpg-xxxx-a (no dot)
-  local u="${1:-}"
   local host
-  host="$(extract_host "$u")"
+  host="$(extract_host "${1:-}")"
   host="${host,,}"
   [[ -n "$host" && "$host" == dpg-* && "$host" != *.* ]]
-}
-
-is_render_external_host() {
-  local u="${1:-}"
-  local host
-  host="$(extract_host "$u")"
-  host="${host,,}"
-  [[ -n "$host" && ( "$host" == *.render.com || "$host" == *postgres.render.com* ) ]]
 }
 
 ensure_sslmode_require() {
@@ -348,9 +318,7 @@ normalize_sqlalchemy_async_dsn() {
   [[ "$v" =~ ^postgres:// ]] && v="${v/postgres:\/\//postgresql:\/\/}"
   v="$(strip_sqlalchemy_driver "$v")"
   [[ "$v" =~ ^postgresql:// ]] && v="${v/postgresql:\/\//postgresql+asyncpg://}"
-  if is_render_external_host "$v" || is_true "${PG_FORCE_SSLMODE_REQUIRE:-0}"; then
-    v="$(ensure_sslmode_require "$v")"
-  fi
+  v="$(ensure_sslmode_require "$v")"
   printf '%s' "$v"
 }
 
@@ -358,13 +326,9 @@ normalize_asyncpg_dsn() {
   local v="$1"
   [[ -z "$v" ]] && { printf '%s' ""; return; }
   [[ "$v" =~ ^postgres:// ]] && v="${v/postgres:\/\//postgresql:\/\/}"
-  if [[ "$v" =~ ^postgresql\+ ]]; then
-    v="$(strip_sqlalchemy_driver "$v")"
-  fi
+  v="$(strip_sqlalchemy_driver "$v")"
   v="${v/postgresql+asyncpg:\/\//postgresql:\/\/}"
-  if is_render_external_host "$v" || is_true "${PG_FORCE_SSLMODE_REQUIRE:-0}"; then
-    v="$(ensure_sslmode_require "$v")"
-  fi
+  v="$(ensure_sslmode_require "$v")"
   printf '%s' "$v"
 }
 
@@ -380,9 +344,60 @@ to_sqlalchemy_from_asyncpg() {
   normalize_sqlalchemy_async_dsn "$v"
 }
 
-# =============================================================================
-# 6) WALLET BOOTSTRAP
-# =============================================================================
+START_REQUIRE_DSN="${START_STRICT}"
+is_true "${SKIP_DSN_REQUIRED:-0}" && START_REQUIRE_DSN=0
+
+pick_dsn=""
+
+try_pick() {
+  local candidate="${1:-}"
+  [[ -z "$candidate" ]] && return 1
+  if [[ "$is_render" == "0" ]] && is_render_internal_host "$candidate"; then
+    return 1
+  fi
+  pick_dsn="$candidate"
+  return 0
+}
+
+if [[ "$is_render" == "1" ]]; then
+  try_pick "${PG_DSN_INTERNAL:-}" || true
+  try_pick "${POSTGRES_DSN:-}"   || true
+  try_pick "${DATABASE_URL:-}"   || true
+  try_pick "${PG_DSN_EXTERNAL:-}"|| true
+  try_pick "${PG_DSN:-}"         || true
+  try_pick "${PNL_DSN:-}"        || true
+else
+  try_pick "${PG_DSN_EXTERNAL:-}"|| true
+  try_pick "${PG_DSN:-}"         || true
+  try_pick "${PNL_DSN:-}"        || true
+  try_pick "${POSTGRES_DSN:-}"   || true
+  try_pick "${DATABASE_URL:-}"   || true
+fi
+
+if is_true "${START_REQUIRE_DSN}" && [[ -z "${pick_dsn:-}" ]]; then
+  die "Missing DB DSN. Set PG_DSN_INTERNAL (Render) or DATABASE_URL/POSTGRES_DSN (or SKIP_DSN_REQUIRED=1)."
+fi
+
+if [[ -n "${pick_dsn:-}" ]]; then
+  if [[ "$pick_dsn" =~ ^postgresql\+ ]]; then
+    DATABASE_URL="$(normalize_sqlalchemy_async_dsn "$pick_dsn")"
+    PG_DSN="$(to_asyncpg_from_sqlalchemy "$DATABASE_URL")"
+  else
+    PG_DSN="$(normalize_asyncpg_dsn "$pick_dsn")"
+    DATABASE_URL="$(to_sqlalchemy_from_asyncpg "$PG_DSN")"
+  fi
+
+  POSTGRES_DSN="${POSTGRES_DSN:-$DATABASE_URL}"
+  PNL_DSN="${PNL_DSN:-$PG_DSN}"
+
+  export DATABASE_URL POSTGRES_DSN PG_DSN PNL_DSN
+  log "DB SQLA async : $(mask_url "${DATABASE_URL}")"
+  log "DB asyncpg    : $(mask_url "${PG_DSN}")"
+fi
+
+# -----------------------------------------------------------------------------
+# 7) WALLET BOOTSTRAP
+# -----------------------------------------------------------------------------
 wallet_path="${SECRETS_DIR%/}/wallet.json"
 : "${START_WALLET_OVERWRITE:=0}"
 
@@ -432,105 +447,18 @@ if [[ -n "${WALLET_PRIVATE_KEY:-}" && -f "${WALLET_PRIVATE_KEY:-}" ]]; then
   log "Wallet: present (path) $(basename "${WALLET_PRIVATE_KEY}")"
 fi
 
-# =============================================================================
-# 7) DSN ROUTING (Render internal vs local external) — LOCK-IN
-# =============================================================================
-START_REQUIRE_DSN="${START_STRICT}"
-is_true "${SKIP_DSN_REQUIRED:-0}" && START_REQUIRE_DSN=0
-
-pick_dsn=""   # base DSN in whichever form user provided
-
-try_pick() {
-  local candidate="${1:-}"
-  [[ -z "$candidate" ]] && return 1
-
-  # If local, ignore render-internal host DSNs
-  if [[ "$is_render" == "0" ]] && is_render_internal_host "$candidate"; then
-    return 1
-  fi
-
-  pick_dsn="$candidate"
-  return 0
-}
-
-# Priority:
-# - Render: prefer internal -> then SQLA -> then external
-# - Local : prefer external -> then asyncpg -> then SQLA (but never internal)
-if [[ "$is_render" == "1" ]]; then
-  try_pick "${PG_DSN_INTERNAL:-}" || true
-  try_pick "${POSTGRES_DSN:-}" || true
-  try_pick "${DATABASE_URL:-}" || true
-  try_pick "${PG_DSN:-}" || true
-  try_pick "${PNL_DSN:-}" || true
-  try_pick "${PG_DSN_EXTERNAL:-}" || true
-else
-  try_pick "${PG_DSN_EXTERNAL:-}" || true
-  try_pick "${PNL_DSN:-}" || true
-  try_pick "${PG_DSN:-}" || true
-  try_pick "${POSTGRES_DSN:-}" || true
-  try_pick "${DATABASE_URL:-}" || true
-fi
-
-if is_true "${START_REQUIRE_DSN}" && [[ -z "${pick_dsn:-}" ]]; then
-  die "Missing DB DSN. Provide PG_DSN_EXTERNAL (local) or PG_DSN_INTERNAL (Render) or DATABASE_URL/POSTGRES_DSN (or set SKIP_DSN_REQUIRED=1)."
-fi
-
-# Normalize/derive canonical env:
-# - DATABASE_URL / POSTGRES_DSN: SQLAlchemy async (postgresql+asyncpg://)
-# - PG_DSN / PNL_DSN: asyncpg (postgresql://)
-if [[ -n "${pick_dsn:-}" ]]; then
-  if [[ "$pick_dsn" =~ ^postgresql\+ ]]; then
-    DATABASE_URL="$(normalize_sqlalchemy_async_dsn "$pick_dsn")"
-    PG_DSN="$(to_asyncpg_from_sqlalchemy "$DATABASE_URL")"
-  else
-    # assume asyncpg-ish
-    PG_DSN="$(normalize_asyncpg_dsn "$pick_dsn")"
-    DATABASE_URL="$(to_sqlalchemy_from_asyncpg "$PG_DSN")"
-  fi
-
-  POSTGRES_DSN="${POSTGRES_DSN:-$DATABASE_URL}"
-  PNL_DSN="${PNL_DSN:-$PG_DSN}"
-
-  export DATABASE_URL POSTGRES_DSN PG_DSN PNL_DSN
-  log "DB SQLA async : $(mask_url "${DATABASE_URL}")"
-  log "DB asyncpg   : $(mask_url "${PG_DSN}")"
-fi
-
-# =============================================================================
-# 8) JUPITER NORMALIZATION (no key logging)
-# =============================================================================
-: "${JUP_BASE_URL:=https://api.jup.ag}"
-: "${JUP_ALT_BASE_URLS:=$JUP_BASE_URL}"
-: "${JUPITER_SWAP_API:=$JUP_BASE_URL}"
-export JUP_BASE_URL JUP_ALT_BASE_URLS JUPITER_SWAP_API
-log "Jupiter base URL: ${JUP_BASE_URL}"
-
-# =============================================================================
-# 9) CHECK_ENV
-# =============================================================================
+# -----------------------------------------------------------------------------
+# 8) CHECK_ENV + PREFLIGHT GATES
+# -----------------------------------------------------------------------------
 if is_true "${START_RUN_CHECK_ENV}"; then
   log "check_env enabled (strict=${START_CHECK_ENV_STRICT})"
   ce_args=(--json-only)
   is_true "${START_CHECK_ENV_STRICT}" && ce_args+=(--strict)
-
-  set +e
-  if [[ -n "${START_CHECK_ENV_JSON_FILE:-}" ]]; then
-    mkdir -p "$(dirname "${START_CHECK_ENV_JSON_FILE}")" 2>/dev/null || true
-    CHECK_ENV_JSON=1 CHECK_ENV_JSON_ONLY=1 "$PYTHON" -m scripts.check_env "${ce_args[@]}" >"${START_CHECK_ENV_JSON_FILE}"
-    ce_rc=$?
-  else
-    CHECK_ENV_JSON=1 CHECK_ENV_JSON_ONLY=1 "$PYTHON" -m scripts.check_env "${ce_args[@]}" >/dev/null
-    ce_rc=$?
-  fi
-  set -e
-  [[ "$ce_rc" == "0" ]] || die "check_env failed (rc=$ce_rc)"
+  "$PYTHON" -m scripts.check_env "${ce_args[@]}" >/dev/null
 else
   log "check_env disabled (START_RUN_CHECK_ENV=0)"
 fi
 
-# =============================================================================
-# 10) PREFLIGHT
-# =============================================================================
 if is_true "${START_PRECHECKS}"; then
   log "Preflight enabled (strict=${START_PRECHECKS_STRICT} canary=${START_PRECHECKS_CANARY})"
   preflight_args=()
@@ -553,10 +481,10 @@ else
   log "Preflight disabled (START_PRECHECKS=0)"
 fi
 
-# =============================================================================
-# 11) LAUNCH (restart supervisor + signal forwarding)
-# =============================================================================
-log "Launching: ${PYTHON} -m ${MAIN_MODULE} [args]"
+# -----------------------------------------------------------------------------
+# 9) LAUNCH (restart supervisor + signal forwarding)
+# -----------------------------------------------------------------------------
+log "Launching: ${PYTHON} -m ${MAIN_MODULE}"
 
 main_argv=()
 
@@ -569,16 +497,14 @@ if [[ -n "${MAIN_ARGS_JSON:-}" ]]; then
 import json, os, sys
 raw = os.environ.get("MAIN_ARGS_JSON","").strip()
 try:
-    arr = json.loads(raw) if raw else []
-    if not isinstance(arr, list):
-        arr = []
+  arr = json.loads(raw) if raw else []
+  if not isinstance(arr, list): arr = []
 except Exception:
-    arr = []
+  arr = []
 for x in arr:
-    if x is None:
-        continue
-    s = str(x).replace("\r"," ").replace("\n"," ")
-    sys.stdout.write(s + "\n")
+  if x is None: continue
+  s = str(x).replace("\r"," ").replace("\n"," ")
+  sys.stdout.write(s + "\n")
 PY
   )
 elif [[ -n "${MAIN_ARGS_FILE:-}" && -f "${MAIN_ARGS_FILE:-}" ]]; then
