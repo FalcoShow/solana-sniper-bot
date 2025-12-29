@@ -2,14 +2,16 @@
 # Solana Sniper Bot — V3+++ / Quant-Grade Requirements (LOCK-IN)
 # ============================================================
 #
-# Goals:
-#   • Render (Python 3.11+) + Local (Python 3.13) compatible
-#   • Deterministic installs (hard pins)
-#   • "Core runtime" stays lean; heavy/optional sections are clearly marked
+# Primary target: Render Linux (Python 3.12.x)
+# Secondary: Local Windows (Python 3.11+ / 3.13 where wheels exist)
 #
-# Notes:
-#   • Keep ONLY ONE primary Postgres driver unless you *know* you need both.
-#   • If slug size becomes an issue, comment out OPTIONAL sections first.
+# Rules:
+#   1) Hard-pin core runtime libs
+#   2) Avoid pinning platform-compiled deps to versions without wheels
+#   3) Keep "standard server extras" Windows-safe via markers
+#
+# If Render slug/build time becomes an issue:
+#   - Comment out numpy/pandas first (if not used in live worker path)
 # ============================================================
 
 # ------------------------------------------------------------
@@ -35,12 +37,7 @@ python-dotenv==1.1.1
 # ------------------------------------------------------------
 SQLAlchemy==2.0.45
 asyncpg==0.30.0
-
-# Prefer modern psycopg3. (Remove psycopg2 unless you still import it somewhere.)
 psycopg[binary]==3.3.2
-
-# If (and ONLY if) you still have legacy imports that require psycopg2:
-# psycopg2-binary==2.9.11
 
 # ------------------------------------------------------------
 # Solana + crypto tooling (required)
@@ -50,7 +47,7 @@ solders==0.27.1
 base58==2.1.1
 
 # ------------------------------------------------------------
-# Serialization / settings / typing (required)
+# Serialization / validation / typing (required)
 # ------------------------------------------------------------
 orjson==3.11.3
 pydantic==2.12.3
@@ -62,33 +59,37 @@ typing-extensions==4.15.0
 openai==2.14.0
 
 # ------------------------------------------------------------
-# Web / API surface (optional)
+# Web / API surface (optional — keep if you actually run the API)
 # ------------------------------------------------------------
 fastapi==0.127.0
-uvicorn[standard]==0.40.0
+
+# IMPORTANT:
+# - On Windows, uvicorn[standard] may try to pull compiled extras and fail.
+# - On Render/Linux, we want the "standard" extras for performance.
+uvicorn==0.40.0; platform_system=="Windows"
+uvicorn[standard]==0.40.0; platform_system!="Windows"
 
 # ------------------------------------------------------------
-# Performance extras (optional; safe markers)
+# Performance extras (Linux only)
 # ------------------------------------------------------------
+# DO NOT hard-pin httptools to 0.6.1 (it breaks uvicorn[standard]).
+# If you want to lock these tighter later, do it only AFTER a clean Render deploy.
 uvloop==0.21.0; platform_system!="Windows"
-httptools==0.6.1; platform_system!="Windows"
+httptools>=0.6.3,<0.7; platform_system!="Windows"
 
 # ------------------------------------------------------------
-# Observability / ops (optional but useful; small footprint)
+# Observability / ops (small, useful)
 # ------------------------------------------------------------
 psutil==6.1.1
 python-json-logger==2.0.7
 
 # ------------------------------------------------------------
-# Quant / analytics / ML helpers (OPTIONAL — enable only if used)
-# Keeping SciPy / scikit-learn optional avoids wheel/build pain on some setups.
+# Quant / analytics (only keep if used in live path)
 # ------------------------------------------------------------
 numpy==2.4.0
 pandas==2.3.3
-# scipy==1.16.3
-# scikit-learn==1.8.0
 
 # ------------------------------------------------------------
-# Tooling / automation / scraping (OPTIONAL — big)
+# OPTIONAL: heavy / scraping / browser automation (keep off by default)
 # ------------------------------------------------------------
 # playwright==1.57.0
