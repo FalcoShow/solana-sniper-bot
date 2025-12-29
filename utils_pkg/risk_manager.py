@@ -1,227 +1,186 @@
-# utils_pkg/risk_manager.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
 utils_pkg/risk_manager.py
 
-Quant-grade portfolio risk manager (V3+++ / God-Tier / Phase 0–7)
+Quant-Grade Portfolio Risk Manager (V3+++ / God-Tier / Phase 0–7)
 =================================================================
 
-MASTER ROLE IN THE STACK
-------------------------
-This is the single “risk brain” for the whole system. It glues together:
+Goals (hard requirements)
+-------------------------
+1) Global kill-switches (instant + deterministic):
+   - "Stop trading" must block *all* new entries immediately, regardless of cached limits.
+   - Keys checked on every gate call:
+       • risk:halt == "1"              (hard global halt)
+       • risk:manual_block == "1"      (operator manual block)
+       • infra:halt == "1"             (infra halt from watchdog)
+       • strategy HARD_HALT == true    (self-learning strategy hard stop)
 
-  • Wallet + equity sensing        (live equity, SOL floor, synthetic equity)
-  • Performance sensing            (winrate-20, rolling DD, daily PnL)
-  • Regime engine                  (regime_state: risk_on/off, volatility, chop)
-  • Self-learning strategy         (equity plan, caps, HARD_HALT, MIN_SOL_BALANCE)
-  • AI capacity overlay            (ai_risk_model: capacity nudges)
-  • Kelly-style safety clamp       (fraction of equity per trade)
-  • Live overrides                 (Redis knobs for ops / dashboards)
-  • Sandbox mode                   (low-risk “flight simulator” mode)
-  • Equity utilization guardrail   (ticket * concurrency vs equity)
-  • Trading window gating          (UTC hours + allowed weekdays)
+2) Portfolio governance:
+   - Max daily loss, max daily spend, profit-stop
+   - Max concurrent positions
+   - Max exposure (optional): blocks new entries if open exposure would exceed limit
+   - Cooldowns after losses / DD, per-mint cooldown
 
-And produces, for the rest of the system:
+3) Production wiring:
+   - Works with core_utils async redis getter and shared redis
+   - Emits explainable gate reasons (no silent no-buy)
+   - Exposes stable API used by sniper/pump_trader/scanners/exit engine
 
-  • Global risk limits:
-        - ticket_usd (base position size)
-        - pos_pct_cap (max per-position risk vs equity)
-        - max_concurrent (hard cap on open positions)
-        - daily_spend_usd (daily notional budget)
-        - risk_capacity ∈ [0,1]
-        - risk_mode ∈ {0=OFF,1=NORMAL,2=AGGRESSIVE,3=DEFENSIVE}
-        - risk_profile (conservative / balanced / aggressive / auto)
-        - equity_utilization_pct (how “loaded” we are)
+Integration contract (entry path)
+---------------------------------
+Entry executor SHOULD:
+  A) gate = await entry_gate_debug(mint=..., pool_depth_usd=..., projected_ticket_usd=...)
+     if not gate["allowed"]: skip (and log gate["reasons_blocking"])
 
-  • Entry gate decisions:
-        - should_allow_new_entry()             → True/False
-        - entry_gate_debug()                   → detailed reasons
+  B) limits = gate["limits"]
+     ticket_usd = limits["ticket_usd"] (or liq-adjusted)
 
-  • Context for AI / feature layers:
-        - risk_capacity_snapshot()
-        - read_risk_ctx_hash() (Redis hash for FeatureBuilder / ai_entry_logic /
-          ai_buy_scoring / scanners / reinvestor / self_learning_ai_strategy)
+  C) Immediately BEFORE sending BUY:
+       ok = await reserve_daily_entries_slot()
+       ok = ok and await reserve_entry_budget(ticket_usd)
+       if not ok: skip
+       await note_entry_attempt(...)
 
-  • Trade result ingestion:
-        - note_trade_result() updates:
-              * daily realized PnL
-              * winrate-20
-              * rolling drawdown vs equity HWM
-              * daily trades count
-              * cooldowns on losing streak / DD
-              * regime_state account-awareness
-              * self_learning_ai_strategy.process_trade_closure()
-              * Notion / data_logger analytics
-              * (indirectly via data_logger → ai_db training rows)
+     If BUY fails after reserving, call:
+       await release_entry_budget(ticket_usd)   (recommended)
 
-  • Health + diagnostics:
-        - risk_snapshot() / risk_budget_summary()
-        - risk_health() (aggregate health block for dashboards / healthcheck)
+On SELL/close_position:
+  - Exit engine / sell path MUST call note_trade_result(..., trade_id=...) exactly once.
+  - trade_id enables idempotency.
 
-In other words: **everything that wants to know “can we trade and how big?” talks
-to THIS module**, not to random env vars.
-
-Public API
-----------
-  async current_limits(redis=None) -> dict
-  async recommend_ticket_usd(redis=None) -> float
-
-  async should_allow_new_entry(redis=None) -> bool
-  async entry_gate_debug(redis=None) -> dict
-
-  async risk_snapshot(redis=None) -> dict
-  async risk_capacity_snapshot(redis=None) -> dict
-  async risk_capacity_score(redis=None) -> float
-  async read_risk_ctx_hash(redis=None) -> dict[str, float]
-
-  async estimate_equity_usd() -> float
-
-  async note_trade_result(...)
-  async note_spend(redis, usd: float) -> None
-
-  async pair_limits_for_depth(pool_depth_usd, redis=None) -> dict
-  def  liq_aware_ticket_usd(base_ticket_usd, pool_depth_usd) -> float
-
-  async monitor_positions_loop(...)
-  async risk_manager_loop(stop_evt)
-
-  async set_manual_block(on=True, redis=None) -> None
-  async clear_manual_block(redis=None) -> None
-  async clear_risk_cooldown(redis=None) -> None
-  async force_risk_mode(mode: int | None, redis=None) -> None
-  async set_risk_profile_override(profile: str | None, redis=None) -> None
-
-  async risk_health(redis=None) -> dict
-
-All other modules (Strategy, scanners, ai_entry_logic, ai_buy_scoring,
-self_learning_ai_strategy, reinvestor, ai_sell_logic, exit_engine)
-should treat THIS as the canonical risk brain for sizing / gating.
-
-God-Tier Phases (how this file maps to Phase 0–7)
--------------------------------------------------
-Phase 0 – Wiring / Infra:
-    Redis, equity sensing, metrics keys, trading window, cooldown keys.
-Phase 1 – Observability:
-    risk_snapshot(), risk_budget_summary(), risk_health(), risk:ctx hash.
-Phase 2 – Dynamic Sizing:
-    current_limits(), tier schedule, regime scaling, equity utilization guardrail.
-Phase 3 – Performance-Aware:
-    winrate-20, rolling DD, daily PnL → risk_capacity in [0,1].
-Phase 4 – AI / Kelly Layer:
-    Kelly clamp, ai_risk_model capacity nudges, regime_gate_factor, risk_profile auto.
-Phase 5 – Self-Learning:
-    get_strategy_params(), plan_gap_pct, HARD_HALT, self-learning caps, note_trade_result().
-Phase 6 – Guardrails:
-    daily loss/ profit stop, cooldowns, equity floor, SOL floor, trading window, infra:halt.
-Phase 7 – Autopilot Diagnostics:
-    entry_gate_debug(), risk_health(), rich risk:ctx for FeatureBuilder / AI brain.
 """
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, List, Optional, Tuple
 
-# Optional standalone redis client (fallback if core_utils.redis is None)
-try:  # pragma: no cover – optional dependency
-    import redis.asyncio as aioredis  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover
-    aioredis = None  # type: ignore[assignment]
-
-# Local positions / strategy helpers (JSON-based store / canonical positions API)
-from positions import (
-    load_positions,
-    save_position,
-    close_position as remove_position,
-)
-
-# Self-learning strategy brain (equity plan + risk caps)
-from utils_pkg.self_learning_ai_strategy import (
-    get_strategy_params,
-    process_trade_closure,
-)
-
-# Core utils (shared Redis client + infra)
-from utils_pkg.core_utils import (
-    get_token_price,             # returns USD price from Dexscreener/Birdeye
-    get_wallet_tokens,           # wallet SPL tokens
-    swap_token_jupiter,          # Jupiter-based swap helper (used by other modules primarily)
-    convert_sol_to_usd_amount,   # SOL amount -> USD
-    send_telegram,
-    log_to_notion,
-    redis as shared_redis,
-)
-
-# Regime state (risk_on / normal / risk_off) from upgraded module
-from utils_pkg.regime import regime_state
-
-# Optional AI risk capacity overlay (offline-trained model)
-try:  # pragma: no cover - optional
-    from utils_pkg.ai_risk_model import (
-        predict_capacity_adjustment as _predict_capacity_adjustment,
-    )
-except Exception:  # pragma: no cover
-    _predict_capacity_adjustment = None  # type: ignore[assignment]
-
-# Optional structured logger (linked to data_logger → ai_db)
+# Prefer your repo's logging_setup (JSON-ish structured logs)
 try:
-    from utils_pkg.data_logger import log_event  # type: ignore
+    from logging_setup import get_logger  # type: ignore
 except Exception:  # pragma: no cover
-    async def log_event(*_: Any, **__: Any) -> None:
-        return
+    get_logger = None  # type: ignore
 
+log = get_logger(__name__) if get_logger else logging.getLogger("risk_manager")
 
-logger = logging.getLogger("risk_manager")
-if not logger.handlers:
-    logging.basicConfig(level=logging.INFO)
-
-# Version tag for dashboards / debugging / AI
-RISK_ENGINE_VERSION = "3+++_GOD_TIER_PHASE0_7"  # keep in sync with other V3+++ modules
+RISK_ENGINE_VERSION = "3+++_GOD_TIER_PHASE0_7"
+SOL_MINT = "So11111111111111111111111111111111111111112"
 
 __all__ = [
-    # sizing / gating
+    # limits/sizing/gating
     "current_limits",
+    "invalidate_limits_cache",
+    "recommend_ticket_usd",
+    "equity_and_ticket",
     "should_allow_new_entry",
     "entry_gate_debug",
-    "recommend_ticket_usd",
-    "equity_and_ticket", 
     "risk_snapshot",
     "risk_capacity_snapshot",
     "risk_capacity_score",
     "read_risk_ctx_hash",
-    "note_trade_result",
-    "note_spend",
-    "risk_budget_summary",
     "estimate_equity_usd",
     "liq_aware_ticket_usd",
     "pair_limits_for_depth",
+    "ctx_digest",
+    # reservations
+    "reserve_entry_budget",
+    "release_entry_budget",
+    "reserve_daily_entries_slot",
+    "note_entry_attempt",
+    # trade ingestion
+    "note_trade_result",
+    "note_spend",
+    "risk_budget_summary",
+    "reinvestor_risk_view",
     # loops
     "monitor_positions_loop",
     "risk_manager_loop",
-    "handle_position",
-    # ops helpers
+    # ops helpers (halt/block/overrides)
+    "halt_trading",
+    "resume_trading",
     "set_manual_block",
     "clear_manual_block",
     "clear_risk_cooldown",
     "force_risk_mode",
     "set_risk_profile_override",
-    # aggregate health helper
+    "set_mint_cooldown",
+    "clear_mint_cooldown",
+    # health
     "risk_health",
 ]
 
-# ============================================================================ #
-# Constants & ENV helpers
-# ============================================================================ #
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional async redis fallback
+# ──────────────────────────────────────────────────────────────────────────────
+try:  # pragma: no cover
+    import redis.asyncio as aioredis  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    aioredis = None  # type: ignore[assignment]
 
-SOL_MINT = "So11111111111111111111111111111111111111112"
+# ──────────────────────────────────────────────────────────────────────────────
+# Positions store (repo canonical: positions.py with load_positions())
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from positions import load_positions  # type: ignore
+except Exception:  # pragma: no cover
+    def load_positions() -> list[dict[str, Any]]:  # type: ignore[override]
+        return []
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Self-learning strategy caps (HARD_HALT, MAX_RISK_PER_TRADE, etc.)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from utils_pkg.self_learning_ai_strategy import (  # type: ignore
+        get_strategy_params,
+        process_trade_closure,
+    )
+except Exception:  # pragma: no cover
+    async def get_strategy_params(redis=None) -> Dict[str, Any]:  # type: ignore
+        return {}
+
+    async def process_trade_closure(*_: Any, **__: Any) -> None:  # type: ignore
+        return
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core utils (shared infra)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from utils_pkg import core_utils as cu  # type: ignore
+except Exception as e:  # pragma: no cover
+    raise RuntimeError(f"risk_manager requires utils_pkg.core_utils: {e}")
+
+# Regime (required)
+try:
+    from utils_pkg.regime import regime_state  # type: ignore
+except Exception as e:  # pragma: no cover
+    raise RuntimeError(f"risk_manager requires utils_pkg.regime.regime_state: {e}")
+
+# Optional AI overlay
+try:  # pragma: no cover
+    from utils_pkg.ai_risk_model import predict_capacity_adjustment as _predict_capacity_adjustment  # type: ignore
+except Exception:  # pragma: no cover
+    _predict_capacity_adjustment = None  # type: ignore[assignment]
+
+# Optional structured logging
+try:
+    from utils_pkg.data_logger import log_event  # type: ignore
+except Exception:  # pragma: no cover
+    async def log_event(*_: Any, **__: Any) -> None:  # type: ignore
+        return
 
 
+# =============================================================================
+# ENV helpers
+# =============================================================================
 def _env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
     if v is None:
@@ -229,129 +188,115 @@ def _env_bool(key: str, default: bool = False) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def _env_float(key: str, default: float) -> float:
+def _env_int(key: str, default: int) -> int:
     try:
-        return float(os.getenv(key, str(default)))
+        return int(str(os.getenv(key, str(default))).strip())
     except Exception:
         return default
 
 
-def _env_int(key: str, default: int) -> int:
+def _env_float(key: str, default: float) -> float:
     try:
-        return int(os.getenv(key, str(default)))
+        return float(str(os.getenv(key, str(default))).strip())
     except Exception:
         return default
 
 
 def _env_str(key: str, default: str = "") -> str:
-    return os.getenv(key, default).strip()
+    return str(os.getenv(key, default) or default).strip()
 
 
-# ---- Legacy per-position exit knobs (kept for backward compat / advisory alerts) ----
+def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    try:
+        x = float(x)
+    except Exception:
+        x = 0.0
+    return max(lo, min(hi, x))
 
-TRAILING_STOP_ENABLED = _env_bool("TRAILING_STOP_ENABLED", True)
-DEFAULT_STOP_LOSS_PERCENT = _env_float("STOP_LOSS_PERCENT", 12.0)
-DEFAULT_TARGET_PROFIT_PERCENT = _env_float("TARGET_PROFIT_PERCENT", 0.0)  # 0 = disabled
-DEFAULT_MAX_HOLD_MINUTES = _env_int("MAX_HOLD_TIME_MINUTES", 240)
-DEFAULT_SLIPPAGE = _env_float("JUPITER_MAX_SLIPPAGE", 0.005)  # fraction (0.5%)
 
-# Position monitor loop cadence
+def _s(x: Any) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, (bytes, bytearray)):
+        return x.decode("utf-8", "ignore")
+    return str(x)
+
+
+async def _maybe_await(x: Any) -> Any:
+    if asyncio.iscoroutine(x):
+        return await x
+    return x
+
+
+async def _call(fn, *args, **kwargs):
+    if fn is None:
+        return None
+    try:
+        return await _maybe_await(fn(*args, **kwargs))
+    except Exception:
+        return None
+
+
+# =============================================================================
+# Config (ENV)
+# =============================================================================
+# Loop cadences
 POSITION_CHECK_INTERVAL = _env_int("POSITION_MONITOR_INTERVAL", 20)
+RISK_MANAGER_LOOP_INTERVAL = _env_int("RISK_MANAGER_LOOP_INTERVAL_SEC", 5)
 
-# Backwards-compatible cooldown env:
-#   prefer ALERT_COOLDOWN_SECONDS, fallback to older ALERT_COOLDOWNS_SECONDS
-ALERT_COOLDOWN_SECONDS = _env_int(
-    "ALERT_COOLDOWN_SECONDS",
-    _env_int("ALERT_COOLDOWNS_SECONDS", 900),
-)
+# Alerts
+ALERT_COOLDOWN_SECONDS = _env_int("ALERT_COOLDOWN_SECONDS", _env_int("ALERT_COOLDOWNS_SECONDS", 900))
+RISK_DISABLE_ALERTS = _env_bool("RISK_DISABLE_ALERTS", False)
+RISK_DISABLE_NOTION = _env_bool("RISK_DISABLE_NOTION", False)
+RISK_DISABLE_AI_OVERLAY = _env_bool("RISK_DISABLE_AI_OVERLAY", False)
 
+# Redis
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-WALLET_PUBKEY = (
-    os.getenv("WALLET_PUBKEY")
-    or os.getenv("WALLET_PUBLIC_KEY")
-    or os.getenv("WALLET_ADDRESS")
-)
 
-# ---- Day-level governance / base caps ----
+# Wallet pubkey env aliases (optional; equity calc can use smart_wallets)
+WALLET_PUBKEY = os.getenv("WALLET_PUBKEY") or os.getenv("WALLET_PUBLIC_KEY") or os.getenv("WALLET_ADDRESS")
 
-STOP_AFTER_DAILY_PROFIT_PCT = _env_float(
-    "STOP_AFTER_DAILY_PROFIT_PCT",
-    4.0,
-)  # % of equity where we strongly taper capacity
+# Day-level governance
+STOP_AFTER_DAILY_PROFIT_PCT = _env_float("STOP_AFTER_DAILY_PROFIT_PCT", 4.0)
+DAILY_LOSS_CAP_PCT = _env_float("DAILY_LOSS_CAP_PCT", 0.0)
+DAILY_SPEND_CAP_PCT = _env_float("DAILY_SPEND_CAP_PCT", 0.15)
+DAILY_SPEND_CAP_USD = _env_float("DAILY_SPEND_CAP_USD", 0.0)
 
-DAILY_LOSS_CAP_PCT = _env_float(
-    "DAILY_LOSS_CAP_PCT",
-    0.0,
-)  # optional daily loss kill-switch (% of equity, 0=disabled)
-
-DAILY_SPEND_CAP_PCT = _env_float("DAILY_SPEND_CAP_PCT", 0.15)  # % of equity
-DAILY_SPEND_CAP_USD = _env_float("DAILY_SPEND_CAP_USD", 0.0)   # hard USD cap (0=off)
-
-# Baseline caps (tiering can be tighter, but not looser)
+# Baseline caps
 RISK_MAX_PER_TRADE = _env_float("RISK_MAX_PER_TRADE", 0.045)
 MAX_CONCURRENT_POS = _env_int("MAX_CONCURRENT_POS", 4)
 
-# Ticket min/max clamps (for UX + sanity)
 RISK_MIN_TICKET_USD = _env_float("RISK_MIN_TICKET_USD", 5.0)
 RISK_MAX_TICKET_USD = _env_float("RISK_MAX_TICKET_USD", 5_000.0)
+RISK_MAX_EQUITY_UTILIZATION_PCT = _env_float("RISK_MAX_EQUITY_UTILIZATION_PCT", 25.0)
 
-# Equity utilization guardrail:
-# max fraction of equity we are willing to lock across concurrent positions
-# (ticket_usd * max_concurrent <= equity * RISK_MAX_EQUITY_UTILIZATION_PCT/100)
-RISK_MAX_EQUITY_UTILIZATION_PCT = _env_float(
-    "RISK_MAX_EQUITY_UTILIZATION_PCT",
-    25.0,  # ~25% of equity notionally at work across open tickets
-)
+# Optional: exposure caps (open notional)
+RISK_MAX_EXPOSURE_PCT = _env_float("RISK_MAX_EXPOSURE_PCT", 0.0)  # percent of equity
+RISK_MAX_EXPOSURE_USD = _env_float("RISK_MAX_EXPOSURE_USD", 0.0)
 
-# ---- Adaptive throttle thresholds ----
-
+# Performance throttle
 THROTTLE_WINRATE_FLOOR = _env_float("THROTTLE_WINRATE_FLOOR", 0.45)
 THROTTLE_DD_FLOOR = _env_float("THROTTLE_DD_FLOOR", 0.08)
-THROTTLE_TICKET_CUT = _env_float("THROTTLE_TICKET_CUT", 0.40)  # 40% cut
-THROTTLE_CONC_DEC = _env_int("THROTTLE_CONC_DEC", 1)           # minus one slot
+THROTTLE_TICKET_CUT = _env_float("THROTTLE_TICKET_CUT", 0.40)
+THROTTLE_CONC_DEC = _env_int("THROTTLE_CONC_DEC", 1)
 
-# ---- Risk profile (global flavour: conservative / balanced / aggressive / auto) ----
-
+# Risk profile
 RISK_PROFILE = _env_str("RISK_PROFILE", "balanced").lower()
 RISK_PROFILE_OVERRIDE_KEY = "risk:profile_override"
-
-# Soft multipliers applied on top of tier + regime + capacity.
 RISK_PROFILE_CONFIG: Dict[str, Dict[str, float]] = {
-    "conservative": {
-        "ticket_mult": 0.70,
-        "pos_pct_mult": 0.80,
-        "max_conc_mult": 0.80,
-        "daily_spend_mult": 0.80,
-        "capacity_exp_mult": 1.20,  # more convex (shrinks faster)
-    },
-    "balanced": {
-        "ticket_mult": 1.00,
-        "pos_pct_mult": 1.00,
-        "max_conc_mult": 1.00,
-        "daily_spend_mult": 1.00,
-        "capacity_exp_mult": 1.00,
-    },
-    "aggressive": {
-        "ticket_mult": 1.20,
-        "pos_pct_mult": 1.10,
-        "max_conc_mult": 1.10,
-        "daily_spend_mult": 1.20,
-        "capacity_exp_mult": 0.85,  # more linear/forgiving
-    },
+    "conservative": {"ticket_mult": 0.70, "pos_pct_mult": 0.80, "max_conc_mult": 0.80, "daily_spend_mult": 0.80, "capacity_exp_mult": 1.20},
+    "balanced": {"ticket_mult": 1.00, "pos_pct_mult": 1.00, "max_conc_mult": 1.00, "daily_spend_mult": 1.00, "capacity_exp_mult": 1.00},
+    "aggressive": {"ticket_mult": 1.20, "pos_pct_mult": 1.10, "max_conc_mult": 1.10, "daily_spend_mult": 1.20, "capacity_exp_mult": 0.85},
 }
-RISK_PROFILE_DEFAULTS = RISK_PROFILE_CONFIG.get(
-    RISK_PROFILE if RISK_PROFILE in RISK_PROFILE_CONFIG else "balanced",
-    RISK_PROFILE_CONFIG["balanced"],
-)
 
-# Regime concurrency deltas (ticket scaling uses regime_state.risk_multiplier())
+# Regime conc deltas
 REGIME_MAX_CONC_DELTA: Dict[str, int] = {
     "risk_off": _env_int("REGIME_MAX_CONC_DELTA_RISK_OFF", -2),
     "normal": _env_int("REGIME_MAX_CONC_DELTA_NORMAL", 0),
     "risk_on": _env_int("REGIME_MAX_CONC_DELTA_RISK_ON", 1),
 }
 
-# Tier schedule (equity bands).
+# Tier schedule (equity bands)
 TIER_SCHEDULE: List[Dict[str, Any]] = [
     {"equity_to": 2_500, "ticket": 50, "pos_pct": 0.025, "max_conc": 3, "spend_pct": 0.10},
     {"equity_to": 5_000, "ticket": 100, "pos_pct": 0.030, "max_conc": 4, "spend_pct": 0.12},
@@ -360,203 +305,202 @@ TIER_SCHEDULE: List[Dict[str, Any]] = [
     {"equity_to": 50_000, "ticket": 600, "pos_pct": 0.045, "max_conc": 7, "spend_pct": 0.16},
     {"equity_to": 100_000, "ticket": 1_000, "pos_pct": 0.045, "max_conc": 8, "spend_pct": 0.18},
     {"equity_to": 500_000, "ticket": 2_500, "pos_pct": 0.050, "max_conc": 10, "spend_pct": 0.20},
-    {
-        "equity_to": 10**12,
-        "ticket": 0,  # depth-driven at high AUM
-        "pos_pct": 0.050,
-        "max_conc": 10,
-        "spend_pct": 0.20,
-    },
+    {"equity_to": 10**12, "ticket": 0, "pos_pct": 0.050, "max_conc": 10, "spend_pct": 0.20},
 ]
 
-# Risk capacity model (how we compress winrate / DD / daily pnl → 0..1)
-RISK_CAPACITY_DD_AT_ZERO = _env_float("RISK_CAPACITY_DD_AT_ZERO", 0.20)  # 20% DD → 0
+# Capacity model knobs
+RISK_CAPACITY_DD_AT_ZERO = _env_float("RISK_CAPACITY_DD_AT_ZERO", 0.20)  # fraction
 RISK_CAPACITY_WR_LOW = _env_float("RISK_CAPACITY_WR_LOW", 0.40)
 RISK_CAPACITY_WR_MID = _env_float("RISK_CAPACITY_WR_MID", 0.55)
-
-# Extra volatility / choppiness penalties from regime_state (optional)
 RISK_CAPACITY_VOL_PENALTY = _env_float("RISK_CAPACITY_VOL_PENALTY", 0.15)
 RISK_CAPACITY_CHOP_PENALTY = _env_float("RISK_CAPACITY_CHOP_PENALTY", 0.15)
-
-# Optional manual risk_mode override (ENV) and infra soft flags
-RISK_MODE_OVERRIDE_ENV = os.getenv("RISK_MODE_OVERRIDE")  # "0", "1", "2", "3" or None
-
-# Ticket scaling exponent based on capacity (1.0 = linear, <1 more aggressive, >1 more defensive)
 RISK_CAPACITY_TICKET_EXP_BASE = _env_float("RISK_CAPACITY_TICKET_EXP", 0.9)
 
-# Optional global equity drawdown kill-switch
-EQUITY_KILL_SWITCH_DD_PCT = _env_float("EQUITY_KILL_SWITCH_DD_PCT", 0.0)  # 0 = disabled
+# Optional risk mode override (env)
+RISK_MODE_OVERRIDE_ENV = os.getenv("RISK_MODE_OVERRIDE")  # optional "0..3"
+EQUITY_KILL_SWITCH_DD_PCT = _env_float("EQUITY_KILL_SWITCH_DD_PCT", 0.0)  # fraction
 
-# Whether legacy per-position selling from this file is enabled
-# NOTE: in V3+++, this only controls *advisory alerts* in handle_position /
-# monitor_positions_loop. Actual sells are done by ai_sell_logic / exit_engine.
-RISK_LEGACY_SELL_ENABLED = _env_bool("RISK_LEGACY_SELL_ENABLED", True)
-
-# Consecutive-loss cooldown: after N losses in a row, block new entries for X minutes
+# Cooldowns
 RISK_COOLDOWN_CONSEC_LOSSES = _env_int("RISK_COOLDOWN_CONSEC_LOSSES", 3)
 RISK_COOLDOWN_MINUTES = _env_int("RISK_COOLDOWN_MINUTES", 15)
-
-# DD-based cooldown
-RISK_DD_COOLDOWN_FLOOR_PCT = _env_float("RISK_DD_COOLDOWN_FLOOR_PCT", 0.0)
+RISK_DD_COOLDOWN_FLOOR_PCT = _env_float("RISK_DD_COOLDOWN_FLOOR_PCT", 0.0)  # percent
 RISK_DD_COOLDOWN_MINUTES = _env_int("RISK_DD_COOLDOWN_MINUTES", 0)
 
-# Optional hard floor on risk_capacity for entries (extra guardrail on top of risk_mode)
+# Entry floors
 RISK_MIN_CAPACITY_FOR_ENTRY = _env_float("RISK_MIN_CAPACITY_FOR_ENTRY", 0.05)
-
-# Plan-aware hard stop for entries when far ahead of equity curve
-RISK_PLAN_AHEAD_HARD_STOP_PCT = _env_float("RISK_PLAN_AHEAD_HARD_STOP_PCT", 0.0)
-
-# Equity floor guardrail – if equity_usd < RISK_MIN_EQUITY_USD, no new entries.
+RISK_PLAN_AHEAD_HARD_STOP_PCT = _env_float("RISK_PLAN_AHEAD_HARD_STOP_PCT", 0.0)  # percent
 RISK_MIN_EQUITY_USD = _env_float("RISK_MIN_EQUITY_USD", 0.0)
-
-# Synthetic equity override: if > 0, treat as equity for risk calculations
 RISK_EQUITY_OVERRIDE_USD = _env_float("RISK_EQUITY_OVERRIDE_USD", 0.0)
 
-# Daily trade-count cap — hard upper bound on trades per UTC day (0 = disabled)
+# Daily caps
 RISK_MAX_DAILY_TRADES = _env_int("RISK_MAX_DAILY_TRADES", 0)
+RISK_MAX_DAILY_ENTRIES = _env_int("RISK_MAX_DAILY_ENTRIES", 0)
 
-# Manual block (ops override) key
-RISK_MANUAL_BLOCK_KEY = "risk:manual_block"  # "1" to block all new entries
+# Liquidity-aware sizing
+RISK_LIQ_AWARE_SIZING = _env_bool("RISK_LIQ_AWARE_SIZING", True)
+RISK_LIQ_MAX_IMPACT_BPS = _env_float("RISK_LIQ_MAX_IMPACT_BPS", 75.0)
 
-# Risk context hash (consumed by FeatureBuilder, scanners, etc.)
+# Sandbox (tiny sizing)
+RISK_SANDBOX_MODE = _env_bool("RISK_SANDBOX_MODE", False)
+
+# Kelly clamp
+RISK_KELLY_ENABLED = _env_bool("RISK_KELLY_ENABLED", True)
+RISK_KELLY_DEFAULT_R = _env_float("RISK_KELLY_DEFAULT_R", 1.5)
+RISK_KELLY_MAX_FRACTION = _env_float("RISK_KELLY_MAX_FRACTION", 0.05)
+RISK_KELLY_MIN_FRACTION = _env_float("RISK_KELLY_MIN_FRACTION", 0.005)
+
+# Trading window (UTC)
+RISK_TRADING_WINDOW_ENABLED = _env_bool("RISK_TRADING_WINDOW_ENABLED", False)
+RISK_TRADING_START_HOUR_UTC = _env_int("RISK_TRADING_START_HOUR_UTC", 0)
+RISK_TRADING_END_HOUR_UTC = _env_int("RISK_TRADING_END_HOUR_UTC", 24)
+RISK_TRADING_DAYS = _env_str("RISK_TRADING_DAYS", "").lower()
+
+# Caching (hot path)
+RISK_LIMITS_CACHE_TTL_MS = _env_int("RISK_LIMITS_CACHE_TTL_MS", 500)
+
+# Per-mint cooldown (anti-chop / revenge trade)
+RISK_MINT_COOLDOWN_MINUTES_DEFAULT = _env_int("RISK_MINT_COOLDOWN_MINUTES_DEFAULT", 0)
+
+# Redis keys
+RISK_HALT_KEY = "risk:halt"  # hard global halt (instant deterministic)
+RISK_MANUAL_BLOCK_KEY = "risk:manual_block"
 RISK_CTX_KEY = "risk:ctx"
-
-# Optional halt reason key
+RISK_CTX_DIGEST_KEY = "risk:ctx_digest"
 RISK_HALT_REASON_KEY = "risk:halt_reason"
 RISK_COOLDOWN_UNTIL_KEY = "risk:cooldown_until_ts"
 
-# Metrics keys
-METRICS_LAST20_KEY = "metrics:last20"           # list of 1/0 (most recent first)
+METRICS_LAST20_KEY = "metrics:last20"
 METRICS_TRADES_KEY = "metrics:trades_total"
 METRICS_WINS_KEY = "metrics:wins_total"
 METRICS_WINRATE20 = "metrics:winrate20"
-METRICS_ROLLING_DD = "metrics:rolling_dd_pct"   # fraction (0..1)
+METRICS_ROLLING_DD = "metrics:rolling_dd_frac"  # fraction [0..1]
 EQUITY_HWM_KEY = "metrics:equity_hwm_usd"
 
-# Live override keys for live tuning (all optional)
 OVERRIDE_TICKET_KEY = "risk:ticket_usd_override"
 OVERRIDE_POS_PCT_KEY = "risk:pos_pct_cap_override"
 OVERRIDE_MAX_CONC_KEY = "risk:max_concurrent_override"
 OVERRIDE_DAILY_SPEND_KEY = "risk:daily_spend_usd_override"
-OVERRIDE_MODE_KEY = "risk:mode_override"  # "0".."3"
-
-# Liquidity-aware sizing helpers:
-RISK_LIQ_AWARE_SIZING = _env_bool("RISK_LIQ_AWARE_SIZING", True)
-RISK_LIQ_MAX_IMPACT_BPS = _env_float("RISK_LIQ_MAX_IMPACT_BPS", 75.0)  # 0.75% default
-
-# Sandbox mode: clamp risk super low for live testing
-RISK_SANDBOX_MODE = _env_bool("RISK_SANDBOX_MODE", False)
-
-# Kelly-style per-trade risk clamp (safety, not hyper-precise Kelly)
-RISK_KELLY_ENABLED = _env_bool("RISK_KELLY_ENABLED", True)
-RISK_KELLY_DEFAULT_R = _env_float("RISK_KELLY_DEFAULT_R", 1.5)     # avg win/loss payoff
-RISK_KELLY_MAX_FRACTION = _env_float("RISK_KELLY_MAX_FRACTION", 0.05)
-RISK_KELLY_MIN_FRACTION = _env_float("RISK_KELLY_MIN_FRACTION", 0.005)
-
-# Trading window controls (UTC-based)
-RISK_TRADING_WINDOW_ENABLED = _env_bool("RISK_TRADING_WINDOW_ENABLED", False)
-RISK_TRADING_START_HOUR_UTC = _env_int("RISK_TRADING_START_HOUR_UTC", 0)   # [0, 23]
-RISK_TRADING_END_HOUR_UTC = _env_int("RISK_TRADING_END_HOUR_UTC", 24)      # [0, 24], end-exclusive
-RISK_TRADING_DAYS = _env_str(
-    "RISK_TRADING_DAYS",
-    "",  # empty = all days; otherwise comma-separated: "mon,tue,wed,fri" or "0,1,2,3,4"
-).lower()
-
-# Risk manager loop cadence (for keeping risk:ctx fresh)
-RISK_MANAGER_LOOP_INTERVAL = _env_int("RISK_MANAGER_LOOP_INTERVAL_SEC", 5)
-
-# Local cooldowns for sell/guardrail alerts per-mint (in-memory only)
-_COOLDOWNS: Dict[str, float] = {}
-
-# Track last broadcast risk_mode to avoid spammy alerts
-_last_broadcast_mode: Optional[int] = None
+OVERRIDE_MODE_KEY = "risk:mode_override"
 
 
-# ============================================================================ #
-# Redis / time helpers
-# ============================================================================ #
-
+# =============================================================================
+# Daily keys + idempotency keys
+# =============================================================================
 def _key_daily(prefix: str) -> str:
-    today = datetime.now(timezone.utc).strftime("%Y%m%d")
-    return f"{prefix}:{today}"
+    d = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return f"{prefix}:{d}"
 
 
 def _pnl_key_today() -> str:
     return _key_daily("pnl:day:realized_usd")
 
 
-async def _get_redis(url: Optional[str] = None):
-    """
-    Prefer the shared Redis client from core_utils; fallback to a local aioredis
-    client if needed, or return None if Redis is unavailable.
-    """
-    if shared_redis is not None:
-        return shared_redis
-    if aioredis is None:
-        logger.warning(
-            "redis (async) not installed; running without Redis-backed budgets/metrics."
-        )
-        return None
-    return aioredis.from_url(url or REDIS_URL, decode_responses=True)
+def _spent_key_today() -> str:
+    return _key_daily("budget:sniper:spent_usd")
 
 
+def _entries_key_today() -> str:
+    return _key_daily("risk:entries_count")
+
+
+def _trades_key_today() -> str:
+    return _key_daily("risk:trades_count")
+
+
+def _closed_trade_key(trade_id: str) -> str:
+    return f"trade:closed:{trade_id}"
+
+
+# local alert cooldowns
+_COOLDOWNS: Dict[str, float] = {}
+_last_broadcast_mode: Optional[int] = None
+
+
+# =============================================================================
+# Time + redis helpers
+# =============================================================================
 def _now_ts() -> float:
     return datetime.now(timezone.utc).timestamp()
 
 
 def _midnight_utc() -> datetime:
     now = datetime.now(timezone.utc)
-    return (now + timedelta(days=1)).replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
+    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _ttl_to_midnight_sec() -> int:
+    ttl = int((_midnight_utc() - datetime.now(timezone.utc)).total_seconds())
+    return max(1, ttl)
 
 
 async def _set_expire_at_midnight(redis, key: str) -> None:
     if not redis:
         return
+    with contextlib.suppress(Exception):
+        await redis.expire(key, _ttl_to_midnight_sec())
+
+
+_redis_singleton = None
+
+
+async def _get_redis(url: Optional[str] = None):
+    """
+    Prefer core_utils shared redis (if present), otherwise use core_utils.get_redis_async(),
+    otherwise fallback to aioredis singleton.
+    """
+    global _redis_singleton
+
+    # 1) shared client exposed by core_utils (if your repo keeps one)
+    shared = getattr(cu, "redis", None)
+    if shared is not None:
+        return shared
+
+    # 2) preferred async getter
+    getter = getattr(cu, "get_redis_async", None)
+    if getter is not None:
+        with contextlib.suppress(Exception):
+            r = await getter()
+            if r is not None:
+                return r
+
+    # 3) fallback local singleton
+    if _redis_singleton is not None:
+        return _redis_singleton
+    if aioredis is None:
+        return None
     try:
-        ttl = int((_midnight_utc() - datetime.now(timezone.utc)).total_seconds())
-        if ttl > 0:
-            await redis.expire(key, ttl)
+        _redis_singleton = aioredis.from_url(url or REDIS_URL, decode_responses=True)
+        return _redis_singleton
     except Exception:
-        pass
+        _redis_singleton = None
+        return None
+
+
+def _alert_ok(token: str) -> bool:
+    if RISK_DISABLE_ALERTS:
+        return False
+    if ALERT_COOLDOWN_SECONDS <= 0:
+        return True
+    now = _now_ts()
+    until = _COOLDOWNS.get(token)
+    if until is not None and until > now:
+        return False
+    _COOLDOWNS[token] = now + ALERT_COOLDOWN_SECONDS
+    return True
 
 
 def _parse_trading_days(raw: str) -> Optional[set[int]]:
-    """
-    Parse RISK_TRADING_DAYS into a set of weekday indices (0=Mon..6=Sun).
-
-    Accepts:
-      - "mon,tue,wed" / "monday,friday"
-      - "0,1,2,3,4"
-    Returns None if parsing fails or raw is empty → interpreted as "all days".
-    """
     raw = (raw or "").strip().lower()
     if not raw:
         return None
-
     name_to_idx = {
-        "mon": 0,
-        "monday": 0,
-        "tue": 1,
-        "tues": 1,
-        "tuesday": 1,
-        "wed": 2,
-        "weds": 2,
-        "wednesday": 2,
-        "thu": 3,
-        "thur": 3,
-        "thurs": 3,
-        "thursday": 3,
-        "fri": 4,
-        "friday": 4,
-        "sat": 5,
-        "saturday": 5,
-        "sun": 6,
-        "sunday": 6,
+        "mon": 0, "monday": 0,
+        "tue": 1, "tues": 1, "tuesday": 1,
+        "wed": 2, "weds": 2, "wednesday": 2,
+        "thu": 3, "thur": 3, "thurs": 3, "thursday": 3,
+        "fri": 4, "friday": 4,
+        "sat": 5, "saturday": 5,
+        "sun": 6, "sunday": 6,
     }
     out: set[int] = set()
     for part in raw.split(","):
@@ -564,224 +508,345 @@ def _parse_trading_days(raw: str) -> Optional[set[int]]:
         if not p:
             continue
         if p.isdigit():
-            try:
-                idx = int(p)
-                if 0 <= idx <= 6:
-                    out.add(idx)
-            except Exception:
-                continue
+            with contextlib.suppress(Exception):
+                v = int(p)
+                if 0 <= v <= 6:
+                    out.add(v)
         else:
-            idx = name_to_idx.get(p)
-            if idx is not None:
-                out.add(idx)
+            v = name_to_idx.get(p)
+            if v is not None:
+                out.add(v)
     return out or None
 
 
 def _trading_window_status() -> Tuple[bool, str]:
-    """
-    Evaluate if we are inside the configured trading window (UTC).
-
-    Env controls:
-      RISK_TRADING_WINDOW_ENABLED       -> bool
-      RISK_TRADING_START_HOUR_UTC      -> int in [0,23]
-      RISK_TRADING_END_HOUR_UTC        -> int in [0,24], end-exclusive
-      RISK_TRADING_DAYS                -> "" or comma list of weekdays
-                                          "mon,tue,wed,fri" or "0,1,2,3,4"
-
-    Returns: (is_open, human_reason)
-    """
     if not RISK_TRADING_WINDOW_ENABLED:
         return True, "trading_window_disabled"
 
     now = datetime.now(timezone.utc)
     hour = now.hour
-    weekday = now.weekday()  # 0=Mon..6=Sun
+    weekday = now.weekday()
 
     allowed_days = _parse_trading_days(RISK_TRADING_DAYS)
     if allowed_days is not None and weekday not in allowed_days:
-        return False, f"weekday {weekday} not in allowed trading days"
+        return False, f"weekday {weekday} not allowed"
 
-    # Clamp hours to valid ranges
     start = max(0, min(23, int(RISK_TRADING_START_HOUR_UTC)))
     end = max(0, min(24, int(RISK_TRADING_END_HOUR_UTC)))
-
-    # If start == end, treat as "all day"
     if start == end:
         return True, "24h_window"
 
     if start < end:
-        in_window = start <= hour < end
-        if not in_window:
-            return False, f"hour {hour} outside [{start},{end}) UTC"
-    else:
-        # Window crosses midnight, e.g. 18 → 4
-        in_window = (hour >= start) or (hour < end)
-        if not in_window:
-            return False, f"hour {hour} outside overnight window {start}→{end} UTC"
+        ok = start <= hour < end
+        return ok, (f"within [{start},{end})" if ok else f"hour {hour} outside [{start},{end})")
 
-    return True, "within_trading_window"
+    ok = (hour >= start) or (hour < end)
+    return ok, (f"within overnight {start}->{end}" if ok else f"hour {hour} outside overnight {start}->{end}")
 
 
-def _cooldown_key(token: str) -> str:
-    return str(token)
+# =============================================================================
+# Halt / stop-trading (instant deterministic)
+# =============================================================================
+async def _read_halt_reason(redis) -> str:
+    if not redis:
+        return ""
+    with contextlib.suppress(Exception):
+        return _s(await redis.get(RISK_HALT_REASON_KEY))
+    return ""
 
 
-def _alert_ok(token: str) -> bool:
+async def _is_halted_fast(redis) -> Tuple[bool, str]:
     """
-    In-memory per-token cooldown for Telegram alerts to avoid spam.
+    FAST path: do not depend on cached limits.
+    Checks keys that must immediately stop trading.
     """
-    if ALERT_COOLDOWN_SECONDS <= 0:
-        return True
-    key = _cooldown_key(token)
-    now = _now_ts()
-    until = _COOLDOWNS.get(key)
-    if until is not None and until > now:
-        return False
-    _COOLDOWNS[key] = now + ALERT_COOLDOWN_SECONDS
-    return True
+    if not redis:
+        return False, ""
+
+    # hard key
+    with contextlib.suppress(Exception):
+        if _s(await redis.get(RISK_HALT_KEY)).strip() == "1":
+            reason = await _read_halt_reason(redis)
+            return True, f"risk:halt=1{(' | ' + reason) if reason else ''}"
+
+    # manual block
+    with contextlib.suppress(Exception):
+        if _s(await redis.get(RISK_MANUAL_BLOCK_KEY)).strip() == "1":
+            reason = await _read_halt_reason(redis)
+            return True, f"risk:manual_block=1{(' | ' + reason) if reason else ''}"
+
+    # infra halt
+    with contextlib.suppress(Exception):
+        if _s(await redis.get("infra:halt")).strip() == "1":
+            return True, "infra:halt=1"
+
+    # strategy HARD_HALT (best effort)
+    with contextlib.suppress(Exception):
+        strat = await get_strategy_params(redis)
+        hh = str(strat.get("HARD_HALT", "0")).strip().lower() in ("1", "true", "yes", "on")
+        if hh:
+            return True, "strategy HARD_HALT=1"
+
+    return False, ""
 
 
-# ============================================================================ #
-# Equity & metrics
-# ============================================================================ #
+async def halt_trading(reason: str = "manual_halt", redis=None) -> None:
+    """
+    Hard global halt. This is the *strongest* stop and is checked on every entry gate call.
+    """
+    if redis is None:
+        redis = await _get_redis()
+    if not redis:
+        return
+    try:
+        await redis.set(RISK_HALT_KEY, "1")
+        if reason:
+            await redis.set(RISK_HALT_REASON_KEY, str(reason)[:300])
+        await log_event("risk_halt_set", {"reason": reason, "engine": RISK_ENGINE_VERSION})
+        invalidate_limits_cache()
+    except Exception:
+        pass
 
+
+async def resume_trading(redis=None) -> None:
+    """
+    Clears hard global halt. Does NOT clear manual block or infra halt.
+    """
+    if redis is None:
+        redis = await _get_redis()
+    if not redis:
+        return
+    try:
+        await redis.delete(RISK_HALT_KEY)
+        await redis.delete(RISK_HALT_REASON_KEY)
+        await log_event("risk_halt_cleared", {"engine": RISK_ENGINE_VERSION})
+        invalidate_limits_cache()
+    except Exception:
+        pass
+
+
+# =============================================================================
+# Equity + positions exposure
+# =============================================================================
 async def _wallet_equity_usd() -> float:
     """
-    Estimate total equity in USD using wallet balances & token prices.
+    Best-effort total trading equity in USD.
 
-    Strategy:
-      - Fetch wallet SPL tokens from core_utils.get_wallet_tokens().
-      - For SOL itself, treat balance as SOL.
-      - For other tokens:
-            price_usd = get_token_price(mint)
-            sol_usd   = price of 1 SOL in USD
-            px_sol    = price_usd / sol_usd
-            sol_equiv = balance * px_sol
-      - Convert aggregate SOL to USD once via convert_sol_to_usd_amount.
+    Priority:
+      1) utils_pkg.smart_wallets.trading_equity_view (if available)
+      2) fallback: WALLET_PUBKEY SPL balances + token prices
 
-    This is best-effort and conservative; failures return 0.0.
+    Conservative: tokens without a usable price are ignored.
     """
+    tev = getattr(__import__("utils_pkg.smart_wallets", fromlist=["trading_equity_view"]), "trading_equity_view", None)  # type: ignore
+    if tev is not None:
+        with contextlib.suppress(Exception):
+            view = await _maybe_await(tev())
+            if isinstance(view, dict):
+                raw_eq = view.get("equity_usd") or view.get("equity") or view.get("trading_equity_usd") or 0.0
+                eq = float(raw_eq or 0.0)
+                if eq > 0:
+                    return eq
+
     if not WALLET_PUBKEY:
         return 0.0
-    try:
-        tokens = await get_wallet_tokens(WALLET_PUBKEY)  # [{mint, balance}, ...]
-        if not tokens:
-            return 0.0
 
-        sol_usd = await convert_sol_to_usd_amount(1.0)
-        if sol_usd <= 0:
-            return 0.0
+    get_wallet_tokens = getattr(cu, "get_wallet_tokens", None)
+    get_token_price = getattr(cu, "get_token_price", None)
+    convert_sol_to_usd_amount = getattr(cu, "convert_sol_to_usd_amount", None)
 
-        total_sol = 0.0
-        for t in tokens:
-            try:
-                mint = t.get("mint")
-                bal = float(t.get("balance", 0.0) or 0.0)
-            except Exception:
-                continue
-            if not mint or bal <= 0:
-                continue
-
-            if mint == SOL_MINT:
-                total_sol += bal
-            else:
-                try:
-                    px_usd = await get_token_price(mint)
-                    if px_usd > 0:
-                        px_sol = px_usd / sol_usd
-                        total_sol += bal * px_sol
-                except Exception:
-                    continue
-
-        usd = await convert_sol_to_usd_amount(total_sol)
-        return float(usd or 0.0)
-    except Exception as e:
-        logger.warning("[RISK] equity calc failed: %s", e)
+    tokens = await _call(get_wallet_tokens, WALLET_PUBKEY)
+    tokens = tokens or []
+    if not tokens:
         return 0.0
+
+    sol_usd = await _call(convert_sol_to_usd_amount, 1.0)
+    sol_usd = float(sol_usd or 0.0)
+    if sol_usd <= 0:
+        return 0.0
+
+    total_usd = 0.0
+    for t in tokens:
+        try:
+            mint = (t or {}).get("mint")
+            bal = float((t or {}).get("balance", 0.0) or 0.0)
+        except Exception:
+            continue
+        if not mint or bal <= 0:
+            continue
+
+        if mint == SOL_MINT:
+            total_usd += bal * sol_usd
+            continue
+
+        px = await _call(get_token_price, mint)
+        try:
+            px = float(px or 0.0)
+        except Exception:
+            px = 0.0
+        if px <= 0:
+            continue
+        total_usd += bal * px
+
+    return float(total_usd)
 
 
 async def estimate_equity_usd() -> float:
-    """
-    Public convenience wrapper: expose wallet equity to other modules.
-    Synthetic equity override (RISK_EQUITY_OVERRIDE_USD) is *not* applied here,
-    so other modules can explicitly choose whether to use synthetic equity.
-    """
     return await _wallet_equity_usd()
 
 
 async def _wallet_sol_balance() -> float:
-    """
-    Lightweight SOL-balance helper used for MIN_SOL_BALANCE guardrails.
-    """
+    tev = getattr(__import__("utils_pkg.smart_wallets", fromlist=["trading_equity_view"]), "trading_equity_view", None)  # type: ignore
+    if tev is not None:
+        with contextlib.suppress(Exception):
+            view = await _maybe_await(tev())
+            if isinstance(view, dict):
+                raw = view.get("sol_balance") or view.get("sol") or view.get("trading_sol_balance") or 0.0
+                bal = float(raw or 0.0)
+                if bal > 0:
+                    return bal
+
     if not WALLET_PUBKEY:
         return 0.0
+
+    get_wallet_tokens = getattr(cu, "get_wallet_tokens", None)
+    tokens = await _call(get_wallet_tokens, WALLET_PUBKEY)
+    for t in (tokens or []):
+        if (t or {}).get("mint") == SOL_MINT:
+            return float((t or {}).get("balance", 0.0) or 0.0)
+    return 0.0
+
+
+def _select_tier(equity_usd: float) -> Dict[str, Any]:
+    for t in TIER_SCHEDULE:
+        if equity_usd <= t["equity_to"]:
+            return dict(t)
+    return dict(TIER_SCHEDULE[-1])
+
+
+def _positions_open_count() -> int:
     try:
-        tokens = await get_wallet_tokens(WALLET_PUBKEY)
-        for t in tokens or []:
-            if t.get("mint") == SOL_MINT:
-                return float(t.get("balance", 0.0))
-        return 0.0
-    except Exception as e:
-        logger.warning("[RISK] SOL balance calc failed: %s", e)
-        return 0.0
+        return len(load_positions() or [])
+    except Exception:
+        return 0
 
 
+def _positions_open_exposure_usd() -> float:
+    """
+    Best-effort open exposure (USD). Uses stored fields when available.
+
+    We do NOT hit RPC here. This must stay safe and fast.
+    """
+    total = 0.0
+    try:
+        for p in (load_positions() or []):
+            if not isinstance(p, dict):
+                continue
+            # common fields across many bots
+            for k in ("notional_usd", "exposure_usd", "entry_usd", "cost_usd", "spent_usd", "ticket_usd"):
+                v = p.get(k)
+                if v is None:
+                    continue
+                with contextlib.suppress(Exception):
+                    vv = float(v)
+                    if vv > 0:
+                        total += vv
+                        break
+            else:
+                # fallback: if it stores entry_sol or spent_sol
+                for k in ("entry_sol", "spent_sol", "cost_sol", "amount_sol"):
+                    v = p.get(k)
+                    if v is None:
+                        continue
+                    with contextlib.suppress(Exception):
+                        vv = float(v)
+                        if vv > 0:
+                            # convert using last known SOL price from core_utils if possible (best effort)
+                            convert_sol_to_usd_amount = getattr(cu, "convert_sol_to_usd_amount", None)
+                            # Avoid await here (sync function). If convert is async, this block won't run; fine.
+                            if convert_sol_to_usd_amount is not None and not asyncio.iscoroutinefunction(convert_sol_to_usd_amount):
+                                px = convert_sol_to_usd_amount(1.0)
+                                px = float(px or 0.0)
+                                if px > 0:
+                                    total += vv * px
+                            break
+    except Exception:
+        return float(total)
+    return float(total)
+
+
+# =============================================================================
+# Metrics helpers
+# =============================================================================
 async def _metrics(redis) -> Tuple[float, float]:
-    """
-    Return (winrate20, rolling_dd_pct) from Redis.
-
-    Defaults to (0.50, 0.0) if metrics or Redis are unavailable.
-    rolling_dd_pct is a fraction (0..1).
-    """
+    """Return (winrate20, rolling_dd_frac) where rolling_dd_frac ∈ [0..1]."""
+    if not redis:
+        return 0.50, 0.0
     try:
-        if redis is None:
-            redis = await _get_redis()
-        if not redis:
-            return 0.50, 0.0
         wr, dd = await redis.mget(METRICS_WINRATE20, METRICS_ROLLING_DD)
         winrate = float(wr) if wr is not None else 0.50
         drawdown = float(dd) if dd is not None else 0.0
-        return winrate, drawdown
+        return _clamp(winrate, 0.0, 1.0), _clamp(drawdown, 0.0, 1.0)
     except Exception:
         return 0.50, 0.0
 
 
 async def _equity_hwm(redis) -> float:
-    """
-    Helper: best-effort equity high-watermark in USD.
-    """
-    try:
-        if redis is None:
-            redis = await _get_redis()
-        if not redis:
-            return 0.0
+    if not redis:
+        return 0.0
+    with contextlib.suppress(Exception):
         v = await redis.get(EQUITY_HWM_KEY)
         return float(v) if v else 0.0
-    except Exception:
+    return 0.0
+
+
+async def _daily_realized_usd(redis) -> float:
+    if not redis:
         return 0.0
+    with contextlib.suppress(Exception):
+        v = await redis.get(_pnl_key_today())
+        return float(v) if v else 0.0
+    return 0.0
+
+
+async def _daily_spent_usd(redis) -> float:
+    if not redis:
+        return 0.0
+    with contextlib.suppress(Exception):
+        v = await redis.get(_spent_key_today())
+        return float(v) if v else 0.0
+    return 0.0
+
+
+async def _daily_trades(redis) -> int:
+    if not redis:
+        return 0
+    with contextlib.suppress(Exception):
+        v = await redis.get(_trades_key_today())
+        return int(float(v)) if v else 0
+    return 0
+
+
+async def _daily_entries(redis) -> int:
+    if not redis:
+        return 0
+    with contextlib.suppress(Exception):
+        v = await redis.get(_entries_key_today())
+        return int(float(v)) if v else 0
+    return 0
 
 
 async def _consecutive_losses(redis) -> int:
-    """
-    Approximate consecutive losses from METRICS_LAST20 (1=win, 0=loss).
-
-    'Consecutive losses' = number of leading zeros from the most
-    recent trade backwards until the first win is encountered.
-    """
+    """Count leading losses in last20 list (most recent first). last20 values: 1=win, 0=loss"""
+    if not redis:
+        return 0
     try:
-        if redis is None:
-            redis = await _get_redis()
-        if not redis:
-            return 0
         seq = await redis.lrange(METRICS_LAST20_KEY, 0, 19)
-        if not seq:
-            return 0
         losses = 0
-        for v in seq:
-            try:
+        for v in (seq or []):
+            is_win = False
+            with contextlib.suppress(Exception):
                 is_win = int(v) == 1
-            except Exception:
-                is_win = False
             if is_win:
                 break
             losses += 1
@@ -790,517 +855,266 @@ async def _consecutive_losses(redis) -> int:
         return 0
 
 
-def _select_tier(equity_usd: float) -> Dict[str, Any]:
-    """
-    Choose a tier from TIER_SCHEDULE based on equity.
-    """
-    for tier in TIER_SCHEDULE:
-        if equity_usd <= tier["equity_to"]:
-            return dict(tier)
-    return dict(TIER_SCHEDULE[-1])
-
-
-# ============================================================================ #
-# Risk capacity model & Kelly helper
-# ============================================================================ #
-
-def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, float(x)))
-
-
+# =============================================================================
+# Risk capacity + Kelly helpers
+# =============================================================================
 def _risk_capacity_from_components(
     *,
     winrate20: float,
-    rolling_dd: float,
+    rolling_dd: float,  # fraction
     realized_pnl_usd: float,
     equity_usd: float,
     regime_mult: float,
     regime_volatility: float = 0.5,
     regime_choppy: float = 0.0,
 ) -> float:
-    """
-    Compress performance / drawdown / daily pnl & regime into a 0..1 risk capacity.
+    dd = max(0.0, float(rolling_dd))
+    dd_term = 1.0 if RISK_CAPACITY_DD_AT_ZERO <= 0 else _clamp(1.0 - dd / RISK_CAPACITY_DD_AT_ZERO)
 
-    Intuition:
-      - High DD & low winrate → near 0 capacity.
-      - Flat DD & decent winrate → 0.7–1.0 capacity.
-      - Approaching daily profit target → capacity tapers down.
-      - High volatility / choppiness modestly shrink capacity.
-      - Regime multiplier scales capacity (risk_off < 1, risk_on > 1).
-    """
-    # Drawdown term: 0 at RISK_CAPACITY_DD_AT_ZERO or worse, 1 at 0 DD
-    dd = max(0.0, rolling_dd)
-    if RISK_CAPACITY_DD_AT_ZERO <= 0:
-        dd_term = 1.0
-    else:
-        dd_term = _clamp(1.0 - dd / RISK_CAPACITY_DD_AT_ZERO)
-
-    # Winrate term: 0 at WR_LOW or worse, 1 at WR_MID or better
     wr = _clamp(winrate20, 0.0, 1.0)
     if RISK_CAPACITY_WR_MID <= RISK_CAPACITY_WR_LOW:
         wr_term = wr
     else:
-        wr_term = _clamp(
-            (wr - RISK_CAPACITY_WR_LOW)
-            / (RISK_CAPACITY_WR_MID - RISK_CAPACITY_WR_LOW)
-        )
+        wr_term = _clamp((wr - RISK_CAPACITY_WR_LOW) / (RISK_CAPACITY_WR_MID - RISK_CAPACITY_WR_LOW))
 
-    # Daily PnL term: 1 at <=0, taper as we approach daily target
+    # Profit stop tapers capacity as we approach the daily profit target
     if equity_usd <= 0 or STOP_AFTER_DAILY_PROFIT_PCT <= 0:
         pnl_term = 1.0
     else:
-        target_usd = equity_usd * (STOP_AFTER_DAILY_PROFIT_PCT / 100.0)
-        if target_usd <= 0:
+        target = equity_usd * (STOP_AFTER_DAILY_PROFIT_PCT / 100.0)
+        if target <= 0:
             pnl_term = 1.0
         else:
-            pct = max(0.0, realized_pnl_usd) / target_usd
-            base = 1.0 - min(pct, 1.0) * 0.7  # taper to 0.3 as we approach target
-            pnl_term = _clamp(base, 0.3, 1.0)
+            pct = max(0.0, float(realized_pnl_usd)) / target
+            pnl_term = _clamp(1.0 - min(pct, 1.0) * 0.7, 0.3, 1.0)
 
-    # Volatility / choppiness penalty from regime_state (best-effort)
-    vol_penalty = _clamp(regime_volatility, 0.0, 1.0) * RISK_CAPACITY_VOL_PENALTY
-    chop_penalty = _clamp(regime_choppy, 0.0, 1.0) * RISK_CAPACITY_CHOP_PENALTY
+    vol_pen = _clamp(regime_volatility, 0.0, 1.0) * RISK_CAPACITY_VOL_PENALTY
+    chop_pen = _clamp(regime_choppy, 0.0, 1.0) * RISK_CAPACITY_CHOP_PENALTY
 
     base = 0.40 * dd_term + 0.40 * wr_term + 0.20 * pnl_term
-    base = base * (1.0 - vol_penalty) * (1.0 - chop_penalty)
+    base *= (1.0 - vol_pen) * (1.0 - chop_pen)
 
-    # Regime: risk_off < 1, risk_on > 1, but clamp to sane band.
     mult = _clamp(regime_mult, 0.6, 1.4)
-    capacity = _clamp(base * mult, 0.0, 1.0)
-    return capacity
+    return _clamp(base * mult, 0.0, 1.0)
 
 
 def _risk_mode_from_capacity(capacity: float) -> int:
-    """
-    Discrete risk_mode that maps into:
-       0 = OFF (halt, no new entries)
-       1 = NORMAL
-       2 = AGGRESSIVE
-       3 = DEFENSIVE (still trade but shrunk sizing)
-    """
     c = _clamp(capacity, 0.0, 1.0)
     if c <= 0.15:
-        return 0
+        return 0  # OFF
     if c <= 0.35:
-        return 3
+        return 3  # DEFENSIVE
     if c >= 0.80:
-        return 2
-    return 1
+        return 2  # AGGRESSIVE
+    return 1  # NORMAL
 
 
 def _kelly_fraction(winrate: float, payoff_r: float) -> float:
-    """
-    Simple Kelly fraction estimate:
-
-        f* = p - (q / R)
-
-    where:
-      p = winrate
-      q = 1 - p
-      R = average win / average loss payoff ratio.
-
-    We clamp aggressively; this is meant as a *safety* signal, not a precision Kelly.
-    """
     p = _clamp(winrate, 0.0, 1.0)
     if payoff_r <= 0:
         return 0.0
     q = 1.0 - p
-    f_star = p - (q / payoff_r)
-    return _clamp(f_star, 0.0, 1.0)
+    f = p - (q / payoff_r)
+    return _clamp(f, 0.0, 1.0)
 
 
 def _kelly_pos_cap(winrate: float) -> Tuple[float, float]:
-    """
-    Return (kelly_raw, kelly_pos_pct_cap):
-
-      kelly_raw          → raw Kelly fraction in [0,1]
-      kelly_pos_pct_cap  → sanitized fraction in [min, max] for use as an
-                           *upper bound* on per-trade risk.
-    """
     if not RISK_KELLY_ENABLED:
         return 0.0, 0.0
     raw = _kelly_fraction(winrate, RISK_KELLY_DEFAULT_R)
-    if raw <= 0:
-        # still allow a tiny exploratory fraction
-        frac = RISK_KELLY_MIN_FRACTION
-    else:
-        frac = raw
+    frac = raw if raw > 0 else RISK_KELLY_MIN_FRACTION
     frac = max(RISK_KELLY_MIN_FRACTION, min(RISK_KELLY_MAX_FRACTION, frac))
     return raw, frac
 
 
-async def _risk_mode_with_override(
-    redis,
-    capacity: float,
-    *,
-    rolling_dd: float,
-) -> Tuple[float, int, Optional[int], Optional[str]]:
-    """
-    Compute (capacity, risk_mode, override_mode, halt_reason):
-
-      • capacity: possibly shrunk (for OFF/DEFENSIVE)
-      • risk_mode: 0..3 derived from capacity or override
-      • override_mode: if non-None, the explicit override used
-      • halt_reason: optional human-readable reason for risk_mode=0
-    """
+async def _risk_mode_with_override(redis, capacity: float, *, rolling_dd: float) -> Tuple[float, int, Optional[int], Optional[str]]:
     base_mode = _risk_mode_from_capacity(capacity)
     override_mode: Optional[int] = None
     halt_reason: Optional[str] = None
 
-    # ENV override wins over Redis if present
+    # ENV override > redis override
     if RISK_MODE_OVERRIDE_ENV is not None:
-        try:
-            override_mode = int(RISK_MODE_OVERRIDE_ENV)
-        except Exception:
-            override_mode = None
-    elif redis is not None:
-        try:
-            val = await redis.get(OVERRIDE_MODE_KEY)
-            if val is not None:
-                override_mode = int(val)
-        except Exception:
-            override_mode = None
+        with contextlib.suppress(Exception):
+            override_mode = int(str(RISK_MODE_OVERRIDE_ENV).strip())
+    elif redis:
+        with contextlib.suppress(Exception):
+            v = await redis.get(OVERRIDE_MODE_KEY)
+            if v is not None:
+                override_mode = int(float(v))
 
-    if override_mode is not None and override_mode in (0, 1, 2, 3):
-        risk_mode = override_mode
+    mode = override_mode if (override_mode in (0, 1, 2, 3)) else base_mode
+
+    # equity kill switch by rolling DD fraction
+    if EQUITY_KILL_SWITCH_DD_PCT > 0 and float(rolling_dd) >= float(EQUITY_KILL_SWITCH_DD_PCT):
+        mode = 0
+        halt_reason = f"equity_drawdown>=kill_switch ({rolling_dd:.3f} ≥ {EQUITY_KILL_SWITCH_DD_PCT:.3f})"
+
+    # adjust capacity for OFF/DEFENSIVE
+    if mode == 0:
+        cap_adj = 0.0
+    elif mode == 3:
+        cap_adj = min(float(capacity), 0.40)
     else:
-        risk_mode = base_mode
+        cap_adj = float(capacity)
 
-    # Optional global equity DD kill switch (uses rolling DD fraction)
-    if EQUITY_KILL_SWITCH_DD_PCT > 0 and rolling_dd >= EQUITY_KILL_SWITCH_DD_PCT:
-        risk_mode = 0
-        halt_reason = (
-            f"equity_drawdown>=kill_switch "
-            f"({rolling_dd:.3f} ≥ {EQUITY_KILL_SWITCH_DD_PCT:.3f})"
-        )
-
-    # Optionally shrink capacity further for defensive or off
-    if risk_mode == 0:
-        capacity_adj = 0.0
-    elif risk_mode == 3:
-        capacity_adj = min(capacity, 0.40)
-    else:
-        capacity_adj = capacity
-
-    return capacity_adj, risk_mode, override_mode, halt_reason
+    return _clamp(cap_adj, 0.0, 1.0), int(mode), override_mode, halt_reason
 
 
-# ============================================================================ #
-# Live overrides
-# ============================================================================ #
-
+# =============================================================================
+# Profiles + live overrides
+# =============================================================================
 async def _effective_risk_profile(redis) -> tuple[str, Dict[str, float]]:
-    """
-    Determine the *active* risk profile and return:
+    profile = RISK_PROFILE
 
-      (profile_name, profile_config_dict)
-
-    Where profile_name is one of:
-      - 'conservative' / 'balanced' / 'aggressive'
-      - or 'auto' resolved to one of the above via regime_state.risk_profile_hint().
-    """
-    profile_name = RISK_PROFILE
-
-    # Redis override beats env if valid
     if redis:
-        try:
+        with contextlib.suppress(Exception):
             v = await redis.get(RISK_PROFILE_OVERRIDE_KEY)
             if v:
-                v_lower = str(v).strip().lower()
-                if v_lower in RISK_PROFILE_CONFIG or v_lower == "auto":
-                    profile_name = v_lower
-        except Exception:
-            pass
+                vv = _s(v).strip().lower()
+                if vv in RISK_PROFILE_CONFIG or vv == "auto":
+                    profile = vv
 
-    # If "auto", let regime_state hint the flavour
-    if profile_name == "auto":
-        try:
+    if profile == "auto":
+        with contextlib.suppress(Exception):
             hinted = regime_state.risk_profile_hint()
-            profile_name = hinted if hinted in RISK_PROFILE_CONFIG else "balanced"
-        except Exception:
-            profile_name = "balanced"
+            profile = hinted if hinted in RISK_PROFILE_CONFIG else "balanced"
 
-    cfg = RISK_PROFILE_CONFIG.get(profile_name, RISK_PROFILE_CONFIG["balanced"])
-    return profile_name, cfg
+    cfg = RISK_PROFILE_CONFIG.get(profile, RISK_PROFILE_CONFIG["balanced"])
+    return profile, cfg
 
 
-async def _apply_overrides(
-    redis,
-    *,
-    ticket_usd: float,
-    pos_pct_cap: float,
-    max_concurrent: int,
-    daily_spend_usd: float,
-) -> Dict[str, Any]:
-    """
-    Allow live tuning from Redis without redeploys.
-
-    Keys (all optional):
-      risk:ticket_usd_override          -> float (USD)
-      risk:pos_pct_cap_override         -> float (0..RISK_MAX_PER_TRADE)
-      risk:max_concurrent_override      -> int
-      risk:daily_spend_usd_override     -> float (USD)
-    """
-    base = {
+async def _apply_overrides(redis, *, ticket_usd: float, pos_pct_cap: float, max_concurrent: int, daily_spend_usd: float) -> Dict[str, Any]:
+    out = {
         "ticket_usd": float(ticket_usd),
         "pos_pct_cap": float(pos_pct_cap),
         "max_concurrent": int(max_concurrent),
         "daily_spend_usd": float(daily_spend_usd),
     }
     if not redis:
-        return base
+        return out
 
     try:
-        t_raw, p_raw, c_raw, s_raw = await redis.mget(
-            OVERRIDE_TICKET_KEY,
-            OVERRIDE_POS_PCT_KEY,
-            OVERRIDE_MAX_CONC_KEY,
-            OVERRIDE_DAILY_SPEND_KEY,
-        )
+        t_raw, p_raw, c_raw, s_raw = await redis.mget(OVERRIDE_TICKET_KEY, OVERRIDE_POS_PCT_KEY, OVERRIDE_MAX_CONC_KEY, OVERRIDE_DAILY_SPEND_KEY)
     except Exception:
-        return base
+        return out
 
-    # Ticket override
     if t_raw is not None:
-        try:
+        with contextlib.suppress(Exception):
             t = float(t_raw)
             if t > 0:
-                base["ticket_usd"] = t
-        except Exception:
-            pass
+                out["ticket_usd"] = t
 
-    # Pos pct override
     if p_raw is not None:
-        try:
+        with contextlib.suppress(Exception):
             p = float(p_raw)
-            if 0 < p <= RISK_MAX_PER_TRADE:
-                base["pos_pct_cap"] = p
-        except Exception:
-            pass
+            if 0 < p <= max(RISK_MAX_PER_TRADE, 1e-9):
+                out["pos_pct_cap"] = p
 
-    # Max conc override
     if c_raw is not None:
-        try:
-            c = int(c_raw)
-            if c > 0:
-                base["max_concurrent"] = c
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            c = int(float(c_raw))
+            if c >= 0:
+                out["max_concurrent"] = c
 
-    # Daily spend override
     if s_raw is not None:
-        try:
+        with contextlib.suppress(Exception):
             s = float(s_raw)
             if s > 0:
-                base["daily_spend_usd"] = s
-        except Exception:
-            pass
+                out["daily_spend_usd"] = s
 
-    return base
+    return out
 
 
-# ============================================================================ #
-# Liquidity-aware ticket helper (used by ai_entry_logic / FeatureBuilder)
-# ============================================================================ #
-
-def liq_aware_ticket_usd(
-    base_ticket_usd: float,
-    pool_depth_usd: Optional[float],
-) -> float:
-    """
-    Liquidity-aware clamp for ticket size.
-
-    This is intentionally stateless and pure so scanners / ai_entry_logic can call it.
-
-    Intuition:
-      - If pool_depth_usd is None or RISK_LIQ_AWARE_SIZING is disabled, return base.
-      - Otherwise:
-            max_notional = pool_depth_usd * (RISK_LIQ_MAX_IMPACT_BPS / 10_000)
-        and we clamp ticket at that bound.
-
-    Example:
-      pool_depth_usd = 50_000
-      RISK_LIQ_MAX_IMPACT_BPS = 75 → 0.75% → max_notional ≈ 375 USD
-    """
-    base_ticket_usd = float(max(0.0, base_ticket_usd))
+# =============================================================================
+# Liquidity-aware sizing
+# =============================================================================
+def liq_aware_ticket_usd(base_ticket_usd: float, pool_depth_usd: Optional[float]) -> float:
+    base = max(0.0, float(base_ticket_usd))
     if not RISK_LIQ_AWARE_SIZING:
-        return base_ticket_usd
+        return base
     if pool_depth_usd is None or pool_depth_usd <= 0:
-        return base_ticket_usd
+        return base
     if RISK_LIQ_MAX_IMPACT_BPS <= 0:
-        return base_ticket_usd
+        return base
 
     impact_frac = float(RISK_LIQ_MAX_IMPACT_BPS) / 10_000.0
     max_notional = float(pool_depth_usd) * impact_frac
     if max_notional <= 0:
-        return base_ticket_usd
+        return base
+    return max(0.0, min(base, max_notional))
 
-    return float(max(0.0, min(base_ticket_usd, max_notional)))
 
-
-async def pair_limits_for_depth(
-    pool_depth_usd: Optional[float],
-    redis=None,
-) -> Dict[str, Any]:
-    """
-    Convenience helper for scanners / ai_entry_logic / reinvestor:
-
-    Returns the *global* risk limits plus a liquidity-aware ticket for a
-    specific pool depth.
-
-    Output contains all fields from current_limits(), plus:
-      - ticket_usd_raw: ticket_usd before liq clamp
-      - ticket_usd_liq: ticket_usd after liq_aware_ticket_usd()
-
-    Typical usage:
-      limits = await pair_limits_for_depth(pool_depth_usd, redis)
-      ticket = limits["ticket_usd_liq"]
-    """
+async def pair_limits_for_depth(pool_depth_usd: Optional[float], redis=None) -> Dict[str, Any]:
     limits = await current_limits(redis)
     base_ticket = float(limits.get("ticket_usd", 0.0))
     ticket_liq = liq_aware_ticket_usd(base_ticket, pool_depth_usd)
-    merged = dict(limits)
-    merged["ticket_usd_raw"] = base_ticket
-    merged["ticket_usd_liq"] = ticket_liq
-    return merged
+    out = dict(limits)
+    out["ticket_usd_raw"] = base_ticket
+    out["ticket_usd_liq"] = ticket_liq
+    return out
 
 
-# ============================================================================ #
-# Limits / sizing (core API)
-# ============================================================================ #
-
-async def _daily_realized_usd(redis) -> float:
-    """
-    Daily realized PnL (USD) from Redis, keyed per UTC day.
-    """
+# =============================================================================
+# ctx digest (observability & reproducibility)
+# =============================================================================
+def ctx_digest(d: Dict[str, Any]) -> str:
     try:
-        if redis is None:
-            redis = await _get_redis()
-        if not redis:
-            return 0.0
-        key = _pnl_key_today()
-        val = await redis.get(key)
-        return float(val) if val else 0.0
+        s = json.dumps(d, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
     except Exception:
-        return 0.0
+        return "digest_err"
 
 
-async def _daily_spent_usd(redis) -> float:
-    """
-    How much we've already spent (entry notional) today in USD.
-    """
+async def _read_ctx_digest(redis=None) -> str:
     if redis is None:
         redis = await _get_redis()
     if not redis:
-        return 0.0
-    try:
-        budget_key = _key_daily("budget:sniper:spent_usd")
-        val = await redis.get(budget_key)
-        return float(val) if val else 0.0
-    except Exception:
-        return 0.0
+        return "no_redis"
+    with contextlib.suppress(Exception):
+        v = await redis.get(RISK_CTX_DIGEST_KEY)
+        return _s(v) if v else "missing"
+    return "err"
 
 
-async def _daily_trades(redis) -> int:
-    """
-    How many trades we've executed today (closed trades),
-    used for RISK_MAX_DAILY_TRADES gating and diagnostics.
-    """
-    if redis is None:
-        redis = await _get_redis()
-    if not redis:
-        return 0
-    try:
-        key = _key_daily("risk:trades_count")
-        val = await redis.get(key)
-        return int(val) if val else 0
-    except Exception:
-        return 0
-
-
-async def _update_risk_context_hash(
+# =============================================================================
+# Risk context publishing + alerts
+# =============================================================================
+async def _update_risk_ctx(
     redis,
     *,
     limits: Dict[str, Any],
     realized_usd: float,
-    equity_usd: float,
     winrate20: float,
     consec_losses: int,
     cooldown_until_ts: Optional[float],
-    max_risk_per_trade: float,
-    min_sol_balance: float,
-    strat_mode: Optional[int],
-    plan_equity_today_usd: float,
-    plan_gap_pct: float,
-    plan_status: Optional[str],
+    strat_params: Dict[str, Any],
+    profile_name: str,
     ai_capacity_delta: float,
     halt_reason: Optional[str],
     kelly_raw: float,
     kelly_pos_pct_cap: float,
-    active_profile_name: str,
     regime_gate_factor: float,
     equity_utilization_pct: float,
+    open_exposure_usd: float,
+    max_exposure_usd: float,
     trading_window_open: bool,
     trading_window_reason: str,
 ) -> None:
-    """
-    Publish risk:ctx for FeatureBuilder / scanners / self-learning:
-
-      - open_positions
-      - max_positions
-      - ticket_usd
-      - daily_spend_usd / daily_spend_remaining_usd
-      - daily_realized_pnl_pct   (percent, e.g. +5.0 == +5%)
-      - daily_drawdown_pct       (percent, 0..100)
-      - risk_mode
-      - risk_capacity
-      - regime_risk_multiplier
-      - regime_gate_factor
-      - winrate20                (fraction 0..1)
-      - equity_usd
-      - consecutive_losses
-      - cooldown_remaining_sec
-      - risk_profile             (active profile name after auto/override)
-      - sandbox_mode
-      - max_risk_per_trade
-      - min_sol_balance
-      - strat_mode (optional)
-      - plan_equity_today_usd / plan_gap_pct / plan_status (optional)
-      - ai_capacity_delta (effect of AI overlay)
-      - daily_trades_count / daily_trades_cap
-      - kelly_raw / kelly_pos_pct_cap (diagnostic)
-      - equity_utilization_pct  (ticket * max_conc / equity, in %)
-      - risk_profile_override   (if set in Redis)
-      - risk_profile_env        (env default)
-      - equity_override_usd     (synthetic equity in use, if any)
-      - trading_window_open     (0/1, UTC-based)
-      - trading_window_reason   (string, e.g. "within_trading_window")
-      - halt_reason (if any)
-      - risk_engine_version
-      - equity_hwm_usd
-      - last_update_ts
-    """
     if not redis:
         return
 
-    try:
-        positions = load_positions()
-        open_positions = len(positions) if positions else 0
-    except Exception:
-        open_positions = 0
-
+    open_positions = _positions_open_count()
+    equity_usd = float(limits.get("equity_usd", 0.0))
+    max_conc = int(limits.get("max_concurrent", 0))
     daily_spend_usd = float(limits.get("daily_spend_usd", 0.0))
     spent_usd = await _daily_spent_usd(redis)
-    trades_count = await _daily_trades(redis)
-    daily_realized_pct = (
-        (realized_usd / equity_usd) * 100.0 if equity_usd > 0 else 0.0
-    )
-    dd_fraction = float(limits.get("rolling_dd_pct", 0.0))  # 0..1
+    trades_today = await _daily_trades(redis)
+    entries_today = await _daily_entries(redis)
+    equity_hwm = await _equity_hwm(redis)
+
+    daily_realized_pct = (realized_usd / equity_usd) * 100.0 if equity_usd > 0 else 0.0
+    dd_fraction = float(limits.get("rolling_dd_frac", 0.0))
     dd_pct = dd_fraction * 100.0
-    risk_mode = int(limits.get("risk_mode", 1))
-    max_conc = int(limits.get("max_concurrent", 0))
-    risk_capacity = float(limits.get("risk_capacity", 1.0))
-    regime_mult = float(limits.get("regime_risk_multiplier", 1.0))
 
     now_ts = _now_ts()
     cooldown_rem = 0.0
@@ -1308,104 +1122,123 @@ async def _update_risk_context_hash(
         cooldown_rem = cooldown_until_ts - now_ts
 
     remaining_spend = max(0.0, daily_spend_usd - spent_usd)
-    spend_used_pct = (
-        (spent_usd / daily_spend_usd) * 100.0 if daily_spend_usd > 0 else 0.0
-    )
+    spend_used_pct = (spent_usd / daily_spend_usd) * 100.0 if daily_spend_usd > 0 else 0.0
 
-    # Expose risk_profile_override (if present) for transparency to AI modules
-    risk_profile_override = ""
-    try:
+    profile_override = ""
+    with contextlib.suppress(Exception):
         v = await redis.get(RISK_PROFILE_OVERRIDE_KEY)
         if v:
-            risk_profile_override = str(v).strip().lower()
-    except Exception:
-        risk_profile_override = ""
+            profile_override = _s(v).strip().lower()
 
-    # HWM for diagnostics
-    equity_hwm = await _equity_hwm(redis)
+    strat_mode = strat_params.get("STRAT_MODE")
+    plan_equity_today = float(strat_params.get("PLAN_EQUITY_TODAY_USD", 0.0))
+    plan_gap_pct = float(strat_params.get("PLAN_GAP_PCT", 0.0))
+    plan_status = strat_params.get("PLAN_STATUS")
 
     mapping: Dict[str, str] = {
-        "open_positions": f"{float(open_positions):.4f}",
-        "max_positions": f"{float(max_conc):.4f}",
+        "open_positions": str(int(open_positions)),
+        "max_positions": str(int(max_conc)),
+        "open_exposure_usd": f"{float(open_exposure_usd):.4f}",
+        "max_exposure_usd": f"{float(max_exposure_usd):.4f}",
         "ticket_usd": f"{float(limits.get('ticket_usd', 0.0)):.4f}",
         "daily_spend_usd": f"{daily_spend_usd:.4f}",
         "daily_spend_remaining_usd": f"{remaining_spend:.4f}",
         "daily_spend_used_pct": f"{spend_used_pct:.6f}",
         "daily_realized_pnl_pct": f"{float(daily_realized_pct):.6f}",
         "daily_drawdown_pct": f"{float(dd_pct):.6f}",
-        "risk_mode": f"{float(risk_mode):.1f}",
-        "risk_capacity": f"{float(risk_capacity):.6f}",
-        "regime_risk_multiplier": f"{float(regime_mult):.6f}",
+        "risk_mode": str(int(limits.get("risk_mode", 1))),
+        "risk_capacity": f"{float(limits.get('risk_capacity', 1.0)):.6f}",
+        "regime_risk_multiplier": f"{float(limits.get('regime_risk_multiplier', 1.0)):.6f}",
         "regime_gate_factor": f"{float(regime_gate_factor):.6f}",
         "winrate20": f"{float(winrate20):.6f}",
         "equity_usd": f"{float(equity_usd):.4f}",
-        "consecutive_losses": f"{float(consec_losses):.1f}",
+        "equity_hwm_usd": f"{float(equity_hwm):.4f}",
+        "consecutive_losses": str(int(consec_losses)),
         "cooldown_remaining_sec": f"{float(cooldown_rem):.1f}",
-        "risk_profile": active_profile_name,
+        "risk_profile": profile_name,
         "risk_profile_env": RISK_PROFILE,
-        "risk_profile_override": risk_profile_override,
+        "risk_profile_override": profile_override,
         "sandbox_mode": "1" if RISK_SANDBOX_MODE else "0",
-        "max_risk_per_trade": f"{float(max_risk_per_trade):.6f}",
-        "min_sol_balance": f"{float(min_sol_balance):.6f}",
-        "plan_equity_today_usd": f"{float(plan_equity_today_usd):.4f}",
-        "plan_gap_pct": f"{float(plan_gap_pct):.6f}",
+        "max_risk_per_trade": f"{float(strat_params.get('MAX_RISK_PER_TRADE', RISK_MAX_PER_TRADE)):.6f}",
+        "min_sol_balance": f"{float(strat_params.get('MIN_SOL_BALANCE', 0.0)):.6f}",
+        "plan_equity_today_usd": f"{plan_equity_today:.4f}",
+        "plan_gap_pct": f"{plan_gap_pct:.6f}",
         "ai_capacity_delta": f"{float(ai_capacity_delta):.6f}",
-        "daily_trades_count": f"{float(trades_count):.4f}",
-        "daily_trades_cap": f"{float(RISK_MAX_DAILY_TRADES):.4f}",
+        "daily_trades_count": str(int(trades_today)),
+        "daily_trades_cap": str(int(RISK_MAX_DAILY_TRADES)),
+        "daily_entries_count": str(int(entries_today)),
+        "daily_entries_cap": str(int(RISK_MAX_DAILY_ENTRIES)),
         "kelly_raw": f"{float(kelly_raw):.6f}",
         "kelly_pos_pct_cap": f"{float(kelly_pos_pct_cap):.6f}",
         "equity_utilization_pct": f"{float(equity_utilization_pct):.6f}",
-        "risk_engine_version": RISK_ENGINE_VERSION,
-        "equity_hwm_usd": f"{float(equity_hwm):.4f}",
         "equity_override_usd": f"{float(RISK_EQUITY_OVERRIDE_USD):.4f}",
         "trading_window_open": "1" if trading_window_open else "0",
         "trading_window_reason": trading_window_reason,
+        "risk_engine_version": RISK_ENGINE_VERSION,
         "last_update_ts": datetime.now(timezone.utc).isoformat(),
     }
     if strat_mode is not None:
-        mapping["strat_mode"] = str(int(strat_mode))
+        mapping["strat_mode"] = str(strat_mode)
     if plan_status is not None:
         mapping["plan_status"] = str(plan_status)
     if halt_reason is not None:
-        mapping["halt_reason"] = halt_reason
+        mapping["halt_reason"] = str(halt_reason)
 
-    try:
+    digest_payload = {
+        "equity_usd": equity_usd,
+        "ticket_usd": float(limits.get("ticket_usd", 0.0)),
+        "pos_pct_cap": float(limits.get("pos_pct_cap", 0.0)),
+        "max_concurrent": max_conc,
+        "daily_spend_usd": daily_spend_usd,
+        "winrate20": winrate20,
+        "rolling_dd_frac": dd_fraction,
+        "risk_capacity": float(limits.get("risk_capacity", 1.0)),
+        "risk_mode": int(limits.get("risk_mode", 1)),
+        "regime": str(limits.get("regime", "")),
+        "regime_gate_factor": float(regime_gate_factor),
+        "profile": profile_name,
+        "sandbox": bool(RISK_SANDBOX_MODE),
+        "open_exposure_usd": float(open_exposure_usd),
+        "max_exposure_usd": float(max_exposure_usd),
+    }
+    digest = ctx_digest(digest_payload)
+
+    with contextlib.suppress(Exception):
         await redis.hset(RISK_CTX_KEY, mapping=mapping)
-    except Exception:
-        # best-effort; no need to explode the pipeline
-        pass
+        await redis.set(RISK_CTX_DIGEST_KEY, digest)
+        await _set_expire_at_midnight(redis, RISK_CTX_DIGEST_KEY)
 
-    # Structured log for dashboards / analytics (best-effort)
-    try:
+    with contextlib.suppress(Exception):
         await log_event(
             "risk_ctx_update",
             {
+                "ctx_digest": digest,
                 "equity_usd": equity_usd,
                 "equity_hwm_usd": equity_hwm,
-                "risk_capacity": risk_capacity,
-                "risk_mode": risk_mode,
+                "risk_capacity": float(limits.get("risk_capacity", 1.0)),
+                "risk_mode": int(limits.get("risk_mode", 1)),
                 "winrate20": winrate20,
-                "rolling_dd_pct": dd_fraction,
+                "rolling_dd_frac": dd_fraction,
                 "plan_gap_pct": plan_gap_pct,
                 "ai_capacity_delta": ai_capacity_delta,
                 "daily_spend_usd": daily_spend_usd,
                 "daily_spent_usd": spent_usd,
-                "daily_trades_count": trades_count,
-                "daily_trades_cap": RISK_MAX_DAILY_TRADES,
+                "daily_trades_count": trades_today,
+                "daily_entries_count": entries_today,
                 "kelly_raw": kelly_raw,
                 "kelly_pos_pct_cap": kelly_pos_pct_cap,
-                "sandbox_mode": RISK_SANDBOX_MODE,
-                "risk_profile": active_profile_name,
-                "risk_profile_override": risk_profile_override,
+                "sandbox_mode": bool(RISK_SANDBOX_MODE),
+                "risk_profile": profile_name,
+                "risk_profile_override": profile_override,
                 "regime_gate_factor": regime_gate_factor,
                 "equity_utilization_pct": equity_utilization_pct,
+                "open_exposure_usd": float(open_exposure_usd),
+                "max_exposure_usd": float(max_exposure_usd),
                 "trading_window_open": trading_window_open,
                 "trading_window_reason": trading_window_reason,
                 "risk_engine_version": RISK_ENGINE_VERSION,
             },
         )
-    except Exception:
-        pass
 
 
 async def _broadcast_risk_mode_change(
@@ -1419,26 +1252,22 @@ async def _broadcast_risk_mode_change(
     realized_usd: float,
     equity_usd: float,
 ) -> None:
-    """
-    Best-effort broadcast when risk_mode changes (e.g. to 0 / OFF).
-
-    This is intentionally very light; if Telegram or Redis fail, we just move on.
-    """
     global _last_broadcast_mode
-
     if new_mode == _last_broadcast_mode:
         return
-
     _last_broadcast_mode = new_mode
 
-    # Persist halt reason if any
     if redis and halt_reason:
-        try:
-            await redis.set(RISK_HALT_REASON_KEY, halt_reason)
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            await redis.set(RISK_HALT_REASON_KEY, str(halt_reason))
 
-    # Optional Telegram alert (only on transitions)
+    if RISK_DISABLE_ALERTS:
+        return
+
+    if not _alert_ok(f"risk_mode:{new_mode}"):
+        return
+
+    send_telegram = getattr(cu, "send_telegram", None)
     try:
         if new_mode == 0:
             msg = (
@@ -1453,42 +1282,29 @@ async def _broadcast_risk_mode_change(
                 f"• reason: {halt_reason or 'n/a'}"
             )
         elif new_mode == 3:
-            msg = (
-                "🟠 *RISK MODE: DEFENSIVE* — shrinking tickets & concurrency\n"
-                f"• capacity: {capacity:.3f}  • winrate20: {winrate20:.3f}  "
-                f"• rolling_dd: {rolling_dd:.3f}"
-            )
+            msg = "🟠 *RISK MODE: DEFENSIVE* — shrinking tickets & concurrency"
         elif new_mode == 2:
-            msg = (
-                "🟢 *RISK MODE: AGGRESSIVE* — scaling tickets & opportunities\n"
-                f"• capacity: {capacity:.3f}  • winrate20: {winrate20:.3f}"
-            )
+            msg = "🟢 *RISK MODE: AGGRESSIVE* — scaling tickets & opportunities"
         else:
-            msg = (
-                "🔵 *RISK MODE: NORMAL*\n"
-                f"• capacity: {capacity:.3f}  • winrate20: {winrate20:.3f}"
-            )
+            msg = "🔵 *RISK MODE: NORMAL*"
 
-        await send_telegram(msg)
+        await _call(send_telegram, msg)
     except Exception:
-        # don't let alerts break risk manager
         pass
 
 
+# =============================================================================
+# Limits dataclass + in-process engine (single-flight + caching)
+# =============================================================================
 @dataclass
 class RiskLimits:
-    """
-    Internal structure for risk limits. We still return dicts publicly
-    for backward compatibility, but the dataclass helps keep logic clean.
-    """
-
     equity_usd: float
     ticket_usd: float
     pos_pct_cap: float
     max_concurrent: int
     daily_spend_usd: float
     winrate20: float
-    rolling_dd_pct: float
+    rolling_dd_frac: float
     regime: str
     risk_capacity: float
     risk_mode: int
@@ -1497,12 +1313,17 @@ class RiskLimits:
     regime_gate_factor: float
     risk_profile: str
     ai_capacity_delta: float
-    halt_reason: Optional[str] = None
-    # Kelly diagnostics (optional)
-    kelly_raw: float = 0.0
-    kelly_pos_pct_cap: float = 0.0
-    # NEW: equity utilization (ticket * max_conc / equity, as %)
-    equity_utilization_pct: float = 0.0
+    halt_reason: Optional[str]
+    kelly_raw: float
+    kelly_pos_pct_cap: float
+    equity_utilization_pct: float
+    open_positions: int
+    open_exposure_usd: float
+    max_exposure_usd: float
+    daily_spent_usd: float
+    daily_realized_usd: float
+    trading_window_open: bool
+    trading_window_reason: str
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1512,680 +1333,1004 @@ class RiskLimits:
             "max_concurrent": int(self.max_concurrent),
             "daily_spend_usd": float(self.daily_spend_usd),
             "winrate20": float(self.winrate20),
-            "rolling_dd_pct": float(self.rolling_dd_pct),
-            "regime": self.regime,
+            "rolling_dd_frac": float(self.rolling_dd_frac),
+            "regime": str(self.regime),
             "risk_capacity": float(self.risk_capacity),
             "risk_mode": int(self.risk_mode),
             "risk_mode_override": self.risk_mode_override,
             "regime_risk_multiplier": float(self.regime_risk_multiplier),
             "regime_gate_factor": float(self.regime_gate_factor),
-            "risk_profile": self.risk_profile,
+            "risk_profile": str(self.risk_profile),
             "ai_capacity_delta": float(self.ai_capacity_delta),
             "halt_reason": self.halt_reason,
             "kelly_raw": float(self.kelly_raw),
             "kelly_pos_pct_cap": float(self.kelly_pos_pct_cap),
             "equity_utilization_pct": float(self.equity_utilization_pct),
+            "open_positions": int(self.open_positions),
+            "open_exposure_usd": float(self.open_exposure_usd),
+            "max_exposure_usd": float(self.max_exposure_usd),
+            "daily_spent_usd": float(self.daily_spent_usd),
+            "daily_realized_usd": float(self.daily_realized_usd),
+            "trading_window_open": bool(self.trading_window_open),
+            "trading_window_reason": str(self.trading_window_reason),
+            "risk_engine_version": RISK_ENGINE_VERSION,
         }
 
 
-# ============================================================================ #
-# Core limits / sizing
-# ============================================================================ #
+class _RiskEngine:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._cached: Optional[Dict[str, Any]] = None
+        self._cached_at_monotonic: float = 0.0
 
-async def current_limits(redis=None) -> Dict[str, Any]:
-    """
-    Compute risk limits from equity + tier + regime + throttle + risk capacity
-    + overrides + self-learning strategy constraints + plan-aware & AI overlays
-    + Kelly-style safety clamp, synthetic equity override, regime_gate_factor,
-    equity utilization guardrail, trading-window status & concurrency context.
+    def invalidate(self) -> None:
+        self._cached = None
+        self._cached_at_monotonic = 0.0
 
-    Returns dict with:
-      equity_usd, ticket_usd, pos_pct_cap, max_concurrent,
-      daily_spend_usd, winrate20, rolling_dd_pct, regime,
-      risk_capacity, risk_mode, risk_mode_override,
-      regime_risk_multiplier, regime_gate_factor,
-      risk_profile, ai_capacity_delta, halt_reason,
-      kelly_raw, kelly_pos_pct_cap, equity_utilization_pct
-    """
-    if redis is None:
-        redis = await _get_redis()
+    def _cache_valid(self) -> bool:
+        ttl = max(0, int(RISK_LIMITS_CACHE_TTL_MS))
+        if ttl <= 0:
+            return False
+        age_ms = (time.monotonic() - self._cached_at_monotonic) * 1000.0
+        return (self._cached is not None) and (age_ms <= ttl)
 
-    # Equity: wallet → optional synthetic override
-    equity_wallet = await _wallet_equity_usd()
-    equity = float(equity_wallet)
-    if RISK_EQUITY_OVERRIDE_USD > 0:
-        equity = RISK_EQUITY_OVERRIDE_USD
+    async def current_limits(self, redis=None) -> Dict[str, Any]:
+        if self._cache_valid():
+            return dict(self._cached or {})
 
-    tier = _select_tier(equity)
+        async with self._lock:
+            if self._cache_valid():
+                return dict(self._cached or {})
 
-    # Base tier values
-    ticket = float(tier["ticket"]) if tier["ticket"] else max(
-        50.0, equity * float(tier["pos_pct"]) * 0.5
-    )
-    pos_pct_cap = float(tier["pos_pct"])
-    max_conc = int(tier["max_conc"])
-    daily_spend_usd = equity * float(tier["spend_pct"])
+            if redis is None:
+                redis = await _get_redis()
 
-    # Performance metrics
-    winrate, dd = await _metrics(redis)              # dd is fraction 0..1
-    realized_usd = await _daily_realized_usd(redis)
+            # Equity sensing
+            equity_wallet = await _wallet_equity_usd()
+            equity = float(equity_wallet)
+            if RISK_EQUITY_OVERRIDE_USD > 0:
+                equity = float(RISK_EQUITY_OVERRIDE_USD)
 
-    # Kelly-style upper bound on per-trade risk (safety clamp)
-    kelly_raw = 0.0
-    kelly_pos_pct_cap = 0.0
-    if RISK_KELLY_ENABLED:
-        kelly_raw, kelly_pos_pct_cap = _kelly_pos_cap(winrate)
-        if kelly_pos_pct_cap > 0:
-            pos_pct_cap = min(pos_pct_cap, kelly_pos_pct_cap)
+            tier = _select_tier(equity)
+            ticket = float(tier["ticket"]) if tier.get("ticket") else max(50.0, equity * float(tier["pos_pct"]) * 0.5)
+            pos_pct_cap = float(tier["pos_pct"])
+            max_conc = int(tier["max_conc"])
+            daily_spend = equity * float(tier["spend_pct"])
 
-    # Regime-based scaling
-    regime = regime_state.get()
-    regime_mult = float(regime_state.risk_multiplier())
-    regime_feats = await regime_state.features()
-    regime_vol = float(regime_feats.get("regime_volatility", 0.5))
-    regime_chop = float(regime_feats.get("regime_choppy_score", 0.0))
-    # NEW: regime_gate_factor (extra gate 0..1 from regime_state, default=1)
-    regime_gate_factor = float(
-        regime_feats.get(
-            "regime_gate_factor",
-            regime_feats.get("gate_factor", 1.0),
-        )
-    )
-    regime_gate_factor = _clamp(regime_gate_factor, 0.0, 1.0)
-    regime_delta_conc = REGIME_MAX_CONC_DELTA.get(regime, 0)
+            # Metrics
+            winrate, dd_frac = await _metrics(redis)
+            realized_usd = await _daily_realized_usd(redis)
+            spent_usd = await _daily_spent_usd(redis)
 
-    # Pull self-learning strategy params as *additional* caps
-    try:
-        strat_params = await get_strategy_params(redis)
-    except Exception:
-        strat_params = {}
+            # Kelly clamp
+            kelly_raw, kelly_pos_cap = (0.0, 0.0)
+            if RISK_KELLY_ENABLED:
+                kelly_raw, kelly_pos_cap = _kelly_pos_cap(winrate)
+                if kelly_pos_cap > 0:
+                    pos_pct_cap = min(pos_pct_cap, kelly_pos_cap)
 
-    strat_max_risk = float(strat_params.get("MAX_RISK_PER_TRADE", RISK_MAX_PER_TRADE))
-    strat_min_sol_balance = float(strat_params.get("MIN_SOL_BALANCE", 0.0))
-    strat_mode = strat_params.get("STRAT_MODE")
-    try:
-        strat_mode_int: Optional[int] = (
-            int(strat_mode) if strat_mode is not None else None
-        )
-    except Exception:
-        strat_mode_int = None
+            # Regime scaling
+            regime = regime_state.get()
+            regime_mult = float(regime_state.risk_multiplier())
+            regime_feats = await regime_state.features()
+            regime_vol = float(regime_feats.get("regime_volatility", 0.5))
+            regime_chop = float(regime_feats.get("regime_choppy_score", 0.0))
+            regime_gate_factor = float(regime_feats.get("regime_gate_factor", regime_feats.get("gate_factor", 1.0)))
+            regime_gate_factor = _clamp(regime_gate_factor, 0.0, 1.0)
+            max_conc += int(REGIME_MAX_CONC_DELTA.get(regime, 0))
 
-    # Optional plan / equity-curve context (all best-effort)
-    plan_equity_today = float(strat_params.get("PLAN_EQUITY_TODAY_USD", 0.0))
-    plan_gap_pct = float(strat_params.get("PLAN_GAP_PCT", 0.0))
-    plan_status = strat_params.get("PLAN_STATUS")
-    try:
-        plan_status_str: Optional[str] = (
-            str(plan_status) if plan_status is not None else None
-        )
-    except Exception:
-        plan_status_str = None
+            # Strategy caps (self-learning)
+            try:
+                strat_params = await get_strategy_params(redis)
+            except Exception:
+                strat_params = {}
 
-    # NEW: optional self-learning caps for concurrency & daily spend
-    try:
-        strat_max_conc_override_raw = strat_params.get("MAX_CONCURRENT_OVERRIDE")
-        strat_max_conc_override: Optional[int] = (
-            int(strat_max_conc_override_raw)
-            if strat_max_conc_override_raw is not None
-            else None
-        )
-        if strat_max_conc_override is not None and strat_max_conc_override <= 0:
-            strat_max_conc_override = None
-    except Exception:
-        strat_max_conc_override = None
+            strat_max_risk = float(strat_params.get("MAX_RISK_PER_TRADE", RISK_MAX_PER_TRADE))
+            strat_max_conc_override: Optional[int] = None
+            with contextlib.suppress(Exception):
+                v = strat_params.get("MAX_CONCURRENT_OVERRIDE")
+                if v is not None:
+                    vv = int(v)
+                    if vv > 0:
+                        strat_max_conc_override = vv
 
-    strat_daily_spend_cap_pct = float(strat_params.get("DAILY_SPEND_CAP_PCT", 0.0))
-    strat_daily_spend_cap_usd = float(strat_params.get("DAILY_SPEND_CAP_USD", 0.0))
+            strat_daily_spend_cap_pct = float(strat_params.get("DAILY_SPEND_CAP_PCT", 0.0))
+            strat_daily_spend_cap_usd = float(strat_params.get("DAILY_SPEND_CAP_USD", 0.0))
+            plan_gap_pct = float(strat_params.get("PLAN_GAP_PCT", 0.0))
 
-    # Apply global risk profile multipliers (with potential Redis/auto override)
-    profile_name, profile_cfg = await _effective_risk_profile(redis)
-    ticket *= profile_cfg["ticket_mult"]
-    pos_pct_cap *= profile_cfg["pos_pct_mult"]
-    max_conc = int(round(max_conc * profile_cfg["max_conc_mult"]))
+            # Profile multipliers
+            profile_name, profile_cfg = await _effective_risk_profile(redis)
+            ticket *= profile_cfg["ticket_mult"]
+            pos_pct_cap *= profile_cfg["pos_pct_mult"]
+            max_conc = int(round(max_conc * profile_cfg["max_conc_mult"]))
+            daily_spend *= profile_cfg["daily_spend_mult"]
 
-    daily_spend_usd *= profile_cfg["daily_spend_mult"]
+            # Adaptive throttle (pre-capacity)
+            if (winrate < THROTTLE_WINRATE_FLOOR) or (dd_frac > THROTTLE_DD_FLOOR):
+                ticket *= (1.0 - THROTTLE_TICKET_CUT)
+                max_conc = max(1, max_conc - THROTTLE_CONC_DEC)
 
-    # Adaptive throttle from performance metrics (pre-capacity)
-    if (winrate < THROTTLE_WINRATE_FLOOR) or (dd > THROTTLE_DD_FLOOR):
-        ticket *= (1.0 - THROTTLE_TICKET_CUT)
-        max_conc = max(1, max_conc - THROTTLE_CONC_DEC)
+            # Regime scaling on ticket
+            ticket *= regime_mult
 
-    # Regime scaling
-    ticket *= regime_mult
-    max_conc = max(1, max_conc + int(regime_delta_conc))
+            # Respect caps (env + strategy)
+            pos_pct_cap = min(pos_pct_cap, RISK_MAX_PER_TRADE, strat_max_risk)
+            max_conc = max(0, min(max_conc, MAX_CONCURRENT_POS))
+            if strat_max_conc_override is not None:
+                max_conc = min(max_conc, strat_max_conc_override)
 
-    # Respect env caps and strategy caps before capacity
-    pos_pct_cap = min(pos_pct_cap, RISK_MAX_PER_TRADE, strat_max_risk)
-    max_conc = min(max_conc, MAX_CONCURRENT_POS)
-    if strat_max_conc_override is not None:
-        max_conc = min(max_conc, strat_max_conc_override)
+            # Daily spend caps
+            daily_spend = min(daily_spend, equity * DAILY_SPEND_CAP_PCT)
+            if DAILY_SPEND_CAP_USD > 0:
+                daily_spend = min(daily_spend, DAILY_SPEND_CAP_USD)
+            if strat_daily_spend_cap_pct > 0:
+                daily_spend = min(daily_spend, equity * strat_daily_spend_cap_pct)
+            if strat_daily_spend_cap_usd > 0:
+                daily_spend = min(daily_spend, strat_daily_spend_cap_usd)
 
-    # Daily spend caps: % of equity AND optional absolute USD
-    daily_spend_usd = min(daily_spend_usd, equity * DAILY_SPEND_CAP_PCT)
-    if DAILY_SPEND_CAP_USD > 0:
-        daily_spend_usd = min(daily_spend_usd, DAILY_SPEND_CAP_USD)
+            # Capacity model
+            capacity_raw = _risk_capacity_from_components(
+                winrate20=winrate,
+                rolling_dd=dd_frac,
+                realized_pnl_usd=realized_usd,
+                equity_usd=equity,
+                regime_mult=regime_mult,
+                regime_volatility=regime_vol,
+                regime_choppy=regime_chop,
+            )
 
-    # NEW: self-learning daily spend caps (strongest clamp)
-    if strat_daily_spend_cap_pct > 0:
-        daily_spend_usd = min(daily_spend_usd, equity * strat_daily_spend_cap_pct)
-    if strat_daily_spend_cap_usd > 0:
-        daily_spend_usd = min(daily_spend_usd, strat_daily_spend_cap_usd)
+            # Plan bias
+            if plan_gap_pct != 0.0:
+                if plan_gap_pct > 0:
+                    capacity_raw = _clamp(capacity_raw - min(abs(plan_gap_pct) / 100.0 * 0.3, 0.3), 0.0, 1.0)
+                else:
+                    capacity_raw = _clamp(capacity_raw + min(abs(plan_gap_pct) / 100.0 * 0.2, 0.2), 0.0, 1.0)
 
-    # Risk capacity (global portfolio slider 0..1)
-    capacity_raw = _risk_capacity_from_components(
-        winrate20=winrate,
-        rolling_dd=dd,
-        realized_pnl_usd=realized_usd,
-        equity_usd=equity,
-        regime_mult=regime_mult,
-        regime_volatility=regime_vol,
-        regime_choppy=regime_chop,
-    )
-
-    # Strategy plan bias (behind/ahead) → tilt capacity
-    plan_bias = 0.0
-    if plan_gap_pct != 0.0:
-        if plan_gap_pct > 0:
-            # ahead of plan → shrink risk, up to -0.3
-            plan_bias = -min(abs(plan_gap_pct) / 100.0 * 0.3, 0.3)
-        else:
-            # behind plan → gently boost risk, up to +0.2
-            plan_bias = min(abs(plan_gap_pct) / 100.0 * 0.2, 0.2)
-    capacity_raw = _clamp(capacity_raw + plan_bias, 0.0, 1.0)
-
-    # Optional AI overlay for capacity (quant model learns how much to nudge)
-    ai_capacity_delta = 0.0
-    if _predict_capacity_adjustment is not None:
-        try:
-            features = {
-                "equity_usd": float(equity),
-                "winrate20": float(winrate),
-                "rolling_dd": float(dd),
-                "realized_pnl_usd": float(realized_usd),
-                "regime_mult": float(regime_mult),
-                "plan_gap_pct": float(plan_gap_pct),
-                "risk_profile": profile_name,
-            }
-            ai_raw = _predict_capacity_adjustment(features)
-            if asyncio.iscoroutine(ai_raw):
-                ai_raw = await ai_raw
-            ai_capacity_delta = float(ai_raw or 0.0)
-        except Exception:
+            # AI overlay nudge
             ai_capacity_delta = 0.0
+            if _predict_capacity_adjustment is not None and not RISK_DISABLE_AI_OVERLAY:
+                with contextlib.suppress(Exception):
+                    feats = {
+                        "equity_usd": float(equity),
+                        "winrate20": float(winrate),
+                        "rolling_dd": float(dd_frac),
+                        "realized_pnl_usd": float(realized_usd),
+                        "regime_mult": float(regime_mult),
+                        "plan_gap_pct": float(plan_gap_pct),
+                        "risk_profile": profile_name,
+                    }
+                    out = _predict_capacity_adjustment(feats)
+                    out = await _maybe_await(out)
+                    ai_capacity_delta = float(out or 0.0)
 
-    capacity_raw = _clamp(capacity_raw + ai_capacity_delta, 0.0, 1.0)
+            capacity_raw = _clamp(capacity_raw + ai_capacity_delta, 0.0, 1.0)
 
-    # Apply regime_gate_factor as final pre-mode gate on capacity
-    capacity_raw = _clamp(capacity_raw * regime_gate_factor, 0.0, 1.0)
+            # Apply regime gate factor (hard external throttle)
+            capacity_raw = _clamp(capacity_raw * regime_gate_factor, 0.0, 1.0)
 
-    capacity, risk_mode, override_mode, halt_reason = await _risk_mode_with_override(
-        redis,
-        capacity_raw,
-        rolling_dd=dd,
-    )
+            # Derive risk mode
+            capacity, risk_mode, override_mode, halt_reason = await _risk_mode_with_override(redis, capacity_raw, rolling_dd=dd_frac)
 
-    # Capacity exponent adjusted by effective risk profile
-    capacity_exp = max(
-        0.10,
-        RISK_CAPACITY_TICKET_EXP_BASE * profile_cfg["capacity_exp_mult"],
-    )
+            # Capacity exponent (profile-aware)
+            capacity_exp = max(0.10, float(RISK_CAPACITY_TICKET_EXP_BASE) * float(profile_cfg["capacity_exp_mult"]))
+            capacity_scale = 0.0 if capacity <= 0 else math.pow(float(capacity), capacity_exp)
 
-    if capacity <= 0:
-        capacity_scale = 0.0
-    else:
-        capacity_scale = math.pow(capacity, capacity_exp)
+            ticket *= capacity_scale
+            daily_spend *= capacity_scale
 
-    ticket *= capacity_scale
-    daily_spend_usd *= capacity_scale
+            # Risk-mode concurrency adjustments
+            if risk_mode == 0:
+                max_conc = 0
+            elif risk_mode == 3:
+                max_conc = max(0, int(round(max_conc * 0.5)))
 
-    # Concurrency reduction for very low capacity
-    if risk_mode == 0:
-        max_conc = 0
-    elif risk_mode == 3:
-        max_conc = max(0, int(round(max_conc * 0.5)))
+            # Sandbox clamp
+            if RISK_SANDBOX_MODE:
+                ticket = min(ticket, 5.0)
+                daily_spend = min(daily_spend, 20.0)
+                max_conc = min(max_conc, 1)
 
-    # Sandbox mode: hard clamp risk super low for testing
-    if RISK_SANDBOX_MODE:
-        ticket = min(ticket, 5.0)
-        daily_spend_usd = min(daily_spend_usd, 20.0)
-        max_conc = min(max_conc, 1)
+            # Equity utilization guardrail
+            equity_utilization_pct = 0.0
+            if equity > 0 and max_conc > 0:
+                potential = ticket * max_conc
+                max_notional = equity * (RISK_MAX_EQUITY_UTILIZATION_PCT / 100.0)
+                if max_notional > 0 and potential > max_notional:
+                    scale = max_notional / max(1e-9, potential)
+                    ticket *= max(0.0, scale)
+                    daily_spend = min(daily_spend, max_notional)
+                equity_utilization_pct = min(100.0, (ticket * max_conc) / equity * 100.0)
 
-    # --- Equity utilization guardrail (quant-style sanity) --- #
-    equity_utilization_pct = 0.0
-    if equity > 0 and max_conc > 0:
-        potential_notional = ticket * max_conc
-        max_notional = equity * (RISK_MAX_EQUITY_UTILIZATION_PCT / 100.0)
-        if max_notional > 0 and potential_notional > max_notional:
-            scale = max_notional / potential_notional
-            ticket *= max(0.0, scale)
-            daily_spend_usd = min(daily_spend_usd, max_notional)
-        equity_utilization_pct = min(
-            100.0,
-            (ticket * max_conc) / equity * 100.0 if equity > 0 else 0.0,
-        )
+            # Round ticket & clamp min/max
+            if ticket < 10:
+                ticket = max(RISK_MIN_TICKET_USD, round(ticket, 2))
+            elif ticket < 100:
+                ticket = max(RISK_MIN_TICKET_USD, round(ticket / 5.0) * 5.0)
+            else:
+                ticket = max(RISK_MIN_TICKET_USD, round(ticket / 10.0) * 10.0)
+            ticket = min(ticket, max(RISK_MIN_TICKET_USD, RISK_MAX_TICKET_USD))
 
-    # Round ticket nicely and clamp min/max
-    if ticket < 10:
-        ticket = max(RISK_MIN_TICKET_USD, round(ticket, 2))
-    elif ticket < 100:
-        ticket = max(RISK_MIN_TICKET_USD, round(ticket / 5.0) * 5.0)
-    else:
-        ticket = max(RISK_MIN_TICKET_USD, round(ticket / 10.0) * 10.0)
-    ticket = min(ticket, max(RISK_MIN_TICKET_USD, RISK_MAX_TICKET_USD))
+            # Live overrides
+            overrides = await _apply_overrides(
+                redis,
+                ticket_usd=ticket,
+                pos_pct_cap=pos_pct_cap,
+                max_concurrent=max_conc,
+                daily_spend_usd=daily_spend,
+            )
+            ticket = float(overrides["ticket_usd"])
+            pos_pct_cap = float(overrides["pos_pct_cap"])
+            max_conc = int(overrides["max_concurrent"])
+            daily_spend = float(overrides["daily_spend_usd"])
 
-    # Apply live overrides from Redis (if present)
-    overrides = await _apply_overrides(
-        redis,
-        ticket_usd=ticket,
-        pos_pct_cap=pos_pct_cap,
-        max_concurrent=max_conc,
-        daily_spend_usd=daily_spend_usd,
-    )
+            # Final per-trade clamp from pos_pct_cap
+            if equity > 0 and pos_pct_cap > 0:
+                ticket = min(ticket, equity * pos_pct_cap)
 
-    ticket = float(overrides["ticket_usd"])
-    pos_pct_cap = float(overrides["pos_pct_cap"])
-    max_conc = int(overrides["max_concurrent"])
-    daily_spend_usd = float(overrides["daily_spend_usd"])
+            open_positions = _positions_open_count()
+            open_exposure_usd = _positions_open_exposure_usd()
+            # Exposure cap (optional)
+            max_exposure_usd = 0.0
+            if RISK_MAX_EXPOSURE_USD > 0:
+                max_exposure_usd = float(RISK_MAX_EXPOSURE_USD)
+            elif RISK_MAX_EXPOSURE_PCT > 0 and equity > 0:
+                max_exposure_usd = float(equity) * (float(RISK_MAX_EXPOSURE_PCT) / 100.0)
 
-    # FINAL per-trade safety clamp: ticket must respect per-trade risk fraction.
-    if equity > 0 and pos_pct_cap > 0:
-        max_ticket_from_pos_pct = equity * pos_pct_cap
-        if ticket > max_ticket_from_pos_pct:
-            ticket = max_ticket_from_pos_pct
+            # Trading window
+            tw_open, tw_reason = _trading_window_status()
 
-    # After overrides + final clamp, recompute equity utilization for diagnostics
-    if equity > 0 and max_conc > 0:
-        equity_utilization_pct = min(
-            100.0,
-            (ticket * max_conc) / equity * 100.0,
-        )
-    else:
-        equity_utilization_pct = 0.0
+            limits_obj = RiskLimits(
+                equity_usd=float(equity),
+                ticket_usd=float(ticket),
+                pos_pct_cap=float(pos_pct_cap),
+                max_concurrent=int(max_conc),
+                daily_spend_usd=float(daily_spend),
+                winrate20=float(winrate),
+                rolling_dd_frac=float(dd_frac),
+                regime=str(regime),
+                risk_capacity=float(capacity),
+                risk_mode=int(risk_mode),
+                risk_mode_override=override_mode,
+                regime_risk_multiplier=float(regime_mult),
+                regime_gate_factor=float(regime_gate_factor),
+                risk_profile=str(profile_name),
+                ai_capacity_delta=float(ai_capacity_delta),
+                halt_reason=halt_reason,
+                kelly_raw=float(kelly_raw),
+                kelly_pos_pct_cap=float(kelly_pos_cap),
+                equity_utilization_pct=float(equity_utilization_pct),
+                open_positions=int(open_positions),
+                open_exposure_usd=float(open_exposure_usd),
+                max_exposure_usd=float(max_exposure_usd),
+                daily_spent_usd=float(spent_usd),
+                daily_realized_usd=float(realized_usd),
+                trading_window_open=bool(tw_open),
+                trading_window_reason=str(tw_reason),
+            )
+            limits = limits_obj.to_dict()
 
-    limits_obj = RiskLimits(
-        equity_usd=float(equity),
-        ticket_usd=float(ticket),
-        pos_pct_cap=float(pos_pct_cap),
-        max_concurrent=int(max_conc),
-        daily_spend_usd=float(daily_spend_usd),
-        winrate20=float(winrate),
-        rolling_dd_pct=float(dd),
-        regime=regime,
-        risk_capacity=float(capacity),
-        risk_mode=int(risk_mode),
-        risk_mode_override=override_mode,
-        regime_risk_multiplier=float(regime_mult),
-        regime_gate_factor=float(regime_gate_factor),
-        risk_profile=profile_name,
-        ai_capacity_delta=float(ai_capacity_delta),
-        halt_reason=halt_reason,
-        kelly_raw=float(kelly_raw),
-        kelly_pos_pct_cap=float(kelly_pos_pct_cap),
-        equity_utilization_pct=float(equity_utilization_pct),
-    )
-    limits = limits_obj.to_dict()
+            # Cooldown status
+            cooldown_until: Optional[float] = None
+            if redis:
+                with contextlib.suppress(Exception):
+                    v = await redis.get(RISK_COOLDOWN_UNTIL_KEY)
+                    if v is not None:
+                        cooldown_until = float(v)
 
-    # --- Push account state into regime_state (account-aware regime) --- #
-    try:
-        equity_safe = float(equity)
-        realized_safe = float(realized_usd)
-        daily_pnl_pct = (
-            0.0 if equity_safe <= 0 else (realized_safe / equity_safe) * 100.0
-        )
-        daily_dd_pct = float(dd) * 100.0  # convert fraction -> percent
-        consec_losses_for_regime = await _consecutive_losses(redis)
+            # Publish risk:ctx
+            with contextlib.suppress(Exception):
+                consec_losses = await _consecutive_losses(redis)
+                await _update_risk_ctx(
+                    redis,
+                    limits=limits,
+                    realized_usd=float(realized_usd),
+                    winrate20=float(winrate),
+                    consec_losses=int(consec_losses),
+                    cooldown_until_ts=cooldown_until,
+                    strat_params=strat_params,
+                    profile_name=profile_name,
+                    ai_capacity_delta=float(ai_capacity_delta),
+                    halt_reason=halt_reason,
+                    kelly_raw=float(kelly_raw),
+                    kelly_pos_pct_cap=float(kelly_pos_cap),
+                    regime_gate_factor=float(regime_gate_factor),
+                    equity_utilization_pct=float(equity_utilization_pct),
+                    open_exposure_usd=float(open_exposure_usd),
+                    max_exposure_usd=float(max_exposure_usd),
+                    trading_window_open=bool(tw_open),
+                    trading_window_reason=str(tw_reason),
+                )
 
-        await regime_state.update_from_account(
-            daily_realized_pnl_pct=daily_pnl_pct,
-            daily_drawdown_pct=daily_dd_pct,
-            consecutive_losses=consec_losses_for_regime,
-        )
-    except Exception:
-        # regime_state is best-effort; never break risk manager
-        pass
+            # Broadcast mode changes
+            with contextlib.suppress(Exception):
+                await _broadcast_risk_mode_change(
+                    redis=redis,
+                    new_mode=int(limits["risk_mode"]),
+                    halt_reason=halt_reason,
+                    capacity=float(limits["risk_capacity"]),
+                    winrate20=float(limits["winrate20"]),
+                    rolling_dd=float(limits["rolling_dd_frac"]),
+                    realized_usd=float(realized_usd),
+                    equity_usd=float(limits["equity_usd"]),
+                )
 
-    # Check if there is a cooldown in effect
-    cooldown_until_ts: Optional[float] = None
-    if redis:
-        try:
-            val = await redis.get(RISK_COOLDOWN_UNTIL_KEY)
-            if val is not None:
-                cooldown_until_ts = float(val)
-        except Exception:
-            cooldown_until_ts = None
+            self._cached = dict(limits)
+            self._cached_at_monotonic = time.monotonic()
+            return dict(limits)
 
-    # Trading window open/closed status (UTC)
-    trading_window_open, tw_reason = _trading_window_status()
 
-    # Publish risk:ctx for FeatureBuilder / ai_buy_scoring + self-learning
-    try:
-        consec_losses = await _consecutive_losses(redis)
-        await _update_risk_context_hash(
-            redis,
-            limits=limits,
-            realized_usd=realized_usd,
-            equity_usd=equity,
-            winrate20=winrate,
-            consec_losses=consec_losses,
-            cooldown_until_ts=cooldown_until_ts,
-            max_risk_per_trade=strat_max_risk,
-            min_sol_balance=strat_min_sol_balance,
-            strat_mode=strat_mode_int,
-            plan_equity_today_usd=plan_equity_today,
-            plan_gap_pct=plan_gap_pct,
-            plan_status=plan_status_str,
-            ai_capacity_delta=ai_capacity_delta,
-            halt_reason=halt_reason,
-            kelly_raw=kelly_raw,
-            kelly_pos_pct_cap=kelly_pos_pct_cap,
-            active_profile_name=profile_name,
-            regime_gate_factor=regime_gate_factor,
-            equity_utilization_pct=equity_utilization_pct,
-            trading_window_open=trading_window_open,
-            trading_window_reason=tw_reason,
-        )
-    except Exception:
-        pass
+_ENGINE = _RiskEngine()
 
-    # Broadcast mode changes (once per transition)
-    try:
-        await _broadcast_risk_mode_change(
-            redis=redis,
-            new_mode=limits["risk_mode"],
-            halt_reason=halt_reason,
-            capacity=limits["risk_capacity"],
-            winrate20=limits["winrate20"],
-            rolling_dd=limits["rolling_dd_pct"],
-            realized_usd=realized_usd,
-            equity_usd=limits["equity_usd"],
-        )
-    except Exception:
-        pass
 
-    return limits
+def invalidate_limits_cache() -> None:
+    _ENGINE.invalidate()
+
+
+# =============================================================================
+# Public API: limits/sizing
+# =============================================================================
+async def current_limits(redis=None) -> Dict[str, Any]:
+    return await _ENGINE.current_limits(redis)
 
 
 async def recommend_ticket_usd(redis=None) -> float:
-    """
-    Convenience wrapper for Strategy, scanners, etc.
-    """
-    limits = await current_limits(redis)
-    return float(limits["ticket_usd"])
+    return float((await current_limits(redis)).get("ticket_usd", 0.0))
+
 
 async def equity_and_ticket(redis=None) -> Dict[str, Any]:
-    """
-    Micro-helper for any module that just wants the core sizing snapshot
-    without dealing with the full current_limits() dict.
-
-    Returns:
-      {
-        "equity_usd": float,
-        "ticket_usd": float,
-        "risk_capacity": float,
-        "risk_mode": int,
-      }
-    """
     limits = await current_limits(redis)
     return {
-        "equity_usd": float(limits["equity_usd"]),
-        "ticket_usd": float(limits["ticket_usd"]),
-        "risk_capacity": float(limits["risk_capacity"]),
-        "risk_mode": int(limits["risk_mode"]),
+        "equity_usd": float(limits.get("equity_usd", 0.0)),
+        "ticket_usd": float(limits.get("ticket_usd", 0.0)),
+        "risk_capacity": float(limits.get("risk_capacity", 1.0)),
+        "risk_mode": int(limits.get("risk_mode", 1)),
+        "ctx_digest": await _read_ctx_digest(redis),
     }
 
-# ============================================================================ #
-# Risk capacity public APIs (for FeatureBuilder / ai_entry_logic / reinvestor)
-# ============================================================================ #
 
-async def risk_capacity_snapshot(redis=None) -> Dict[str, Any]:
+# =============================================================================
+# Budget reservation (race-safe entry path)
+# =============================================================================
+_LUA_RESERVE_CAP = r"""
+local key = KEYS[1]
+local cap = tonumber(ARGV[1])
+local inc = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+local cur = tonumber(redis.call('GET', key) or '0')
+if cap > 0 and (cur + inc) > cap then
+  return 0
+end
+redis.call('INCRBYFLOAT', key, inc)
+if ttl and ttl > 0 then
+  redis.call('EXPIRE', key, ttl)
+end
+return 1
+"""
+
+_LUA_RELEASE_FLOOR0 = r"""
+local key = KEYS[1]
+local dec = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+local cur = tonumber(redis.call('GET', key) or '0')
+local nxt = cur - dec
+if nxt < 0 then nxt = 0 end
+redis.call('SET', key, tostring(nxt))
+if ttl and ttl > 0 then
+  redis.call('EXPIRE', key, ttl)
+end
+return 1
+"""
+
+_LUA_RESERVE_INCR = r"""
+local key = KEYS[1]
+local cap = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+local cur = tonumber(redis.call('GET', key) or '0')
+if cap > 0 and (cur + 1) > cap then
+  return 0
+end
+redis.call('INCR', key)
+if ttl and ttl > 0 then
+  redis.call('EXPIRE', key, ttl)
+end
+return 1
+"""
+
+
+async def reserve_entry_budget(usd: float, redis=None) -> bool:
     """
-    Focused snapshot for FeatureBuilder / ai_buy_scoring / ai_entry_logic /
-    reinvestor / regime-aware modules.
+    Atomically reserve today's spend budget for an entry.
+    Safety: also refuses if a hard halt is active (instant deterministic).
+    """
+    usd = float(usd or 0.0)
+    if usd <= 0:
+        return True
+    if redis is None:
+        redis = await _get_redis()
+    if not redis:
+        return True  # no redis -> allow (other caps still apply)
 
-    Returns a rich diagnostic dict (see code for full schema).
+    halted, _ = await _is_halted_fast(redis)
+    if halted:
+        return False
+
+    limits = await current_limits(redis)
+    cap = float(limits.get("daily_spend_usd", 0.0))
+    ttl = _ttl_to_midnight_sec()
+    key = _spent_key_today()
+
+    try:
+        ok = await redis.eval(_LUA_RESERVE_CAP, 1, key, cap, usd, ttl)
+        ok = int(ok) == 1
+        with contextlib.suppress(Exception):
+            await log_event("risk_reserve_spend_ok" if ok else "risk_reserve_spend_block", {"usd": usd, "cap": cap, "sandbox_mode": bool(RISK_SANDBOX_MODE)})
+        return ok
+    except Exception:
+        # fallback non-atomic
+        try:
+            spent = await _daily_spent_usd(redis)
+            if cap > 0 and (spent + usd) > cap:
+                return False
+            await redis.incrbyfloat(key, usd)
+            await _set_expire_at_midnight(redis, key)
+            return True
+        except Exception:
+            return True
+
+
+async def release_entry_budget(usd: float, redis=None) -> None:
+    """Optional: if you reserved spend but BUY never happened, refund budget (floors at 0)."""
+    usd = float(usd or 0.0)
+    if usd <= 0:
+        return
+    if redis is None:
+        redis = await _get_redis()
+    if not redis:
+        return
+    ttl = _ttl_to_midnight_sec()
+    key = _spent_key_today()
+    with contextlib.suppress(Exception):
+        await redis.eval(_LUA_RELEASE_FLOOR0, 1, key, usd, ttl)
+        await log_event("risk_release_spend", {"usd": usd, "sandbox_mode": bool(RISK_SANDBOX_MODE)})
+
+
+async def reserve_daily_entries_slot(redis=None) -> bool:
+    """If you enforce RISK_MAX_DAILY_ENTRIES, call this before entry."""
+    if RISK_MAX_DAILY_ENTRIES <= 0:
+        return True
+    if redis is None:
+        redis = await _get_redis()
+    if not redis:
+        return True
+
+    halted, _ = await _is_halted_fast(redis)
+    if halted:
+        return False
+
+    ttl = _ttl_to_midnight_sec()
+    key = _entries_key_today()
+    try:
+        ok = await redis.eval(_LUA_RESERVE_INCR, 1, key, int(RISK_MAX_DAILY_ENTRIES), ttl)
+        return int(ok) == 1
+    except Exception:
+        with contextlib.suppress(Exception):
+            cur = await _daily_entries(redis)
+            if cur + 1 > int(RISK_MAX_DAILY_ENTRIES):
+                return False
+            await redis.incr(key)
+            await _set_expire_at_midnight(redis, key)
+            return True
+        return True
+
+
+async def note_entry_attempt(*, mint: str, ticket_usd: float, symbol: Optional[str] = None, meta: Optional[Dict[str, Any]] = None, redis=None) -> None:
+    """Best-effort entry telemetry. NOT a budget reservation."""
+    if redis is None:
+        redis = await _get_redis()
+    with contextlib.suppress(Exception):
+        await log_event(
+            "entry_attempt",
+            {"mint": mint, "symbol": symbol or "", "ticket_usd": float(ticket_usd), "meta": meta or {}, "sandbox_mode": bool(RISK_SANDBOX_MODE)},
+        )
+
+
+# =============================================================================
+# Trade metrics ingestion
+# =============================================================================
+async def _push_trade_metrics(redis, profit_usd: float, equity_after: float) -> None:
+    if not redis:
+        return
+    try:
+        await redis.incr(METRICS_TRADES_KEY)
+        if profit_usd > 0:
+            await redis.incr(METRICS_WINS_KEY)
+
+        await redis.lpush(METRICS_LAST20_KEY, 1 if profit_usd > 0 else 0)
+        await redis.ltrim(METRICS_LAST20_KEY, 0, 19)
+        last20 = await redis.lrange(METRICS_LAST20_KEY, 0, 19)
+
+        wins20 = 0
+        for x in (last20 or []):
+            with contextlib.suppress(Exception):
+                wins20 += int(x)
+        winrate20 = wins20 / max(1, len(last20 or []))
+        await redis.set(METRICS_WINRATE20, f"{winrate20:.4f}")
+
+        hwm_raw = await redis.get(EQUITY_HWM_KEY)
+        hwm = float(hwm_raw) if hwm_raw else equity_after
+        if equity_after > hwm:
+            hwm = equity_after
+        await redis.set(EQUITY_HWM_KEY, f"{hwm:.2f}")
+
+        dd = 0.0 if hwm <= 0 else (hwm - equity_after) / hwm
+        await redis.set(METRICS_ROLLING_DD, f"{dd:.4f}")
+    except Exception:
+        pass
+
+
+def _mint_cooldown_key(mint: str) -> str:
+    return f"risk:mint_cooldown_until:{mint}"
+
+
+async def set_mint_cooldown(mint: str, *, minutes: int, redis=None, reason: str = "") -> None:
+    if minutes <= 0:
+        return
+    if redis is None:
+        redis = await _get_redis()
+    if not redis:
+        return
+    try:
+        until = _now_ts() + float(minutes) * 60.0
+        await redis.set(_mint_cooldown_key(mint), f"{until:.1f}", ex=int(minutes * 60))
+        await log_event("risk_mint_cooldown_set", {"mint": mint, "minutes": minutes, "reason": reason})
+    except Exception:
+        pass
+
+
+async def clear_mint_cooldown(mint: str, redis=None) -> None:
+    if redis is None:
+        redis = await _get_redis()
+    if not redis:
+        return
+    try:
+        await redis.delete(_mint_cooldown_key(mint))
+        await log_event("risk_mint_cooldown_cleared", {"mint": mint})
+    except Exception:
+        pass
+
+
+async def _mint_cooldown_active(mint: Optional[str], redis) -> Tuple[bool, float]:
+    if not mint or not redis:
+        return False, 0.0
+    try:
+        v = await redis.get(_mint_cooldown_key(mint))
+        if v is None:
+            return False, 0.0
+        until = float(v)
+        return (until > _now_ts()), until
+    except Exception:
+        return False, 0.0
+
+
+async def note_trade_result(
+    token_address: str,
+    *,
+    profit_usd: float,
+    equity_after_usd: Optional[float] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    trade_id: Optional[str] = None,
+    redis=None,
+) -> None:
+    """
+    Canonical hook called by *any* exit path to update:
+      - daily realized pnl
+      - rolling metrics (winrate20, DD)
+      - daily trade counter (completed trades)
+      - cooldown windows (loss streak / DD)
+      - regime_state account context
+      - self-learning trade closure hook
+      - Notion + structured logs (best effort)
+      - optional per-mint cooldown
+      - optional idempotency via trade_id
+    """
+    try:
+        if redis is None:
+            redis = await _get_redis()
+        if not redis:
+            return
+
+        # Idempotency
+        if trade_id:
+            k = _closed_trade_key(str(trade_id).strip())
+            if k.strip():
+                already = False
+                with contextlib.suppress(Exception):
+                    already = bool(await redis.get(k))
+                if already:
+                    return
+                with contextlib.suppress(Exception):
+                    await redis.set(k, "1", ex=int(7 * 24 * 3600))  # 7d
+
+        pnl_key = _pnl_key_today()
+        await redis.incrbyfloat(pnl_key, float(profit_usd))
+        await _set_expire_at_midnight(redis, pnl_key)
+
+        if equity_after_usd is None:
+            equity_after_usd = await _wallet_equity_usd()
+        equity_after_usd = float(equity_after_usd or 0.0)
+
+        await _push_trade_metrics(redis, float(profit_usd), equity_after_usd)
+
+        # Daily completed trades counter
+        with contextlib.suppress(Exception):
+            k = _trades_key_today()
+            await redis.incr(k)
+            await _set_expire_at_midnight(redis, k)
+
+        # Consecutive-loss cooldown
+        if RISK_COOLDOWN_CONSEC_LOSSES > 0 and RISK_COOLDOWN_MINUTES > 0 and profit_usd < 0:
+            with contextlib.suppress(Exception):
+                consec = await _consecutive_losses(redis)
+                if consec >= RISK_COOLDOWN_CONSEC_LOSSES:
+                    until = _now_ts() + float(RISK_COOLDOWN_MINUTES) * 60.0
+                    await redis.set(RISK_COOLDOWN_UNTIL_KEY, f"{until:.1f}")
+                    if not RISK_DISABLE_ALERTS:
+                        send_telegram = getattr(cu, "send_telegram", None)
+                        await _call(
+                            send_telegram,
+                            "⚠️ *RISK COOLDOWN* — consecutive losses threshold hit\n"
+                            f"• consecutive_losses={consec}\n"
+                            f"• cooldown={RISK_COOLDOWN_MINUTES} min",
+                        )
+
+        # DD cooldown (optional)
+        if RISK_DD_COOLDOWN_FLOOR_PCT > 0 and RISK_DD_COOLDOWN_MINUTES > 0:
+            with contextlib.suppress(Exception):
+                _, dd_frac = await _metrics(redis)
+                dd_pct = dd_frac * 100.0
+                if dd_pct >= float(RISK_DD_COOLDOWN_FLOOR_PCT):
+                    until = _now_ts() + float(RISK_DD_COOLDOWN_MINUTES) * 60.0
+                    await redis.set(RISK_COOLDOWN_UNTIL_KEY, f"{until:.1f}")
+                    if not RISK_DISABLE_ALERTS:
+                        send_telegram = getattr(cu, "send_telegram", None)
+                        await _call(
+                            send_telegram,
+                            "⚠️ *RISK DD COOLDOWN* — drawdown threshold hit\n"
+                            f"• rolling_dd={dd_pct:.2f}% ≥ floor={RISK_DD_COOLDOWN_FLOOR_PCT:.2f}%\n"
+                            f"• cooldown={RISK_DD_COOLDOWN_MINUTES} min",
+                        )
+
+        # Optional per-mint cooldown (anti-chop)
+        with contextlib.suppress(Exception):
+            mint_cd = int((meta or {}).get("mint_cooldown_min") or RISK_MINT_COOLDOWN_MINUTES_DEFAULT)
+            if mint_cd > 0:
+                await set_mint_cooldown(token_address, minutes=mint_cd, redis=redis, reason=f"trade_close_{profit_usd:.2f}")
+
+        # Push account state into regime
+        with contextlib.suppress(Exception):
+            winrate20, dd_frac = await _metrics(redis)
+            realized = await _daily_realized_usd(redis)
+            equity_now = await _wallet_equity_usd()
+            equity_now = float(equity_now or 0.0)
+            daily_pnl_pct = 0.0 if equity_now <= 0 else (realized / equity_now) * 100.0
+            daily_dd_pct = float(dd_frac) * 100.0
+            consec = await _consecutive_losses(redis)
+            await regime_state.update_from_account(
+                daily_realized_pnl_pct=float(daily_pnl_pct),
+                daily_drawdown_pct=float(daily_dd_pct),
+                consecutive_losses=int(consec),
+            )
+
+        # Notion (best effort)
+        if not RISK_DISABLE_NOTION:
+            log_to_notion = getattr(cu, "log_to_notion", None)
+            with contextlib.suppress(Exception):
+                await _call(
+                    log_to_notion,
+                    token=token_address,
+                    symbol=(meta or {}).get("symbol") or token_address[:6],
+                    balance=(meta or {}).get("amount", 0.0),
+                    entry=(meta or {}).get("entry", 0.0),
+                    current=(meta or {}).get("exit", 0.0),
+                    profit=float(profit_usd),
+                    reason=(meta or {}).get("reason", "risk_manager.note_trade_result"),
+                )
+
+        # Structured log
+        with contextlib.suppress(Exception):
+            await log_event(
+                "trade_result",
+                {
+                    "token": token_address,
+                    "profit_usd": float(profit_usd),
+                    "equity_after_usd": float(equity_after_usd),
+                    "trade_id": trade_id,
+                    "meta": meta or {},
+                    "sandbox_mode": bool(RISK_SANDBOX_MODE),
+                },
+            )
+
+        # Self-learning hook
+        with contextlib.suppress(Exception):
+            await process_trade_closure(
+                token_address=token_address,
+                profit_usd=float(profit_usd),
+                equity_after_usd=float(equity_after_usd),
+                meta=meta or {},
+                redis=redis,
+            )
+
+        # After any trade close, invalidate cached limits
+        invalidate_limits_cache()
+
+    except Exception as e:
+        try:
+            log.warning("[RISK] note_trade_result failed for %s: %s", token_address, e)
+        except Exception:
+            pass
+
+
+async def note_spend(*args, **kwargs) -> None:
+    """
+    Backwards compatible spend increment.
+
+    Preferred: reserve_entry_budget() (atomic).
+    Accepts both:
+      - note_spend(redis, usd)
+      - note_spend(usd, redis=redis)
+    """
+    redis = None
+    usd = 0.0
+
+    if len(args) == 2:
+        redis, usd = args[0], args[1]
+    elif len(args) == 1:
+        usd = args[0]
+        redis = kwargs.get("redis", None)
+    else:
+        usd = kwargs.get("usd", 0.0)
+        redis = kwargs.get("redis", None)
+
+    try:
+        usd = float(usd or 0.0)
+    except Exception:
+        usd = 0.0
+
+    if redis is None:
+        redis = await _get_redis()
+    if not redis or usd <= 0:
+        return
+
+    try:
+        k = _spent_key_today()
+        await redis.incrbyfloat(k, float(usd))
+        await _set_expire_at_midnight(redis, k)
+        with contextlib.suppress(Exception):
+            await log_event("risk_spend", {"usd": float(usd), "sandbox_mode": bool(RISK_SANDBOX_MODE)})
+        invalidate_limits_cache()
+    except Exception:
+        pass
+
+
+# =============================================================================
+# Entry gating (explainable, no silent blocks)
+# =============================================================================
+async def should_allow_new_entry(redis=None) -> bool:
+    info = await entry_gate_debug(redis=redis)
+    return bool(info.get("allowed", True))
+
+
+async def entry_gate_debug(
+    redis=None,
+    *,
+    mint: Optional[str] = None,
+    pool_depth_usd: Optional[float] = None,
+    projected_ticket_usd: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Full explainable gate with concrete reasons.
+
+    Instant deterministic stop:
+      - checks halt keys FIRST (does not depend on cached limits)
+
+    Extra args:
+      - pool_depth_usd: enables liq-adjusted ticket visibility
+      - projected_ticket_usd: if caller already decided a ticket, use it for exposure check
     """
     if redis is None:
         redis = await _get_redis()
 
-    # Active profile (takes override + auto + regime hint into account)
-    profile_name, _profile_cfg = await _effective_risk_profile(redis)
+    reasons: List[str] = []
 
-    # For diagnostics, also expose raw override (if any)
-    profile_override: Optional[str] = None
-    if redis:
-        try:
-            v = await redis.get(RISK_PROFILE_OVERRIDE_KEY)
-            if v:
-                profile_override = str(v).strip().lower()
-        except Exception:
-            profile_override = None
+    # 0) Hard halt / manual / infra / HARD_HALT (instant)
+    halted, halt_reason = await _is_halted_fast(redis)
+    if halted:
+        reasons.append(halt_reason or "halted")
 
-    equity_wallet = await _wallet_equity_usd()
-    equity = float(equity_wallet)
-    if RISK_EQUITY_OVERRIDE_USD > 0:
-        equity = RISK_EQUITY_OVERRIDE_USD
+    # 1) trading window (cheap)
+    tw_open, tw_reason = _trading_window_status()
+    if not tw_open:
+        reasons.append(f"trading window closed ({tw_reason})")
 
-    winrate, dd_fraction = await _metrics(redis)
-    realized = await _daily_realized_usd(redis)
-    trades_today = await _daily_trades(redis)
-    regime = regime_state.get()
-    regime_mult = float(regime_state.risk_multiplier())
-    consec_losses = await _consecutive_losses(redis)
-    equity_hwm = await _equity_hwm(redis)
+    # 2) limits (cached)
+    limits = await current_limits(redis)
+    equity = float(limits.get("equity_usd", 0.0))
+    risk_mode = int(limits.get("risk_mode", 1))
+    capacity = float(limits.get("risk_capacity", 1.0))
+    max_conc = int(limits.get("max_concurrent", 0))
+    daily_spend_cap = float(limits.get("daily_spend_usd", 0.0))
 
-    # Strategy params for extra context
+    # 3) open positions / concurrency
+    open_positions = _positions_open_count()
+    if max_conc > 0 and open_positions >= max_conc:
+        reasons.append(f"open_positions {open_positions} ≥ max_concurrent {max_conc}")
+
+    # 4) per-mint cooldown
+    mint_cd_active = False
+    mint_cd_until = 0.0
+    if mint and redis:
+        mint_cd_active, mint_cd_until = await _mint_cooldown_active(mint, redis)
+        if mint_cd_active:
+            rem = max(0.0, mint_cd_until - _now_ts())
+            reasons.append(f"mint cooldown active ({rem:.0f}s remaining)")
+
+    # 5) strategy params (best effort)
     try:
         strat_params = await get_strategy_params(redis)
     except Exception:
         strat_params = {}
-    strat_max_risk = float(strat_params.get("MAX_RISK_PER_TRADE", RISK_MAX_PER_TRADE))
-    strat_min_sol_balance = float(strat_params.get("MIN_SOL_BALANCE", 0.0))
-    strat_mode = strat_params.get("STRAT_MODE")
-    try:
-        strat_mode_int: Optional[int] = (
-            int(strat_mode) if strat_mode is not None else None
-        )
-    except Exception:
-        strat_mode_int = None
 
-    plan_equity_today = float(strat_params.get("PLAN_EQUITY_TODAY_USD", 0.0))
+    hard_halt = str(strat_params.get("HARD_HALT", "0")).strip().lower() in ("1", "true", "yes", "on")
+    if hard_halt and ("strategy HARD_HALT=1" not in reasons):
+        reasons.append("strategy HARD_HALT=1")
+
     plan_gap_pct = float(strat_params.get("PLAN_GAP_PCT", 0.0))
-    plan_status = strat_params.get("PLAN_STATUS")
-    try:
-        plan_status_str: Optional[str] = (
-            str(plan_status) if plan_status is not None else None
-        )
-    except Exception:
-        plan_status_str = None
+    if RISK_PLAN_AHEAD_HARD_STOP_PCT > 0 and plan_gap_pct >= float(RISK_PLAN_AHEAD_HARD_STOP_PCT):
+        reasons.append(f"plan_gap_pct {plan_gap_pct:.2f}% ≥ hard-stop {RISK_PLAN_AHEAD_HARD_STOP_PCT:.2f}%")
 
-    # NEW: self-learning caps (for visibility)
-    try:
-        strat_max_conc_override_raw = strat_params.get("MAX_CONCURRENT_OVERRIDE")
-        strat_max_conc_override: Optional[int] = (
-            int(strat_max_conc_override_raw)
-            if strat_max_conc_override_raw is not None
-            else None
-        )
-        if strat_max_conc_override is not None and strat_max_conc_override <= 0:
-            strat_max_conc_override = None
-    except Exception:
-        strat_max_conc_override = None
+    # 6) risk mode + capacity floor
+    if risk_mode == 0:
+        reasons.append("risk_mode=0 (OFF)")
+    if capacity < float(RISK_MIN_CAPACITY_FOR_ENTRY):
+        reasons.append(f"risk_capacity {capacity:.3f} < floor {RISK_MIN_CAPACITY_FOR_ENTRY:.3f}")
 
-    strat_daily_spend_cap_pct = float(strat_params.get("DAILY_SPEND_CAP_PCT", 0.0))
-    strat_daily_spend_cap_usd = float(strat_params.get("DAILY_SPEND_CAP_USD", 0.0))
+    # 7) regime hard risk-off
+    with contextlib.suppress(Exception):
+        if regime_state.is_hard_risk_off():
+            reasons.append("regime_state.is_hard_risk_off()")
 
-    # Regime features (same basis as current_limits)
+    # 8) cooldown active
+    cooldown_active = False
+    if redis:
+        with contextlib.suppress(Exception):
+            v = await redis.get(RISK_COOLDOWN_UNTIL_KEY)
+            if v is not None and float(v) > _now_ts():
+                cooldown_active = True
+                reasons.append("loss/DD cooldown active")
+
+    # 9) equity floor
+    if RISK_MIN_EQUITY_USD > 0 and equity < float(RISK_MIN_EQUITY_USD):
+        reasons.append(f"equity_usd {equity:.2f} < RISK_MIN_EQUITY_USD {RISK_MIN_EQUITY_USD:.2f}")
+
+    # 10) profit stop + loss cap
+    realized = await _daily_realized_usd(redis)
+    profit_stop_usd = equity * (STOP_AFTER_DAILY_PROFIT_PCT / 100.0)
+    loss_cap_usd = equity * (DAILY_LOSS_CAP_PCT / 100.0) if DAILY_LOSS_CAP_PCT > 0 else 0.0
+    if profit_stop_usd > 0 and realized >= profit_stop_usd:
+        reasons.append(f"stop-after-profit hit ({realized:.2f} ≥ {profit_stop_usd:.2f})")
+    if loss_cap_usd > 0 and realized <= -abs(loss_cap_usd):
+        reasons.append(f"daily loss cap hit ({realized:.2f} ≤ -{abs(loss_cap_usd):.2f})")
+
+    # 11) spend budget
+    spent_usd = await _daily_spent_usd(redis)
+    if daily_spend_cap > 0 and spent_usd >= daily_spend_cap:
+        reasons.append(f"daily spend cap hit (spent {spent_usd:.2f} ≥ cap {daily_spend_cap:.2f})")
+
+    # 12) daily caps
+    trades_today = await _daily_trades(redis)
+    if RISK_MAX_DAILY_TRADES > 0 and trades_today >= int(RISK_MAX_DAILY_TRADES):
+        reasons.append(f"daily trades cap hit ({trades_today} ≥ cap {RISK_MAX_DAILY_TRADES})")
+
+    entries_today = await _daily_entries(redis)
+    if RISK_MAX_DAILY_ENTRIES > 0 and entries_today >= int(RISK_MAX_DAILY_ENTRIES):
+        reasons.append(f"daily entries cap hit ({entries_today} ≥ cap {RISK_MAX_DAILY_ENTRIES})")
+
+    # 13) MIN_SOL_BALANCE from strategy
+    strat_min_sol_balance = float(strat_params.get("MIN_SOL_BALANCE", 0.0))
+    sol_bal = 0.0
+    if strat_min_sol_balance > 0:
+        sol_bal = await _wallet_sol_balance()
+        if sol_bal < strat_min_sol_balance:
+            reasons.append(f"SOL balance {sol_bal:.4f} < MIN_SOL_BALANCE {strat_min_sol_balance:.4f}")
+
+    # 14) exposure cap (optional)
+    open_exposure = _positions_open_exposure_usd()
+    max_exposure = 0.0
+    if RISK_MAX_EXPOSURE_USD > 0:
+        max_exposure = float(RISK_MAX_EXPOSURE_USD)
+    elif RISK_MAX_EXPOSURE_PCT > 0 and equity > 0:
+        max_exposure = float(equity) * (float(RISK_MAX_EXPOSURE_PCT) / 100.0)
+
+    # Determine "intended ticket" for exposure check
+    intended_ticket = float(projected_ticket_usd) if projected_ticket_usd is not None else float(limits.get("ticket_usd", 0.0))
+    if pool_depth_usd is not None:
+        intended_ticket = liq_aware_ticket_usd(intended_ticket, float(pool_depth_usd))
+
+    if max_exposure > 0 and (open_exposure + max(0.0, intended_ticket)) > max_exposure:
+        reasons.append(f"max exposure hit (open {open_exposure:.2f} + ticket {intended_ticket:.2f} > cap {max_exposure:.2f})")
+
+    profile_name, _ = await _effective_risk_profile(redis)
+    allowed = len(reasons) == 0
+
     regime_feats = await regime_state.features()
-    regime_vol = float(regime_feats.get("regime_volatility", 0.5))
-    regime_chop = float(regime_feats.get("regime_choppy_score", 0.0))
-    regime_label_numeric = float(regime_feats.get("regime_label_numeric", 0.0))
-    regime_stress_score = float(regime_feats.get("regime_stress_score", regime_vol))
-    regime_signal_strength = float(
-        regime_feats.get(
-            "regime_signal_strength",
-            regime_feats.get("regime_meme_heat", 0.5),
-        )
-    )
     regime_entry_gate_factor = float(
         regime_feats.get(
             "regime_entry_gate_factor",
-            regime_feats.get("gate_factor", regime_mult),
+            regime_feats.get("gate_factor", regime_feats.get("regime_risk_multiplier", 1.0)),
         )
     )
 
-    # Capacity, with same pipeline as current_limits (minus live overrides)
-    capacity_raw = _risk_capacity_from_components(
-        winrate20=winrate,
-        rolling_dd=dd_fraction,
-        realized_pnl_usd=realized,
-        equity_usd=equity,
-        regime_mult=regime_mult,
-        regime_volatility=regime_vol,
-        regime_choppy=regime_chop,
-    )
-
-    # Plan bias (same logic as current_limits)
-    plan_bias = 0.0
-    if plan_gap_pct != 0.0:
-        if plan_gap_pct > 0:
-            plan_bias = -min(abs(plan_gap_pct) / 100.0 * 0.3, 0.3)
-        else:
-            plan_bias = min(abs(plan_gap_pct) / 100.0 * 0.2, 0.2)
-    capacity_raw = _clamp(capacity_raw + plan_bias, 0.0, 1.0)
-
-    # Optional AI overlay
-    ai_capacity_delta = 0.0
-    if _predict_capacity_adjustment is not None:
-        try:
-            features = {
-                "equity_usd": float(equity),
-                "winrate20": float(winrate),
-                "rolling_dd": float(dd_fraction),
-                "realized_pnl_usd": float(realized),
-                "regime_mult": float(regime_mult),
-                "plan_gap_pct": float(plan_gap_pct),
-                "risk_profile": profile_name,
-            }
-            ai_raw = _predict_capacity_adjustment(features)
-            if asyncio.iscoroutine(ai_raw):
-                ai_raw = await ai_raw
-            ai_capacity_delta = float(ai_raw or 0.0)
-        except Exception:
-            ai_capacity_delta = 0.0
-
-    capacity_raw = _clamp(capacity_raw + ai_capacity_delta, 0.0, 1.0)
-
-    capacity, risk_mode, override_mode, halt_reason = await _risk_mode_with_override(
-        redis,
-        capacity_raw,
-        rolling_dd=dd_fraction,
-    )
-
-    # Kelly diagnostics, *not* used to recompute equity here
-    kelly_raw = 0.0
-    kelly_pos_pct_cap = 0.0
-    if RISK_KELLY_ENABLED:
-        kelly_raw, kelly_pos_pct_cap = _kelly_pos_cap(winrate)
-
-    pnl_pct_fraction = 0.0 if equity <= 0 else (realized / equity)
-    pnl_pct = pnl_pct_fraction * 100.0
-    dd_pct = dd_fraction * 100.0
-
-    cooldown_active = False
-    if redis:
-        try:
-            val = await redis.get(RISK_COOLDOWN_UNTIL_KEY)
-            if val is not None:
-                cooldown_active = float(val) > _now_ts()
-        except Exception:
-            cooldown_active = False
-
-    trading_window_open, tw_reason = _trading_window_status()
+    ticket_usd_liq = None
+    if pool_depth_usd is not None:
+        ticket_usd_liq = liq_aware_ticket_usd(float(limits.get("ticket_usd", 0.0)), float(pool_depth_usd))
 
     return {
-        "risk_capacity": float(capacity),
-        "risk_mode": int(risk_mode),
-        "risk_mode_override": override_mode,
-        "winrate20": float(winrate),
-        "rolling_dd_pct": float(dd_fraction),
-        "equity_usd": float(equity),
-        "equity_hwm_usd": float(equity_hwm),
-        "daily_realized_pnl_usd": float(realized),
-        "daily_realized_pnl_pct": float(pnl_pct),
-        "daily_drawdown_pct": float(dd_pct),
-        "regime_label": regime,
-        "regime_risk_multiplier": float(regime_mult),
-        "regime_label_numeric": float(regime_label_numeric),
-        "regime_stress_score": float(regime_stress_score),
-        "regime_signal_strength": float(regime_signal_strength),
-        "regime_entry_gate_factor": float(regime_entry_gate_factor),
-        "consecutive_losses": int(consec_losses),
+        "allowed": bool(allowed),
+        "reasons_blocking": reasons,
+        "limits": limits,
+        "daily_realized_usd": float(realized),
+        "profit_stop_usd": float(profit_stop_usd),
+        "loss_cap_usd": float(loss_cap_usd),
+        "spent_usd": float(spent_usd),
+        "sol_balance": float(sol_bal),
         "cooldown_active": bool(cooldown_active),
-        "max_risk_per_trade": float(strat_max_risk),
-        "min_sol_balance": float(strat_min_sol_balance),
-        "strat_mode": strat_mode_int,
-        "plan_equity_today_usd": float(plan_equity_today),
+        "hard_halt": bool(hard_halt),
         "plan_gap_pct": float(plan_gap_pct),
-        "plan_status": plan_status_str,
-        "strat_daily_spend_cap_pct": float(strat_daily_spend_cap_pct),
-        "strat_daily_spend_cap_usd": float(strat_daily_spend_cap_usd),
-        "strat_max_concurrent_override": strat_max_conc_override,
-        "ai_capacity_delta": float(ai_capacity_delta),
-        "halt_reason": halt_reason,
-        "daily_trades_count": int(trades_today),
-        "daily_trades_cap": int(RISK_MAX_DAILY_TRADES),
+        "plan_ahead_hard_stop": float(RISK_PLAN_AHEAD_HARD_STOP_PCT),
+        "trade_count_today": int(trades_today),
+        "trade_cap_today": int(RISK_MAX_DAILY_TRADES),
+        "entries_count_today": int(entries_today),
+        "entries_cap_today": int(RISK_MAX_DAILY_ENTRIES),
+        "equity_floor_usd": float(RISK_MIN_EQUITY_USD),
         "sandbox_mode": bool(RISK_SANDBOX_MODE),
-        "kelly_raw": float(kelly_raw),
-        "kelly_pos_pct_cap": float(kelly_pos_pct_cap),
-        "equity_override_usd": float(RISK_EQUITY_OVERRIDE_USD),
         "risk_profile": profile_name,
         "risk_profile_env": RISK_PROFILE,
-        "risk_profile_override": profile_override,
+        "regime_entry_gate_factor": float(regime_entry_gate_factor),
+        "trading_window_open": bool(tw_open),
+        "trading_window_reason": str(tw_reason),
         "risk_engine_version": RISK_ENGINE_VERSION,
-        "trading_window_open": bool(trading_window_open),
-        "trading_window_reason": tw_reason,
+        "open_positions": int(open_positions),
+        "max_concurrent": int(max_conc),
+        "positions_open_ge_max": bool(max_conc > 0 and open_positions >= max_conc),
+        "mint": mint,
+        "mint_cooldown_active": bool(mint_cd_active),
+        "mint_cooldown_until_ts": float(mint_cd_until),
+        "ticket_usd_liq": ticket_usd_liq,
+        "open_exposure_usd": float(open_exposure),
+        "max_exposure_usd": float(max_exposure),
+        "intended_ticket_usd_for_exposure": float(intended_ticket),
+        "ctx_digest": await _read_ctx_digest(redis),
     }
 
 
-async def risk_capacity_score(redis=None) -> float:
-    """
-    Scalar convenience wrapper used by any module that just wants [0,1].
-    """
-    snap = await risk_capacity_snapshot(redis)
-    return float(snap["risk_capacity"])
-
-
+# =============================================================================
+# Snapshots / health
+# =============================================================================
 async def read_risk_ctx_hash(redis=None) -> Dict[str, float]:
-    """
-    Optional helper: read the already-published risk:ctx hash.
-
-    This lets FeatureBuilder / scanners pull risk context cheaply without
-    recomputing limits if they don't need the full `current_limits()` output.
-
-    Returns 0'd defaults if Redis / hash missing.
-    """
+    """Backwards compatible: small numeric hash-like subset."""
     if redis is None:
         redis = await _get_redis()
     if not redis:
-        return {
-            "open_positions": 0.0,
-            "max_positions": 0.0,
-            "daily_realized_pnl_pct": 0.0,
-            "daily_drawdown_pct": 0.0,
-            "risk_mode": 1.0,
-            "risk_capacity": 1.0,
-        }
-
+        return {"open_positions": 0.0, "max_positions": 0.0, "daily_realized_pnl_pct": 0.0, "daily_drawdown_pct": 0.0, "risk_mode": 1.0, "risk_capacity": 1.0}
     try:
         h = await redis.hgetall(RISK_CTX_KEY)
     except Exception:
         h = {}
 
     def _f(name: str, default: float) -> float:
-        try:
+        with contextlib.suppress(Exception):
             return float(h.get(name, default))
-        except Exception:
-            return default
+        return default
 
     return {
         "open_positions": _f("open_positions", 0.0),
@@ -2197,1214 +2342,384 @@ async def read_risk_ctx_hash(redis=None) -> Dict[str, float]:
     }
 
 
-# ============================================================================ #
-# Trade metrics updates
-# ============================================================================ #
-
-async def _push_trade_metrics(redis, profit_usd: float, equity_after: float) -> None:
-    """
-    Update:
-      - total trades/wins
-      - rolling winrate-20
-      - rolling drawdown vs equity HWM
-    """
-    if not redis:
-        return
-    try:
-        await redis.incr(METRICS_TRADES_KEY)
-        if profit_usd > 0:
-            await redis.incr(METRICS_WINS_KEY)
-
-        # rolling last-20 (1/0)
-        await redis.lpush(METRICS_LAST20_KEY, 1 if profit_usd > 0 else 0)
-        await redis.ltrim(METRICS_LAST20_KEY, 0, 19)
-        last20 = await redis.lrange(METRICS_LAST20_KEY, 0, 19)
-        wins20 = sum(int(x) for x in last20)
-        winrate20 = wins20 / max(1, len(last20))
-        await redis.set(METRICS_WINRATE20, f"{winrate20:.4f}")
-
-        # rolling DD vs equity HWM (fraction 0..1)
-        hwm_raw = await redis.get(EQUITY_HWM_KEY)
-        hwm = float(hwm_raw) if hwm_raw else equity_after
-        if equity_after > hwm:
-            hwm = equity_after
-        await redis.set(EQUITY_HWM_KEY, f"{hwm:.2f}")
-        dd = 0.0 if hwm <= 0 else (hwm - equity_after) / hwm
-        await redis.set(METRICS_ROLLING_DD, f"{dd:.4f}")
-    except Exception:
-        pass
-
-
-async def note_trade_result(
-    token_address: str,
-    *,
-    profit_usd: float,
-    equity_after_usd: Optional[float] = None,
-    meta: Optional[Dict[str, Any]] = None,
-    redis=None,
-) -> None:
-    """
-    Central hook for *any* exit path (ai_sell_logic, exit_engine, legacy) to
-    update daily realized PnL and risk metrics and push account context
-    into regime_state.
-
-    NEW (V3+++):
-      - If profit_usd < 0 and consecutive losses ≥ RISK_COOLDOWN_CONSEC_LOSSES,
-        we start a cooldown window (RISK_COOLDOWN_MINUTES) where should_allow_new_entry()
-        will block new entries.
-      - Optionally, if rolling DD% ≥ RISK_DD_COOLDOWN_FLOOR_PCT, we start a
-        DD-based cooldown window (RISK_DD_COOLDOWN_MINUTES).
-      - We increment daily trade count for use with RISK_MAX_DAILY_TRADES.
-    """
-    try:
-        if redis is None:
-            redis = await _get_redis()
-
-        if not redis:
-            return
-
-        # 1) update daily realized PnL
-        pnl_key = _pnl_key_today()
-        await redis.incrbyfloat(pnl_key, float(profit_usd))
-        await _set_expire_at_midnight(redis, pnl_key)
-
-        # 2) update HWM / DD / winrate metrics
-        if equity_after_usd is None:
-            equity_after_usd = await _wallet_equity_usd()
-        equity_after_usd = float(equity_after_usd or 0.0)
-
-        await _push_trade_metrics(redis, float(profit_usd), equity_after_usd)
-
-        # 3) daily trades counter (for RISK_MAX_DAILY_TRADES)
-        try:
-            trades_key = _key_daily("risk:trades_count")
-            await redis.incr(trades_key)
-            await _set_expire_at_midnight(redis, trades_key)
-        except Exception:
-            pass
-
-        # 4) consecutive-loss cooldown (if configured and this trade is a loser)
-        if RISK_COOLDOWN_CONSEC_LOSSES > 0 and profit_usd < 0:
-            try:
-                consec_losses = await _consecutive_losses(redis)
-                if consec_losses >= RISK_COOLDOWN_CONSEC_LOSSES:
-                    cooldown_until = _now_ts() + RISK_COOLDOWN_MINUTES * 60.0
-                    await redis.set(RISK_COOLDOWN_UNTIL_KEY, f"{cooldown_until:.1f}")
-                    await send_telegram(
-                        "⚠️ *RISK COOLDOWN* — consecutive losses threshold hit\n"
-                        f"• consecutive_losses={consec_losses}  "
-                        f"• cooldown={RISK_COOLDOWN_MINUTES} min"
-                    )
-            except Exception:
-                pass
-
-        # 4b) DD-based cooldown (optional, uses updated METRICS_ROLLING_DD)
-        if (
-            RISK_DD_COOLDOWN_FLOOR_PCT > 0
-            and RISK_DD_COOLDOWN_MINUTES > 0
-        ):
-            try:
-                _, dd_fraction = await _metrics(redis)  # 0..1
-                dd_pct = dd_fraction * 100.0
-                if dd_pct >= RISK_DD_COOLDOWN_FLOOR_PCT:
-                    cooldown_until = _now_ts() + RISK_DD_COOLDOWN_MINUTES * 60.0
-                    await redis.set(RISK_COOLDOWN_UNTIL_KEY, f"{cooldown_until:.1f}")
-                    await send_telegram(
-                        "⚠️ *RISK DD COOLDOWN* — drawdown threshold hit\n"
-                        f"• rolling_dd={dd_pct:.2f}% ≥ floor={RISK_DD_COOLDOWN_FLOOR_PCT:.2f}%\n"
-                        f"• cooldown={RISK_DD_COOLDOWN_MINUTES} min"
-                    )
-            except Exception:
-                pass
-
-        # 5) push account → regime_state (account-aware regime)
-        try:
-            winrate20, dd = await _metrics(redis)
-            realized_usd = await _daily_realized_usd(redis)
-            equity_now = await _wallet_equity_usd()
-            equity_now = float(equity_now or 0.0)
-
-            daily_pnl_pct = (
-                0.0 if equity_now <= 0 else (realized_usd / equity_now) * 100.0
-            )
-            daily_dd_pct = float(dd) * 100.0  # fraction -> percent
-            consec_losses = await _consecutive_losses(redis)
-
-            await regime_state.update_from_account(
-                daily_realized_pnl_pct=daily_pnl_pct,
-                daily_drawdown_pct=daily_dd_pct,
-                consecutive_losses=consec_losses,
-            )
-        except Exception:
-            # Don't let regime coupling break risk pipeline
-            pass
-
-        # 6) optional lightweight log to Notion for analytics
-        try:
-            await log_to_notion(
-                token=token_address,
-                symbol=(meta or {}).get("symbol") or token_address[:6],
-                balance=(meta or {}).get("amount", 0.0),
-                entry=(meta or {}).get("entry", 0.0),
-                current=(meta or {}).get("exit", 0.0),
-                profit=profit_usd,
-                reason=(meta or {}).get("reason", "risk_manager.note_trade_result"),
-            )
-        except Exception:
-            # Don't let analytics break risk pipeline
-            pass
-
-        # 7) Structured log_event
-        try:
-            await log_event(
-                "trade_result",
-                {
-                    "token": token_address,
-                    "profit_usd": profit_usd,
-                    "equity_after_usd": equity_after_usd,
-                    "meta": meta or {},
-                    "sandbox_mode": RISK_SANDBOX_MODE,
-                },
-            )
-        except Exception:
-            pass
-
-        # 8) Self-learning strategy hook (best-effort)
-        try:
-            await process_trade_closure(
-                token_address=token_address,
-                profit_usd=profit_usd,
-                equity_after_usd=equity_after_usd,
-                meta=meta or {},
-                redis=redis,
-            )
-        except Exception:
-            pass
-
-    except Exception as e:
-        logger.warning("[RISK] note_trade_result failed for %s: %s", token_address, e)
-
-
-# ============================================================================ #
-# Entry gating
-# ============================================================================ #
-
-async def should_allow_new_entry(redis=None) -> bool:
-    """
-    Gate new entries by:
-      - manual block (risk:manual_block)
-      - infra halt (from infra_guard via "infra:halt" Redis key)
-      - global risk_mode (0=off → no entries)
-      - risk_capacity floor (RISK_MIN_CAPACITY_FOR_ENTRY)
-      - equity floor (RISK_MIN_EQUITY_USD, optional)
-      - daily realized PnL ≥ STOP_AFTER_DAILY_PROFIT_PCT * equity
-      - daily realized PnL ≤ -DAILY_LOSS_CAP_PCT * equity (if configured)
-      - daily spend budget exhausted
-      - daily trade-count cap (RISK_MAX_DAILY_TRADES)
-      - consecutive-loss cooldown window (if active)
-      - DD-based cooldown window (if active)
-      - wallet SOL balance < MIN_SOL_BALANCE from self-learning strategy
-      - strategy HARD_HALT flag
-      - strategy plan hard-stop when far ahead of plan (optional)
-      - regime_state hard risk-off flag
-      - trading window closed (UTC hours + weekdays)
-      - NEW: concurrency guard (open_positions >= max_concurrent)
-
-    NOTE: Regime / performance are already reflected in ticket size & concurrency
-    via current_limits(), not here.
-    """
+async def risk_capacity_snapshot(redis=None) -> Dict[str, Any]:
     if redis is None:
         redis = await _get_redis()
 
-    # Manual block (ops / safety switch)
+    profile_name, _ = await _effective_risk_profile(redis)
+    profile_override: Optional[str] = None
     if redis:
-        try:
-            manual = await redis.get(RISK_MANUAL_BLOCK_KEY)
-            if str(manual).strip() == "1":
-                logger.info("[RISK] risk:manual_block=1 -> blocking new entries")
-                return False
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            v = await redis.get(RISK_PROFILE_OVERRIDE_KEY)
+            if v:
+                profile_override = _s(v).strip().lower()
 
-    limits = await current_limits(redis)
-    equity = limits["equity_usd"]
-    daily_spend = limits["daily_spend_usd"]
-    risk_mode = limits.get("risk_mode", 1)
-    capacity = float(limits.get("risk_capacity", 1.0))
-    max_conc = int(limits.get("max_concurrent", 0))
+    equity = float(await _wallet_equity_usd())
+    if RISK_EQUITY_OVERRIDE_USD > 0:
+        equity = float(RISK_EQUITY_OVERRIDE_USD)
 
-    # NEW: hard concurrency guard (belt + suspenders with Strategy semaphore)
-    open_positions = 0
-    try:
-        positions = load_positions()
-        open_positions = len(positions) if positions else 0
-    except Exception:
-        open_positions = 0
-
-    if max_conc > 0 and open_positions >= max_conc:
-        logger.info(
-            "[RISK] open_positions=%d ≥ max_concurrent=%d -> blocking new entries",
-            open_positions,
-            max_conc,
-        )
-        return False
-
-    # Also pull strategy for balance floor, plan, and HARD_HALT
-    try:
-        strat_params = await get_strategy_params(redis)
-    except Exception:
-        strat_params = {}
-    strat_min_sol_balance = float(strat_params.get("MIN_SOL_BALANCE", 0.0))
-    plan_gap_pct = float(strat_params.get("PLAN_GAP_PCT", 0.0))
-
-    # Optional hard halt from strategy (self-learning emergency brake)
-    if str(strat_params.get("HARD_HALT", "0")).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
-        logger.info("[RISK] strategy HARD_HALT=1 → blocking new entries")
-        return False
-
-    # Plan-aware hard stop when ahead of target curve
-    if (
-        RISK_PLAN_AHEAD_HARD_STOP_PCT > 0.0
-        and plan_gap_pct >= RISK_PLAN_AHEAD_HARD_STOP_PCT
-    ):
-        logger.info(
-            "[RISK] plan_gap_pct %.2f >= hard-stop %.2f → blocking new entries",
-            plan_gap_pct,
-            RISK_PLAN_AHEAD_HARD_STOP_PCT,
-        )
-        return False
-
-    # Infra-halt flag
-    try:
-        if redis:
-            halted = await redis.get("infra:halt")
-            if halted == "1":
-                logger.info("[RISK] infra:halt=1 -> blocking new entries")
-                return False
-    except Exception:
-        pass
-
-    # Global risk_mode = off
-    if risk_mode == 0:
-        logger.info("[RISK] risk_mode=0 (OFF) -> blocking new entries")
-        return False
-
-    # Extra guard: if risk_capacity is below floor, block even if mode>0
-    if capacity < RISK_MIN_CAPACITY_FOR_ENTRY:
-        logger.info(
-            "[RISK] risk_capacity %.3f < floor %.3f -> blocking new entries",
-            capacity,
-            RISK_MIN_CAPACITY_FOR_ENTRY,
-        )
-        return False
-
-    # Hard risk_off regime (from regime_state) – extra guardrail
-    if regime_state.is_hard_risk_off():
-        logger.info("[RISK] regime_state.is_hard_risk_off() -> blocking new entries")
-        return False
-
-    # Consecutive-loss or DD-based cooldown
-    if redis and (
-        (RISK_COOLDOWN_CONSEC_LOSSES > 0 and RISK_COOLDOWN_MINUTES > 0)
-        or (RISK_DD_COOLDOWN_FLOOR_PCT > 0 and RISK_DD_COOLDOWN_MINUTES > 0)
-    ):
-        try:
-            val = await redis.get(RISK_COOLDOWN_UNTIL_KEY)
-            if val is not None:
-                cooldown_until = float(val)
-                if cooldown_until > _now_ts():
-                    logger.info(
-                        "[RISK] cooldown active until %.0f -> blocking new entries",
-                        cooldown_until,
-                    )
-                    return False
-        except Exception:
-            pass
-
-    # Equity floor guardrail (if configured)
-    if RISK_MIN_EQUITY_USD > 0.0 and equity < RISK_MIN_EQUITY_USD:
-        logger.info(
-            "[RISK] equity_usd %.2f < RISK_MIN_EQUITY_USD %.2f -> blocking new entries",
-            equity,
-            RISK_MIN_EQUITY_USD,
-        )
-        return False
-
-    # Daily trades cap (if configured)
-    if RISK_MAX_DAILY_TRADES > 0 and redis:
-        try:
-            trades_today = await _daily_trades(redis)
-        except Exception:
-            trades_today = 0
-        if trades_today >= RISK_MAX_DAILY_TRADES:
-            logger.info(
-                "[RISK] daily trades cap hit: trades=%d cap=%d",
-                trades_today,
-                RISK_MAX_DAILY_TRADES,
-            )
-            return False
-
-    # Trading window (UTC hours + weekdays)
-    trading_window_open, reason = _trading_window_status()
-    if not trading_window_open:
-        logger.info("[RISK] trading window closed: %s", reason)
-        return False
-
-    # Stop-after-profit & daily loss cap (day-level)
+    winrate, dd_frac = await _metrics(redis)
     realized = await _daily_realized_usd(redis)
-    profit_stop_usd = equity * (STOP_AFTER_DAILY_PROFIT_PCT / 100.0)
-    loss_cap_usd = (
-        equity * (DAILY_LOSS_CAP_PCT / 100.0) if DAILY_LOSS_CAP_PCT > 0 else 0.0
-    )
-
-    if realized >= profit_stop_usd > 0:
-        logger.info(
-            "[RISK] stop-after-profit hit: realized=%.2f, stop=%.2f",
-            realized,
-            profit_stop_usd,
-        )
-        return False
-
-    if loss_cap_usd > 0 and realized <= -abs(loss_cap_usd):
-        logger.info(
-            "[RISK] daily loss cap hit: realized=%.2f, cap=-%.2f",
-            realized,
-            abs(loss_cap_usd),
-        )
-        return False
-
-    # Daily spend budget
-    if redis:
-        budget_key = _key_daily("budget:sniper:spent_usd")
-        try:
-            spent = await redis.get(budget_key)
-            spent_val = float(spent) if spent else 0.0
-        except Exception:
-            spent_val = 0.0
-        if spent_val >= daily_spend > 0:
-            logger.info(
-                "[RISK] daily spend cap hit: spent=%.2f, cap=%.2f",
-                spent_val,
-                daily_spend,
-            )
-            return False
-
-    # MIN_SOL_BALANCE guardrail from self-learning strategy
-    if strat_min_sol_balance > 0:
-        sol_bal = await _wallet_sol_balance()
-        if sol_bal < strat_min_sol_balance:
-            logger.info(
-                "[RISK] SOL balance %.4f < MIN_SOL_BALANCE %.4f -> blocking new entries",
-                sol_bal,
-                strat_min_sol_balance,
-            )
-            return False
-
-    return True
-
-
-async def entry_gate_debug(redis=None) -> Dict[str, Any]:
-    """
-    Debug helper: run the same gating logic as should_allow_new_entry(), but
-    return a structured breakdown of *why* entries are blocked or allowed.
-
-    This is for:
-      - scripts/diagnostics.py
-      - healthcheck endpoints
-      - "why am I seeing no buys?" Telegram debugging
-
-    NEW (V3+++ upgrade):
-      - Includes concurrency context:
-            • open_positions
-            • max_concurrent
-            • positions_open_ge_max (bool)
-    """
-    if redis is None:
-        redis = await _get_redis()
-
-    reasons: List[str] = []
-    manual_block = False
-    infra_halt = False
-    hard_halt = False
-    hard_risk_off = False
-    cooldown_active = False
-    spent_usd = 0.0
-    sol_balance = 0.0
-    trades_today = 0
-    open_positions = 0
-    positions_open_ge_max = False
-
-    # Active risk profile (for debug)
-    profile_name, _profile_cfg = await _effective_risk_profile(redis)
-
-    # Load limits first so we have equity / capacity context
-    limits = await current_limits(redis)
-    equity = float(limits["equity_usd"])
-    daily_spend_cap = float(limits["daily_spend_usd"])
-    risk_mode = int(limits.get("risk_mode", 1))
-    capacity = float(limits.get("risk_capacity", 1.0))
-    max_conc = int(limits.get("max_concurrent", 0))
-
-    # NEW: observe current open positions vs max_concurrent
-    try:
-        positions = load_positions()
-        open_positions = len(positions) if positions else 0
-    except Exception:
-        open_positions = 0
-
-    if max_conc > 0 and open_positions >= max_conc:
-        positions_open_ge_max = True
-        reasons.append(
-            f"open_positions {open_positions} ≥ max_concurrent {max_conc}"
-        )
-
-    # Strategy params
-    try:
-        strat_params = await get_strategy_params(redis)
-    except Exception:
-        strat_params = {}
-    strat_min_sol_balance = float(strat_params.get("MIN_SOL_BALANCE", 0.0))
-    plan_gap_pct = float(strat_params.get("PLAN_GAP_PCT", 0.0))
-
-    # HARD_HALT
-    if str(strat_params.get("HARD_HALT", "0")).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
-        hard_halt = True
-        reasons.append("strategy HARD_HALT=1")
-
-    # Plan hard-stop (optional)
-    if (
-        RISK_PLAN_AHEAD_HARD_STOP_PCT > 0.0
-        and plan_gap_pct >= RISK_PLAN_AHEAD_HARD_STOP_PCT
-    ):
-        reasons.append(
-            f"plan_gap_pct {plan_gap_pct:.2f}% >= hard-stop {RISK_PLAN_AHEAD_HARD_STOP_PCT:.2f}%"
-        )
-
-    # Manual block
-    if redis:
-        try:
-            v = await redis.get(RISK_MANUAL_BLOCK_KEY)
-            manual_block = str(v).strip() == "1"
-            if manual_block:
-                reasons.append("risk:manual_block=1")
-        except Exception:
-            manual_block = False
-
-    # Infra halt
-    if redis:
-        try:
-            halted = await redis.get("infra:halt")
-            infra_halt = (halted == "1")
-            if infra_halt:
-                reasons.append("infra:halt=1")
-        except Exception:
-            infra_halt = False
-
-    # risk_mode
-    if risk_mode == 0:
-        reasons.append("risk_mode=0 (OFF)")
-
-    # capacity floor
-    if capacity < RISK_MIN_CAPACITY_FOR_ENTRY:
-        reasons.append(
-            f"risk_capacity {capacity:.3f} < floor {RISK_MIN_CAPACITY_FOR_ENTRY:.3f}"
-        )
-
-    # regime hard risk-off
-    if regime_state.is_hard_risk_off():
-        hard_risk_off = True
-        reasons.append("regime_state.is_hard_risk_off()")
-
-    # cooldown
-    if redis and (
-        (RISK_COOLDOWN_CONSEC_LOSSES > 0 and RISK_COOLDOWN_MINUTES > 0)
-        or (RISK_DD_COOLDOWN_FLOOR_PCT > 0 and RISK_DD_COOLDOWN_MINUTES > 0)
-    ):
-        try:
-            v = await redis.get(RISK_COOLDOWN_UNTIL_KEY)
-            if v is not None:
-                ts = float(v)
-                cooldown_active = ts > _now_ts()
-                if cooldown_active:
-                    reasons.append("loss/DD cooldown active")
-        except Exception:
-            cooldown_active = False
-
-    # daily realized PnL vs caps
-    realized = await _daily_realized_usd(redis)
-    profit_stop_usd = equity * (STOP_AFTER_DAILY_PROFIT_PCT / 100.0)
-    loss_cap_usd = (
-        equity * (DAILY_LOSS_CAP_PCT / 100.0) if DAILY_LOSS_CAP_PCT > 0 else 0.0
-    )
-    if realized >= profit_stop_usd > 0:
-        reasons.append(
-            f"stop-after-profit hit ({realized:.2f} ≥ {profit_stop_usd:.2f})"
-        )
-    if loss_cap_usd > 0 and realized <= -abs(loss_cap_usd):
-        reasons.append(
-            f"daily loss cap hit ({realized:.2f} ≤ -{abs(loss_cap_usd):.2f})"
-        )
-
-    # daily spend vs cap
-    if redis:
-        budget_key = _key_daily("budget:sniper:spent_usd")
-        try:
-            spent_raw = await redis.get(budget_key)
-            spent_usd = float(spent_raw) if spent_raw else 0.0
-        except Exception:
-            spent_usd = 0.0
-        if spent_usd >= daily_spend_cap > 0:
-            reasons.append(
-                f"daily spend cap hit (spent {spent_usd:.2f} ≥ cap {daily_spend_cap:.2f})"
-            )
-
-    # SOL balance vs MIN_SOL_BALANCE
-    if strat_min_sol_balance > 0:
-        sol_balance = await _wallet_sol_balance()
-        if sol_balance < strat_min_sol_balance:
-            reasons.append(
-                f"SOL balance {sol_balance:.4f} < MIN_SOL_BALANCE {strat_min_sol_balance:.4f}"
-            )
-
-    # equity floor
-    if RISK_MIN_EQUITY_USD > 0.0 and equity < RISK_MIN_EQUITY_USD:
-        reasons.append(
-            f"equity_usd {equity:.2f} < RISK_MIN_EQUITY_USD {RISK_MIN_EQUITY_USD:.2f}"
-        )
-
-    # daily trades cap
-    if RISK_MAX_DAILY_TRADES > 0 and redis:
-        try:
-            trades_today = await _daily_trades(redis)
-        except Exception:
-            trades_today = 0
-        if trades_today >= RISK_MAX_DAILY_TRADES:
-            reasons.append(
-                f"daily trades cap hit ({trades_today} ≥ cap {RISK_MAX_DAILY_TRADES})"
-            )
-
-    # Trading window
-    trading_window_open, tw_reason = _trading_window_status()
-    if not trading_window_open:
-        reasons.append(f"trading window closed ({tw_reason})")
-
-    allowed = len(reasons) == 0
-
-    # Regime features for debug (including gate factor)
-    regime_feats = await regime_state.features()
-    regime_entry_gate_factor = float(
-        regime_feats.get(
-            "regime_entry_gate_factor",
-            regime_feats.get("gate_factor", regime_feats.get("regime_risk_multiplier", 1.0)),
-        )
-    )
-
-    return {
-        "allowed": bool(allowed),
-        "reasons_blocking": reasons,
-        "limits": limits,
-        "daily_realized_usd": float(realized),
-        "profit_stop_usd": float(profit_stop_usd),
-        "loss_cap_usd": float(loss_cap_usd),
-        "spent_usd": float(spent_usd),
-        "sol_balance": float(sol_balance),
-        "cooldown_active": bool(cooldown_active),
-        "manual_block": bool(manual_block),
-        "infra_halt": bool(infra_halt),
-        "hard_halt": bool(hard_halt),
-        "hard_risk_off": bool(hard_risk_off),
-        "plan_gap_pct": float(plan_gap_pct),
-        "plan_ahead_hard_stop": float(RISK_PLAN_AHEAD_HARD_STOP_PCT),
-        "trade_count_today": int(trades_today),
-        "trade_cap_today": int(RISK_MAX_DAILY_TRADES),
-        "equity_floor_usd": float(RISK_MIN_EQUITY_USD),
-        "sandbox_mode": bool(RISK_SANDBOX_MODE),
-        "risk_profile": profile_name,
-        "risk_profile_env": RISK_PROFILE,
-        "regime_entry_gate_factor": float(regime_entry_gate_factor),
-        "trading_window_open": bool(trading_window_open),
-        "trading_window_reason": tw_reason,
-        "risk_engine_version": RISK_ENGINE_VERSION,
-        # NEW: concurrency context
-        "open_positions": int(open_positions),
-        "max_concurrent": int(max_conc),
-        "positions_open_ge_max": bool(positions_open_ge_max),
-    }
-
-
-async def note_spend(redis, usd: float) -> None:
-    """
-    Increment daily spend; create the key with TTL to midnight if missing.
-    """
-    if redis is None:
-        redis = await _get_redis()
-    if not redis:
-        return
-    try:
-        budget_key = _key_daily("budget:sniper:spent_usd")
-        await redis.incrbyfloat(budget_key, float(usd))
-        await _set_expire_at_midnight(redis, budget_key)
-        try:
-            await log_event(
-                "risk_spend",
-                {"usd": float(usd), "sandbox_mode": RISK_SANDBOX_MODE},
-            )
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-
-async def risk_budget_summary(redis=None) -> Dict[str, Any]:
-    """
-    Lightweight risk budget summary for dashboards / diagnostics.
-
-    Returns:
-      {
-        "equity_usd": float,
-        "daily_spend_cap_usd": float,
-        "daily_spent_usd": float,
-        "daily_spend_remaining_usd": float,
-        "daily_spend_used_pct": float,
-        "sandbox_mode": bool,
-        "trading_window_open": bool,
-      }
-    """
-    if redis is None:
-        redis = await _get_redis()
-    limits = await current_limits(redis)
-    equity = float(limits["equity_usd"])
-    cap = float(limits["daily_spend_usd"])
-    spent = await _daily_spent_usd(redis)
-    remaining = max(0.0, cap - spent)
-    used_pct = (spent / cap) * 100.0 if cap > 0 else 0.0
-    trading_window_open, _tw_reason = _trading_window_status()
-    return {
-        "equity_usd": equity,
-        "daily_spend_cap_usd": cap,
-        "daily_spent_usd": spent,
-        "daily_spend_remaining_usd": remaining,
-        "daily_spend_used_pct": used_pct,
-        "sandbox_mode": bool(RISK_SANDBOX_MODE),
-        "trading_window_open": bool(trading_window_open),
-    }
-
-
-async def risk_snapshot(redis=None) -> Dict[str, Any]:
-    """
-    Diagnostic snapshot combining regime, limits and performance.
-
-    Useful for scripts/diagnostics.py, /healthcheck endpoints, dashboards, etc.
-    """
-    if redis is None:
-        redis = await _get_redis()
-    limits = await current_limits(redis)
-    realized = await _daily_realized_usd(redis)
-    winrate20, dd_fraction = await _metrics(redis)
-    regime_feats = await regime_state.features()
+    trades_today = await _daily_trades(redis)
+    entries_today = await _daily_entries(redis)
+    consec_losses = await _consecutive_losses(redis)
     equity_hwm = await _equity_hwm(redis)
 
-    # Strategy params for debugging / dashboards
     try:
         strat_params = await get_strategy_params(redis)
     except Exception:
         strat_params = {}
-    strat_max_risk = float(strat_params.get("MAX_RISK_PER_TRADE", RISK_MAX_PER_TRADE))
-    strat_min_sol_balance = float(strat_params.get("MIN_SOL_BALANCE", 0.0))
-    strat_mode = strat_params.get("STRAT_MODE")
     plan_equity_today = float(strat_params.get("PLAN_EQUITY_TODAY_USD", 0.0))
     plan_gap_pct = float(strat_params.get("PLAN_GAP_PCT", 0.0))
     plan_status = strat_params.get("PLAN_STATUS")
 
-    # Self-learning caps for visibility
-    strat_daily_spend_cap_pct = float(strat_params.get("DAILY_SPEND_CAP_PCT", 0.0))
-    strat_daily_spend_cap_usd = float(strat_params.get("DAILY_SPEND_CAP_USD", 0.0))
-    try:
-        strat_max_conc_override_raw = strat_params.get("MAX_CONCURRENT_OVERRIDE")
-        strat_max_conc_override: Optional[int] = (
-            int(strat_max_conc_override_raw)
-            if strat_max_conc_override_raw is not None
-            else None
-        )
-        if strat_max_conc_override is not None and strat_max_conc_override <= 0:
-            strat_max_conc_override = None
-    except Exception:
-        strat_max_conc_override = None
+    regime = regime_state.get()
+    regime_mult = float(regime_state.risk_multiplier())
+    regime_feats = await regime_state.features()
+    regime_vol = float(regime_feats.get("regime_volatility", 0.5))
+    regime_chop = float(regime_feats.get("regime_choppy_score", 0.0))
+    regime_label_numeric = float(regime_feats.get("regime_label_numeric", 0.0))
+    regime_stress_score = float(regime_feats.get("regime_stress_score", regime_vol))
+    regime_signal_strength = float(regime_feats.get("regime_signal_strength", regime_feats.get("regime_meme_heat", 0.5)))
+    regime_entry_gate_factor = float(regime_feats.get("regime_entry_gate_factor", regime_feats.get("gate_factor", regime_mult)))
 
-    # Active risk profile + override visibility
-    profile_name, _profile_cfg = await _effective_risk_profile(redis)
+    cap_raw = _risk_capacity_from_components(
+        winrate20=winrate,
+        rolling_dd=dd_frac,
+        realized_pnl_usd=realized,
+        equity_usd=equity,
+        regime_mult=regime_mult,
+        regime_volatility=regime_vol,
+        regime_choppy=regime_chop,
+    )
+
+    if plan_gap_pct != 0.0:
+        if plan_gap_pct > 0:
+            cap_raw = _clamp(cap_raw - min(abs(plan_gap_pct) / 100.0 * 0.3, 0.3), 0.0, 1.0)
+        else:
+            cap_raw = _clamp(cap_raw + min(abs(plan_gap_pct) / 100.0 * 0.2, 0.2), 0.0, 1.0)
+
+    ai_capacity_delta = 0.0
+    if _predict_capacity_adjustment is not None and not RISK_DISABLE_AI_OVERLAY:
+        with contextlib.suppress(Exception):
+            feats = {
+                "equity_usd": float(equity),
+                "winrate20": float(winrate),
+                "rolling_dd": float(dd_frac),
+                "realized_pnl_usd": float(realized),
+                "regime_mult": float(regime_mult),
+                "plan_gap_pct": float(plan_gap_pct),
+                "risk_profile": profile_name,
+            }
+            out = _predict_capacity_adjustment(feats)
+            out = await _maybe_await(out)
+            ai_capacity_delta = float(out or 0.0)
+
+    cap_raw = _clamp(cap_raw + ai_capacity_delta, 0.0, 1.0)
+    cap, risk_mode, override_mode, halt_reason = await _risk_mode_with_override(redis, cap_raw, rolling_dd=dd_frac)
+
+    kelly_raw = 0.0
+    kelly_pos_cap = 0.0
+    if RISK_KELLY_ENABLED:
+        kelly_raw, kelly_pos_cap = _kelly_pos_cap(winrate)
+
+    pnl_pct = 0.0 if equity <= 0 else (realized / equity) * 100.0
+    dd_pct = dd_frac * 100.0
+
+    cooldown_active = False
+    if redis:
+        with contextlib.suppress(Exception):
+            v = await redis.get(RISK_COOLDOWN_UNTIL_KEY)
+            if v is not None:
+                cooldown_active = float(v) > _now_ts()
+
+    tw_open, tw_reason = _trading_window_status()
+
+    # Hard halt keys (instant)
+    halted, halt_reason2 = await _is_halted_fast(redis)
+    if halted:
+        halt_reason = halt_reason or halt_reason2
+        risk_mode = 0
+        cap = 0.0
+
+    return {
+        "risk_capacity": float(cap),
+        "risk_mode": int(risk_mode),
+        "risk_mode_override": override_mode,
+        "winrate20": float(winrate),
+        "rolling_dd_frac": float(dd_frac),
+        "equity_usd": float(equity),
+        "equity_hwm_usd": float(equity_hwm),
+        "daily_realized_pnl_usd": float(realized),
+        "daily_realized_pnl_pct": float(pnl_pct),
+        "daily_drawdown_pct": float(dd_pct),
+        "regime_label": str(regime),
+        "regime_risk_multiplier": float(regime_mult),
+        "regime_label_numeric": float(regime_label_numeric),
+        "regime_stress_score": float(regime_stress_score),
+        "regime_signal_strength": float(regime_signal_strength),
+        "regime_entry_gate_factor": float(regime_entry_gate_factor),
+        "consecutive_losses": int(consec_losses),
+        "cooldown_active": bool(cooldown_active),
+        "plan_equity_today_usd": float(plan_equity_today),
+        "plan_gap_pct": float(plan_gap_pct),
+        "plan_status": plan_status,
+        "ai_capacity_delta": float(ai_capacity_delta),
+        "halt_reason": halt_reason,
+        "daily_trades_count": int(trades_today),
+        "daily_trades_cap": int(RISK_MAX_DAILY_TRADES),
+        "daily_entries_count": int(entries_today),
+        "daily_entries_cap": int(RISK_MAX_DAILY_ENTRIES),
+        "sandbox_mode": bool(RISK_SANDBOX_MODE),
+        "kelly_raw": float(kelly_raw),
+        "kelly_pos_pct_cap": float(kelly_pos_cap),
+        "equity_override_usd": float(RISK_EQUITY_OVERRIDE_USD),
+        "risk_profile": profile_name,
+        "risk_profile_env": RISK_PROFILE,
+        "risk_profile_override": profile_override,
+        "risk_engine_version": RISK_ENGINE_VERSION,
+        "trading_window_open": bool(tw_open),
+        "trading_window_reason": str(tw_reason),
+        "ctx_digest": await _read_ctx_digest(redis),
+        "halted_fast": bool(halted),
+        "halt_reason_fast": halt_reason2,
+    }
+
+
+async def risk_capacity_score(redis=None) -> float:
+    snap = await risk_capacity_snapshot(redis)
+    return float(snap.get("risk_capacity", 0.0))
+
+
+async def risk_budget_summary(redis=None) -> Dict[str, Any]:
+    if redis is None:
+        redis = await _get_redis()
+    limits = await current_limits(redis)
+    cap = float(limits.get("daily_spend_usd", 0.0))
+    spent = await _daily_spent_usd(redis)
+    remaining = max(0.0, cap - spent)
+    used_pct = (spent / cap) * 100.0 if cap > 0 else 0.0
+    tw_open, _ = _trading_window_status()
+    return {
+        "equity_usd": float(limits.get("equity_usd", 0.0)),
+        "daily_spend_cap_usd": cap,
+        "daily_spent_usd": float(spent),
+        "daily_spend_remaining_usd": float(remaining),
+        "daily_spend_used_pct": float(used_pct),
+        "sandbox_mode": bool(RISK_SANDBOX_MODE),
+        "trading_window_open": bool(tw_open),
+        "ctx_digest": await _read_ctx_digest(redis),
+    }
+
+
+async def risk_snapshot(redis=None) -> Dict[str, Any]:
+    if redis is None:
+        redis = await _get_redis()
+
+    limits = await current_limits(redis)
+    realized = await _daily_realized_usd(redis)
+    winrate20, dd_frac = await _metrics(redis)
+    regime_feats = await regime_state.features()
+    equity_hwm = await _equity_hwm(redis)
+
+    try:
+        strat_params = await get_strategy_params(redis)
+    except Exception:
+        strat_params = {}
+    plan_equity_today = float(strat_params.get("PLAN_EQUITY_TODAY_USD", 0.0))
+    plan_gap_pct = float(strat_params.get("PLAN_GAP_PCT", 0.0))
+    plan_status = strat_params.get("PLAN_STATUS")
+
+    profile_name, _ = await _effective_risk_profile(redis)
     profile_override: Optional[str] = None
     if redis:
-        try:
+        with contextlib.suppress(Exception):
             v = await redis.get(RISK_PROFILE_OVERRIDE_KEY)
             if v:
-                profile_override = str(v).strip().lower()
-        except Exception:
-            profile_override = None
+                profile_override = _s(v).strip().lower()
 
-    # Pull AI capacity delta / cooldown / manual block from redis
-    ai_capacity_delta = float(limits.get("ai_capacity_delta", 0.0))
     cooldown_remaining = 0.0
     manual_block = False
     spent_usd = 0.0
-    halt_reason = limits.get("halt_reason")
     trades_today = 0
-    kelly_raw = float(limits.get("kelly_raw", 0.0))
-    kelly_pos_pct_cap = float(limits.get("kelly_pos_pct_cap", 0.0))
-    equity_utilization_pct = float(limits.get("equity_utilization_pct", 0.0))
+    entries_today = 0
+    halt_reason = limits.get("halt_reason")
     if redis:
-        try:
+        with contextlib.suppress(Exception):
             if halt_reason is None:
-                saved_reason = await redis.get(RISK_HALT_REASON_KEY)
-                if saved_reason:
-                    halt_reason = saved_reason
-            manual_block = str(await redis.get(RISK_MANUAL_BLOCK_KEY) or "").strip() == "1"
-            val = await redis.get(RISK_COOLDOWN_UNTIL_KEY)
-            if val is not None:
-                ts = float(val)
+                saved = await redis.get(RISK_HALT_REASON_KEY)
+                if saved:
+                    halt_reason = saved
+            manual_block = (_s(await redis.get(RISK_MANUAL_BLOCK_KEY) or "").strip() == "1")
+            v = await redis.get(RISK_COOLDOWN_UNTIL_KEY)
+            if v is not None:
+                ts = float(v)
                 if ts > _now_ts():
                     cooldown_remaining = ts - _now_ts()
             spent_usd = await _daily_spent_usd(redis)
             trades_today = await _daily_trades(redis)
-        except Exception:
-            cooldown_remaining = 0.0
-            spent_usd = 0.0
-            trades_today = 0
+            entries_today = await _daily_entries(redis)
 
-    cap_spend = float(limits["daily_spend_usd"])
-    spend_remaining = max(0.0, cap_spend - spent_usd)
-    spend_used_pct = (spent_usd / cap_spend) * 100.0 if cap_spend > 0 else 0.0
+    cap_spend = float(limits.get("daily_spend_usd", 0.0))
+    spend_remaining = max(0.0, cap_spend - float(spent_usd))
+    spend_used_pct = ((float(spent_usd) / cap_spend) * 100.0) if cap_spend > 0 else 0.0
 
-    # Regime entry gate factor (same as risk_capacity_snapshot)
     regime_entry_gate_factor = float(
         regime_feats.get(
             "regime_entry_gate_factor",
             regime_feats.get("gate_factor", regime_feats.get("regime_risk_multiplier", 1.0)),
         )
     )
+    tw_open, tw_reason = _trading_window_status()
 
-    trading_window_open, tw_reason = _trading_window_status()
+    halted, halt_reason2 = await _is_halted_fast(redis)
 
-    snap: Dict[str, Any] = {
-        "equity_usd": limits["equity_usd"],
-        "equity_hwm_usd": equity_hwm,
-        "ticket_usd": limits["ticket_usd"],
-        "pos_pct_cap": limits["pos_pct_cap"],
-        "max_concurrent": limits["max_concurrent"],
-        "daily_spend_usd": limits["daily_spend_usd"],
-        "daily_spent_usd": spent_usd,
-        "daily_spend_remaining_usd": spend_remaining,
-        "daily_spend_used_pct": spend_used_pct,
-        "daily_realized_pnl_usd": realized,
-        "winrate20": winrate20,
-        "rolling_dd_pct": dd_fraction,
-        "regime_label": limits["regime"],
-        "regime_risk_mode": regime_feats.get("regime_risk_mode", 1.0),
-        "regime_risk_multiplier": regime_feats.get("regime_risk_multiplier", 1.0),
-        "regime_trend": regime_feats.get("regime_trend", 0.0),
-        "regime_volatility": regime_feats.get("regime_volatility", 0.0),
-        "regime_liquidity": regime_feats.get("regime_liquidity", 0.5),
-        "regime_manipulation_risk": regime_feats.get("regime_manipulation_risk", 0.0),
-        "regime_choppy_score": regime_feats.get("regime_choppy_score", 0.0),
-        "regime_confidence": regime_feats.get("regime_confidence", 0.5),
-        "regime_meme_heat": regime_feats.get("regime_meme_heat", 0.5),
-        "regime_entry_gate_factor": regime_entry_gate_factor,
-        "risk_capacity": limits.get("risk_capacity", 1.0),
-        "risk_mode": limits.get("risk_mode", 1),
+    return {
+        "equity_usd": float(limits.get("equity_usd", 0.0)),
+        "equity_hwm_usd": float(equity_hwm),
+        "ticket_usd": float(limits.get("ticket_usd", 0.0)),
+        "pos_pct_cap": float(limits.get("pos_pct_cap", 0.0)),
+        "max_concurrent": int(limits.get("max_concurrent", 0)),
+        "daily_spend_usd": float(limits.get("daily_spend_usd", 0.0)),
+        "daily_spent_usd": float(spent_usd),
+        "daily_spend_remaining_usd": float(spend_remaining),
+        "daily_spend_used_pct": float(spend_used_pct),
+        "daily_realized_pnl_usd": float(realized),
+        "winrate20": float(winrate20),
+        "rolling_dd_frac": float(dd_frac),
+        "regime_label": str(limits.get("regime", "")),
+        "regime_features": regime_feats,
+        "regime_entry_gate_factor": float(regime_entry_gate_factor),
+        "risk_capacity": float(limits.get("risk_capacity", 1.0)),
+        "risk_mode": int(limits.get("risk_mode", 1)),
         "risk_mode_override": limits.get("risk_mode_override"),
-        "risk_profile": profile_name,            # ACTIVE
-        "risk_profile_env": RISK_PROFILE,        # ENV default
+        "risk_profile": profile_name,
+        "risk_profile_env": RISK_PROFILE,
         "risk_profile_override": profile_override,
-        "ai_capacity_delta": ai_capacity_delta,
-        "strat_max_risk_per_trade": strat_max_risk,
-        "strat_min_sol_balance": strat_min_sol_balance,
-        "strat_mode": strat_mode,
-        "plan_equity_today_usd": plan_equity_today,
-        "plan_gap_pct": plan_gap_pct,
+        "ai_capacity_delta": float(limits.get("ai_capacity_delta", 0.0)),
+        "plan_equity_today_usd": float(plan_equity_today),
+        "plan_gap_pct": float(plan_gap_pct),
         "plan_status": plan_status,
-        "manual_block": manual_block,
-        "cooldown_remaining_sec": cooldown_remaining,
-        "halt_reason": halt_reason,
-        "plan_ahead_hard_stop_pct": RISK_PLAN_AHEAD_HARD_STOP_PCT,
-        "dd_cooldown_floor_pct": RISK_DD_COOLDOWN_FLOOR_PCT,
-        "dd_cooldown_minutes": RISK_DD_COOLDOWN_MINUTES,
-        "strat_daily_spend_cap_pct": strat_daily_spend_cap_pct,
-        "strat_daily_spend_cap_usd": strat_daily_spend_cap_usd,
-        "strat_max_concurrent_override": strat_max_conc_override,
-        "daily_trades_cap": RISK_MAX_DAILY_TRADES,
-        "daily_trades_count": trades_today,
-        "equity_floor_usd": RISK_MIN_EQUITY_USD,
+        "manual_block": bool(manual_block),
+        "cooldown_remaining_sec": float(cooldown_remaining),
+        "halt_reason": _s(halt_reason),
+        "halted_fast": bool(halted),
+        "halt_reason_fast": halt_reason2,
+        "daily_trades_cap": int(RISK_MAX_DAILY_TRADES),
+        "daily_trades_count": int(trades_today),
+        "daily_entries_cap": int(RISK_MAX_DAILY_ENTRIES),
+        "daily_entries_count": int(entries_today),
         "sandbox_mode": bool(RISK_SANDBOX_MODE),
-        "kelly_raw": kelly_raw,
-        "kelly_pos_pct_cap": kelly_pos_pct_cap,
-        "equity_override_usd": RISK_EQUITY_OVERRIDE_USD,
-        "equity_utilization_pct": equity_utilization_pct,
+        "kelly_raw": float(limits.get("kelly_raw", 0.0)),
+        "kelly_pos_pct_cap": float(limits.get("kelly_pos_pct_cap", 0.0)),
+        "equity_override_usd": float(RISK_EQUITY_OVERRIDE_USD),
+        "equity_utilization_pct": float(limits.get("equity_utilization_pct", 0.0)),
+        "open_exposure_usd": float(limits.get("open_exposure_usd", 0.0)),
+        "max_exposure_usd": float(limits.get("max_exposure_usd", 0.0)),
         "risk_engine_version": RISK_ENGINE_VERSION,
-        "trading_window_open": bool(trading_window_open),
-        "trading_window_reason": tw_reason,
-    }
-    return snap
-
-
-# ============================================================================ #
-# Sell-side logic (per-position legacy guardrail — ADVISORY ONLY)
-# ============================================================================ #
-
-def _position_age_minutes(position: Dict[str, Any], now: Optional[datetime] = None) -> float:
-    """
-    Best-effort position age in minutes, given heterogeneous timestamp formats.
-    """
-    if now is None:
-        now = datetime.now(timezone.utc)
-
-    ts_raw = (
-        position.get("opened_at")
-        or position.get("open_time")
-        or position.get("timestamp")
-        or position.get("ts")
-    )
-    if ts_raw is None:
-        return 0.0
-
-    dt: Optional[datetime] = None
-    try:
-        if isinstance(ts_raw, (int, float)):
-            dt = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
-        elif isinstance(ts_raw, str):
-            # try ISO, else numeric
-            try:
-                dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-            except Exception:
-                dt = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
-    except Exception:
-        dt = None
-
-    if dt is None:
-        return 0.0
-
-    return max(0.0, (now - dt).total_seconds() / 60.0)
-
-
-async def _position_pnl(
-    position: Dict[str, Any],
-    *,
-    px_usd: Optional[float] = None,
-) -> Tuple[float, float, float]:
-    """
-    Best-effort (value_now_usd, entry_usd, pnl_pct).
-
-    Uses:
-      - amount * get_token_price
-      - entry_value_usd / notional_usd / initial_notional_usd, or
-      - amount * entry_price_usd, or
-      - falls back to "flat" (pnl=0) if we can't infer.
-    """
-    mint = (
-        position.get("mint")
-        or position.get("token_address")
-        or position.get("token")
-        or position.get("address")
-    )
-    amount = float(position.get("amount") or position.get("size") or 0.0)
-    if not mint or amount <= 0:
-        return 0.0, 0.0, 0.0
-
-    if px_usd is None:
-        try:
-            px_usd = await get_token_price(mint)
-        except Exception:
-            px_usd = 0.0
-    if px_usd is None or px_usd <= 0:
-        return 0.0, 0.0, 0.0
-
-    value_now = amount * float(px_usd)
-
-    entry_usd = float(
-        position.get("entry_value_usd")
-        or position.get("notional_usd")
-        or position.get("initial_notional_usd")
-        or 0.0
-    )
-    if entry_usd <= 0:
-        # attempt to infer from entry_price_usd
-        entry_px = float(
-            position.get("entry_price_usd")
-            or position.get("entry_price")
-            or position.get("entry")
-            or 0.0
-        )
-        if entry_px > 0:
-            entry_usd = entry_px * amount
-
-    if entry_usd <= 0:
-        # Can't estimate – treat as flat to avoid bogus signals
-        return value_now, value_now, 0.0
-
-    pnl_usd = value_now - entry_usd
-    pnl_pct = (pnl_usd / entry_usd) * 100.0 if entry_usd > 0 else 0.0
-    return value_now, entry_usd, pnl_pct
-
-
-async def handle_position(
-    position: Dict[str, Any],
-    *,
-    redis=None,
-    now: Optional[datetime] = None,
-) -> Optional[Dict[str, Any]]:
-    """
-    Legacy per-position guardrail (ADVISORY ONLY in V3+++).
-
-    What it does:
-      - Computes PnL% and age for the position.
-      - Evaluates simple thresholds:
-            • hard stop-loss (DEFAULT_STOP_LOSS_PERCENT)
-            • target profit (DEFAULT_TARGET_PROFIT_PERCENT)
-            • max hold (DEFAULT_MAX_HOLD_MINUTES)
-      - If a trigger hits, sends a Telegram alert + structured log_event.
-
-    What it does *NOT* do:
-      - It does NOT execute a sell or mutate positions.
-      - It does NOT call Jupiter directly.
-
-    Actual sells should be driven by:
-      - ai_sell_logic / exit_engine
-      - or your own higher-level exit engine.
-
-    Return:
-      - dict with advisory info if a guardrail fired, else None.
-    """
-    if not RISK_LEGACY_SELL_ENABLED:
-        return None
-
-    if now is None:
-        now = datetime.now(timezone.utc)
-
-    mint = (
-        position.get("mint")
-        or position.get("token_address")
-        or position.get("token")
-        or position.get("address")
-    )
-    if not mint:
-        return None
-
-    symbol = (
-        position.get("symbol")
-        or position.get("sym")
-        or str(mint)[:6]
-    )
-
-    # Config (allow per-position overrides)
-    sl_pct = float(
-        position.get("stop_loss_pct")
-        or position.get("sl_pct")
-        or DEFAULT_STOP_LOSS_PERCENT
-    )
-    tp_pct = float(
-        position.get("take_profit_pct")
-        or position.get("tp_pct")
-        or DEFAULT_TARGET_PROFIT_PERCENT
-    )
-    max_hold_min = int(
-        position.get("max_hold_minutes")
-        or position.get("max_hold_min")
-        or DEFAULT_MAX_HOLD_MINUTES
-    )
-
-    # Compute age & pnl
-    age_min = _position_age_minutes(position, now)
-    px_usd = None
-    try:
-        px_usd = await get_token_price(mint)
-    except Exception:
-        px_usd = None
-
-    value_now, entry_usd, pnl_pct = await _position_pnl(position, px_usd=px_usd)
-
-    if entry_usd <= 0 or value_now <= 0:
-        # Not enough info to make a meaningful guardrail call
-        return None
-
-    # Decide if any guardrail should *advise* an exit
-    reason: Optional[str] = None
-    # Priority: deep loss > big win > max-hold
-    if sl_pct > 0 and pnl_pct <= -abs(sl_pct):
-        reason = f"stop_loss_{sl_pct:.1f}%"
-    elif tp_pct > 0 and pnl_pct >= tp_pct:
-        reason = f"target_profit_{tp_pct:.1f}%"
-    elif max_hold_min > 0 and age_min >= max_hold_min:
-        reason = f"max_hold_{max_hold_min}min"
-
-    if reason is None:
-        return None
-
-    # Cooldown to avoid spammy alerts
-    if not _alert_ok(mint):
-        return None
-
-    advisory = {
-        "mint": mint,
-        "symbol": symbol,
-        "reason": reason,
-        "age_min": float(age_min),
-        "pnl_pct": float(pnl_pct),
-        "value_now_usd": float(value_now),
-        "entry_usd": float(entry_usd),
-        "ts": now.isoformat(),
+        "trading_window_open": bool(tw_open),
+        "trading_window_reason": str(tw_reason),
+        "ctx_digest": await _read_ctx_digest(redis),
     }
 
-    # Telegram + structured log
-    try:
-        msg = (
-            "⚠️ *LEGACY GUARDRAIL ADVISORY*\n"
-            f"• {symbol} ({mint[:6]}…)\n"
-            f"• reason: `{reason}`\n"
-            f"• pnl: {pnl_pct:.2f}%  (now ${value_now:.2f}, entry ${entry_usd:.2f})\n"
-            f"• age: {age_min:.1f} min\n"
-            "_Note: advisory only — actual exit via ai_sell_logic / exit_engine._"
-        )
-        await send_telegram(msg)
-    except Exception:
-        pass
 
-    try:
-        await log_event(
-            "legacy_guardrail_advisory",
-            {
-                "mint": mint,
-                "symbol": symbol,
-                "reason": reason,
-                "age_min": age_min,
-                "pnl_pct": pnl_pct,
-                "value_now_usd": value_now,
-                "entry_usd": entry_usd,
-                "sandbox_mode": RISK_SANDBOX_MODE,
-            },
-        )
-    except Exception:
-        pass
-
-    return advisory
+async def risk_health(redis=None) -> Dict[str, Any]:
+    if redis is None:
+        redis = await _get_redis()
+    snapshot = await risk_snapshot(redis)
+    gate = await entry_gate_debug(redis=redis)
+    capacity = await risk_capacity_snapshot(redis)
+    ok = bool(gate.get("allowed", True))
+    return {"ok": ok, "ts": datetime.now(timezone.utc).isoformat(), "snapshot": snapshot, "entry_gate": gate, "capacity": capacity}
 
 
-# ============================================================================ #
+async def reinvestor_risk_view(redis=None) -> Dict[str, Any]:
+    """
+    Lightweight reinvestor-focused view:
+      - budget_utilization_pct (0..100)
+      - scale_hint (0..~2) recommended multiplicative aggressiveness
+    """
+    if redis is None:
+        redis = await _get_redis()
+    limits = await current_limits(redis)
+    budget = await risk_budget_summary(redis)
+    cap_snap = await risk_capacity_snapshot(redis)
+
+    equity_usd = float(limits.get("equity_usd", 0.0))
+    ticket_usd = float(limits.get("ticket_usd", 0.0))
+
+    risk_capacity = float(cap_snap.get("risk_capacity", limits.get("risk_capacity", 1.0)))
+    risk_mode = int(cap_snap.get("risk_mode", limits.get("risk_mode", 1)))
+
+    daily_cap = float(budget.get("daily_spend_cap_usd", limits.get("daily_spend_usd", 0.0)))
+    daily_spent = float(budget.get("daily_spent_usd", 0.0))
+    daily_remaining = float(budget.get("daily_spend_remaining_usd", 0.0))
+    tw_open = bool(budget.get("trading_window_open", cap_snap.get("trading_window_open", True)))
+
+    budget_utilization_pct = ((daily_spent / daily_cap) * 100.0) if daily_cap > 0 else 0.0
+
+    scale_hint = float(risk_capacity)
+    if not tw_open or risk_mode == 0:
+        scale_hint = 0.0
+    elif risk_mode == 3:
+        scale_hint = min(scale_hint, 0.75)
+    elif risk_mode == 2:
+        scale_hint = min(max(scale_hint * 1.5, 0.8), 2.0)
+    else:
+        scale_hint = min(max(scale_hint * 1.1, 0.5), 1.25)
+
+    return {
+        "equity_usd": equity_usd,
+        "ticket_usd": ticket_usd,
+        "risk_capacity": risk_capacity,
+        "risk_mode": risk_mode,
+        "sandbox_mode": bool(RISK_SANDBOX_MODE),
+        "daily_spend_cap_usd": daily_cap,
+        "daily_spent_usd": daily_spent,
+        "daily_spend_remaining_usd": daily_remaining,
+        "budget_utilization_pct": float(budget_utilization_pct),
+        "trading_window_open": bool(tw_open),
+        "scale_hint": float(scale_hint),
+        "ctx_digest": await _read_ctx_digest(redis),
+        "risk_engine_version": RISK_ENGINE_VERSION,
+    }
+
+
+# =============================================================================
 # Loops
-# ============================================================================ #
-
-async def monitor_positions_loop(
-    *,
-    redis=None,
-    stop_evt: Optional[asyncio.Event] = None,
-    interval_sec: Optional[int] = None,
-) -> None:
+# =============================================================================
+async def monitor_positions_loop(*, redis=None, stop_evt: Optional[asyncio.Event] = None, interval_sec: Optional[int] = None) -> None:
     """
-    Background loop that monitors open positions and runs the legacy guardrail.
-
-    In V3+++:
-      - This loop is *optional* and only emits advisory alerts via Telegram / 
-        data_logger when RISK_LEGACY_SELL_ENABLED=1.
-      - It does NOT execute sells. ai_sell_logic / exit_engine are the primary
-        exit engines.
-
-    Recommended:
-      - Enable when you want an extra "seatbelt" of alerts if a position is
-        sitting in a big loss for too long, etc.
-      - Disable via RISK_LEGACY_SELL_ENABLED=0 if all exits are 100% AI-based.
+    Kept for backwards compatibility; exits should be driven by ai_sell_logic/exit_engine.
     """
     if interval_sec is None:
         interval_sec = POSITION_CHECK_INTERVAL
-
     if redis is None:
         redis = await _get_redis()
-
-    if not RISK_LEGACY_SELL_ENABLED:
-        logger.info("[RISK] monitor_positions_loop: RISK_LEGACY_SELL_ENABLED=0 → no-op")
-        # Keep loop alive but don't do per-position scans
-        while not (stop_evt and stop_evt.is_set()):
-            await asyncio.sleep(interval_sec)
-        return
-
-    logger.info("[RISK] monitor_positions_loop started (interval=%ss)", interval_sec)
-
     while not (stop_evt and stop_evt.is_set()):
-
-        try:
-            positions = load_positions()
-        except Exception as e:
-            logger.warning("[RISK] monitor_positions_loop: load_positions failed: %s", e)
-            positions = []
-
-        now = datetime.now(timezone.utc)
-
-        for pos in positions or []:
-            try:
-                await handle_position(pos, redis=redis, now=now)
-            except Exception as e:
-                logger.warning(
-                    "[RISK] monitor_positions_loop: handle_position failed: %s", e
-                )
-
-        await asyncio.sleep(interval_sec)
-
-    logger.info("[RISK] monitor_positions_loop stopped")
+        await asyncio.sleep(max(1, int(interval_sec)))
 
 
 async def risk_manager_loop(stop_evt: asyncio.Event) -> None:
-    """
-    Master risk loop.
-
-    Responsibilities:
-      - Periodically recompute `current_limits()` to keep risk:ctx fresh for
-        scanners / AI modules / dashboards.
-      - Optionally run `monitor_positions_loop` in the background for legacy
-        per-position guardrail advisories.
-    """
+    """Periodically refresh current_limits() so risk:ctx stays hot for scanners/AI."""
     redis = await _get_redis()
     interval = max(1, int(RISK_MANAGER_LOOP_INTERVAL))
-
-    monitor_task: Optional[asyncio.Task] = None
-    if RISK_LEGACY_SELL_ENABLED:
-        monitor_task = asyncio.create_task(
-            monitor_positions_loop(redis=redis, stop_evt=stop_evt)
-        )
-
-    logger.info("[RISK] risk_manager_loop started (interval=%ss)", interval)
-
     try:
         while not stop_evt.is_set():
-            try:
+            with contextlib.suppress(Exception):
                 await current_limits(redis)
-            except Exception as e:
-                logger.warning("[RISK] risk_manager_loop: current_limits failed: %s", e)
             await asyncio.sleep(interval)
     finally:
-        logger.info("[RISK] risk_manager_loop stopping")
-        if monitor_task:
-            monitor_task.cancel()
-            with contextlib.suppress(Exception):
-                await monitor_task
-        logger.info("[RISK] risk_manager_loop stopped")
+        return
 
 
-# ============================================================================ #
-# Ops helpers (for dashboards / scripts)
-# ============================================================================ #
-
-async def set_manual_block(on: bool = True, redis=None) -> None:
+# =============================================================================
+# Ops helpers
+# =============================================================================
+async def set_manual_block(on: bool = True, redis=None, reason: str = "manual_block") -> None:
     """
-    Turn the manual block on/off (risk:manual_block).
-
-    When ON (1), should_allow_new_entry() will hard-block new entries.
+    Operator manual block.
+    NOTE: This is distinct from risk:halt, but both block entries immediately.
     """
     if redis is None:
         redis = await _get_redis()
@@ -3413,28 +2728,20 @@ async def set_manual_block(on: bool = True, redis=None) -> None:
     try:
         if on:
             await redis.set(RISK_MANUAL_BLOCK_KEY, "1")
+            await redis.set(RISK_HALT_REASON_KEY, str(reason)[:300])
         else:
             await redis.delete(RISK_MANUAL_BLOCK_KEY)
-        await log_event(
-            "risk_manual_block",
-            {"on": bool(on)},
-        )
+        await log_event("risk_manual_block", {"on": bool(on), "reason": reason})
+        invalidate_limits_cache()
     except Exception:
         pass
 
 
 async def clear_manual_block(redis=None) -> None:
-    """
-    Convenience wrapper: clear manual block.
-    """
-    await set_manual_block(on=False, redis=redis)
+    await set_manual_block(on=False, redis=redis, reason="clear_manual_block")
 
 
 async def clear_risk_cooldown(redis=None) -> None:
-    """
-    Clear any active loss/DD-based cooldown so entries are immediately allowed
-    (subject to other gates).
-    """
     if redis is None:
         redis = await _get_redis()
     if not redis:
@@ -3442,18 +2749,12 @@ async def clear_risk_cooldown(redis=None) -> None:
     try:
         await redis.delete(RISK_COOLDOWN_UNTIL_KEY)
         await log_event("risk_cooldown_cleared", {})
+        invalidate_limits_cache()
     except Exception:
         pass
 
 
 async def force_risk_mode(mode: int | None, redis=None) -> None:
-    """
-    Force risk_mode via OVERRIDE_MODE_KEY.
-
-      mode ∈ {0,1,2,3} or None to clear.
-
-    0 = OFF, 1 = NORMAL, 2 = AGGRESSIVE, 3 = DEFENSIVE
-    """
     if redis is None:
         redis = await _get_redis()
     if not redis:
@@ -3463,20 +2764,13 @@ async def force_risk_mode(mode: int | None, redis=None) -> None:
             await redis.delete(OVERRIDE_MODE_KEY)
         else:
             await redis.set(OVERRIDE_MODE_KEY, str(int(mode)))
-        await log_event(
-            "risk_mode_override",
-            {"mode": mode},
-        )
+        await log_event("risk_mode_override", {"mode": mode})
+        invalidate_limits_cache()
     except Exception:
         pass
 
 
 async def set_risk_profile_override(profile: str | None, redis=None) -> None:
-    """
-    Override RISK_PROFILE at runtime via redis, or clear override.
-
-      profile ∈ {'conservative','balanced','aggressive','auto'} or None.
-    """
     if redis is None:
         redis = await _get_redis()
     if not redis:
@@ -3486,63 +2780,19 @@ async def set_risk_profile_override(profile: str | None, redis=None) -> None:
             await redis.delete(RISK_PROFILE_OVERRIDE_KEY)
         else:
             await redis.set(RISK_PROFILE_OVERRIDE_KEY, str(profile).strip().lower())
-        await log_event(
-            "risk_profile_override",
-            {"profile": profile},
-        )
+        await log_event("risk_profile_override", {"profile": profile})
+        invalidate_limits_cache()
     except Exception:
         pass
 
 
-# ============================================================================ #
-# Aggregate health helper (NEW)
-# ============================================================================ #
-
-async def risk_health(redis=None) -> Dict[str, Any]:
-    """
-    Aggregate "health" helper combining:
-
-      - risk_snapshot()        → limits, performance, regime, caps
-      - entry_gate_debug()     → whether entries are allowed + reasons
-      - risk_capacity_snapshot() → compressed capacity model details
-
-    Useful for:
-      - dashboards
-      - /healthcheck endpoints
-      - quick diagnostics scripts
-    """
-    if redis is None:
-        redis = await _get_redis()
-
-    snapshot = await risk_snapshot(redis)
-    gate = await entry_gate_debug(redis)
-    capacity = await risk_capacity_snapshot(redis)
-
-    ok = bool(gate.get("allowed", True))
-
-    return {
-        "ok": ok,
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "snapshot": snapshot,
-        "entry_gate": gate,
-        "capacity": capacity,
-    }
-
-
-# ============================================================================ #
-# CLI / manual run
-# ============================================================================ #
-
+# =============================================================================
+# CLI
+# =============================================================================
 if __name__ == "__main__":
     async def _main() -> None:
-        """
-        Simple CLI debug: print aggregate risk health as JSON.
-
-        Usage:
-          python -m utils_pkg.risk_manager
-        """
-        redis = await _get_redis()
-        health = await risk_health(redis)
+        r = await _get_redis()
+        health = await risk_health(r)
         print(json.dumps(health, indent=2, default=str))
 
     asyncio.run(_main())

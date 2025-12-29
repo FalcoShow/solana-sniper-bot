@@ -3,178 +3,304 @@
 from __future__ import annotations
 
 """
-Scoring Service (V3+++ / quant-grade)
-=====================================
+Scoring Service — God-Tier V3+++ / quant-grade (Phase 0–7)
+==========================================================
 
-Single, unified scoring entrypoint used by scanners / traders / radar:
+Single unified scoring + trade-gate entrypoint for *all* scanners/traders:
 
-    from utils_pkg.scoring_service import ScoredToken, score_candidate
+    from utils_pkg.scoring_service import ScoredToken, score_candidate, score_many
 
-    scored = await score_candidate(raw_pool)
-    print(scored.combined_score, scored.label, scored.reasons)
+Why this exists
+---------------
+- One stable API across Raydium / Pump.fun / Dexscreener / radar feeds.
+- Defensive: never hard-fails when optional modules are missing or signatures differ.
+- Quant-ish: component scores 0..100 + combined score 0..100 + label.
+- Actionable: reasons + gate result + sizing hint (if present in features).
+- Fast: optional in-memory TTL cache (and max-size eviction).
 
-High-level workflow
--------------------
-1. Normalize raw pool meta (mint, symbol, liq, age, etc.).
-2. Build a feature dict (FeatureBuilder) if available.
-3. Ask AI entry logic / AI risk model (if present) for scores.
-4. Fall back to deterministic heuristics when AI not available.
-5. Combine into:
-      - momentum_score (0..100)
-      - risk_score     (0..100; higher = riskier)
-      - quality_score  (0..100)
-      - combined_score (0..100; higher = better)
-6. Derive a GREEN / YELLOW / RED label + human-readable reasons.
+Soft integrations (best-effort, lazy to avoid cycles)
+-----------------------------------------------------
+- utils_pkg.feature_builder         (canonical feature vector, entry_quality/entry_risk)
+- utils_pkg.ai_entry_logic          (AI entry score / routing)
+- utils_pkg.ai_risk_model           (AI risk score)
+- utils_pkg.ai_buy_scoring          (hard gate + optional score)
+- utils_pkg.regime                  (optional context; tighten in risk-off/manip)
 
-This module is *intentionally* defensive:
-- If any optional dependency is missing or has a different function
-  signature, we gracefully fall back without crashing (and log why).
+Contract
+--------
+- score_candidate(raw_pool: dict, context: dict|None) -> ScoredToken
+- raw_pool can be any scanner dict; we normalize it broadly.
+- context is optional, can include:
+    {
+      "regime": RegimeState | dict,
+      "risk_context": dict,
+      "wallet_signals": dict,
+      "ai_signals": dict,
+      "history": list[dict],
+      "scanner_source": "raydium"|"dexscreener"|"pumpfun"|"momo"|...
+    }
 
-Environment tuning knobs
-------------------------
-All are optional; sensible defaults are provided.
-
-  SCORING_MIN_LIQ_USD            (default: 3_000)
-  SCORING_MAX_AGE_MIN            (default: 720)
-  SCORING_HIGH_SCORE_THRESHOLD   (default: 80)
-  SCORING_MEDIUM_SCORE_THRESHOLD (default: 60)
-  SCORING_MIN_MOMO_GREEN         (default: 70)
-  SCORING_MAX_RISK_GREEN         (default: 70)
-  SCORING_MIN_QUALITY_GREEN      (default: 60)
-
-Weights for combined_score:
-
-  SCORING_W_AI       (default: 0.35)
-  SCORING_W_MOMENTUM (default: 0.35)
-  SCORING_W_QUALITY  (default: 0.20)
-  SCORING_W_RISK     (default: 0.10)
-
-Notes
------
-- combined_score is "higher is better" (we invert risk internally).
-- risk_score is "higher is more dangerous" (0 = risk-free, 100 = max risk).
+No network / DB calls here.
 """
 
+import asyncio
+import contextlib
+import inspect
 import math
 import os
 import time
-import inspect
+from collections import OrderedDict
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from logging_setup import get_logger
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Optional imports (feature builder / AI logic / risk)
+# Logging (robust)
 # ──────────────────────────────────────────────────────────────────────────────
-
 try:
-    from utils_pkg import feature_builder as FB  # type: ignore
-except Exception:  # pragma: no cover - optional
-    FB = None  # type: ignore
+    from logging_setup import get_logger  # type: ignore
 
-try:
-    from utils_pkg import ai_entry_logic as AEL  # type: ignore
-except Exception:  # pragma: no cover - optional
-    AEL = None  # type: ignore
+    try:
+        log = get_logger(__name__)  # type: ignore[arg-type]
+    except TypeError:
+        log = get_logger()  # type: ignore[misc]
+except Exception:  # pragma: no cover
+    import logging
 
-try:
-    from utils_pkg import ai_risk_model as ARM  # type: ignore
-except Exception:  # pragma: no cover - optional
-    ARM = None  # type: ignore
+    log = logging.getLogger("utils_pkg.scoring_service")
+    if not log.handlers:
+        logging.basicConfig(level=logging.INFO)
 
-try:
-    from utils_pkg import ai_buy_scoring as ABS  # type: ignore
-except Exception:  # pragma: no cover - optional
-    ABS = None  # type: ignore
-
-log = get_logger(__name__)
-
-# safety shim so log.every(...) always exists
+# log.every shim (per-key "log every N occurrences")
 if not hasattr(log, "every"):
-    def _every(_key: str, n: int = 60) -> bool:
-        # Very simple: log every n-th time per key (could be upgraded later)
-        # Here we just always log for simplicity.
-        return True
+    _EVERY_STATE: Dict[str, int] = {}
+
+    def _every(key: str, n: int = 60) -> bool:
+        try:
+            n = int(n)
+        except Exception:
+            n = 60
+        if n <= 1:
+            return True
+        c = _EVERY_STATE.get(key, 0) + 1
+        _EVERY_STATE[key] = c
+        return (c % n) == 1
+
     setattr(log, "every", _every)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Configuration dataclass
+# Small helpers
 # ──────────────────────────────────────────────────────────────────────────────
+def _clamp(x: Any, lo: float = 0.0, hi: float = 100.0) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        return float(lo)
+    if v != v or math.isinf(v):  # NaN/inf
+        return float(lo)
+    return float(max(lo, min(hi, v)))
 
+
+def _clip01(x: Any) -> float:
+    return _clamp(x, 0.0, 1.0)
+
+
+def _safe_ratio(num: float, den: float, default: float = 0.0) -> float:
+    try:
+        d = float(den)
+        if d == 0.0:
+            return float(default)
+        return float(num) / d
+    except Exception:
+        return float(default)
+
+
+def _log1p_pos(x: float) -> float:
+    try:
+        x = float(x)
+        if x <= 0.0:
+            return 0.0
+        return float(math.log1p(x))
+    except Exception:
+        return 0.0
+
+
+def _first_present(*vals: Any, default: float | None = None) -> Optional[float]:
+    for v in vals:
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            continue
+        try:
+            return float(v)
+        except Exception:
+            continue
+    return default
+
+
+def _age_min_from_ts(ts: Any) -> Optional[float]:
+    try:
+        if ts is None:
+            return None
+        t = float(ts)
+        if t <= 0:
+            return None
+        # ms epoch → s
+        if t > 10_000_000_000:
+            t = t / 1000.0
+        return max(0.0, (time.time() - t) / 60.0)
+    except Exception:
+        return None
+
+
+def _normalize_mint(m: Any) -> str:
+    s = str(m or "").strip()
+    if not s:
+        return ""
+    # Prefer your SSoT if it exists
+    with contextlib.suppress(Exception):
+        from utils_pkg.mints import normalize_mint  # type: ignore
+
+        return str(normalize_mint(s)).strip()
+    with contextlib.suppress(Exception):
+        from utils_pkg.mint_guard import normalize_from_any  # type: ignore
+
+        return str(normalize_from_any(s)).strip()
+    return s
+
+
+def _b_env(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def _f_env(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return float(default)
+    try:
+        return float(v)
+    except Exception:
+        if log.every(f"SCORING_BAD_FLOAT_{name}", 600):
+            log.warning("SCORING: env %s=%r not float; using default=%s", name, v, default)
+        return float(default)
+
+
+def _i_env(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return int(default)
+    try:
+        return int(float(v))
+    except Exception:
+        if log.every(f"SCORING_BAD_INT_{name}", 600):
+            log.warning("SCORING: env %s=%r not int; using default=%s", name, v, default)
+        return int(default)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ScoreConfig:
+    # Structural constraints (trade viability)
     min_liq_usd: float = 3_000.0
     max_age_min: float = 720.0
 
+    # Label thresholds
     high_score_threshold: float = 80.0
     medium_score_threshold: float = 60.0
 
+    # GREEN component constraints
     min_momentum_for_green: float = 70.0
     max_risk_for_green: float = 70.0
     min_quality_for_green: float = 60.0
 
+    # Combined score weights (normalized on load)
     w_ai: float = 0.35
     w_momentum: float = 0.35
     w_quality: float = 0.20
-    w_risk: float = 0.10  # this is applied to (100 - risk_score) internally
+    w_risk: float = 0.10  # applied to (100 - risk)
+
+    # Optional tightening/loosening
+    regime_risk_penalty: float = 12.0
+    manip_risk_penalty: float = 18.0
+
+    # Cache controls
+    cache_ttl_s: float = 0.0        # 0 disables TTL caching
+    cache_max_items: int = 2048     # eviction if ttl enabled (or manually enabled)
+
+    # Feature toggles
+    enable_ai_entry: bool = True
+    enable_ai_risk: bool = True
+    enable_abs_gate: bool = True
+    prefer_abs_ai_score: bool = False
+
+    # Parallel scoring helper default (score_many_parallel)
+    max_concurrency: int = 12
 
     @classmethod
     def from_env(cls) -> "ScoreConfig":
-        def _f(name: str, default: float) -> float:
-            v = os.getenv(name)
-            if v is None:
-                return default
-            try:
-                return float(v)
-            except ValueError:
-                log.warning("SCORING: env %s=%r is not a float, using default=%s", name, v, default)
-                return default
-
         cfg = cls(
-            min_liq_usd=_f("SCORING_MIN_LIQ_USD", 3_000.0),
-            max_age_min=_f("SCORING_MAX_AGE_MIN", 720.0),
-            high_score_threshold=_f("SCORING_HIGH_SCORE_THRESHOLD", 80.0),
-            medium_score_threshold=_f("SCORING_MEDIUM_SCORE_THRESHOLD", 60.0),
-            min_momentum_for_green=_f("SCORING_MIN_MOMO_GREEN", 70.0),
-            max_risk_for_green=_f("SCORING_MAX_RISK_GREEN", 70.0),
-            min_quality_for_green=_f("SCORING_MIN_QUALITY_GREEN", 60.0),
-            w_ai=_f("SCORING_W_AI", 0.35),
-            w_momentum=_f("SCORING_W_MOMENTUM", 0.35),
-            w_quality=_f("SCORING_W_QUALITY", 0.20),
-            w_risk=_f("SCORING_W_RISK", 0.10),
+            min_liq_usd=_f_env("SCORING_MIN_LIQ_USD", 3_000.0),
+            max_age_min=_f_env("SCORING_MAX_AGE_MIN", 720.0),
+            high_score_threshold=_f_env("SCORING_HIGH_SCORE_THRESHOLD", 80.0),
+            medium_score_threshold=_f_env("SCORING_MEDIUM_SCORE_THRESHOLD", 60.0),
+            min_momentum_for_green=_f_env("SCORING_MIN_MOMO_GREEN", 70.0),
+            max_risk_for_green=_f_env("SCORING_MAX_RISK_GREEN", 70.0),
+            min_quality_for_green=_f_env("SCORING_MIN_QUALITY_GREEN", 60.0),
+            w_ai=_f_env("SCORING_W_AI", 0.35),
+            w_momentum=_f_env("SCORING_W_MOMENTUM", 0.35),
+            w_quality=_f_env("SCORING_W_QUALITY", 0.20),
+            w_risk=_f_env("SCORING_W_RISK", 0.10),
+            regime_risk_penalty=_f_env("SCORING_REGIME_RISK_PENALTY", 12.0),
+            manip_risk_penalty=_f_env("SCORING_MANIP_RISK_PENALTY", 18.0),
+            cache_ttl_s=_f_env("SCORING_CACHE_TTL_S", 0.0),
+            cache_max_items=_i_env("SCORING_CACHE_MAX_ITEMS", 2048),
+            enable_ai_entry=_b_env("SCORING_ENABLE_AI_ENTRY", True),
+            enable_ai_risk=_b_env("SCORING_ENABLE_AI_RISK", True),
+            enable_abs_gate=_b_env("SCORING_ENABLE_ABS_GATE", True),
+            prefer_abs_ai_score=_b_env("SCORING_PREFER_ABS_AI_SCORE", False),
+            max_concurrency=_i_env("SCORING_MAX_CONCURRENCY", 12),
         )
 
-        # Normalize weights in case user did something weird.
-        total_w = cfg.w_ai + cfg.w_momentum + cfg.w_quality + cfg.w_risk
-        if total_w <= 0:
-            log.warning("SCORING: total weights <= 0, resetting to defaults")
+        # Normalize weights safely
+        total = float(cfg.w_ai + cfg.w_momentum + cfg.w_quality + cfg.w_risk)
+        if total <= 0:
+            if log.every("SCORING_BAD_WEIGHTS", 600):
+                log.warning("SCORING: weights sum <= 0; resetting to defaults")
             return cls()
 
-        cfg.w_ai /= total_w
-        cfg.w_momentum /= total_w
-        cfg.w_quality /= total_w
-        cfg.w_risk /= total_w
-
+        cfg.w_ai /= total
+        cfg.w_momentum /= total
+        cfg.w_quality /= total
+        cfg.w_risk /= total
+        cfg.cache_max_items = max(128, int(cfg.cache_max_items))
+        cfg.max_concurrency = max(1, int(cfg.max_concurrency))
         return cfg
 
 
 CONFIG = ScoreConfig.from_env()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Core data model
-# ──────────────────────────────────────────────────────────────────────────────
+def reload_config() -> ScoreConfig:
+    global CONFIG
+    CONFIG = ScoreConfig.from_env()
+    return CONFIG
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Output model
+# ──────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ScoredToken:
-    # Basic identity
     mint: str
     symbol: str
     chain: str
 
-    # Raw structural stats
     liq_usd: float
     age_min: float
 
@@ -184,77 +310,74 @@ class ScoredToken:
     quality_score: float
     ai_score: float
 
-    # Combined + label
     combined_score: float
-    label: str  # "GREEN", "YELLOW", "RED"
+    label: str  # GREEN/YELLOW/RED
 
-    # Explanations
     reasons: str
 
-    # Backing features (for DB / debugging / analytics)
-    raw_features: Dict[str, Any]
-
-    # Meta
-    created_at_ts: float  # unix timestamp (UTC)
-
-    # Optional gate info for trading usage
+    # Useful extras for the rest of the stack
     is_trade_viable: bool
     trade_gate_reason: str
+    size_hint: float                 # 0..1 (if features provide it), else 0
+    entry_block_flag: float          # 0/1 (if features provide it), else 0
+
+    raw_features: Dict[str, Any]     # feature_builder output (best-effort)
+    created_at_ts: float
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convenience for JSON / DB insertion."""
         return asdict(self)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Small helpers
+# TTL + size-bounded cache (in-memory)
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _clamp(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
-    return max(lo, min(hi, x))
-
-
-def _first_present(*vals: Any, default: float | None = None) -> Optional[float]:
-    for v in vals:
-        if v is None:
-            continue
-        try:
-            # we treat bools as ints; filter them out
-            if isinstance(v, bool):
-                continue
-            return float(v)
-        except (TypeError, ValueError):
-            continue
-    return default
+# We use OrderedDict so eviction is deterministic: oldest first.
+_SCORE_CACHE: "OrderedDict[str, Tuple[float, ScoredToken]]" = OrderedDict()
 
 
-async def _maybe_await(result: Any) -> Any:
-    if inspect.isawaitable(result):
-        return await result
-    return result
+def _cache_enabled() -> bool:
+    return float(CONFIG.cache_ttl_s or 0.0) > 0.0
+
+
+def _cache_get(mint: str) -> Optional[ScoredToken]:
+    if not mint or not _cache_enabled():
+        return None
+    ttl = float(CONFIG.cache_ttl_s or 0.0)
+    item = _SCORE_CACHE.get(mint)
+    if not item:
+        return None
+    ts, val = item
+    if (time.time() - ts) <= ttl:
+        # touch to mark recent
+        _SCORE_CACHE.move_to_end(mint, last=True)
+        return val
+    _SCORE_CACHE.pop(mint, None)
+    return None
+
+
+def _cache_put(mint: str, st: ScoredToken) -> None:
+    if not mint or not _cache_enabled():
+        return
+    _SCORE_CACHE[mint] = (time.time(), st)
+    _SCORE_CACHE.move_to_end(mint, last=True)
+
+    # Evict if too big
+    max_items = int(CONFIG.cache_max_items or 2048)
+    while len(_SCORE_CACHE) > max_items:
+        _SCORE_CACHE.popitem(last=False)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pool meta normalization
+# Pool meta normalization (broad, robust)
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _normalize_pool_meta(raw_pool: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Try to normalize a heterogeneous raw pool dict to a minimal schema.
-
-    Expected / normalized keys:
-        mint      : str
-        symbol    : str
-        chain     : str (default 'SOL')
-        liq_usd   : float
-        age_min   : float
-    """
     mint = (
         raw_pool.get("mint")
         or raw_pool.get("base_mint")
         or raw_pool.get("baseMint")
         or raw_pool.get("mint_address")
         or raw_pool.get("base_token_mint")
+        or raw_pool.get("token_mint")
         or ""
     )
     symbol = (
@@ -262,185 +385,375 @@ def _normalize_pool_meta(raw_pool: Dict[str, Any]) -> Dict[str, Any]:
         or raw_pool.get("sym")
         or raw_pool.get("base_symbol")
         or raw_pool.get("baseSymbol")
+        or raw_pool.get("ticker")
         or "UNKNOWN"
     )
-    chain = raw_pool.get("chain") or "SOL"
+    chain = raw_pool.get("chain") or raw_pool.get("chainId") or raw_pool.get("network") or "SOL"
 
-    # Liquidity USD
+    mint_s = _normalize_mint(mint)
+    sym_s = str(symbol or "UNKNOWN").strip() or "UNKNOWN"
+    chain_s = str(chain or "SOL").strip() or "SOL"
+
+    # Liquidity
     liq_usd = _first_present(
         raw_pool.get("liq_usd"),
         raw_pool.get("liquidity_usd"),
+        (raw_pool.get("liquidity") or {}).get("usd") if isinstance(raw_pool.get("liquidity"), dict) else None,
         raw_pool.get("liquidity"),
         raw_pool.get("liq"),
         default=0.0,
     ) or 0.0
 
-    # Age minutes
+    # Age
     age_min = _first_present(
         raw_pool.get("age_min"),
+        raw_pool.get("token_age_min"),
         raw_pool.get("ageMinutes"),
         raw_pool.get("age_minute"),
+        raw_pool.get("pool_age_min"),
+        default=None,
+    )
+    if age_min is None or age_min <= 0:
+        age_min = _age_min_from_ts(
+            raw_pool.get("pairCreatedAt")
+            or raw_pool.get("pairCreatedAtMs")
+            or raw_pool.get("pairCreatedAtTs")
+            or raw_pool.get("created_at")
+            or raw_pool.get("createdAt")
+            or raw_pool.get("ts_created")
+        ) or 0.0
+
+    # Common “meta” fields (best-effort)
+    mcap = _first_present(
+        raw_pool.get("mcap_usd"),
+        raw_pool.get("mcap"),
+        raw_pool.get("marketCap"),
+        raw_pool.get("marketCapUsd"),
+        raw_pool.get("fdv"),
+        raw_pool.get("fdv_usd"),
         default=0.0,
     ) or 0.0
 
+    # Volume / orderflow (5m preferred)
+    vol5 = _first_present(
+        raw_pool.get("vol_5m_usd"),
+        raw_pool.get("vol5"),
+        (raw_pool.get("volume") or {}).get("m5") if isinstance(raw_pool.get("volume"), dict) else None,
+        (raw_pool.get("volumeUsd") or {}).get("m5") if isinstance(raw_pool.get("volumeUsd"), dict) else None,
+        default=0.0,
+    ) or 0.0
+
+    buys5 = int(_first_present(raw_pool.get("buys_5m"), raw_pool.get("buys5"), default=0.0) or 0.0)
+    sells5 = int(_first_present(raw_pool.get("sells_5m"), raw_pool.get("sells5"), default=0.0) or 0.0)
+
+    # Momentum / price
+    px = _first_present(raw_pool.get("price_usd"), raw_pool.get("px_usd"), raw_pool.get("priceUsd"), raw_pool.get("price"), default=0.0) or 0.0
+    chg1 = _first_present(raw_pool.get("price_change_1m_pct"), raw_pool.get("chg1"), raw_pool.get("chg_1m_pct"), default=0.0) or 0.0
+    chg5 = _first_present(raw_pool.get("price_change_5m_pct"), raw_pool.get("chg5"), raw_pool.get("chg_5m_pct"), default=0.0) or 0.0
+
+    # Slippage/impact (if scanner provides)
+    impact_bps = _first_present(raw_pool.get("impact_1k_bps"), raw_pool.get("impact_1000usd_bps"), raw_pool.get("priceImpact1kBps"), default=0.0) or 0.0
+
+    # Rug/fraud (if scanner provides)
+    ai_rug = _first_present(raw_pool.get("ai_rug_score_01"), raw_pool.get("ai_rug_score"), raw_pool.get("ai_fraud_score"), default=0.0) or 0.0
+
     return {
-        "mint": str(mint),
-        "symbol": str(symbol),
-        "chain": str(chain),
+        "mint": mint_s,
+        "symbol": sym_s,
+        "chain": chain_s,
         "liq_usd": float(liq_usd),
         "age_min": float(age_min),
+        "mcap_usd": float(mcap),
+        "vol_5m_usd": float(vol5),
+        "buys_5m": int(buys5),
+        "sells_5m": int(sells5),
+        "price_usd": float(px),
+        "chg_1m_pct": float(chg1),
+        "chg_5m_pct": float(chg5),
+        "impact_1k_bps": float(impact_bps),
+        "ai_rug_score": float(ai_rug),
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Feature builder adapter
+# Lazy imports (avoid cycles)
 # ──────────────────────────────────────────────────────────────────────────────
+def _lazy_imports() -> Tuple[Any, Any, Any, Any]:
+    FB = None
+    AEL = None
+    ARM = None
+    ABS = None
+    with contextlib.suppress(Exception):
+        from utils_pkg import feature_builder as FB  # type: ignore
+    with contextlib.suppress(Exception):
+        from utils_pkg import ai_entry_logic as AEL  # type: ignore
+    with contextlib.suppress(Exception):
+        from utils_pkg import ai_risk_model as ARM  # type: ignore
+    with contextlib.suppress(Exception):
+        from utils_pkg import ai_buy_scoring as ABS  # type: ignore
+    return FB, AEL, ARM, ABS
 
-async def _build_features(raw_pool: Dict[str, Any],
-                          context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Adapter around utils_pkg.feature_builder (if present).
 
-    We try several common function names / signatures to avoid tight coupling.
-    Fallback: return {} (pure heuristic scoring still works).
-    """
+async def _maybe_await(x: Any) -> Any:
+    return await x if inspect.isawaitable(x) else x
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Feature builder adapter (canonical)
+# ──────────────────────────────────────────────────────────────────────────────
+async def _build_features(raw_pool: Dict[str, Any], pool_meta: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    FB, _, _, _ = _lazy_imports()
     if FB is None:
         if log.every("SCORING_NO_FB", 600):
             log.warning("SCORING: feature_builder not available; using empty features.")
         return {}
 
-    # Try in order: build_entry_features, build_features_for_pool, build_features
-    candidates = [
-        "build_entry_features",
-        "build_features_for_pool",
-        "build_features",
-    ]
+    # Prefer FeatureBuilder().build(...) (your canonical API)
+    with contextlib.suppress(Exception):
+        cls = getattr(FB, "FeatureBuilder", None)
+        if cls is not None:
+            fb = cls()
+            history = context.get("history")
+            regime = context.get("regime")
+            wallet_signals = context.get("wallet_signals")
+            ai_signals = context.get("ai_signals")
+            scanner_source = context.get("scanner_source")
+            risk_context = context.get("risk_context")
 
-    for fname in candidates:
+            res = fb.build(
+                symbol=pool_meta.get("symbol"),
+                mint=pool_meta.get("mint"),
+                snapshot=raw_pool,
+                history=history,
+                regime=regime,
+                wallet_signals=wallet_signals,
+                ai_signals=ai_signals,
+                scanner_source=scanner_source,
+                risk_context=risk_context,
+            )
+            feats = await _maybe_await(res)
+            if isinstance(feats, dict):
+                return feats
+
+    # Fallback: module-level build_features(snapshot)
+    for fname in ("build_features",):
         fn = getattr(FB, fname, None)
-        if not callable(fn):
-            continue
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                feats = await _maybe_await(fn(raw_pool))
+                if isinstance(feats, dict):
+                    return feats
 
-        try:
-            res = fn(raw_pool, context=context or {})
-        except TypeError:
-            # maybe it only accepts raw_pool
-            try:
-                res = fn(raw_pool)
-            except TypeError:
-                continue
-
-        try:
-            features = await _maybe_await(res)
-        except Exception as exc:  # pragma: no cover
-            if log.every(f"SCORING_FB_ERR_{fname}", 600):
-                log.exception("SCORING: feature_builder.%s failed: %s", fname, exc)
-            continue
-
-        if not isinstance(features, dict):
-            if log.every(f"SCORING_FB_BAD_{fname}", 600):
-                log.warning("SCORING: feature_builder.%s returned non-dict type=%s",
-                            fname, type(features))
-            continue
-
-        return features
-
-    if log.every("SCORING_FB_NO_FUNC", 600):
-        log.warning(
-            "SCORING: no usable feature_builder function found; using empty features."
-        )
+    if log.every("SCORING_FB_NO_USABLE", 600):
+        log.warning("SCORING: no usable feature_builder API found; using empty features.")
     return {}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# AI entry logic adapter
+# AI adapters (async-safe, best-effort)
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _call_ai_entry_logic(features: Dict[str, Any],
-                         pool_meta: Dict[str, Any],
-                         context: Optional[Dict[str, Any]] = None
-                         ) -> Tuple[Optional[float], str]:
+def _normalize_score_reason(res: Any, *, key: str = "score") -> Tuple[Optional[float], str]:
     """
-    Ask utils_pkg.ai_entry_logic (if present) for an entry score in [0, 1] or [0, 100].
+    Normalize outputs into (score, reason).
 
-    Returns:
-        (ai_score_0_100_or_None, reason_string)
+    Supported:
+      - float/int
+      - dict with {key} or {"score"} or {"risk_score"} and reason/why
+      - tuple/list: (score, reason) or (ok, score, why) handled elsewhere
     """
+    if res is None:
+        return None, ""
+    if isinstance(res, (int, float)) and not isinstance(res, bool):
+        return float(res), ""
+    if isinstance(res, dict):
+        sc = res.get(key)
+        if sc is None and key != "score":
+            sc = res.get("score")
+        why = str(res.get("reason") or res.get("why") or res.get("msg") or "")
+        if sc is None:
+            return None, why
+        with contextlib.suppress(Exception):
+            return float(sc), why
+        return None, why
+    if isinstance(res, (tuple, list)) and len(res) >= 1:
+        sc = None
+        why = ""
+        with contextlib.suppress(Exception):
+            sc = float(res[0])
+        if len(res) >= 2:
+            why = str(res[1])
+        return sc, why
+    return None, ""
+
+
+def _clamp01_to_100(sc: float) -> float:
+    sc = float(sc)
+    if 0.0 <= sc <= 1.0:
+        sc *= 100.0
+    return _clamp(sc)
+
+
+def _normalize_pass_gate(res: Any) -> Tuple[bool, Optional[float], str]:
+    """
+    pass_gate outputs:
+      - (ok:bool, score:float, why:str)
+      - (ok:bool, score:float)
+      - dict {ok/allow/pass, score, why}
+      - bool
+    """
+    if res is None:
+        return True, None, ""
+    if isinstance(res, bool):
+        return bool(res), None, ""
+    if isinstance(res, dict):
+        ok = bool(res.get("ok", res.get("allow", res.get("pass", True))))
+        sc, why = _normalize_score_reason(res, key="score")
+        why = why or str(res.get("why") or "")
+        return ok, sc, why
+    if isinstance(res, (tuple, list)) and len(res) >= 1:
+        ok = bool(res[0])
+        sc = None
+        why = ""
+        if len(res) >= 2 and isinstance(res[1], (int, float)) and not isinstance(res[1], bool):
+            sc = float(res[1])
+        if len(res) >= 3:
+            why = str(res[2])
+        return ok, sc, why
+    return True, None, ""
+
+
+def _candidate_kwargs(pool_meta: Dict[str, Any], features: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Best-effort mapping for ai_buy_scoring.Candidate(...)
+    We keep it minimal but include common names.
+    """
+    kw: Dict[str, Any] = {}
+    kw["mint"] = pool_meta.get("mint")
+    kw["symbol"] = pool_meta.get("symbol")
+    kw["liq_usd"] = pool_meta.get("liq_usd", features.get("liq_usd", 0.0))
+    kw["age_min"] = pool_meta.get("age_min", features.get("age_min", features.get("token_age_min", 0.0)))
+
+    # Momentum-ish
+    kw["chg5"] = pool_meta.get("chg_5m_pct", features.get("price_change_5m_pct", features.get("chg_5m_pct", 0.0)))
+    kw["buys5"] = pool_meta.get("buys_5m", features.get("buys_5m", features.get("buys5", 0)))
+    kw["sells5"] = pool_meta.get("sells_5m", features.get("sells_5m", features.get("sells5", 0)))
+    kw["vol5"] = pool_meta.get("vol_5m_usd", features.get("vol_5m_usd", features.get("vol5", 0.0)))
+    kw["mcap_usd"] = pool_meta.get("mcap_usd", features.get("mcap_usd", features.get("mcap", 0.0)))
+
+    # If Candidate supports extra kwargs, we can pass more via **features later (we don't here).
+    return kw
+
+
+async def _call_ai_buy_scoring(features: Dict[str, Any], pool_meta: Dict[str, Any]) -> Tuple[Optional[float], bool, str]:
+    """
+    Returns: (ai_score_0_100_or_None, gate_ok, reason)
+    If module present but only gate exists -> score None, gate True/False.
+    """
+    _, _, _, ABS = _lazy_imports()
+    if ABS is None:
+        return None, True, "ai_buy_scoring not available"
+
+    # score_only(features) (if exists)
+    with contextlib.suppress(Exception):
+        score_only = getattr(ABS, "score_only", None)
+        if callable(score_only):
+            res = await _maybe_await(score_only(features))
+            sc, why = _normalize_score_reason(res, key="score")
+            if sc is not None:
+                return _clamp01_to_100(sc), True, why or "ai_buy_scoring.score_only"
+
+    # pass_gate(Candidate(...))
+    with contextlib.suppress(Exception):
+        pass_gate = getattr(ABS, "pass_gate", None)
+        Candidate = getattr(ABS, "Candidate", None)
+        if callable(pass_gate) and Candidate is not None:
+            c = Candidate(**_candidate_kwargs(pool_meta, features))  # type: ignore
+            res = await _maybe_await(pass_gate(c))
+            ok, sc, why = _normalize_pass_gate(res)
+            if sc is not None:
+                return _clamp01_to_100(sc), bool(ok), why or "ai_buy_scoring.pass_gate"
+            return None, bool(ok), why or ("ai_buy_scoring gate OK" if ok else "ai_buy_scoring gate FAIL")
+
+    return None, True, "ai_buy_scoring has no usable API"
+
+
+async def _call_ai_entry(features: Dict[str, Any], pool_meta: Dict[str, Any], context: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """
+    Returns (ai_entry_score_0_100_or_None, reason)
+    Preference order:
+      1) ai_buy_scoring numeric score (if prefer_abs_ai_score)
+      2) ai_entry_logic scoring
+      3) feature_builder entry_quality_score scaled (fallback)
+    """
+    if not CONFIG.enable_ai_entry:
+        return None, "AI entry disabled"
+
+    # ai_buy_scoring as preferred numeric score (optional)
+    abs_sc, abs_gate_ok, abs_reason = await _call_ai_buy_scoring(features, pool_meta)
+    if abs_sc is not None and CONFIG.prefer_abs_ai_score:
+        return float(abs_sc), f"ABS: {abs_reason} (gate_ok={abs_gate_ok})"
+
+    _, AEL, _, _ = _lazy_imports()
     if AEL is None:
+        # fallback: use feature_builder entry_quality_score if available
+        eq = features.get("entry_quality_score")
+        if eq is not None:
+            return _clamp(float(eq) / 1.5 * 100.0), "fallback: entry_quality_score"
         return None, "ai_entry_logic not available"
 
-    # Try 'score_entry' first (our preferred API)
-    for fname in ("score_entry", "score_only", "score"):
+    # Try common APIs
+    for fname in ("score_candidate", "score_entry", "score_only", "score"):
         fn = getattr(AEL, fname, None)
         if not callable(fn):
             continue
 
-        try:
-            res = fn(
-                features=features,
-                meta={
-                    "mint": pool_meta["mint"],
-                    "symbol": pool_meta["symbol"],
-                    "chain": pool_meta["chain"],
-                    **(context or {}),
-                },
-            )
-        except TypeError:
-            # fallback: assume single positional arg
+        attempts: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
+            ((), {"meta": pool_meta, "features": features, **context}),
+            ((), {"meta": pool_meta, "features": features}),
+            ((), {"features": features, "meta": pool_meta}),
+            ((features,), {"meta": pool_meta}),
+            ((features,), {}),
+        ]
+
+        for args, kwargs in attempts:
             try:
-                res = fn(features)
+                res = fn(*args, **kwargs)
+                res = await _maybe_await(res)
+                sc, why = _normalize_score_reason(res, key="score")
+                if sc is None:
+                    sc, why = _normalize_score_reason(res, key="entry_score")
+                if sc is None:
+                    continue
+                return _clamp01_to_100(sc), why or f"ai_entry_logic.{fname}"
             except TypeError:
                 continue
+            except Exception as exc:
+                if log.every(f"SCORING_AEL_ERR_{fname}", 600):
+                    log.warning("SCORING: ai_entry_logic.%s error: %s", fname, exc)
+                continue
 
-        # Normalize result
-        score_0_100: Optional[float] = None
-        reason = ""
-
-        if isinstance(res, (float, int)):
-            score_0_100 = float(res)
-        elif isinstance(res, dict):
-            sc = res.get("score")
-            if sc is not None:
-                score_0_100 = float(sc)
-            reason = str(res.get("reason") or res.get("why") or "")
-        elif isinstance(res, (list, tuple)):
-            # (score, reason, extra?) or (score, reason)
-            if len(res) >= 1:
-                try:
-                    score_0_100 = float(res[0])
-                except (TypeError, ValueError):
-                    pass
-            if len(res) >= 2:
-                reason = str(res[1])
-
-        if score_0_100 is None:
-            continue
-
-        # If score seems to be 0..1, rescale
-        if 0.0 <= score_0_100 <= 1.0:
-            score_0_100 *= 100.0
-
-        score_0_100 = _clamp(score_0_100)
-        return score_0_100, reason or "ai_entry_logic used"
-
+    # fallback: feature_builder entry_quality_score if available
+    eq = features.get("entry_quality_score")
+    if eq is not None:
+        return _clamp(float(eq) / 1.5 * 100.0), "fallback: entry_quality_score"
     return None, "ai_entry_logic has no usable scoring function"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# AI risk model adapter (optional)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _call_ai_risk_model(features: Dict[str, Any],
-                        pool_meta: Dict[str, Any],
-                        context: Optional[Dict[str, Any]] = None
-                        ) -> Tuple[Optional[float], str]:
+async def _call_ai_risk(features: Dict[str, Any], pool_meta: Dict[str, Any], context: Dict[str, Any]) -> Tuple[Optional[float], str]:
     """
-    Ask utils_pkg.ai_risk_model (if present) for a risk score in [0, 100].
-
-    Returns:
-        (risk_score_or_None, reason)
+    Returns (ai_risk_score_0_100_or_None, reason)
+    Preference:
+      1) ai_risk_model
+      2) feature_builder entry_risk_score scaled
     """
+    if not CONFIG.enable_ai_risk:
+        return None, "AI risk disabled"
+
+    _, _, ARM, _ = _lazy_imports()
     if ARM is None:
+        er = features.get("entry_risk_score")
+        if er is not None:
+            return _clamp(float(er) * 100.0), "fallback: entry_risk_score"
         return None, "ai_risk_model not available"
 
     for fname in ("score_risk", "risk_score", "score"):
@@ -448,459 +761,543 @@ def _call_ai_risk_model(features: Dict[str, Any],
         if not callable(fn):
             continue
 
-        try:
-            res = fn(
-                features=features,
-                meta={
-                    "mint": pool_meta["mint"],
-                    "symbol": pool_meta["symbol"],
-                    "chain": pool_meta["chain"],
-                    **(context or {}),
-                },
-            )
-        except TypeError:
+        attempts: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
+            ((), {"meta": pool_meta, "features": features, **context}),
+            ((), {"meta": pool_meta, "features": features}),
+            ((), {"features": features, "meta": pool_meta}),
+            ((features,), {"meta": pool_meta}),
+            ((features,), {}),
+        ]
+
+        for args, kwargs in attempts:
             try:
-                res = fn(features)
+                res = fn(*args, **kwargs)
+                res = await _maybe_await(res)
+                sc, why = _normalize_score_reason(res, key="risk_score")
+                if sc is None:
+                    sc, why = _normalize_score_reason(res, key="score")
+                if sc is None:
+                    continue
+                return _clamp01_to_100(sc), why or f"ai_risk_model.{fname}"
             except TypeError:
                 continue
+            except Exception as exc:
+                if log.every(f"SCORING_ARM_ERR_{fname}", 600):
+                    log.warning("SCORING: ai_risk_model.%s error: %s", fname, exc)
+                continue
 
-        risk_score = None
-        reason = ""
-
-        if isinstance(res, (float, int)):
-            risk_score = float(res)
-        elif isinstance(res, dict):
-            sc = res.get("risk_score") or res.get("score")
-            if sc is not None:
-                risk_score = float(sc)
-            reason = str(res.get("reason") or res.get("why") or "")
-        elif isinstance(res, (tuple, list)):
-            if len(res) >= 1:
-                try:
-                    risk_score = float(res[0])
-                except (TypeError, ValueError):
-                    pass
-            if len(res) >= 2:
-                reason = str(res[1])
-
-        if risk_score is None:
-            continue
-
-        # risk_score is defined as [0..100], higher = more dangerous
-        if 0.0 <= risk_score <= 1.0:
-            # if they gave a 0..1 risk probability, scale up
-            risk_score *= 100.0
-
-        risk_score = _clamp(risk_score)
-        return risk_score, reason or "ai_risk_model used"
-
+    er = features.get("entry_risk_score")
+    if er is not None:
+        return _clamp(float(er) * 100.0), "fallback: entry_risk_score"
     return None, "ai_risk_model has no usable scoring function"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Heuristic component calculators
+# Heuristic component scoring (uses feature_builder first, then meta fallbacks)
 # ──────────────────────────────────────────────────────────────────────────────
+def _compute_momentum_score(features: Dict[str, Any], pool_meta: Dict[str, Any]) -> Tuple[float, str]:
+    # Prefer canonical features produced by your FeatureBuilder
+    chg_1m = _first_present(features.get("price_change_1m_pct"), features.get("chg_1m_pct"), pool_meta.get("chg_1m_pct"), default=0.0) or 0.0
+    chg_5m = _first_present(features.get("price_change_5m_pct"), features.get("chg_5m_pct"), pool_meta.get("chg_5m_pct"), default=0.0) or 0.0
 
-def _compute_momentum_score(features: Dict[str, Any],
-                            raw_pool: Dict[str, Any]) -> Tuple[float, str]:
-    """
-    Compute a heuristic momentum score [0..100].
+    buys = _first_present(features.get("buys_5m"), pool_meta.get("buys_5m"), default=0.0) or 0.0
+    sells = _first_present(features.get("sells_5m"), pool_meta.get("sells_5m"), default=0.0) or 0.0
+    vol5 = _first_present(features.get("vol_5m_usd"), pool_meta.get("vol_5m_usd"), default=0.0) or 0.0
+    liq = float(pool_meta.get("liq_usd") or 0.0)
 
-    Uses whatever is available:
-        - momo_5m_pct / momo_1m_pct / etc.
-        - buys / sells counts
-        - raw chg5 from Raydium-style feeds
-    """
-    # Try to find a short-horizon price change
-    chg_short = _first_present(
-        features.get("momo_1m_pct"),
-        features.get("pct_change_1m"),
-        features.get("chg_1m_pct"),
-        features.get("chg_5m_pct"),
-        raw_pool.get("chg5"),
-        default=0.0,
-    ) or 0.0
+    # Pump-aware boost if present
+    pump_vel = _first_present(features.get("pump_velocity_score"), default=0.0) or 0.0
+    pump_vel_norm = _clip01(_safe_ratio(pump_vel, 10.0, 0.0))  # 0..1
 
-    # buys vs sells (5m window maybe)
-    buys = _first_present(
-        features.get("buys_5m"),
-        features.get("buys_1m"),
-        raw_pool.get("buys5"),
-        default=0.0,
-    ) or 0.0
-    sells = _first_present(
-        features.get("sells_5m"),
-        features.get("sells_1m"),
-        raw_pool.get("sells5"),
-        default=0.0,
-    ) or 0.0
+    # Momentum base from change: shape both 1m + 5m
+    # Positive 5m matters most; 1m is "urgency"
+    pos5 = max(0.0, min(120.0, chg_5m))
+    pos1 = max(0.0, min(80.0, chg_1m))
+    neg5 = max(0.0, min(120.0, -chg_5m))
 
-    # Normalize change: 0%..+30% => 0..100; negative => penalty
-    if chg_short <= 0:
-        base = 20.0 + max(-30.0, chg_short)  # negative change drags it down
-    else:
-        base = min(100.0, chg_short / 30.0 * 100.0)
+    base = 30.0 + (pos5 / 30.0) * 45.0 + (pos1 / 10.0) * 15.0 - (neg5 / 20.0) * 35.0
+    base = _clamp(base)
 
-    # Buy/sell imbalance: strong skew to buys increases momentum
-    total_trades = buys + sells
-    if total_trades > 0:
-        buy_ratio = buys / total_trades
-    else:
-        buy_ratio = 0.5
+    # Orderflow imbalance
+    total = buys + sells
+    buy_ratio = (buys / total) if total > 0 else 0.5
+    imbalance = (buy_ratio - 0.5) * 70.0  # -35..+35
 
-    imbalance_boost = (buy_ratio - 0.5) * 60.0  # -30..+30
-    score = _clamp(base + imbalance_boost)
+    # Activity intensity vs liquidity (cap)
+    v_rel = 0.0
+    if liq > 0 and vol5 > 0:
+        v_rel = min(3.0, vol5 / max(1.0, liq))  # 0..3
+    intensity = v_rel * 14.0  # 0..42
 
-    reason_parts = [
-        f"short-term change ≈ {chg_short:.1f}%",
-        f"buys/sells={int(buys)}/{int(sells)} (buy_ratio={buy_ratio:.2f})",
-    ]
-    return score, "; ".join(reason_parts)
+    score = _clamp(base + imbalance + intensity + 10.0 * pump_vel_norm)
+    why = f"chg1m={chg_1m:.2f}% chg5m={chg_5m:.2f}%; br={buy_ratio:.2f}; vol5/liq={v_rel:.2f}; pumpVelN={pump_vel_norm:.2f}"
+    return score, why
 
 
-def _compute_risk_score(features: Dict[str, Any],
-                        pool_meta: Dict[str, Any],
-                        ai_risk_score: Optional[float]) -> Tuple[float, str]:
-    """
-    Compute heuristic risk [0..100], higher = more dangerous.
+def _compute_quality_score(features: Dict[str, Any], pool_meta: Dict[str, Any]) -> Tuple[float, str]:
+    # If FeatureBuilder already computed entry_quality_score (0..1.5), prefer it
+    eq = features.get("entry_quality_score")
+    if isinstance(eq, (int, float)) and not isinstance(eq, bool):
+        sc = _clamp(float(eq) / 1.5 * 100.0)
+        return sc, f"from entry_quality_score={float(eq):.3f}"
 
-    We start from AI risk if present, then adjust for obvious hazards:
-        - suspicious honeypot / rug flags
-        - very low liquidity
-        - extremely young pools
-        - extreme concentration of holders
-    """
-    base = ai_risk_score if ai_risk_score is not None else 50.0
-    reasons: List[str] = []
-    if ai_risk_score is not None:
-        reasons.append(f"AI risk={ai_risk_score:.1f}")
+    liq = float(pool_meta.get("liq_usd") or 0.0)
+    age = float(pool_meta.get("age_min") or 0.0)
+    mcap = float(pool_meta.get("mcap_usd") or 0.0)
+    holders = _first_present(features.get("holders"), features.get("holders_total"), pool_meta.get("holders"), default=None)
 
-    liq = pool_meta["liq_usd"]
-    age = pool_meta["age_min"]
-
-    # Liquidity: very low = very risky
-    if liq < CONFIG.min_liq_usd:
-        excess = CONFIG.min_liq_usd - liq
-        bump = min(25.0, excess / CONFIG.min_liq_usd * 50.0)
-        base += bump
-        reasons.append(f"low liq (${liq:,.0f} < ${CONFIG.min_liq_usd:,.0f}) (+{bump:.1f})")
-    else:
-        reasons.append("liq OK")
-
-    # Age: super fresh pools can be rug-prone, but older than max_age_min = decaying risk
-    if age < 30.0:
-        base += 10.0
-        reasons.append("very young pool (<30min) (+10)")
-    elif age < 120.0:
-        base += 5.0
-        reasons.append("young pool (<2h) (+5)")
-    elif age > CONFIG.max_age_min:
-        base -= 5.0
-        reasons.append(f"older than {CONFIG.max_age_min:.0f}min (-5)")
-
-    # Explicit flags from features if available
-    honeypot_flags = [
-        features.get("is_honeypot"),
-        features.get("honeypot_flag"),
-        features.get("rugpull_flag"),
-        features.get("can_sell") is False,
-    ]
-    if any(bool(f) for f in honeypot_flags):
-        base = max(base, 90.0)
-        reasons.append("honeypot / rug flag detected (risk>=90)")
-
-    # Big holder concentration
-    top1 = _first_present(
-        features.get("top_holder_pct"),
-        features.get("top1_holder_pct"),
-        default=None,
-    )
-    top10 = _first_present(
-        features.get("top10_holder_pct"),
-        default=None,
-    )
-    if top1 is not None and top1 > 40.0:
-        base += 15.0
-        reasons.append(f"top1 holder {top1:.1f}% (+15)")
-    if top10 is not None and top10 > 80.0:
-        base += 10.0
-        reasons.append(f"top10 holders {top10:.1f}% (+10)")
-
-    # Clamp
-    risk = _clamp(base)
-    return risk, "; ".join(reasons)
-
-
-def _compute_quality_score(features: Dict[str, Any],
-                           pool_meta: Dict[str, Any]) -> Tuple[float, str]:
-    """
-    Quality tries to capture 'structure' vs pure momo/risk:
-        - adequate, but not insane, liquidity
-        - reasonable age (not 30 seconds, not fully dead yet)
-        - holder count
-        - volume consistency (if available)
-    """
-    liq = pool_meta["liq_usd"]
-    age = pool_meta["age_min"]
-
-    score = 50.0
+    score = 45.0
     reasons: List[str] = []
 
-    # Liquidity sweet spot: between min_liq_usd and maybe 30x that
-    if liq < CONFIG.min_liq_usd:
-        # we already penalized risk; here we just keep quality modest
-        reasons.append(f"low liq (${liq:,.0f})")
+    # Liquidity (log shaped)
+    if liq <= 0:
+        score -= 10.0
+        reasons.append("liq=0")
     else:
-        # map liq from [min_liq, 30x min_liq] → [60..95]
-        hi = CONFIG.min_liq_usd * 30.0
-        liq_clamped = _clamp(liq, CONFIG.min_liq_usd, hi)
-        frac = (liq_clamped - CONFIG.min_liq_usd) / (hi - CONFIG.min_liq_usd + 1e-9)
-        liq_score = 60.0 + frac * 35.0
+        ref = max(50.0, float(CONFIG.min_liq_usd))
+        x = max(0.0, math.log10(max(1.0, liq / ref)))  # 0 at ref
+        liq_score = 60.0 + min(32.0, x * 12.0)
+        if liq < ref:
+            liq_score = 40.0 + (liq / ref) * 20.0
         score = max(score, liq_score)
-        reasons.append(f"liq in good range (${liq:,.0f}) → ~{liq_score:.1f}")
+        reasons.append(f"liq=${liq:,.0f}→{liq_score:.0f}")
 
-    # Age: super fresh <10min => quality a bit unknown, older 30min+ slightly better
-    if age < 10.0:
-        score -= 5.0
-        reasons.append("very new (<10min)")
-    elif age < 60.0:
-        score += 5.0
-        reasons.append("new but maturing (<1h)")
+    # Age: slightly prefer “not 30 seconds old”
+    if age < 5:
+        score -= 8.0
+        reasons.append("age<5m")
+    elif age < 30:
+        score -= 2.0
+        reasons.append("age<30m")
+    elif age < 180:
+        score += 4.0
+        reasons.append("age good")
     else:
-        score += 0.0
+        reasons.append("age ok")
 
-    # Holder count
-    holders = _first_present(
-        features.get("holder_count"),
-        features.get("holders"),
-        default=None,
-    )
+    # Market cap sanity
+    if mcap > 0:
+        if mcap < 25_000:
+            score -= 4.0
+            reasons.append("mcap tiny")
+        elif mcap > 250_000:
+            score += 2.0
+            reasons.append("mcap ok")
+
+    # Holders
     if holders is not None:
-        if holders < 50:
-            score -= 5.0
-            reasons.append(f"low holder count ({int(holders)})")
-        elif holders < 300:
-            score += 0.0
-            reasons.append(f"moderate holder count ({int(holders)})")
+        h = float(holders)
+        if h < 30:
+            score -= 6.0
+            reasons.append(f"holders={int(h)} low")
+        elif h < 200:
+            reasons.append(f"holders={int(h)} mid")
         else:
-            score += 5.0
-            reasons.append(f"good holder count ({int(holders)})")
+            score += 4.0
+            reasons.append(f"holders={int(h)} good")
 
     return _clamp(score), "; ".join(reasons)
 
 
+def _compute_risk_score(features: Dict[str, Any], pool_meta: Dict[str, Any], ai_risk_score: Optional[float], context: Dict[str, Any]) -> Tuple[float, str]:
+    # Prefer FeatureBuilder entry_risk_score (0..1) if AI missing
+    entry_risk = features.get("entry_risk_score")
+    fb_risk_100 = None
+    if isinstance(entry_risk, (int, float)) and not isinstance(entry_risk, bool):
+        fb_risk_100 = _clamp(float(entry_risk) * 100.0)
+
+    base = float(ai_risk_score) if ai_risk_score is not None else (fb_risk_100 if fb_risk_100 is not None else 50.0)
+    reasons: List[str] = []
+    if ai_risk_score is not None:
+        reasons.append(f"AI={ai_risk_score:.1f}")
+    elif fb_risk_100 is not None:
+        reasons.append(f"FB={fb_risk_100:.1f}")
+
+    liq = float(pool_meta.get("liq_usd") or 0.0)
+    age = float(pool_meta.get("age_min") or 0.0)
+    impact = float(pool_meta.get("impact_1k_bps") or 0.0)
+    ai_rug = float(pool_meta.get("ai_rug_score") or 0.0)
+
+    # Rug score (0..1 or 0..100)
+    if ai_rug > 0:
+        rug100 = ai_rug * 100.0 if 0.0 <= ai_rug <= 1.0 else ai_rug
+        base = max(base, min(95.0, rug100))
+        reasons.append(f"rug≈{rug100:.0f}")
+
+    # Low liquidity raises risk
+    ref = max(50.0, float(CONFIG.min_liq_usd))
+    if liq < ref:
+        bump = min(28.0, (ref - liq) / ref * 45.0)
+        base += bump
+        reasons.append(f"low_liq(+{bump:.0f})")
+
+    # Very young pools are rug-prone
+    if age < 3:
+        base += 14.0
+        reasons.append("age<3m(+14)")
+    elif age < 15:
+        base += 8.0
+        reasons.append("age<15m(+8)")
+    elif age < 60:
+        base += 3.0
+        reasons.append("age<60m(+3)")
+    elif age > float(CONFIG.max_age_min or 720.0):
+        base -= 4.0
+        reasons.append("old(-4)")
+
+    # Price impact as manip/slippage proxy (higher => riskier)
+    if impact > 0:
+        # interpret bps directly; beyond ~1200 bps (12%) gets ugly
+        bump = min(20.0, max(0.0, (impact - 1200.0) / 1200.0) * 30.0)
+        base += bump
+        if bump > 0:
+            reasons.append(f"impact{impact:.0f}bps(+{bump:.0f})")
+
+    # Explicit honeypot/rug flags
+    flags = [
+        features.get("is_honeypot"),
+        features.get("honeypot_flag"),
+        features.get("rugpull_flag"),
+        features.get("can_sell") is False,
+        pool_meta.get("is_honeypot"),
+    ]
+    if any(bool(x) for x in flags):
+        base = max(base, 92.0)
+        reasons.append("honeypot_flag(>=92)")
+
+    # Authority flags (if present)
+    if features.get("mint_authority_disabled") is False or pool_meta.get("mint_authority_disabled") is False:
+        base += 10.0
+        reasons.append("mint_auth_on(+10)")
+    if features.get("freeze_authority_disabled") is False or pool_meta.get("freeze_authority_disabled") is False:
+        base += 10.0
+        reasons.append("freeze_auth_on(+10)")
+
+    # Concentration flags if present
+    top1 = _first_present(features.get("top_holder_pct"), features.get("top1_holder_pct"), pool_meta.get("top1_hold_pct"), default=None)
+    top10 = _first_present(features.get("top10_holder_pct"), pool_meta.get("top10_hold_pct"), default=None)
+    if top1 is not None and float(top1) > 40.0:
+        base += 14.0
+        reasons.append("top1>40(+14)")
+    if top10 is not None and float(top10) > 80.0:
+        base += 10.0
+        reasons.append("top10>80(+10)")
+
+    # Regime penalty (context-aware; supports dict or RegimeState-like)
+    regime = context.get("regime")
+    ln = 0.0
+    manip = 0.0
+    if isinstance(regime, dict):
+        with contextlib.suppress(Exception):
+            ln = float(regime.get("label_numeric", regime.get("labelNumeric", 0.0)) or 0.0)
+        with contextlib.suppress(Exception):
+            manip = float(regime.get("manipulation_risk", regime.get("manipulationRisk", 0.0)) or 0.0)
+    else:
+        # RegimeState-like
+        with contextlib.suppress(Exception):
+            if hasattr(regime, "as_numeric"):
+                ln = float(regime.as_numeric())
+        with contextlib.suppress(Exception):
+            if hasattr(regime, "manipulation_risk"):
+                manip = float(getattr(regime, "manipulation_risk"))
+
+    if ln <= -0.7:
+        base += 8.0
+        reasons.append("regime_risk_off(+8)")
+    if manip >= 0.8:
+        base += 14.0
+        reasons.append("manip_high(+14)")
+    elif manip >= 0.6:
+        base += 7.0
+        reasons.append("manip_mid(+7)")
+
+    return _clamp(base), "; ".join(reasons)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Combined score + labeling
+# Combine + label + trade gate
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _combine_scores(momentum_score: float,
-                    risk_score: float,
-                    quality_score: float,
-                    ai_entry_score: Optional[float]) -> float:
-    """
-    Combine component scores into a single [0..100] combined_score.
-
-    Higher = better opportunity. Risk is inverted because higher risk_score
-    means more dangerous.
-    """
-    ai_sc = ai_entry_score if ai_entry_score is not None else (momentum_score + quality_score) / 2.0
-    safe_risk = _clamp(risk_score)
-
-    # Invert risk: 0 risk → 100 contribution, 100 risk → 0
-    risk_contrib = 100.0 - safe_risk
+def _combine_scores(momentum: float, risk: float, quality: float, ai_entry: Optional[float], context: Dict[str, Any]) -> float:
+    # If AI entry missing, approximate from momentum+quality (stable fallback)
+    ai_sc = float(ai_entry) if ai_entry is not None else (float(momentum) + float(quality)) / 2.0
+    risk_contrib = 100.0 - _clamp(risk)
 
     combined = (
-        CONFIG.w_ai * ai_sc
-        + CONFIG.w_momentum * momentum_score
-        + CONFIG.w_quality * quality_score
-        + CONFIG.w_risk * risk_contrib
+        CONFIG.w_ai * _clamp(ai_sc)
+        + CONFIG.w_momentum * _clamp(momentum)
+        + CONFIG.w_quality * _clamp(quality)
+        + CONFIG.w_risk * _clamp(risk_contrib)
     )
+
+    # Optional separate regime penalties to combined score
+    regime = context.get("regime")
+    ln = 0.0
+    manip = 0.0
+    if isinstance(regime, dict):
+        with contextlib.suppress(Exception):
+            ln = float(regime.get("label_numeric", regime.get("labelNumeric", 0.0)) or 0.0)
+        with contextlib.suppress(Exception):
+            manip = float(regime.get("manipulation_risk", regime.get("manipulationRisk", 0.0)) or 0.0)
+    else:
+        with contextlib.suppress(Exception):
+            if hasattr(regime, "as_numeric"):
+                ln = float(regime.as_numeric())
+        with contextlib.suppress(Exception):
+            if hasattr(regime, "manipulation_risk"):
+                manip = float(getattr(regime, "manipulation_risk"))
+
+    penalty = 0.0
+    if ln <= -0.7:
+        penalty += float(CONFIG.regime_risk_penalty)
+    if manip >= 0.8:
+        penalty += float(CONFIG.manip_risk_penalty)
+    elif manip >= 0.6:
+        penalty += float(CONFIG.manip_risk_penalty) * 0.5
+
+    if penalty > 0:
+        combined = max(0.0, combined - penalty)
 
     return _clamp(combined)
 
 
-def _derive_label(combined_score: float,
-                  momentum_score: float,
-                  risk_score: float,
-                  quality_score: float) -> str:
-    """
-    Label:
-        GREEN  - strong combined score + acceptable risk / quality
-        YELLOW - medium combined score OR some blemishes
-        RED    - low combined score or very risky
-    """
+def _derive_label(combined: float, momentum: float, risk: float, quality: float) -> str:
     if (
-        combined_score >= CONFIG.high_score_threshold
-        and momentum_score >= CONFIG.min_momentum_for_green
-        and risk_score <= CONFIG.max_risk_for_green
-        and quality_score >= CONFIG.min_quality_for_green
+        combined >= CONFIG.high_score_threshold
+        and momentum >= CONFIG.min_momentum_for_green
+        and risk <= CONFIG.max_risk_for_green
+        and quality >= CONFIG.min_quality_for_green
     ):
         return "GREEN"
-
-    if combined_score >= CONFIG.medium_score_threshold and risk_score <= 90.0:
+    if combined >= CONFIG.medium_score_threshold and risk <= 90.0:
         return "YELLOW"
-
     return "RED"
 
 
-def _format_reasons(momentum_score: float,
-                    momentum_reason: str,
-                    risk_score: float,
-                    risk_reason: str,
-                    quality_score: float,
-                    quality_reason: str,
-                    ai_entry_score: Optional[float],
-                    ai_reason: str,
-                    combined_score: float,
-                    label: str) -> str:
-    parts: List[str] = []
+async def _derive_trade_gate(pool_meta: Dict[str, Any], features: Dict[str, Any], combined: float, label: str, risk: float) -> Tuple[bool, str]:
+    liq = float(pool_meta.get("liq_usd") or 0.0)
+    age = float(pool_meta.get("age_min") or 0.0)
 
-    parts.append(f"Label={label}, combined={combined_score:.1f}/100")
+    # Structural constraints
+    if liq < float(CONFIG.min_liq_usd):
+        return False, f"liq ${liq:.0f} < min ${CONFIG.min_liq_usd:.0f}"
+    if age > float(CONFIG.max_age_min):
+        return False, f"age {age:.1f}m > max {CONFIG.max_age_min:.0f}m"
 
-    if ai_entry_score is not None:
-        parts.append(f"AI entry score={ai_entry_score:.1f}/100 ({ai_reason})")
-    else:
-        parts.append(f"AI entry score=N/A ({ai_reason})")
-
-    parts.append(f"Momentum={momentum_score:.1f}/100 ({momentum_reason})")
-    parts.append(f"Risk={risk_score:.1f}/100 (higher=worse; {risk_reason})")
-    parts.append(f"Quality={quality_score:.1f}/100 ({quality_reason})")
-
-    return " | ".join(parts)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Trade viability (optional extra for sniper usage)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _derive_trade_gate(pool_meta: Dict[str, Any],
-                       combined_score: float,
-                       label: str) -> Tuple[bool, str]:
-    """
-    Simple, generic gate hint for actual trading.
-
-    We keep this conservative; radar / alert logic can use looser thresholds.
-    """
-    if pool_meta["liq_usd"] < CONFIG.min_liq_usd:
-        return False, f"liq ${pool_meta['liq_usd']:.0f} < min ${CONFIG.min_liq_usd:.0f}"
-
-    if pool_meta["age_min"] > CONFIG.max_age_min:
-        return False, f"age {pool_meta['age_min']:.1f}min > max {CONFIG.max_age_min:.1f}min"
+    # FeatureBuilder hard-block (if present)
+    entry_block_flag = float(features.get("entry_block_flag", 0.0) or 0.0)
+    if entry_block_flag >= 1.0:
+        return False, "feature_builder entry_block_flag"
 
     if label == "RED":
-        return False, "RED label (combined score too low)"
+        return False, "RED label"
+    if combined < float(CONFIG.medium_score_threshold):
+        return False, f"combined {combined:.1f} < {CONFIG.medium_score_threshold:.1f}"
 
-    if combined_score < CONFIG.medium_score_threshold:
-        return False, f"combined score {combined_score:.1f} < medium threshold {CONFIG.medium_score_threshold:.1f}"
+    # Optional ABS gate enforcement
+    if CONFIG.enable_abs_gate:
+        abs_sc, abs_ok, abs_reason = await _call_ai_buy_scoring(features, pool_meta)
+        if not abs_ok:
+            return False, abs_reason or "ai_buy_scoring gate blocked"
+
+    # Hard-ish risk guard
+    if risk >= 92.0:
+        return False, f"risk {risk:.0f} too high"
+
+    # Optional “soft gate” flags from FeatureBuilder (if available)
+    # If they exist and say "not ok", respect them in a conservative way.
+    # (Keeps wiring consistent with your gate_* feature plan.)
+    soft_all = features.get("gate_all_soft_ok")
+    if isinstance(soft_all, (int, float)) and not isinstance(soft_all, bool):
+        if float(soft_all) <= 0.0 and label == "YELLOW":
+            return False, "feature_builder soft-gate"
 
     return True, "OK"
+
+
+def _format_reasons(
+    label: str,
+    combined: float,
+    ai_entry: Optional[float],
+    ai_entry_reason: str,
+    momentum: float,
+    momentum_reason: str,
+    risk: float,
+    risk_reason: str,
+    quality: float,
+    quality_reason: str,
+    size_hint: float,
+    gate_ok: bool,
+    gate_reason: str,
+) -> str:
+    parts: List[str] = []
+    parts.append(f"Label={label} combined={combined:.1f}/100 gate={gate_ok}({gate_reason}) size≈{size_hint:.2f}")
+    if ai_entry is None:
+        parts.append(f"AI=N/A ({ai_entry_reason})")
+    else:
+        parts.append(f"AI={ai_entry:.1f}/100 ({ai_entry_reason})")
+    parts.append(f"MOMO={momentum:.1f}/100 ({momentum_reason})")
+    parts.append(f"RISK={risk:.1f}/100 (higher=worse; {risk_reason})")
+    parts.append(f"QUAL={quality:.1f}/100 ({quality_reason})")
+    return " | ".join(parts)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────────────────────────────────────
-
-async def score_candidate(raw_pool: Dict[str, Any],
-                          context: Optional[Dict[str, Any]] = None) -> ScoredToken:
+async def score_candidate(raw_pool: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> ScoredToken:
     """
     Main scoring entrypoint.
-
-    Args:
-        raw_pool: dict from scanner (Raydium, Pump.fun, Dexscreener, etc.)
-        context: optional extra info (regime, account, etc.)
-
-    Returns:
-        ScoredToken instance with component scores, label, reasons, raw features.
+    raw_pool: dict from scanner (Raydium / Pumpfun / Dexscreener / etc.)
+    context: optional info (regime/risk_context/history/wallet_signals/ai_signals/scanner_source)
     """
     if context is None:
         context = {}
 
     pool_meta = _normalize_pool_meta(raw_pool)
+    mint = pool_meta["mint"] or _normalize_mint(raw_pool.get("mint") or raw_pool.get("base_mint") or "")
+    pool_meta["mint"] = mint
 
-    # Step 1: features
-    features = await _build_features(raw_pool, context=context)
+    # Cache (mint must exist)
+    if mint:
+        cached = _cache_get(mint)
+        if cached is not None:
+            return cached
 
-    # Step 2: AI entry score (if available)
-    ai_entry_score, ai_reason = _call_ai_entry_logic(features, pool_meta, context=context)
+    # Build features (canonical FeatureBuilder)
+    features = await _build_features(raw_pool, pool_meta, context)
 
-    # Step 3: AI risk (if available)
-    ai_risk_score, ai_risk_reason = _call_ai_risk_model(features, pool_meta, context=context)
+    # AI entry + AI risk (async-safe)
+    ai_entry_score, ai_entry_reason = await _call_ai_entry(features, pool_meta, context)
+    ai_risk_score, ai_risk_reason = await _call_ai_risk(features, pool_meta, context)
 
-    # Step 4: heuristics
-    momentum_score, momentum_reason = _compute_momentum_score(features, raw_pool)
-    risk_score, risk_reason_h = _compute_risk_score(features, pool_meta, ai_risk_score)
+    # Heuristic components (feature-aware)
+    momentum_score, momentum_reason = _compute_momentum_score(features, pool_meta)
     quality_score, quality_reason = _compute_quality_score(features, pool_meta)
+    risk_score, risk_reason_h = _compute_risk_score(features, pool_meta, ai_risk_score, context)
 
-    # Combine AI risk reason with heuristic risk reason
-    risk_reason = "; ".join([r for r in [ai_risk_reason, risk_reason_h] if r])
+    risk_reason = "; ".join([x for x in [ai_risk_reason, risk_reason_h] if x])
 
-    # Step 5: combined score + label
-    combined_score = _combine_scores(momentum_score, risk_score, quality_score, ai_entry_score)
+    # Combined + label
+    combined_score = _combine_scores(momentum_score, risk_score, quality_score, ai_entry_score, context)
     label = _derive_label(combined_score, momentum_score, risk_score, quality_score)
 
-    # Step 6: formatted reasons
+    # Trade gate
+    is_trade_viable, gate_reason = await _derive_trade_gate(pool_meta, features, combined_score, label, risk_score)
+
+    # Sizing hint + block flag from features (if present)
+    size_hint = 0.0
+    with contextlib.suppress(Exception):
+        size_hint = float(features.get("position_size_scalar", 0.0) or 0.0)
+    size_hint = _clamp(size_hint, 0.0, 1.0)
+    entry_block_flag = _clamp(features.get("entry_block_flag", 0.0) or 0.0, 0.0, 1.0)
+
     reasons = _format_reasons(
-        momentum_score=momentum_score,
-        momentum_reason=momentum_reason,
-        risk_score=risk_score,
-        risk_reason=risk_reason,
-        quality_score=quality_score,
-        quality_reason=quality_reason,
-        ai_entry_score=ai_entry_score,
-        ai_reason=ai_reason,
-        combined_score=combined_score,
         label=label,
+        combined=combined_score,
+        ai_entry=ai_entry_score,
+        ai_entry_reason=ai_entry_reason,
+        momentum=momentum_score,
+        momentum_reason=momentum_reason,
+        risk=risk_score,
+        risk_reason=risk_reason,
+        quality=quality_score,
+        quality_reason=quality_reason,
+        size_hint=size_hint,
+        gate_ok=bool(is_trade_viable),
+        gate_reason=str(gate_reason or ""),
     )
 
-    # Step 7: trade gate hint
-    is_trade_viable, gate_reason = _derive_trade_gate(pool_meta, combined_score, label)
-
-    scored = ScoredToken(
-        mint=pool_meta["mint"],
-        symbol=pool_meta["symbol"],
-        chain=pool_meta["chain"],
-        liq_usd=pool_meta["liq_usd"],
-        age_min=pool_meta["age_min"],
+    st = ScoredToken(
+        mint=str(pool_meta["mint"] or ""),
+        symbol=str(pool_meta["symbol"] or "UNKNOWN"),
+        chain=str(pool_meta["chain"] or "SOL"),
+        liq_usd=float(pool_meta.get("liq_usd") or 0.0),
+        age_min=float(pool_meta.get("age_min") or 0.0),
         risk_score=_clamp(risk_score),
         momentum_score=_clamp(momentum_score),
         quality_score=_clamp(quality_score),
         ai_score=_clamp(ai_entry_score) if ai_entry_score is not None else 0.0,
         combined_score=_clamp(combined_score),
-        label=label,
+        label=str(label).upper().strip(),
         reasons=reasons,
-        raw_features=features,
+        is_trade_viable=bool(is_trade_viable),
+        trade_gate_reason=str(gate_reason or ""),
+        size_hint=float(size_hint),
+        entry_block_flag=float(entry_block_flag),
+        raw_features=features if isinstance(features, dict) else {},
         created_at_ts=time.time(),
-        is_trade_viable=is_trade_viable,
-        trade_gate_reason=gate_reason,
     )
+
+    if mint:
+        _cache_put(mint, st)
 
     if log.every("SCORING_SAMPLE", 60):
         log.info(
-            "SCORING: %s (%s) label=%s combined=%.1f liq=$%.0f age=%.1fmin",
-            scored.symbol,
-            scored.mint,
-            scored.label,
-            scored.combined_score,
-            scored.liq_usd,
-            scored.age_min,
+            "SCORING: %s (%s) label=%s combined=%.1f liq=$%.0f age=%.1fmin trade_ok=%s size=%.2f",
+            st.symbol,
+            st.mint,
+            st.label,
+            st.combined_score,
+            st.liq_usd,
+            st.age_min,
+            st.is_trade_viable,
+            st.size_hint,
         )
 
-    return scored
+    return st
 
 
-async def score_many(raw_pools: Iterable[Dict[str, Any]],
-                     context: Optional[Dict[str, Any]] = None) -> List[ScoredToken]:
+async def score_many(raw_pools: Iterable[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> List[ScoredToken]:
     """
-    Convenience helper: score many raw pools (sequentially for now).
-
-    You can parallelize at the caller level if needed.
+    Convenience helper: score many sequentially (predictable, low overhead).
     """
-    results: List[ScoredToken] = []
+    if context is None:
+        context = {}
+    out: List[ScoredToken] = []
     for raw in raw_pools:
         try:
-            scored = await score_candidate(raw, context=context)
-            results.append(scored)
+            out.append(await score_candidate(raw, context=context))
         except Exception as exc:  # pragma: no cover
             if log.every("SCORING_MANY_ERR", 60):
-                log.exception("SCORING: error scoring pool %r: %s", raw.get("mint"), exc)
-    return results
+                log.warning("SCORING: error scoring pool mint=%r: %s", (raw or {}).get("mint"), exc)
+    return out
+
+
+async def score_many_parallel(raw_pools: Iterable[Dict[str, Any]], context: Optional[Dict[str, Any]] = None, *, max_concurrency: Optional[int] = None) -> List[ScoredToken]:
+    """
+    Parallel scoring helper (bounded). Use this for radar / wide scans.
+    """
+    if context is None:
+        context = {}
+
+    pools = list(raw_pools)
+    if not pools:
+        return []
+
+    mc = int(max_concurrency or CONFIG.max_concurrency or 12)
+    mc = max(1, mc)
+    sem = asyncio.Semaphore(mc)
+
+    out: List[Optional[ScoredToken]] = [None] * len(pools)
+
+    async def _one(i: int, p: Dict[str, Any]) -> None:
+        async with sem:
+            try:
+                out[i] = await score_candidate(p, context=context)
+            except Exception as exc:  # pragma: no cover
+                if log.every("SCORING_PAR_ERR", 60):
+                    log.warning("SCORING: parallel error mint=%r: %s", (p or {}).get("mint"), exc)
+
+    await asyncio.gather(*[_one(i, p) for i, p in enumerate(pools)])
+    return [x for x in out if x is not None]
+
+
+__all__ = [
+    "ScoreConfig",
+    "ScoredToken",
+    "CONFIG",
+    "reload_config",
+    "score_candidate",
+    "score_many",
+    "score_many_parallel",
+]

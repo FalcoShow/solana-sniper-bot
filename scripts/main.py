@@ -1,6284 +1,2346 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
+"""
+scripts/main.py
+
+God-Tier Orchestrator (Master Roadmap Phase 0–7) — FINAL LOCK-IN (V3+++)
+======================================================================
+
+CONTROL PLANE ONLY
+------------------
+This file supervises the whole system:
+  • Starts scanners -> emits candidates (+ optional ticks)
+  • Runs entry workers -> calls maybe_buy()
+  • (Optional) Pre-buy unified scoring -> utils_pkg.scoring_service.score_candidate()
+  • Routes ticks -> exit_engine.on_trade_tick()
+  • Wires buy-filled events -> exit_engine.on_buy_filled()
+  • Runs queue-based auto-exit worker (Redis zset consumer) if enabled
+  • Optional reinvestor / smart_wallets loops
+  • Watchdogs, bounded queues, dedupe, restart resilience
+  • Optional: stdlib-only HTTP debug server (main web health lives in health.py)
+
+HARD RULES
+----------
+- NO swap/build/sign tx code here.
+- SAFE IMPORT: no network at import time. Only stdlib at module scope (besides logging_setup fallback).
+- Optional modules may be missing; main must not crash unless MAIN_FAST_FAIL=1.
+- Respect: KILL_SWITCH / DISABLE_BUYS / DISABLE_SELLS / DISABLE_SCANNERS (+ file flags).
+- Never print secrets. (This file only logs high-level flags & counts.)
+"""
+
+# stdlib only at module scope
 import asyncio
 import contextlib
-import datetime as _dt
+import hashlib
 import importlib
+import importlib.util
 import inspect
 import json
-import logging
 import os
+import random
 import signal
+import socket
 import sys
-import threading
 import time
 import traceback
-from asyncio import create_task
-from typing import Any, Dict, Optional, Tuple
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
+# =============================================================================
+# Identity (RUN_ID is generated per run inside main(); build/version are stable)
+# =============================================================================
+MAIN_VERSION = "v3+++_lockin_orchestrator"
+MAIN_BUILD = (os.getenv("GIT_COMMIT", "")[:12] or os.getenv("RENDER_GIT_COMMIT", "")[:12] or "").strip()
+RUN_ID = ""  # set per main() invocation
+
+_TRUE = {"1", "true", "yes", "y", "on", "t"}
+_FALSE = {"0", "false", "no", "n", "off", "f"}
+_JITTER_DISABLED = os.getenv("MAIN_DISABLE_RANDOM_JITTER", "").strip().lower() in _TRUE
+
+# =============================================================================
+# Logging (soft import + shims)
+# =============================================================================
 try:
-    import aiohttp  # type: ignore
-except Exception:  # pragma: no cover
-    aiohttp = None  # type: ignore
-
-# Core utils (alerts + shared Redis client)
-from utils_pkg.core_utils import AlertManager, redis
-
-"""
-scripts/main.py – Part 1
-========================
-
-V3+++ / quant-grade bootstrap + glue layer.
-
-This section is responsible for:
-
-  • Hardened logging + helpers:
-        - collision-safe .event / .every helpers
-        - safe-logging wrappers that never break trading
-
-  • Env + DSN helpers:
-        - asyncpg-safe DSN normalizer for all PG/Render variants
-        - thin aliases over config.py for ENTRY / EXIT / AI / RISK / MOMENTUM
-        - smart-wallet / risk-capacity / regime toggles shared with Strategy
-
-  • Router BUY wrapper:
-        - auto-detects best buy function from utils_pkg.router
-        - introspects signature & passes only supported kwargs
-        - supports new-style (sig, entry_meta) for Jupiter v6 lightning_impl
-        - normalizes lamports/amount_raw/spend_sol, logs ENTRY_META, caches to Redis
-
-  • BUY hooks:
-        - BUY_SUBMITTED / BUY_FILLED / BUY_FAILED structured logs
-        - AlertManager / Telegram notifications
-        - exit_engine integration (on_buy_filled)
-        - optional Notion intraday PnL snapshots
-
-  • Early candidate filters:
-        - pool allowlist (PF_POOLS)
-        - age / pool-age / min initial buy
-        - Raydium-specific age cap for runners
-        - name/symbol sanity + blacklist
-
-  • Solana RPC helpers:
-        - getSignatureStatuses polling with configurable commitment & timeout
-
-  • Exit logging helpers:
-        - EXIT_TICK / EXIT_STOP_LOSS / EXIT_TSL_ARM / EXIT_TSL_HIT / EXIT_STAGNANT
-
-Strategy, scanner wiring, main event loop, risk manager loop, and
-PnL / Notion helper implementations live in later sections of this file.
-"""
-
-# ===========================================================================
-# Optional deps (HTTP / PG / Sentry / Health)
-# ===========================================================================
-try:
-    import httpx
-except Exception:  # pragma: no cover
-    httpx = None  # type: ignore
-
-try:
-    import asyncpg
-except Exception:  # pragma: no cover
-    asyncpg = None  # type: ignore
-
-try:
-    import sentry_sdk  # type: ignore
-except Exception:  # pragma: no cover
-    sentry_sdk = None  # type: ignore
-
-try:
-    from aiohttp import web  # type: ignore
-except Exception:  # pragma: no cover
-    web = None  # type: ignore
-
-# ===========================================================================
-# Config module (feature flags)
-# ===========================================================================
-try:
-    C = importlib.import_module("config")
-except Exception:  # pragma: no cover
-
-    class _C:
-        ENABLE_RAYDIUM_SCANNER = True
-
-    C = _C()  # type: ignore
-
-# ===========================================================================
-# Logging (robust + collision-safe helpers)
-# ===========================================================================
-_RESERVED: set[str] = {
-    "name",
-    "msg",
-    "message",
-    "levelname",
-    "levelno",
-    "pathname",
-    "filename",
-    "module",
-    "exc_info",
-    "exc_text",
-    "stack_info",
-    "lineno",
-    "funcName",
-    "created",
-    "msecs",
-    "relativeCreated",
-    "thread",
-    "threadName",
-    "process",
-    "processName",
-}
-
-_last_every: Dict[str, float] = {}
-_every_lock = threading.Lock()
-
-
-def _add_safe_extra(fields: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Copy fields, but rename any reserved logging keys so we never get:
-        KeyError: "Attempt to overwrite 'msg' in LogRecord"
-    """
-    safe: Dict[str, Any] = {}
-    for k, v in fields.items():
-        if k in _RESERVED:
-            safe[f"extra_{k}"] = v
-        else:
-            safe[k] = v
-    return safe
-
-
-def _attach_log_helpers_base(_log: logging.Logger):
-    """
-    Attach `event` and `every` helpers to a logger instance in a
-    collision-safe way (no reserved keys in `extra`).
-    """
-
-    def event(name: str, **fields: Any) -> None:
-        _log.info(name, extra=_add_safe_extra(fields))
-
-    def every(_key: str, n: int = 60, **fields: Any) -> None:
-        now = time.time()
-        with _every_lock:
-            last = _last_every.get(_key, 0.0)
-            if now - last < n:
-                return
-            _last_every[_key] = now
-        _log.info(f"[every {n}s] {_key}", extra=_add_safe_extra(fields))
-
-    if not hasattr(_log, "event"):
-        _log.event = event  # type: ignore[attr-defined]
-    if not hasattr(_log, "every"):
-        _log.every = every  # type: ignore[attr-defined]
-    return _log
-
-
-try:
-    from logging_setup import get_logger, bump, start_global_heartbeat
-
-    _base_log = get_logger()
-except Exception:  # pragma: no cover
-
-    class DummyLogger(logging.Logger):
-        def __init__(self) -> None:
-            super().__init__("dummy")
-
-        def _p(self, lvl: str, msg: str, **fields: Any) -> None:
-            line = f"[{lvl}] {msg}"
-            if fields:
-                line += " " + repr(fields)
-            print(line, flush=True)
-
-        def info(self, msg: str, **fields: Any) -> None:  # type: ignore[override]
-            self._p("INFO", msg, **fields)
-
-        def warning(self, msg: str, **fields: Any) -> None:  # type: ignore[override]
-            self._p("WARN", msg, **fields)
-
-        def error(self, msg: str, **fields: Any) -> None:  # type: ignore[override]
-            self._p("ERROR", msg, **fields)
-
-        def debug(self, msg: str, **fields: Any) -> None:  # type: ignore[override]
-            self._p("DEBUG", msg, **fields)
-
-    def bump(*_a, **_k):  # type: ignore[func-returns-value]
-        return None
-
-    def start_global_heartbeat(*_a, **_k):  # type: ignore[func-returns-value]
-        return None
-
-    _base_log = DummyLogger()
-
-# Final logger used everywhere
-log = _attach_log_helpers_base(_base_log)
-
-# ===========================================================================
-# Normalization helpers (mints / env)
-# ===========================================================================
-try:
-    from scripts.pp_utils import normalize_mint as _pp_normalize
-except Exception:  # pragma: no cover
-
-    def _pp_normalize(s: str) -> str:  # type: ignore
-        return s.strip()
-
-
-try:
-    from utils_pkg.mint_guard import (
-        normalize_from_any as _mg_normalize,
-        is_probable_mint as _mg_prob,
+    from logging_setup import (  # type: ignore
+        get_logger as _get_logger,
+        bump as _bump,
+        start_global_heartbeat as _start_global_heartbeat,
     )
 except Exception:  # pragma: no cover
-    _mg_normalize = None  # type: ignore
-    _mg_prob = None  # type: ignore
+    import logging
 
+    def _get_logger(name: str = "sniper.main") -> Any:  # type: ignore
+        lg = logging.getLogger(name)
+        if not lg.handlers:
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+        return lg
 
-def _env_bool(key: str, default: bool = False) -> bool:
-    v = os.getenv(key)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
+    def _bump(*_a: Any, **_k: Any) -> None:  # type: ignore
+        return None
 
-
-def _dryrun_env_on() -> bool:
-    # honour any of these flags
-    return (
-        _env_bool("DRYRUN")
-        or _env_bool("DRY_RUN")
-        or _env_bool("IS_DRYRUN")
-    )
-
-# ===========================================================================
-# Event source + trading / exit hooks
-# ===========================================================================
-try:
-    from utils_pkg.pumpportal_client import PumpPortalClient
-except Exception:  # pragma: no cover
-
-    class PumpPortalClient:  # type: ignore
-        def __init__(self, *a, **kw):
-            raise RuntimeError("PumpPortalClient not available")
-
-
-# We intentionally *don't* import maybe_buy from pump_trader.
-# Instead we wire to whatever buy-capable function router exposes.
-try:
-    from utils_pkg.trader import sell_on_jupiter, IS_DRYRUN as _pkg_is_dryrun
-except Exception:  # pragma: no cover
-
-    async def sell_on_jupiter(*_a, **_kw):  # type: ignore
-        raise RuntimeError("sell_on_jupiter not available")
-
-    _pkg_is_dryrun = True  # type: ignore[assignment]
-
-# Exit engine + worker: the engine enqueues exit_request:* in Redis,
-# and the worker consumes them. (Loops wired in later sections.)
-try:
-    from utils_pkg.auto_exit_worker import exit_worker_loop, exit_engine  # type: ignore
-except Exception:  # pragma: no cover
-
-    async def exit_worker_loop(stop_evt: asyncio.Event) -> None:  # type: ignore
-        while not stop_evt.is_set():
-            await asyncio.sleep(5)
-
-    class _NoopExit:
-        async def on_trade_tick(self, *_a, **_kw): ...
-        async def on_buy_filled(self, *_a, **_kw): ...
-
-    exit_engine = _NoopExit()  # type: ignore
-
-# Auto-sell loop (main exit loop; started later)
-try:
-    from utils_pkg.auto_sell import exit_engine_loop  # type: ignore
-except Exception:  # pragma: no cover
-
-    async def exit_engine_loop() -> None:  # type: ignore
-        """
-        Fallback no-op loop if utils_pkg.auto_sell is missing.
-        This prevents crashes; real implementation is in auto_sell.py.
-        """
-        while True:
-            await asyncio.sleep(float(os.getenv("EXIT_LOOP_INTERVAL_SEC", "15")))
-
-
-# Optional position / guardrail helpers
-try:
-    from utils_pkg.dedupe import claim_once  # (key:str, ttl:int) -> bool
-except Exception:  # pragma: no cover
-
-    def claim_once(_key: str, _ttl: int = 3600) -> bool:  # type: ignore
-        return True
-
-
-try:
-    from utils_pkg.guardrails import buys_allowed, record_buy_result
-except Exception:  # pragma: no cover
-
-    def buys_allowed() -> bool:  # type: ignore
-        return True
-
-    def record_buy_result(*_args, **_kwargs):  # type: ignore
+    def _start_global_heartbeat(*_a: Any, **_k: Any) -> None:  # type: ignore
         return None
 
 
-try:
-    from utils_pkg.positions import all as all_positions
-except Exception:  # pragma: no cover
-
-    def all_positions():  # type: ignore
-        return []
-
-
-# Optional extra risk loop (separate from auto_exit_worker / auto_sell)
-try:
-    from utils_pkg.risk_manager import risk_manager_loop  # type: ignore
-except Exception:  # pragma: no cover
-
-    async def risk_manager_loop(stop_evt: asyncio.Event) -> None:  # type: ignore
-        while not stop_evt.is_set():
-            await asyncio.sleep(10)
-
-
-# Optional legacy sell-loop worker
-try:
-    from utils_pkg.sell_loop import run_sell_loop  # type: ignore
-except Exception:  # pragma: no cover
-
-    async def run_sell_loop(stop_evt: asyncio.Event) -> None:  # type: ignore
-        while not stop_evt.is_set():
-            await asyncio.sleep(10)
-
-
-# Router + price helpers
-try:
-    from utils_pkg import router  # provides buy function(s)
-    from utils_pkg.router import get_price_ui as _route_price_ui
+def _logger() -> Any:
     try:
-        from utils_pkg.router import get_decimals as _route_get_decimals
-    except Exception:  # pragma: no cover
-        _route_get_decimals = None  # type: ignore
-except Exception:  # pragma: no cover
-    router = None  # type: ignore
-
-    async def _route_price_ui(_mint: str) -> float:  # type: ignore
-        return 0.0
-
-    _route_get_decimals = None  # type: ignore
-
-# ===========================================================================
-# ROUTER BUY WRAPPER
-# ===========================================================================
+        return _get_logger("sniper.main")  # type: ignore[misc]
+    except TypeError:
+        return _get_logger()  # type: ignore[misc]
 
 
-def _safe_log_router_state(event: str, **fields: Any) -> None:
+log = _logger()
+
+
+def _ensure_logger_shims() -> None:
+    # log.event(name, **fields)
+    if not hasattr(log, "event"):
+
+        def _event(name: str, **fields: Any) -> None:
+            with contextlib.suppress(Exception):
+                log.info("%s %s", name, fields)
+
+        setattr(log, "event", _event)
+
+    # log.every(key, sec, msg=None, **fields): time-based throttle
+    if not hasattr(log, "every"):
+
+        def _every(key: str, sec: int = 60, msg: Optional[str] = None, **fields: Any) -> None:
+            try:
+                now_m = time.monotonic()
+                store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
+                last = float(store.get(key, 0.0))
+                if now_m - last >= float(sec):
+                    store[key] = now_m
+                    setattr(_every, "_store", store)  # type: ignore[attr-defined]
+                    with contextlib.suppress(Exception):
+                        log.event(msg or key, **fields)  # type: ignore[attr-defined]
+            except Exception:
+                return None
+
+        setattr(log, "every", _every)
+
+
+_ensure_logger_shims()
+
+
+def bump(name: str) -> None:
+    with contextlib.suppress(Exception):
+        _bump(name)
+
+
+# =============================================================================
+# Tiny helpers
+# =============================================================================
+def _now() -> float:
+    return time.time()
+
+
+def _mono() -> float:
+    return time.monotonic()
+
+
+def _short_exc(e: BaseException, n: int = 420) -> str:
+    s = f"{type(e).__name__}: {e}"
+    return (s[:n] + "…") if len(s) > n else s
+
+
+def _envs(k: str, d: str = "") -> str:
+    v = os.getenv(k)
+    return (v if v is not None else d).strip()
+
+
+def _envb(k: str, d: bool = False) -> bool:
+    v = _envs(k, "")
+    if v == "":
+        return bool(d)
+    s = v.lower().strip()
+    if s in _TRUE:
+        return True
+    if s in _FALSE:
+        return False
+    return bool(d)
+
+
+def _envi(k: str, d: int) -> int:
     try:
-        log.event(event, **fields)
+        return int(float(_envs(k, str(d))))
     except Exception:
-        # logging must never break routing
-        pass
+        return int(d)
 
 
-def _candidate_buy_names() -> list[str]:
-    # Preferred stable names first, then common variants.
-    return [
-        "buy_via_lightning",  # primary Jupiter v6 path (supports return_meta)
-        "pump_buy_with_fallback",
-        "maybe_buy",
-        "buy",
-        "route_and_buy",
-        "buy_on_jupiter",
-        "buy_token",
-        "execute_buy",
-        "exec_buy",
-        "_buy_lightning",
-        "buy_lightning",
-        "buy_direct",
-        "buy_pump",
-    ]
-
-
-def _pick_router_buy_callable() -> Optional[tuple[str, Any]]:
-    """
-    Try to discover a buy-capable function on utils_pkg.router.
-    Prefer well-known names, then fall back to any function with 'buy'
-    in its name (excluding sell/quote helpers).
-    """
-    if router is None:
-        return None
-
-    # 1) Preferred names
-    for name in _candidate_buy_names():
-        fn = getattr(router, name, None)
-        if callable(fn):
-            return name, fn
-
-    # 2) Fallback: any function with 'buy' in name, excluding sell/quote.
+def _envf(k: str, d: float) -> float:
     try:
-        for n in dir(router):
-            if "buy" not in n.lower():
-                continue
-            low = n.lower()
-            if any(bad in low for bad in ("sell", "quote")):
-                continue
-            fn = getattr(router, n, None)
-            if callable(fn):
-                return n, fn
+        return float(_envs(k, str(d)))
     except Exception:
-        pass
+        return float(d)
+
+
+def _fast_fail() -> bool:
+    return _envb("MAIN_FAST_FAIL", False)
+
+
+def _json_dumps(x: Any, max_len: int = 250_000) -> str:
+    try:
+        s = json.dumps(x, ensure_ascii=False, separators=(",", ":"), default=str)
+        if len(s) > max_len:
+            return s[:max_len] + "…"
+        return s
+    except Exception:
+        return "{}"
+
+
+def _ema(prev: float, x: float, alpha: float = 0.12) -> float:
+    if prev <= 0:
+        return x
+    return (1.0 - alpha) * prev + alpha * x
+
+
+def _safe_float(x: Any, d: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(d)
+
+
+# =============================================================================
+# Config (soft) — MUST be safe / no network
+# =============================================================================
+def _load_config() -> Any:
+    try:
+        return importlib.import_module("config")
+    except Exception:
+
+        class _C:
+            ENABLE_RAYDIUM_SCANNER = True
+            ENABLE_PUMP_SCANNER = True
+            ENABLE_DEXSCREENER_SCANNER = True
+
+            ENTRY_WORKERS = 2
+            CANDIDATE_QUEUE_MAX = 2500
+            TICK_QUEUE_MAX = 5000
+
+            SUPERVISOR_SEC = 5
+            RESTART_BACKOFF_SEC = 2
+            RESTART_MAX_BACKOFF_SEC = 60
+            RESTART_MAX_PER_HOUR = 60
+
+            HEALTH_LOG_SEC = 30
+            STARVATION_WARN_SEC = 180
+            NO_BUY_WARN_SEC = 300
+
+            MAIN_IDLE_SLEEP_SEC = 0.5
+            SHUTDOWN_GRACE_SEC = 15.0
+
+            MASTER_PHASE = int(os.getenv("MASTER_PHASE", "7"))
+
+        return _C()
+
+
+C = _load_config()
+
+
+def _phase() -> int:
+    p = _envi("MASTER_PHASE", int(getattr(C, "MASTER_PHASE", 7) or 7))
+    if os.getenv("MASTER_PHASE") is None:
+        p = _envi("STRATEGY_PHASE", p)
+    return max(0, min(7, int(p)))
+
+
+# =============================================================================
+# Kill-switch + file flags
+# =============================================================================
+_KILL_FILE = _envs("KILL_SWITCH_FILE", "")
+_DISABLE_BUYS_FILE = _envs("DISABLE_BUYS_FILE", "")
+_DISABLE_SELLS_FILE = _envs("DISABLE_SELLS_FILE", "")
+_DISABLE_SCANNERS_FILE = _envs("DISABLE_SCANNERS_FILE", "")
+
+_KILL_WATCHDOG_SEC = max(0.5, float(_envf("KILL_WATCHDOG_SEC", 2.0)))
+_KILL_SHUTDOWN_ON_TRIGGER = _envb("KILL_SHUTDOWN_ON_TRIGGER", False)
+
+_PANIC_STOP = _envb("PANIC_STOP", False)  # immediate stop if set at boot (safety)
+_MAIN_MAX_UPTIME_SEC = max(0.0, float(_envf("MAIN_MAX_UPTIME_SEC", 0.0)))  # 0 disables
+
+
+def _file_flag(path: str) -> bool:
+    if not path:
+        return False
+    with contextlib.suppress(Exception):
+        return os.path.exists(path)
+    return False
+
+
+def _kill_active() -> bool:
+    return _envb("KILL_SWITCH", False) or _file_flag(_KILL_FILE)
+
+
+def _buys_disabled() -> bool:
+    return _envb("DISABLE_BUYS", False) or _kill_active() or _file_flag(_DISABLE_BUYS_FILE)
+
+
+def _sells_disabled() -> bool:
+    return _envb("DISABLE_SELLS", False) or _kill_active() or _file_flag(_DISABLE_SELLS_FILE)
+
+
+def _scanners_disabled() -> bool:
+    return _envb("DISABLE_SCANNERS", False) or _kill_active() or _file_flag(_DISABLE_SCANNERS_FILE)
+
+
+def _apply_disable_sells_to_env() -> None:
+    """
+    If sells are disabled, force-disable downstream sell execution behavior via env
+    BEFORE we import exit_engine / auto_exit modules.
+    """
+    if not _sells_disabled():
+        return
+    os.environ["EXIT_ALLOW_WORKER_ENQUEUE"] = "0"
+    os.environ["EXIT_ALLOW_DIRECT_FALLBACK"] = "0"
+    os.environ["EXIT_FOLLOW_ALLOW_DIRECT_FALLBACK"] = "0"
+    os.environ["AUTO_EXIT_WORKER_ENABLED"] = "0"
+
+
+# =============================================================================
+# Runtime soft import helper
+# =============================================================================
+def _soft_import(mod_name: str, *, aliases: Optional[List[str]] = None, critical: bool = False) -> Optional[Any]:
+    tried: List[str] = []
+    for name in [mod_name] + (aliases or []):
+        tried.append(name)
+        try:
+            return importlib.import_module(name)
+        except Exception as e:
+            log.every("SOFT_IMPORT_FAIL", 30, module=name, err=_short_exc(e))
+    log.every("SOFT_IMPORT_ALL_FAIL", 60, module=mod_name, tried=",".join(tried)[:320])
+    if critical and _fast_fail():
+        raise RuntimeError(f"Critical import failed: {mod_name} tried={tried!r}")
     return None
 
 
-def _compute_spend_sol(ui: Dict[str, Any]) -> float:
-    """
-    Decide how much SOL to spend for a buy, preferring explicit UI overrides,
-    then env hints, then a tiny default.
-
-    This is shared between live trading and backtest-style simulations
-    (to keep behaviour consistent when Strategy calls maybe_buy()).
-    """
-    # 1) UI overrides from scanner/strategy
-    for k in ("spend_sol", "buy_size_sol", "amount_sol", "size_sol"):
-        try:
-            v = ui.get(k)
-            if v is None:
-                continue
-            f = float(v)
-            if f > 0:
-                return f
-        except Exception:
-            continue
-
-    # 2) Env hints
-    for envk in ("ENTRY_BUY_SOL", "ENTRY_SPEND_SOL", "INITIAL_BUY_SOL"):
-        try:
-            v = float(os.getenv(envk, "0"))
-            if v > 0:
-                return v
-        except Exception:
-            continue
-
-    # 3) Fallback: ultra-safe tiny default
-    return 0.02
+def _module_exists(name: str) -> bool:
+    with contextlib.suppress(Exception):
+        return importlib.util.find_spec(name) is not None
+    return False
 
 
-def _env_slippage_bps() -> int:
-    """
-    Fallback slippage in bps for router buy, if the router function
-    accepts `slippage_bps`. Prefer explicit env, otherwise derive from
-    JUPITER_MAX_SLIPPAGE if present in config.
-    """
-    try:
-        explicit = os.getenv("SLIPPAGE_BPS") or os.getenv("ENTRY_SLIPPAGE_BPS")
-        if explicit is not None:
-            return int(explicit)
-
-        # If config has JUPITER_MAX_SLIPPAGE as a fraction, convert to bps.
-        jup_slip = getattr(C, "JUPITER_MAX_SLIPPAGE", None)
-        if jup_slip is not None:
-            return int(round(float(jup_slip) * 10_000))
-
-    except Exception:
-        pass
-    return 50  # 0.5% default
-
-
-def _build_kwargs_for_router(
-    fn: Any,
-    mint: str,
-    ui: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Introspect the router buy function and pass only parameters it expects.
-    This keeps us forwards-compatible across refactors of utils_pkg.router.
-
-    IMPORTANT: if the underlying buy supports `return_meta`, we set it True
-    so we can harvest exact entry size/price data.
-    """
-    kwargs: Dict[str, Any] = {}
+# =============================================================================
+# Signature-safe helpers
+# =============================================================================
+def _filter_kwargs(fn: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     try:
         sig = inspect.signature(fn)
-        params = sig.parameters
-        names = set(params.keys())
-
-        if "mint" in names:
-            kwargs["mint"] = mint
-        if "ui" in names:
-            kwargs["ui"] = ui
-
-        spend = _compute_spend_sol(ui)
-        if "amount_sol" in names:
-            kwargs["amount_sol"] = float(spend)
-        if "lamports_in" in names:
-            kwargs["lamports_in"] = int(round(spend * 1_000_000_000))
-
-        if "slippage_bps" in names:
-            kwargs["slippage_bps"] = _env_slippage_bps()
-
-        if "only_direct" in names:
-            kwargs["only_direct"] = bool(
-                os.getenv("ONLY_DIRECT", "0").strip().lower()
-                in {"1", "true", "yes", "on"}
-            )
-
-        # If the impl supports meta, request it so we can log into Notion/DB.
-        if "return_meta" in names:
-            kwargs["return_meta"] = True
+        params = sig.parameters.values()
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+            return kwargs
+        allowed = {p.name for p in params}
+        return {k: v for k, v in kwargs.items() if k in allowed}
     except Exception:
-        # If introspection fails, fall back to the safest minimal call
-        kwargs = {"mint": mint, "ui": ui}
-    return kwargs
+        return kwargs
 
 
-async def _call_with_variants(
-    fn: Any,
-    *,
-    mint: str,
-    ui: Dict[str, Any],
-):
-    """
-    Call the router buy function with best-effort kwargs, falling back through
-    multiple signatures until one succeeds.
-
-    Return value is passed through untouched so maybe_buy() can interpret:
-      - str                        → tx signature
-      - dict                       → {signature, ...}
-      - (sig, entry_meta) tuple    → sig + entry meta from lightning_impl
-    """
-    # Variant 1: full introspected kwargs (including return_meta if supported)
+def _filter_kwargs_ctor(cls_or_fn: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        kw_sig = _build_kwargs_for_router(fn, mint, ui)
-        res = fn(**kw_sig)
-        if inspect.isawaitable(res):
-            res = await res
-        _safe_log_router_state(
-            "ROUTER_BUY_CALL",
-            variant="kw_sig",
-            sent_keys=sorted(kw_sig.keys()),
-        )
-        return res
-    except TypeError as e:
-        _safe_log_router_state(
-            "ROUTER_BUY_CALL_TYPERR",
-            where="kw_sig",
-            err=str(e),
-        )
-    except Exception as e:
-        _safe_log_router_state(
-            "ROUTER_BUY_CALL_ERR",
-            where="kw_sig",
-            err=str(e),
-        )
-
-    # Variant 2: minimal mint+ui
-    try:
-        res = fn(mint=mint, ui=ui)
-        if inspect.isawaitable(res):
-            res = await res
-        _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_min_mint_ui")
-        return res
-    except Exception as e:
-        _safe_log_router_state(
-            "ROUTER_BUY_CALL_ERR",
-            where="kw_min_mint_ui",
-            err=str(e),
-        )
-
-    # Variant 3: mint only
-    try:
-        res = fn(mint=mint)
-        if inspect.isawaitable(res):
-            res = await res
-        _safe_log_router_state("ROUTER_BUY_CALL", variant="kw_mint_only")
-        return res
-    except Exception as e:
-        _safe_log_router_state(
-            "ROUTER_BUY_CALL_ERR",
-            where="kw_mint_only",
-            err=str(e),
-        )
-
-    _safe_log_router_state(
-        "ROUTER_BUY_ALL_VARIANTS_FAILED",
-        error="no compatible kwargs",
-    )
-    return None
-
-
-async def maybe_buy(
-    *,
-    mint: str,
-    ui: Dict[str, Any],
-    on_buy_submitted=None,
-    on_buy_filled=None,
-    on_buy_failed=None,
-) -> Optional[str]:
-    """
-    Unified buy entrypoint for the rest of the script.
-
-    - Picks the best buy-capable function from utils_pkg.router.
-    - If the underlying buy supports `return_meta`, we harvest (sig, entry_meta)
-      and normalize it via log_entry_from_meta (lamports_in / amount_raw /
-      spend_sol) so Notion/DB/exit-engine stay in sync.
-    - Returns a plain tx signature string (or None) so Strategy and
-      other callers remain fully compatible.
-
-    NOTE:
-      The on_buy_* callbacks are *not* invoked here. Strategy acts as the
-      single source of truth for calling _buy_hook_* after confirmation.
-    """
-    if router is None:
-        _safe_log_router_state("ROUTER_UNAVAILABLE_FOR_BUY")
-        raise RuntimeError("router unavailable")
-
-    choice = _pick_router_buy_callable()
-    if not choice:
-        _safe_log_router_state(
-            "ROUTER_NO_BUY_CAPABLE",
-            impls=getattr(router, "buy_keys", None),
-            sell_keys=getattr(router, "sell_keys", None),
-            file=getattr(router, "__file__", "<router?>"),
-        )
-        raise RuntimeError("router has no buy-capable function")
-
-    fn_name, fn = choice
-    _safe_log_router_state(
-        "ROUTER_BUY_FN",
-        fn=fn_name,
-        impls=getattr(router, "buy_keys", None),
-        sell_keys=getattr(router, "sell_keys", None),
-        file=getattr(router, "__file__", "<router?>"),
-    )
-
-    # Call router, possibly getting back (sig, entry_meta)
-    res = await _call_with_variants(
-        fn,
-        mint=mint,
-        ui=ui,
-    )
-
-    sig: Optional[str] = None
-    entry_meta: Dict[str, Any] = {}
-
-    # Case 1: new-style (sig, entry_meta)
-    if isinstance(res, tuple) and len(res) == 2:
-        maybe_sig, maybe_meta = res
-        if isinstance(maybe_sig, str) and maybe_sig:
-            sig = maybe_sig
-        if isinstance(maybe_meta, dict):
-            entry_meta = maybe_meta or {}
-
-    # Case 2: raw string signature
-    elif isinstance(res, str):
-        sig = res
-
-    # Case 3: dict with a signature key
-    elif isinstance(res, dict):
-        for k in ("signature", "sig", "tx_sig", "tx", "id"):
-            v = res.get(k)
-            if isinstance(v, str) and v:
-                sig = v
-                break
-
-    # If we have entry meta, log and normalize it for downstream consumers.
-    if entry_meta:
-        try:
-            log.event(
-                "ENTRY_META",
-                mint=mint,
-                amount_raw=int(entry_meta.get("amount_raw") or 0),
-                in_amount_raw=int(
-                    entry_meta.get("in_amount_raw")
-                    or entry_meta.get("lamports_in")
-                    or 0
-                ),
-                priceImpactPct=entry_meta.get("priceImpactPct"),
-                pool=ui.get("pool") or "unknown",
-                symbol=ui.get("symbol") or ui.get("name") or "?",
-            )
-        except Exception:
-            # meta logging must never break trading
-            pass
-
-        # Best-effort normalization + caching; never break the buy flow
-        try:
-            entry_meta = await log_entry_from_meta(
-                mint=mint,
-                entry_meta=entry_meta,
-                ui=ui,
-                sig=sig,
-            )
-        except Exception as e:
-            try:
-                log.event(
-                    "ENTRY_META_LOG_FAIL",
-                    mint=mint,
-                    err=str(e)[:200],
-                )
-            except Exception:
-                pass
-
-    return sig
-
-# ===========================================================================
-# Liquidity screen (optional fallback)
-# ===========================================================================
-try:
-    from utils_pkg.liquidity import screen_token
-except Exception:  # pragma: no cover
-
-    async def screen_token(_mint: str):  # type: ignore
-        return True, {"ok": True}
-
-
-# Optional price feed tidy shutdown
-try:
-    from utils_pkg.price_feed import close as pricefeed_close
-except Exception:  # pragma: no cover
-
-    async def pricefeed_close() -> None:
-        return None
-
-
-# Optional Telegram text sender (for debug paths)
-try:
-    from utils_pkg.telegram_utils import send_text as _tg_send_text  # type: ignore
-except Exception:  # pragma: no cover
-    _tg_send_text = None  # type: ignore
-
-
-# Raydium scanner (lazy import – actual usage in later sections)
-def _get_raydium_scanner():
-    try:
-        from scanner.raydium_scanner import scan_raydium  # type: ignore
-
-        return scan_raydium
+        if inspect.isclass(cls_or_fn):
+            init = getattr(cls_or_fn, "__init__", None)
+            if callable(init):
+                return _filter_kwargs(init, kwargs)
+        return _filter_kwargs(cls_or_fn, kwargs)
     except Exception:
-        return None
+        return kwargs
 
 
-# ===========================================================================
-# Solana tx confirmation helpers
-# ===========================================================================
-def _rpc_url() -> str:
-    return (
-        os.getenv("SOLANA_RPC_URL")
-        or os.getenv("RPC_URL")
-        or getattr(C, "RPC_URL", "https://api.mainnet-beta.solana.com")
-    )
+async def _call_maybe_async(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    res = fn(*args, **kwargs)
+    if inspect.isawaitable(res):
+        return await res
+    return res
 
 
-def _confirm_commitment() -> str:
-    return os.getenv("CONFIRM_COMMITMENT", getattr(C, "COMMITMENT", "confirmed"))
+def _threadify_sync_modules_enabled() -> bool:
+    return _envb("MAIN_THREADIFY_SYNC_MODULES", False)
 
 
-def _confirm_timeout_sec() -> float:
+async def _call_possibly_blocking(fn: Any, *args: Any, **kwargs: Any) -> Any:
     try:
-        return float(os.getenv("CONFIRM_TIMEOUT_SEC", "25"))
+        is_coro_fn = inspect.iscoroutinefunction(fn)
     except Exception:
-        return 25.0
+        is_coro_fn = False
 
+    if is_coro_fn:
+        return await _call_maybe_async(fn, *args, **kwargs)
 
-async def _get_sig_status(sig: str) -> Optional[dict]:
-    if httpx is None:
-        return None
-    body = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getSignatureStatuses",
-        "params": [[sig], {"searchTransactionHistory": True}],
-    }
-    async with httpx.AsyncClient(timeout=10) as c:  # type: ignore[attr-defined]
-        r = await c.post(_rpc_url(), json=body)
-        r.raise_for_status()
-        j = r.json()
-        val = (j.get("result") or {}).get("value") or []
-        return val[0] if val else None
+    if _threadify_sync_modules_enabled():
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
+    return await _call_maybe_async(fn, *args, **kwargs)
 
-async def _confirm_sig(sig: str) -> Tuple[bool, Optional[str]]:
-    import time as _time
 
-    deadline = _time.monotonic() + _confirm_timeout_sec()
-    want = _confirm_commitment()
-    ok_states = {"confirmed", "finalized"}
+def _install_loop_exception_handler() -> None:
+    with contextlib.suppress(Exception):
+        loop = asyncio.get_running_loop()
 
-    while _time.monotonic() < deadline:
-        st = await _get_sig_status(sig)
-        if st:
-            err = st.get("err")
-            conf = (st.get("confirmationStatus") or "").lower()
-            slot = st.get("slot")
-            if err is None and conf in ok_states:
-                if want == "finalized" and conf != "finalized":
-                    await asyncio.sleep(0.35)
-                    continue
-                return True, str(slot)
-            if err is not None:
-                return False, f"rpc_error:{err}"
-        await asyncio.sleep(0.35)
-
-    return False, "timeout"
-
-# ===========================================================================
-# ENV helpers
-# ===========================================================================
-def _as_bool(s: str, default: bool = False) -> bool:
-    try:
-        return s.strip().lower() in ("1", "true", "yes", "on")
-    except Exception:
-        return default
-
-
-def _as_float(val: Any, default: float) -> float:
-    try:
-        return float(val)
-    except Exception:
-        return default
-
-
-def _as_int(val: Any, default: int) -> int:
-    try:
-        return int(val)
-    except Exception:
-        return default
-
-
-CANDIDATE_DEBUG_ENABLED = _as_bool(os.getenv("CANDIDATE_DEBUG_ENABLED", "0"), False)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv(
-    "ALERTS_TELEGRAM_BOT_TOKEN"
-)
-TELEGRAM_DEBUG_CHAT_ID = os.getenv("TELEGRAM_DEBUG_CHAT_ID") or os.getenv(
-    "TELEGRAM_CHAT_ID"
-)
-
-
-async def _send_telegram_debug(msg: str) -> None:
-    """
-    Fire-and-forget tiny debug message to Telegram (for candidate / momentum
-    debugging). Completely optional and never allowed to crash the process.
-    """
-    if not CANDIDATE_DEBUG_ENABLED:
-        return
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_DEBUG_CHAT_ID:
-        return
-    if aiohttp is None:
-        return
-
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_DEBUG_CHAT_ID,
-            "text": msg[:1000],
-            "disable_web_page_preview": True,
-        }
-        timeout = aiohttp.ClientTimeout(total=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            await session.post(url, json=payload)
-    except Exception:
-        # Debug only – never crash on failure
-        with contextlib.suppress(Exception):
-            print(
-                "[telegram-debug] failed to send message",
-                file=sys.stderr,
-                flush=True,
-            )
-
-# ===========================================================================
-# DSN NORMALIZER (used by ai_db / backtest / PnL)
-# ===========================================================================
-def _dsn_to_asyncpg(dsn: str | None) -> str:
-    """
-    Normalize a DSN into something asyncpg understands:
-      - strip +asyncpg driver suffixes
-      - keep postgres:// / postgresql:// prefixes
-    """
-    if not dsn:
-        return ""
-    s = dsn.strip()
-    if not s:
-        return ""
-    s_low = s.lower()
-    if s_low.startswith("postgresql+asyncpg://"):
-        s = "postgresql://" + s.split("://", 1)[1]
-    elif s_low.startswith("postgres+asyncpg://"):
-        s = "postgres://" + s.split("://", 1)[1]
-    return s
-
-
-def _pick_env_dsn() -> Tuple[str, str, str]:
-    """
-    Choose PnL and generic PG DSNs from env, normalize both for asyncpg, and
-    return (pnl_dsn_asyncpg, pg_dsn_asyncpg, masked_host_db).
-
-    Includes Render-style SNIPER_DB_DSN plus generic DATABASE_URL / PG_DSN,
-    as well as config.POSTGRES_DSN.
-    """
-    cfg_pg = getattr(C, "POSTGRES_DSN", "") or ""
-    raw_candidates = [
-        os.getenv("PNL_DSN"),
-        os.getenv("AI_DB_DSN"),
-        os.getenv("SNIPER_DB_DSN"),
-        os.getenv("TELEMETRY_PG_DSN"),
-        os.getenv("PG_DSN"),
-        os.getenv("DATABASE_URL"),
-        os.getenv("POSITIONS_PG_DSN"),
-        os.getenv("PG_DSN_INTERNAL"),
-        os.getenv("PG_DSN_EXTERNAL"),
-        cfg_pg,
-    ]
-    pnl_raw = next((x for x in raw_candidates if x and x.strip()), "") or ""
-
-    pg_raw = (
-        os.getenv("PG_DSN")
-        or os.getenv("DATABASE_URL")
-        or os.getenv("SNIPER_DB_DSN")
-        or os.getenv("PG_DSN_INTERNAL")
-        or os.getenv("PG_DSN_EXTERNAL")
-        or os.getenv("POSITIONS_PG_DSN")
-        or cfg_pg
-        or ""
-    ).strip()
-
-    pnl_async = _dsn_to_asyncpg(pnl_raw)
-    pg_async = _dsn_to_asyncpg(pg_raw)
-
-    def _mask(s: str) -> str:
-        if not s:
-            return ""
-        try:
-            body = s.split("://", 1)[1]
-            after_at = body.split("@", 1)[-1]
-            host_db = after_at.split("?", 1)[0]
-            return host_db
-        except Exception:
-            return "<dsn>"
-
-    return pnl_async, pg_async, (_mask(pnl_async) or _mask(pg_async) or "")
-
-
-_PNL_DSN_ASYNC, _PG_DSN_ASYNC, _PG_DSN_MASK = _pick_env_dsn()
-
-# ===========================================================================
-# Config (env) – ENTRY, EXIT, RISK, REGIME, AI (thin layer over config.py)
-# ===========================================================================
-
-# Exit engine / auto-sell toggles:
-_RAW_EXIT_ENABLED = _as_bool(
-    os.getenv("EXIT_ENGINE_ENABLED", os.getenv("EXIT_ENGINE", "")),
-    True,
-)
-_AUTO_SELL_ENABLED = bool(
-    getattr(C, "AUTO_SELL_ENABLED", _as_bool(os.getenv("AUTO_SELL_ENABLED", "0"), False))
-)
-
-ENABLE_EXIT_ENGINE = (
-    _RAW_EXIT_ENABLED
-    or _AUTO_SELL_ENABLED
-    or _as_bool(os.getenv("ENABLE_EXIT_ENGINE", "0"), False)
-)
-EXIT_ENGINE_ENABLED = ENABLE_EXIT_ENGINE
-
-DEDUPE_ENABLED = _as_bool(os.getenv("PF_DEDUPE_ENABLED", "1"), True)
-DEDUPE_TTL_SEC = _as_int(os.getenv("PF_DEDUPE_TTL_SEC", "3600"), 3600)
-LIQ_FILTER_ENABLED = _as_bool(os.getenv("ENTRY_LIQ_FILTER", "1"), True)
-
-# Core AI entry / scoring toggles (backed by config.py)
-AI_ENTRY_ENABLED: bool = bool(
-    getattr(C, "AI_ENTRY_ENABLED", _as_bool(os.getenv("AI_ENTRY_ENABLED", "0"), False))
-)
-
-AI_ENTRY_SCORE_MIN: float = float(
-    getattr(
-        C,
-        "AI_SCORE_SOFT_FLOOR",
-        _as_float(os.getenv("AI_ENTRY_SCORE_MIN", "0.0"), 0.0),
-    )
-)
-
-AI_ENTRY_SCORE_HARD_MIN: float = float(
-    getattr(
-        C,
-        "AI_SCORE_HARD_FLOOR",
-        _as_float(os.getenv("AI_ENTRY_SCORE_HARD_MIN", "0.0"), 0.0),
-    )
-)
-
-AI_ENTRY_RISK_ADJ_MIN: float = float(
-    getattr(
-        C,
-        "AI_SCORE_GATE",
-        _as_float(os.getenv("AI_ENTRY_RISK_ADJ_MIN", "0.0"), 0.0),
-    )
-)
-
-# Risk-capacity / smart-wallet gating – shared with ai_entry_logic + backtest
-ENTRY_REQUIRE_RISK_CAPACITY: bool = bool(
-    getattr(
-        C,
-        "ENTRY_REQUIRE_RISK_CAPACITY",
-        _as_bool(os.getenv("ENTRY_REQUIRE_RISK_CAPACITY", "0"), False),
-    )
-)
-ENTRY_MIN_RISK_CAPACITY: float = float(
-    getattr(
-        C,
-        "ENTRY_RISK_CAPACITY_MIN",
-        _as_float(os.getenv("ENTRY_MIN_RISK_CAPACITY", "0.0"), 0.0),
-    )
-)
-ENTRY_MAX_RISK_CAPACITY: float = _as_float(
-    os.getenv("ENTRY_MAX_RISK_CAPACITY", os.getenv("MAX_RISK_CAPACITY", "1.0")),
-    1.0,
-)
-
-SMART_WALLET_FILTER_ENABLED: bool = _as_bool(
-    os.getenv("SMART_WALLET_FILTER_ENABLED", "0"),
-    False,
-)
-SMART_WALLET_MIN_SCORE: float = _as_float(
-    os.getenv("SMART_WALLET_MIN_SCORE", "0.0"),
-    0.0,
-)
-SMART_WALLET_REQUIRE_FLAG: bool = _as_bool(
-    os.getenv("SMART_WALLET_REQUIRE_FLAG", "0"),
-    False,
-)
-
-# Regime-aware sizing & filters (wired to utils_pkg.regime.regime_state later)
-REGIME_AWARE_SIZING_ENABLED: bool = _as_bool(
-    os.getenv("REGIME_AWARE_SIZING_ENABLED", "1"),
-    True,
-)
-REGIME_BLOCK_RISK_OFF_ENTRIES: bool = _as_bool(
-    os.getenv("REGIME_BLOCK_RISK_OFF_ENTRIES", "0"),
-    False,
-)
-REGIME_FORCE_MODE: str = (os.getenv("REGIME_FORCE_MODE") or "").strip().lower()
-# expected values: "", "risk_off", "normal", "risk_on"
-
-# Momentum / entry window (Strategy wiring is later)
-ENTRY_MOMENTUM_ENABLED = bool(
-    getattr(
-        C,
-        "ENTRY_MOMENTUM_ENABLED",
-        _as_bool(os.getenv("ENTRY_MOMENTUM_ENABLED", "1"), True),
-    )
-)
-ENTRY_MOMO_WINDOW_SEC = int(
-    getattr(
-        C,
-        "ENTRY_MOMO_WINDOW_SEC",
-        _as_int(os.getenv("ENTRY_MOMO_WINDOW_SEC", "10"), 10),
-    )
-)
-ENTRY_MOMO_MIN_TRADES = int(
-    getattr(
-        C,
-        "ENTRY_MOMO_MIN_TRADES",
-        _as_int(os.getenv("ENTRY_MOMO_MIN_TRADES", "6"), 6),
-    )
-)
-ENTRY_MOMO_MIN_UP_PCT = float(
-    getattr(
-        C,
-        "ENTRY_MOMO_MIN_UP_PCT",
-        _as_float(os.getenv("ENTRY_MOMO_MIN_UP_PCT", "5"), 5.0),
-    )
-)
-ENTRY_MOMO_PRICE_TRIES = _as_int(os.getenv("ENTRY_MOMO_PRICE_TRIES", "4"), 4)
-ENTRY_MOMO_PRICE_DELAY_S = _as_float(
-    os.getenv("ENTRY_MOMO_PRICE_DELAY_S", "0.7"), 0.7
-)
-ENTRY_MOMO_MAX_PARALLEL = max(
-    1, _as_int(os.getenv("ENTRY_MOMO_MAX_PARALLEL", "6"), 6)
-)
-
-# Allow momentum gate to proceed even if we don't have full pump.fun data.
-ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP = bool(
-    getattr(
-        C,
-        "ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP",
-        _as_bool(
-            os.getenv(
-                "ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP",
-                os.getenv("ENTRY_MOMO_ALLOW_NO_DATA", "0"),
-            ),
-            False,
-        ),
-    )
-)
-
-# Some early-entry knobs that still live only here:
-MIN_INITIAL_BUY_SOL = _as_float(os.getenv("ENTRY_MIN_BUY_SOL", "0.0"), 0.0)
-MAX_NAME_LEN = _as_int(os.getenv("ENTRY_MAX_NAME_LEN", "40"), 40)
-ENTRY_MAX_AGE_MIN = _as_int(os.getenv("ENTRY_MAX_AGE_MIN", "20"), 20)
-MIN_POOL_AGE_MIN = _as_int(
-    os.getenv("MIN_POOL_AGE_MIN", str(getattr(C, "MIN_POOL_AGE_MIN", 3))),
-    getattr(C, "MIN_POOL_AGE_MIN", 3),
-)
-# Separate cap for Raydium runners (in minutes) – used only for pool="raydium".
-RAY_MAX_AGE_MIN = _as_float(os.getenv("RAY_MAX_AGE_MIN", "1440"), 1440.0)
-
-SYMBOL_BLACKLIST = {
-    s.strip().upper()
-    for s in os.getenv("ENTRY_SYMBOL_BLACKLIST", "RUG,SCAM").split(",")
-    if s.strip()
-}
-
-MAX_CONCURRENCY = max(
-    1, _as_int(os.getenv("PF_MAX_CONCURRENT", str(getattr(C, "PF_MAX_CONCURRENT", 2))), 2)
-)
-LOOP_COOLDOWN_SEC = _as_float(os.getenv("PF_COOLDOWN_SEC", "15"), 15.0)
-MAX_TRADEABLE = _as_int(os.getenv("MAX_TRADEABLE", "0"), 0)  # 0 = unlimited
-PAUSE_TRADING = bool(getattr(C, "PAUSE_TRADING", _as_bool(os.getenv("PAUSE_TRADING", "0"), False)))
-DEBUG_TX = _as_bool(os.getenv("PF_DEBUG_TX", "0"), False)
-
-# ---- AI OK notification controls ----
-AI_NOTIFY_MIN_SCORE = float(os.getenv("AI_NOTIFY_MIN_SCORE", "0.60"))
-AI_NOTIFY_MIN_PRE_SCORE = float(os.getenv("AI_NOTIFY_MIN_PRE_SCORE", "0.40"))
-TG_AI_OK_NOTIFY = os.getenv("TG_AI_OK_NOTIFY", "1")
-
-# Pools filter (affects printing and Raydium scanner scheduling)
-_POOLS_ENV = [
-    p.strip().lower()
-    for p in (os.getenv("PF_POOLS") or "").split(",")
-    if p.strip()
-]
-POOLS_FILTER: set[str] = set(_POOLS_ENV)
-
-# Daily PnL env
-DAILY_PNL_ENABLED = _as_bool(os.getenv("DAILY_PNL_ENABLED", "1"), True)
-DAILY_PNL_HOUR_UTC = _as_int(os.getenv("DAILY_PNL_HOUR_UTC", "23"), 23)
-DAILY_PNL_TEST_NOW = _as_bool(os.getenv("DAILY_PNL_TEST_NOW", "0"), False)
-DAILY_PNL_CHAT_ID = (
-    os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or ""
-).strip()
-DAILY_PNL_BOT = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-DAILY_PNL_DEBOUNCE_MIN = _as_int(os.getenv("DAILY_PNL_DEBOUNCE_MIN", "10"), 10)
-
-# Scanner + dedupe tuning
-RAYDIUM_SCAN_INTERVAL_SEC = _as_float(
-    os.getenv("RAYDIUM_SCAN_INTERVAL_SEC", "30"), 30.0
-)
-PF_GATE_TTL_SEC = _as_int(
-    os.getenv(
-        "PF_GATE_TTL_SEC",
-        str(max(ENTRY_MOMO_WINDOW_SEC * 2, 60)),
-    ),
-    max(ENTRY_MOMO_WINDOW_SEC * 2, 60),
-)
-PF_BUY_TTL_SEC = _as_int(os.getenv("PF_BUY_TTL_SEC", "600"), 600)
-
-# Buy-hook Telegram toggles (optional) – defaults ON for visibility
-NOTIFY_BUY_SUBMITTED = _as_bool(os.getenv("NOTIFY_BUY_SUBMITTED", "1"), True)
-NOTIFY_BUY_FAILED = _as_bool(os.getenv("NOTIFY_BUY_FAILED", "1"), True)
-NOTIFY_BUY_FILLED = _as_bool(os.getenv("NOTIFY_BUY_FILLED", "1"), True)
-
-# Health / Sentry
-HEALTH_PORT = _as_int(os.getenv("HEALTH_PORT", "0"), 0)
-SENTRY_DSN = (os.getenv("SENTRY_DSN") or "").strip()
-
-# Risk manager toggles (loop wired later)
-RISK_MANAGER_ENABLED = _as_bool(os.getenv("RISK_MANAGER_ENABLED", "1"), True)
-RISK_MANAGER_POLL_SEC = _as_float(
-    os.getenv("RISK_MANAGER_POLL_SEC", "60"), 60.0
-)
-
-# ===========================================================================
-# Exit env (shared by Strategy / exit loop) + thresholds
-# ===========================================================================
-# Hard stop loss (pct below entry, e.g. 8 => -8%)
-EXIT_STOP_LOSS_PCT = float(
-    getattr(
-        C,
-        "EXIT_STOP_LOSS_PCT",
-        _as_float(os.getenv("EXIT_STOP_LOSS_PCT", os.getenv("PF_SL_PCT", "8.0")), 8.0),
-    )
-)
-
-# Time-based stagnation exit (minutes + min move in either direction)
-EXIT_STAGNANT_MAX_MIN = float(
-    getattr(
-        C,
-        "EXIT_STAGNANT_MAX_MIN",
-        _as_float(os.getenv("EXIT_STAGNANT_MAX_MIN", "10.0"), 10.0),
-    )
-)
-EXIT_STAGNANT_MIN_MOVE_PCT = float(
-    getattr(
-        C,
-        "EXIT_STAGNANT_MIN_MOVE_PCT",
-        _as_float(os.getenv("EXIT_STAGNANT_MIN_MOVE_PCT", "5.0"), 5.0),
-    )
-)
-
-# Trailing stop thresholds:
-# - PF_TSL_ARM_PCT: arm trailing stop once peak gain >= this
-# - PF_TSL_PCT: allowed drawdown from hi-water (e.g. 4.5 => sell after -4.5% from peak)
-PF_TSL_ARM_PCT = float(
-    getattr(C, "PF_TSL_ARM_PCT", _as_float(os.getenv("PF_TSL_ARM_PCT", "10.0"), 10.0))
-)
-PF_TSL_PCT = float(
-    getattr(C, "PF_TSL_PCT", _as_float(os.getenv("PF_TSL_PCT", "4.5"), 4.5))
-)
-
-# Optional take-profit threshold (not mandatory, but useful if exit loop uses it)
-EXIT_TAKE_PROFIT_PCT = _as_float(os.getenv("EXIT_TP_PCT", "0.0"), 0.0)
-
-# ===========================================================================
-# Small helpers
-# ===========================================================================
-def _get_first(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return default
-
-
-def _extract_symbol(msg: Dict[str, Any]) -> str:
-    return str(_get_first(msg, "symbol", "ticker", default="")).strip()
-
-
-def _extract_name(msg: Dict[str, Any]) -> str:
-    return str(_get_first(msg, "name", default="")).strip()
-
-
-def _extract_raw_mint(msg: Dict[str, Any]) -> str:
-    raw = _get_first(
-        msg,
-        "mint",
-        "mintAddress",
-        "mint_address",
-        "bondingCurve",
-        "bonding_curve",
-        "address",
-        "id",
-        default="",
-    )
-    return ("" if raw is None else str(raw)).strip()
-
-
-def _approx_minutes_since(ts_any: Any) -> Optional[float]:
-    try:
-        now = _dt.datetime.now(_dt.timezone.utc).timestamp()
-        if ts_any is None:
-            return None
-        if isinstance(ts_any, (int, float)):
-            t = float(ts_any)
-            if t > 10_000_000_000:  # ms → s
-                t /= 1000.0
-            return max(0.0, (now - t) / 60.0)
-        if isinstance(ts_any, str):
-            s = ts_any.strip()
-            if not s:
-                return None
-            try:
-                f = float(s)
-                if f > 10_000_000_000:
-                    f /= 1000.0
-                return max(0.0, (now - f) / 60.0)
-            except Exception:
-                pass
-            try:
-                dt = _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
-                return max(0.0, (now - dt.timestamp()) / 60.0)
-            except Exception:
-                return None
-    except Exception:
-        return None
-    return None
-
-
-def utc_today_iso() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).date().isoformat()
-
-# ===========================================================================
-# Basic filters (pre-momentum / pre-expensive work)
-# ===========================================================================
-def _passes_basic_filters(msg: Dict[str, Any]) -> bool:
-    """
-    Very early guardrail filter before we do any heavy work.
-    Uses global env/config-derived thresholds so behaviour is consistent
-    across runtime.
-    """
-    pool = str((_get_first(msg, "pool", default="") or "")).strip().lower()
-    is_raydium = pool == "raydium"
-
-    # Pool allow-list (PF_POOLS)
-    if POOLS_FILTER and pool and pool not in POOLS_FILTER:
-        if DEBUG_TX:
-            print(
-                f".[filter] pool '{pool}' not in {sorted(POOLS_FILTER)} — skip",
-                flush=True,
-            )
-        return False
-
-    # For non-Raydium, require "create" events
-    typ = str(_get_first(msg, "txType", "type", default="")).strip().lower()
-    if not is_raydium and typ != "create":
-        return False
-
-    # Minimum initial buy (SOL) for non-Raydium events
-    init_buy = _as_float(
-        _get_first(msg, "initialBuy", "initial_buy", default=0.0),
-        0.0,
-    )
-    if (not is_raydium) and MIN_INITIAL_BUY_SOL > 0 and init_buy < MIN_INITIAL_BUY_SOL:
-        if DEBUG_TX:
-            print(
-                f".[filter] initialBuy {init_buy} < min {MIN_INITIAL_BUY_SOL} — skip",
-                flush=True,
-            )
-        return False
-
-    # Symbol blacklist (SCAM / RUG etc.)
-    sym = _extract_symbol(msg).upper()
-    if SYMBOL_BLACKLIST and any(
-        bad and bad in sym for bad in SYMBOL_BLACKLIST
-    ):
-        if DEBUG_TX:
-            print(
-                f".[filter] symbol '{sym}' hits blacklist {sorted(SYMBOL_BLACKLIST)} — skip",
-                flush=True,
-            )
-        return False
-
-    # Name length sanity check
-    nm = _extract_name(msg)
-    if MAX_NAME_LEN > 0 and len(nm) > MAX_NAME_LEN:
-        if DEBUG_TX:
-            print(
-                f".[filter] name too long ({len(nm)} > {MAX_NAME_LEN}) — skip",
-                flush=True,
-            )
-        return False
-
-    # Token age (ENTRY_MAX_AGE_MIN, except Raydium where we allow a separate cap)
-    mins_since_token = _approx_minutes_since(
-        _get_first(
-            msg,
-            "created_at",
-            "createdAt",
-            "timestamp",
-            "ts",
-            default=None,
-        )
-    )
-    if mins_since_token is not None:
-        if is_raydium:
-            # Raydium can be used for mid/late runners; cap separately via RAY_MAX_AGE_MIN
-            if RAY_MAX_AGE_MIN > 0 and mins_since_token > RAY_MAX_AGE_MIN:
-                if DEBUG_TX:
-                    print(
-                        f".[filter] RAY token age {mins_since_token:.1f}m > {RAY_MAX_AGE_MIN}m — skip",
-                        flush=True,
-                    )
-                return False
-        else:
-            if ENTRY_MAX_AGE_MIN > 0 and mins_since_token > ENTRY_MAX_AGE_MIN:
-                if DEBUG_TX:
-                    print(
-                        f".[filter] token age {mins_since_token:.1f}m > {ENTRY_MAX_AGE_MIN}m — skip",
-                        flush=True,
-                    )
-                return False
-
-    # Pool age (MIN_POOL_AGE_MIN)
-    mins_since_pool = _approx_minutes_since(
-        _get_first(msg, "poolCreatedAt", "pool_created_at", default=None)
-    )
-    if (
-        mins_since_pool is not None
-        and MIN_POOL_AGE_MIN > 0
-        and mins_since_pool < MIN_POOL_AGE_MIN
-    ):
-        if DEBUG_TX:
-            print(
-                f".[filter] pool age {mins_since_pool:.1f}m < {MIN_POOL_AGE_MIN}m — skip",
-                flush=True,
-            )
-        return False
-
-    return True
-
-# ===========================================================================
-# Post-buy optional immediate sell test
-# ===========================================================================
-async def _post_buy_exit_test(mint_norm: str, tx_sig: str) -> None:
-    """
-    Optional post-buy path: if POSTBUY_MODE=immediate_sell_test, do a
-    quick Jupiter sell to verify routing & slippage behaviour in DRYRUN
-    environments. No-op in live mode.
-    """
-    if str(os.getenv("POSTBUY_MODE", "")).strip().lower() != "immediate_sell_test":
-        return
-    await asyncio.sleep(5)
-    try:
-        await sell_on_jupiter(mint_norm, pct_of_wallet=1.0)
-    except Exception:
-        if DEBUG_TX:
-            traceback.print_exc()
-
-# ===========================================================================
-# Liquidity retry helper
-# ===========================================================================
-async def _screen_with_retry(
-    mint: str,
-    tries: int = 3,
-    first_wait: float = 0.8,
-):
-    """
-    Re-try the liquidity screen a few times for "no_account" race conditions
-    when a pool is just spinning up.
-    """
-    wait = first_wait
-    last = None
-    for i in range(tries):
-        ok, rep = await screen_token(mint)
-        last = rep
-        if ok:
-            return True, rep
-        if str((rep or {}).get("reason")) != "no_account":
-            return False, rep
-        if i < tries - 1:
-            if DEBUG_TX:
-                print(
-                    f"[liquidity] retrying for {mint} (no_account) in {wait:.2f}s",
-                    flush=True,
-                )
-            await asyncio.sleep(wait)
-            wait *= 1.6
-    return False, last
-
-
-async def _await_mint_ready(
-    mint_norm: str,
-    max_wait_s: int = 45,
-    step_s: float = 3.0,
-) -> Optional[int]:
-    """
-    Wait for router.get_decimals() to succeed for a new mint, up to max_wait_s.
-    This is mainly a UX helper to avoid insta-failing brand new pools.
-    """
-    if _route_get_decimals is None:
-        return None
-    waited = 0.0
-    while waited < max_wait_s:
-        try:
-            dec = await _route_get_decimals(mint_norm)  # type: ignore
-            if isinstance(dec, int) and 0 <= dec <= 18:
-                return dec
-        except Exception:
-            pass
-        await asyncio.sleep(step_s)
-        waited += step_s
-    return None
-
-# ===========================================================================
-# Boot: ensure keypair file
-# ===========================================================================
-def _ensure_keypair_file() -> None:
-    """
-    Make sure ~/.config/solana/id.json exists. If not, and KEYPAIR_JSON /
-    SOLANA_KEYPAIR_JSON is provided, write it with chmod 600.
-    """
-    import pathlib
-    import stat
-
-    try:
-        home = os.path.expanduser("~")
-        cfg_dir = pathlib.Path(home) / ".config" / "solana"
-        key_path = cfg_dir / "id.json"
-        if key_path.exists():
-            return
-        raw = os.getenv("KEYPAIR_JSON") or os.getenv("SOLANA_KEYPAIR_JSON")
-        if not raw:
-            log.event(
-                "KEYPAIR_ENV_MISSING",
-                hint="set KEYPAIR_JSON to auto-create wallet",
-            )
-            return
-        kp = json.loads(raw)
-        if not (
-            isinstance(kp, list)
-            and len(kp) == 64
-            and all(isinstance(x, int) for x in kp)
-        ):
-            raise ValueError("KEYPAIR_JSON must be a JSON array of 64 integers")
-        cfg_dir.mkdir(parents=True, exist_ok=True)
-        key_path.write_text(json.dumps(kp), encoding="utf-8")
-        key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
-        with contextlib.suppress(Exception):
-            cfg_dir.chmod(stat.S_IRWXU)
-        log.event("KEYPAIR_FILE_WRITTEN", path=str(key_path))
-    except Exception as e:
-        try:
-            log.event("KEYPAIR_FILE_WRITE_FAIL", error=str(e))
-        except Exception:
-            print(f"[boot] could not write wallet: {e}", flush=True)
-
-# ===========================================================================
-# BUY HOOKS (submitted / filled / failed)
-# ===========================================================================
-_AM_SINGLETON: Optional[AlertManager] = None
-
-
-def _am() -> AlertManager:
-    """
-    Global AlertManager singleton so we don't recreate clients/sessions.
-    """
-    global _AM_SINGLETON
-    if _AM_SINGLETON is None:
-        _AM_SINGLETON = AlertManager()
-    return _AM_SINGLETON
-
-
-def _normalize_spend_sol(d: Dict[str, Any]) -> float:
-    """
-    Ensure we always have a numeric 'spend_sol' field on buy payloads/events.
-
-    Priority:
-      1) explicit SOL-sized fields:
-         - d["spend_sol"]
-         - d["amount_sol"]
-         - d["size_sol"]
-         - d["size"]
-      2) lamport-sized fields (converted to SOL):
-         - d["lamports_in"]
-         - d["in_amount_raw"]
-         - d["amount_raw"]
-      3) 0.0 (last resort – but normally one of the above exists)
-
-    The normalized value is also written back into d["spend_sol"] so any
-    downstream consumers (exit engine, PnL, alerts) see the same value.
-    """
-    cand = d.get("spend_sol", None)
-
-    # --- SOL-sized candidates first ---
-    if cand in (None, "", 0, 0.0):
-        for k in ("amount_sol", "size_sol", "size"):
-            v = d.get(k, None)
-            if v not in (None, ""):
-                cand = v
-                break
-
-    # --- If still empty, try lamport-sized keys and convert to SOL ---
-    if cand in (None, "", 0, 0.0):
-        lamports_val = None
-        for k in ("lamports_in", "in_amount_raw", "amount_raw"):
-            v = d.get(k, None)
-            if v not in (None, ""):
-                lamports_val = v
-                break
-
-        if lamports_val is not None:
-            try:
-                lamports_f = float(lamports_val)
-                lps = float(globals().get("LAMPORTS_PER_SOL", 1_000_000_000))
-                cand = lamports_f / lps
-            except Exception:
-                cand = 0.0
-
-    # --- Final numeric normalization ---
-    try:
-        spend = float(cand) if cand not in (None, "") else 0.0
-    except Exception:
-        spend = 0.0
-
-    if spend < 0:
-        spend = 0.0
-
-    d["spend_sol"] = spend
-    return spend
-
-
-async def log_entry_from_meta(
-    *,
-    mint: str,
-    entry_meta: Dict[str, Any],
-    ui: Dict[str, Any],
-    sig: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Normalize router entry_meta and cache a compact view in Redis for
-    diagnostics / downstream consumers.
-
-    - ensures lamports_in and amount_raw are ints
-    - derives spend_sol via _normalize_spend_sol
-    - emits ENTRY_META_NORMALIZED structured log
-    - best-effort Redis cache: entry_meta:{mint}
-    """
-    meta: Dict[str, Any] = dict(entry_meta or {})
-
-    # Normalize lamports_in / amount_raw
-    lamports_in = int(
-        meta.get("in_amount_raw")
-        or meta.get("lamports_in")
-        or meta.get("amount_in_raw")
-        or 0
-    )
-    amount_raw = int(meta.get("amount_raw") or meta.get("out_raw") or 0)
-
-    meta["lamports_in"] = lamports_in
-    meta["amount_raw"] = amount_raw
-
-    # Build a small payload to reuse our spend_sol normalization helper
-    payload: Dict[str, Any] = {
-        "mint": mint,
-        "symbol": ui.get("symbol") or ui.get("name") or meta.get("symbol"),
-        "pool": ui.get("pool") or meta.get("pool") or "unknown",
-        "lamports_in": lamports_in,
-        "in_amount_raw": lamports_in,
-        "amount_raw": amount_raw,
-        "spend_sol": meta.get("spend_sol"),
-    }
-
-    spend_sol = _normalize_spend_sol(payload)
-    meta["spend_sol"] = spend_sol
-
-    # Structured log for debugging / telemetry
-    try:
-        log.event(
-            "ENTRY_META_NORMALIZED",
-            mint=mint,
-            symbol=payload.get("symbol"),
-            pool=payload.get("pool"),
-            lamports_in=lamports_in,
-            amount_raw=amount_raw,
-            spend_sol=spend_sol,
-            sig=sig,
-            priceImpactPct=meta.get("priceImpactPct"),
-        )
-    except Exception:
-        pass
-
-    # Best-effort Redis cache for external diagnostics / scripts
-    try:
-        if redis is not None:
-            key = f"entry_meta:{mint}"
-            data = json.dumps(
-                {
-                    "mint": mint,
-                    "symbol": payload.get("symbol"),
-                    "pool": payload.get("pool"),
-                    "lamports_in": lamports_in,
-                    "amount_raw": amount_raw,
-                    "spend_sol": spend_sol,
-                    "sig": sig,
-                    "priceImpactPct": meta.get("priceImpactPct"),
-                }
-            )
-            await redis.set(key, data, ex=24 * 3600)
-    except Exception:
-        # Redis failures are non-fatal and must never block trading
-        pass
-
-    return meta
-
-
-async def _buy_hook_submitted(payload: Dict[str, Any]) -> None:
-    """
-    Called when a BUY has been submitted to the router.
-
-    payload: {mint, pool, symbol, spend_sol?, amount_sol?, route, hint, ...}
-    """
-    # normalize size so everything downstream (logs, alerts, exit) sees a number
-    spend_sol = _normalize_spend_sol(payload)
-
-    # metrics
-    try:
-        bump("buys_submitted")
-    except Exception:
-        pass
-
-    # structured log
-    try:
-        log.event(
-            "BUY_SUBMITTED",
-            mint=payload.get("mint"),
-            symbol=payload.get("symbol"),
-            pool=payload.get("pool"),
-            route=payload.get("route"),
-            spend_sol=spend_sol,
-            hint=payload.get("hint"),
-        )
-    except Exception:
-        pass
-
-    # lightweight analytics hook (non-fatal)
-    try:
-        record_buy_result(
-            ok=True,
-            reason="submitted",
-            spend_sol=spend_sol,
-        )
-    except Exception:
-        pass
-
-    # Telegram/alerts (lightweight text on submission)
-    if NOTIFY_BUY_SUBMITTED:
-        try:
-            txt = (
-                f"🟡 Submitted BUY {payload.get('symbol') or ''}\n"
-                f"mint={payload.get('mint')}  route={payload.get('route') or 'auto'}  "
-                f"size={spend_sol or '—'} SOL"
-            )
-            create_task(_am().notify_text(txt))
-        except Exception as _e:
-            log.warning(
-                "ALERT_BUY_SUBMIT_FAIL",
-                extra={"err": str(_e)[:200]},
-            )
-
-# --- Notion (optional daily PnL sync) ---
-try:
-    # safe no-op if NOTION_ENABLED != 1 inside this helper
-    from utils_pkg.notion_pnl import push_daily_pnl
-except Exception:  # pragma: no cover
-
-    def push_daily_pnl(_snapshot):  # type: ignore[override]
-        return None
-
-
-# Debounce for intraday push after fills (seconds granularity)
-_LAST_NOTION_PUSH_TS: float = 0.0
-
-
-async def _notion_intraday_snapshot_push(note: str = "") -> None:
-    """
-    Lightweight intraday PnL snapshot push to Notion after a buy fill.
-    Debounced via DAILY_PNL_DEBOUNCE_MIN.
-    """
-    import time as _time
-
-    global _LAST_NOTION_PUSH_TS
-    try:
-        if os.getenv("NOTION_ENABLED", "0") != "1":
-            return
-
-        debounce_sec = int(os.getenv("DAILY_PNL_DEBOUNCE_MIN", "10")) * 60
-        now = _time.time()
-        if (now - _LAST_NOTION_PUSH_TS) < debounce_sec:
-            return
-
-        # very small snapshot (no price walk); safe + fast
-        # Helpers are defined later in this file.
-        unrl, open_n, _ = await _estimate_unrealized_from_positions()
-        realized, _ = await _estimate_realized_today()
-        wallet = await _get_wallet_sol_balance()
-
-        from datetime import date as _date
-
-        sn = {
-            "date": _date.today().isoformat(),
-            "realized_sol": realized,
-            "unrealized_sol": unrl,
-            "open_positions": open_n,
-            "wallet_sol": wallet,
-            "note": note or "auto intraday snapshot",
-        }
-        with contextlib.suppress(Exception):
-            push_daily_pnl(sn)
-        _LAST_NOTION_PUSH_TS = now
-    except Exception as e:
-        log.event("NOTION_INTRADAY_PUSH_FAIL", err=str(e))
-
-
-async def _buy_hook_filled(ev: Dict[str, Any]) -> None:
-    """
-    Called when the router reports a BUY fill.
-
-    ev: { mint, signature, symbol, spend_sol?, amount_sol?, pool, amount_raw?, ... }
-
-    Responsibilities:
-      - bump metrics
-      - structured logs
-      - primary alert (Telegram / AlertManager)
-      - optional intraday Notion snapshot
-      - NOTIFY EXIT ENGINE (so exit worker / auto_sell can manage
-        TP/SL/TSL/stagnation)
-
-    NOTE:
-      Because 'ev' is a dict passed by reference, normalizing ev["spend_sol"]
-      here ensures the exit engine sees the same non-zero size.
-    """
-    # No-op in DRYRUN / package-dryrun environments
-    if _dryrun_env_on() or _pkg_is_dryrun:
-        return
-
-    # normalize size (this is the value the exit engine + PnL will see)
-    spend_sol = _normalize_spend_sol(ev)
-
-    # metrics
-    try:
-        bump("buys_filled")
-    except Exception:
-        pass
-
-    # structured log
-    try:
-        log.event(
-            "BUY_FILLED",
-            mint=ev.get("mint"),
-            symbol=ev.get("symbol"),
-            pool=ev.get("pool"),
-            spend_sol=spend_sol,
-            sig=ev.get("signature"),
-        )
-    except Exception:
-        pass
-
-    # analytics hook (success)
-    try:
-        record_buy_result(
-            ok=True,
-            reason="filled",
-            spend_sol=spend_sol,
-        )
-    except Exception:
-        pass
-
-    # Primary alert path (AlertManager)
-    if NOTIFY_BUY_FILLED:
-        try:
-            create_task(
-                _am().notify_trade_fill(
-                    side="BUY",
-                    mint=ev.get("mint"),
-                    symbol=ev.get("symbol"),
-                    pool=ev.get("pool"),
-                    sig=ev.get("signature"),
-                    spend_sol=spend_sol,
-                    out_amount=ev.get("amount_raw"),  # if present
-                )
-            )
-        except Exception as _e:
-            log.warning(
-                "ALERT_BUY_FILLED_FAIL",
-                extra={"err": str(_e)[:200]},
-            )
-
-    # ✅ Push the fill into the exit engine so the sell worker
-    # has a guaranteed, normalized view of the position.
-    if EXIT_ENGINE_ENABLED:
-        try:
-            await exit_engine.on_buy_filled(ev)
-        except Exception as e:
-            try:
-                log.event(
-                    "EXIT_ENGINE_ON_BUY_FILLED_FAIL",
-                    err=str(e)[:200],
-                    mint=ev.get("mint"),
-                    symbol=ev.get("symbol"),
-                )
-            except Exception:
-                pass
-
-    # Kick an intraday Notion push (debounced, safe if disabled)
-    asyncio.create_task(_notion_intraday_snapshot_push())
-
-
-async def _buy_hook_failed(payload: Dict[str, Any]) -> None:
-    """
-    Called when a BUY fails in the router.
-
-    payload: {mint, pool, symbol, spend_sol?, amount_sol?, route, hint, reason, error}
-    """
-    # normalize size for analytics
-    spend_sol = _normalize_spend_sol(payload)
-
-    # structured log
-    try:
-        log.event(
-            "BUY_FAILED",
-            mint=payload.get("mint"),
-            symbol=payload.get("symbol"),
-            pool=payload.get("pool"),
-            route=payload.get("route"),
-            spend_sol=spend_sol,
-            reason=payload.get("reason"),
-            error=payload.get("error"),
-        )
-    except Exception:
-        pass
-
-    # Alert
-    if NOTIFY_BUY_FAILED:
-        try:
-            txt = (
-                f"🔴 BUY FAILED {payload.get('symbol') or ''}\n"
-                f"mint={payload.get('mint')}  route={payload.get('route') or 'auto'}\n"
-                f"size={spend_sol or '—'} SOL\n"
-                f"reason={payload.get('reason') or '—'}  err={payload.get('error') or '—'}"
-            )
-            create_task(_am().notify_text(txt))
-        except Exception as _e:
-            log.warning(
-                "ALERT_BUY_FAILED_FAIL",
-                extra={"err": str(_e)[:200]},
-            )
-
-    # Optional telemetry for guardrails / analytics
-    try:
-        record_buy_result(
-            ok=False,
-            reason=str(payload.get("reason") or "failed"),
-            error=payload.get("error"),
-            spend_sol=spend_sol,
-        )
-    except Exception:
-        pass
-
-# ===========================================================================
-# Exit logging helpers (used by exit loop / ai_sell_logic)
-# ===========================================================================
-def exit_log_heartbeat(
-    *,
-    mint: str,
-    symbol: Optional[str],
-    age_s: float,
-    pnl_pct: float,
-    hi_water_pct: float,
-    move_pct: Optional[float] = None,
-) -> None:
-    """
-    Per-position heartbeat log emitted on each exit tick.
-
-    This is wired from the exit loop right after we compute PnL / hi-water / age,
-    but *before* we apply any exit rules.
-    """
-    try:
-        fields: Dict[str, Any] = {
-            "mint": mint,
-            "symbol": symbol,
-            "age_min": round(age_s / 60.0, 2),
-            "pnl_pct": round(pnl_pct, 2),
-            "hi_water_pct": round(hi_water_pct, 2),
-            "stagnant_max_min": EXIT_STAGNANT_MAX_MIN,
-            "stagnant_min_move_pct": EXIT_STAGNANT_MIN_MOVE_PCT,
-        }
-        if move_pct is not None:
-            fields["move_pct"] = round(move_pct, 2)
-        log.event("EXIT_TICK", **fields)
-    except Exception:
-        # logging must never block exits
-        pass
-
-
-def exit_log_stop_loss(
-    *,
-    mint: str,
-    symbol: Optional[str],
-    pnl_pct: float,
-) -> None:
-    """
-    Structured log when the hard stop-loss rule fires.
-    """
-    try:
-        log.event(
-            "EXIT_STOP_LOSS",
-            mint=mint,
-            symbol=symbol,
-            pnl_pct=round(pnl_pct, 2),
-            stop_loss_pct=EXIT_STOP_LOSS_PCT,
-        )
-    except Exception:
-        pass
-
-
-def exit_log_tsl_arm(
-    *,
-    mint: str,
-    symbol: Optional[str],
-    hi_water_pct: float,
-) -> None:
-    """
-    Structured log when trailing stop becomes armed for a position.
-    """
-    try:
-        log.event(
-            "EXIT_TSL_ARM",
-            mint=mint,
-            symbol=symbol,
-            hi_water_pct=round(hi_water_pct, 2),
-            arm_pct=PF_TSL_ARM_PCT,
-        )
-    except Exception:
-        pass
-
-
-def exit_log_tsl_hit(
-    *,
-    mint: str,
-    symbol: Optional[str],
-    hi_water_pct: float,
-    pnl_pct: float,
-) -> None:
-    """
-    Structured log when the trailing stop *fires* (sell triggered).
-    """
-    try:
-        log.event(
-            "EXIT_TSL_HIT",
-            mint=mint,
-            symbol=symbol,
-            hi_water_pct=round(hi_water_pct, 2),
-            pnl_pct=round(pnl_pct, 2),
-            tsl_drawdown_pct=PF_TSL_PCT,
-        )
-    except Exception:
-        pass
-
-
-def exit_log_stagnant(
-    *,
-    mint: str,
-    symbol: Optional[str],
-    age_min: float,
-    pnl_pct: float,
-    move_pct: float,
-) -> None:
-    """
-    Structured log when the stagnation rule fires (chop / no movement exit).
-    """
-    try:
-        log.event(
-            "EXIT_STAGNANT",
-            mint=mint,
-            symbol=symbol,
-            age_min=round(age_min, 2),
-            pnl_pct=round(pnl_pct, 2),
-            move_pct=round(move_pct, 2),
-            stagnant_max_min=EXIT_STAGNANT_MAX_MIN,
-            stagnant_min_move_pct=EXIT_STAGNANT_MIN_MOVE_PCT,
-        )
-    except Exception:
-        pass
-
-# ---------------------------
-# Strategy
-# ---------------------------
-class Strategy:
-    """
-    Core entry / execution engine (V3+++ / quant-grade)
-
-    Responsibilities:
-      - Handles new-token events from scanners (PumpPortal / Raydium / Dexscreener).
-      - Layered gates (in order):
-          1) Regime gate (macro risk-on/off, utils_pkg.regime)
-          2) Top guardrails (PAUSE_TRADING, MAX_TRADEABLE, buys_allowed())
-          3) Risk-capacity gate (ENTRY_REQUIRE_RISK_CAPACITY, min/max bounds)
-          4) Basic filters (age, name, blacklist, scanner metrics)
-          5) Smart-wallet guard (deployers / known bad actors)
-          6) Liquidity screen (utils_pkg.liquidity)
-          7) AI stack:
-               • feature_builder → feature dict
-               • optional ai_buy_scoring pre-gate
-               • ai_entry_logic main AI entry gate
-               • self_learning_ai_strategy hook (for live learning / overrides)
-               • risk-adjusted size (AI + regime + risk capacity)
-          8) Dedupe / momentum gate (pool-aware, windowed)
-          9) Final guardrails + buy via maybe_buy()
-
-      - Diagnostics / quant telemetry:
-          * DIAG_MINUTE
-          * POSITION_HEARTBEAT
-          * REGIME_HEARTBEAT
-          * per-gate rejection stats
-          * AI score buckets, pre-score stats, fast-lane counts
-          * risk-capacity + regime stats
-    """
-
-    def __init__(self) -> None:
-        # How many buys can run in parallel (use global MAX_CONCURRENCY)
-        self._sema = asyncio.Semaphore(MAX_CONCURRENCY)
-
-        # How many momentum gates can run in parallel
-        gate_max = _as_int(
-            os.getenv("ENTRY_MOMENTUM_MAX_PARALLEL", str(ENTRY_MOMO_MAX_PARALLEL)),
-            ENTRY_MOMO_MAX_PARALLEL,
-        )
-        self._gate_sema = asyncio.Semaphore(max(1, gate_max))
-
-        # Per-mint momentum state while we observe trades/prices in the window
-        # keyed by *raw mint* so on_trade() can update counts safely
-        self._gate_state: Dict[str, Dict[str, Any]] = {}
-
-        # Momentum config (mirrors env/constants)
-        self.momo_enabled: bool = bool(ENTRY_MOMENTUM_ENABLED)
-        self.momo_min_trades: int = int(ENTRY_MOMO_MIN_TRADES)
-        self.momo_min_up_pct: float = float(ENTRY_MOMO_MIN_UP_PCT)
-        self.momo_window_sec: int = int(ENTRY_MOMO_WINDOW_SEC)
-        self.momo_price_tries: int = int(ENTRY_MOMO_PRICE_TRIES)
-        self.momo_price_delay_s: float = float(ENTRY_MOMO_PRICE_DELAY_S)
-        self.momo_allow_no_data_pump: bool = bool(ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP)
-
-        # AI / feature gating (quant-grade)
-        self.ai_enabled: bool = bool(AI_ENTRY_ENABLED)
-        self.ai_min_score: float = float(AI_ENTRY_SCORE_MIN)
-        self.ai_hard_min_score: float = float(AI_ENTRY_SCORE_HARD_MIN)
-        self.ai_risk_adj_min: float = float(AI_ENTRY_RISK_ADJ_MIN)
-
-        # Optional "fast lane" for very strong AI scores (0–1 scaled)
-        self.ai_fastlane_score: float = _as_float(
-            os.getenv("AI_ENTRY_FASTLANE_SCORE", "0.9"),
-            0.9,
-        )
-
-        # Optional pre-AI buy scoring gate (utils_pkg.ai_buy_scoring)
-        self.ai_pre_enabled: bool = _as_bool(
-            os.getenv("AI_PRE_SCORE_ENABLED", "1"),
-            True,
-        )
-        self.ai_pre_min_score: float = _as_float(
-            os.getenv("AI_PRE_SCORE_MIN", "0.0"),
-            0.0,
-        )
-
-        # Risk-adjusted sizing (multipliers applied to spend_sol)
-        # final_size_factor ≈ clamp(ai_factor * regime_factor * cap_factor, [size_floor, size_cap])
-        self.size_floor: float = _as_float(
-            os.getenv("AI_ENTRY_SIZE_FLOOR", "0.5"),
-            0.5,
-        )
-        self.size_cap: float = _as_float(
-            os.getenv("AI_ENTRY_SIZE_CAP", "2.0"),
-            2.0,
-        )
-
-        # Regime / macro gate (optional, fail-open)
-        self.regime_enforced: bool = _as_bool(
-            os.getenv("REGIME_ENFORCED", "1"),
-            True,
-        )
-        self.regime_min_risk: float = _as_float(
-            os.getenv("REGIME_MIN_RISK_SCORE", "0.0"),
-            0.0,
-        )
-
-        # Lazy optional modules (all best-effort + fail-safe)
-        self._ai_mod = None
-        self._feat_mod = None
-        self._smart_mod = None
-        self._log_mod = None
-        self._regime_mod = None
-        self._score_mod = None
-        self._sl_mod = None
-        self._risk_mod = None
-
-        try:
-            import utils_pkg.ai_entry_logic as _ai_mod  # type: ignore
-            self._ai_mod = _ai_mod
-        except Exception:
-            self._ai_mod = None
-
-        try:
-            import utils_pkg.feature_builder as _feat_mod  # type: ignore
-            self._feat_mod = _feat_mod
-        except Exception:
-            self._feat_mod = None
-
-        try:
-            import utils_pkg.smart_wallets as _smart_mod  # type: ignore
-            self._smart_mod = _smart_mod
-        except Exception:
-            self._smart_mod = None
-
-        try:
-            import utils_pkg.data_logger as _log_mod  # type: ignore
-            self._log_mod = _log_mod
-        except Exception:
-            self._log_mod = None
-
-        try:
-            import utils_pkg.regime as _regime_mod  # type: ignore
-            self._regime_mod = _regime_mod
-        except Exception:
-            self._regime_mod = None
-
-        try:
-            import utils_pkg.ai_buy_scoring as _score_mod  # type: ignore
-            self._score_mod = _score_mod
-        except Exception:
-            self._score_mod = None
-
-        try:
-            import utils_pkg.self_learning_ai_strategy as _sl_mod  # type: ignore
-            self._sl_mod = _sl_mod
-        except Exception:
-            self._sl_mod = None
-
-        try:
-            import utils_pkg.risk_manager as _risk_mod  # type: ignore
-            self._risk_mod = _risk_mod
-        except Exception:
-            self._risk_mod = None
-
-        # Diagnostics (mirrored into DIAG_MINUTE)
-        self._diag: Dict[str, int] = {
-            "events_total": 0,
-            "events_trade": 0,
-            "events_new_token": 0,
-            # filter / guardrail rejections
-            "rejected_filters": 0,
-            "rejected_guardrails": 0,
-            "rejected_momo": 0,         # strict momentum rejections only
-            "rejected_ai": 0,           # AI gate rejections (incl. risk-adj)
-            "rejected_regime": 0,       # regime-based rejections
-            "rejected_risk_cap": 0,     # risk-capacity rejections
-            # AI stats
-            "ai_allowed": 0,
-            "ai_errors": 0,
-            "ai_score_low": 0,
-            "ai_score_mid": 0,
-            "ai_score_high": 0,
-            "ai_fastlane": 0,
-            "ai_pre_reject": 0,
-            # regime / capacity stats
-            "regime_risk_off": 0,
-            "regime_risk_on": 0,
-            "risk_cap_ok": 0,
-            "risk_cap_low": 0,
-            "risk_cap_high": 0,
-            # buy stats
-            "buys_submitted": 0,
-            "buys_filled": 0,
-        }
-
-    # ------------------------------------------------------------------ #
-    # Internal helpers
-    # ------------------------------------------------------------------ #
-    def _get_gate_state(self, mint_raw: str) -> Dict[str, Any]:
-        """
-        Safely get/create gate state for a raw mint.
-
-        This avoids KeyError races when gate-state is cleared or was never
-        initialised (e.g. dedupe / early return).
-        """
-        st = self._gate_state.get(mint_raw)
-        if st is None:
-            st = {}
-            self._gate_state[mint_raw] = st
-        return st
-
-    # ───────────────────────── Regime Gate ──────────────────────────────
-    def _regime_snapshot(self) -> Optional[Dict[str, Any]]:
-        """
-        Best-effort call into utils_pkg.regime (if available).
-
-        Expected (but not required) fields:
-          - state: str ("risk_on" / "risk_off" / ...)
-          - risk_score: float
-          - reason: str
-        """
-        if self._regime_mod is None:
-            return None
-        try:
-            fn = getattr(self._regime_mod, "get_regime_state", None) or getattr(
-                self._regime_mod, "current_regime", None
-            )
-            if not callable(fn):
-                return None
-            snap = fn()  # type: ignore[misc]
-            if not isinstance(snap, dict):
-                return None
-            return snap
-        except Exception:
-            if DEBUG_TX:
-                traceback.print_exc()
-            return None
-
-    def _regime_allows_entry(self, pool: str, symbol: str, mint: str) -> bool:
-        """
-        Regime-aware gate (fail-open):
-
-        - If REGIME_ENFORCED=0 or module missing → allow.
-        - If regime.risk_score < REGIME_MIN_RISK_SCORE → block new tokens.
-        - If regime.state == "risk_off" (or similar) → block, unless
-          REGIME_ALLOW_RAYDIUM_RISK_OFF=1 and pool=raydium.
-        """
-        if not self.regime_enforced or self._regime_mod is None:
-            return True
-
-        snap = self._regime_snapshot()
-        if not snap:
-            return True  # fail-open
-
-        state = str(snap.get("state") or "").lower()
-        risk_score = _as_float(snap.get("risk_score", 0.0), 0.0)
-        reason = str(snap.get("reason") or "").strip()
-
-        if risk_score >= self.regime_min_risk:
-            self._diag["regime_risk_on"] += 1
-        else:
-            self._diag["regime_risk_off"] += 1
-
-        # Allowed Raydium override in "risk_off" regime
-        allow_ray_in_off = _as_bool(
-            os.getenv("REGIME_ALLOW_RAYDIUM_RISK_OFF", "0"),
-            False,
-        )
-
-        is_risk_off = state in {"risk_off", "panic", "halt"} or (
-            risk_score < self.regime_min_risk
-        )
-
-        if not is_risk_off:
-            log.event(
-                "REGIME_ENTRY_OK",
-                pool=pool,
-                mint=mint,
-                symbol=symbol,
-                state=state or "unknown",
-                risk_score=risk_score,
-                min_risk=self.regime_min_risk,
-                reason=reason or "regime_ok",
-            )
-            return True
-
-        # Risk-off regime
-        if pool == "raydium" and allow_ray_in_off:
-            log.event(
-                "REGIME_RISK_OFF_RAYDIUM_BYPASS",
-                pool=pool,
-                mint=mint,
-                symbol=symbol,
-                state=state or "risk_off",
-                risk_score=risk_score,
-                min_risk=self.regime_min_risk,
-                reason=reason or "risk_off_but_raydium_allowed",
-            )
-            return True
-
-        # Block new entries
-        self._diag["rejected_regime"] += 1
-        log.event(
-            "REGIME_ENTRY_BLOCK",
-            pool=pool,
-            mint=mint,
-            symbol=symbol,
-            state=state or "risk_off",
-            risk_score=risk_score,
-            min_risk=self.regime_min_risk,
-            reason=reason or "risk_off",
-        )
-        try:
-            record_buy_result(
-                ok=False,
-                reason="regime_block",
-                regime_state=state,
-                regime_score=risk_score,
-            )
-        except Exception:
-            pass
-        return False
-
-    # ───────────────────── Risk-capacity gate ───────────────────────────
-    async def _risk_capacity_decision(
-        self,
-        *,
-        pool: str,
-        mint: str,
-        symbol: str,
-    ) -> tuple[bool, Optional[float]]:
-        """
-        Risk-capacity gate (fail-open but logged):
-
-        - If ENTRY_REQUIRE_RISK_CAPACITY=0 or no risk module → allow, cap=None.
-        - Otherwise, attempts to fetch a 0–1 style capacity value from
-          utils_pkg.risk_manager and enforce:
-              ENTRY_MIN_RISK_CAPACITY <= cap <= ENTRY_MAX_RISK_CAPACITY
-        """
-        if self._risk_mod is None:
-            return True, None
-
-        cap_val: Optional[float] = None
-        try:
-            fn = (
-                getattr(self._risk_mod, "current_entry_capacity", None)
-                or getattr(self._risk_mod, "current_risk_capacity", None)
-                or getattr(self._risk_mod, "get_entry_capacity", None)
-                or getattr(self._risk_mod, "get_risk_capacity", None)
-            )
-            if callable(fn):
-                res = fn()  # type: ignore[misc]
-                if inspect.isawaitable(res):
-                    res = await res  # type: ignore[assignment]
-                cap_val = float(res)
-        except Exception:
-            if DEBUG_TX:
-                traceback.print_exc()
-            cap_val = None
-
-        if cap_val is None:
-            # no signal → fail-open, but keep feature for AI
-            return True, None
-
-        # clamp to sane range for diagnostics
-        cap_val = max(-10.0, min(10.0, cap_val))
-
-        # record stats
-        if ENTRY_MIN_RISK_CAPACITY <= cap_val <= ENTRY_MAX_RISK_CAPACITY:
-            self._diag["risk_cap_ok"] += 1
-        elif cap_val < ENTRY_MIN_RISK_CAPACITY:
-            self._diag["risk_cap_low"] += 1
-        else:
-            self._diag["risk_cap_high"] += 1
-
-        if not ENTRY_REQUIRE_RISK_CAPACITY:
-            # purely advisory if not enforced
-            log.event(
-                "RISK_CAP_ADVISORY",
-                pool=pool,
-                mint=mint,
-                symbol=symbol,
-                cap=cap_val,
-                min_cap=ENTRY_MIN_RISK_CAPACITY,
-                max_cap=ENTRY_MAX_RISK_CAPACITY,
-            )
-            return True, cap_val
-
-        # Enforced gate
-        if ENTRY_MIN_RISK_CAPACITY <= cap_val <= ENTRY_MAX_RISK_CAPACITY:
-            log.event(
-                "RISK_CAP_ENTRY_OK",
-                pool=pool,
-                mint=mint,
-                symbol=symbol,
-                cap=cap_val,
-                min_cap=ENTRY_MIN_RISK_CAPACITY,
-                max_cap=ENTRY_MAX_RISK_CAPACITY,
-            )
-            return True, cap_val
-
-        # Block new entry
-        self._diag["rejected_risk_cap"] += 1
-        log.event(
-            "RISK_CAP_ENTRY_BLOCK",
-            pool=pool,
-            mint=mint,
-            symbol=symbol,
-            cap=cap_val,
-            min_cap=ENTRY_MIN_RISK_CAPACITY,
-            max_cap=ENTRY_MAX_RISK_CAPACITY,
-        )
-        try:
-            record_buy_result(
-                ok=False,
-                reason="risk_capacity_block",
-                risk_capacity=cap_val,
-            )
-        except Exception:
-            pass
-        return False, cap_val
-
-    # ─────────────── Risk-adjusted sizing (AI + Regime + Cap) ───────────
-    def _risk_adjust_size(
-        self,
-        *,
-        ui: Dict[str, Any],
-        score: Optional[float],
-        regime_snap: Optional[Dict[str, Any]],
-        risk_cap: Optional[float],
-    ) -> None:
-        """
-        Compute a risk-adjusted sizing factor from AI score + regime + capacity.
-
-        Writes:
-          - ui["ai_entry_score"]
-          - ui["ai_size_factor"]
-          - ui["regime_risk_factor"]
-          - ui["risk_cap_factor"]
-          - ui["size_factor"] (final, clamped)
-          - ui["spend_sol"] updated if we can safely scale it.
-        """
-        if score is None:
-            return
-
-        # AI factor: linear-ish from ai_min_score → fastlane
-        try:
-            base_min = max(0.0, self.ai_min_score)
-            base_max = max(base_min + 1e-6, self.ai_fastlane_score)
-            s = max(base_min, min(score, base_max))
-            ai_factor_raw = 0.5 + 1.5 * ((s - base_min) / (base_max - base_min))
-        except Exception:
-            ai_factor_raw = 1.0
-
-        ai_factor = max(0.1, min(ai_factor_raw, 1.5))
-
-        # Regime factor: downscale in risk_off / low scores, upscale in strong regimes
-        regime_factor = 1.0
-        if regime_snap:
-            try:
-                r_score = _as_float(regime_snap.get("risk_score", 0.0), 0.0)
-                state = str(regime_snap.get("state") or "").lower()
-
-                if 0.0 <= r_score <= 1.0:
-                    regime_factor = 0.5 + 1.0 * r_score  # 0.5x → 1.5x
-                else:
-                    regime_factor = 0.5 + 0.5 * max(
-                        0.0, min(1.0, r_score / max(abs(r_score), 1.0))
-                    )
-
-                if state in {"risk_off", "panic", "halt"}:
-                    regime_factor *= 0.6
-            except Exception:
-                regime_factor = 1.0
-
-        # Risk-capacity factor: 0 → highly reduced, 1 → neutral, >1 → slight boost
-        cap_factor = 1.0
-        if risk_cap is not None:
-            try:
-                # Assume cap in [0,1] in the common case
-                if 0.0 <= risk_cap <= 1.0:
-                    cap_factor = 0.3 + 1.0 * risk_cap  # 0.3x → 1.3x
-                else:
-                    cap_factor = 0.5 + 0.5 * max(
-                        0.0, min(1.0, risk_cap / max(abs(risk_cap), 1.0))
-                    )
-            except Exception:
-                cap_factor = 1.0
-
-        size_factor = ai_factor * regime_factor * cap_factor
-        size_factor = max(self.size_floor, min(self.size_cap, size_factor))
-
-        ui["ai_size_factor"] = ai_factor
-        ui["regime_risk_factor"] = regime_factor
-        ui["risk_cap_factor"] = cap_factor
-        ui["size_factor"] = size_factor
-
-        # If we already have a spend_sol hint, scale it
-        try:
-            if "spend_sol" in ui and ui["spend_sol"]:
-                base = float(ui["spend_sol"])
-                scaled = max(0.0, base * size_factor)
-                ui["spend_sol"] = scaled
-        except Exception:
-            pass
-
-    # ────────────── Optional pre-AI buy scoring (ai_buy_scoring) ────────
-    async def _ai_pre_score(
-        self,
-        *,
-        mint_norm: str,
-        pool: str,
-        symbol: str,
-        ui: Dict[str, Any],
-        features: Dict[str, Any],
-        raw_event: Dict[str, Any],
-    ) -> tuple[Optional[float], Optional[bool]]:
-        """
-        Optional pre-AI scoring via utils_pkg.ai_buy_scoring.
-
-        Returns:
-          (score, decision) where:
-            - score: float | None  (for logging / overrides)
-            - decision:
-                • True  → allow
-                • False → block
-                • None  → no opinion (do not gate)
-
-        Design notes
-        ------------
-        - Ultra-defensive: any error → (None, None) and we DO NOT block.
-        - Uses Candidate.__annotations__ to only pass fields the dataclass knows.
-        - Fills V3+++ fields with sensible defaults if the feature is missing:
-            pool_age_min, impact_1k_bps, vol5m_pct, top10_pct,
-            honeypot_flag, whale_touches_1h.
-        """
-        if not self.ai_pre_enabled or self._score_mod is None:
-            return None, None
-
-        try:
-            # Pull main symbols from scoring module
-            Candidate = getattr(self._score_mod, "Candidate", None)
-            pass_gate = getattr(self._score_mod, "pass_gate", None)
-            if Candidate is None or not callable(pass_gate):
-                # ai_buy_scoring not imported / older version: no-op
-                return None, None
-
-            # ---------- Core primitive fields ----------
-            # age_min used both as "age_min" and as fallback for "pool_age_min"
-            age_min = (
-                raw_event.get("token_age_min")
-                or raw_event.get("age_min")
-                or _approx_minutes_since(
-                    _get_first(
-                        raw_event,
-                        "created_at",
-                        "createdAt",
-                        "timestamp",
-                        "ts",
-                        default=None,
-                    )
-                )
-                or 0.0
-            )
-
-            liq_usd = (
-                ui.get("liq_usd")
-                or raw_event.get("liq_usd")
-                or raw_event.get("liq")
-                or 0.0
-            )
-
-            vol_5m_usd = (
-                ui.get("vol_5m_usd")
-                or raw_event.get("vol_5m_usd")
-                or raw_event.get("vol5")
-                or 0.0
-            )
-
-            buys_5m = (
-                ui.get("buys_5m")
-                or raw_event.get("buys_5m")
-                or raw_event.get("buys5")
-                or 0
-            )
-
-            sells_5m = (
-                ui.get("sells_5m")
-                or raw_event.get("sells_5m")
-                or raw_event.get("sells5")
-                or 0
-            )
-
-            # ---------- V3+++ / quant-grade extra features ----------
-            # Pool age in minutes (prefer explicit feature, otherwise reuse age_min)
-            pool_age_min = features.get("pool_age_min")
-            if pool_age_min is None:
-                pool_age_min = age_min
-
-            # Slippage / impact if we slam 1k USD into the pool (basis points)
-            impact_1k_bps = (
-                features.get("impact_1k_bps")
-                or ui.get("impact_1k_bps")
-                or 0.0
-            )
-
-            # Volume share & holder concentration
-            vol5m_pct = features.get("vol5m_pct") or 0.0
-            top10_pct = features.get("top10_pct") or 0.0
-
-            # Rug / honeypot / whale signal flags
-            honeypot_flag = bool(
-                features.get("honeypot_flag")
-                or ui.get("honeypot_flag")
-                or raw_event.get("honeypot_flag")
-                or raw_event.get("honeypot")
-                or False
-            )
-
-            whale_touches_1h = int(
-                features.get("whale_touches_1h")
-                or features.get("whale_touches_60m")
-                or 0
-            )
-
-            # ---------- Build base kwargs ----------
-            base_kwargs: Dict[str, Any] = {
-                "mint": mint_norm,
-                "pool": pool,
-                "symbol": symbol,
-                "liq_usd": float(liq_usd),
-                "vol_5m_usd": float(vol_5m_usd),
-                "buys_5m": int(buys_5m),
-                "sells_5m": int(sells_5m),
-                "age_min": float(age_min),
-
-                # V3+++ extra fields (only used if Candidate defines them)
-                "pool_age_min": float(pool_age_min),
-                "impact_1k_bps": float(impact_1k_bps),
-                "vol5m_pct": float(vol5m_pct),
-                "top10_pct": float(top10_pct),
-                "honeypot_flag": bool(honeypot_flag),
-                "whale_touches_1h": int(whale_touches_1h),
-
-                # Contextual AI / risk features
-                "ai_entry_score": ui.get("ai_entry_score"),
-                "risk_capacity": ui.get("risk_capacity"),
-                "regime_score": features.get("regime_score"),
-            }
-
-            # ---------- Filter by Candidate annotations (backwards compatible) ----------
-            cand_kwargs = dict(base_kwargs)
-            ann = getattr(Candidate, "__annotations__", None)
-            if isinstance(ann, dict) and ann:
-                cand_kwargs = {k: v for k, v in base_kwargs.items() if k in ann}
-
-            # ---------- Construct Candidate (defensive) ----------
-            try:
-                candidate = Candidate(**cand_kwargs)  # type: ignore[misc]
-            except TypeError as e:
-                # If something still mismatches, log & give up rather than blocking.
-                try:
-                    log.event(
-                        "AI_PRE_SCORE_CANDIDATE_ERROR",
-                        mint=mint_norm,
-                        pool=pool,
-                        symbol=symbol,
-                        err=str(e)[:200],
-                        cand_keys=list(cand_kwargs.keys()),
-                    )
-                except Exception:
-                    pass
-                return None, None
-
-            # ---------- Call pass_gate ----------
-            res = pass_gate(candidate)  # type: ignore[misc]
-            if inspect.isawaitable(res):
-                res = await res
-
-            pre_score: Optional[float] = None
-            decision: Optional[bool] = None
-
-            # pass_gate can return: bool, float, (decision,), (decision, score, ...)
-            if isinstance(res, (list, tuple)):
-                if len(res) >= 1:
-                    decision = bool(res[0])
-                if len(res) >= 2 and res[1] is not None:
-                    try:
-                        pre_score = float(res[1])
-                    except Exception:
-                        pre_score = None
-            elif isinstance(res, (int, float)):
-                pre_score = float(res)
-            elif isinstance(res, bool):
-                decision = res
-
-            # ---------- Optional min-score enforcement ----------
-            if pre_score is not None and self.ai_pre_min_score > 0:
-                if pre_score < self.ai_pre_min_score:
-                    # Below minimum → treat as hard-block unless already blocked
-                    decision = False if decision is None else bool(decision and False)
-
-            # ---------- Logging ----------
-            try:
-                # Normalize decision flag to a clean string for logs
-                if decision is True:
-                    decision_str = "allow"
-                elif decision is False:
-                    decision_str = "block"
-                else:
-                    decision_str = "none"
-
-                # Main AI pre-score event
-                log.event(
-                    "AI_PRE_SCORE",
-                    pool=pool,
-                    mint=mint_norm,
-                    symbol=symbol,
-                    pre_score=pre_score,
-                    pre_min=self.ai_pre_min_score,
-                    decision=decision_str,
-                )
-
-                # Pump.fun: do NOT let AI hard-block entries (for now).
-                # We still log the original "block" decision and emit a synthetic
-                # AI_PRE_PUMP_BYPASS event, but then flip `decision` to True.
-                if pool == "pump" and decision is False:
-                    log.event(
-                        "AI_PRE_PUMP_BYPASS",
-                        pool=pool,
-                        mint=mint_norm,
-                        symbol=symbol,
-                        pre_score=pre_score,
-                        pre_min=self.ai_pre_min_score,
-                        original_decision=decision_str,
-                    )
-                    # Force allow for pump while we debug/tune AI
-                    decision = True
-
-            except Exception:
-                # Never let logging break the trade pipeline
-                if DEBUG_TX:
-                    traceback.print_exc()
-
-            # Final output of the pre-gate: score + (possibly overridden) decision
-            return pre_score, decision
-
-        except Exception as e:
-            # Outer safety net around the whole AI pre-gate
-            if DEBUG_TX:
-                traceback.print_exc()
-            try:
-                log.event(
-                    "AI_PRE_SCORE_ERROR",
-                    mint=mint_norm,
-                    pool=pool,
-                    symbol=symbol,
-                    err=str(e)[:200],
-                )
-            except Exception:
-                if DEBUG_TX:
-                    traceback.print_exc()
-            return None, None
-
-    # ───────────── Self-learning strategy hook (optional) ───────────────
-    async def _self_learning_candidate_hook(
-        self,
-        *,
-        mint_norm: str,
-        pool: str,
-        symbol: str,
-        ui: Dict[str, Any],
-        features: Dict[str, Any],
-        ai_score: Optional[float],
-        allow: bool,
-    ) -> None:
-        """
-        Notify utils_pkg.self_learning_ai_strategy about each candidate decision.
-        This gives the self-learning brain a live stream of decisions + features.
-        """
-        if self._sl_mod is None:
-            return
-
-        try:
-            fn = (
-                getattr(self._sl_mod, "on_candidate_decision", None)
-                or getattr(self._sl_mod, "record_candidate_decision", None)
-                or getattr(self._sl_mod, "record_candidate", None)
-            )
-            if not callable(fn):
-                return
-
-            payload = {
-                "mint": mint_norm,
-                "pool": pool,
-                "symbol": symbol,
-                "ui": ui,
-                "features": features,
-                "ai_score": ai_score,
-                "decision": bool(allow),
-            }
-
-            sig = inspect.signature(fn)
-            if "mint" in sig.parameters:
-                res = fn(**payload)  # type: ignore[misc]
+        def _handler(_loop: asyncio.AbstractEventLoop, context: Dict[str, Any]) -> None:
+            msg = str(context.get("message") or "asyncio_exception")
+            exc = context.get("exception")
+            if exc:
+                log.event("ASYNCIO_EXCEPTION", msg=msg, err=_short_exc(exc))
             else:
-                res = fn(payload)  # type: ignore[misc]
+                log.event("ASYNCIO_EXCEPTION", msg=msg, context=str(context)[:1600])
 
-            if inspect.isawaitable(res):
-                await res
-        except Exception:
-            if DEBUG_TX:
-                traceback.print_exc()
+        loop.set_exception_handler(_handler)
 
-    # ─────────────────────── AI / Feature Gate (v3+++) ──────────────────
-    async def _ai_entry_gate(
-        self,
-        *,
-        ui: Dict[str, Any],
-        mint_norm: str,
-        pool: str,
-        raw_event: Dict[str, Any],
-        risk_cap: Optional[float],
-    ) -> bool:
-        """
-        Unified AI / feature gate (fully async, quant-grade):
 
-        Behaviour:
-          - AI_ENTRY_ENABLED=0 or no modules → no-op (allow).
-          - Build features via feature_builder (if present).
-          - Optional pre-AI ai_buy_scoring pass_gate (if present).
-          - Call ai_entry_logic.should_enter_with_ai (preferred), or fall back to
-            ai_entry_logic.evaluate/decide/score if that's what's available.
-          - Expect return of:
-              (allow: bool, score: float | None, meta: dict | None)
-            or a dict with allow/blocked/ok + score.
-          - Enforce:
-              * soft min:  AI_ENTRY_SCORE_MIN
-              * hard min:  AI_ENTRY_SCORE_HARD_MIN
-              * risk-adj: AI_ENTRY_RISK_ADJ_MIN on score * risk_cap
-          - Risk-adjust size using AI score + regime snapshot + risk capacity.
-          - Log candidate + AI decision via utils_pkg.data_logger.log_candidate (async).
-          - Notify self_learning_ai_strategy (if present) so it can learn.
-        """
-        if not self.ai_enabled or self._ai_mod is None:
-            return True
-
-        DEBUG_LOCAL = DEBUG_TX
-        symbol = ui.get("symbol") or ui.get("name") or _extract_symbol(raw_event)
-
-        # Attach basic scanner metrics into UI for AI visibility
-        try:
-            liq = float(
-                raw_event.get("liq_usd")
-                or raw_event.get("liq")
-                or 0.0
-            )
-            vol5 = float(
-                raw_event.get("vol_5m_usd")
-                or raw_event.get("vol5")
-                or 0.0
-            )
-            up5 = float(
-                raw_event.get("price_change_5m_pct")
-                or raw_event.get("chg5")
-                or raw_event.get("up_5m_pct")
-                or 0.0
-            )
-            buys5 = int(raw_event.get("buys_5m") or raw_event.get("buys5") or 0)
-            sells5 = int(raw_event.get("sells_5m") or raw_event.get("sells5") or 0)
-
-            ui.setdefault("liq_usd", liq)
-            ui.setdefault("vol_5m_usd", vol5)
-            ui.setdefault("up_5m_pct", up5)
-            ui.setdefault("buys_5m", buys5)
-            ui.setdefault("sells_5m", sells5)
-        except Exception:
-            if DEBUG_LOCAL:
-                traceback.print_exc()
-
-        # --- Build features (if builder present) ------------------------
-        features: Dict[str, Any] = {}
-        feature_meta: Dict[str, Any] = {}
-
-        try:
-            if self._feat_mod is not None:
-                fb = (
-                    getattr(self._feat_mod, "build_features_for_candidate", None)
-                    or getattr(self._feat_mod, "build_features_for_event", None)
-                    or getattr(self._feat_mod, "build_features", None)
-                )
-                if callable(fb):
-                    try:
-                        res = fb(  # type: ignore[misc]
-                            raw_event=raw_event,
-                            ui=ui,
-                            pool=pool,
-                        )
-                        if inspect.isawaitable(res):
-                            res = await res
-                    except TypeError:
-                        # Fallback to minimal signatures
-                        res = fb(raw_event)  # type: ignore[misc]
-
-                    if isinstance(res, tuple) and len(res) == 2:
-                        features, feature_meta = res  # type: ignore[assignment]
-                    elif isinstance(res, dict):
-                        features = res  # type: ignore[assignment]
-
-            if not isinstance(features, dict):
-                features = {}
-            if not isinstance(feature_meta, dict):
-                feature_meta = {}
-        except Exception:
-            features = {}
-            feature_meta = {}
-            if DEBUG_LOCAL:
-                traceback.print_exc()
-
-        # Add light regime / capacity context into features (if available)
-        regime_snap = self._regime_snapshot()
-        if regime_snap:
-            try:
-                features.setdefault("regime_state", regime_snap.get("state"))
-                features.setdefault("regime_score", regime_snap.get("risk_score"))
-            except Exception:
-                pass
-        if risk_cap is not None:
-            features.setdefault("risk_capacity", risk_cap)
-
-        # --- Optional pre-AI buy scoring gate ---------------------------
-        pre_score, pre_decision = await self._ai_pre_score(
-            mint_norm=mint_norm,
-            pool=pool,
-            symbol=symbol,
-            ui=ui,
-            features=features,
-            raw_event=raw_event,
-        )
-        if pre_score is not None:
-            ui["ai_pre_score"] = float(pre_score)
-
-        if pre_decision is False:
-            # hard block from pre-gate
-            self._diag["ai_pre_reject"] += 1
-            self._diag["rejected_ai"] += 1
-            log.event(
-                "AI_PRE_ENTRY_REJECT",
-                pool=pool,
-                mint=mint_norm,
-                symbol=symbol,
-                pre_score=pre_score,
-                pre_min=self.ai_pre_min_score,
-            )
-            try:
-                record_buy_result(
-                    ok=False,
-                    reason="ai_pre_entry_reject",
-                    ai_pre_score=pre_score,
-                )
-            except Exception:
-                pass
-            return False
-
-        # --- AI evaluator -----------------------------------------------
-        ai_fn = getattr(self._ai_mod, "should_enter_with_ai", None)
-        raw_decision: Any = None
-        allow = True
-        score: Optional[float] = None
-        meta: Dict[str, Any] = {}
-
-        try:
-            if callable(ai_fn):
-                raw_decision = await ai_fn(  # type: ignore[misc]
-                    mint=mint_norm,
-                    pool=pool,
-                    ui=ui,
-                    features=features,
-                    feature_meta=feature_meta,
-                )
-                # expected: (bool, score, meta)
-                if (
-                    isinstance(raw_decision, (list, tuple))
-                    and len(raw_decision) >= 1
-                ):
-                    allow = bool(raw_decision[0])
-                    if len(raw_decision) >= 2 and raw_decision[1] is not None:
-                        try:
-                            score = float(raw_decision[1])
-                        except Exception:
-                            score = None
-                    if (
-                        len(raw_decision) >= 3
-                        and isinstance(raw_decision[2], dict)
-                    ):
-                        meta = raw_decision[2]  # type: ignore[assignment]
-                elif isinstance(raw_decision, dict):
-                    d = raw_decision
-                    if "allow" in d:
-                        allow = bool(d.get("allow"))
-                    elif "ok" in d:
-                        allow = bool(d.get("ok"))
-                    elif "blocked" in d:
-                        allow = not bool(d.get("blocked"))
-                    if d.get("score") is not None:
-                        try:
-                            score = float(d.get("score"))
-                        except Exception:
-                            score = None
-                    if isinstance(d.get("meta"), dict):
-                        meta = d.get("meta")  # type: ignore[assignment]
-
-            else:
-                # Fallback: generic scoring functions
-                fallback = (
-                    getattr(self._ai_mod, "evaluate_candidate", None)
-                    or getattr(self._ai_mod, "decide_entry", None)
-                    or getattr(self._ai_mod, "score_candidate", None)
-                    or getattr(self._ai_mod, "decide", None)
-                )
-                if callable(fallback):
-                    raw_decision = fallback(  # type: ignore[misc]
-                        event=raw_event,
-                        ui=ui,
-                        features=features,
-                        mint=mint_norm,
-                    )
-                    if inspect.isawaitable(raw_decision):
-                        raw_decision = await raw_decision
-
-                    if isinstance(raw_decision, dict):
-                        d = raw_decision
-                        if "allow" in d:
-                            allow = bool(d.get("allow"))
-                        elif "ok" in d:
-                            allow = bool(d.get("ok"))
-                        elif "blocked" in d:
-                            allow = not bool(d.get("blocked"))
-                        if d.get("score") is not None:
-                            try:
-                                score = float(d.get("score"))
-                            except Exception:
-                                score = None
-                        if isinstance(d.get("meta"), dict):
-                            meta = d.get("meta")  # type: ignore[assignment]
-                    elif isinstance(raw_decision, (int, float)):
-                        score = float(raw_decision)
-                        allow = score >= self.ai_min_score
-
-        except Exception as e:
-            self._diag["ai_errors"] += 1
-            log.event(
-                "AI_ENTRY_ERROR",
-                mint=mint_norm,
-                pool=pool,
-                symbol=symbol,
-                err=str(e)[:200],
-            )
-            if DEBUG_LOCAL:
-                traceback.print_exc()
-            # fail-open so we don't brick trading
-            allow = True
-
-        # --- Score-based enforcement & buckets --------------------------
-        risk_adj_score: Optional[float] = None
-        if score is not None:
-            ui["ai_entry_score"] = float(score)
-
-            # Hard floor (absolute no-go)
-            if score < self.ai_hard_min_score:
-                allow = False
-
-            # Soft floor
-            if score < self.ai_min_score:
-                allow = False
-
-            # Risk-adjusted score (AI * risk_cap)
-            if risk_cap is not None:
-                try:
-                    cap_clamped = max(0.0, min(1.0, float(risk_cap)))
-                    risk_adj_score = float(score) * cap_clamped
-                except Exception:
-                    risk_adj_score = float(score)
-                ui["ai_risk_adj_score"] = risk_adj_score
-
-                if self.ai_risk_adj_min > 0 and risk_adj_score < self.ai_risk_adj_min:
-                    allow = False
-
-            # Diag buckets (0–1 scale-ish, but tolerant)
-            try:
-                if score < max(0.0, self.ai_min_score):
-                    self._diag["ai_score_low"] += 1
-                elif score < self.ai_fastlane_score:
-                    self._diag["ai_score_mid"] += 1
-                else:
-                    self._diag["ai_score_high"] += 1
-            except Exception:
-                pass
-
-        if meta:
-            ui["ai_entry_meta"] = meta
-
-        # --- Risk-adjusted sizing ---------------------------------------
-        try:
-            self._risk_adjust_size(
-                ui=ui,
-                score=score,
-                regime_snap=regime_snap,
-                risk_cap=risk_cap,
-            )
-        except Exception:
-            if DEBUG_LOCAL:
-                traceback.print_exc()
-
-        # --- Data logger hook (async) -----------------------------------
-        try:
-            if self._log_mod is not None:
-                log_fn = getattr(self._log_mod, "log_candidate", None)
-                if callable(log_fn):
-                    await log_fn(  # type: ignore[misc]
-                        mint=mint_norm,
-                        pool=pool,
-                        ui=ui,
-                        features=features,
-                        ai_score=score,
-                        ai_meta=meta,
-                    )
-        except Exception:
-            if DEBUG_LOCAL:
-                traceback.print_exc()
-
-        # --- Self-learning hook -----------------------------------------
-        try:
-            await self._self_learning_candidate_hook(
-                mint_norm=mint_norm,
-                pool=pool,
-                symbol=symbol,
-                ui=ui,
-                features=features,
-                ai_score=score,
-                allow=allow,
-            )
-        except Exception:
-            if DEBUG_LOCAL:
-                traceback.print_exc()
-
-        # --- Decision + metrics -----------------------------------------
-        if allow:
-            self._diag["ai_allowed"] += 1
-
-            # Fastlane flag (for observability / later tweaks)
-            if score is not None and score >= self.ai_fastlane_score:
-                self._diag["ai_fastlane"] += 1
-                ui["ai_fastlane"] = True
-            else:
-                ui["ai_fastlane"] = False
-
-            log.event(
-                "AI_ENTRY_OK",
-                pool=pool,
-                mint=mint_norm,
-                symbol=symbol,
-                score=score,
-                min_score=self.ai_min_score,
-                hard_min=self.ai_hard_min_score,
-                risk_adj_score=ui.get("ai_risk_adj_score"),
-                risk_cap=risk_cap,
-                fastlane=bool(ui.get("ai_fastlane")),
-            )
-
-            # Optional Telegram debug (defensive + thresholded)
-            try:
-                send_dbg = globals().get("_send_telegram_debug")
-                if not callable(send_dbg):
-                    return True  # no debug helper wired → silently skip
-
-                # Respect global toggle from env
-                if TG_AI_OK_NOTIFY != "1":
-                    return True
-
-                # Normalize main AI score
-                main_score: Optional[float]
-                if isinstance(score, (int, float)):
-                    main_score = float(score)
-                else:
-                    main_score = None
-
-                # Normalize pre-score (from UI dict)
-                pre_raw = ui.get("ai_pre_score")
-                pre_score: Optional[float]
-                try:
-                    pre_score = float(pre_raw) if pre_raw is not None else None
-                except Exception:
-                    pre_score = None
-
-                # Normalize risk capacity
-                cap_val: Optional[float]
-                if isinstance(risk_cap, (int, float)):
-                    cap_val = float(risk_cap)
-                else:
-                    cap_val = None
-
-                # Decide if this is interesting enough to notify
-                should_notify = False
-                if main_score is not None:
-                    if main_score >= AI_NOTIFY_MIN_SCORE:
-                        should_notify = True
-                elif pre_score is not None:
-                    if pre_score >= AI_NOTIFY_MIN_PRE_SCORE:
-                        should_notify = True
-
-                # If neither score passes thresholds, don't spam Telegram
-                if not should_notify:
-                    return True
-
-                # Format safe strings for the message
-                score_str = f"{main_score:.3f}" if main_score is not None else "None"
-                pre_str = f"{pre_score:.3f}" if pre_score is not None else "None"
-                cap_str = f"{cap_val:.3f}" if cap_val is not None else "None"
-
-                msg = (
-                    f"AI OK {symbol} ({mint_norm[:6]}…): "
-                    f"score={score_str} pre={pre_str} cap={cap_str}"
-                )
-                asyncio.create_task(send_dbg(msg))
-
-            except Exception:
-                if DEBUG_LOCAL:
-                    traceback.print_exc()
-
-            return True
-
-        # Rejected
-        self._diag["rejected_ai"] += 1
-        log.event(
-            "AI_ENTRY_REJECT",
-            pool=pool,
-            mint=mint_norm,
-            symbol=symbol,
-            score=score,
-            min_score=self.ai_min_score,
-            hard_min=self.ai_hard_min_score,
-            risk_adj_score=ui.get("ai_risk_adj_score"),
-            risk_cap=risk_cap,
-        )
-        try:
-            record_buy_result(
-                ok=False,
-                reason="ai_entry_reject",
-                ai_score=score,
-                ai_risk_adj=ui.get("ai_risk_adj_score"),
-                risk_capacity=risk_cap,
-            )
-        except Exception:
-            pass
-        return False
-
-    def _smart_wallet_guard(
-        self,
-        *,
-        raw_event: Dict[str, Any],
-        mint_norm: str,
-        pool: str,
-    ) -> bool:
-        """
-        Optional smart-wallet guard (deployers / known bad actors).
-
-        Returns True if candidate is allowed, False if blocked.
-        """
-        if self._smart_mod is None:
-            return True
-
-        try:
-            # Try to infer a "creator" / "deployer" field from the event
-            creator = (
-                raw_event.get("creator")
-                or raw_event.get("deployer")
-                or raw_event.get("owner")
-                or raw_event.get("wallet")
-                or raw_event.get("authority")
-                or ""
-            )
-            creator = str(creator or "").strip()
-            if not creator:
-                return True
-
-            # Common function names
-            is_bad = (
-                getattr(self._smart_mod, "is_wallet_blocked", None)
-                or getattr(self._smart_mod, "is_banned_wallet", None)
-                or getattr(self._smart_mod, "is_bad_actor", None)
-            )
-            if callable(is_bad):
-                try:
-                    blocked = bool(
-                        is_bad(  # type: ignore[misc]
-                            wallet=creator,
-                            mint=mint_norm,
-                            pool=pool,
-                        )
-                    )
-                except TypeError:
-                    blocked = bool(is_bad(creator))  # type: ignore[misc]
-
-                if blocked:
-                    self._diag["rejected_filters"] += 1
-                    log.event(
-                        "ENTRY_SMART_WALLET_REJECT",
-                        pool=pool,
-                        mint=mint_norm,
-                        creator=creator,
-                    )
-                    try:
-                        record_buy_result(
-                            ok=False,
-                            reason="smart_wallet_reject",
-                            creator=creator,
-                        )
-                    except Exception:
-                        pass
-                    return False
-
-            # Optional recorder (pure analytics)
-            rec = (
-                getattr(self._smart_mod, "record_wallet_activity", None)
-                or getattr(self._smart_mod, "track_wallet", None)
-            )
-            if callable(rec):
-                with contextlib.suppress(Exception):
-                    rec(  # type: ignore[misc]
-                        wallet=creator,
-                        mint=mint_norm,
-                        pool=pool,
-                        event="candidate",
-                    )
-
-        except Exception:
-            # Guard must never block trading due to implementation errors
-            if DEBUG_TX:
-                traceback.print_exc()
-        return True
-
-    # --- DIAGNOSTICS + POSITION HEARTBEAT ------------------------------- #
-    async def diag_loop(
-        self,
-        stop_evt: asyncio.Event,
-        interval_s: float = 60.0,
-    ) -> None:
-        """
-        Periodic diagnostics emitter:
-          - aggregate event counters
-          - AI score buckets / fastlane stats
-          - risk-capacity / regime stats
-          - per-position heartbeat logs
-          - optional regime snapshot
-          - optional self-learning background tick
-        """
-        last_total = 0
-        while not stop_evt.is_set():
-            await asyncio.sleep(interval_s)
-            et = self._diag["events_total"]
-            rate = (et - last_total) / max(interval_s, 1e-3)
-            last_total = et
-
-            # Aggregate diag snapshot
-            log.event(
-                "DIAG_MINUTE",
-                events_total=self._diag["events_total"],
-                per_sec=f"{rate:.3f}",
-                trade=self._diag["events_trade"],
-                new_token=self._diag["events_new_token"],
-                rej_filters=self._diag["rejected_filters"],
-                rej_guard=self._diag["rejected_guardrails"],
-                rej_momo=self._diag["rejected_momo"],
-                rej_ai=self._diag["rejected_ai"],
-                rej_regime=self._diag["rejected_regime"],
-                rej_risk_cap=self._diag["rejected_risk_cap"],
-                ai_allowed=self._diag["ai_allowed"],
-                ai_errors=self._diag["ai_errors"],
-                ai_score_low=self._diag["ai_score_low"],
-                ai_score_mid=self._diag["ai_score_mid"],
-                ai_score_high=self._diag["ai_score_high"],
-                ai_fastlane=self._diag["ai_fastlane"],
-                ai_pre_reject=self._diag["ai_pre_reject"],
-                buys_sub=self._diag["buys_submitted"],
-                buys_fill=self._diag["buys_filled"],
-                regime_risk_off=self._diag["regime_risk_off"],
-                regime_risk_on=self._diag["regime_risk_on"],
-                risk_cap_ok=self._diag["risk_cap_ok"],
-                risk_cap_low=self._diag["risk_cap_low"],
-                risk_cap_high=self._diag["risk_cap_high"],
-            )
-
-            # Optional regime snapshot log
-            snap = self._regime_snapshot()
-            if snap:
-                with contextlib.suppress(Exception):
-                    log.event(
-                        "REGIME_HEARTBEAT",
-                        state=str(snap.get("state") or ""),
-                        risk_score=_as_float(
-                            snap.get("risk_score", 0.0),
-                            0.0,
-                        ),
-                        reason=str(snap.get("reason") or ""),
-                    )
-
-            # Optional self-learning heartbeat
-            if self._sl_mod is not None:
-                try:
-                    hb = getattr(self._sl_mod, "background_tick", None) or getattr(
-                        self._sl_mod, "on_diag_minute", None
-                    )
-                    if callable(hb):
-                        r = hb(diag=dict(self._diag))  # type: ignore[misc]
-                        if inspect.isawaitable(r):
-                            await r
-                except Exception:
-                    if DEBUG_TX:
-                        traceback.print_exc()
-
-            # --- Per-position heartbeat --------------------------------
-            try:
-                try:
-                    poss = list(all_positions())
-                except Exception:
-                    poss = []
-
-                max_hb = _as_int(os.getenv("POSITION_HEARTBEAT_MAX", "25"), 25)
-                if max_hb <= 0:
-                    continue
-
-                for p in poss[:max_hb]:
-                    try:
-                        mint = str(p.get("mint") or p.get("token") or "").strip()
-                        if not mint:
-                            continue
-
-                        symbol = (
-                            p.get("symbol")
-                            or p.get("ticker")
-                            or p.get("name")
-                            or "?"
-                        )
-
-                        # Token qty
-                        qty_tokens = float(
-                            p.get("amount")
-                            or p.get("qty")
-                            or p.get("size_token")
-                            or 0.0
-                        ) or 0.0
-
-                        # Raw size (lamports/raw tokens)
-                        size_raw_any = (
-                            p.get("amount_raw")
-                            or p.get("position_raw")
-                            or p.get("size_raw")
-                            or 0
-                        )
-                        try:
-                            size_raw = int(size_raw_any)
-                        except Exception:
-                            size_raw = 0
-
-                        # Total entry cost in SOL if available
-                        entry_total_any = (
-                            p.get("entry_total_sol")
-                            or p.get("cost_basis_sol")
-                            or p.get("cost")
-                            or 0.0
-                        )
-                        try:
-                            entry_total_sol = float(entry_total_any)
-                        except Exception:
-                            entry_total_sol = 0.0
-
-                        # Mark price & current value
-                        mark_price = 0.0
-                        try:
-                            if mint and qty_tokens > 0:
-                                mark_price = float(await _route_price_ui(mint))
-                        except Exception:
-                            mark_price = 0.0
-
-                        cur_val = (
-                            mark_price * qty_tokens
-                            if (mark_price > 0 and qty_tokens > 0)
-                            else 0.0
-                        )
-                        pnl_sol = cur_val - entry_total_sol if entry_total_sol > 0 else 0.0
-                        pnl_pct = (
-                            ((cur_val / entry_total_sol) - 1.0) * 100.0
-                            if entry_total_sol > 0
-                            else None
-                        )
-
-                        log.event(
-                            "POSITION_HEARTBEAT",
-                            mint=mint,
-                            symbol=symbol,
-                            qty_tokens=qty_tokens,
-                            size_raw=size_raw,
-                            entry_total_sol=entry_total_sol,
-                            mark_price_sol=mark_price,
-                            cur_val_sol=cur_val,
-                            pnl_sol=pnl_sol,
-                            pnl_pct=pnl_pct,
-                        )
-                    except Exception:
-                        if DEBUG_TX:
-                            traceback.print_exc()
-                        continue
-            except Exception:
-                if DEBUG_TX:
-                    traceback.print_exc()
-
-    # --- TRADE TICKS (for momo counts + exit engine) --------------------
-    async def on_trade(self, raw_event: Dict[str, Any]) -> None:
-        """
-        Trade ticks:
-          - feed exit_engine for follow-through logic
-          - increment trade counts for momentum windows per mint
-        """
-        self._diag["events_total"] += 1
-        self._diag["events_trade"] += 1
-
-        # Pass trade ticks into exit engine (for follow-through logic, etc.)
-        if EXIT_ENGINE_ENABLED:
-            try:
-                await exit_engine.on_trade_tick(raw_event)
-            except Exception:
-                if DEBUG_TX:
-                    traceback.print_exc()
-
-        # Update momentum trade count for this mint (if it's being gated)
-        m = str(
-            _get_first(
-                raw_event,
-                "mint",
-                "mintAddress",
-                "mint_address",
-                "id",
-                default="",
-            )
-        ).strip()
-        if not m:
-            return
-
-        st = self._gate_state.get(m)
-        if st is not None:
-            st["trades"] = int(st.get("trades", 0)) + 1
-
-    # --- MOMENTUM DECISION (pool-aware) ---------------------------------
-    def _momentum_decision(
-        self,
-        *,
-        pool: str,
-        mint: str,
-        symbol: str,
-        trades: int,
-        price0: float,
-        price1: float,
-    ) -> bool:
-        """
-        Returns True = momentum OK / not blocking
-                False = block entry
-
-        Behaviour:
-          - Pump:
-              * if trades < min_trades:
-                    - obey MOMO_ALLOW_NO_DATA_FOR_PUMP (bypass or reject)
-              * if trades >= min_trades and price data is missing:
-                    - trades-only gate ⇒ allow (with log)
-              * if trades >= min_trades and price data present:
-                    - full pct_up + trades checks
-          - Raydium:
-              * no data → advisory only (log, do NOT block)
-              * with data but weak momentum → reject
-          - Other pools:
-              * no data → reject
-              * with data but weak momentum → reject
-        """
-        if not self.momo_enabled:
-            return True
-
-        pool = (pool or "").lower()
-        no_trades = trades < self.momo_min_trades
-        no_price_data = (price0 <= 0.0 or price1 <= 0.0)
-
-        # ───── Pump-special handling ─────────────────────────────────────
-        if pool in ("pump", "pumpfun", "pump.fun"):
-            # 1) Absolutely no trades in the window
-            if no_trades:
-                if self.momo_allow_no_data_pump:
-                    log.event(
-                        "MOMO_BYPASS_NO_TRADES_PUMP",
-                        rule="momentum",
-                        pool=pool,
-                        mint=mint,
-                        symbol=symbol,
-                        trades=trades,
-                        price0=price0,
-                        price1=price1,
-                        min_trades=self.momo_min_trades,
-                        min_up_pct=self.momo_min_up_pct,
-                    )
-                    return True
-
-                log.event(
-                    "MOMO_SKIP_NO_TRADES_PUMP",
-                    rule="momentum",
-                    pool=pool,
-                    mint=mint,
-                    symbol=symbol,
-                    trades=trades,
-                    price0=price0,
-                    price1=price1,
-                    min_trades=self.momo_min_trades,
-                    min_up_pct=self.momo_min_up_pct,
-                )
-                try:
-                    record_buy_result(ok=False, reason="momo_no_trades_pump")
-                except Exception:
-                    pass
-                self._diag["rejected_momo"] += 1
-                return False
-
-            # 2) We DO have trades >= min_trades
-            if no_price_data:
-                # Jupiter can't price it yet – rely on trades + upstream filters.
-                log.event(
-                    "MOMO_PUMP_TRADES_ONLY_OK",
-                    rule="momentum",
-                    pool=pool,
-                    mint=mint,
-                    symbol=symbol,
-                    trades=trades,
-                    price0=price0,
-                    price1=price1,
-                    min_trades=self.momo_min_trades,
-                    min_up_pct=self.momo_min_up_pct,
-                )
-                return True
-            # else: fall through to generic pct_up evaluation below
-
-        # ───── Generic no-data handling (non-pump, or pump with price) ──
-        no_data = no_trades or no_price_data
-
-        if no_data:
-            # Raydium: advisory only on no-data (do NOT block)
-            if pool == "raydium":
-                log.event(
-                    "MOMO_SKIP_NO_DATA",
-                    rule="momentum",
-                    pool=pool,
-                    mint=mint,
-                    symbol=symbol,
-                    trades=trades,
-                    price0=price0,
-                    price1=price1,
-                    min_trades=self.momo_min_trades,
-                    min_up_pct=self.momo_min_up_pct,
-                )
-                return True
-
-            # Other pools: strict
-            log.event(
-                "MOMO_SKIP_NO_DATA",
-                rule="momentum",
-                pool=pool,
-                mint=mint,
-                symbol=symbol,
-                trades=trades,
-                price0=price0,
-                price1=price1,
-                min_trades=self.momo_min_trades,
-                min_up_pct=self.momo_min_up_pct,
-            )
-            try:
-                record_buy_result(ok=False, reason="momo_no_data")
-            except Exception:
-                pass
-            self._diag["rejected_momo"] += 1
-            return False
-
-        # ───── HAVE DATA: evaluate real momentum ────────────────────────
-        pct_up = ((price1 / max(price0, 1e-12)) - 1.0) * 100.0
-        up_ok = pct_up >= self.momo_min_up_pct
-        trades_ok = trades >= self.momo_min_trades
-
-        log.event(
-            "MOMO_EVAL",
-            rule="momentum",
-            pool=pool,
-            mint=mint,
-            symbol=symbol,
-            trades=trades,
-            price0=price0,
-            price1=price1,
-            pct_up=pct_up,
-            min_trades=self.momo_min_trades,
-            min_up_pct=self.momo_min_up_pct,
-            up_ok=int(up_ok),
-            trades_ok=int(trades_ok),
-        )
-
-        if not (up_ok and trades_ok):
-            reasons: list[str] = []
-            if not up_ok:
-                reasons.append(f"up {pct_up:.2f}% < {self.momo_min_up_pct}%")
-            if not trades_ok:
-                reasons.append(f"trades {trades} < {self.momo_min_trades}")
-
-            log.event(
-                "MOMO_REJECT",
-                rule="momentum",
-                pool=pool,
-                mint=mint,
-                symbol=symbol,
-                pct_up=pct_up,
-                trades=trades,
-                reasons="; ".join(reasons) or "unknown",
-            )
-            try:
-                record_buy_result(ok=False, reason="momo_reject")
-            except Exception:
-                pass
-            self._diag["rejected_momo"] += 1
-            return False
-
-        log.event(
-            "MOMO_OK",
-            rule="momentum",
-            pool=pool,
-            mint=mint,
-            symbol=symbol,
-            pct_up=pct_up,
-            trades=trades,
-            min_trades=self.momo_min_trades,
-            min_up_pct=self.momo_min_up_pct,
-        )
-        return True
-
-    # --- MOMENTUM GATE ---------------------------------------------------
-    async def _gate_candidate(
-        self,
-        ui: Dict[str, Any],
-        mint_raw: str,
-        mint_norm: str,
-    ) -> None:
-        """
-        Momentum gate that:
-          - waits for a short window
-          - counts trades + price move
-          - enforces pool-aware momentum thresholds
-          - runs guardrails
-          - finally calls maybe_buy()
-        """
-        IS_DRYRUN = (_dryrun_env_on() or _pkg_is_dryrun)
-
-        async with self._gate_sema:
-            # Dedupe gating per mint
-            if DEDUPE_ENABLED:
-                if not claim_once(f"gate:{mint_norm}", ttl=int(PF_GATE_TTL_SEC)):
-                    if DEBUG_TX:
-                        print(
-                            f".[dedupe] gate already running for {mint_norm} — skip",
-                            flush=True,
-                        )
-                    log.event(
-                        "RULE_DEDUPE_GATE_SKIP",
-                        mint=mint_norm,
-                        where="gate_candidate",
-                    )
-                    return
-                else:
-                    log.event(
-                        "RULE_DEDUPE_GATE_OK",
-                        mint=mint_norm,
-                        where="gate_candidate",
-                    )
-
-            pool = str(ui.get("pool") or "").lower()
-
-            # Ensure spend_sol is baked into UI so BUY_SUBMITTED / exit see
-            # the same size the router is about to use.
-            try:
-                spend_hint = _compute_spend_sol(ui)
-                if spend_hint > 0:
-                    ui["spend_sol"] = float(spend_hint)
-            except Exception:
-                # Never block on size estimation
-                pass
-
-            # Initialise gate state (keyed by raw mint so on_trade() updates)
-            st = self._get_gate_state(mint_raw)
-            st["trades"] = 0
-            st["price0"] = 0.0
-
-            # First price sample (price0)
-            price0 = 0.0
-            if _is_probable_mint(mint_norm):
-                for _ in range(max(1, self.momo_price_tries)):
-                    try:
-                        price0 = await _route_price_ui(mint_norm)
-                    except Exception:
-                        price0 = 0.0
-                    if price0 > 0:
-                        break
-                    await asyncio.sleep(self.momo_price_delay_s)
-
-            # Safely persist price0 back into gate-state
-            st = self._get_gate_state(mint_raw)
-            st["price0"] = price0
-
-            # Wait the momentum window
-            await asyncio.sleep(max(1, self.momo_window_sec))
-
-            # Snapshot state after the window
-            st = self._gate_state.get(mint_raw, {})
-            trades = int(st.get("trades", 0))
-
-            price1 = 0.0
-            if _is_probable_mint(mint_norm):
-                try:
-                    price1 = await _route_price_ui(mint_norm)
-                except Exception:
-                    price1 = 0.0
-
-            # Clear gate state (best-effort)
-            self._gate_state.pop(mint_raw, None)
-
-            # --- MOMENTUM DECISION (pool-aware) -------------------------
-            symbol = ui.get("symbol") or ui.get("name") or "?"
-            momo_ok = self._momentum_decision(
-                pool=pool,
-                mint=mint_norm,
-                symbol=symbol,
-                trades=trades,
-                price0=price0,
-                price1=price1,
-            )
-            if not momo_ok:
-                # strict momentum rejections already logged + diag updated
-                log.event(
-                    "RULE_MOMENTUM_BLOCK",
-                    pool=pool,
-                    mint=mint_norm,
-                    symbol=symbol,
-                    trades=trades,
-                )
-                return
-
-            # ---- Guardrails before executing a buy ----------------------
-            if PAUSE_TRADING or not buys_allowed():
-                if DEBUG_TX:
-                    print(
-                        "[guardrails] buys not allowed at gate decision — skip",
-                        flush=True,
-                    )
-                try:
-                    record_buy_result(ok=False, reason="guardrails_halt")
-                except Exception:
-                    pass
-                self._diag["rejected_guardrails"] += 1
-                log.event(
-                    "RULE_GUARDRAILS_EXEC_BLOCK",
-                    where="gate_candidate",
-                    mint=mint_norm,
-                    pool=pool,
-                )
-                return
-
-            max_tradeable = MAX_TRADEABLE
-            if max_tradeable > 0:
-                try:
-                    if len(list(all_positions())) >= max_tradeable:
-                        log.event(
-                            "BUY_BLOCK_MAX_TRADEABLE",
-                            cap=max_tradeable,
-                        )
-                        try:
-                            record_buy_result(ok=False, reason="max_tradeable")
-                        except Exception:
-                            pass
-                        self._diag["rejected_guardrails"] += 1
-                        log.event(
-                            "RULE_MAX_TRADEABLE_BLOCK",
-                            where="gate_candidate",
-                            mint=mint_norm,
-                            pool=pool,
-                        )
-                        return
-                except Exception:
-                    pass
-
-            # Dedupe final buy
-            if DEDUPE_ENABLED:
-                if not claim_once(
-                    f"buy:{mint_norm}",
-                    ttl=int(PF_BUY_TTL_SEC),
-                ):
-                    if DEBUG_TX:
-                        print(
-                            f".[dedupe] buy already claimed for {mint_norm} — skip",
-                            flush=True,
-                        )
-                    try:
-                        record_buy_result(ok=False, reason="buy_claimed_elsewhere")
-                    except Exception:
-                        pass
-                    log.event(
-                        "RULE_DEDUPE_BUY_SKIP",
-                        mint=mint_norm,
-                        where="gate_candidate",
-                    )
-                    return
-                else:
-                    log.event(
-                        "RULE_DEDUPE_BUY_OK",
-                        mint=mint_norm,
-                        where="gate_candidate",
-                    )
-
-            # ---- Execute buy via maybe_buy (signature-only API) ---------
-            try:
-                async with self._sema:
-                    tx_sig = await maybe_buy(
-                        mint=mint_norm,
-                        ui=ui | {"dryrun": IS_DRYRUN},
-                        on_buy_submitted=_buy_hook_submitted,
-                        on_buy_filled=_buy_hook_filled,
-                        on_buy_failed=_buy_hook_failed,
-                    )
-                    self._diag["buys_submitted"] += 1
-
-                    if tx_sig:
-                        # Fire submitted hook again as a safety net (if router didn't)
-                        try:
-                            await _buy_hook_submitted({"mint": mint_norm, **ui})
-                        except Exception:
-                            pass
-
-                        ok, info = await _confirm_sig(tx_sig)
-                        if ok:
-                            log.info(
-                                "BUY_FILLED",
-                                extra={
-                                    "mint": mint_norm,
-                                    "tx_sig": tx_sig,
-                                    "slot": info,
-                                },
-                            )
-
-                            # Alerts (Telegram/Notion) – secondary path,
-                            # primary is _buy_hook_filled
-                            try:
-                                create_task(
-                                    _am().notify_trade_fill(
-                                        side="BUY",
-                                        mint=mint_norm,
-                                        symbol=ui.get("symbol"),
-                                        pool=ui.get("pool") or "unknown",
-                                        sig=tx_sig,
-                                        spend_sol=ui.get("spend_sol"),
-                                        out_amount=ui.get("amount_raw"),
-                                    )
-                                )
-                            except Exception as _e:
-                                log.warning(
-                                    "ALERT_BUY_FILLED_FAIL",
-                                    extra={"err": str(_e)[:200]},
-                                )
-
-                            # Exit engine hook (fallback; primary wiring is _buy_hook_filled)
-                            if EXIT_ENGINE_ENABLED:
-                                try:
-                                    ev = {
-                                        "mint": mint_norm,
-                                        "signature": tx_sig,
-                                        "symbol": ui.get("symbol"),
-                                        "spend_sol": ui.get("spend_sol") or 0.0,
-                                        "pool": ui.get("pool") or "unknown",
-                                    }
-
-                                    # Best-effort amount_raw extraction from UI
-                                    amount_raw: Optional[int] = None
-                                    for k in (
-                                        "amount_raw",
-                                        "position_raw",
-                                        "size_raw",
-                                        "raw_out",
-                                        "raw_amount_out",
-                                        "out_amount",
-                                        "token_amount_raw",
-                                    ):
-                                        v = ui.get(k)
-                                        if isinstance(v, int) and v > 0:
-                                            amount_raw = v
-                                            break
-                                        if isinstance(v, float) and v > 0:
-                                            amount_raw = int(v)
-                                            break
-
-                                    await exit_engine.on_buy_filled(
-                                        ev,
-                                        tx_sig=tx_sig,
-                                        amount_raw=amount_raw,
-                                    )
-                                except Exception:
-                                    if DEBUG_TX:
-                                        traceback.print_exc()
-
-                            self._diag["buys_filled"] += 1
-                            try:
-                                record_buy_result(ok=True, reason="executed", sig=tx_sig)
-                            except Exception:
-                                pass
-                            asyncio.create_task(_post_buy_exit_test(mint_norm, tx_sig))
-                        else:
-                            log.error(
-                                "BUY_FAILED",
-                                extra={"mint": mint_norm, "tx_sig": tx_sig, "reason": info},
-                            )
-                            try:
-                                await _buy_hook_failed(
-                                    {"mint": mint_norm, "reason": info, **ui}
-                                )
-                            except Exception:
-                                pass
-                            try:
-                                record_buy_result(ok=False, reason=str(info))
-                            except Exception:
-                                pass
-                    else:
-                        # DRYRUN path usually returns None
-                        if IS_DRYRUN:
-                            log.event("BUY_DRYRUN_EXIT", mint=mint_norm)
-                            try:
-                                record_buy_result(ok=False, reason="dryrun_exit")
-                            except Exception:
-                                pass
-                        else:
-                            try:
-                                record_buy_result(ok=False, reason="no_tx_sig")
-                            except Exception:
-                                pass
-
-            except Exception:
-                traceback.print_exc()
-                try:
-                    record_buy_result(ok=False, reason="exception")
-                except Exception:
-                    pass
-
-    # --- NEW TOKENS (entry point for gating) -----------------------------
-    async def on_new_token(self, raw_event: Dict[str, Any]) -> None:
-        """
-        New-token handler from scanners (PumpPortal / Raydium / Dexscreener):
-          - regime gate
-          - top-level guardrails
-          - mint normalization + basic filters
-          - risk-capacity gate
-          - smart-wallet guard
-          - liquidity screening
-          - AI / feature-based gate
-          - dedupe & momentum gate (or direct-buy if disabled)
-        """
-        DEBUG_LOCAL = DEBUG_TX  # just an alias for readability
-        IS_DRYRUN = (_dryrun_env_on() or _pkg_is_dryrun)
-
-        self._diag["events_total"] += 1
-        self._diag["events_new_token"] += 1
-
-        # Pool + force-buy flag (for Raydium debug / aggression)
-        pool = str(raw_event.get("pool") or "pump").lower()
-        force_ray = (
-            os.getenv("ENTRY_FORCE_BUY_RAYDIUM", "0") == "1"
-            and pool == "raydium"
-        )
-
-        # --- Raydium-specific age guard (we only want relatively "fresh" runners)
-        age_min = float(
-            raw_event.get("token_age_min")
-            or raw_event.get("age_min")
-            or 0.0
-        )
-
-        if (
-            pool == "raydium"
-            and not force_ray  # let you bypass manually if you REALLY want old coins
-            and RAY_MAX_AGE_MIN > 0
-            and age_min > RAY_MAX_AGE_MIN
-        ):
-            self._diag["rejected_filters"] += 1
-            log.event(
-                "ENTRY_RAY_AGE_REJECT",
-                pool=pool,
-                mint="(pending_norm)",
-                symbol=_extract_symbol(raw_event),
-                age_min=age_min,
-                ray_max_age_min=RAY_MAX_AGE_MIN,
-            )
-            try:
-                record_buy_result(
-                    ok=False,
-                    reason="ray_age_reject",
-                    age_min=age_min,
-                )
-            except Exception:
-                pass
-            if DEBUG_LOCAL:
-                print(
-                    f"[ENTRY_RAY_AGE_REJECT] sym={_extract_symbol(raw_event)} "
-                    f"age={age_min:.1f}m > {RAY_MAX_AGE_MIN:.1f}m — skip",
-                    flush=True,
-                )
-            return
-
-        # --- Extract and normalise mint early for regime / risk logs ----
-        mint_source = _extract_raw_mint(raw_event)
-        if not mint_source:
-            if DEBUG_LOCAL:
-                print("[strategy] missing mint — skip", flush=True)
-            return
-
-        mint_norm = _normalize_from_source(mint_source)
-        symbol_for_regime = _extract_symbol(raw_event)
-
-        if not _is_probable_mint(mint_norm):
-            if DEBUG_LOCAL:
-                print(
-                    f"[strategy] implausible mint after normalize => skip ({mint_source})",
-                    flush=True,
-                )
-            return
-
-        # --- Regime gate (macro / risk-on/off) --------------------------
-        if not self._regime_allows_entry(
-            pool=pool,
-            symbol=symbol_for_regime,
-            mint=mint_norm,
-        ):
-            # regime gate already logged + diag updated
-            return
-
-        # Top-level guardrails
-        if PAUSE_TRADING or not buys_allowed():
-            if DEBUG_LOCAL:
-                print("[guardrails] buys not allowed now — skip", flush=True)
-            self._diag["rejected_guardrails"] += 1
-            try:
-                record_buy_result(ok=False, reason="guardrails_top")
-            except Exception:
-                pass
-            log.event(
-                "RULE_GUARDRAILS_TOP_BLOCK",
-                pool=pool,
-                reason="pause_or_not_allowed",
-            )
-            return
-
-        max_tradeable = MAX_TRADEABLE
-        if max_tradeable > 0:
-            try:
-                if len(list(all_positions())) >= max_tradeable:
-                    log.event("BUY_BLOCK_MAX_TRADEABLE", cap=max_tradeable)
-                    self._diag["rejected_guardrails"] += 1
-                    try:
-                        record_buy_result(ok=False, reason="max_tradeable_top")
-                    except Exception:
-                        pass
-                    log.event(
-                        "RULE_MAX_TRADEABLE_BLOCK",
-                        where="top",
-                        pool=pool,
-                        cap=max_tradeable,
-                    )
-                    return
-            except Exception:
-                pass
-
-        # If we got here, guardrails-top passed for this candidate
-        log.event(
-            "RULE_GUARDRAILS_TOP_OK",
-            pool=pool,
-            max_tradeable=max_tradeable,
-            pause=int(PAUSE_TRADING),
-        )
-
-        # --- Risk-capacity gate ----------------------------------------
-        cap_ok, risk_cap = await self._risk_capacity_decision(
-            pool=pool,
-            mint=mint_norm,
-            symbol=symbol_for_regime,
-        )
-        if not cap_ok:
-            # logged + diag updated
-            return
-
-        # ---------- BASIC FILTERS (age / name / blacklist / scanner metrics)
-        basic_ok = _passes_basic_filters(raw_event)
-
-        if not basic_ok and not force_ray:
-            # hard reject
-            self._diag["rejected_filters"] += 1
-
-            liq = float(
-                raw_event.get("liq_usd")
-                or raw_event.get("liq")
-                or 0.0
-            )
-            vol5 = float(
-                raw_event.get("vol_5m_usd")
-                or raw_event.get("vol5")
-                or 0.0
-            )
-            # Support both naming schemes: price_change_5m_pct / chg5 / up_5m_pct
-            up5 = float(
-                raw_event.get("price_change_5m_pct")
-                or raw_event.get("chg5")
-                or raw_event.get("up_5m_pct")
-                or 0.0
-            )
-            buys5 = int(raw_event.get("buys_5m") or raw_event.get("buys5") or 0)
-            sells5 = int(raw_event.get("sells_5m") or raw_event.get("sells5") or 0)
-            age_min = float(
-                raw_event.get("token_age_min")
-                or raw_event.get("age_min")
-                or 0.0
-            )
-
-            log.event(
-                "ENTRY_FILTER_REJECT",
-                pool=pool,
-                mint=mint_norm,
-                symbol=_extract_symbol(raw_event),
-                liq_usd=liq,
-                vol_5m_usd=vol5,
-                up_5m_pct=up5,
-                buys5=buys5,
-                sells5=sells5,
-                age_min=age_min,
-            )
-            log.event(
-                "RULE_BASIC_FILTERS_FAIL",
-                pool=pool,
-                mint=mint_norm,
-                symbol=_extract_symbol(raw_event),
-            )
-            if DEBUG_LOCAL:
-                print(
-                    f"[ENTRY_FILTER_REJECT] pool={pool} sym={_extract_symbol(raw_event)} "
-                    f"liq={liq:.1f} vol5={vol5:.1f} up5={up5:.2f}% "
-                    f"buys5={buys5} sells5={sells5} age={age_min:.1f}m",
-                    flush=True,
-                )
-            try:
-                record_buy_result(ok=False, reason="basic_filters")
-            except Exception:
-                pass
-            return
-
-        if not basic_ok and force_ray:
-            # We *bypass* the basic filters for Raydium when the flag is set
-            log.event(
-                "ENTRY_FILTER_BYPASS_FORCE_RAYDIUM",
-                pool=pool,
-                mint=mint_norm,
-                symbol=_extract_symbol(raw_event),
-            )
-            log.event(
-                "RULE_BASIC_FILTERS_BYPASS",
-                pool=pool,
-                mint=mint_norm,
-                symbol=_extract_symbol(raw_event),
-                reason="force_ray",
-            )
-            if DEBUG_LOCAL:
-                print(
-                    f"[ENTRY_FILTER_BYPASS_FORCE_RAYDIUM] sym={_extract_symbol(raw_event)} mint={mint_norm}",
-                    flush=True,
-                )
-        else:
-            # Basic filters passed normally
-            log.event(
-                "RULE_BASIC_FILTERS_OK",
-                pool=pool,
-                mint=mint_norm,
-                symbol=_extract_symbol(raw_event),
-            )
-
-        # ---------- SMART WALLET GUARD ----------------------------------
-        if not self._smart_wallet_guard(
-            raw_event=raw_event,
-            mint_norm=mint_norm,
-            pool=pool,
-        ):
-            # guard already logged + diag updated
-            return
-
-        # ---------- LIQUIDITY SCREEN -----------------------------------
-        dec_from_liq: Optional[int] = None
-
-        if LIQ_FILTER_ENABLED and not force_ray:
-            # For non-pump pools we enforce JUP / router-based liquidity screen.
-            if pool != "pump":
-                ok, rep = await _screen_with_retry(mint_norm, tries=3, first_wait=0.8)
-
-                # If JUP says "no_account", we optionally wait for the mint to become readable
-                if not ok and str((rep or {}).get("reason")) == "no_account":
-                    # Fresh bond curve: wait a bit for mint to become readable
-                    dec_from_liq = await _await_mint_ready(
-                        mint_norm,
-                        max_wait_s=45,
-                        step_s=3.0,
-                    )
-                    if dec_from_liq is not None:
-                        ok = True
-                        rep = {
-                            "ok": True,
-                            "reason": "await_mint_ready",
-                            "decimals": dec_from_liq,
-                        }
-
-                # Still not OK → hard reject for non-pump pools
-                if not ok:
-                    if DEBUG_LOCAL:
-                        print(
-                            f"[liquidity] screen failed for {mint_norm}: {rep}",
-                            flush=True,
-                        )
-                    self._diag["rejected_filters"] += 1
-                    log.event(
-                        "ENTRY_LIQ_REJECT",
-                        pool=pool,
-                        mint=mint_norm,
-                        reason=str((rep or {}).get("reason")),
-                    )
-                    log.event(
-                        "RULE_LIQ_FILTER_FAIL",
-                        pool=pool,
-                        mint=mint_norm,
-                        reason=str((rep or {}).get("reason")),
-                    )
-                    try:
-                        record_buy_result(ok=False, reason="liquidity_reject")
-                    except Exception:
-                        pass
-                    return
-
-                # Success path for non-pump pools
-                if dec_from_liq is None:
-                    dec_from_liq = (rep or {}).get("decimals")
-
-                log.event(
-                    "ENTRY_LIQ_OK",
-                    mint=mint_norm,
-                    priceImpactPct=(rep or {}).get("priceImpactPct"),
-                    dec=dec_from_liq,
-                )
-                log.event(
-                    "RULE_LIQ_FILTER_OK",
-                    pool=pool,
-                    mint=mint_norm,
-                    dec=dec_from_liq,
-                )
-
-            else:
-                # Pump.fun: JUP often has no route / account yet for ultra-early mints.
-                # We rely on Pump's own liq/vol filters + AI / risk guardrails instead.
-                log.event(
-                    "ENTRY_LIQ_BYPASS_PUMP",
-                    pool=pool,
-                    mint=mint_norm,
-                    reason="skip_jup_for_pump",
-                )
-                log.event(
-                    "RULE_LIQ_FILTER_BYPASS",
-                    pool=pool,
-                    mint=mint_norm,
-                    reason="pump_skip",
-                )
-                if DEBUG_LOCAL:
-                    print(
-                        f"[ENTRY_LIQ_BYPASS_PUMP] sym={_extract_symbol(raw_event)} mint={mint_norm}",
-                        flush=True,
-                    )
-
-        elif LIQ_FILTER_ENABLED and force_ray:
-            # Skip liq screen entirely in force-ray mode
-            log.event(
-                "ENTRY_LIQ_BYPASS_FORCE_RAYDIUM",
-                pool=pool,
-                mint=mint_norm,
-                symbol=_extract_symbol(raw_event),
-            )
-            log.event(
-                "RULE_LIQ_FILTER_BYPASS",
-                pool=pool,
-                mint=mint_norm,
-                reason="force_ray",
-            )
-            if DEBUG_LOCAL:
-                print(
-                    f"[ENTRY_LIQ_BYPASS_FORCE_RAYDIUM] sym={_extract_symbol(raw_event)} mint={mint_norm}",
-                    flush=True,
-                )
-
-        # Build UI payload / context for downstream
-        ui: Dict[str, Any] = dict(raw_event)
-        ui.setdefault("pool", pool)
-        ui.setdefault("symbol", _extract_symbol(raw_event))
-        ui.setdefault("name", _extract_name(raw_event))
-        ui["rawMint"] = mint_source
-        ui["mint"] = mint_norm
-        ui["normalized"] = (mint_norm != mint_source)
-        if dec_from_liq is not None:
-            ui["decimals"] = dec_from_liq
-        if risk_cap is not None:
-            ui["risk_capacity"] = risk_cap
-
-        print(
-            f"[trade] pool={ui.get('pool','?')} "
-            f"symbol={(ui.get('symbol') or '?')} mint={mint_norm}",
-            flush=True,
-        )
-
-        # --- AI entry gating (unified v3+++ gate) -----------------------
-        ai_ok = True
-        if self.ai_enabled and self._ai_mod is not None:
-            ai_ok = await self._ai_entry_gate(
-                ui=ui,
-                mint_norm=mint_norm,
-                pool=pool,
-                raw_event=raw_event,
-                risk_cap=risk_cap,
-            )
-
-        if not ai_ok:
-            # _ai_entry_gate already logged + diag updated
-            return
-
-        # Dedupe gate proposals
-        if DEDUPE_ENABLED and self.momo_enabled:
-            if not claim_once(
-                f"gate-propose:{mint_norm}",
-                ttl=int(PF_GATE_TTL_SEC),
-            ):
-                if DEBUG_LOCAL:
-                    print(
-                        f".[dedupe] gate-propose taken for {mint_norm} — skip",
-                        flush=True,
-                    )
-                log.event(
-                    "RULE_DEDUPE_GATE_SKIP",
-                    where="gate_propose",
-                    mint=mint_norm,
-                )
-                return
-            else:
-                log.event(
-                    "RULE_DEDUPE_GATE_OK",
-                    where="gate_propose",
-                    mint=mint_norm,
-                )
-
-        # Momentum enabled → send into gate; otherwise buy immediately
-        if self.momo_enabled:
-            asyncio.create_task(self._gate_candidate(ui, mint_source, mint_norm))
-        else:
-            # Direct-buy path, still respecting dedupe/guardrails
-            if DEDUPE_ENABLED and not claim_once(
-                f"buy:{mint_norm}",
-                ttl=int(PF_BUY_TTL_SEC),
-            ):
-                if DEBUG_LOCAL:
-                    print(
-                        f".[dedupe] buy already claimed for {mint_norm} — skip",
-                        flush=True,
-                    )
-                log.event(
-                    "RULE_DEDUPE_BUY_SKIP",
-                    where="direct_buy",
-                    mint=mint_norm,
-                )
-                return
-            else:
-                if DEDUPE_ENABLED:
-                    log.event(
-                        "RULE_DEDUPE_BUY_OK",
-                        where="direct_buy",
-                        mint=mint_norm,
-                    )
-
-            async with self._sema:
-                try:
-                    # Ensure spend_sol is present for BUY_SUBMITTED / exit hooks
-                    try:
-                        spend_hint = _compute_spend_sol(ui)
-                        if spend_hint > 0:
-                            ui["spend_sol"] = float(spend_hint)
-                    except Exception:
-                        pass
-
-                    if PAUSE_TRADING or not buys_allowed():
-                        if DEBUG_LOCAL:
-                            print(
-                                "[guardrails] buys not allowed at execution — skip",
-                                flush=True,
-                            )
-                        self._diag["rejected_guardrails"] += 1
-                        try:
-                            record_buy_result(ok=False, reason="guardrails_exec")
-                        except Exception:
-                            pass
-                        log.event(
-                            "RULE_GUARDRAILS_EXEC_BLOCK",
-                            where="direct_buy",
-                            mint=mint_norm,
-                            pool=pool,
-                        )
-                        return
-
-                    max_tradeable = MAX_TRADEABLE
-                    if max_tradeable > 0:
-                        try:
-                            if len(list(all_positions())) >= max_tradeable:
-                                log.event(
-                                    "BUY_BLOCK_MAX_TRADEABLE",
-                                    cap=max_tradeable,
-                                )
-                                self._diag["rejected_guardrails"] += 1
-                                try:
-                                    record_buy_result(
-                                        ok=False,
-                                        reason="max_tradeable_exec",
-                                    )
-                                except Exception:
-                                    pass
-                                log.event(
-                                    "RULE_MAX_TRADEABLE_BLOCK",
-                                    where="direct_buy",
-                                    mint=mint_norm,
-                                    pool=pool,
-                                )
-                                return
-                        except Exception:
-                            pass
-
-                    # Execute buy via maybe_buy (signature-only)
-                    tx_sig = await maybe_buy(
-                        mint=mint_norm,
-                        ui=ui | {"dryrun": IS_DRYRUN},
-                        on_buy_submitted=_buy_hook_submitted,
-                        on_buy_filled=_buy_hook_filled,
-                        on_buy_failed=_buy_hook_failed,
-                    )
-                    self._diag["buys_submitted"] += 1
-
-                    if tx_sig:
-                        # Fire submitted hook again with enriched UI
-                        try:
-                            await _buy_hook_submitted({"mint": mint_norm, **ui})
-                        except Exception:
-                            pass
-
-                        ok, info = await _confirm_sig(tx_sig)
-                        if ok:
-                            log.info(
-                                "BUY_FILLED",
-                                extra={
-                                    "mint": mint_norm,
-                                    "tx_sig": tx_sig,
-                                    "slot": info,
-                                },
-                            )
-
-                            # Alert manager (Telegram/Discord)
-                            try:
-                                create_task(
-                                    _am().notify_trade_fill(
-                                        side="BUY",
-                                        mint=mint_norm,
-                                        symbol=ui.get("symbol"),
-                                        pool=ui.get("pool") or "unknown",
-                                        sig=tx_sig,
-                                        spend_sol=ui.get("spend_sol"),
-                                        out_amount=ui.get("amount_raw"),
-                                    )
-                                )
-                            except Exception as _e:
-                                log.warning(
-                                    "ALERT_BUY_FILLED_FAIL",
-                                    extra={"err": str(_e)[:200]},
-                                )
-
-                            # Exit engine hook (fallback; primary wiring is _buy_hook_filled)
-                            if EXIT_ENGINE_ENABLED:
-                                try:
-                                    ev = {
-                                        "mint": mint_norm,
-                                        "signature": tx_sig,
-                                        "symbol": ui.get("symbol"),
-                                        "spend_sol": ui.get("spend_sol") or 0.0,
-                                        "pool": ui.get("pool") or "legacy",
-                                    }
-
-                                    # ensure amount_raw present
-                                    amount_raw: Optional[int] = None
-                                    for k in (
-                                        "amount_raw",
-                                        "position_raw",
-                                        "size_raw",
-                                        "raw_out",
-                                        "raw_amount_out",
-                                        "out_amount",
-                                        "token_amount_raw",
-                                    ):
-                                        v = ui.get(k)
-                                        if isinstance(v, int) and v > 0:
-                                            amount_raw = v
-                                            break
-                                        if isinstance(v, float) and v > 0:
-                                            amount_raw = int(v)
-                                            break
-
-                                    # Notify exit engine
-                                    try:
-                                        await exit_engine.on_buy_filled(
-                                            ev,
-                                            tx_sig=tx_sig,
-                                            amount_raw=amount_raw,
-                                        )
-                                    except Exception:
-                                        if DEBUG_TX:
-                                            traceback.print_exc()
-
-                                    self._diag["buys_filled"] += 1
-                                    try:
-                                        record_buy_result(
-                                            ok=True,
-                                            reason="executed",
-                                            sig=tx_sig,
-                                        )
-                                    except Exception:
-                                        pass
-                                    asyncio.create_task(
-                                        _post_buy_exit_test(mint_norm, tx_sig)
-                                    )
-                                except Exception:
-                                    if DEBUG_TX:
-                                        traceback.print_exc()
-                        else:
-                            # Confirmation failed / timed out
-                            log.error(
-                                "BUY_FAILED",
-                                extra={
-                                    "mint": mint_norm,
-                                    "tx_sig": tx_sig,
-                                    "reason": info,
-                                },
-                            )
-                            try:
-                                await _buy_hook_failed(
-                                    {"mint": mint_norm, "reason": info, **ui}
-                                )
-                            except Exception:
-                                pass
-                            try:
-                                record_buy_result(ok=False, reason=str(info))
-                            except Exception:
-                                pass
-                    else:
-                        # No tx_sig came back from maybe_buy
-                        if IS_DRYRUN:
-                            log.event("BUY_DRYRUN_EXIT", mint=mint_norm)
-                            try:
-                                record_buy_result(ok=False, reason="dryrun_exit")
-                            except Exception:
-                                pass
-                        else:
-                            try:
-                                record_buy_result(ok=False, reason="no_tx_sig")
-                            except Exception:
-                                pass
-                except Exception:
-                    print("[strategy] maybe_buy exception:", flush=True)
-                    traceback.print_exc()
-                    try:
-                        record_buy_result(ok=False, reason="exception")
-                    except Exception:
-                        pass
-
-        # Cooldown between processing new tokens
-        await asyncio.sleep(LOOP_COOLDOWN_SEC)
-
-# ---------------------------
-# Mint normalization wrappers
-# ---------------------------
-
-# Small in-memory caches so we don't hammer pp_normalize / mint_guard
-# for the same mints over and over. This is *especially* helpful when
-# scanners keep revisiting hot tokens.
-_NORMALIZE_CACHE: Dict[str, str] = {}
-_PROB_CACHE: Dict[str, bool] = {}
-_MAX_NORM_CACHE = 4096  # tiny & safe; auto-evicts FIFO-ish
-
-
-def _normalize_from_source(raw: str) -> str:
-    """
-    Normalize any incoming mint-like string into a canonical mint.
-
-    Priority:
-      1. scripts.pp_utils.normalize_mint  (your local normalizer)
-      2. utils_pkg.mint_guard.normalize_from_any (if available)
-      3. raw string fallback (last resort)
-
-    Uses a small LRU-style cache to avoid repeated expensive normalizations.
-
-    V3+++:
-      - Defensive against garbage inputs (None/empty/whitespace).
-      - Bound cache with simple FIFO-ish eviction.
-      - Never raises: always returns a string (possibly raw).
-    """
-    if raw is None:
-        return ""
-    raw = str(raw).strip()
-    if not raw:
-        return ""
-
-    cached = _NORMALIZE_CACHE.get(raw)
-    if cached is not None:
-        return cached
-
-    # Local normalizer first (fast + close to router expectations)
-    try:
-        m = _pp_normalize(raw)
-    except Exception:
-        m = ""
-
-    # Optional mint_guard normalizer for cross-system consistency
-    if (not m) and _mg_normalize:
-        try:
-            m2 = _mg_normalize(raw)
-            if isinstance(m2, str) and m2:
-                m = m2
-        except Exception:
-            # Best-effort only – never break flow
-            m = raw
-
-    if not m:
-        m = raw
-
-    # Maintain a bounded cache size
-    if len(_NORMALIZE_CACHE) >= _MAX_NORM_CACHE:
-        # crude FIFO-ish eviction: pop an arbitrary item
-        try:
-            _NORMALIZE_CACHE.pop(next(iter(_NORMALIZE_CACHE)))
-        except Exception:
-            _NORMALIZE_CACHE.clear()
-
-    _NORMALIZE_CACHE[raw] = m
-    return m
-
-
-def _is_probable_mint(s: str) -> bool:
-    """
-    Heuristic "is this a real Solana mint?" check.
-
-    Priority:
-      1. utils_pkg.mint_guard.is_probable_mint (if present)
-      2. local pp_normalize truthiness
-
-    V3+++:
-      - Small cache to avoid repeated checks.
-      - Never throws; strictly returns a bool.
-    """
-    if not s:
-        return False
-
-    cached = _PROB_CACHE.get(s)
-    if cached is not None:
-        return cached
-
-    ok = False
-    if _mg_prob:
-        try:
-            ok = bool(_mg_prob(s))
-        except Exception:
-            ok = False
-    else:
-        try:
-            ok = bool(_pp_normalize(s))
-        except Exception:
-            ok = False
-
-    # Small bounded cache for this as well
-    if len(_PROB_CACHE) >= _MAX_NORM_CACHE:
-        try:
-            _PROB_CACHE.pop(next(iter(_PROB_CACHE)))
-        except Exception:
-            _PROB_CACHE.clear()
-    _PROB_CACHE[s] = ok
-    return ok
-
-
-# ---------------------------
-# Entry meta logging (PG + analytics)
-# ---------------------------
-
-_ENTRY_LOG_TABLE_READY: bool = False
-_ENTRY_LOG_PG_ENABLED: bool = _as_bool(
-    os.getenv("ENTRY_PG_ENABLED", "1"),
-    default=True,
-)
-
-
-async def _ensure_entry_log_table() -> None:
-    """
-    Ensure the entry_log table exists in the primary PG DSN.
-
-    We use the generic PG DSN if present, otherwise fall back to PNL DSN.
-    Safe no-op if asyncpg / DSN are missing.
-
-    Table is intentionally minimal + append-only so we can run
-    analytics/backtests on historical entries.
-
-    V3+++:
-      - Adds basic indexes (at_utc, mint) for faster analytics scans.
-      - Safe to call repeatedly; guarded by _ENTRY_LOG_TABLE_READY flag.
-    """
-    global _ENTRY_LOG_TABLE_READY
-
-    if _ENTRY_LOG_TABLE_READY:
-        return
-    if not asyncpg:
-        return
-    if not _ENTRY_LOG_PG_ENABLED:
-        return
-
-    dsn = _PG_DSN_ASYNC or _PNL_DSN_ASYNC
-    if not dsn:
-        return
-
-    try:
-        conn = await asyncpg.connect(dsn)
-        try:
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS entry_log (
-                    id BIGSERIAL PRIMARY KEY,
-                    at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    mint TEXT NOT NULL,
-                    symbol TEXT,
-                    pool TEXT,
-                    signature TEXT,
-                    route TEXT,
-                    spend_sol NUMERIC,
-                    in_amount_raw NUMERIC,
-                    out_amount_raw NUMERIC,
-                    price_impact NUMERIC,
-                    meta JSONB,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-                """
-            )
-            # Lightweight indexes for analytics
-            try:
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_entry_log_at_utc "
-                    "ON entry_log (at_utc);"
-                )
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_entry_log_mint_at_utc "
-                    "ON entry_log (mint, at_utc DESC);"
-                )
-            except Exception:
-                # Index creation failure is non-fatal
-                if DEBUG_TX:
-                    traceback.print_exc()
-
-            _ENTRY_LOG_TABLE_READY = True
-            log.event("ENTRY_PG_READY", dsn=_PG_DSN_MASK or "<dsn>")
-        finally:
-            await conn.close()
-    except Exception as e:
-        if DEBUG_TX:
-            traceback.print_exc()
-        log.event("ENTRY_PG_ERROR", when="ensure_table", error=str(e))
-
-
-def _spend_from_meta_and_ui(entry_meta: Dict[str, Any], ui: Dict[str, Any]) -> float:
-    """
-    Derive spend_sol from entry_meta (preferred) and fall back to UI/env.
-
-    Priority:
-      1) lamport-based fields in meta
-      2) SOL-sized fields in meta
-      3) _compute_spend_sol(ui)
-
-    V3+++:
-      - Robust across many possible Jupiter/router shapes.
-      - Never raises; returns 0.0 on failure.
-    """
-    lamports_val = None
-    for k in (
-        "in_amount_raw",
-        "inAmount",
-        "lamports_in",
-        "amount_in_raw",
-        "input_amount",
-    ):
-        v = entry_meta.get(k)
-        if v not in (None, ""):
-            lamports_val = v
-            break
-
-    if lamports_val is not None:
-        try:
-            lamports_f = float(lamports_val)
-            lps = float(globals().get("LAMPORTS_PER_SOL", 1_000_000_000))
-            return max(0.0, lamports_f / lps)
-        except Exception:
-            pass
-
-    for k in ("spend_sol", "amount_sol", "size_sol", "size_in_sol", "size"):
-        v = entry_meta.get(k)
-        if v not in (None, ""):
-            try:
-                return max(0.0, float(v))
-            except Exception:
-                pass
-
-    try:
-        return max(0.0, float(_compute_spend_sol(ui)))
-    except Exception:
-        return 0.0
-
-
-async def log_entry_pg_from_meta(
-    *,
-    mint: str,
-    entry_meta: Dict[str, Any],
-    ui: Dict[str, Any],
-    sig: Optional[str] = None,
-) -> None:
-    """
-    Persist a single entry into Postgres (and emit structured logs).
-
-    NOTE: This is separate from the Redis/normalization log_entry_from_meta
-    defined earlier in this file. Call this helper explicitly if you want PG logging.
-
-    V3+++:
-      - Slightly smarter meta compaction (caps giant blobs).
-      - Structured event is emitted even when PG is disabled.
-      - Includes AI / regime hints in meta when present in UI.
-    """
-    if not entry_meta:
-        return
-
-    # Always emit a structured log for external sinks
-    try:
-        log.event(
-            "ENTRY_META_PLAIN",
-            mint=mint,
-            symbol=ui.get("symbol") or ui.get("name") or "?",
-            pool=ui.get("pool") or "unknown",
-            sig=sig,
-            amount_raw=int(entry_meta.get("amount_raw") or 0),
-            in_amount_raw=int(entry_meta.get("in_amount_raw") or 0),
-            priceImpactPct=entry_meta.get("priceImpactPct"),
-        )
-    except Exception:
-        pass
-
-    if not _ENTRY_LOG_PG_ENABLED:
-        # PG persistence disabled – log event only
-        return
-
-    if not asyncpg:
-        return
-
-    dsn = _PG_DSN_ASYNC or _PNL_DSN_ASYNC
-    if not dsn:
-        return
-
-    try:
-        await _ensure_entry_log_table()
-    except Exception:
-        # Table creation failure is non-fatal
-        if DEBUG_TX:
-            traceback.print_exc()
-
-    pool = ui.get("pool") or "unknown"
-    symbol = ui.get("symbol") or ui.get("name") or "?"
-    route = ui.get("route") or entry_meta.get("route") or None
-
-    spend_sol = _spend_from_meta_and_ui(entry_meta, ui)
-
-    in_raw = entry_meta.get("in_amount_raw")
-    out_raw = entry_meta.get("amount_raw")
-    price_impact = entry_meta.get("priceImpactPct")
-
-    def _as_num(x: Any) -> Optional[float]:
-        if x in (None, "", 0, 0.0):
-            return None
-        try:
-            return float(x)
-        except Exception:
-            return None
-
-    in_raw_f = _as_num(in_raw)
-    out_raw_f = _as_num(out_raw)
-    price_imp_f = _as_num(price_impact)
-
-    # Defensive: cap meta size to keep rows small-ish
-    meta_to_store: Dict[str, Any] = dict(entry_meta)
-
-    # Enrich with AI entry hints if present in ui
-    try:
-        if "ai_entry_score" in ui:
-            meta_to_store.setdefault(
-                "ai_entry",
-                {
-                    "score": ui.get("ai_entry_score"),
-                    "fastlane": ui.get("ai_fastlane"),
-                    "size_factor": ui.get("size_factor"),
-                },
-            )
-    except Exception:
-        if DEBUG_TX:
-            traceback.print_exc()
-
-    try:
-        # Drop any giant blobs if present (e.g. raw route, debug tx)
-        for k in ("raw_tx", "route_plan", "full_quote", "debug"):
-            if k in meta_to_store and len(str(meta_to_store[k])) > 20_000:
-                meta_to_store[k] = f"<omitted:{k}:len>"
-    except Exception:
-        if DEBUG_TX:
-            traceback.print_exc()
-
-    try:
-        conn = await asyncpg.connect(dsn)
-        try:
-            await conn.execute(
-                """
-                INSERT INTO entry_log (
-                    at_utc,
-                    mint,
-                    symbol,
-                    pool,
-                    signature,
-                    route,
-                    spend_sol,
-                    in_amount_raw,
-                    out_amount_raw,
-                    price_impact,
-                    meta
-                )
-                VALUES (NOW() AT TIME ZONE 'UTC', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
-                """,
-                mint,
-                symbol,
-                pool,
-                sig,
-                route,
-                spend_sol if spend_sol > 0 else None,
-                in_raw_f,
-                out_raw_f,
-                price_imp_f,
-                json.dumps(meta_to_store),
-            )
-            log.event(
-                "ENTRY_META_PG_INSERTED",
-                mint=mint,
-                symbol=symbol,
-                pool=pool,
-                sig=sig,
-                spend_sol=spend_sol,
-            )
-        finally:
-            await conn.close()
-    except Exception as e:
-        if DEBUG_TX:
-            traceback.print_exc()
-        try:
-            log.event("ENTRY_META_PG_ERROR", error=str(e))
-        except Exception:
-            pass
-
-
-# ---------------------------
-# Daily PnL helpers  (USES NORMALIZED DSN)
-# ---------------------------
-
-def _fmt_sol(x: Optional[float]) -> str:
-    if x is None:
-        return "—"
-    try:
-        return f"{x:.4f} SOL"
-    except Exception:
-        return str(x)
-
-
-async def _telegram_send(text: str) -> None:
-    """
-    Fire-and-forget Telegram helper.
-
-    Controlled by:
-      - TELEGRAM_BOT_TOKEN
-      - DAILY_PNL_CHAT_ID or TELEGRAM_CHAT_ID
-      - DAILY_PNL_TG_ENABLED (optional, default=1)
-    """
-    bot = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-    chat = (
-        os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or ""
-    ).strip()
-    if not (bot and chat and httpx):
-        log.event("DAILY_PNL_TG_SKIP", reason="missing_cfg_or_httpx")
-        return
-
-    if not _as_bool(os.getenv("DAILY_PNL_TG_ENABLED", "1"), True):
-        log.event("DAILY_PNL_TG_SKIP", reason="disabled_flag")
-        return
-
-    try:
-        url = f"https://api.telegram.org/bot{bot}/sendMessage"
-        payload = {
-            "chat_id": chat,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        async with httpx.AsyncClient(timeout=15) as cli:  # type: ignore[arg-type]
-            r = await cli.post(url, json=payload)
-            log.event(
-                "DAILY_PNL_TG_SENT",
-                http_status=getattr(r, "status_code", None),
-            )
-    except Exception as e:
-        log.event("DAILY_PNL_TG_ERROR", error=str(e))
-
-
-async def _pnl_pg_ensure_table() -> None:
-    if not asyncpg or not _PNL_DSN_ASYNC:
-        log.event("DAILY_PNL_PG_SKIP", reason="no_asyncpg_or_dsn")
-        return
-    try:
-        conn = await asyncpg.connect(_PNL_DSN_ASYNC)
-        try:
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS daily_pnl (
-                    id BIGSERIAL PRIMARY KEY,
-                    at_utc TIMESTAMPTZ NOT NULL,
-                    realized_sol NUMERIC,
-                    unrealized_sol NUMERIC,
-                    open_positions INT,
-                    wallet_sol NUMERIC,
-                    notes JSONB,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-            """
-            )
-            # Light index for time-ordered scans
-            try:
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_daily_pnl_at_utc "
-                    "ON daily_pnl (at_utc DESC);"
-                )
-            except Exception:
-                if DEBUG_TX:
-                    traceback.print_exc()
-
-            log.event("DAILY_PNL_PG_READY", dsn=_PG_DSN_MASK)
-        finally:
-            await conn.close()
-    except Exception as e:
-        if DEBUG_TX:
-            traceback.print_exc()
-        log.event("DAILY_PNL_PG_ERROR", when="ensure_table", error=str(e))
-
-
-async def _pnl_pg_insert_row(
-    *,
-    realized_sol: float,
-    unrealized_sol: float,
-    open_positions: int,
-    wallet_sol: Optional[float],
-    notes: Dict[str, Any],
-) -> None:
-    if not asyncpg or not _PNL_DSN_ASYNC:
-        log.event("DAILY_PNL_PG_SKIP", reason="no_asyncpg_or_dsn")
-        return
-    try:
-        conn = await asyncpg.connect(_PNL_DSN_ASYNC)
-        try:
-            await conn.execute(
-                """
-                INSERT INTO daily_pnl (
-                    at_utc,
-                    realized_sol,
-                    unrealized_sol,
-                    open_positions,
-                    wallet_sol,
-                    notes
-                )
-                VALUES (NOW() AT TIME ZONE 'UTC', $1, $2, $3, $4, $5::jsonb)
-                """
-                ,
-                realized_sol,
-                unrealized_sol,
-                open_positions,
-                wallet_sol,
-                json.dumps(notes),
-            )
-            log.event(
-                "DAILY_PNL_PG_INSERTED",
-                realized_sol=realized_sol,
-                unrealized_sol=unrealized_sol,
-                open_positions=open_positions,
-            )
-        finally:
-            await conn.close()
-    except Exception as e:
-        if DEBUG_TX:
-            traceback.print_exc()
-        log.event("DAILY_PNL_PG_ERROR", when="insert_row", error=str(e))
-
-
-async def _get_wallet_sol_balance() -> Optional[float]:
-    """
-    Best-effort wallet SOL balance helper.
-    """
-    try:
-        from utils_pkg.wallet import get_sol_balance  # type: ignore
-
-        bal = await get_sol_balance()
-        return float(bal)
-    except Exception:
-        return None
-
-
-async def _estimate_unrealized_from_positions() -> Tuple[float, int, Dict[str, Any]]:
-    """
-    Estimate unrealized PnL and open positions from in-memory positions.
-
-    This is approximate but good enough for daily telemetry.
-    """
-    total_unrl = 0.0
-    open_n = 0
-    details: Dict[str, Any] = {"legs": []}
-    try:
-        poss = list(all_positions())
-    except Exception:
-        poss = []
-
-    for p in poss:
-        try:
-            mint = str(p.get("mint") or p.get("token") or "")
-            if not mint:
-                continue
-            qty = float(
-                p.get("amount")
-                or p.get("qty")
-                or p.get("size")
-                or 0
-            ) or 0.0
-            if qty <= 0:
-                continue
-            cost = float(
-                p.get("entry_total_sol")
-                or p.get("cost_basis_sol")
-                or p.get("cost")
-                or 0.0
-            )
-            price = 0.0
-            try:
-                price = float(await _route_price_ui(mint))
-            except Exception:
-                price = 0.0
-            cur_val = price * qty if price > 0 else 0.0
-            unrl = cur_val - cost
-            total_unrl += unrl
-            open_n += 1
-            details["legs"].append(
-                {
-                    "mint": mint,
-                    "qty": qty,
-                    "entry_cost_sol": cost,
-                    "mark_price_sol": price,
-                    "cur_val_sol": cur_val,
-                    "unrealized_sol": unrl,
-                }
-            )
-        except Exception:
-            if DEBUG_TX:
-                traceback.print_exc()
+async def _cancel_and_gather(task_map: Dict[str, asyncio.Task], timeout: float) -> None:
+    me = asyncio.current_task()
+    to_wait: List[asyncio.Task] = []
+    for _, t in list(task_map.items()):
+        if t is me:
             continue
-    return total_unrl, open_n, details
+        if not t.done():
+            t.cancel()
+        to_wait.append(t)
 
-
-async def _estimate_realized_today() -> Tuple[float, Dict[str, Any]]:
-    """
-    Try multiple sources for realized PnL for the current UTC date.
-
-    Priority:
-      1) utils_pkg.realized.realized_today_sol
-      2) utils_pkg.positions_pg.realized_today_sol
-      3) Fallback 0.0
-    """
-    try:
-        from utils_pkg.realized import realized_today_sol  # type: ignore
-
-        v = await realized_today_sol()
-        return float(v or 0.0), {"source": "utils_pkg.realized.realized_today_sol"}
-    except Exception:
-        pass
-    try:
-        from utils_pkg.positions_pg import (  # type: ignore
-            realized_today_sol as pg_realized_today_sol,
-        )
-
-        v = await pg_realized_today_sol()
-        return float(v or 0.0), {
-            "source": "utils_pkg.positions_pg.realized_today_sol"
-        }
-    except Exception:
-        pass
-    return 0.0, {"source": "fallback_zero"}
-
-
-async def _run_daily_pnl_loop(stop_evt: asyncio.Event) -> None:
-    """
-    Once-per-day PnL snapshot:
-
-      - realized (closed trades)
-      - unrealized (open positions via pricefeed)
-      - wallet SOL balance
-      - optional regime / risk / smart-wallet / AI diagnostics annotations
-      - Telegram notification
-      - Notion push (via push_daily_pnl)
-      - Postgres insert (daily_pnl table)
-
-    V3+++:
-      - Debounce protection (DAILY_PNL_DEBOUNCE_MIN).
-      - Rich notes payload including regime, smart_wallets, AI day summary,
-        and current Strategy diagnostics (if available).
-    """
-    if not DAILY_PNL_ENABLED:
+    if not to_wait:
         return
 
-    await _pnl_pg_ensure_table()
-    _last_sent_ts: Optional[float] = None
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(asyncio.gather(*to_wait, return_exceptions=True), timeout=timeout)
 
-    # Optional extra context from regime / risk / smart_wallets / AI stats
-    async def _extra_notes() -> Dict[str, Any]:
-        notes: Dict[str, Any] = {}
 
-        # Regime snapshot (if available)
+# =============================================================================
+# Optional: preflight runner (subprocess, no side-effects in-process)
+# =============================================================================
+async def _run_preflight_if_enabled(run_id: str) -> None:
+    """
+    If START_PRECHECKS=1 and RUN_PREFLIGHT_IN_MAIN=1, run the canonical preflight.
+    (In Render, start.sh can run preflight; this is a belt-and-suspenders option.)
+    """
+    if not _envb("START_PRECHECKS", False):
+        return
+    if not _envb("RUN_PREFLIGHT_IN_MAIN", False):
+        return
+    if not _module_exists("scripts.preflight"):
+        log.event("PREFLIGHT_MISSING", run_id=run_id)
+        if _fast_fail():
+            raise RuntimeError("scripts.preflight missing")
+        return
+
+    exe = sys.executable or "python"
+    args = [exe, "-m", "scripts.preflight"]
+    if _envb("START_PRECHECKS_STRICT", False) or _envb("PREFLIGHT_STRICT", False):
+        args.append("--strict")
+    if _envb("PREFLIGHT_JSON", False):
+        args.append("--json")
+
+    log.event("PREFLIGHT_START", run_id=run_id)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
         try:
-            from utils_pkg.regime import current_regime_snapshot  # type: ignore[attr-defined]
-
-            snap = current_regime_snapshot()
-            if isinstance(snap, dict):
-                notes["regime"] = snap
-        except Exception:
-            pass
-
-        # Smart-wallets state (if available)
-        try:
-            from utils_pkg.smart_wallets import get_wallet_state  # type: ignore[attr-defined]
-
-            sw = await get_wallet_state()
-            if isinstance(sw, dict):
-                notes["smart_wallets"] = sw
-        except Exception:
-            pass
-
-        # Optional: intraday AI/entry stats summary
-        try:
-            from utils_pkg.data_logger import summarize_trading_day  # type: ignore[attr-defined]
-
-            summary = await summarize_trading_day()
-            if isinstance(summary, dict):
-                notes["ai_day_summary"] = summary
-        except Exception:
-            pass
-
-        # Optional: Strategy diagnostics snapshot (if stream already booted)
-        try:
-            s = globals().get("strat")
-            if s is not None and hasattr(s, "_diag"):
-                # shallow copy to avoid mutation
-                notes["entry_diag"] = dict(getattr(s, "_diag"))
-        except Exception:
-            if DEBUG_TX:
-                traceback.print_exc()
-
-        return notes
-
-    async def _once():
-        nonlocal _last_sent_ts
-        now_ts = _dt.datetime.now(_dt.timezone.utc).timestamp()
-        if _last_sent_ts and (now_ts - _last_sent_ts) < (DAILY_PNL_DEBOUNCE_MIN * 60):
-            log.event(
-                "DAILY_PNL_DEBOUNCE_SKIP",
-                since_sec=int(now_ts - _last_sent_ts),
+            out, err = await asyncio.wait_for(
+                proc.communicate(), timeout=max(20.0, _envf("PREFLIGHT_MAIN_TIMEOUT_S", 120.0))
             )
+        except asyncio.TimeoutError:
+            with contextlib.suppress(Exception):
+                proc.kill()
+            raise RuntimeError("preflight timeout")
+
+        rc = int(proc.returncode or 0)
+        if err:
+            log.every("PREFLIGHT_STDERR", 10, run_id=run_id, stderr=err.decode("utf-8", "ignore")[:2000])
+        if out:
+            log.every("PREFLIGHT_STDOUT", 10, run_id=run_id, stdout=out.decode("utf-8", "ignore")[:2000])
+
+        if rc != 0:
+            raise RuntimeError(f"preflight failed rc={rc}")
+        log.event("PREFLIGHT_OK", run_id=run_id)
+    except Exception as e:
+        log.event("PREFLIGHT_FAIL", run_id=run_id, err=_short_exc(e))
+        if _envb("PREFLIGHT_FAIL_HARD", True) or _fast_fail():
+            raise
+
+
+# =============================================================================
+# Mint normalizer resolver (supports older repos)
+# =============================================================================
+def _resolve_normalize_mint() -> Callable[[str], str]:
+    with contextlib.suppress(Exception):
+        m = importlib.import_module("utils_pkg.mints")
+        fn = getattr(m, "normalize_mint", None)
+        if callable(fn):
+            return fn  # type: ignore[return-value]
+    with contextlib.suppress(Exception):
+        m = importlib.import_module("scripts.pp_utils")
+        fn = getattr(m, "normalize_mint", None)
+        if callable(fn):
+            return fn  # type: ignore[return-value]
+    return lambda x: (x or "").strip()
+
+
+# =============================================================================
+# Optional bootstraps (best effort)
+# =============================================================================
+async def _core_bootstrap_best_effort(run_id: str) -> None:
+    cu = _soft_import("utils_pkg.core_utils", aliases=["utils_pkg.core", "utils_pkg.bootstrap"])
+    if not cu:
+        return
+    for nm in ("bootstrap", "init", "setup", "warmup", "init_resources"):
+        fn = getattr(cu, nm, None)
+        if callable(fn):
+            try:
+                out = fn()
+                if inspect.isawaitable(out):
+                    await out
+                log.event("CORE_BOOTSTRAP_OK", run_id=run_id, fn=nm)
+            except Exception as e:
+                log.event("CORE_BOOTSTRAP_FAIL", run_id=run_id, fn=nm, err=_short_exc(e))
+                if _fast_fail():
+                    raise
             return
 
-        unrl_sol, open_n, unrl_details = await _estimate_unrealized_from_positions()
-        realized_sol, r_meta = await _estimate_realized_today()
-        wallet_sol = await _get_wallet_sol_balance()
-        extra = await _extra_notes()
 
-        # --- Notion: push daily snapshot (safe no-op if NOTION_ENABLED != 1)
-        try:
-            if _as_bool(os.getenv("NOTION_ENABLED", "1"), True):
-                page = push_daily_pnl(
-                    {
-                        "date": utc_today_iso(),
-                        "realized_sol": realized_sol,
-                        "unrealized_sol": unrl_sol,
-                        "open_positions": open_n,
-                        "wallet_sol": wallet_sol,
-                        "net_sol": (realized_sol + unrl_sol),
-                        "note": "Auto-daily sync",
-                    }
-                )
-                if page:
-                    log.event("NOTION_DAILY_PNL_UPSERTED", page_id=page)
-        except Exception as e:
-            log.warning("NOTION_DAILY_PNL_FAILED %s", e)
+async def _ai_db_bootstrap_best_effort(run_id: str) -> None:
+    adb = _soft_import("utils_pkg.ai_db", critical=False)
+    if not adb:
+        return
+    for nm in ("bootstrap", "migrate", "ensure_schema", "init_db", "setup"):
+        fn = getattr(adb, nm, None)
+        if callable(fn):
+            try:
+                out = fn()
+                if inspect.isawaitable(out):
+                    await out
+                log.event("AI_DB_BOOTSTRAP_OK", run_id=run_id, fn=nm)
+            except Exception as e:
+                log.event("AI_DB_BOOTSTRAP_FAIL", run_id=run_id, fn=nm, err=_short_exc(e))
+                if _fast_fail():
+                    raise
+            return
 
-        # Optional PnL target (for emoji status)
-        target_env = os.getenv("DAILY_PNL_TARGET_SOL")
-        target_emoji = ""
-        try:
-            if target_env is not None:
-                tgt = float(target_env)
-                if realized_sol >= tgt:
-                    target_emoji = " ✅"
-                elif realized_sol >= 0:
-                    target_emoji = " ⚖️"
-                else:
-                    target_emoji = " ⚠️"
-        except Exception:
-            target_emoji = ""
 
-        now = _dt.datetime.now(_dt.timezone.utc)
-        hdr = f"📊 <b>Daily PnL</b> — {now.strftime('%Y-%m-%d')} (UTC){target_emoji}"
-        body = (
-            f"\nRealized: <b>{_fmt_sol(realized_sol)}</b>"
-            f"\nUnrealized: <b>{_fmt_sol(unrl_sol)}</b>"
-            f"\nOpen positions: <b>{open_n}</b>"
-            f"\nWallet: <b>{_fmt_sol(wallet_sol)}</b>"
+# =============================================================================
+# Modules resolved lazily inside main()
+# =============================================================================
+@dataclass
+class Modules:
+    normalize_mint: Callable[[str], str]
+
+    maybe_buy: Optional[Callable[..., Any]] = None
+    buys_allowed: Optional[Callable[[], bool]] = None
+
+    # Optional AI gate (legacy)
+    ai_pass_gate: Optional[Callable[..., Any]] = None
+    ai_candidate_cls: Optional[Any] = None
+
+    # Preferred unified scorer
+    scoring_mod: Optional[Any] = None
+    scoring_fn: Optional[Callable[..., Any]] = None  # async score_candidate
+    scoring_enabled: bool = True
+
+    routeguard_mod: Optional[Any] = None
+    risk_mod: Optional[Any] = None
+
+    exit_mod: Optional[Any] = None
+
+    # Redis queue-based auto-exit worker
+    auto_exit_worker_mod: Optional[Any] = None
+    auto_exit_worker_loop: Optional[Callable[..., Any]] = None
+
+    reinvest_mod: Optional[Any] = None
+    smart_mod: Optional[Any] = None
+
+    data_logger_mod: Optional[Any] = None
+
+
+def _resolve_modules() -> Modules:
+    nm = _resolve_normalize_mint()
+
+    # BUY executor: prefer pump_trader.maybe_buy
+    maybe_buy = None
+    with contextlib.suppress(Exception):
+        m = importlib.import_module("utils_pkg.pump_trader")
+        maybe_buy = getattr(m, "maybe_buy", None)
+
+    if maybe_buy is None:
+        pt = _soft_import(
+            "utils_pkg.trader",
+            aliases=["utils_pkg.trade_engine", "utils_pkg.entry_engine", "utils_pkg.pump_trader"],
         )
-        if extra.get("regime"):
-            body += f"\nRegime: <b>{extra['regime'].get('label','?')}</b>"
-        footer = "\n\n<code>src=daily_pnl_loop</code>"
+        maybe_buy = getattr(pt, "maybe_buy", None) if pt else None
 
-        notes = {
-            "realized_meta": r_meta,
-            "unrealized_details": unrl_details,
-            "extra": extra,
-        }
+    # guardrails.buys_allowed optional
+    buys_allowed = None
+    with contextlib.suppress(Exception):
+        gr = importlib.import_module("utils_pkg.guardrails")
+        buys_allowed = getattr(gr, "buys_allowed", None)
 
-        await _pnl_pg_insert_row(
-            realized_sol=realized_sol,
-            unrealized_sol=unrl_sol,
-            open_positions=open_n,
-            wallet_sol=wallet_sol,
-            notes=notes,
-        )
-        _last_sent_ts = now_ts
-        await _telegram_send(hdr + body + footer)
+    # AI gate (optional)
+    ai_pass_gate = None
+    ai_candidate_cls = None
+    with contextlib.suppress(Exception):
+        ai = importlib.import_module("utils_pkg.ai_buy_scoring")
+        ai_pass_gate = getattr(ai, "pass_gate", None)
+        ai_candidate_cls = getattr(ai, "Candidate", None)
 
-        log.event(
-            "DAILY_PNL_SNAPSHOT",
-            realized_sol=realized_sol,
-            unrealized_sol=unrl_sol,
-            open_positions=open_n,
-            wallet_sol=wallet_sol,
-        )
+    # Unified scoring service (optional but recommended)
+    scoring_mod = _soft_import("utils_pkg.scoring_service", critical=False)
+    scoring_fn = None
+    if scoring_mod is not None:
+        fn = getattr(scoring_mod, "score_candidate", None)
+        if callable(fn):
+            scoring_fn = fn  # type: ignore[assignment]
 
-    if DAILY_PNL_TEST_NOW and not stop_evt.is_set():
-        with contextlib.suppress(Exception):
-            await _once()
+    scoring_enabled = _envb("SCORING_SERVICE_ENABLED", True)
 
-    while not stop_evt.is_set():
-        now = _dt.datetime.now(_dt.timezone.utc)
-        run_at = now.replace(
-            hour=DAILY_PNL_HOUR_UTC,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
-        if run_at <= now:
-            run_at = run_at + _dt.timedelta(days=1)
-        wait_s = (run_at - now).total_seconds()
-        chunk = 5.0
-        while wait_s > 0 and not stop_evt.is_set():
-            sl = min(chunk, wait_s)
-            await asyncio.sleep(sl)
-            wait_s -= sl
-        if stop_evt.is_set():
-            break
-        with contextlib.suppress(Exception):
-            await _once()
+    # Routeguard + risk manager (optional)
+    routeguard_mod = _soft_import("utils_pkg.routeguard", critical=False)
+    risk_mod = _soft_import("utils_pkg.risk_manager", critical=False)
 
+    # Exit engine (optional)
+    exit_mod = _soft_import("utils_pkg.exit_engine", critical=False)
 
-# ---------------------------
-# Health server (optional)
-# ---------------------------
+    # Auto-exit queue worker (Redis consumer)
+    auto_exit_worker_mod = _soft_import("utils_pkg.auto_exit_worker.exit_engine", critical=False)
+    auto_exit_worker_loop = None
+    if auto_exit_worker_mod is not None:
+        fn = getattr(auto_exit_worker_mod, "worker_loop", None)
+        if callable(fn):
+            auto_exit_worker_loop = fn  # type: ignore[assignment]
 
-async def _maybe_start_health_server(
-    stop_evt: asyncio.Event,
-) -> Optional[asyncio.Task]:
-    """
-    Lightweight JSON health endpoint for Render / k8s / uptime checks.
+    # Optional brains
+    reinvest_mod = _soft_import("utils_pkg.reinvestor", critical=False)
+    smart_mod = _soft_import("utils_pkg.smart_wallets", critical=False)
 
-    Exposes:
-      - ok flag
-      - UTC timestamp
-      - dryrun flag
-      - enabled pools
-      - approximate open positions
-      - optional regime label
-      - basic feature flags (AI / liq / exit / risk manager)
-      - optional Strategy diagnostics snapshot (entry engine)
-
-    This is designed to be cheap enough to hit very frequently.
-    """
-    if not (web and HEALTH_PORT > 0):
-        return None
-    app = web.Application()
-
-    async def _health(_request):
-        open_n = 0
-        try:
-            open_n = len(list(all_positions()))
-        except Exception:
-            open_n = 0
-
-        regime_label: Optional[str] = None
-        try:
-            from utils_pkg.regime import current_regime_snapshot  # type: ignore[attr-defined]
-
-            snap = current_regime_snapshot()
-            if isinstance(snap, dict):
-                regime_label = snap.get("label") or snap.get("state")
-        except Exception:
-            regime_label = None
-
-        # Optional Strategy diagnostics snapshot
-        diag: Dict[str, Any] = {}
-        try:
-            s = globals().get("strat")
-            if s is not None and hasattr(s, "_diag"):
-                raw_diag = getattr(s, "_diag")
-                if isinstance(raw_diag, dict):
-                    diag = dict(raw_diag)
-        except Exception:
-            if DEBUG_TX:
-                traceback.print_exc()
-
-        return web.json_response(
-            {
-                "ok": True,
-                "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                "dryrun": _dryrun_env_on() or bool(_pkg_is_dryrun),
-                "pools": sorted(POOLS_FILTER) if POOLS_FILTER else ["<all>"],
-                "open_positions": open_n,
-                "regime": regime_label,
-                "ai_entry_enabled": bool(AI_ENTRY_ENABLED),
-                "liq_filter_enabled": bool(LIQ_FILTER_ENABLED),
-                "exit_engine_enabled": bool(EXIT_ENGINE_ENABLED),
-                "risk_manager_enabled": bool(RISK_MANAGER_ENABLED),
-                "version": "v3+++",
-                "diag": diag,
-            }
-        )
-
-    app.router.add_get("/health", _health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
-    await site.start()
-    log.event("HEALTH_LISTENING", port=HEALTH_PORT)
-
-    async def _waiter():
-        try:
-            while not stop_evt.is_set():
-                await asyncio.sleep(0.5)
-        finally:
-            with contextlib.suppress(Exception):
-                await runner.cleanup()
-
-    return asyncio.create_task(_waiter(), name="health.server")
-
-
-# ---------------------------
-# Streaming loop (PumpPortal)
-# ---------------------------
-
-async def stream_loop(stop_evt: Optional[asyncio.Event] = None) -> None:
-    """
-    Robust, version-proof PumpPortal streaming loop:
-      - Works with older PumpPortalClient signatures (no subscribe_trades kwarg)
-      - Subscribes to trades via client methods if present, or internal helper
-      - Gracefully handles reconnects and shutdown
-      - Shields Strategy handlers from crashing the stream
-
-    V3+++:
-      - Shares a single Strategy instance globally (`globals()["strat"]`)
-        so other components (Raydium scanner, health, PnL) can introspect
-        diagnostics and regime-aware behaviour.
-    """
-    strat = Strategy()
-    # Expose this Strategy globally so Raydium scanner and others can reuse it
-    globals()["strat"] = strat
-
-    local_stop = stop_evt or asyncio.Event()
-    diag_task = asyncio.create_task(
-        strat.diag_loop(local_stop),
-        name="diag.minute",
+    # Optional data logger
+    data_logger_mod = _soft_import(
+        "utils_pkg.data_logger",
+        aliases=["utils_pkg.logger", "utils_pkg.trade_logger"],
+        critical=False,
     )
 
-    def _mask_uri(obj: Any) -> str:
-        try:
-            fn = getattr(obj, "masked_uri", None)
-            return fn() if callable(fn) else "<uri?>"
-        except Exception:
-            return "<uri?>"
+    return Modules(
+        normalize_mint=nm,
+        maybe_buy=maybe_buy if callable(maybe_buy) else None,
+        buys_allowed=buys_allowed if callable(buys_allowed) else None,
+        ai_pass_gate=ai_pass_gate if callable(ai_pass_gate) else None,
+        ai_candidate_cls=ai_candidate_cls,
+        scoring_mod=scoring_mod,
+        scoring_fn=scoring_fn,
+        scoring_enabled=scoring_enabled,
+        routeguard_mod=routeguard_mod,
+        risk_mod=risk_mod,
+        exit_mod=exit_mod,
+        auto_exit_worker_mod=auto_exit_worker_mod,
+        auto_exit_worker_loop=auto_exit_worker_loop,
+        reinvest_mod=reinvest_mod,
+        smart_mod=smart_mod,
+        data_logger_mod=data_logger_mod,
+    )
 
-    async def _handle_event(ev: dict) -> None:
-        kind = (ev or {}).get("kind")
-        raw = (ev or {}).get("raw", {}) or {}
-        if kind == "new_token":
-            await strat.on_new_token(raw)
-        elif kind == "trade":
-            await strat.on_trade(raw)
 
-    subscribe_trades_flag = _env_bool("PUMP_SUBSCRIBE_TRADES", True)
+# =============================================================================
+# Data models
+# =============================================================================
+@dataclass
+class CandidateMsg:
+    mint: str
+    ui: Dict[str, Any] = field(default_factory=dict)
+    source: str = "unknown"
+    ts: float = field(default_factory=_now)
+    kind: str = "candidate"  # candidate | tick
+    trace_id: str = ""
 
-    async def _subscribe_if_possible(client: Any) -> None:
-        """
-        Version-safe subscription:
-          1) Try public methods if they exist
-          2) Fallback to internal `_subscribe("trades")`
-        """
-        if not subscribe_trades_flag:
-            return
-        for name in ("subscribe_trades", "enable_trades", "enable_trade_stream"):
-            fn = getattr(client, name, None)
-            if callable(fn):
-                try:
-                    res = fn()
-                    if asyncio.iscoroutine(res):
-                        await res
-                    log.every(
-                        "pump.subscribe",
-                        n=30,
-                        msg="PUMP_SUBSCRIBED",
-                        via=name,
-                    )
-                    return
-                except Exception as e:
-                    log.every(
-                        "pump.subscribe.err",
-                        n=5,
-                        msg="PUMP_SUBSCRIBE_FAIL",
-                        via=name,
-                        err=str(e),
-                    )
-        try:
-            sub = getattr(client, "_subscribe", None)
-            if callable(sub):
-                res = sub("trades")
-                if asyncio.iscoroutine(res):
-                    await res
-                log.every(
-                    "pump.subscribe",
-                    n=30,
-                    msg="PUMP_SUBSCRIBED",
-                    via="_subscribe",
-                )
-        except Exception as e:
-            log.every(
-                "pump.subscribe.err",
-                n=5,
-                msg="PUMP_SUBSCRIBE_FAIL",
-                via="_subscribe",
-                err=str(e),
-            )
 
-    async def _run_with_client_obj(client: Any) -> None:
-        print("[main] Connecting:", _mask_uri(client), flush=True)
-        await _subscribe_if_possible(client)
-        async for ev in client.events():
-            if local_stop.is_set():
-                break
-            try:
-                await _handle_event(ev)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                print("[main] event handling error:", flush=True)
-                traceback.print_exc()
+@dataclass
+class RuntimeState:
+    run_id: str = ""
+    started_at: float = field(default_factory=_now)
+    started_mono: float = field(default_factory=_mono)
 
-    pp_kwargs: Dict[str, Any] = {}
-    if os.getenv("PF_PP_KEY"):
-        pp_kwargs["api_key"] = os.getenv("PF_PP_KEY")
-    if os.getenv("OWNER"):
-        pp_kwargs["account"] = os.getenv("OWNER")
+    last_candidate_at: float = 0.0
+    last_tick_at: float = 0.0
+    last_buy_action_at: float = 0.0
+    last_buy_fill_at: float = 0.0
 
-    try:
-        if hasattr(PumpPortalClient, "__aenter__"):
-            async with PumpPortalClient(**pp_kwargs) as client:
-                await _run_with_client_obj(client)
-        else:
-            client = PumpPortalClient(**pp_kwargs)
-            try:
-                await _run_with_client_obj(client)
-            finally:
-                with contextlib.suppress(Exception):
-                    if hasattr(client, "close"):
-                        maybe_awaitable = client.close()
-                        if asyncio.iscoroutine(maybe_awaitable):
-                            await maybe_awaitable  # type: ignore[arg-type]
-    finally:
+    buy_ok: int = 0
+    buy_fail: int = 0
+    buy_exc: int = 0
+    buy_skip: int = 0
+
+    cand_seen: int = 0
+    cand_dropped: int = 0
+    cand_sunk: int = 0
+
+    tick_seen: int = 0
+    tick_dropped: int = 0
+    tick_sunk: int = 0
+
+    per_source_seen: Dict[str, int] = field(default_factory=dict)
+    per_source_dropped: Dict[str, int] = field(default_factory=dict)
+    per_source_last: Dict[str, float] = field(default_factory=dict)
+
+    loop_lag_ms: float = 0.0
+    last_health_at: float = 0.0
+
+    cand_q_hwm: int = 0
+    tick_q_hwm: int = 0
+    cand_lat_ms_ema: float = 0.0
+    tick_lat_ms_ema: float = 0.0
+
+    last_kill_seen: float = 0.0
+
+
+# =============================================================================
+# Snapshot (debug)
+# =============================================================================
+def _snapshot_state(
+    M: Modules,
+    st: RuntimeState,
+    *,
+    cand_q: asyncio.Queue,
+    tick_q: asyncio.Queue,
+    tasks: Optional[Dict[str, asyncio.Task]] = None,
+) -> Dict[str, Any]:
+    task_view: Dict[str, Any] = {}
+    if isinstance(tasks, dict):
         with contextlib.suppress(Exception):
-            local_stop.set()
-            diag_task.cancel()
-            await asyncio.wait_for(diag_task, timeout=1.5)
+            task_view = {
+                k: {"done": int(t.done()), "cancelled": int(t.cancelled())}
+                for k, t in list(tasks.items())[:800]
+            }
+
+    return {
+        "version": MAIN_VERSION,
+        "build": MAIN_BUILD,
+        "run_id": st.run_id,
+        "up_sec": int(_now() - st.started_at),
+        "phase": _phase(),
+        "queues": {
+            "cand_q": int(cand_q.qsize()),
+            "tick_q": int(tick_q.qsize()),
+            "cand_q_hwm": int(st.cand_q_hwm),
+            "tick_q_hwm": int(st.tick_q_hwm),
+            "cand_lat_ms_ema": int(st.cand_lat_ms_ema),
+            "tick_lat_ms_ema": int(st.tick_lat_ms_ema),
+        },
+        "cand": {"seen": st.cand_seen, "dropped": st.cand_dropped, "sunk": st.cand_sunk},
+        "tick": {"seen": st.tick_seen, "dropped": st.tick_dropped, "sunk": st.tick_sunk},
+        "buy": {"ok": st.buy_ok, "fail": st.buy_fail, "exc": st.buy_exc, "skip": st.buy_skip},
+        "flags": {
+            "kill": int(_kill_active()),
+            "disable_buys": int(_buys_disabled()),
+            "disable_sells": int(_sells_disabled()),
+            "disable_scanners": int(_scanners_disabled()),
+            "dryrun": int(_envb("DRYRUN", _envb("DRY_RUN", False))),
+            "fast_fail": int(_fast_fail()),
+        },
+        "modules": {
+            "buy_executor": int(M.maybe_buy is not None),
+            "ai_gate": int(M.ai_pass_gate is not None),
+            "scoring_service": int(M.scoring_fn is not None and M.scoring_enabled),
+            "exit_engine": int(M.exit_mod is not None),
+            "auto_exit_worker": int(M.auto_exit_worker_loop is not None),
+            "reinvestor": int(M.reinvest_mod is not None),
+            "smart_wallets": int(M.smart_mod is not None),
+            "routeguard": int(M.routeguard_mod is not None),
+            "risk_manager": int(M.risk_mod is not None),
+        },
+        "last": {
+            "cand_sec_ago": int(_now() - st.last_candidate_at) if st.last_candidate_at else -1,
+            "tick_sec_ago": int(_now() - st.last_tick_at) if st.last_tick_at else -1,
+            "buy_sec_ago": int(_now() - st.last_buy_action_at) if st.last_buy_action_at else -1,
+        },
+        "tasks": task_view,
+    }
 
 
-# ---------------------------
-# Raydium scanner supervisor
-# ---------------------------
+# =============================================================================
+# Deduper (cheap spam shield)
+# =============================================================================
+class _Deduper:
+    def __init__(self, ttl_sec: float, max_items: int) -> None:
+        self.ttl = float(ttl_sec)
+        self.max_items = int(max_items)
+        self._m: "OrderedDict[str, float]" = OrderedDict()
 
-async def _run_raydium_scanner_forever(stop_evt: asyncio.Event) -> None:
-    """
-    Periodically run the Raydium scanner and feed its candidates into the
-    Strategy.on_new_token pipeline as synthetic 'raydium' events.
+    def _evict(self, now_m: float) -> None:
+        cutoff = now_m - self.ttl
+        while self._m:
+            k0, t0 = next(iter(self._m.items()))
+            if t0 >= cutoff:
+                break
+            self._m.popitem(last=False)
+        while len(self._m) > self.max_items:
+            self._m.popitem(last=False)
 
-    V3+++:
-      - Slight jitter per instance to avoid thundering herd.
-      - Robust candidate normalization & logging.
-    """
-    scan_raydium = _get_raydium_scanner()
-    if scan_raydium is None:
-        log.event("SCAN_RAYDIUM_UNAVAILABLE")
+    def seen_recently(self, key: str) -> bool:
+        now_m = _mono()
+        t = self._m.get(key)
+        if t is not None and (now_m - t) < self.ttl:
+            self._m.move_to_end(key, last=True)
+            return True
+        self._m[key] = now_m
+        self._m.move_to_end(key, last=True)
+        self._evict(now_m)
+        return False
+
+
+_CAND_DEDUP = _Deduper(ttl_sec=_envf("CAND_DEDUP_TTL_SEC", 10.0), max_items=_envi("CAND_DEDUP_MAX", 75_000))
+_TICK_DEDUP = _Deduper(ttl_sec=_envf("TICK_DEDUP_TTL_SEC", 2.0), max_items=_envi("TICK_DEDUP_MAX", 200_000))
+
+_DROP_POLICY = (_envs("QUEUE_DROP_POLICY", "drop_newest") or "drop_newest").strip().lower()
+_DROP_OLDEST = _DROP_POLICY in {"drop_oldest", "oldest", "pop_oldest", "drop-oldest"}
+
+
+def _bump_source(st: RuntimeState, source: str, *, seen: bool = False, dropped: bool = False) -> None:
+    s = source or "unknown"
+    if seen:
+        st.per_source_seen[s] = int(st.per_source_seen.get(s, 0)) + 1
+        st.per_source_last[s] = _now()
+    if dropped:
+        st.per_source_dropped[s] = int(st.per_source_dropped.get(s, 0)) + 1
+
+
+def _trace_id_for(mint: str, source: str, ui: Dict[str, Any], ts: float, run_id: str) -> str:
+    seed = f"{mint}|{source}|{ui.get('pair') or ui.get('pairAddress') or ''}|{int(ts)}|{run_id}"
+    return hashlib.sha1(seed.encode("utf-8", "ignore")).hexdigest()[:12]
+
+
+# =============================================================================
+# Candidate/Tick helpers
+# =============================================================================
+def _looks_like_tick(d: Dict[str, Any]) -> bool:
+    if not isinstance(d, dict):
+        return False
+    kind = str(d.get("kind") or d.get("type") or d.get("event") or "").lower()
+    if kind in {"tick", "trade", "swap", "fill", "price"}:
+        return True
+    has_price = any(
+        k in d
+        for k in (
+            "price",
+            "priceUi",
+            "price_ui",
+            "priceInSol",
+            "price_in_sol",
+            "last_price",
+            "lastPrice",
+        )
+    )
+    has_amt = any(k in d for k in ("amount", "amount_raw", "amount_in", "amount_out", "qty", "size"))
+    return bool(has_price and (has_amt or kind != ""))
+
+
+def _queue_hwm_update(st: RuntimeState, cand_q: asyncio.Queue, tick_q: asyncio.Queue) -> None:
+    with contextlib.suppress(Exception):
+        st.cand_q_hwm = max(st.cand_q_hwm, int(cand_q.qsize()))
+    with contextlib.suppress(Exception):
+        st.tick_q_hwm = max(st.tick_q_hwm, int(tick_q.qsize()))
+
+
+def _source_to_pool_hint(source: str) -> str:
+    s = (source or "").lower()
+    if "raydium" in s:
+        return "raydium"
+    if "dexscreener" in s:
+        return "dexscreener"
+    if "pump" in s:
+        return "pump"
+    if "axiom" in s:
+        return "axiom"
+    return "unknown"
+
+
+def _enqueue_candidate_nowait(
+    M: Modules,
+    out_q: "asyncio.Queue[CandidateMsg]",
+    msg: CandidateMsg,
+    st: RuntimeState,
+) -> None:
+    mint = M.normalize_mint(msg.mint)
+    if not mint:
         return
 
-    base_interval = RAYDIUM_SCAN_INTERVAL_SEC
-    jitter_seed = (os.getpid() % 7) / 6.0  # 0.0–1.0
-    backoff = 2.0
-    first_log = True
-    warned_no_strat = False  # avoid spamming logs
+    msg.mint = mint
+    msg.ts = float(msg.ts or _now())
+    msg.source = msg.source or "unknown"
+    msg.trace_id = msg.trace_id or _trace_id_for(mint, msg.source, msg.ui or {}, msg.ts, st.run_id)
 
-    while not stop_evt.is_set():
+    _bump_source(st, msg.source, seen=True)
+
+    if _envb("CAND_DEDUP_ENABLED", True):
+        rid = str((msg.ui or {}).get("pair") or (msg.ui or {}).get("pairAddress") or (msg.ui or {}).get("id") or "")
+        key = f"{msg.source}:{msg.mint}:{rid}" if rid else f"{msg.source}:{msg.mint}"
+        if _CAND_DEDUP.seen_recently(key):
+            bump("cand_dedup_drop")
+            st.cand_dropped += 1
+            _bump_source(st, msg.source, dropped=True)
+            return
+
+    try:
+        out_q.put_nowait(msg)
+    except asyncio.QueueFull:
+        if _DROP_OLDEST:
+            with contextlib.suppress(Exception):
+                _ = out_q.get_nowait()
+                out_q.task_done()
+            with contextlib.suppress(Exception):
+                out_q.put_nowait(msg)
+            bump("cand_drop_oldest")
+            st.cand_dropped += 1
+            _bump_source(st, msg.source, dropped=True)
+            return
+        bump("cand_queue_full")
+        st.cand_dropped += 1
+        _bump_source(st, msg.source, dropped=True)
+
+
+def _enqueue_tick_nowait(
+    M: Modules,
+    tick_q: "asyncio.Queue[Dict[str, Any]]",
+    d: Dict[str, Any],
+    st: RuntimeState,
+) -> None:
+    mint = M.normalize_mint(str(d.get("mint") or ""))
+    if not mint:
+        return
+
+    if _envb("TICK_DEDUP_ENABLED", True):
+        price = str(d.get("price") or d.get("priceUi") or d.get("price_ui") or d.get("last_price") or "")
+        key = f"{mint}:{price}"
+        if _TICK_DEDUP.seen_recently(key):
+            bump("tick_dedup_drop")
+            st.tick_dropped += 1
+            return
+
+    try:
+        tick_q.put_nowait(d)
+    except asyncio.QueueFull:
+        if _DROP_OLDEST:
+            with contextlib.suppress(Exception):
+                _ = tick_q.get_nowait()
+                tick_q.task_done()
+            with contextlib.suppress(Exception):
+                tick_q.put_nowait(d)
+            bump("tick_drop_oldest")
+            st.tick_dropped += 1
+            return
+        bump("tick_queue_full")
+        st.tick_dropped += 1
+
+
+def _push_payload_nowait(
+    M: Modules,
+    out_q: "asyncio.Queue[CandidateMsg]",
+    tick_q: "asyncio.Queue[Dict[str, Any]]",
+    source: str,
+    payload: Any,
+    stop_evt: asyncio.Event,
+    st: RuntimeState,
+) -> None:
+    if stop_evt.is_set() or payload is None:
+        return
+
+    forward_ticks = _envb("FORWARD_TICKS_FROM_SCANNERS", False)
+
+    if isinstance(payload, CandidateMsg):
+        payload.source = payload.source or source
+        _enqueue_candidate_nowait(M, out_q, payload, st)
+        if forward_ticks and isinstance(payload.ui, dict) and _looks_like_tick(payload.ui):
+            _enqueue_tick_nowait(M, tick_q, dict(payload.ui), st)
+        return
+
+    if not isinstance(payload, dict):
+        return
+
+    mint = M.normalize_mint(
+        str(payload.get("mint") or payload.get("mintAddress") or payload.get("address") or payload.get("token") or "")
+    )
+    if not mint:
+        return
+
+    ui = dict(payload)
+    ui.setdefault("mint", mint)
+    ui.setdefault("source", source)
+    ui.setdefault("pool", ui.get("pool") or ui.get("venue") or ui.get("dex") or _source_to_pool_hint(source))
+    ui.setdefault("ts", float(ui.get("ts") or ui.get("timestamp") or _now()))
+
+    if forward_ticks and _looks_like_tick(ui):
+        _enqueue_tick_nowait(M, tick_q, ui, st)
+
+    msg = CandidateMsg(mint=mint, ui=ui, source=source, kind="candidate", ts=float(ui["ts"]))
+    msg.trace_id = _trace_id_for(mint, source, ui, msg.ts, st.run_id)
+    _enqueue_candidate_nowait(M, out_q, msg, st)
+
+
+async def _push_payload(
+    M: Modules,
+    out_q: "asyncio.Queue[CandidateMsg]",
+    tick_q: "asyncio.Queue[Dict[str, Any]]",
+    source: str,
+    payload: Any,
+    stop_evt: asyncio.Event,
+    st: RuntimeState,
+) -> None:
+    _push_payload_nowait(M, out_q, tick_q, source, payload, stop_evt, st)
+
+
+class _ScannerQueueProxy:
+    """Lets legacy scanners do await q.put(dict)/q.put_nowait(dict) safely."""
+
+    def __init__(
+        self,
+        *,
+        M: Modules,
+        out_q: "asyncio.Queue[CandidateMsg]",
+        tick_q: "asyncio.Queue[Dict[str, Any]]",
+        source: str,
+        stop_evt: asyncio.Event,
+        st: RuntimeState,
+    ) -> None:
+        self._M = M
+        self._out_q = out_q
+        self._tick_q = tick_q
+        self._source = source
+        self._stop = stop_evt
+        self._st = st
+
+    async def put(self, item: Any) -> None:
+        await _push_payload(self._M, self._out_q, self._tick_q, self._source, item, self._stop, self._st)
+
+    def put_nowait(self, item: Any) -> None:
+        _push_payload_nowait(self._M, self._out_q, self._tick_q, self._source, item, self._stop, self._st)
+
+    def qsize(self) -> int:
+        return self._out_q.qsize()
+
+    def empty(self) -> bool:
+        return self._out_q.empty()
+
+    @property
+    def maxsize(self) -> int:
+        return int(getattr(self._out_q, "maxsize", 0) or 0)
+
+
+# =============================================================================
+# Scanner runner
+# =============================================================================
+def _scanner_entrypoints(mod: Any) -> List[Callable[..., Any]]:
+    out: List[Callable[..., Any]] = []
+    for nm in ("run_scanner", "run", "main", "scan_loop", "scanner_loop"):
+        fn = getattr(mod, nm, None)
+        if callable(fn):
+            out.append(fn)
+    for nm in ("scan_once", "scan"):
+        fn = getattr(mod, nm, None)
+        if callable(fn):
+            out.append(fn)
+    for nm in ("scan_raydium", "scan_pumpfun", "scan_dexscreener", "scan_axiom"):
+        fn = getattr(mod, nm, None)
+        if callable(fn):
+            out.append(fn)
+    return out
+
+
+async def _consume_result_as_stream(
+    result: Any,
+    emit: Callable[[Any], Awaitable[None]],
+    stop_evt: asyncio.Event,
+    *,
+    module_name: str,
+) -> None:
+    if result is None or stop_evt.is_set():
+        return
+
+    if inspect.isasyncgen(result) or hasattr(result, "__aiter__"):
         try:
-            if first_log:
-                log.event(
-                    "SCAN_RAYDIUM_STARTING",
-                    task="scan.raydium",
-                    limit=os.getenv("RAYDIUM_LIMIT"),
-                    min_liq=os.getenv("RAYDIUM_MIN_LIQ_USD"),
-                )
-                first_log = False
-
-            runners_raw = await scan_raydium()
-
-            candidates: list[dict] = []
-            if isinstance(runners_raw, dict):
-                if isinstance(runners_raw.get("runners"), (list, tuple)):
-                    candidates = list(runners_raw["runners"])  # type: ignore[arg-type]
-                else:
-                    pf = runners_raw.get("pf") or []
-                    fb = runners_raw.get("fb") or []
-                    if isinstance(pf, (list, tuple)):
-                        candidates.extend(pf)
-                    if isinstance(fb, (list, tuple)):
-                        candidates.extend(x for x in fb)
-            elif isinstance(runners_raw, (list, tuple)):
-                candidates = list(runners_raw)
-
-            log.event(
-                "SCAN_RAYDIUM_RETURNED",
-                candidates=len(candidates),
-            )
-
-            s = globals().get("strat")
-            if s is None:
-                try:
-                    s = Strategy()  # type: ignore[name-defined]
-                    globals()["strat"] = s
-                    log.event("STRATEGY_INIT_RAYDIUM")
-                except NameError:
-                    if DEBUG_TX and not warned_no_strat:
-                        print(
-                            "[raydium] Strategy not defined yet; skipping batch",
-                            flush=True,
-                        )
-                        warned_no_strat = True
-                    s = None
-
-            if s is None:
-                if DEBUG_TX:
-                    print("[raydium] strat still not ready; skipping batch", flush=True)
-            elif candidates:
-                for cand in candidates:
-                    if not isinstance(cand, dict):
-                        continue
-
-                    try:
-                        mint = (
-                            cand.get("mint")
-                            or cand.get("baseMint")
-                            or cand.get("tokenAddress")
-                            or cand.get("address")
-                        )
-                        if not mint:
-                            continue
-
-                        sym = (
-                            cand.get("sym")
-                            or cand.get("symbol")
-                            or cand.get("baseSymbol")
-                            or "?"
-                        )
-
-                        liq = cand.get("liq", cand.get("liq_usd", 0.0)) or 0.0
-                        vol5 = cand.get("vol5", cand.get("vol_5m_usd", 0.0)) or 0.0
-                        chg5 = cand.get("chg5", cand.get("up_5m_pct", 0.0)) or 0.0
-                        buys5 = cand.get("buys5", cand.get("buys_5m", 0)) or 0
-                        sells5 = cand.get("sells5", cand.get("sells_5m", 0)) or 0
-                        age_min = (
-                            cand.get("age_min", cand.get("ageMinutes", 0.0)) or 0.0
-                        )
-
-                        raw_event: Dict[str, Any] = {
-                            "pool": "raydium",
-                            "mint": mint,
-                            "symbol": sym,
-                            "liq_usd": float(liq),
-                            "vol_5m_usd": float(vol5),
-                            "up_5m_pct": float(chg5),
-                            "buys5": int(buys5),
-                            "sells5": int(sells5),
-                            "age_min": float(age_min),
-                        }
-
-                        pair_addr = cand.get("pairAddress") or cand.get("pair")
-                        if pair_addr:
-                            raw_event["raydium_pair"] = pair_addr
-                        ds_url = cand.get("ds_url") or cand.get("url")
-                        if ds_url:
-                            raw_event["dexscreener_url"] = ds_url
-
-                        asyncio.create_task(s.on_new_token(raw_event))
-                    except Exception as e:
-                        if DEBUG_TX:
-                            print(f"[raydium] candidate build error: {e}", flush=True)
-                        continue
-
-            if base_interval > 0:
-                jitter = 0.15 * base_interval * jitter_seed
-                await asyncio.sleep(base_interval + jitter)
-
-            backoff = 2.0
-
+            async for item in result:
+                if stop_evt.is_set():
+                    break
+                await emit(item)
         except asyncio.CancelledError:
-            log.event("SCAN_RAYDIUM_CANCELLED")
             raise
         except Exception as e:
-            log.event("SCAN_RAYDIUM_CRASH", error=str(e))
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 1.7, 30.0)
-
-
-# ---------------------------
-# Background tasks: scanners, PnL, exit worker, risk manager, health, AI loops
-# ---------------------------
-
-async def _start_background_tasks(
-    stop_evt: asyncio.Event,
-) -> Dict[str, asyncio.Task]:
-    """
-    Schedule all long-lived background loops:
-
-      - Raydium scanner
-      - Daily PnL snapshot
-      - Exit worker (sell executor)
-      - Portfolio risk manager
-      - Optional AI / data logger / regime / smart-wallet loops
-      - Optional self-learning AI loop
-      - Health server
-
-    Every loop is optional and guarded so a missing module never breaks boot.
-    """
-    tasks: Dict[str, asyncio.Task] = {}
-
-    # Raydium scanner
-    want_raydium = getattr(C, "ENABLE_RAYDIUM_SCANNER", True)
-    pools_ok = (not POOLS_FILTER) or ("raydium" in POOLS_FILTER)
-    if want_raydium and pools_ok:
-        t = asyncio.create_task(
-            _run_raydium_scanner_forever(stop_evt),
-            name="scan.raydium",
-        )
-        tasks["scan.raydium"] = t
-        log.event(
-            "SCAN_RAYDIUM_SCHEDULED",
-            task="scan.raydium",
-            interval=RAYDIUM_SCAN_INTERVAL_SEC,
-        )
-
-    # Daily PnL loop
-    if DAILY_PNL_ENABLED:
-        t = asyncio.create_task(
-            _run_daily_pnl_loop(stop_evt),
-            name="telemetry.daily_pnl",
-        )
-        tasks["telemetry.daily_pnl"] = t
-        log.event(
-            "DAILY_PNL_SCHEDULED",
-            hour_utc=DAILY_PNL_HOUR_UTC,
-        )
-
-    # Auto-exit worker: processes exit_request:* in Redis and executes sells.
-    if _as_bool(os.getenv("EXIT_WORKER_ENABLED", "1"), True):
-        if redis is None:
-            log.event(
-                "EXIT_WORKER_SKIP",
-                reason="redis_none",
-                hint="check REDIS_URL / core_utils",
-            )
-        else:
-            t = asyncio.create_task(
-                exit_worker_loop(stop_evt),
-                name="exit.worker",
-            )
-            tasks["exit.worker"] = t
-            log.event(
-                "EXIT_WORKER_SCHEDULED",
-                poll_sec=os.getenv("EXIT_WORKER_POLL_SEC", "3"),
-            )
-
-    # Risk manager loop (portfolio-level risk / stop-losses, etc.)
-    if RISK_MANAGER_ENABLED:
-        t = asyncio.create_task(
-            risk_manager_loop(stop_evt),
-            name="risk.manager",
-        )
-        tasks["risk.manager"] = t
-        log.event(
-            "RISK_MANAGER_SCHEDULED",
-            poll_sec=RISK_MANAGER_POLL_SEC,
-        )
-
-    # Optional AI / data / regime / smart-wallet loops
-    # All are best-effort; missing modules will be logged but won't crash.
-    try:
-        from utils_pkg.data_logger import data_logger_loop  # type: ignore[attr-defined]
-
-        if callable(data_logger_loop):
-            t = asyncio.create_task(
-                data_logger_loop(stop_evt),
-                name="telemetry.data_logger",
-            )
-            tasks["telemetry.data_logger"] = t
-            log.event("DATA_LOGGER_SCHEDULED")
-    except Exception:
-        log.event("DATA_LOGGER_UNAVAILABLE")
-
-    try:
-        from utils_pkg.regime import regime_loop  # type: ignore[attr-defined]
-
-        if callable(regime_loop):
-            t = asyncio.create_task(
-                regime_loop(stop_evt),
-                name="regime.loop",
-            )
-            tasks["regime.loop"] = t
-            log.event("REGIME_LOOP_SCHEDULED")
-    except Exception:
-        log.event("REGIME_LOOP_UNAVAILABLE")
-
-    try:
-        from utils_pkg.smart_wallets import smart_wallets_loop  # type: ignore[attr-defined]
-
-        if callable(smart_wallets_loop):
-            t = asyncio.create_task(
-                smart_wallets_loop(stop_evt),
-                name="smart_wallets.loop",
-            )
-            tasks["smart_wallets.loop"] = t
-            log.event("SMART_WALLETS_LOOP_SCHEDULED")
-    except Exception:
-        log.event("SMART_WALLETS_LOOP_UNAVAILABLE")
-
-    # Optional: AI maintenance / model-refresh loop if present
-    try:
-        from utils_pkg.ai_entry_logic import ai_maintenance_loop  # type: ignore[attr-defined]
-
-        if callable(ai_maintenance_loop):
-            t = asyncio.create_task(
-                ai_maintenance_loop(stop_evt),
-                name="ai.maintenance",
-            )
-            tasks["ai.maintenance"] = t
-            log.event("AI_MAINTENANCE_SCHEDULED")
-    except Exception:
-        log.event("AI_MAINTENANCE_UNAVAILABLE")
-
-    # Optional: self-learning strategy loop (quant-grade auto-tuner)
-    try:
-        from utils_pkg.self_learning_ai_strategy import (  # type: ignore[attr-defined]
-            self_learning_loop as _self_learning_loop,
-        )
-
-        if callable(_self_learning_loop):
-            t = asyncio.create_task(
-                _self_learning_loop(stop_evt),
-                name="self_learning.loop",
-            )
-            tasks["self_learning.loop"] = t
-            log.event("SELF_LEARNING_LOOP_SCHEDULED")
-    except Exception:
-        # If module/name not present, we just log an info-level hint.
-        log.event("SELF_LEARNING_LOOP_UNAVAILABLE")
-
-    # Health server
-    ht = await _maybe_start_health_server(stop_evt)
-    if ht:
-        tasks["health.server"] = ht
-
-    return tasks
-
-
-async def _graceful_shutdown(
-    stop_evt: asyncio.Event,
-    sell_task: Optional[asyncio.Task],
-    bg_tasks: Dict[str, asyncio.Task],
-) -> None:
-    """
-    Coordinated shutdown:
-      - Signal all tasks to stop
-      - Cancel background tasks
-      - Stop legacy sell loop
-      - Shutdown router + pricefeed
-    """
-    stop_evt.set()
-
-    for _name, t in list(bg_tasks.items()):
-        with contextlib.suppress(Exception):
-            t.cancel()
-
-    with contextlib.suppress(Exception):
-        if sell_task:
-            sell_task.cancel()
-            await asyncio.wait_for(sell_task, timeout=3.0)
-
-    with contextlib.suppress(Exception):
-        if router and hasattr(router, "shutdown"):
-            await router.shutdown()
-
-    with contextlib.suppress(Exception):
-        await pricefeed_close()
-
-
-# ---------------------------
-# Sentry (optional)
-# ---------------------------
-
-def _maybe_init_sentry() -> None:
-    if not (SENTRY_DSN and sentry_sdk):
+            log.event("SCANNER_STREAM_FAIL", module=module_name, err=_short_exc(e))
         return
-    try:
-        sentry_sdk.init(
-            dsn=SENTRY_DSN,
-            traces_sample_rate=float(
-                os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0")
-            ),
-        )
-        log.event("SENTRY_INIT_OK")
-    except Exception as e:
-        log.event("SENTRY_INIT_FAIL", error=str(e))
 
-
-# ---------------------------
-# Main
-# ---------------------------
-
-def _boot_banner() -> None:
-    pools = ",".join(sorted(POOLS_FILTER)) if POOLS_FILTER else "<all>"
-    effective_dryrun = _dryrun_env_on() or bool(_pkg_is_dryrun)
-    pump_trades = _env_bool("PUMP_SUBSCRIBE_TRADES", True)
-    exit_worker_enabled = _as_bool(os.getenv("EXIT_WORKER_ENABLED", "1"), True)
-    print(
-        "\n=== 🟢 sniper main boot ===\n"
-        f"DRYRUN={effective_dryrun}\n"
-        f"PF_DEBUG_TX={int(DEBUG_TX)} | "
-        f"PF_MAX_CONCURRENT={MAX_CONCURRENCY} | "
-        f"PF_COOLDOWN_SEC={LOOP_COOLDOWN_SEC}\n"
-        f"MOMO: on={int(ENTRY_MOMENTUM_ENABLED)} "
-        f"window={ENTRY_MOMO_WINDOW_SEC}s "
-        f"min_trades={ENTRY_MOMO_MIN_TRADES} "
-        f"min_up={ENTRY_MOMO_MIN_UP_PCT}% "
-        f"allow_no_data_pump={int(ENTRY_MOMO_ALLOW_NO_DATA_FOR_PUMP)}\n"
-        f"AI_ENTRY={int(AI_ENTRY_ENABLED)} | "
-        f"LIQ_FILTER={int(LIQ_FILTER_ENABLED)} | "
-        f"EXIT_ENGINE={int(EXIT_ENGINE_ENABLED)} | "
-        f"EXIT_WORKER={int(exit_worker_enabled)} | "
-        f"MAX_TRADEABLE={MAX_TRADEABLE}\n"
-        f"POOLS={pools} | PUMP_TRADES={int(pump_trades)}\n"
-        f"PG(asyncpg) DSN={_PG_DSN_MASK or '<none>'} | HEALTH_PORT={HEALTH_PORT or 'off'}\n"
-        "===========================\n",
-        flush=True,
-    )
-
-
-def _env_hints() -> None:
-    if not (os.getenv("KEYPAIR_JSON") or os.getenv("SOLANA_KEYPAIR_JSON")):
-        log.event(
-            "HINT_KEYPAIR_JSON_MISSING",
-            note="wallet auto-create disabled (ok if mounted)",
-        )
-    if not (
-        os.getenv("TELEGRAM_BOT_TOKEN")
-        and (os.getenv("DAILY_PNL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID"))
-    ):
-        log.event(
-            "HINT_TELEGRAM_MISSING",
-            note="daily pnl / buy notifications off",
-        )
-    if not (_PNL_DSN_ASYNC or _PG_DSN_ASYNC):
-        log.event(
-            "HINT_PG_DSN_MISSING",
-            note="daily pnl persistence disabled",
-        )
-
-
-async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
-    # Heartbeat + boot bump
-    with contextlib.suppress(Exception):
-        start_global_heartbeat(
-            log,
-            interval=float(os.getenv("PF_HEARTBEAT_SEC", "45")),
-        )
-        bump("boot")
-
-    _maybe_init_sentry()
-    _boot_banner()
-    _env_hints()
-    _ensure_keypair_file()
-
-    # Optional router pre-init (Jupiter / routing warmup)
-    try:
-        if router and hasattr(router, "start"):
-            await router.start()
-            log.event("ROUTER_PRIO_INIT_STARTED", ok=1)
-    except Exception as e:
-        log.event("ROUTER_PRIO_INIT_FAIL", error=str(e))
-
-    # Optional legacy sell loop if positions already exist
-    sell_stop_evt: Optional[asyncio.Event] = None
-    sell_task: Optional[asyncio.Task] = None
-    try:
-        if list(all_positions()):
-            log.event("BOOT_START_SELL_LOOP", reason="existing_positions")
-            sell_stop_evt = asyncio.Event()
-            sell_task = asyncio.create_task(run_sell_loop(sell_stop_evt))
-    except Exception as e:
-        log.event("BOOT_SELL_LOOP_START_FAIL", error=str(e))
-
-    local_stop = stop_evt or asyncio.Event()
-    bg_tasks = await _start_background_tasks(local_stop)
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    if not isinstance(result, (dict, str, bytes, bytearray)) and hasattr(result, "__iter__"):
         try:
-            loop.add_signal_handler(
-                sig,
-                lambda s=sig: asyncio.create_task(
-                    _graceful_shutdown(local_stop, sell_task, bg_tasks)
-                ),
-            )
-        except NotImplementedError:
-            # Windows / restricted env: ignore
-            pass
+            for item in result:
+                if stop_evt.is_set():
+                    break
+                await emit(item)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.event("SCANNER_ITER_FAIL", module=module_name, err=_short_exc(e))
+        return
 
-    backoff = 3.0
+    if isinstance(result, dict):
+        await emit(result)
+
+
+async def _scanner_run_module(
+    M: Modules,
+    module_name: str,
+    out_q: "asyncio.Queue[CandidateMsg]",
+    tick_q: "asyncio.Queue[Dict[str, Any]]",
+    stop_evt: asyncio.Event,
+    st: RuntimeState,
+) -> None:
     try:
-        while not local_stop.is_set():
+        mod = importlib.import_module(module_name)
+    except Exception as e:
+        log.event("SCANNER_IMPORT_FAIL", module=module_name, err=_short_exc(e))
+        if _fast_fail():
+            raise
+        return
+
+    async def _emit(payload: Any) -> None:
+        await _push_payload(M, out_q, tick_q, module_name, payload, stop_evt, st)
+
+    proxy_q = _ScannerQueueProxy(M=M, out_q=out_q, tick_q=tick_q, source=module_name, stop_evt=stop_evt, st=st)
+
+    fns = _scanner_entrypoints(mod)
+    if not fns:
+        log.event("SCANNER_NO_ENTRYPOINT", module=module_name)
+        if _fast_fail():
+            raise RuntimeError(f"Scanner has no entrypoints: {module_name}")
+        return
+
+    def _score_fn(fn: Callable[..., Any]) -> int:
+        nm = getattr(fn, "__name__", "")
+        if nm in {"run_scanner"}:
+            return 110
+        if nm in {"run", "main", "scan_loop", "scanner_loop"}:
+            return 100
+        if nm in {"scan_once", "scan"}:
+            return 60
+        return 10
+
+    fns.sort(key=_score_fn, reverse=True)
+
+    async def _try_call(fn: Callable[..., Any]) -> bool:
+        if stop_evt.is_set():
+            return True
+
+        # kwargs-based probes
+        for kwargs in (
+            {"q": proxy_q, "queue": proxy_q, "out_q": proxy_q, "emit": _emit, "stop_evt": stop_evt},
+            {"q": proxy_q, "queue": proxy_q, "stop_evt": stop_evt},
+            {"emit": _emit, "stop_evt": stop_evt},
+            {"stop_evt": stop_evt},
+        ):
             try:
-                await stream_loop(local_stop)
-                print(
-                    "[main] stream ended (remote closed). Reconnecting...",
-                    flush=True,
-                )
-                backoff = 3.0
+                kw = _filter_kwargs(fn, dict(kwargs))
+                res = await _call_possibly_blocking(fn, **kw)  # type: ignore[misc]
+                await _consume_result_as_stream(res, _emit, stop_evt, module_name=module_name)
+                return True
+            except TypeError:
+                continue
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                print("[main] stream_loop crashed:", flush=True)
-                traceback.print_exc()
-                backoff = min(backoff * 2.0, 30.0)
-            await asyncio.sleep(backoff)
-    finally:
-        try:
-            if sell_stop_evt is not None:
-                sell_stop_evt.set()
-            if sell_task is not None:
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(sell_task, timeout=2.5)
-        except Exception:
-            pass
-        await _graceful_shutdown(local_stop, sell_task, bg_tasks)
+            except Exception as e:
+                log.event("SCANNER_RUN_FAIL", module=module_name, fn=getattr(fn, "__name__", "?"), err=_short_exc(e))
+                if _fast_fail():
+                    raise
+                return True
+
+        # args-based probes
+        for args in ((proxy_q, stop_evt), (_emit, stop_evt), (proxy_q,), (stop_evt,), tuple()):
+            try:
+                res = await _call_possibly_blocking(fn, *args)  # type: ignore[misc]
+                await _consume_result_as_stream(res, _emit, stop_evt, module_name=module_name)
+                return True
+            except TypeError:
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.event("SCANNER_RUN_FAIL", module=module_name, fn=getattr(fn, "__name__", "?"), err=_short_exc(e))
+                if _fast_fail():
+                    raise
+                return True
+
+        return False
+
+    base_interval = max(0.2, float(_envf("SCAN_ONCE_INTERVAL_SEC", 2.0)))
+    jitter = max(0.0, float(_envf("SCAN_ONCE_JITTER_SEC", 0.35)))
+    if _JITTER_DISABLED:
+        jitter = 0.0
+
+    for fn in fns:
+        nm = getattr(fn, "__name__", "")
+
+        if nm in {"scan_once", "scan"}:
+            while not stop_evt.is_set():
+                if _scanners_disabled():
+                    log.every("SCANNERS_DISABLED_RUNTIME", 15, module=module_name)
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(stop_evt.wait(), timeout=1.0)
+                    continue
+                _ = await _try_call(fn)
+                j = 0.0 if jitter <= 0 else random.uniform(-jitter, jitter)
+                await asyncio.sleep(max(0.05, base_interval + j))
+            return
+
+        if _scanners_disabled():
+            log.every("SCANNERS_DISABLED_RUNTIME", 15, module=module_name)
+            await stop_evt.wait()
+            return
+
+        ok = await _try_call(fn)
+        if ok:
+            return
+
+    log.event("SCANNER_NO_COMPATIBLE_CALL", module=module_name)
+    if _fast_fail():
+        raise RuntimeError(f"No compatible call signature for scanner: {module_name}")
 
 
-if __name__ == "__main__":
+# =============================================================================
+# Pre-buy gating: scoring_service + AI gate + routeguard + risk_manager
+# =============================================================================
+async def _scoring_gate(M: Modules, ui: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Preferred unified scorer gate.
+    Attaches ui['score'] = dict when available.
+    """
+    if (not M.scoring_enabled) or (M.scoring_fn is None):
+        return True, "scoring_off"
+
+    fail_closed = _envb("SCORING_SERVICE_FAIL_CLOSED", False)
+    attach_features = _envb("SCORING_SERVICE_ATTACH_FEATURES", False)  # can be big; default off
+    gate_mode = (_envs("SCORING_SERVICE_GATE_MODE", "trade_viable") or "trade_viable").lower()
+    min_combined = float(_envf("SCORING_SERVICE_MIN_COMBINED", 0.0))  # optional extra clamp
+
+    raw_pool = dict(ui)
+    raw_pool.setdefault("mint", ui.get("mint"))
+    raw_pool.setdefault("symbol", ui.get("symbol") or ui.get("sym") or "UNKNOWN")
+    raw_pool.setdefault("chain", ui.get("chain") or "SOL")
+    raw_pool.setdefault("liq_usd", ui.get("liq_usd") or ui.get("liquidity_usd") or ui.get("liq") or 0.0)
+    raw_pool.setdefault("age_min", ui.get("age_min") or ui.get("token_age_min") or 0.0)
+
+    context: Dict[str, Any] = {}
+    if isinstance(ui.get("regime"), dict):
+        context["regime"] = ui.get("regime")
+
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        sys.exit(0)
+        st = await M.scoring_fn(raw_pool, context=context)  # type: ignore[misc]
+        if hasattr(st, "to_dict") and callable(getattr(st, "to_dict")):
+            st_dict = st.to_dict()  # type: ignore[misc]
+        elif isinstance(st, dict):
+            st_dict = dict(st)
+        else:
+            st_dict = {"score": str(st)}
+
+        if not attach_features and isinstance(st_dict.get("raw_features"), dict):
+            st_dict.pop("raw_features", None)
+
+        ui["score"] = st_dict
+
+        if gate_mode in {"trade_viable", "viable", "default"}:
+            ok = bool(st_dict.get("is_trade_viable", True))
+            reason = str(st_dict.get("trade_gate_reason") or "trade_viable_gate")
+        elif gate_mode in {"label"}:
+            ok = str(st_dict.get("label") or "").upper() in {"GREEN", "YELLOW"}
+            reason = f"label={st_dict.get('label')}"
+        elif gate_mode in {"combined"}:
+            ok = float(st_dict.get("combined_score") or 0.0) >= max(0.0, min_combined)
+            reason = f"combined={st_dict.get('combined_score')}"
+        else:
+            ok = bool(st_dict.get("is_trade_viable", True))
+            reason = str(st_dict.get("trade_gate_reason") or "trade_viable_gate")
+
+        if ok and min_combined > 0:
+            with contextlib.suppress(Exception):
+                if float(st_dict.get("combined_score") or 0.0) < min_combined:
+                    return False, f"combined<{min_combined:.1f}"
+
+        return ok, reason
+    except Exception as e:
+        if fail_closed:
+            return False, f"scoring_err:{_short_exc(e)}"
+        return True, f"scoring_err_allowed:{_short_exc(e)}"
+
+
+async def _ai_gate(M: Modules, ui: Dict[str, Any]) -> Tuple[bool, float, str]:
+    if (not M.ai_pass_gate) or _envb("AI_GATE_DISABLED", False):
+        return True, 0.0, "ai_gate_off"
+    try:
+        if M.ai_candidate_cls:
+            cand_kwargs = _filter_kwargs_ctor(M.ai_candidate_cls, dict(ui))
+            c = M.ai_candidate_cls(**cand_kwargs)  # type: ignore[misc]
+            out = M.ai_pass_gate(c)  # type: ignore[misc]
+        else:
+            out = M.ai_pass_gate(ui)  # type: ignore[misc]
+
+        if inspect.isawaitable(out):
+            out = await out
+
+        ok, score, why = out  # type: ignore[misc]
+        return bool(ok), float(score), str(why)
+    except Exception as e:
+        fail_closed = _envb("AI_GATE_FAIL_CLOSED", False)
+        if fail_closed:
+            return False, 0.0, f"ai_gate_error:{_short_exc(e)}"
+        return True, 0.0, f"ai_gate_error_allowed:{_short_exc(e)}"
+
+
+async def _routeguard_gate(M: Modules, ui: Dict[str, Any]) -> Tuple[bool, str]:
+    if not M.routeguard_mod or _envb("ROUTEGUARD_DISABLED", False):
+        return True, "routeguard_off"
+
+    rg = M.routeguard_mod
+    fail_closed = _envb("ROUTEGUARD_FAIL_CLOSED", False)
+
+    async def _maybe_await(x: Any) -> Any:
+        if inspect.isawaitable(x):
+            return await x
+        return x
+
+    for nm in ("guard_candidate", "guard", "check_candidate"):
+        fn = getattr(rg, nm, None)
+        if callable(fn):
+            try:
+                out = await _maybe_await(fn(ui))
+                if isinstance(out, tuple) and len(out) >= 1:
+                    ok = bool(out[0])
+                    reason = str(out[1]) if len(out) > 1 else nm
+                    return ok, reason
+                if isinstance(out, dict):
+                    ok = bool(out.get("ok", True))
+                    reason = str(out.get("reason") or nm)
+                    return ok, reason
+            except Exception as e:
+                return (not fail_closed), f"routeguard_err:{_short_exc(e)}"
+
+    for nm in ("allow_candidate", "should_allow", "allow"):
+        fn = getattr(rg, nm, None)
+        if callable(fn):
+            try:
+                out = await _maybe_await(fn(ui))
+                return bool(out), nm
+            except Exception as e:
+                return (not fail_closed), f"routeguard_err:{_short_exc(e)}"
+
+    return True, "routeguard_no_api"
+
+
+async def _risk_gate(M: Modules, ui: Dict[str, Any]) -> Tuple[bool, str]:
+    if not M.risk_mod or _envb("RISK_MANAGER_DISABLED", False):
+        return True, "risk_off"
+
+    rm = M.risk_mod
+    fail_closed = _envb("RISK_FAIL_CLOSED", False)
+
+    async def _maybe_await(x: Any) -> Any:
+        if inspect.isawaitable(x):
+            return await x
+        return x
+
+    for nm in ("check_candidate", "check_buy", "check_entry", "guard_candidate", "guard_buy", "allow_buy", "allow_entry"):
+        fn = getattr(rm, nm, None)
+        if callable(fn):
+            try:
+                kw = _filter_kwargs(fn, {"ui": ui, "candidate": ui, **ui})
+                out = await _maybe_await(fn(**kw) if kw else fn(ui))
+                if isinstance(out, tuple) and len(out) >= 1:
+                    ok = bool(out[0])
+                    reason = str(out[1]) if len(out) > 1 else nm
+                    return ok, reason
+                if isinstance(out, dict):
+                    ok = bool(out.get("ok", True))
+                    reason = str(out.get("reason") or nm)
+                    return ok, reason
+                if isinstance(out, bool):
+                    return out, nm
+            except Exception as e:
+                return (not fail_closed), f"risk_err:{_short_exc(e)}"
+
+    for nm in ("can_trade", "can_buy", "should_trade", "should_buy"):
+        fn = getattr(rm, nm, None)
+        if callable(fn):
+            try:
+                out = await _maybe_await(fn())
+                return bool(out), nm
+            except Exception as e:
+                return (not fail_closed), f"risk_err:{_short_exc(e)}"
+
+    return True, "risk_no_api"
+
+
+# =============================================================================
+# Exit engine wiring
+# =============================================================================
+def _exit_allow_events_when_sells_disabled() -> bool:
+    return _envb("EXIT_ENGINE_ALLOW_EVENTS_WHEN_SELLS_DISABLED", True)
+
+
+def _reload_exit_engine_config_best_effort(M: Modules) -> None:
+    if not M.exit_mod:
+        return
+    fn = getattr(M.exit_mod, "reload_exit_engine_config", None)
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            fn()
+
+
+async def _exit_on_buy_filled(M: Modules, payload: Dict[str, Any]) -> None:
+    if not M.exit_mod:
+        return
+    if _sells_disabled() and not _exit_allow_events_when_sells_disabled():
+        return
+    fn = getattr(M.exit_mod, "on_buy_filled", None) or getattr(M.exit_mod, "on_buy_filled_event", None)
+    if not callable(fn):
+        return
+    with contextlib.suppress(Exception):
+        await _call_maybe_async(fn, payload)
+
+
+async def _exit_on_tick(M: Modules, payload: Dict[str, Any]) -> None:
+    if not M.exit_mod:
+        return
+    if _sells_disabled() and not _exit_allow_events_when_sells_disabled():
+        return
+    fn = getattr(M.exit_mod, "on_trade_tick", None)
+    if not callable(fn):
+        return
+    try:
+        await _call_maybe_async(fn, payload)
+    except Exception as e:
+        log.every("EXIT_ON_TICK_FAIL", 10, err=_short_exc(e))
+
+
+# =============================================================================
+# Long-running worker runner (best-effort)
+# =============================================================================
+async def _run_module_worker(mod: Any, stop_evt: asyncio.Event, label: str) -> None:
+    candidates = (
+        "run_worker",
+        "exit_engine_loop",
+        "reinvestor_loop",
+        "smart_wallets_loop",
+        "worker_loop",
+        "loop",
+        "run",
+        "main",
+    )
+    for name in candidates:
+        fn = getattr(mod, name, None)
+        if not callable(fn):
+            continue
+        try:
+            kwargs = _filter_kwargs(fn, {"stop_evt": stop_evt, "stop_event": stop_evt, "stop": stop_evt})
+            if kwargs:
+                return await _call_possibly_blocking(fn, **kwargs)
+            with contextlib.suppress(TypeError):
+                return await _call_possibly_blocking(fn, stop_evt)
+            return await _call_possibly_blocking(fn)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.event(f"{label}_RUNNER_FAIL", fn=name, err=_short_exc(e))
+            raise
+
+    log.event(f"{label}_NO_RUNNER")
+    if _fast_fail():
+        raise RuntimeError(f"{label} worker has no compatible runner")
+
+
+async def _run_loop_until_stop(loop_fn: Callable[..., Any], stop_evt: asyncio.Event, *, name: str) -> None:
+    async def _start_inner() -> Any:
+        try:
+            kw = _filter_kwargs(loop_fn, {"stop_evt": stop_evt, "stop_event": stop_evt, "stop": stop_evt})
+            if kw:
+                return await _call_maybe_async(loop_fn, **kw)
+        except TypeError:
+            pass
+
+        with contextlib.suppress(TypeError):
+            return await _call_maybe_async(loop_fn, stop_evt)
+
+        return await _call_maybe_async(loop_fn)
+
+    inner = asyncio.create_task(_start_inner(), name=f"{name}::inner")
+    try:
+        await stop_evt.wait()
+    finally:
+        inner.cancel()
+        with contextlib.suppress(Exception):
+            await asyncio.gather(inner, return_exceptions=True)
+
+
+# =============================================================================
+# Tick router + sinks
+# =============================================================================
+async def _tick_router(M: Modules, tick_q: "asyncio.Queue[Dict[str, Any]]", stop_evt: asyncio.Event, st: RuntimeState) -> None:
+    while not stop_evt.is_set():
+        try:
+            d = await asyncio.wait_for(tick_q.get(), timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+
+        try:
+            st.tick_seen += 1
+            st.last_tick_at = _now()
+            with contextlib.suppress(Exception):
+                ts = _safe_float(d.get("ts") or d.get("timestamp") or 0.0, 0.0)
+                if ts > 0:
+                    st.tick_lat_ms_ema = _ema(st.tick_lat_ms_ema, max(0.0, (_now() - ts) * 1000.0))
+            await _exit_on_tick(M, d)
+        finally:
+            with contextlib.suppress(Exception):
+                tick_q.task_done()
+
+
+async def _tick_sink(tick_q: "asyncio.Queue[Dict[str, Any]]", stop_evt: asyncio.Event, st: RuntimeState) -> None:
+    while not stop_evt.is_set():
+        try:
+            _ = await asyncio.wait_for(tick_q.get(), timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+        try:
+            st.tick_sunk += 1
+            st.last_tick_at = _now()
+        finally:
+            with contextlib.suppress(Exception):
+                tick_q.task_done()
+
+
+async def _candidate_sink(in_q: "asyncio.Queue[CandidateMsg]", stop_evt: asyncio.Event, st: RuntimeState) -> None:
+    while not stop_evt.is_set():
+        try:
+            msg = await asyncio.wait_for(in_q.get(), timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+        try:
+            st.cand_sunk += 1
+            st.last_candidate_at = _now()
+            with contextlib.suppress(Exception):
+                st.cand_lat_ms_ema = _ema(st.cand_lat_ms_ema, max(0.0, (_now() - float(msg.ts or _now())) * 1000.0))
+        finally:
+            with contextlib.suppress(Exception):
+                in_q.task_done()
+
+
+# =============================================================================
+# Entry worker
+# =============================================================================
+_BUY_INFLIGHT: Dict[str, float] = {}
+_BUY_INFLIGHT_TTL = _envf("BUY_INFLIGHT_TTL_SEC", 25.0)
+
+_BUY_COOLDOWN_SEC = _envf("BUY_MINT_COOLDOWN_SEC", 0.0)
+_LAST_BUY_ATTEMPT: Dict[str, float] = {}
+
+_BUY_EXEC_TIMEOUT_S = float(_envf("BUY_EXEC_TIMEOUT_S", 35.0))
+_BUY_WARMUP_SEC = float(_envf("BUY_WARMUP_SEC", 0.0))
+
+
+def _buy_inflight_ok(mint: str) -> bool:
+    now = _now()
+    cutoff = now - float(_BUY_INFLIGHT_TTL)
+    for k, ts in list(_BUY_INFLIGHT.items()):
+        if ts < cutoff:
+            _BUY_INFLIGHT.pop(k, None)
+    if mint in _BUY_INFLIGHT:
+        return False
+    _BUY_INFLIGHT[mint] = now
+    return True
+
+
+def _buy_cooldown_ok(mint: str) -> bool:
+    if _BUY_COOLDOWN_SEC <= 0:
+        return True
+    now = _now()
+    last = float(_LAST_BUY_ATTEMPT.get(mint, 0.0))
+    if last and (now - last) < float(_BUY_COOLDOWN_SEC):
+        return False
+    _LAST_BUY_ATTEMPT[mint] = now
+    return True
+
+
+def _optional_log_candidate(M: Modules, ui: Dict[str, Any]) -> None:
+    if not M.data_logger_mod:
+        return
+    if not _envb("LOG_CANDIDATES_ENABLED", False):
+        return
+    fn = getattr(M.data_logger_mod, "log_candidate_event", None)
+    if not callable(fn):
+        return
+    try:
+        out = fn(ui)
+        if inspect.isawaitable(out):
+            asyncio.create_task(out)
+    except Exception:
+        return
+
+
+async def _entry_worker(
+    M: Modules,
+    wid: int,
+    in_q: "asyncio.Queue[CandidateMsg]",
+    stop_evt: asyncio.Event,
+    st: RuntimeState,
+    buy_sema: asyncio.Semaphore,
+) -> None:
+    if M.maybe_buy is None:
+        log.event("ENTRY_DISABLED_NO_BUY_EXECUTOR", run_id=st.run_id)
+        if _fast_fail():
+            raise RuntimeError("No maybe_buy executor available")
+        await stop_evt.wait()
+        return
+
+    dryrun = _envb("DRYRUN", _envb("DRY_RUN", False))
+    started_at = _now()
+
+    async def _on_submitted(p: Dict[str, Any]) -> None:
+        bump("buy_submitted")
+        st.last_buy_action_at = _now()
+        log.event("BUY_SUBMITTED", run_id=st.run_id, worker=wid, **(p or {}))
+
+    async def _on_filled(p: Dict[str, Any]) -> None:
+        bump("buy_filled")
+        st.last_buy_action_at = _now()
+        st.last_buy_fill_at = _now()
+        log.event("BUY_FILLED", run_id=st.run_id, worker=wid, **(p or {}))
+        await _exit_on_buy_filled(M, p or {})
+
+    async def _on_failed(p: Dict[str, Any]) -> None:
+        bump("buy_failed")
+        st.last_buy_action_at = _now()
+        log.event("BUY_FAILED", run_id=st.run_id, worker=wid, **(p or {}))
+
+    while not stop_evt.is_set():
+        try:
+            msg = await asyncio.wait_for(in_q.get(), timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+
+        mint = ""
+        try:
+            st.cand_seen += 1
+            st.last_candidate_at = _now()
+
+            mint = M.normalize_mint(msg.mint)
+            ui = dict(msg.ui or {})
+            ui.setdefault("pool", ui.get("pool") or _source_to_pool_hint(msg.source))
+            ui.setdefault("source", msg.source)
+            ui.setdefault("mint", mint)
+            ui.setdefault("ts", float(msg.ts or _now()))
+            ui.setdefault("trace_id", msg.trace_id or _trace_id_for(mint, msg.source, ui, float(ui["ts"]), st.run_id))
+            ui.setdefault("run_id", st.run_id)
+
+            with contextlib.suppress(Exception):
+                st.cand_lat_ms_ema = _ema(st.cand_lat_ms_ema, max(0.0, (_now() - float(msg.ts or _now())) * 1000.0))
+
+            if not mint:
+                st.buy_skip += 1
+                continue
+
+            _optional_log_candidate(M, ui)
+
+            if _BUY_WARMUP_SEC > 0 and (_now() - started_at) < _BUY_WARMUP_SEC:
+                bump("buy_skip_warmup")
+                st.buy_skip += 1
+                log.every("BUY_SKIP_WARMUP", 10, mint=mint, warmup_sec=_BUY_WARMUP_SEC)
+                continue
+
+            if _buys_disabled():
+                bump("buy_skip_disabled")
+                st.buy_skip += 1
+                log.every("BUY_SKIP_DISABLED", 15, mint=mint, pool=ui.get("pool"), source=msg.source)
+                continue
+
+            # Optional global guardrails hook (if present)
+            if M.buys_allowed is not None:
+                with contextlib.suppress(Exception):
+                    ok_guard = bool(M.buys_allowed())
+                    if not ok_guard:
+                        bump("buy_skip_guardrails")
+                        st.buy_skip += 1
+                        log.every("BUY_SKIP_GUARDRAILS", 10, mint=mint)
+                        continue
+
+            if not _buy_inflight_ok(mint):
+                bump("buy_skip_inflight")
+                st.buy_skip += 1
+                log.every("BUY_SKIP_INFLIGHT", 10, mint=mint, pool=ui.get("pool"), source=msg.source)
+                continue
+
+            if not _buy_cooldown_ok(mint):
+                bump("buy_skip_cooldown")
+                st.buy_skip += 1
+                log.every("BUY_SKIP_COOLDOWN", 10, mint=mint, cooldown_sec=_BUY_COOLDOWN_SEC)
+                with contextlib.suppress(Exception):
+                    _BUY_INFLIGHT.pop(mint, None)
+                continue
+
+            ok_sc, why_sc = await _scoring_gate(M, ui)
+            if not ok_sc:
+                bump("buy_skip_scoring")
+                st.buy_skip += 1
+                log.event(
+                    "BUY_SKIP_SCORING",
+                    run_id=st.run_id,
+                    mint=mint,
+                    pool=ui.get("pool"),
+                    why=why_sc,
+                    score=ui.get("score"),
+                )
+                with contextlib.suppress(Exception):
+                    _BUY_INFLIGHT.pop(mint, None)
+                continue
+
+            ok_risk, why_risk = await _risk_gate(M, ui)
+            if not ok_risk:
+                bump("buy_skip_risk")
+                st.buy_skip += 1
+                log.event(
+                    "BUY_SKIP_RISK",
+                    run_id=st.run_id,
+                    mint=mint,
+                    pool=ui.get("pool"),
+                    why=why_risk,
+                    score=ui.get("score"),
+                )
+                with contextlib.suppress(Exception):
+                    _BUY_INFLIGHT.pop(mint, None)
+                continue
+
+            ok_rg, why_rg = await _routeguard_gate(M, ui)
+            if not ok_rg:
+                bump("buy_skip_routeguard")
+                st.buy_skip += 1
+                log.event(
+                    "BUY_SKIP_ROUTEGUARD",
+                    run_id=st.run_id,
+                    mint=mint,
+                    pool=ui.get("pool"),
+                    why=why_rg,
+                    score=ui.get("score"),
+                )
+                with contextlib.suppress(Exception):
+                    _BUY_INFLIGHT.pop(mint, None)
+                continue
+
+            ok_ai, score_ai, why_ai = await _ai_gate(M, ui)
+            if not ok_ai:
+                bump("buy_skip_ai_gate")
+                st.buy_skip += 1
+                log.event(
+                    "BUY_SKIP_AI_GATE",
+                    run_id=st.run_id,
+                    mint=mint,
+                    pool=ui.get("pool"),
+                    score=score_ai,
+                    why=why_ai,
+                    score_blob=ui.get("score"),
+                )
+                with contextlib.suppress(Exception):
+                    _BUY_INFLIGHT.pop(mint, None)
+                continue
+
+            try:
+                async with buy_sema:
+                    fn = M.maybe_buy
+                    kwargs = _filter_kwargs(
+                        fn,
+                        {
+                            "mint": mint,
+                            "ui": ui,
+                            "on_buy_submitted": _on_submitted,
+                            "on_buy_filled": _on_filled,
+                            "on_buy_failed": _on_failed,
+                            "worker_id": wid,
+                            "source": msg.source,
+                            "dryrun": dryrun,
+                            "DRYRUN": dryrun,
+                        },
+                    )
+
+                    if dryrun and ("dryrun" not in kwargs) and ("DRYRUN" not in kwargs):
+                        st.buy_skip += 1
+                        bump("buy_dryrun_skip_noarg")
+                        log.every("DRYRUN_SKIP_NOARG", 10, mint=mint)
+                        continue
+
+                    ok = await asyncio.wait_for(_call_maybe_async(fn, **kwargs), timeout=_BUY_EXEC_TIMEOUT_S)
+
+                    ok_bool = bool(ok)
+                    if isinstance(ok, dict):
+                        ok_bool = bool(ok.get("ok", ok.get("success", False)))
+
+                    if ok_bool:
+                        st.buy_ok += 1
+                    else:
+                        st.buy_fail += 1
+
+            except asyncio.TimeoutError:
+                st.buy_exc += 1
+                st.buy_fail += 1
+                bump("buy_exec_timeout")
+                log.event("BUY_EXEC_TIMEOUT", run_id=st.run_id, mint=mint, timeout_s=_BUY_EXEC_TIMEOUT_S)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                st.buy_exc += 1
+                st.buy_fail += 1
+                bump("buy_exec_error")
+                log.event(
+                    "BUY_EXEC_EXCEPTION",
+                    run_id=st.run_id,
+                    mint=mint,
+                    err=_short_exc(e),
+                    tb=traceback.format_exc(limit=2),
+                )
+
+        finally:
+            with contextlib.suppress(Exception):
+                if mint:
+                    _BUY_INFLIGHT.pop(mint, None)
+            with contextlib.suppress(Exception):
+                in_q.task_done()
+
+
+# =============================================================================
+# Supervisor + kill watchdog
+# =============================================================================
+@dataclass
+class TaskSpec:
+    name: str
+    factory: Callable[[], Awaitable[None]]
+    critical: bool = True
+    restarts: int = 0
+    last_start: float = 0.0
+    backoff: float = 0.0
+    restarts_window: List[float] = field(default_factory=list)
+
+
+async def _supervisor_loop(
+    M: Modules,
+    specs: Dict[str, TaskSpec],
+    tasks: Dict[str, asyncio.Task],
+    stop_evt: asyncio.Event,
+    st: RuntimeState,
+    *,
+    cand_q: asyncio.Queue,
+    tick_q: asyncio.Queue,
+) -> None:
+    interval = max(1, int(getattr(C, "SUPERVISOR_SEC", 5) or 5))
+    base_backoff = float(getattr(C, "RESTART_BACKOFF_SEC", 2) or 2)
+    max_backoff = float(getattr(C, "RESTART_MAX_BACKOFF_SEC", 60) or 60)
+    max_per_hour = int(getattr(C, "RESTART_MAX_PER_HOUR", 60) or 60)
+
+    health_sec = int(getattr(C, "HEALTH_LOG_SEC", 30) or 30)
+    starvation_warn = float(getattr(C, "STARVATION_WARN_SEC", 180) or 180)
+    no_buy_warn = float(getattr(C, "NO_BUY_WARN_SEC", 300) or 300)
+
+    hang_restart_ms = float(_envf("MAIN_HANG_RESTART_LAG_MS", 0.0))  # 0 disables
+    last_loop_mono = _mono()
+
+    while not stop_evt.is_set():
+        await asyncio.sleep(interval)
+
+        now_m = _mono()
+        st.loop_lag_ms = max(0.0, (now_m - last_loop_mono - float(interval)) * 1000.0)
+        last_loop_mono = now_m
+
+        _queue_hwm_update(st, cand_q, tick_q)
+
+        if hang_restart_ms and st.loop_lag_ms >= hang_restart_ms:
+            log.event(
+                "MAIN_LOOP_LAG_TOO_HIGH",
+                run_id=st.run_id,
+                lag_ms=int(st.loop_lag_ms),
+                threshold_ms=int(hang_restart_ms),
+            )
+            stop_evt.set()
+
+        now = _now()
+        cutoff = now - 3600.0
+        for spec in specs.values():
+            spec.restarts_window = [t for t in spec.restarts_window if t >= cutoff]
+
+        for name, t in list(tasks.items()):
+            if not t.done():
+                continue
+
+            err: Optional[BaseException] = None
+            with contextlib.suppress(Exception):
+                err = t.exception()
+
+            tasks.pop(name, None)
+            spec = specs.get(name)
+            log.event("TASK_DIED", run_id=st.run_id, task=name, err=("done" if err is None else _short_exc(err)))
+
+            if stop_evt.is_set() or not spec or not spec.critical:
+                continue
+
+            if len(spec.restarts_window) >= max_per_hour:
+                log.event("TASK_RESTART_RATE_LIMIT", run_id=st.run_id, task=name, per_hour=max_per_hour)
+                continue
+
+            spec.backoff = min(max_backoff, max(base_backoff, spec.backoff * 1.7 if spec.backoff else base_backoff))
+            jitter = 0.0 if _JITTER_DISABLED else random.uniform(0.0, min(1.0, spec.backoff * 0.15))
+            wait = spec.backoff + jitter
+            log.event("TASK_RESTART_SCHEDULED", run_id=st.run_id, task=name, backoff_sec=round(wait, 2))
+
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop_evt.wait(), timeout=wait)
+                continue
+
+            tasks[name] = asyncio.create_task(spec.factory(), name=name)
+            spec.restarts += 1
+            spec.last_start = _now()
+            spec.restarts_window.append(spec.last_start)
+            log.event("TASK_RESTARTED", run_id=st.run_id, task=name, restarts=spec.restarts)
+
+        now = _now()
+        if st.last_candidate_at > 0 and (now - st.last_candidate_at) > starvation_warn:
+            log.every(
+                "WATCHDOG_NO_CANDIDATES",
+                30,
+                run_id=st.run_id,
+                sec_since_last=int(now - st.last_candidate_at),
+                cand_q=cand_q.qsize(),
+            )
+
+        if st.last_buy_action_at > 0 and (now - st.last_buy_action_at) > no_buy_warn:
+            log.every(
+                "WATCHDOG_NO_BUY_ACTION",
+                30,
+                run_id=st.run_id,
+                sec_since_last=int(now - st.last_buy_action_at),
+                cand_q=cand_q.qsize(),
+            )
+
+        if (now - st.last_health_at) >= float(health_sec):
+            st.last_health_at = now
+            snap = _snapshot_state(M, st, cand_q=cand_q, tick_q=tick_q, tasks=tasks)
+            log.event("HEALTH", **snap, queue_policy=_DROP_POLICY, loop_lag_ms=int(st.loop_lag_ms))
+
+
+async def _kill_watchdog(stop_evt: asyncio.Event, st: RuntimeState) -> None:
+    while not stop_evt.is_set():
+        if _kill_active():
+            st.last_kill_seen = _now()
+            log.every("KILL_SWITCH_ACTIVE", 2, run_id=st.run_id, shutdown_on_trigger=int(_KILL_SHUTDOWN_ON_TRIGGER))
+            if _KILL_SHUTDOWN_ON_TRIGGER:
+                stop_evt.set()
+                return
+        await asyncio.sleep(_KILL_WATCHDOG_SEC)
+
+
+def _install_signal_handlers(stop_evt: asyncio.Event, run_id: str) -> None:
+    def _ask_stop(*_a: Any) -> None:
+        if not stop_evt.is_set():
+            log.event("STOP_REQUESTED", run_id=run_id)
+            stop_evt.set()
+
+    with contextlib.suppress(Exception):
+        signal.signal(signal.SIGINT, lambda *_: _ask_stop())
+    with contextlib.suppress(Exception):
+        signal.signal(signal.SIGTERM, lambda *_: _ask_stop())
+
+    with contextlib.suppress(Exception):
+        loop = asyncio.get_running_loop()
+        with contextlib.suppress(Exception):
+            loop.add_signal_handler(signal.SIGINT, _ask_stop)  # type: ignore[arg-type]
+        with contextlib.suppress(Exception):
+            loop.add_signal_handler(signal.SIGTERM, _ask_stop)  # type: ignore[arg-type]
+
+
+# =============================================================================
+# Optional stdlib HTTP debug server (health.py is the real Render web service)
+# =============================================================================
+async def _http_server(
+    M: Modules,
+    st: RuntimeState,
+    cand_q: asyncio.Queue,
+    tick_q: asyncio.Queue,
+    tasks: Dict[str, asyncio.Task],
+    stop_evt: asyncio.Event,
+) -> None:
+    host = _envs("MAIN_HTTP_HOST", "0.0.0.0")
+    port = _envi("MAIN_HTTP_PORT", 0)
+    if port <= 0:
+        return
+
+    async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+        except Exception:
+            with contextlib.suppress(Exception):
+                writer.close()
+            return
+
+        path = "/"
+        try:
+            line0 = (data.splitlines()[0] if data else b"").decode("utf-8", "ignore")
+            parts = line0.split()
+            if len(parts) >= 2:
+                path = parts[1]
+        except Exception:
+            path = "/"
+
+        if path in {"/health", "/healthz"}:
+            body = _json_dumps({"ok": True, "run_id": st.run_id, "version": MAIN_VERSION})
+            resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (
+                len(body),
+                body,
+            )
+        elif path in {"/state", "/debug/state"}:
+            body = _json_dumps(_snapshot_state(M, st, cand_q=cand_q, tick_q=tick_q, tasks=tasks))
+            resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (
+                len(body),
+                body,
+            )
+        elif path in {"/metrics"}:
+            snap = _snapshot_state(M, st, cand_q=cand_q, tick_q=tick_q, tasks=None)
+            lines = [
+                "sniper_up 1",
+                f"sniper_uptime_sec {snap.get('up_sec', 0)}",
+                f"sniper_cand_seen {snap['cand']['seen']}",
+                f"sniper_cand_dropped {snap['cand']['dropped']}",
+                f"sniper_buy_ok {snap['buy']['ok']}",
+                f"sniper_buy_fail {snap['buy']['fail']}",
+                f"sniper_buy_skip {snap['buy']['skip']}",
+                f"sniper_tick_seen {snap['tick']['seen']}",
+            ]
+            body = "\n".join(lines) + "\n"
+            resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s" % (
+                len(body),
+                body,
+            )
+        else:
+            body = "ok\n"
+            resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s" % (
+                len(body),
+                body,
+            )
+
+        try:
+            writer.write(resp.encode("utf-8", "ignore"))
+            await writer.drain()
+        finally:
+            with contextlib.suppress(Exception):
+                writer.close()
+
+    server = await asyncio.start_server(_handle, host=host, port=port)
+    log.event("HTTP_SERVER_STARTED", run_id=st.run_id, host=host, port=port)
+
+    try:
+        await stop_evt.wait()
+    finally:
+        server.close()
+        with contextlib.suppress(Exception):
+            await server.wait_closed()
+        log.event("HTTP_SERVER_STOPPED", run_id=st.run_id)
+
+
+# =============================================================================
+# Scanner module selection
+# =============================================================================
+def _scanner_modules_from_env() -> Optional[List[str]]:
+    raw = _envs("SCANNER_MODULES", "").strip()
+    if not raw:
+        return None
+    parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+    return parts or None
+
+
+def _pick_first_existing(cands: List[str]) -> Optional[str]:
+    for m in cands:
+        if _module_exists(m):
+            return m
+    return None
+
+
+def _default_scanner_modules() -> List[str]:
+    mods: List[str] = []
+
+    if getattr(C, "ENABLE_RAYDIUM_SCANNER", True) and _envb("ENABLE_RAYDIUM_SCANNER", True):
+        ray = _pick_first_existing(["scanner.raydium_scanner", "scanner.raydium", "scanner.raydium_scanner_v2"])
+        mods.append(ray or "scanner.raydium_scanner")
+
+    if getattr(C, "ENABLE_PUMP_SCANNER", True) and _envb("ENABLE_PUMP_SCANNER", True):
+        pump = _pick_first_existing(["scanner.pumpfun_scanner", "scanner.pumpfun", "scanner.pump_scanner"])
+        mods.append(pump or "scanner.pumpfun_scanner")
+
+    if getattr(C, "ENABLE_DEXSCREENER_SCANNER", True) and _envb("ENABLE_DEXSCREENER_SCANNER", True):
+        dex = _pick_first_existing(["scanner.dexscreener_scanner", "scanner.dexscreener"])
+        mods.append(dex or "scanner.dexscreener_scanner")
+
+    return mods
+
+
+# =============================================================================
+# Main
+# =============================================================================
+async def main(stop_evt: Optional[asyncio.Event] = None) -> None:
+    global RUN_ID
+
+    # Fresh per-run identity (so run_forever restarts don't reuse the same RUN_ID)
+    if not RUN_ID or _envb("MAIN_FORCE_NEW_RUN_ID", True):
+        base = f"{time.time()}|{os.getpid()}|{socket.gethostname()}|{random.random()}"
+        RUN_ID = (os.getenv("RUN_ID", "") or hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()[:10]).strip()
+
+    # Deterministic-ish seed per run (unless jitter disabled)
+    if not _JITTER_DISABLED:
+        with contextlib.suppress(Exception):
+            seed = int(hashlib.sha1(RUN_ID.encode("utf-8", "ignore")).hexdigest()[:8], 16)
+            random.seed(seed)
+
+    stop_evt = stop_evt or asyncio.Event()
+    _install_signal_handlers(stop_evt, RUN_ID)
+    with contextlib.suppress(Exception):
+        _install_loop_exception_handler()
+
+    # IMPORTANT: apply sells-disable env BEFORE importing exit modules
+    _apply_disable_sells_to_env()
+
+    if _PANIC_STOP:
+        log.event("PANIC_STOP_SET", run_id=RUN_ID)
+        stop_evt.set()
+
+    # Optional belt-and-suspenders preflight (subprocess)
+    await _run_preflight_if_enabled(RUN_ID)
+
+    # Bootstraps (best effort)
+    with contextlib.suppress(Exception):
+        await _core_bootstrap_best_effort(RUN_ID)
+    with contextlib.suppress(Exception):
+        await _ai_db_bootstrap_best_effort(RUN_ID)
+
+    # Resolve modules lazily (after env overrides + bootstrap)
+    M = _resolve_modules()
+
+    if _sells_disabled():
+        _reload_exit_engine_config_best_effort(M)
+
+    phase = _phase()
+    disable_sells = _sells_disabled()
+
+    max_concurrent_buys = max(1, _envi("MAX_CONCURRENT_BUYS", _envi("MAX_CONCURRENCY", 3)))
+    buy_sema = asyncio.Semaphore(max_concurrent_buys)
+
+    log.event(
+        "MAIN_BOOT",
+        run_id=RUN_ID,
+        version=MAIN_VERSION,
+        build=MAIN_BUILD,
+        phase=phase,
+        py=sys.version.split()[0],
+        pid=os.getpid(),
+        buy_executor=int(M.maybe_buy is not None),
+        ai_gate=int(M.ai_pass_gate is not None),
+        scoring_service=int(M.scoring_fn is not None and M.scoring_enabled),
+        exit_engine=int(M.exit_mod is not None),
+        auto_exit_worker=int(M.auto_exit_worker_loop is not None),
+        reinvestor=int(M.reinvest_mod is not None),
+        smart_wallets=int(M.smart_mod is not None),
+        routeguard=int(M.routeguard_mod is not None),
+        risk_manager=int(M.risk_mod is not None),
+        queue_policy=_DROP_POLICY,
+        max_concurrent_buys=max_concurrent_buys,
+        buy_exec_timeout_s=_BUY_EXEC_TIMEOUT_S,
+        kill_switch=int(_kill_active()),
+        disable_buys=int(_buys_disabled()),
+        disable_sells=int(disable_sells),
+        disable_scanners=int(_scanners_disabled()),
+        dryrun=int(_envb("DRYRUN", _envb("DRY_RUN", False))),
+        threadify_sync_modules=int(_threadify_sync_modules_enabled()),
+        fast_fail=int(_fast_fail()),
+        jitter_disabled=int(_JITTER_DISABLED),
+        max_uptime_sec=int(_MAIN_MAX_UPTIME_SEC),
+    )
+
+    with contextlib.suppress(Exception):
+        _start_global_heartbeat()  # type: ignore[misc]
+
+    if phase <= 0:
+        log.event("MAIN_PHASE0_IDLE", run_id=RUN_ID)
+        await stop_evt.wait()
+        return
+
+    qmax = _envi("CANDIDATE_QUEUE_MAX", int(getattr(C, "CANDIDATE_QUEUE_MAX", 2500) or 2500))
+    tqmax = _envi("TICK_QUEUE_MAX", int(getattr(C, "TICK_QUEUE_MAX", 5000) or 5000))
+    qmax = max(50, min(250_000, qmax))
+    tqmax = max(50, min(500_000, tqmax))
+
+    cand_q: "asyncio.Queue[CandidateMsg]" = asyncio.Queue(maxsize=qmax)
+    tick_q: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue(maxsize=tqmax)
+    st = RuntimeState(run_id=RUN_ID)
+
+    tasks: Dict[str, asyncio.Task] = {}
+    specs: Dict[str, TaskSpec] = {}
+
+    def _spawn(name: str, coro_factory: Callable[[], Awaitable[None]], critical: bool = True) -> None:
+        if name in tasks and not tasks[name].done():
+            return
+        specs[name] = TaskSpec(name=name, factory=coro_factory, critical=critical, last_start=_now())
+        tasks[name] = asyncio.create_task(coro_factory(), name=name)
+
+    # Optional debug HTTP server (NOT the Render web service; see health.py)
+    _spawn("http_server", lambda: _http_server(M, st, cand_q, tick_q, tasks, stop_evt), critical=False)
+
+    # Phase 1: scanners
+    if phase >= 1:
+        mods = _scanner_modules_from_env() or _default_scanner_modules()
+        log.event("SCANNERS_SELECTED", run_id=RUN_ID, modules=",".join(mods) if mods else "")
+        for mod_name in (mods or []):
+            crit = _envb(f"SCANNER_CRITICAL__{mod_name.replace('.', '_').upper()}", True)
+            _spawn(
+                f"scanner::{mod_name}",
+                lambda m=mod_name: _scanner_run_module(M, m, cand_q, tick_q, stop_evt, st),
+                critical=crit,
+            )
+
+    # Phase 2: entry workers
+    entry_workers_started = 0
+    if phase >= 2:
+        nworkers = int(getattr(C, "ENTRY_WORKERS", 2) or 2)
+        nworkers = max(1, min(32, _envi("ENTRY_WORKERS", nworkers)))
+        if M.maybe_buy is not None:
+            for wid in range(nworkers):
+                _spawn(
+                    f"entry_worker_{wid}",
+                    lambda wid=wid: _entry_worker(M, wid, cand_q, stop_evt, st, buy_sema),
+                    critical=True,
+                )
+            entry_workers_started = nworkers
+            log.event("ENTRY_WORKERS_STARTED", run_id=RUN_ID, n=nworkers)
+        else:
+            log.event("ENTRY_WORKERS_SKIPPED_NO_BUY_EXECUTOR", run_id=RUN_ID, requested=nworkers)
+            if _fast_fail():
+                raise RuntimeError("No buy executor; cannot run entry workers")
+
+    # If scanners running but no entry workers, drain to sink (prevents memory growth)
+    if phase >= 1 and entry_workers_started <= 0:
+        _spawn("candidate_sink", lambda: _candidate_sink(cand_q, stop_evt, st), critical=False)
+
+    # Phase 3: tick routing + exit modules + AUTO EXIT QUEUE WORKER
+    if phase >= 3:
+        _spawn("tick_router", lambda: _tick_router(M, tick_q, stop_evt, st), critical=True)
+
+        if M.exit_mod is not None and _envb("EXIT_ENGINE_WORKER_ENABLED", True):
+            _spawn("exit_engine", lambda: _run_module_worker(M.exit_mod, stop_evt, "EXIT"), critical=False)
+
+        if (not disable_sells) and _envb("AUTO_EXIT_WORKER_ENABLED", True) and M.auto_exit_worker_loop is not None:
+            _spawn(
+                "auto_exit_worker",
+                lambda: _run_loop_until_stop(M.auto_exit_worker_loop, stop_evt, name="auto_exit_worker"),
+                critical=False,
+            )
+        elif disable_sells:
+            log.event("AUTO_EXIT_WORKER_SKIPPED_DISABLE_SELLS", run_id=RUN_ID)
+        else:
+            log.event(
+                "AUTO_EXIT_WORKER_NOT_AVAILABLE",
+                run_id=RUN_ID,
+                enabled=int(_envb("AUTO_EXIT_WORKER_ENABLED", True)),
+            )
+
+    else:
+        if _envb("FORWARD_TICKS_FROM_SCANNERS", False):
+            _spawn("tick_sink", lambda: _tick_sink(tick_q, stop_evt, st), critical=False)
+
+    # Phase 4: reinvestor
+    if phase >= 4 and M.reinvest_mod is not None and _envb("REINVESTOR_ENABLED", True):
+        _spawn("reinvestor", lambda: _run_module_worker(M.reinvest_mod, stop_evt, "REINVEST"), critical=False)
+
+    # Phase 5: smart wallets
+    if phase >= 5 and M.smart_mod is not None and _envb("SMART_WALLETS_ENABLED", True):
+        _spawn("smart_wallets", lambda: _run_module_worker(M.smart_mod, stop_evt, "SMARTWALLETS"), critical=False)
+
+    # Phase 6+: supervisor + kill watchdog
+    supervisor_needed = (phase >= 6) or _envb("SUPERVISOR_ALWAYS", False)
+    if supervisor_needed:
+        _spawn(
+            "supervisor",
+            lambda: _supervisor_loop(M, specs, tasks, stop_evt, st, cand_q=cand_q, tick_q=tick_q),
+            critical=True,
+        )
+        _spawn("kill_watchdog", lambda: _kill_watchdog(stop_evt, st), critical=True)
+
+    log.event("MAIN_STARTED", run_id=RUN_ID, phase=phase, tasks=len(tasks), cand_q_max=qmax, tick_q_max=tqmax)
+
+    idle_sleep = float(getattr(C, "MAIN_IDLE_SLEEP_SEC", 0.5) or 0.5)
+    shutdown_grace = float(_envf("SHUTDOWN_GRACE_SEC", float(getattr(C, "SHUTDOWN_GRACE_SEC", 15.0) or 15.0)))
+
+    try:
+        while not stop_evt.is_set():
+            if _MAIN_MAX_UPTIME_SEC and (_now() - st.started_at) >= _MAIN_MAX_UPTIME_SEC:
+                log.event("MAIN_MAX_UPTIME_REACHED", run_id=RUN_ID, max_uptime_sec=int(_MAIN_MAX_UPTIME_SEC))
+                stop_evt.set()
+                break
+            await asyncio.sleep(idle_sleep)
+    finally:
+        log.event("MAIN_SHUTDOWN_BEGIN", run_id=RUN_ID)
+        stop_evt.set()
+        await _cancel_and_gather(tasks, timeout=shutdown_grace)
+        log.event("MAIN_SHUTDOWN_DONE", run_id=RUN_ID)
+
+
+# =============================================================================
+# Compatibility aliases
+# =============================================================================
+async def run(stop_evt: Optional[asyncio.Event] = None) -> None:
+    await main(stop_evt)
+
+
+async def loop(stop_evt: Optional[asyncio.Event] = None) -> None:
+    await main(stop_evt)
+
+
+# =============================================================================
+# Crash-resilient runner (Phase 7)
+# =============================================================================
+async def run_forever() -> None:
+    restart_default = _phase() >= 7
+    restart = _envb("MAIN_RESTART_ON_CRASH", restart_default)
+    if not restart:
+        await main()
+        return
+
+    backoff = float(_envf("MAIN_CRASH_BACKOFF_SEC", 2.0))
+    backoff_max = float(_envf("MAIN_CRASH_BACKOFF_MAX_SEC", 60.0))
+
+    while True:
+        try:
+            await main()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.event("MAIN_CRASH", run_id=RUN_ID or "unknown", err=_short_exc(e, 450))
+            await asyncio.sleep(backoff)
+            backoff = min(backoff_max, max(1.0, backoff * 1.7))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    # Windows-friendly: Proactor is REQUIRED for asyncio subprocess APIs (preflight runner).
+    with contextlib.suppress(Exception):
+        if os.name == "nt" and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())  # type: ignore[attr-defined]
+    asyncio.run(run_forever())

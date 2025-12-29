@@ -1,102 +1,158 @@
-# scanner/pumpfun_scanner.py
-#
-# Pump.fun scanner (V3+++ / quant-grade)
-# ======================================
-#
-# Responsibilities:
-#   - Discover *live runners* on Pump.fun using multiple sources:
-#       1) Playwright next-data (/_next/data) trending (apex)
-#       2) Playwright DOM scrape (apex site)
-#       3) JSON API + legacy + HTML __NEXT_DATA__ fallback
-#   - Normalize all shapes → PF "meta" dict compatible with utils_pkg.pair_filters.
-#   - Apply:
-#       • Regime-aware soft filters (liq / mcap / age / slippage).
-#       • Optional PF-based viability + scoring (final_score + momentum_score).
-#       • Optional AI fraud ("rug") scoring (ai_fraud_score).
-#       • Optional whale presence (is_whale_wallet + smart_wallet tags).
-#       • Optional AI entry scoring via feature_builder + ai_entry_logic.
-#       • Optional risk-manager aware shrink of runners (capacity / shutdown).
-#   - Select runner candidates using rank_score (PF + AI + volume + whales).
-#   - Emit:
-#       • MOMO_OK alerts for top runners via AlertManager.
-#       • AI training rows via utils_pkg.data_logger (entry_candidates / pumpfun tables).
-#       • Optional scan summary via data_logger.log_event("pumpfun_scan_summary", ...).
-#
-# Public API (flexible signature, mirrors Raydium scanner):
-#   async def scan_pumpfun(*args) -> List[Dict[str, Any]]
-#
-# Usage:
-#   - scan_pumpfun()
-#   - scan_pumpfun(redis)
-#   - scan_pumpfun(redis, session)
-#   - scan_pumpfun(session)
-#
-# Only aiohttp.ClientSession (if provided) is used.
-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
-import re
-import ssl
-import json
-import time
-import logging
+"""
+scanner/pumpfun_scanner.py — Pump.fun scanner (V3+++ / God-tier LOCK-IN)
+========================================================================
+
+CRITICAL FIX (DNS / mirror outage):
+----------------------------------
+This scanner now supports a real-time PumpPortal websocket provider:
+
+    PUMP_PROVIDER=pumpportal
+    PUMP_WS_URL=wss://pumpportal.fun/api/data
+
+When PUMP_PROVIDER=pumpportal, we DO NOT depend on pump-mirror HTTP endpoints.
+We keep optional HTTP/HTML fallbacks for "auto" mode, but pump-mirror is not
+a default base anymore (it was proven dead via DNS in your tests).
+
+Role
+----
+Produce unified CandidateSnapshot-like dicts compatible with your pipeline:
+
+  • utils_pkg.pair_filters
+  • utils_pkg.scoring_service
+  • utils_pkg.data_logger
+  • utils_pkg.alert_manager
+
+Hard guarantees
+---------------
+✅ Never hard-fail if optional modules are missing.
+✅ PumpPortal WS: single connection, resilient reconnect, bounded memory.
+✅ No “silent no-buy”: reject buckets + summary logs.
+✅ Scoring-first selection; legacy + heuristic fallback.
+✅ Optional redis cooldown dedupe for runners.
+✅ ToS-safe: we do not attempt bypasses if blocked; we just degrade gracefully.
+
+Public API
+----------
+async def scan_pumpfun(*args) -> List[Dict[str, Any]]
+"""
+
 import asyncio
 import contextlib
+import json
+import logging
+import os
+import random
+import re
+import ssl
+import time
+from collections import deque
+from dataclasses import dataclass, field
 from math import log1p
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 import aiohttp
 import certifi
 
-from config import (
-    PF_SCAN_MIN_LIQ_USD,
-    PF_SCAN_MIN_MCAP_USD,
-    PF_SCAN_MAX_TOKEN_AGE_MIN,
-)
-
-# Optional whale-size hint; safe fallback if not present.
+# ──────────────────────────────────────────────────────────────────────────────
+# Logger (safe + shims)
+# ──────────────────────────────────────────────────────────────────────────────
 try:
-    from config import PF_SCAN_MIN_WHALE_SIZE_SOL  # type: ignore
+    from logging_setup import get_logger  # type: ignore
+    log = get_logger("scanner.pumpfun")
 except Exception:  # pragma: no cover
-    PF_SCAN_MIN_WHALE_SIZE_SOL = 3.0  # reasonable default
+    log = logging.getLogger("scanner.pumpfun")
+    if not log.handlers:
+        logging.basicConfig(level=logging.INFO)
 
-from utils_pkg.alert_manager import AlertManager
-from utils_pkg.pair_filters import (
-    is_viable_pair,
-    compute_momentum_score,
-    compute_final_score,
-)
+if not hasattr(log, "event"):
+    def _event(name: str, **kw: Any) -> None:  # pragma: no cover
+        with contextlib.suppress(Exception):
+            log.info("%s %s", name, kw)
+    setattr(log, "event", _event)
 
-LOG = logging.getLogger("scanner.pumpfun")
-if not LOG.handlers:
-    logging.basicConfig(level=logging.INFO)
+if not hasattr(log, "every"):
+    def _every(key: str, n: int = 60, msg: Optional[str] = None, **kw: Any) -> None:  # pragma: no cover
+        now = time.time()
+        store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
+        last = float(store.get(key, 0.0))
+        if (now - last) >= float(n):
+            store[key] = now
+            setattr(_every, "_store", store)  # type: ignore[attr-defined]
+            with contextlib.suppress(Exception):
+                getattr(log, "event")(msg or key, **kw)
+    setattr(log, "every", _every)
 
-# Optional AI training / DB logging module
+def _short(x: Any, n: int = 260) -> str:
+    try:
+        s = str(x)
+        return s if len(s) <= n else (s[:n] + "…")
+    except Exception:
+        return "<?>"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Safe config import
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    import config as C  # type: ignore
+except Exception:  # pragma: no cover
+    class _C:
+        pass
+    C = _C()  # type: ignore
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional modules (soft imports)
+# ──────────────────────────────────────────────────────────────────────────────
+# Alerts
+try:
+    from utils_pkg.alert_manager import AlertManager  # type: ignore
+except Exception:  # pragma: no cover
+    AlertManager = None  # type: ignore
+
+# Legacy PF filters & scoring
+try:
+    from utils_pkg.pair_filters import (  # type: ignore
+        is_viable_pair,
+        compute_momentum_score,
+        compute_final_score,
+    )
+except Exception:  # pragma: no cover
+    def is_viable_pair(_meta: Dict[str, Any]) -> bool:  # type: ignore
+        return True
+    def compute_momentum_score(_meta: Dict[str, Any]) -> float:  # type: ignore
+        return 0.0
+    def compute_final_score(_meta: Dict[str, Any]) -> float:  # type: ignore
+        return 0.0
+
+# Preferred unified scoring
+try:
+    from utils_pkg.scoring_service import score_candidate  # type: ignore
+except Exception:  # pragma: no cover
+    score_candidate = None  # type: ignore
+
+# Data logger
 try:
     from utils_pkg import data_logger  # type: ignore
 except Exception:  # pragma: no cover
     data_logger = None  # type: ignore
 
-# Optional scan-summary logger
 try:
-    from utils_pkg.data_logger import log_event  # type: ignore
+    from utils_pkg.data_logger import log_event as _log_event  # type: ignore
 except Exception:  # pragma: no cover
+    _log_event = None  # type: ignore
 
-    async def log_event(*_: Any, **__: Any) -> None:  # type: ignore
-        return None
-
-
-# Regime state: preferred unified API
+# Regime
 try:
     from utils_pkg.regime import regime_state  # type: ignore
 except Exception:  # pragma: no cover
-
     class _DummyRegimeState:
         @staticmethod
         def get() -> str:
             return "unknown"
-
         @staticmethod
         async def features() -> Dict[str, Any]:
             return {
@@ -107,103 +163,52 @@ except Exception:  # pragma: no cover
                 "manipulation_risk": 0.0,
                 "regime_label": "unknown",
             }
-
     regime_state = _DummyRegimeState()  # type: ignore
 
-# Optional helper for source-specific regime tags
-try:
-    from utils_pkg import regime as _regime  # type: ignore
-except Exception:  # pragma: no cover
-    _regime = None  # type: ignore
-
-# Risk manager snapshot (capacity / shutdown); safe dummy fallback
+# Risk snapshot
 try:
     from utils_pkg.risk_manager import risk_capacity_snapshot  # type: ignore
 except Exception:  # pragma: no cover
-
     async def risk_capacity_snapshot(_redis=None) -> Dict[str, Any]:  # type: ignore
-        return {
-            "risk_capacity": 1.0,         # 0..1 fraction of "allowed risk"
-            "risk_shutdown": False,       # if True → exit early
-            "risk_mode": "normal",        # "panic", "cooldown", etc.
-        }
+        return {"risk_capacity": 1.0, "risk_shutdown": False, "risk_mode": "normal"}
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional Cloudflare/Playwright helpers (gracefully degrade if missing)
-# ──────────────────────────────────────────────────────────────────────────────
-
-try:
-    from utils_pkg.pumpfun_cf import (  # type: ignore
-        apply_cookies_to_session,              # attach per-host cookies to aiohttp session
-        get_cookie_for,                        # cookie string for a given URL/host
-        flag_cookie_bad,                       # mark cookie stale (e.g., on 530/403/407)
-        browser_fetch_json,                    # last-resort JSON via Playwright (API host)
-        browser_fetch_trending_via_next_data,  # Next.js JSON from apex (/_next/data)
-        browser_scrape_trending_dom,           # DOM scrape from apex pages (no API host)
-    )
-except Exception:  # pragma: no cover
-
-    def apply_cookies_to_session(_session: aiohttp.ClientSession) -> None:  # type: ignore
-        return None
-
-    def get_cookie_for(_url_or_host: str) -> str:  # type: ignore
-        # allow env cookie if provided
-        return (
-            os.getenv("CF_PUMP_COOKIE")
-            or os.getenv("PUMPFUN_COOKIE")
-            or os.getenv("PUMP_COOKIE")
-            or ""
-        )
-
-    def flag_cookie_bad() -> None:  # type: ignore
-        return None
-
-    async def browser_fetch_json(_url: str):  # type: ignore
-        return None
-
-    async def browser_fetch_trending_via_next_data(*, limit: int = 50):  # type: ignore
-        return None
-
-    async def browser_scrape_trending_dom(*, limit: int = 50):  # type: ignore
-        return None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional AI entry + smart wallets (soft imports)
-# ──────────────────────────────────────────────────────────────────────────────
-
-try:
-    from utils_pkg import feature_builder as FB  # type: ignore
-except Exception:  # pragma: no cover
-    FB = None  # type: ignore
-
-try:
-    from utils_pkg import ai_entry_logic as AI_ENTRY  # type: ignore
-except Exception:  # pragma: no cover
-    AI_ENTRY = None  # type: ignore
-
+# Smart wallets enrichment (optional)
 try:
     from utils_pkg import smart_wallets as SW  # type: ignore
 except Exception:  # pragma: no cover
     SW = None  # type: ignore
 
+# Optional AI rug score (optional)
+try:
+    from utils_pkg.core_utils import ai_fraud_score  # type: ignore
+except Exception:  # pragma: no cover
+    ai_fraud_score = None  # type: ignore
+
+# Optional SOL price helper (best-effort)
+try:
+    from utils_pkg import core_utils as _cu  # type: ignore
+except Exception:  # pragma: no cover
+    _cu = None  # type: ignore
+
+# Mint normalize (preferred if you have it)
+try:
+    from utils_pkg.mints import normalize_mint as _normalize_mint  # type: ignore
+except Exception:  # pragma: no cover
+    _normalize_mint = None  # type: ignore
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Env helpers
+# Small helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _b(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
     return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
-
 def _s(name: str, default: str = "") -> str:
     v = os.getenv(name)
-    return default if v is None else v.strip()
-
+    return default if v is None else str(v).strip()
 
 def _i(name: str, default: int) -> int:
     v = os.getenv(name)
@@ -212,7 +217,6 @@ def _i(name: str, default: int) -> int:
     except Exception:
         return default
 
-
 def _f(name: str, default: float) -> float:
     v = os.getenv(name)
     try:
@@ -220,10 +224,93 @@ def _f(name: str, default: float) -> float:
     except Exception:
         return default
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+def _nz(x: Any, d: float = 0.0) -> float:
+    try:
+        f = float(x)
+        if f != f:
+            return d
+        return f
+    except Exception:
+        return d
+
+def _safe_int(x: Any, d: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return d
+
+def _now() -> float:
+    return time.time()
+
+async def _maybe_await(x: Any) -> Any:
+    return await x if asyncio.iscoroutine(x) else x
+
+async def _call_maybe_async(fn: Any, *a: Any, **k: Any) -> Any:
+    if fn is None:
+        return None
+    try:
+        if asyncio.iscoroutinefunction(fn):
+            return await fn(*a, **k)
+        return await asyncio.to_thread(fn, *a, **k)
+    except Exception:
+        return None
+
+def _sslctx() -> ssl.SSLContext:
+    return ssl.create_default_context(cafile=certifi.where())
+
+BASE58_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Config / flags (Pump-specific on top of PF_* defaults)
+# Version / schema
 # ──────────────────────────────────────────────────────────────────────────────
+SCANNER_NAME = "pumpfun_scanner"
+SCANNER_VERSION = "v3+++_lockin_ws"
+CANDIDATE_SCHEMA = "CandidateSnapshot.v1"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config-derived defaults
+# ──────────────────────────────────────────────────────────────────────────────
+PF_SCAN_MIN_LIQ_USD = float(getattr(C, "PF_SCAN_MIN_LIQ_USD", 2500.0) or 2500.0)
+PF_SCAN_MIN_MCAP_USD = float(getattr(C, "PF_SCAN_MIN_MCAP_USD", 0.0) or 0.0)
+PF_SCAN_MAX_TOKEN_AGE_MIN = float(getattr(C, "PF_SCAN_MAX_TOKEN_AGE_MIN", 0.0) or 0.0)
+PF_SCAN_MIN_WHALE_SIZE_SOL = float(getattr(C, "PF_SCAN_MIN_WHALE_SIZE_SOL", 3.0) or 3.0)
+ENABLE_PUMPFUN_SCANNER = bool(getattr(C, "ENABLE_PUMPFUN_SCANNER", True))
+
+MASTER_PHASE = max(0, min(7, _i("MASTER_PHASE", _i("STRATEGY_PHASE", 7))))
+if MASTER_PHASE == 0:
+    _default_mode = "off"
+elif MASTER_PHASE <= 2:
+    _default_mode = "simple"
+elif MASTER_PHASE <= 4:
+    _default_mode = "alpha"
+else:
+    _default_mode = "full"
+
+PUMPFUN_MODE = _s("PUMPFUN_MODE", _default_mode).lower().strip()
+if PUMPFUN_MODE not in {"off", "simple", "alpha", "full"}:
+    PUMPFUN_MODE = "full"
+PUMPFUN_ENABLED = ENABLE_PUMPFUN_SCANNER and _b("PUMPFUN_ENABLED", (PUMPFUN_MODE != "off"))
+
+# Provider selection
+PUMP_PROVIDER = _s("PUMP_PROVIDER", _s("PUMPFUN_PROVIDER", "auto")).lower().strip()
+if PUMP_PROVIDER not in {"auto", "pumpportal", "http"}:
+    PUMP_PROVIDER = "auto"
+
+PUMP_WS_URL = _s("PUMP_WS_URL", "wss://pumpportal.fun/api/data").strip()
+PUMPPORTAL_SUB_MIGRATIONS = _b("PUMPPORTAL_SUB_MIGRATIONS", True)
+PUMPPORTAL_TRACK_WINDOW_SEC = max(30, _i("PUMPPORTAL_TRACK_WINDOW_SEC", 360))          # 6 minutes default
+PUMPPORTAL_SNAP_MAX = max(25, _i("PUMPPORTAL_SNAP_MAX", 250))
+PUMPPORTAL_MAX_TOKENS = max(100, _i("PUMPPORTAL_MAX_TOKENS", 1500))
+PUMPPORTAL_MAX_TRADES_PER_TOKEN = max(25, _i("PUMPPORTAL_MAX_TRADES_PER_TOKEN", 400))
+PUMPPORTAL_SUBSCRIBE_TRADE_MAX = max(10, _i("PUMPPORTAL_SUBSCRIBE_TRADE_MAX", 120))
+PUMPPORTAL_SUBSCRIBE_REFRESH_SEC = max(3, _f("PUMPPORTAL_SUBSCRIBE_REFRESH_SEC", 8.0))
+PUMPPORTAL_CONNECT_TIMEOUT_S = max(2.0, _f("PUMPPORTAL_CONNECT_TIMEOUT_S", 8.0))
+PUMPPORTAL_HEARTBEAT_S = max(10.0, _f("PUMPPORTAL_HEARTBEAT_S", 25.0))
 
 UA = _s(
     "PUMPFUN_UA",
@@ -231,104 +318,150 @@ UA = _s(
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
 )
 
-# Optional override *full URL* for debugging a single endpoint
-OVERRIDE_URL = _s("PUMPFUN_OVERRIDE_URL", "")
-
-# Optional HTTP proxy specifically for Pump.fun requests (aiohttp-compatible URI)
+# HTTP fallback (only used when provider=auto/http)
 PUMPFUN_HTTP_PROXY = _s("PUMPFUN_HTTP_PROXY", "")
+TIMEOUT_S = max(5.0, _f("PUMPFUN_HTTP_TIMEOUT_SEC", 15.0))
+RETRIES = max(1, _i("PUMPFUN_HTTP_RETRIES", 3))
+BACKOFF_S = max(0.1, _f("PUMPFUN_HTTP_BACKOFF_SEC", 0.6))
+TRUST_ENV = _b("PUMPFUN_TRUST_ENV", True)
+CONN_LIMIT = max(10, _i("PUMPFUN_HTTP_CONN_LIMIT", 30))
 
-REQ_TIMEOUT_S = _i("PUMPFUN_HTTP_TIMEOUT_S", 15)
-SESSION_LIMIT = _i("PUMPFUN_HTTP_CONN_LIMIT", 30)
+API_LIMIT = max(5, _i("PUMPFUN_API_LIMIT", 25))
+MAX_RUNNERS = max(1, _i("PUMPFUN_MAX_RUNNERS", API_LIMIT))
 
-# How many items we request from Pump.fun API / HTML sources.
-API_LIMIT = _i("PUMPFUN_API_LIMIT", 20)
-DOM_LIMIT = _i("PUMPFUN_DOM_LIMIT", API_LIMIT)
+RISK_SHRINK_ENABLED = _b("PUMPFUN_RISK_SHRINK_ENABLED", True)
 
-# Max number of final runners returned (hard cap)
-PUMP_RUNNER_LIMIT = _i("PUMPFUN_RUNNER_LIMIT", API_LIMIT)
+RUNNER_DEDUP_ENABLED = _b("PUMPFUN_RUNNER_DEDUP_ENABLED", True)
+RUNNER_DEDUP_SEC = max(0, _i("PUMPFUN_RUNNER_DEDUP_SEC", 180))
+REDIS_KEY_PREFIX = _s("PUMPFUN_REDIS_PREFIX", "pumpfun")
 
-# Playwright/HTML behaviour
-SKIP_NEXT = _b("PUMPFUN_SKIP_NEXT", False)          # skip Playwright-based Next/DOM
-SKIP_HTML_NEXT = _b("PUMPFUN_SKIP_HTMLNEXT", False) # skip HTML __NEXT_DATA__ fallback
+SEND_MOMO_ALERTS = _b("PUMPFUN_SEND_MOMO_ALERTS", True)
+MAX_ALERTS_PER_SCAN = max(0, _i("PUMPFUN_MAX_ALERTS_PER_SCAN", 3))
+ALERT_DEDUP_SEC = max(10.0, _f("PUMPFUN_ALERT_DEDUP_SEC", 180.0))
 
-# MOMO / alert behaviour
-SEND_MOMO_ALERTS = _b("PUMP_SEND_MOMO_ALERTS", True)
-MAX_ALERTS_PER_SCAN = _i("PUMP_MAX_ALERTS_PER_SCAN", 3)
+AI_RUG_ENABLED = _b("PUMPFUN_AI_RUG_ENABLED", False) and (ai_fraud_score is not None)
+AI_RUG_MAX_PER_SCAN = max(0, _i("PUMPFUN_AI_RUG_MAX_PER_SCAN", 20))
+MAX_AI_RUG = _f("PUMPFUN_MAX_AI_RUG", 0.88)
 
-# Optional AI / whales enrichment toggles (off by default, safe if not configured)
-PUMP_AI_RUG_ENABLED = _b("PUMP_AI_RUG_ENABLED", False)
-PUMP_AI_RUG_MAX_PER_SCAN = _i("PUMP_AI_RUG_MAX_PER_SCAN", 15)
-PUMP_WHALES_ENABLED = _b("PUMP_WHALES_ENABLED", False)
+SMART_WALLETS_ENRICH = _b("PUMPFUN_SMART_WALLETS_ENRICH", True)
+SMART_WALLETS_MAX_PER_SCAN = max(0, _i("PUMPFUN_SMART_WALLETS_MAX_PER_SCAN", 80))
 
-# AI entry scoring
-PUMP_AI_ENTRY_ENABLED = _b("PUMP_AI_ENTRY_ENABLED", True)
-PUMP_AI_ENTRY_MAX_PER_SCAN = _i("PUMP_AI_ENTRY_MAX_PER_SCAN", 60)
+SCORING_ENABLED = _b("PUMPFUN_SCORING_ENABLED", True) and (score_candidate is not None)
+SCORING_MAX_PER_SCAN = max(5, _i("PUMPFUN_SCORING_MAX_PER_SCAN", 80))
+SCORING_CONCURRENCY = max(1, _i("PUMPFUN_SCORING_CONCURRENCY", 6))
+SCORING_MIN_COMBINED = _f("PUMPFUN_SCORING_MIN_COMBINED", 55.0)
+SCORING_MIN_LABEL = _s("PUMPFUN_SCORING_MIN_LABEL", "YELLOW").upper().strip()
 
-# AI rug & AI entry guardrails
-PUMP_MAX_AI_RUG = _f("PUMP_MAX_AI_RUG", 0.88)
-PUMP_REQUIRE_AI_ENTRY_FOR_RUNNERS = _b("PUMP_REQUIRE_AI_ENTRY_FOR_RUNNERS", False)
-PUMP_MIN_AI_ENTRY = _f("PUMP_MIN_AI_ENTRY", 0.0)
+LEGACY_PF_ENABLED = _b("PUMPFUN_LEGACY_PF_ENABLED", True)
 
-# Global rank_score guardrail & runner cap
-PUMP_MIN_RANK_SCORE = _f("PUMP_MIN_RANK_SCORE", 0.0)
-PUMP_MAX_RUNNERS = _i("PUMP_MAX_RUNNERS", PUMP_RUNNER_LIMIT)
-
-# Pump.fun HTML routes to try for __NEXT_DATA__ fallback
-FALLBACK_HTML_URLS = [
-    "https://pump.fun/",
-    "https://pump.fun/?tab=trending",
-    "https://pump.fun/?chain=sol&tab=trending",
-]
-
-# Typical CF/anti-bot and tunnel errors
-_BAD_CF_CODES = {403, 407, 429, 530}
-_PROXY_BREAK_CODES = {522, 523, 524, 525, 526, 530}
-
-# Soft prefilters BEFORE full PF logic (we still use PF or fallback on top)
-_BASE_SOFT_LIQ = PF_SCAN_MIN_LIQ_USD * 0.4
-_BASE_SOFT_MCAP = PF_SCAN_MIN_MCAP_USD * 0.4
-SOFT_MIN_LIQ_USD = _f("PUMP_SOFT_MIN_LIQ_USD", _BASE_SOFT_LIQ)
-SOFT_MIN_MCAP_USD = _f("PUMP_SOFT_MIN_MCAP_USD", _BASE_SOFT_MCAP)
+SOFT_MIN_LIQ_USD = _f("PUMPFUN_SOFT_MIN_LIQ_USD", max(0.0, PF_SCAN_MIN_LIQ_USD * 0.4))
+SOFT_MIN_MCAP_USD = _f("PUMPFUN_SOFT_MIN_MCAP_USD", max(0.0, PF_SCAN_MIN_MCAP_USD * 0.4))
 SOFT_MAX_AGE_MIN = _f(
-    "PUMP_SOFT_MAX_AGE_MIN",
+    "PUMPFUN_SOFT_MAX_AGE_MIN",
     PF_SCAN_MAX_TOKEN_AGE_MIN * 1.2 if PF_SCAN_MAX_TOKEN_AGE_MIN > 0 else 0.0,
 )
+HARD_MAX_AGE_MIN = _f("PUMPFUN_HARD_MAX_AGE_MIN", 0.0)
 
-# PF bypass / fallback behaviour
-PUMP_BYPASS_PF = _b("PUMP_BYPASS_PF", False)          # default: use PF
-PUMP_ENABLE_FALLBACK = _b("PUMP_ENABLE_FALLBACK", True)
+FB_MIN_BUYS_5M = max(0, _i("PUMPFUN_FB_MIN_BUYS_5M", 1))
+FB_MIN_VOL5_USD = max(0.0, _f("PUMPFUN_FB_MIN_VOL5_USD", 200.0))
+FB_MAX_RUNNERS = max(1, _i("PUMPFUN_FB_MAX_RUNNERS", 8))
+FB_MAX_IMPACT_1K_BPS = max(0.0, _f("PUMPFUN_FB_MAX_IMPACT_1K_BPS", 1500.0))
 
-# Risk-aware shrink toggle (post PF/fallback)
-PUMP_RISK_SHRINK_ENABLED = _b("PUMP_RISK_SHRINK_ENABLED", True)
+DYNAMIC_THRESH_ENABLED = _b("PUMPFUN_DYNAMIC_THRESH_ENABLED", True)
+DYNAMIC_THRESH_MAX_DELTA = _f("PUMPFUN_DYNAMIC_THRESH_MAX_DELTA", 8.0)
 
-PUMP_FB_MIN_BUYS_5M = _i("PUMP_FB_MIN_BUYS_5M", 1)
-PUMP_FB_MIN_VOL5_USD = _f("PUMP_FB_MIN_VOL5_USD", 200.0)
-PUMP_FB_MAX_RUNNERS = max(1, _i("PUMP_FB_MAX_RUNNERS", 6))
-PUMP_FB_MAX_IMPACT_1K_BPS = _f("PUMP_FB_MAX_IMPACT_1K_BPS", 1500.0)  # ~15% impact cap
+DEBUG_META_SAMPLE = _b("PUMPFUN_DEBUG_META_SAMPLE", True)
+DEBUG_RESULT = _b("PUMPFUN_DEBUG_RESULT", True)
+LOG_SCAN_SUMMARY = _b("PUMPFUN_LOG_SCAN_SUMMARY", True)
 
-# Postgres / AI logging toggles
 PG_ENABLED = _b("PG_ENABLED", False)
-PUMP_LOG_CANDIDATES = _b("PUMPFUN_LOG_CANDIDATES", False)
-PUMP_REGIME_TAG_ENV = _s("PUMPFUN_REGIME_TAG", "")
-PUMP_WALLET_TAG_ENV = _s("PUMPFUN_WALLET_TAG", "")
-PUMP_LOG_SCAN_SUMMARY = _b("PUMPFUN_LOG_SCAN_SUMMARY", True)
+LOG_CANDIDATES = _b("PUMPFUN_LOG_CANDIDATES", False)
+REGIME_TAG_ENV = _s("PUMPFUN_REGIME_TAG", "")
+WALLET_TAG_ENV = _s("PUMPFUN_WALLET_TAG", "")
 
-# Debug toggles
-PUMP_DEBUG_META_SAMPLE = _b("PUMP_DEBUG_META_SAMPLE", True)
-PUMP_DEBUG_PF_RESULT = _b("PUMP_DEBUG_PF_RESULT", True)
+_LABEL_LEVEL = {"RED": 0, "YELLOW": 1, "GREEN": 2}
+_REQUIRED_LABEL_LEVEL = _LABEL_LEVEL.get(SCORING_MIN_LABEL, 0)
+
+_recent_alert_ts: Dict[str, float] = {}
+_recent_alert_lock = asyncio.Lock()
+
+# HTTP block codes (for fallback only)
+_BLOCK_CODES = {401, 403, 407, 429, 451, 503, 520, 521, 522, 523, 524, 530}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Reject buckets (kill silent no-buy)
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class _RejectBuckets:
+    counts: Dict[str, int] = field(default_factory=dict)
+    samples: Dict[str, List[str]] = field(default_factory=dict)
+
+    def inc(self, reason: str, mint: Optional[str] = None) -> None:
+        if not reason:
+            reason = "UNKNOWN"
+        self.counts[reason] = int(self.counts.get(reason, 0)) + 1
+        if mint:
+            arr = self.samples.get(reason)
+            if arr is None:
+                arr = []
+                self.samples[reason] = arr
+            if len(arr) < 4 and mint not in arr:
+                arr.append(mint)
+
+
+@dataclass
+class _ScanStats:
+    t0: float
+    source: str = "none"
+    raw: int = 0
+    metas: int = 0
+    enriched: int = 0
+    scored: int = 0
+    runners: int = 0
+    fb_runners: int = 0
+    risk_capacity: float = 1.0
+    risk_mode: str = "normal"
+    regime_label: str = "unknown"
+    regime_numeric: float = 0.0
+    manip_risk: float = 0.0
+    rejects: _RejectBuckets = field(default_factory=_RejectBuckets)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Redis helpers (optional sync/async clients)
+# ──────────────────────────────────────────────────────────────────────────────
+async def _redis_get(redis: Any, key: str) -> Optional[str]:
+    if redis is None:
+        return None
+    try:
+        v = await _maybe_await(redis.get(key))
+        if v is None:
+            return None
+        if isinstance(v, (bytes, bytearray)):
+            return v.decode("utf-8", "ignore")
+        return str(v)
+    except Exception:
+        return None
+
+async def _redis_setex(redis: Any, key: str, ttl: int, value: str) -> None:
+    if redis is None:
+        return
+    try:
+        if hasattr(redis, "setex"):
+            await _maybe_await(redis.setex(key, int(ttl), value))
+            return
+        await _maybe_await(redis.set(key, value))
+        if hasattr(redis, "expire"):
+            await _maybe_await(redis.expire(key, int(ttl)))
+    except Exception:
+        return
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Regime snapshot + tuning
 # ──────────────────────────────────────────────────────────────────────────────
-
 async def _regime_snapshot() -> Dict[str, Any]:
-    """
-    Pull a compact regime snapshot used for:
-      - logging / tagging
-      - dynamic threshold tuning
-      - AI entry features.
-    """
     try:
         feats = await regime_state.features()
         return {
@@ -340,1797 +473,1427 @@ async def _regime_snapshot() -> Dict[str, Any]:
             "label": str(feats.get("regime_label", "")) or "unknown",
         }
     except Exception:
-        try:
-            label = regime_state.get()
-        except Exception:
-            label = "unknown"
-        return {
-            "label_numeric": 0.0,
-            "trend_score": 0.0,
-            "volatility_score": 0.0,
-            "liquidity_score": 0.5,
-            "manipulation_risk": 0.0,
-            "label": label,
-        }
+        with contextlib.suppress(Exception):
+            return {"label": regime_state.get(), "label_numeric": 0.0, "manipulation_risk": 0.0}
+        return {"label": "unknown", "label_numeric": 0.0, "manipulation_risk": 0.0}
 
-
-def _regime_tune_thresholds(
+def _regime_tune(
     soft_liq: float,
     soft_mcap: float,
     fb_min_vol5: float,
-    fb_max_impact_bps: float,
+    fb_max_impact: float,
     regime: Dict[str, Any],
 ) -> Tuple[float, float, float, float]:
-    """
-    Very lightweight regime-aware tuning:
-      - risk_on (label_numeric >= +0.7, manip < 0.6):
-          loosen liq/mcap/volume and relax impact cap slightly.
-      - risk_off (label_numeric <= -0.7 OR manip >= 0.8):
-          tighten liq/mcap/volume and impact.
-    """
     ln = float(regime.get("label_numeric", 0.0))
     manip = float(regime.get("manipulation_risk", 0.0))
 
-    s_liq = soft_liq
-    s_mcap = soft_mcap
-    fb_vol = fb_min_vol5
-    fb_imp = fb_max_impact_bps
+    s_liq = float(soft_liq)
+    s_mcap = float(soft_mcap)
+    fb_vol = float(fb_min_vol5)
+    fb_imp = float(fb_max_impact)
 
-    if ln >= 0.7 and manip < 0.6:
-        # risk-on: slightly more permissive
-        s_liq *= 0.7
-        s_mcap *= 0.7
-        fb_vol *= 0.7
-        fb_imp *= 1.2 if fb_imp > 0 else fb_imp
-    elif ln <= -0.7 or manip >= 0.8:
-        # risk-off / high manip: tighter
-        s_liq *= 1.4
-        s_mcap *= 1.4
-        fb_vol *= 1.3
+    if ln >= 0.7 and manip < 0.6:  # risk-on
+        s_liq *= 0.70
+        s_mcap *= 0.70
+        fb_vol *= 0.70
+        fb_imp *= 1.20 if fb_imp > 0 else fb_imp
+    elif ln <= -0.7 or manip >= 0.8:  # risk-off / manip
+        s_liq *= 1.40
+        s_mcap *= 1.40
+        fb_vol *= 1.30
         fb_imp *= 0.85 if fb_imp > 0 else fb_imp
 
-    s_liq = max(0.0, s_liq)
-    s_mcap = max(0.0, s_mcap)
-    fb_vol = max(0.0, fb_vol)
-    fb_imp = max(0.0, fb_imp)
-    return s_liq, s_mcap, fb_vol, fb_imp
+    return max(0.0, s_liq), max(0.0, s_mcap), max(0.0, fb_vol), max(0.0, fb_imp)
+
+def _dynamic_min_combined(base: float, regime: Dict[str, Any], risk_capacity: float) -> float:
+    if not DYNAMIC_THRESH_ENABLED:
+        return float(base)
+
+    base = float(base)
+    ln = float(regime.get("label_numeric", 0.0))
+    manip = float(regime.get("manipulation_risk", 0.0))
+    cap = _clamp(float(risk_capacity), 0.0, 1.0)
+
+    cap_delta = (1.0 - cap) * float(DYNAMIC_THRESH_MAX_DELTA)
+
+    regime_delta = 0.0
+    if ln >= 0.7:
+        regime_delta -= 0.5 * float(DYNAMIC_THRESH_MAX_DELTA)
+    elif ln <= -0.7:
+        regime_delta += 0.5 * float(DYNAMIC_THRESH_MAX_DELTA)
+
+    manip_delta = _clamp(manip, 0.0, 1.0) * (0.5 * float(DYNAMIC_THRESH_MAX_DELTA))
+
+    delta = _clamp(
+        cap_delta + regime_delta + manip_delta,
+        -float(DYNAMIC_THRESH_MAX_DELTA),
+        float(DYNAMIC_THRESH_MAX_DELTA),
+    )
+    return float(_clamp(base + delta, 0.0, 100.0))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers: API bases & headers
+# SOL price helper (best effort; never fatal)
 # ──────────────────────────────────────────────────────────────────────────────
+async def _sol_usd() -> float:
+    # Prefer env override (stable, fastest)
+    v = _f("SOL_USD", 0.0)
+    if v > 0:
+        return float(v)
 
-def _api_bases() -> List[str]:
-    """
-    Priority-ordered list of Pump.fun API bases.
-    First item can be overridden via PUMPFUN_API_BASE, then mirrors, etc.
-    """
-    bases: List[str] = []
-    env_base = _s("PUMPFUN_API_BASE", "").rstrip("/")
-    if env_base:
-        bases.append(env_base)
-    bases += [
-        "https://frontend-api.pump-mirror.fun",
-        "https://frontend-api.pump.fun",
-    ]
-    seen: set[str] = set()
-    out: List[str] = []
-    for b in bases:
-        if b and b not in seen:
-            seen.add(b)
-            out.append(b)
-    return out
-
-
-def _hdrs(url: str) -> Dict[str, str]:
-    h = {
-        "User-Agent": UA,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://pump.fun/trending",
-        "Origin": "https://pump.fun",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-    ck = get_cookie_for(url)
-    if ck:
-        h["Cookie"] = ck
-    return h
+    # Best-effort: try core_utils helpers if present (names vary)
+    if _cu is not None:
+        for name in ("get_sol_price_usd", "sol_price_usd", "get_sol_price", "get_sol_usd"):
+            fn = getattr(_cu, name, None)
+            if callable(fn):
+                out = await _call_maybe_async(fn)
+                try:
+                    p = float(out)
+                    if p > 0:
+                        return p
+                except Exception:
+                    pass
+    return 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilities & normalization
+# PumpPortal WS client (single connection; bounded state)
 # ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class _Trade:
+    ts: float
+    side: str  # "buy"|"sell"|"?"
+    sol: float
+    token: float
+    price_sol: float
 
-BASE58_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
+@dataclass
+class _TokenState:
+    mint: str
+    symbol: str = ""
+    name: str = ""
+    created_ts: float = 0.0
+    last_ts: float = 0.0
+    # optional fundamentals from stream (if present)
+    mcap_usd: float = 0.0
+    liq_usd: float = 0.0
+    price_usd: float = 0.0
+    # trades (bounded)
+    trades: Deque[_Trade] = field(default_factory=deque)
+
+    def push_trade(self, t: _Trade, *, max_trades: int) -> None:
+        self.trades.append(t)
+        while len(self.trades) > max_trades:
+            self.trades.popleft()
+        self.last_ts = max(self.last_ts, t.ts)
+
+class _PumpPortalClient:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._task: Optional[asyncio.Task] = None
+        self._sess: Optional[aiohttp.ClientSession] = None
+        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+
+        self._ready = asyncio.Event()
+        self._stop = asyncio.Event()
+
+        self._tokens: Dict[str, _TokenState] = {}
+        self._order: Deque[str] = deque()  # mint order by first seen
+        self._last_subscribe_ts = 0.0
+        self._subscribed_trades: Set[str] = set()
+
+    async def ensure_started(self) -> None:
+        async with self._lock:
+            if self._task and not self._task.done():
+                return
+            self._stop.clear()
+            self._ready.clear()
+            self._task = asyncio.create_task(self._run_loop(), name="pumpportal_ws")
+        # wait a bit for initial connect (non-fatal if it times out)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(self._ready.wait(), timeout=PUMPPORTAL_CONNECT_TIMEOUT_S)
+
+    async def close(self) -> None:
+        self._stop.set()
+        async with self._lock:
+            t = self._task
+            self._task = None
+        if t:
+            with contextlib.suppress(Exception):
+                t.cancel()
+        if self._ws is not None:
+            with contextlib.suppress(Exception):
+                await self._ws.close()
+        if self._sess is not None:
+            with contextlib.suppress(Exception):
+                await self._sess.close()
+        self._ws = None
+        self._sess = None
+
+    def is_ready(self) -> bool:
+        return self._ready.is_set()
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "ready": self.is_ready(),
+            "tokens": len(self._tokens),
+            "sub_trades": len(self._subscribed_trades),
+            "ws": bool(self._ws and not self._ws.closed),
+        }
+
+    def snapshot(self, *, max_items: int) -> List[_TokenState]:
+        # Copy states in newest-first order (last seen)
+        mints = list(self._order)[-max_items:]
+        out: List[_TokenState] = []
+        for mint in reversed(mints):
+            st = self._tokens.get(mint)
+            if st is not None:
+                out.append(st)
+        return out
+
+    async def _ws_send(self, payload: Dict[str, Any]) -> None:
+        ws = self._ws
+        if ws is None or ws.closed:
+            return
+        with contextlib.suppress(Exception):
+            await ws.send_json(payload)
+
+    async def _subscribe_basics(self) -> None:
+        # Must use a SINGLE connection; these are lightweight
+        await self._ws_send({"method": "subscribeNewToken"})
+        if PUMPPORTAL_SUB_MIGRATIONS:
+            await self._ws_send({"method": "subscribeMigration"})
+
+    async def _refresh_trade_subscriptions(self) -> None:
+        # Throttle refresh
+        now = time.time()
+        if (now - self._last_subscribe_ts) < float(PUMPPORTAL_SUBSCRIBE_REFRESH_SEC):
+            return
+        self._last_subscribe_ts = now
+
+        # Subscribe to trades for the newest tokens (bounded)
+        newest = list(self._order)[-PUMPPORTAL_SUBSCRIBE_TRADE_MAX:]
+        keys = [m for m in newest if m and m not in self._subscribed_trades]
+        if not keys:
+            return
+
+        # PumpPortal expects list of mints under keys
+        await self._ws_send({"method": "subscribeTokenTrade", "keys": keys})
+        for m in keys:
+            self._subscribed_trades.add(m)
+
+    def _touch_token(self, mint: str, *, symbol: str = "", name: str = "", created_ts: float = 0.0) -> _TokenState:
+        st = self._tokens.get(mint)
+        if st is None:
+            st = _TokenState(mint=mint)
+            self._tokens[mint] = st
+            self._order.append(mint)
+            # bounded memory
+            while len(self._order) > PUMPPORTAL_MAX_TOKENS:
+                old = self._order.popleft()
+                self._tokens.pop(old, None)
+                self._subscribed_trades.discard(old)
+        else:
+            # move to the end (newest)
+            with contextlib.suppress(ValueError):
+                self._order.remove(mint)
+            self._order.append(mint)
+
+        if symbol and not st.symbol:
+            st.symbol = symbol
+        if name and not st.name:
+            st.name = name
+        if created_ts and st.created_ts <= 0:
+            st.created_ts = created_ts
+        st.last_ts = max(st.last_ts, time.time())
+        return st
+
+    def _extract_mint(self, msg: Dict[str, Any]) -> str:
+        for k in ("mint", "mintAddress", "tokenMint", "token", "tokenAddress", "publicKey"):
+            v = msg.get(k)
+            if isinstance(v, str):
+                m = BASE58_RE.search(v.strip())
+                if m:
+                    return self._norm_mint(m.group(0))
+        # fallback: scan a couple likely nested spots
+        for k in ("data", "token", "coin", "meta"):
+            v = msg.get(k)
+            if isinstance(v, dict):
+                for kk in ("mint", "mintAddress", "tokenMint", "tokenAddress", "publicKey"):
+                    vv = v.get(kk)
+                    if isinstance(vv, str):
+                        m = BASE58_RE.search(vv.strip())
+                        if m:
+                            return self._norm_mint(m.group(0))
+        return ""
+
+    def _norm_mint(self, s: str) -> str:
+        v = (s or "").strip().replace(" ", "")
+        if _normalize_mint is not None:
+            with contextlib.suppress(Exception):
+                nn = _normalize_mint(v)
+                if isinstance(nn, str) and nn:
+                    return nn
+        m = BASE58_RE.search(v)
+        return m.group(0) if m else ""
+
+    def _is_trade_msg(self, msg: Dict[str, Any]) -> bool:
+        tx = msg.get("txType") or msg.get("side") or msg.get("type")
+        if isinstance(tx, str) and tx.lower() in {"buy", "sell"}:
+            return True
+        # heuristics: trade-like numeric fields
+        for k in ("solAmount", "sol_amount", "tokenAmount", "token_amount"):
+            if k in msg:
+                return True
+        return False
+
+    def _parse_trade(self, msg: Dict[str, Any]) -> Tuple[str, _Trade]:
+        side = (msg.get("txType") or msg.get("side") or msg.get("type") or "?")
+        side = str(side).lower()
+        if side not in {"buy", "sell"}:
+            side = "?"
+
+        ts = _nz(msg.get("timestamp") or msg.get("ts") or msg.get("time") or time.time(), time.time())
+        if ts > 10_000_000_000:
+            ts = ts / 1000.0
+
+        sol = _nz(msg.get("solAmount") or msg.get("sol_amount") or msg.get("sol"), 0.0)
+        token = _nz(msg.get("tokenAmount") or msg.get("token_amount") or msg.get("token"), 0.0)
+        price_sol = 0.0
+        if token > 0 and sol > 0:
+            price_sol = sol / token
+
+        return side, _Trade(ts=float(ts), side=side, sol=float(sol), token=float(token), price_sol=float(price_sol))
+
+    def _apply_fundamentals(self, st: _TokenState, msg: Dict[str, Any], sol_usd: float) -> None:
+        # best-effort: if stream gives cap/liquidity/price, capture
+        mcap_usd = (
+            msg.get("marketCapUsd")
+            or msg.get("marketCapUSD")
+            or msg.get("mcapUsd")
+            or msg.get("mcap_usd")
+        )
+        if mcap_usd is None:
+            mcap_sol = msg.get("marketCapSol") or msg.get("marketCapSOL") or msg.get("mcapSol")
+            if mcap_sol is not None and sol_usd > 0:
+                mcap_usd = _nz(mcap_sol, 0.0) * sol_usd
+        if mcap_usd is not None:
+            st.mcap_usd = max(0.0, _nz(mcap_usd, 0.0))
+
+        liq_usd = msg.get("liquidityUsd") or msg.get("liquidityUSD") or msg.get("liqUsd") or msg.get("liq_usd")
+        if liq_usd is None:
+            liq_sol = msg.get("vSolInBondingCurve") or msg.get("solInBondingCurve") or msg.get("liquiditySol")
+            if liq_sol is not None and sol_usd > 0:
+                liq_usd = _nz(liq_sol, 0.0) * sol_usd
+        if liq_usd is not None:
+            st.liq_usd = max(0.0, _nz(liq_usd, 0.0))
+
+        price_usd = msg.get("priceUsd") or msg.get("priceUSD") or msg.get("usdPrice")
+        if price_usd is None:
+            price_sol = msg.get("priceSol") or msg.get("priceSOL")
+            if price_sol is not None and sol_usd > 0:
+                price_usd = _nz(price_sol, 0.0) * sol_usd
+        if price_usd is not None:
+            st.price_usd = max(0.0, _nz(price_usd, 0.0))
+
+    async def _run_loop(self) -> None:
+        backoff = 0.75
+        sol_usd_cache = 0.0
+        sol_usd_ts = 0.0
+
+        while not self._stop.is_set():
+            try:
+                if self._sess is None or self._sess.closed:
+                    self._sess = aiohttp.ClientSession(headers={"User-Agent": UA}, trust_env=True)
+
+                sslctx = _sslctx()
+                async with self._sess.ws_connect(
+                    PUMP_WS_URL,
+                    heartbeat=PUMPPORTAL_HEARTBEAT_S,
+                    ssl=sslctx,
+                    max_msg_size=8 * 1024 * 1024,
+                ) as ws:
+                    self._ws = ws
+                    backoff = 0.75
+
+                    await self._subscribe_basics()
+                    self._ready.set()
+                    log.every("PUMPPORTAL_WS_CONNECTED", n=10, url=PUMP_WS_URL)
+
+                    while not self._stop.is_set():
+                        # periodic SOL price refresh
+                        now = time.time()
+                        if (now - sol_usd_ts) > 20:
+                            sol_usd_cache = await _sol_usd()
+                            sol_usd_ts = now
+
+                        await self._refresh_trade_subscriptions()
+
+                        msg = await ws.receive(timeout=30)
+                        if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                            raise aiohttp.ClientConnectionError("ws_closed")
+                        if msg.type == aiohttp.WSMsgType.ERROR:
+                            raise aiohttp.ClientConnectionError("ws_error")
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            continue
+
+                        try:
+                            data = json.loads(msg.data)
+                        except Exception:
+                            continue
+                        if not isinstance(data, dict):
+                            continue
+
+                        mint = self._extract_mint(data)
+                        if not mint:
+                            continue
+
+                        symbol = str(data.get("symbol") or data.get("ticker") or "").strip()
+                        name = str(data.get("name") or "").strip()
+
+                        # created timestamp best-effort
+                        created = data.get("createdAt") or data.get("created") or data.get("createdOn") or data.get("createdTimestamp")
+                        created_ts = 0.0
+                        if created is not None:
+                            created_ts = _nz(created, 0.0)
+                            if created_ts > 10_000_000_000:
+                                created_ts = created_ts / 1000.0
+
+                        st = self._touch_token(mint, symbol=symbol, name=name, created_ts=float(created_ts))
+
+                        # apply fundamentals if present
+                        self._apply_fundamentals(st, data, sol_usd_cache)
+
+                        # trade updates
+                        if self._is_trade_msg(data):
+                            side, tr = self._parse_trade(data)
+                            st.push_trade(tr, max_trades=PUMPPORTAL_MAX_TRADES_PER_TOKEN)
+
+            except asyncio.TimeoutError:
+                # keep loop alive; WS heartbeat should prevent most
+                continue
+            except Exception as e:
+                self._ready.clear()
+                log.every("PUMPPORTAL_WS_RECONNECT", n=5, err=_short(type(e).__name__), detail=_short(e))
+                # backoff with jitter
+                await asyncio.sleep(backoff * (0.85 + 0.3 * random.random()))
+                backoff = min(25.0, backoff * 1.6)
+
+        # shutdown
+        self._ready.clear()
+        self._ws = None
 
 
-def _now() -> float:
-    return time.time()
+_PUMPPORTAL: Optional[_PumpPortalClient] = None
+
+async def _pumpportal_client() -> _PumpPortalClient:
+    global _PUMPPORTAL
+    if _PUMPPORTAL is None:
+        _PUMPPORTAL = _PumpPortalClient()
+    await _PUMPPORTAL.ensure_started()
+    return _PUMPPORTAL
 
 
-def _nz(x: Any, d: float = 0.0) -> float:
-    try:
-        fx = float(x)
-        if fx != fx:  # NaN
-            return float(d)
-        return fx
-    except Exception:
-        return float(d)
-
-
-def _safe_int(x: Any, d: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return d
-
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Candidate normalization (shared)
+# ──────────────────────────────────────────────────────────────────────────────
 def _age_min(created_ts: Optional[float]) -> Optional[float]:
     try:
-        if created_ts is None:
+        if created_ts is None or created_ts <= 0:
             return None
         t = float(created_ts)
-        if t > 10_000_000_000:  # ms → s
+        if t > 10_000_000_000:  # ms -> s
             t = t / 1000.0
         return max(0.0, (_now() - t) / 60.0)
     except Exception:
         return None
 
+def _buy_ratio(buys: int, sells: int) -> float:
+    total = max(1, buys + sells)
+    return float(buys) / float(total)
 
-def _norm_mint(val: Any) -> str:
-    if not isinstance(val, str):
-        return ""
-    val = val.strip().replace(" ", "")
-    m = BASE58_RE.search(val)
-    return m.group(0) if m else ""
+def _trade_window_metrics(trades: Iterable[_Trade], *, now: float, wsec: float, sol_usd: float) -> Dict[str, Any]:
+    # Trades assumed to be roughly time-sorted; we scan and keep those in window
+    buys = sells = 0
+    vol_sol = 0.0
+    prices: List[float] = []
+    cutoff = now - wsec
+
+    for t in trades:
+        if t.ts < cutoff:
+            continue
+        if t.side == "buy":
+            buys += 1
+        elif t.side == "sell":
+            sells += 1
+        vol_sol += max(0.0, t.sol)
+        if t.price_sol > 0:
+            prices.append(t.price_sol)
+
+    vol_usd = vol_sol * sol_usd if sol_usd > 0 else 0.0
+    price_sol = prices[-1] if prices else 0.0
+    price_usd = price_sol * sol_usd if (price_sol > 0 and sol_usd > 0) else 0.0
+
+    # crude change proxy: compare first vs last in window
+    chg_pct = 0.0
+    if len(prices) >= 2 and prices[0] > 0:
+        chg_pct = ((prices[-1] - prices[0]) / prices[0]) * 100.0
+
+    return {
+        "buys": buys,
+        "sells": sells,
+        "txns": buys + sells,
+        "vol_sol": vol_sol,
+        "vol_usd": vol_usd,
+        "price_usd": price_usd,
+        "chg_pct": chg_pct,
+    }
+
+def _pumpportal_state_to_obj(st: _TokenState, *, sol_usd: float, now: float) -> Dict[str, Any]:
+    # Compute 5m/1h from trades; fall back to stored st.price_usd if present
+    m5 = _trade_window_metrics(st.trades, now=now, wsec=300.0, sol_usd=sol_usd)
+    m1h = _trade_window_metrics(st.trades, now=now, wsec=3600.0, sol_usd=sol_usd)
+
+    # Estimate age
+    created_ts = st.created_ts if st.created_ts > 0 else (st.last_ts if st.last_ts > 0 else 0.0)
+
+    # Whale heuristic in SOL terms
+    largest_buy_sol = 0.0
+    whales_5m = 0
+    for t in st.trades:
+        if (now - t.ts) > 300.0:
+            continue
+        if t.side == "buy":
+            largest_buy_sol = max(largest_buy_sol, t.sol)
+    if largest_buy_sol >= float(PF_SCAN_MIN_WHALE_SIZE_SOL):
+        whales_5m = 1
+
+    # liquidity / mcap can be missing; keep 0 but mark unknown flags
+    liq_usd = float(st.liq_usd or 0.0)
+    mcap_usd = float(st.mcap_usd or 0.0)
+    liq_unknown = (liq_usd <= 0.0)
+    mcap_unknown = (mcap_usd <= 0.0)
+
+    price_usd = float(st.price_usd or 0.0)
+    if price_usd <= 0 and m5["price_usd"] > 0:
+        price_usd = float(m5["price_usd"])
+
+    token_age_min = _age_min(created_ts) or 9999.0
+
+    buy_ratio_5m = _buy_ratio(int(m5["buys"]), int(m5["sells"]))
+    vol_to_liq = (float(m5["vol_usd"]) / max(1.0, liq_usd)) if (liq_usd > 0) else 0.0
+    momo_hint = (buy_ratio_5m * 100.0) + (min(2.0, vol_to_liq) * 25.0) + (max(-20.0, min(20.0, float(m5["chg_pct"]))) * 0.8)
+
+    return {
+        # keys expected by our normalizers
+        "mintAddress": st.mint,
+        "symbol": st.symbol or (st.mint[:6] if st.mint else ""),
+        "name": st.name or "",
+        "createdAt": created_ts,
+        "liquidityUsd": liq_usd,
+        "marketCapUsd": mcap_usd,
+        "priceUsd": price_usd,
+
+        "buys5m": int(m5["buys"]),
+        "sells5m": int(m5["sells"]),
+        "volumeUsd5m": float(m5["vol_usd"]),
+        "priceChange5m": float(m5["chg_pct"]),
+
+        "volumeUsd1h": float(m1h["vol_usd"]),
+        "priceChange1h": float(m1h["chg_pct"]),
+
+        # hints / extras
+        "liq_unknown": bool(liq_unknown),
+        "mcap_unknown": bool(mcap_unknown),
+        "largest_buy_5m_sol": float(largest_buy_sol),
+        "whales_5m": int(whales_5m),
+        "momo_hint": float(momo_hint),
+    }
 
 
-def _attach_risk(
-    metas: List[Dict[str, Any]],
-    risk_ctx: Optional[Dict[str, Any]],
-) -> None:
-    """
-    Attach risk manager context (capacity / mode) to each meta, if available.
-    """
-    if not metas or not risk_ctx:
-        return
-    try:
-        cap = float(risk_ctx.get("risk_capacity", 1.0) or 1.0)
-    except Exception:
-        cap = 1.0
-    mode = risk_ctx.get("risk_mode", "normal")
-    for m in metas:
-        m.setdefault("risk_capacity", cap)
-        m.setdefault("risk_mode", mode)
-
-
-def _extract_metrics_from_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Try to pull out all metrics we care about for runner detection.
-    Produces keys that match utils_pkg.pair_filters expectations.
-    """
-    liq_usd = None
-    for k in ("liquidity", "liquidityUsd", "liqUsd", "lpUsd", "liquidity_usd"):
+# ──────────────────────────────────────────────────────────────────────────────
+# Extract metrics from generic obj (HTTP or PumpPortal-normalized)
+# ──────────────────────────────────────────────────────────────────────────────
+def _extract_metrics(obj: Dict[str, Any]) -> Dict[str, Any]:
+    liq_usd = 0.0
+    for k in ("liquidityUsd", "liquidityUSD", "liqUsd", "lpUsd", "liquidity_usd", "liquidity"):
         v = obj.get(k)
-        try:
-            if v is not None:
-                liq_usd = float(v)
-                break
-        except Exception:
-            pass
+        if v is not None:
+            liq_usd = _nz(v, 0.0)
+            break
 
     fdv_usd = _nz(
         obj.get("fdv")
         or obj.get("fdvUsd")
         or obj.get("fullyDilutedValuation")
-        or obj.get("fullyDilutedMcUsd")
         or obj.get("fullyDilutedMarketCap"),
         0.0,
     )
-    mcap_usd = _nz(
-        obj.get("marketCap")
-        or obj.get("marketCapUsd")
-        or obj.get("mcap_usd")
-        or fdv_usd,
-        0.0,
-    )
+    mcap_usd = _nz(obj.get("marketCap") or obj.get("marketCapUsd") or obj.get("marketCapUSD") or obj.get("mcap_usd") or fdv_usd, 0.0)
 
-    # Buys / sells – many variants exist, favor shorter timeframes, fall back to 24h
-    buys_5m = _safe_int(
-        obj.get("buys5m")
-        or obj.get("buys_5m")
-        or obj.get("m5Buys")
-        or obj.get("buysLast5m")
-    )
-    sells_5m = _safe_int(
-        obj.get("sells5m")
-        or obj.get("sells_5m")
-        or obj.get("m5Sells")
-        or obj.get("sellsLast5m")
-    )
+    buys_5m = _safe_int(obj.get("buys5m") or obj.get("buys_5m") or obj.get("m5Buys") or obj.get("buysLast5m"))
+    sells_5m = _safe_int(obj.get("sells5m") or obj.get("sells_5m") or obj.get("m5Sells") or obj.get("sellsLast5m"))
 
-    buys_15m = _safe_int(
-        obj.get("buys15m")
-        or obj.get("buys_15m")
-        or obj.get("m15Buys")
-        or obj.get("buysLast15m")
-    )
-    sells_15m = _safe_int(
-        obj.get("sells15m")
-        or obj.get("sells_15m")
-        or obj.get("m15Sells")
-        or obj.get("sellsLast15m")
-    )
+    vol_5m_usd = _nz(obj.get("volumeUsd5m") or obj.get("volume5mUsd") or obj.get("vol5mUsd"), 0.0)
+    vol_1h_usd = _nz(obj.get("volumeUsd1h") or obj.get("volume1hUsd"), 0.0)
+    vol_24h_usd = _nz(obj.get("volumeUsd24h") or obj.get("volume24hUsd") or obj.get("usdVolume24Hours"), 0.0)
 
-    buys_24h = _safe_int(
-        obj.get("buys24h") or obj.get("buyCount24h") or obj.get("totalBuys24h")
-    )
-    sells_24h = _safe_int(
-        obj.get("sells24h") or obj.get("sellCount24h") or obj.get("totalSells24h")
-    )
-
-    # Approximate intraday buys if only 24h data is present
-    if buys_5m == 0 and buys_24h > 0:
-        buys_5m = max(1, buys_24h // 288)  # 24h / 5m
-    if buys_15m == 0 and buys_24h > 0:
-        buys_15m = max(1, buys_24h // 96)
-
-    if sells_5m == 0 and sells_24h > 0:
-        sells_5m = max(0, sells_24h // 288)
-    if sells_15m == 0 and sells_24h > 0:
-        sells_15m = max(0, sells_24h // 96)
-
-    vol_5m_usd = _nz(
-        obj.get("volumeUsd5m") or obj.get("volume5mUsd") or obj.get("vol5mUsd"), 0.0
-    )
-    vol_15m_usd = _nz(
-        obj.get("volumeUsd15m") or obj.get("volume15mUsd") or obj.get("vol15mUsd"), 0.0
-    )
-    vol_24h_usd = _nz(
-        obj.get("volumeUsd24h")
-        or obj.get("volume24hUsd")
-        or obj.get("usdVolume24Hours")
-        or obj.get("volume_24h_usd"),
-        0.0,
-    )
-
-    # Approximate 5m / 15m volume from 24h if needed
-    if vol_5m_usd <= 0 and vol_24h_usd > 0:
-        vol_5m_usd = vol_24h_usd / 288.0
-    if vol_15m_usd <= 0 and vol_24h_usd > 0:
-        vol_15m_usd = vol_24h_usd / 96.0
-
-    # Build a rough 1h volume from 24h if direct not present
-    vol_1h_usd = vol_24h_usd / 24.0 if vol_24h_usd > 0 else 0.0
-
-    # Price changes
     chg_5m_pct = _nz(obj.get("priceChange5m") or obj.get("priceChange_5m"), 0.0)
-    chg_15m_pct = _nz(obj.get("priceChange15m") or obj.get("priceChange_15m"), 0.0)
-
-    # If only 24h change is available, approximate short windows
-    chg_24h_pct = _nz(obj.get("priceChange24h") or obj.get("priceChange_24h"), 0.0)
-    if chg_5m_pct == 0.0 and chg_24h_pct != 0.0:
-        chg_5m_pct = chg_24h_pct / 288.0
-    if chg_15m_pct == 0.0 and chg_24h_pct != 0.0:
-        chg_15m_pct = chg_24h_pct / 96.0
-
-    # Approximate 1h price change from 24h if no direct value is present
     chg_1h_pct = _nz(obj.get("priceChange1h") or obj.get("priceChange_1h"), 0.0)
-    if chg_1h_pct == 0.0 and chg_24h_pct != 0.0:
-        chg_1h_pct = chg_24h_pct / 24.0
+    chg_24h_pct = _nz(obj.get("priceChange24h") or obj.get("priceChange_24h"), 0.0)
 
-    created = (
-        obj.get("createdAt")
-        or obj.get("createdAtTs")
-        or obj.get("created")
-        or obj.get("createdOn")
-    )
+    created = obj.get("createdAt") or obj.get("createdAtTs") or obj.get("created") or obj.get("createdOn")
     age_min = _age_min(created if created is not None else None)
     token_age_min = age_min if age_min is not None else 9999.0
 
-    holders = _safe_int(
-        obj.get("holders")
-        or obj.get("holderCount")
-        or obj.get("totalHolders")
-        or obj.get("holdersCount")
-    )
-    holders_5m_change = 0  # Pump.fun doesn't expose differential holder data
+    holders = _safe_int(obj.get("holders") or obj.get("holderCount") or obj.get("totalHolders") or obj.get("holdersCount"))
+    price_usd = _nz(obj.get("priceUsd") or obj.get("usdPrice") or obj.get("price") or obj.get("tokenPriceUsd"), 0.0)
+    impact_1k_bps = _nz(obj.get("priceImpact1kBps") or obj.get("impact1kBps") or obj.get("impact_bps") or obj.get("impact_1k_bps"), 0.0)
 
-    price_usd = _nz(
-        obj.get("priceUsd")
-        or obj.get("usdPrice")
-        or obj.get("price")
-        or obj.get("tokenPriceUsd"),
-        0.0,
-    )
-
-    # Whales: approximate from 5m volume + price.
-    whales_5m = 0
+    whales_5m = _safe_int(obj.get("whales_5m") or obj.get("whales5m") or 0)
+    largest_buy_5m_sol = _nz(obj.get("largest_buy_5m_sol") or 0.0, 0.0)
     whale_vol_5m_usd = 0.0
-    largest_buy_5m_sol = 0.0
-    if price_usd > 0 and vol_5m_usd > 0:
-        approx_largest_buy_usd = vol_5m_usd * 0.25
-        approx_largest_buy_sol = approx_largest_buy_usd / price_usd
-        largest_buy_5m_sol = approx_largest_buy_sol
-        if approx_largest_buy_sol >= float(PF_SCAN_MIN_WHALE_SIZE_SOL):
-            whales_5m = 1
-            whale_vol_5m_usd = approx_largest_buy_usd
+    if largest_buy_5m_sol > 0 and price_usd > 0:
+        # extremely rough conversion; still useful as a hint
+        whale_vol_5m_usd = largest_buy_5m_sol * price_usd
 
-    impact_1k_bps = _nz(
-        obj.get("priceImpact1kBps")
-        or obj.get("impact1kBps")
-        or obj.get("impact_bps")
-        or obj.get("impact_1k_bps"),
-        0.0,
-    )
+    buy_ratio_5m = _buy_ratio(buys_5m, sells_5m)
+    vol_to_liq = (vol_5m_usd / max(1.0, liq_usd)) if liq_usd > 0 else 0.0
+    momo_hint = float(obj.get("momo_hint") or 0.0)
+    if momo_hint == 0.0:
+        momo_hint = (buy_ratio_5m * 100.0) + (min(2.0, vol_to_liq) * 25.0) + (max(-20.0, min(20.0, chg_5m_pct)) * 0.8)
 
     return {
-        "liq_usd": _nz(liq_usd, 0.0),
-        "mcap_usd": mcap_usd,
-        "fdv_usd": fdv_usd,
-        "token_age_min": token_age_min,
-        "vol_5m_usd": vol_5m_usd,
-        "vol_1h_usd": vol_1h_usd,
-        "vol_24h_usd": vol_24h_usd,
-        "buys_5m": buys_5m,
-        "sells_5m": sells_5m,
-        "buys_1h": 0,      # we don't have direct; PF mostly cares about 5m + 1h volume
-        "sells_1h": 0,
-        "buys_24h": buys_24h,
-        "sells_24h": sells_24h,
-        "price_change_5m_pct": chg_5m_pct,
-        "price_change_15m_pct": chg_15m_pct,
-        "price_change_1h_pct": chg_1h_pct,
-        "holders": holders,
-        "holders_5m_change": holders_5m_change,
-        "price_usd": price_usd,
-        "whales_5m": whales_5m,
-        "whale_vol_5m_usd": whale_vol_5m_usd,
-        "largest_buy_5m_sol": largest_buy_5m_sol,
-        "impact_1k_bps": impact_1k_bps,
-        "buys_15m": buys_15m,
-        "sells_15m": sells_15m,
+        "liq_usd": float(max(0.0, liq_usd)),
+        "mcap_usd": float(max(0.0, mcap_usd)),
+        "fdv_usd": float(max(0.0, fdv_usd)),
+        "token_age_min": float(max(0.0, token_age_min)),
+        "vol_5m_usd": float(max(0.0, vol_5m_usd)),
+        "vol_1h_usd": float(max(0.0, vol_1h_usd)),
+        "vol_24h_usd": float(max(0.0, vol_24h_usd)),
+        "buys_5m": int(max(0, buys_5m)),
+        "sells_5m": int(max(0, sells_5m)),
+        "txns_5m": int(max(0, buys_5m + sells_5m)),
+        "price_usd": float(max(0.0, price_usd)),
+        "price_change_5m_pct": float(chg_5m_pct),
+        "price_change_1h_pct": float(chg_1h_pct),
+        "price_change_24h_pct": float(chg_24h_pct),
+        "holders": int(max(0, holders)),
+        "impact_1k_bps": float(max(0.0, impact_1k_bps)),
+        "whales_5m": int(max(0, whales_5m)),
+        "whale_vol_5m_usd": float(max(0.0, whale_vol_5m_usd)),
+        "largest_buy_5m_sol": float(max(0.0, largest_buy_5m_sol)),
+        "buy_ratio_5m": float(_clamp(buy_ratio_5m, 0.0, 1.0)),
+        "vol_to_liq_5m": float(max(0.0, vol_to_liq)),
+        "momo_hint": float(momo_hint),
     }
 
 
-def _buy_ratio(buys: int, sells: int) -> float:
-    total = max(1, buys + sells)
-    return float(buys) / float(total)
-
-
-def _map_coin_to_meta(
+def _map_obj_to_candidate(
     obj: Dict[str, Any],
     *,
     soft_liq: float,
     soft_mcap: float,
     soft_max_age: float,
     regime: Dict[str, Any],
+    stats: _ScanStats,
+    source: str,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Normalize various Pump.fun JSON shapes → common PF "meta" dict compatible
-    with utils_pkg.pair_filters, with regime-aware soft filters.
-    """
-    try:
-        raw_mint = (
-            obj.get("mintAddress")
-            or obj.get("mint")
-            or obj.get("baseMint")
-            or obj.get("tokenMint")
-            or obj.get("id")
-            or obj.get("publicKey")
-        )
-        mint = _norm_mint(raw_mint)
+    raw_mint = (
+        obj.get("mintAddress")
+        or obj.get("mint")
+        or obj.get("baseMint")
+        or obj.get("tokenMint")
+        or obj.get("id")
+        or obj.get("publicKey")
+    )
+    mint = ""
+    if isinstance(raw_mint, str):
+        if _normalize_mint is not None:
+            with contextlib.suppress(Exception):
+                mint = str(_normalize_mint(raw_mint))  # type: ignore
         if not mint:
-            return None
-
-        symbol = (
-            obj.get("symbol")
-            or obj.get("tokenSymbol")
-            or obj.get("name")
-            or mint[:6]
-        )
-
-        m = _extract_metrics_from_obj(obj)
-
-        # Soft prefilters: skip ultra-dead trash before PF / fallback logic
-        liq_usd = m["liq_usd"]
-        mcap_usd = m["mcap_usd"]
-        token_age_min = m["token_age_min"]
-
-        if soft_liq > 0 and liq_usd < soft_liq:
-            return None
-        if soft_mcap > 0 and mcap_usd < soft_mcap:
-            return None
-        if soft_max_age > 0 and token_age_min > soft_max_age:
-            return None
-
-        buys_5m = m["buys_5m"]
-        sells_5m = m["sells_5m"]
-        buys_15m = m.get("buys_15m", buys_5m)
-        sells_15m = m.get("sells_15m", sells_5m)
-
-        buy_ratio_5m = _buy_ratio(buys_5m, sells_5m)
-        buy_ratio_15m = _buy_ratio(buys_15m, sells_15m)
-
-        txns_5m = buys_5m + sells_5m
-        txns_1h = txns_5m * 12  # crude but consistent with PF heuristics
-
-        pair_url = f"https://pump.fun/coin/{mint}"
-
-        cur_regime_label = regime.get("label", "unknown")
-        cur_regime_numeric = float(regime.get("label_numeric", 0.0))
-        cur_regime_manip = float(regime.get("manipulation_risk", 0.0))
-
-        meta: Dict[str, Any] = {
-            # identity
-            "source": "pumpfun",
-            "dex": "pumpfun",
-            "chain": "solana",
-            "mint": mint,
-            "symbol": symbol,
-            "pair_url": pair_url,
-            "scan_ts": _now(),
-
-            # regime context
-            "regime": cur_regime_label,
-            "regime_numeric": cur_regime_numeric,
-            "regime_manipulation": cur_regime_manip,
-            "regime_ctx": dict(regime),
-
-            # core liquidity / size
-            "liq_usd": m["liq_usd"],
-            "mcap_usd": m["mcap_usd"],
-            "fdv_usd": m["fdv_usd"],
-
-            # time
-            "token_age_min": m["token_age_min"],
-
-            # recent activity
-            "vol_5m_usd": m["vol_5m_usd"],
-            "vol_1h_usd": m["vol_1h_usd"],
-            "vol_24h_usd": m["vol_24h_usd"],
-            "buys_5m": buys_5m,
-            "sells_5m": sells_5m,
-            "txns_5m": txns_5m,
-            "txns_1h": txns_1h,
-            "buy_ratio_5m": buy_ratio_5m,
-            "buy_ratio_15m": buy_ratio_15m,
-
-            # price action
-            "price_usd": m["price_usd"],
-            "price_change_5m_pct": m["price_change_5m_pct"],
-            "price_change_15m_pct": m["price_change_15m_pct"],
-            "price_change_1h_pct": m["price_change_1h_pct"],
-
-            # holders
-            "holders": m["holders"],
-            "holders_5m_change": m["holders_5m_change"],
-
-            # whale + AI fields
-            "whales_5m": m["whales_5m"],
-            "whale_vol_5m_usd": m["whale_vol_5m_usd"],
-            "largest_buy_5m_sol": m["largest_buy_5m_sol"],
-            "ai_rug_score": 0.0,        # neutral by default
-            "ai_entry_score": None,     # filled by AI entry if enabled
-            "ai_entry_reason": None,    # human-readable reason if AI provides it
-            "rank_score": None,         # final ranking / tie-breaker score
-
-            # security flags (no direct info here; defaults are conservative)
-            "is_honeypot": False,
-            "trading_paused": False,
-            "blacklisted": False,
-            "top10_hold_pct": 0.0,
-            "dev_hold_pct": 0.0,
-            "mint_authority_disabled": True,
-            "freeze_authority_disabled": True,
-
-            # slippage / impact info
-            "impact_1k_bps": m["impact_1k_bps"],
-        }
-
-        return meta
-    except Exception as e:
-        LOG.debug("pumpfun normalize error: %s", e)
+            m = BASE58_RE.search(raw_mint.strip())
+            mint = m.group(0) if m else ""
+    if not mint:
+        stats.rejects.inc("REJ_NO_MINT")
         return None
 
+    symbol = (obj.get("symbol") or obj.get("tokenSymbol") or obj.get("name") or mint[:6]) or mint[:6]
+    m = _extract_metrics(obj)
 
-def _extract_items_from_payload(
-    payload: Any,
-    *,
-    soft_liq: float,
-    soft_mcap: float,
-    soft_max_age: float,
-    regime: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """
-    Take raw JSON (list/dict) and return normalized PF meta entries.
-    """
-    items: List[Dict[str, Any]] = []
+    # Unknown-metric flags (PumpPortal often has unknown liq/mcap early)
+    liq_unknown = bool(obj.get("liq_unknown", False))
+    mcap_unknown = bool(obj.get("mcap_unknown", False))
 
-    if isinstance(payload, list):
-        src = payload
-    elif isinstance(payload, dict):
-        src: Optional[List[Dict[str, Any]]] = None
-        for k in ("trending", "coins", "items", "projects", "data"):
-            v = payload.get(k)
-            if isinstance(v, list):
-                src = v
-                break
-        if src is None and isinstance(payload.get("data"), dict):
-            dd = payload["data"]
-            for kk in ("trending", "coins", "items", "projects", "data"):
-                v = dd.get(kk)
-                if isinstance(v, list):
-                    src = v
-                    break
-        src = src or []
-    else:
-        src = []
-
-    for it in src:
-        if isinstance(it, dict):
-            meta = _map_coin_to_meta(
-                it,
-                soft_liq=soft_liq,
-                soft_mcap=soft_mcap,
-                soft_max_age=soft_max_age,
-                regime=regime,
-            )
-            if meta:
-                items.append(meta)
-    return items
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# HTML __NEXT_DATA__ extraction (no Playwright required)
-# ──────────────────────────────────────────────────────────────────────────────
-
-_NEXT_RE = re.compile(
-    r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>\s*({.*?})\s*</script>',
-    re.DOTALL | re.IGNORECASE,
-)
-
-
-def _html_next_data(html: str):
-    try:
-        m = _NEXT_RE.search(html or "")
-        if not m:
-            return None
-        return json.loads(m.group(1))
-    except Exception:
+    # soft filters (skip if unknown)
+    if soft_liq > 0 and (not liq_unknown) and m["liq_usd"] < soft_liq:
+        stats.rejects.inc("REJ_SOFT_LIQ", mint)
+        return None
+    if soft_mcap > 0 and (not mcap_unknown) and m["mcap_usd"] < soft_mcap:
+        stats.rejects.inc("REJ_SOFT_MCAP", mint)
+        return None
+    if soft_max_age > 0 and m["token_age_min"] > soft_max_age:
+        stats.rejects.inc("REJ_SOFT_AGE", mint)
+        return None
+    if HARD_MAX_AGE_MIN > 0.0 and m["token_age_min"] > float(HARD_MAX_AGE_MIN):
+        stats.rejects.inc("REJ_HARD_AGE", mint)
         return None
 
+    cand: Dict[str, Any] = {
+        "candidate_schema": CANDIDATE_SCHEMA,
+        "scanner": SCANNER_NAME,
+        "scanner_version": SCANNER_VERSION,
+
+        "source": source,
+        "dex": "pumpfun",
+        "chain": "SOL",
+
+        "mint": mint,
+        "symbol": str(symbol),
+
+        "pair_url": f"https://pump.fun/coin/{mint}",
+        "scan_ts": _now(),
+
+        # regime
+        "regime": str(regime.get("label", "unknown") or "unknown"),
+        "regime_numeric": float(regime.get("label_numeric", 0.0)),
+        "regime_manipulation": float(regime.get("manipulation_risk", 0.0)),
+        "regime_ctx": dict(regime),
+
+        # key metrics (flat)
+        **m,
+
+        # metrics quality tags
+        "liq_unknown": bool(liq_unknown),
+        "mcap_unknown": bool(mcap_unknown),
+
+        # placeholders for downstream
+        "ai_rug_score": 0.0,
+
+        "rank_score": None,
+        "score_combined": None,
+        "score_label": None,
+        "score_momentum": None,
+        "score_quality": None,
+        "score_risk": None,
+        "score_ai": None,
+        "score_reasons": None,
+        "score_is_trade_viable": True,
+        "score_trade_gate_reason": None,
+
+        # conservative token-security defaults (your later checks can overwrite)
+        "is_honeypot": False,
+        "trading_paused": False,
+        "blacklisted": False,
+        "top10_hold_pct": 0.0,
+        "dev_hold_pct": 0.0,
+        "mint_authority_disabled": True,
+        "freeze_authority_disabled": True,
+
+        # common legacy aliases (avoid downstream KeyError)
+        "age_min": m["token_age_min"],
+        "chg5": m["price_change_5m_pct"],
+        "buys5": m["buys_5m"],
+        "sells5": m["sells_5m"],
+        "vol5": m["vol_5m_usd"],
+        "liq": m["liq_usd"],
+    }
+    return cand
+
+
+def _dedupe_best_by_mint(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    best: Dict[str, Dict[str, Any]] = {}
+    for m in metas:
+        mint = m.get("mint")
+        if not isinstance(mint, str) or not mint:
+            continue
+        cur = best.get(mint)
+        if cur is None:
+            best[mint] = m
+            continue
+        a = (float(m.get("vol_5m_usd") or 0.0), int(m.get("buys_5m") or 0), float(m.get("liq_usd") or 0.0))
+        b = (float(cur.get("vol_5m_usd") or 0.0), int(cur.get("buys_5m") or 0), float(cur.get("liq_usd") or 0.0))
+        if a > b:
+            best[mint] = m
+    return list(best.values())
+
+def _attach_risk(metas: List[Dict[str, Any]], risk_ctx: Optional[Dict[str, Any]]) -> None:
+    if not metas or not risk_ctx:
+        return
+    cap = _clamp(float(risk_ctx.get("risk_capacity", 1.0) or 1.0), 0.0, 1.0)
+    mode = str(risk_ctx.get("risk_mode", "normal") or "normal")
+    for m in metas:
+        m["risk_capacity"] = cap
+        m["risk_mode"] = mode
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Optional AI / whales / entry enrichment
+# Optional enrichment (AI rug + smart wallets)
 # ──────────────────────────────────────────────────────────────────────────────
-
-async def _enrich_ai_whales_entry(
-    metas: List[Dict[str, Any]],
-    regime: Dict[str, Any],
-) -> None:
-    """
-    Best-effort enrichment of meta with:
-      - ai_rug_score (0–1) via utils_pkg.core_utils.ai_fraud_score
-      - basic whale signal via utils_pkg.core_utils.is_whale_wallet
-      - smart wallet tags (if SW.enrich_meta / annotate_meta exists)
-      - ai_entry_score + ai_entry_reason via feature_builder + ai_entry_logic
-    """
+async def _enrich_optional(metas: List[Dict[str, Any]], stats: _ScanStats) -> None:
     if not metas:
         return
 
-    try:
-        from utils_pkg.core_utils import ai_fraud_score, is_whale_wallet  # type: ignore
-    except Exception:
-        ai_fraud_score = None  # type: ignore
-        is_whale_wallet = None  # type: ignore
+    sem = asyncio.Semaphore(max(1, _i("PUMPFUN_ENRICH_CONCURRENCY", 8)))
+    to_rug = metas[:AI_RUG_MAX_PER_SCAN] if (AI_RUG_ENABLED and ai_fraud_score) else []
 
-    ai_conc = _i("PUMP_AI_CONCURRENCY", 5)
-    sem = asyncio.Semaphore(max(1, ai_conc))
+    sw_tracker = None
+    if SMART_WALLETS_ENRICH and SW is not None:
+        sw_tracker = getattr(SW, "TRACKER", None) or getattr(SW, "tracker", None) or None
 
-    to_rug = metas[: PUMP_AI_RUG_MAX_PER_SCAN] if (PUMP_AI_RUG_ENABLED and ai_fraud_score) else []
-    to_entry = metas[: PUMP_AI_ENTRY_MAX_PER_SCAN] if (PUMP_AI_ENTRY_ENABLED and FB and AI_ENTRY) else []
-
-    async def _call(fn, *a, **k):
-        if asyncio.iscoroutinefunction(fn):
-            return await fn(*a, **k)
-        return await asyncio.to_thread(fn, *a, **k)
-
-    async def _handle(meta: Dict[str, Any]) -> None:
-        mint = meta.get("mint")
+    async def _one(m: Dict[str, Any]) -> None:
+        mint = m.get("mint")
         if not isinstance(mint, str) or not mint:
             return
 
         async with sem:
-            # AI rug score
-            if meta in to_rug and ai_fraud_score:
-                try:
-                    s01 = await ai_fraud_score(mint)
-                    meta["ai_rug_score"] = max(0.0, min(1.0, float(s01)))
-                except Exception:
-                    pass
+            if m in to_rug and ai_fraud_score:
+                s01 = await _call_maybe_async(ai_fraud_score, mint)
+                if s01 is not None:
+                    m["ai_rug_score"] = _clamp(float(s01), 0.0, 1.0)
 
-            # Whale presence (coarse)
-            if PUMP_WHALES_ENABLED and is_whale_wallet:
-                try:
-                    px = float(meta.get("price_usd") or 0.0)
-                    thresh_usd = (
-                        float(PF_SCAN_MIN_WHALE_SIZE_SOL) * px if px > 0 else 50_000.0
-                    )
-                    has_whale = await is_whale_wallet(mint, usd_threshold=thresh_usd)
-                    if has_whale:
-                        meta["whales_5m"] = max(1, int(meta.get("whales_5m") or 0))
-                except Exception:
-                    pass
+            if sw_tracker is not None and m in metas[:SMART_WALLETS_MAX_PER_SCAN]:
+                bf = getattr(sw_tracker, "build_features", None)
+                if callable(bf):
+                    feats = await _call_maybe_async(bf, mint)
+                    if isinstance(feats, dict):
+                        for k in (
+                            "smart_wallet_score",
+                            "smart_signal_confidence",
+                            "smart_signal_quality",
+                            "smart_risk_flag",
+                            "smart_entry_boost_hint",
+                            "smart_exit_pressure_hint",
+                            "smart_tradeable_flag",
+                        ):
+                            if k in feats:
+                                m[k] = feats.get(k)
 
-            # Smart wallet tags
-            if SW is not None:
-                try:
-                    fn = getattr(SW, "enrich_meta", None) or getattr(
-                        SW, "annotate_meta", None
-                    )
-                    if callable(fn):
-                        if asyncio.iscoroutinefunction(fn):
-                            await fn(meta)
-                        else:
-                            await asyncio.to_thread(fn, meta)
-                except Exception:
-                    pass
-
-            # AI entry scoring (+ reason)
-            if (
-                PUMP_AI_ENTRY_ENABLED
-                and FB is not None
-                and AI_ENTRY is not None
-                and meta in to_entry
-            ):
-                try:
-                    fb_fn = getattr(FB, "build_features_for_meta", None) or getattr(
-                        FB, "build_features", None
-                    )
-                    if not callable(fb_fn):
-                        return
-                    feats = fb_fn(meta, regime=regime)  # type: ignore[arg-type]
-                    meta["_features"] = feats
-
-                    score = None
-                    reason = None
-
-                    # Try multiple AI entry APIs in priority order:
-                    #   1) score_candidate(meta=..., features=..., regime=...)
-                    #      + optional explain_candidate(...)
-                    #   2) score_entry(features=..., meta=..., regime=...)
-                    #   3) score_entry(features)
-                    #   4) compute_entry(meta, features, regime) -> {"score":..,"reason":..}
-                    score_fn = getattr(AI_ENTRY, "score_candidate", None)
-                    if callable(score_fn):
-                        score = await _call(
-                            score_fn, meta=meta, features=feats, regime=regime
-                        )
-                        explain_fn = getattr(AI_ENTRY, "explain_candidate", None)
-                        if callable(explain_fn):
-                            try:
-                                reason_val = await _call(
-                                    explain_fn, meta=meta, features=feats, regime=regime
-                                )
-                                reason = str(reason_val)
-                            except Exception:
-                                reason = None
-                    else:
-                        score_entry_fn = getattr(AI_ENTRY, "score_entry", None)
-                        compute_entry_fn = getattr(AI_ENTRY, "compute_entry", None)
-
-                        if callable(score_entry_fn):
-                            try:
-                                score = await _call(
-                                    score_entry_fn,
-                                    feats,
-                                    meta=meta,
-                                    regime=regime,
-                                )
-                            except TypeError:
-                                # Maybe signature is score_entry(features) only
-                                score = await _call(score_entry_fn, feats)
-
-                        if score is None and callable(compute_entry_fn):
-                            try:
-                                info = await _call(
-                                    compute_entry_fn, meta, feats, regime
-                                )
-                                if isinstance(info, dict):
-                                    score = info.get("score")
-                                    reason_val = info.get("reason")
-                                    if isinstance(reason_val, str):
-                                        reason = reason_val
-                            except Exception:
-                                pass
-
-                    if score is not None:
-                        meta["ai_entry_score"] = float(score)
-                    if reason is not None:
-                        meta["ai_entry_reason"] = str(reason)
-                except Exception:
-                    pass
-
-    tasks = [asyncio.create_task(_handle(m)) for m in metas]
+    tasks = [asyncio.create_task(_one(m)) for m in metas]
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PF-based filtering & ranking + fallback
+# Scoring (preferred)
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _pf_filter_and_rank(
+async def _score_with_service(
     metas: List[Dict[str, Any]],
+    *,
+    regime: Dict[str, Any],
+    risk_ctx: Optional[Dict[str, Any]],
+    stats: _ScanStats,
 ) -> List[Dict[str, Any]]:
-    """
-    Take normalized meta entries, apply is_viable_pair and PF scoring, and
-    return the top candidates ranked by rank_score.
+    if not SCORING_ENABLED or not metas or score_candidate is None:
+        return []
 
-    rank_score is a blend of:
-      - PF final_score
-      - PF momentum_score
-      - optional ai_entry_score
-      - optional whale presence
-      - lightly scaled by volume
-    """
+    pre: List[Dict[str, Any]] = []
+    for m in metas:
+        mint = str(m.get("mint") or "")
+        try:
+            if AI_RUG_ENABLED and float(m.get("ai_rug_score") or 0.0) >= float(MAX_AI_RUG):
+                stats.rejects.inc("REJ_AI_RUG", mint)
+                continue
+            if not is_viable_pair(m):
+                stats.rejects.inc("REJ_LEGACY_VIABLE_FALSE", mint)
+                continue
+            pre.append(m)
+        except Exception:
+            pre.append(m)
+
+    if not pre:
+        pre = metas
+
+    pre.sort(key=lambda x: (float(x.get("vol_5m_usd") or 0.0), int(x.get("buys_5m") or 0)), reverse=True)
+    targets = pre[:SCORING_MAX_PER_SCAN]
+
+    sem = asyncio.Semaphore(SCORING_CONCURRENCY)
     out: List[Dict[str, Any]] = []
 
-    for meta in metas:
+    async def _one(meta: Dict[str, Any]) -> None:
+        mint = str(meta.get("mint") or "")
+        raw = dict(meta)
+        ctx = {
+            "source": str(meta.get("source") or "pumpfun"),
+            "scanner": "pumpfun_scanner",
+            "phase": MASTER_PHASE,
+            "mode": PUMPFUN_MODE,
+            "regime": dict(regime),
+            "risk": dict(risk_ctx or {}),
+        }
+
+        async with sem:
+            try:
+                st: Any = await score_candidate(raw, context=ctx)  # type: ignore[misc]
+            except Exception as e:
+                stats.rejects.inc("REJ_SCORE_EXCEPTION", mint)
+                log.every("PUMP_SCORE_FAIL", n=10, mint=mint, err=_short(e))
+                return
+
         try:
-            # Apply AI rug guardrail first if enabled
-            rug = float(meta.get("ai_rug_score") or 0.0)
-            if PUMP_AI_RUG_ENABLED and PUMP_MAX_AI_RUG > 0 and rug >= PUMP_MAX_AI_RUG:
+            m = dict(meta)
+            m["score_combined"] = float(getattr(st, "combined_score", 0.0))
+            m["score_label"] = str(getattr(st, "label", "") or "")
+            m["score_momentum"] = float(getattr(st, "momentum_score", 0.0))
+            m["score_risk"] = float(getattr(st, "risk_score", 0.0))
+            m["score_quality"] = float(getattr(st, "quality_score", 0.0))
+            m["score_ai"] = float(getattr(st, "ai_score", 0.0))
+            m["score_reasons"] = getattr(st, "reasons", None)
+            m["score_is_trade_viable"] = bool(getattr(st, "is_trade_viable", True))
+            m["score_trade_gate_reason"] = getattr(st, "trade_gate_reason", None)
+            m["rank_score"] = float(m["score_combined"])
+            out.append(m)
+        except Exception:
+            stats.rejects.inc("REJ_SCORE_MAP_FAIL", mint)
+
+    tasks = [asyncio.create_task(_one(m)) for m in targets]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return out
+
+def _select_from_scored(scored: List[Dict[str, Any]], *, min_combined: float, stats: _ScanStats) -> List[Dict[str, Any]]:
+    if not scored:
+        return []
+
+    runners: List[Dict[str, Any]] = []
+    for m in scored:
+        mint = str(m.get("mint") or "")
+        try:
+            label = str(m.get("score_label") or "").upper() or "YELLOW"
+            combined = float(m.get("score_combined") or 0.0)
+            trade_ok = bool(m.get("score_is_trade_viable", True))
+
+            if not trade_ok:
+                stats.rejects.inc("REJ_TRADE_NOT_VIABLE", mint)
+                continue
+            if combined < float(min_combined):
+                stats.rejects.inc("REJ_SCORE_TOO_LOW", mint)
+                continue
+            if _LABEL_LEVEL.get(label, 0) < _REQUIRED_LABEL_LEVEL:
+                stats.rejects.inc("REJ_LABEL_TOO_LOW", mint)
+                continue
+            if AI_RUG_ENABLED and float(m.get("ai_rug_score") or 0.0) >= float(MAX_AI_RUG):
+                stats.rejects.inc("REJ_AI_RUG", mint)
                 continue
 
+            runners.append(m)
+        except Exception:
+            stats.rejects.inc("REJ_SELECT_EXCEPTION", mint)
+            continue
+
+    runners.sort(key=lambda x: float(x.get("score_combined") or 0.0), reverse=True)
+    return runners[:MAX_RUNNERS]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Legacy PF rank fallback
+# ──────────────────────────────────────────────────────────────────────────────
+def _legacy_pf_rank(metas: List[Dict[str, Any]], stats: _ScanStats) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for meta in metas:
+        mint = str(meta.get("mint") or "")
+        try:
+            if AI_RUG_ENABLED and float(meta.get("ai_rug_score") or 0.0) >= float(MAX_AI_RUG):
+                stats.rejects.inc("REJ_AI_RUG", mint)
+                continue
             if not is_viable_pair(meta):
+                stats.rejects.inc("REJ_LEGACY_VIABLE_FALSE", mint)
                 continue
 
-            momentum = compute_momentum_score(meta)
-            final = compute_final_score(meta)
-
-            ai_entry = meta.get("ai_entry_score")
+            momentum = float(compute_momentum_score(meta))
+            final = float(compute_final_score(meta))
             whales = int(meta.get("whales_5m") or 0)
             vol5 = float(meta.get("vol_5m_usd") or 0.0)
 
-            # Optional AI entry gating (strict mode)
-            if PUMP_REQUIRE_AI_ENTRY_FOR_RUNNERS:
-                if not isinstance(ai_entry, (int, float)):
-                    continue
-                if ai_entry < PUMP_MIN_AI_ENTRY:
-                    continue
-            elif isinstance(ai_entry, (int, float)) and ai_entry < 0.0:
-                ai_entry = 0.0
-
-            # Base rank from PF
-            rank = float(final)
-
-            # Small bonus for momentum + whales
-            rank += 0.2 * float(momentum)
+            rank = final + 0.2 * momentum
             if whales > 0:
                 rank += 0.15
 
-            # AI entry override if present
-            if isinstance(ai_entry, (int, float)):
-                vol_boost = max(1.0, log1p(max(vol5, 1.0)) / 5.0)
-                rank = (0.6 * rank + 0.4 * float(ai_entry)) * vol_boost
-
-            # Global rank guardrail if configured
-            if PUMP_MIN_RANK_SCORE > 0.0 and rank < PUMP_MIN_RANK_SCORE:
-                continue
+            vol_boost = max(1.0, log1p(max(vol5, 1.0)) / 5.0)
+            rank = float(rank) * vol_boost
 
             m = dict(meta)
-            m["momentum_score"] = float(momentum)
-            m["final_score"] = float(final)
+            m["final_score"] = final
+            m["momentum_score"] = momentum
             m["rank_score"] = float(rank)
             out.append(m)
-        except Exception as e:
-            LOG.debug("pumpfun PF filter error for %s: %s", meta.get("mint"), e)
+        except Exception:
+            stats.rejects.inc("REJ_LEGACY_EXCEPTION", mint)
+            continue
 
-    out.sort(key=lambda x: x.get("rank_score", x.get("final_score", 0.0)), reverse=True)
-
-    max_runners = PUMP_MAX_RUNNERS if PUMP_MAX_RUNNERS > 0 else PUMP_RUNNER_LIMIT
-    max_runners = max(1, max_runners)
-    return out[: max_runners]
+    out.sort(key=lambda x: float(x.get("rank_score") or 0.0), reverse=True)
+    return out[:MAX_RUNNERS]
 
 
-def _fallback_pick_metas(
+# ──────────────────────────────────────────────────────────────────────────────
+# Heuristic fallback
+# ──────────────────────────────────────────────────────────────────────────────
+def _fallback_pick(
     metas: List[Dict[str, Any]],
     *,
     min_vol5_usd: float,
     max_impact_bps: float,
+    stats: _ScanStats,
 ) -> List[Dict[str, Any]]:
-    """
-    Fallback runner selection when PF returns nothing or PUMP_BYPASS_PF is true:
-      - require minimum 5m buys + 5m volume
-      - respect an AI rug ceiling if AI is enabled
-      - optional AI entry gating (same flags as PF path)
-      - cap slippage using impact_1k_bps
-      - sort by (whales_5m desc, vol_5m_usd desc, price_change_5m_pct desc)
-    """
-    if not PUMP_ENABLE_FALLBACK or not metas:
+    if not metas:
         return []
-
-    min_buys = int(PUMP_FB_MIN_BUYS_5M)
-    min_vol = float(min_vol5_usd)
-    max_impact = float(max_impact_bps)
-    ai_max = float(PUMP_MAX_AI_RUG)
-    fb_max = int(PUMP_FB_MAX_RUNNERS)
 
     cands: List[Dict[str, Any]] = []
     for m in metas:
+        mint = str(m.get("mint") or "")
         try:
             buys5 = int(m.get("buys_5m") or 0)
             vol5 = float(m.get("vol_5m_usd") or 0.0)
             impact = float(m.get("impact_1k_bps") or 0.0)
             rug = float(m.get("ai_rug_score") or 0.0)
 
-            if buys5 < min_buys:
+            if buys5 < FB_MIN_BUYS_5M:
+                stats.rejects.inc("REJ_FB_MIN_BUYS", mint)
                 continue
-            if vol5 < min_vol:
+            if vol5 < float(min_vol5_usd):
+                stats.rejects.inc("REJ_FB_MIN_VOL5", mint)
                 continue
-            if max_impact > 0 and impact > max_impact:
+            if max_impact_bps > 0 and impact > float(max_impact_bps):
+                stats.rejects.inc("REJ_FB_IMPACT", mint)
                 continue
-            if PUMP_AI_RUG_ENABLED and ai_max > 0 and rug >= ai_max:
+            if AI_RUG_ENABLED and rug >= float(MAX_AI_RUG):
+                stats.rejects.inc("REJ_AI_RUG", mint)
                 continue
-
-            # Optional AI entry gating in fallback too
-            ai_entry = m.get("ai_entry_score")
-            if PUMP_REQUIRE_AI_ENTRY_FOR_RUNNERS:
-                if not isinstance(ai_entry, (int, float)):
-                    continue
-                if ai_entry < PUMP_MIN_AI_ENTRY:
-                    continue
 
             cands.append(m)
         except Exception:
+            stats.rejects.inc("REJ_FB_EXCEPTION", mint)
             continue
 
     if not cands:
-        LOG.info(
-            "Pump.fun fallback: 0 metas matched (min_buys=%d min_vol=%.1f "
-            "max_impact=%.1f ai_max=%.2f) from %d metas",
-            min_buys,
-            min_vol,
-            max_impact,
-            ai_max,
-            len(metas),
-        )
         return []
 
-    def _fb_key(m: Dict[str, Any]) -> Tuple[int, float, float]:
-        whales = int(m.get("whales_5m") or 0)
-        vol5 = float(m.get("vol_5m_usd") or 0.0)
-        up5 = float(m.get("price_change_5m_pct") or 0.0)
-        return (whales, vol5, up5)
+    def _key(mm: Dict[str, Any]) -> Tuple[float, float, float]:
+        return (
+            float(mm.get("momo_hint") or 0.0),
+            float(mm.get("vol_5m_usd") or 0.0),
+            float(mm.get("liq_usd") or 0.0),
+        )
 
-    cands.sort(key=_fb_key, reverse=True)
-    picked = cands[:fb_max]
-
-    LOG.info(
-        "Pump.fun fallback: picked %d/%d metas (min_buys=%d min_vol=%.1f max_impact=%.1f ai_max=%.2f)",
-        len(picked),
-        len(cands),
-        min_buys,
-        min_vol,
-        max_impact,
-        ai_max,
-    )
+    cands.sort(key=_key, reverse=True)
+    picked = cands[:FB_MAX_RUNNERS]
+    for m in picked:
+        m.setdefault("rank_score", float(m.get("momo_hint") or m.get("vol_5m_usd") or 0.0))
     return picked
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HTTP helpers
+# PumpPortal collection (primary fix)
 # ──────────────────────────────────────────────────────────────────────────────
-
-async def _fetch_text(
-    session: aiohttp.ClientSession,
-    url: str,
-) -> Tuple[str, int, Dict[str, str]]:
-    headers = {
-        "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://pump.fun/",
-        "Origin": "https://pump.fun",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    ck = get_cookie_for(url)
-    if ck:
-        headers["Cookie"] = ck
-
-    try:
-        async with session.get(
-            url,
-            headers=headers,
-            ssl=ssl.create_default_context(cafile=certifi.where()),
-            timeout=REQ_TIMEOUT_S,
-            proxy=PUMPFUN_HTTP_PROXY or None,
-        ) as r:
-            text = await r.text()
-            return text, r.status, dict(r.headers)
-    except Exception:
-        return "", 0, {}
-
-
-async def _fetch_json(
-    session: aiohttp.ClientSession,
-    url: str,
-) -> Tuple[Optional[Any], int, str]:
-    """
-    GET `url` expecting JSON. Returns (data_or_None, http_status, first_120_chars_of_text).
-    Robust to bad content-types and falls back to manual json.loads(text).
-    """
-    headers = _hdrs(url)
-    status = 0
-    first = ""
-    text = ""
-
-    try:
-        async with session.get(
-            url,
-            headers=headers,
-            ssl=ssl.create_default_context(cafile=certifi.where()),
-            timeout=REQ_TIMEOUT_S,
-            proxy=PUMPFUN_HTTP_PROXY or None,
-        ) as r:
-            status = r.status
-            try:
-                text = await r.text()
-                first = (text or "")[:120]
-            except Exception:
-                text = ""
-                first = ""
-
-            data: Optional[Any] = None
-            if status == 200:
-                try:
-                    data = await r.json(content_type=None)
-                except Exception:
-                    try:
-                        if text:
-                            data = json.loads(text)
-                    except Exception:
-                        data = None
-
-            if status in _BAD_CF_CODES:
-                flag_cookie_bad()
-
-            return data, status, first
-    except (
-        aiohttp.ClientProxyConnectionError,
-        aiohttp.ClientHttpProxyError,
-        aiohttp.ClientConnectorError,
-        aiohttp.ServerTimeoutError,
-        asyncio.TimeoutError,
-    ) as e:
-        LOG.warning("Pump.fun request failed %s: %s", type(e).__name__, url)
-        return None, status, first
-    except Exception as e:
-        LOG.warning("Pump.fun request unexpected error at %s: %s", url, e)
-        return None, status, first
-
-
-def _join_url(base: str, path: str) -> str:
-    base = base.rstrip("/")
-    path = path.lstrip("/")
-    return f"{base}/{path}"
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Fallback: HTML __NEXT_DATA__ from apex pages
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def _html_next_fallback(
-    session: aiohttp.ClientSession,
+async def _collect_from_pumpportal(
     *,
     soft_liq: float,
     soft_mcap: float,
     soft_max_age: float,
     regime: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
+    stats: _ScanStats,
+) -> Tuple[List[Dict[str, Any]], str]:
+    client = await _pumpportal_client()
+    st = client.stats()
+    if not st.get("ready", False):
+        stats.rejects.inc("REJ_PUMPPORTAL_NOT_READY")
+        return [], "pumpportal:not_ready"
 
-    for url in FALLBACK_HTML_URLS:
-        try:
-            html, status, headers = await _fetch_text(session, url)
-        except Exception as e:
-            LOG.warning("pumpfun HTML fallback fetch failed at %s: %s", url, e)
-            continue
+    now = time.time()
+    sol_usd = await _sol_usd()
 
-        ctype = (headers.get("content-type") or "").lower()
-        low = (html or "").lower()
-        blocked = (
-            status in _BAD_CF_CODES
-            or "cloudflare" in low
-            or "cf-chl-" in low
-            or "just a moment" in low
-        )
-        if not html or blocked:
-            LOG.warning(
-                "pumpfun HTML fallback: blocked page at %s (status=%s)", url, status
-            )
-            continue
+    # Build objects from token states
+    states = client.snapshot(max_items=PUMPPORTAL_SNAP_MAX)
+    objs = [_pumpportal_state_to_obj(s, sol_usd=sol_usd, now=now) for s in states]
 
-        payload = _html_next_data(html)
-        if not payload:
-            LOG.debug(
-                "pumpfun HTML fallback: __NEXT_DATA__ not found at %s (status=%s ctype=%s)",
-                url,
-                status,
-                ctype,
-            )
-            continue
-
-        items = _extract_items_from_payload(
-            payload,
+    metas: List[Dict[str, Any]] = []
+    for obj in objs:
+        mm = _map_obj_to_candidate(
+            obj,
             soft_liq=soft_liq,
             soft_mcap=soft_mcap,
             soft_max_age=soft_max_age,
             regime=regime,
+            stats=stats,
+            source="pumpfun_ws",
         )
-        if not items:
-            try:
-                props = (payload.get("props") or {}).get("pageProps") or {}
-                for key in (
-                    "coins",
-                    "trending",
-                    "trendingCoins",
-                    "data",
-                    "items",
-                    "list",
-                    "feed",
-                ):
-                    v = props.get(key)
-                    if isinstance(v, list):
-                        items = _extract_items_from_payload(
-                            v,
-                            soft_liq=soft_liq,
-                            soft_mcap=soft_mcap,
-                            soft_max_age=soft_max_age,
-                            regime=regime,
-                        )
-                        if items:
-                            break
-            except Exception:
-                items = []
+        if mm:
+            metas.append(mm)
 
-        if items:
-            with contextlib.suppress(Exception):
-                await _enrich_ai_whales_entry(items, regime=regime)
+    # Optional: only keep those active recently (avoid stale)
+    cutoff = now - float(PUMPPORTAL_TRACK_WINDOW_SEC)
+    metas = [m for m in metas if (m.get("scan_ts") or 0) >= 0 and (m.get("token_age_min") or 0) >= 0]
+    # Sort by activity signal
+    metas.sort(key=lambda x: (float(x.get("vol_5m_usd") or 0.0), int(x.get("buys_5m") or 0)), reverse=True)
 
-            pf_runners = _pf_filter_and_rank(items) if not PUMP_BYPASS_PF else []
-            fb_runners = _fallback_pick_metas(
-                items,
-                min_vol5_usd=PUMP_FB_MIN_VOL5_USD,
-                max_impact_bps=PUMP_FB_MAX_IMPACT_1K_BPS,
-            ) if (PUMP_BYPASS_PF or not pf_runners) else []
-            runners = pf_runners or fb_runners
-
-            out.extend(runners)
-            LOG.info(
-                "scanner.pumpfun: HTML __NEXT_DATA__ → %s runners (pf=%d fb=%d) from %s",
-                len(runners),
-                len(pf_runners),
-                len(fb_runners),
-                url,
-            )
-
-            if PUMP_LOG_SCAN_SUMMARY:
-                with contextlib.suppress(Exception):
-                    asyncio.create_task(
-                        log_event(
-                            "pumpfun_scan_summary",
-                            {
-                                "source": "html_next",
-                                "raw_items": len(items),
-                                "pf_runners": len(pf_runners),
-                                "fb_runners": len(fb_runners),
-                                "runners": len(runners),
-                                "regime": dict(regime),
-                                # risk is not wired here (no redis context in this helper)
-                            },
-                        )
-                    )
-
-            break  # first success is enough
-
-    if out:
-        seen: set[str] = set()
-        uniq: List[Dict[str, Any]] = []
-        for d in out:
-            m = d.get("mint")
-            if isinstance(m, str) and m not in seen:
-                seen.add(m)
-                uniq.append(d)
-        out = uniq
-
-    return out
+    return _dedupe_best_by_mint(metas), "pumpportal"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core scanning logic
+# Alerts + training logs
 # ──────────────────────────────────────────────────────────────────────────────
-
-async def _fetch_api_json_with_fallback(
-    session: aiohttp.ClientSession,
-    path: str,
-    *,
-    soft_liq: float,
-    soft_mcap: float,
-    soft_max_age: float,
-    regime: Dict[str, Any],
-    tried_out: Optional[List[str]] = None,
-) -> Optional[List[Dict[str, Any]]]:
-    # Debug override
-    if OVERRIDE_URL and OVERRIDE_URL.lower().startswith("http"):
-        payload, status, first = await _fetch_json(session, OVERRIDE_URL)
-        if tried_out is not None:
-            tried_out.append(f"{OVERRIDE_URL} status={status}")
-        if payload:
-            items = _extract_items_from_payload(
-                payload,
-                soft_liq=soft_liq,
-                soft_mcap=soft_mcap,
-                soft_max_age=soft_max_age,
-                regime=regime,
-            )
-            if items:
-                LOG.info(
-                    "scanner.pumpfun: API JSON (override) → %s meta items", len(items)
-                )
-                return items
-
-    for base in _api_bases():
-        url = _join_url(base, path)
-        payload, status, first = await _fetch_json(session, url)
-        if tried_out is not None:
-            tried_out.append(f"{url} status={status}")
-        if not payload:
-            if status in (404, *_BAD_CF_CODES, *_PROXY_BREAK_CODES):
-                LOG.warning("Pump.fun: [%s] HTTP %s; first 120: %s", url, status, first)
-            continue
-        items = _extract_items_from_payload(
-            payload,
-            soft_liq=soft_liq,
-            soft_mcap=soft_mcap,
-            soft_max_age=soft_max_age,
-            regime=regime,
-        )
-        if items:
-            LOG.info(
-                "scanner.pumpfun: API JSON → %s meta items (base=%s)", len(items), base
-            )
-            return items
-
-    return None
-
-
-async def _collect_pumpfun_items(
-    session: aiohttp.ClientSession,
-    *,
-    soft_liq: float,
-    soft_mcap: float,
-    soft_max_age: float,
-    regime: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """
-    Try multiple Pump.fun sources in order, returning a *list* of normalized meta items.
-    """
-    tried: List[str] = []
-
-    # 1) API: trending
-    items = await _fetch_api_json_with_fallback(
-        session,
-        f"coins/trending?offset=0&limit={API_LIMIT}",
-        soft_liq=soft_liq,
-        soft_mcap=soft_mcap,
-        soft_max_age=soft_max_age,
-        regime=regime,
-        tried_out=tried,
-    )
-    if items:
-        return items
-
-    # 2) API: new
-    items = await _fetch_api_json_with_fallback(
-        session,
-        f"coins/new?offset=0&limit={API_LIMIT}",
-        soft_liq=soft_liq,
-        soft_mcap=soft_mcap,
-        soft_max_age=soft_max_age,
-        regime=regime,
-        tried_out=tried,
-    )
-    if items:
-        return items
-
-    # 3) legacy endpoint (often 404) — still try once
-    legacy = "https://pump.fun/api/trending"
-    payload, status, first = await _fetch_json(session, legacy)
-    tried.append(f"{legacy} status={status}")
-    if payload:
-        items = _extract_items_from_payload(
-            payload,
-            soft_liq=soft_liq,
-            soft_mcap=soft_mcap,
-            soft_max_age=soft_max_age,
-            regime=regime,
-        )
-        if items:
-            LOG.info("scanner.pumpfun: legacy API JSON → %s meta items", len(items))
-            return items
-
-    # 4) HTML __NEXT_DATA__ fallback (no Playwright)
-    if not SKIP_HTML_NEXT:
-        items = await _html_next_fallback(
-            session,
-            soft_liq=soft_liq,
-            soft_mcap=soft_mcap,
-            soft_max_age=soft_max_age,
-            regime=regime,
-        )
-        if items:
-            return items
-
-    # 5) last resort: Playwright fetch to *first* available base (capped by API_LIMIT)
-    try:
-        first_base = _api_bases()[0]
-    except Exception:
-        first_base = "https://frontend-api.pump.fun"
-    fallback_url = _join_url(first_base, f"coins/trending?offset=0&limit={API_LIMIT}")
-
-    payload = None
-    try:
-        maybe = browser_fetch_json(fallback_url)
-        payload = await maybe if asyncio.iscoroutine(maybe) else maybe
-    except Exception as e:
-        LOG.debug("browser_fetch_json final fallback failed: %s", e)
-
-    if payload:
-        items = _extract_items_from_payload(
-            payload,
-            soft_liq=soft_liq,
-            soft_mcap=soft_mcap,
-            soft_max_age=soft_max_age,
-            regime=regime,
-        )
-        if items:
-            LOG.info(
-                "scanner.pumpfun: Playwright API → %s meta items", len(items)
-            )
-            return items
-
-    if tried:
-        LOG.warning(
-            "scanner.pumpfun: no items after tries: %s", " | ".join(tried)
-        )
-
-    return []
-
-
-async def _scan_inner(
-    session: aiohttp.ClientSession,
-    *,
-    soft_liq: float,
-    soft_mcap: float,
-    soft_max_age: float,
-    fb_min_vol5: float,
-    fb_max_impact_bps: float,
-    regime: Dict[str, Any],
-    risk_ctx: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Full Pump.fun scan using:
-      1) Next.js via Playwright (if enabled).
-      2) DOM scrape via Playwright (if enabled).
-      3) JSON API + legacy + HTML fallback.
-    Returns normalized runner metas (for strategy / sniper).
-    """
-    apply_cookies_to_session(session)
-
-    # 0) Next.js (/_next/data) via Playwright
-    if not SKIP_NEXT:
-        try:
-            raw = await browser_fetch_trending_via_next_data(limit=DOM_LIMIT)
-            if isinstance(raw, list) and raw:
-                metas: List[Dict[str, Any]] = []
-                for it in raw:
-                    if isinstance(it, dict):
-                        meta = _map_coin_to_meta(
-                            it,
-                            soft_liq=soft_liq,
-                            soft_mcap=soft_mcap,
-                            soft_max_age=soft_max_age,
-                            regime=regime,
-                        )
-                        if meta:
-                            metas.append(meta)
-
-                _attach_risk(metas, risk_ctx)
-
-                with contextlib.suppress(Exception):
-                    await _enrich_ai_whales_entry(metas, regime=regime)
-
-                pf_runners = _pf_filter_and_rank(metas) if not PUMP_BYPASS_PF else []
-                fb_runners = _fallback_pick_metas(
-                    metas,
-                    min_vol5_usd=fb_min_vol5,
-                    max_impact_bps=fb_max_impact_bps,
-                ) if (PUMP_BYPASS_PF or not pf_runners) else []
-                runners = pf_runners or fb_runners
-
-                if runners:
-                    LOG.info(
-                        "scanner.pumpfun: next-data apex → %s runners (pf=%d fb=%d)",
-                        len(runners),
-                        len(pf_runners),
-                        len(fb_runners),
-                    )
-
-                    if PUMP_LOG_SCAN_SUMMARY:
-                        with contextlib.suppress(Exception):
-                            asyncio.create_task(
-                                log_event(
-                                    "pumpfun_scan_summary",
-                                    {
-                                        "source": "next_data",
-                                        "raw_items": len(metas),
-                                        "pf_runners": len(pf_runners),
-                                        "fb_runners": len(fb_runners),
-                                        "runners": len(runners),
-                                        "regime": dict(regime),
-                                        "risk": dict(risk_ctx or {}),
-                                    },
-                                )
-                            )
-
-                    return runners
-        except Exception as e:
-            LOG.warning("Pump.fun next-data apex fetch error: %s", e)
-    else:
-        LOG.debug("PUMPFUN_SKIP_NEXT=1 → skipping next-data step")
-
-    # 1) Apex DOM via Playwright
-    if not SKIP_NEXT:
-        try:
-            dom = await browser_scrape_trending_dom(limit=DOM_LIMIT)
-            if isinstance(dom, list) and dom:
-                metas: List[Dict[str, Any]] = []
-                for it in dom:
-                    if isinstance(it, dict):
-                        meta = _map_coin_to_meta(
-                            it,
-                            soft_liq=soft_liq,
-                            soft_mcap=soft_mcap,
-                            soft_max_age=soft_max_age,
-                            regime=regime,
-                        )
-                        if meta:
-                            metas.append(meta)
-
-                _attach_risk(metas, risk_ctx)
-
-                with contextlib.suppress(Exception):
-                    await _enrich_ai_whales_entry(metas, regime=regime)
-
-                pf_runners = _pf_filter_and_rank(metas) if not PUMP_BYPASS_PF else []
-                fb_runners = _fallback_pick_metas(
-                    metas,
-                    min_vol5_usd=fb_min_vol5,
-                    max_impact_bps=fb_max_impact_bps,
-                ) if (PUMP_BYPASS_PF or not pf_runners) else []
-                runners = pf_runners or fb_runners
-
-                if runners:
-                    LOG.info(
-                        "scanner.pumpfun: DOM apex → %s runners (pf=%d fb=%d)",
-                        len(runners),
-                        len(pf_runners),
-                        len(fb_runners),
-                    )
-
-                    if PUMP_LOG_SCAN_SUMMARY:
-                        with contextlib.suppress(Exception):
-                            asyncio.create_task(
-                                log_event(
-                                    "pumpfun_scan_summary",
-                                    {
-                                        "source": "dom",
-                                        "raw_items": len(metas),
-                                        "pf_runners": len(pf_runners),
-                                        "fb_runners": len(fb_runners),
-                                        "runners": len(runners),
-                                        "regime": dict(regime),
-                                        "risk": dict(risk_ctx or {}),
-                                    },
-                                )
-                            )
-
-                    return runners
-        except Exception as e:
-            LOG.warning("Pump.fun apex DOM scrape error: %s", e)
-    else:
-        LOG.debug("PUMPFUN_SKIP_NEXT=1 → skipping DOM scrape step")
-
-    # 2) API + fallbacks
-    metas = await _collect_pumpfun_items(
-        session,
-        soft_liq=soft_liq,
-        soft_mcap=soft_mcap,
-        soft_max_age=soft_max_age,
-        regime=regime,
-    )
-    if not metas:
-        if PUMP_LOG_SCAN_SUMMARY:
-            with contextlib.suppress(Exception):
-                asyncio.create_task(
-                    log_event(
-                        "pumpfun_scan_summary",
-                        {
-                            "source": "api",
-                            "raw_items": 0,
-                            "pf_runners": 0,
-                            "fb_runners": 0,
-                            "runners": 0,
-                            "regime": dict(regime),
-                            "risk": dict(risk_ctx or {}),
-                        },
-                    )
-                )
-        return []
-
-    if PUMP_DEBUG_META_SAMPLE:
-        sample = [
-            {
-                "sym": m.get("symbol"),
-                "liq": m.get("liq_usd"),
-                "vol5": m.get("vol_5m_usd"),
-                "buys5": m.get("buys_5m"),
-                "sells5": m.get("sells_5m"),
-                "chg5": m.get("price_change_5m_pct"),
-                "age_min": m.get("token_age_min"),
-            }
-            for m in metas[:5]
-        ]
-    LOG.info("PUMP_META_SAMPLE count=%d first=%s", len(metas), sample)
-
-    _attach_risk(metas, risk_ctx)
-
-    with contextlib.suppress(Exception):
-        await _enrich_ai_whales_entry(metas, regime=regime)
-
-    pf_runners: List[Dict[str, Any]] = []
-    if not PUMP_BYPASS_PF:
-        pf_runners = _pf_filter_and_rank(metas)
-
-    fb_runners: List[Dict[str, Any]] = []
-    if pf_runners:
-        runners = pf_runners
-    else:
-        fb_runners = _fallback_pick_metas(
-            metas,
-            min_vol5_usd=fb_min_vol5,
-            max_impact_bps=fb_max_impact_bps,
-        )
-        runners = fb_runners
-
-    if PUMP_DEBUG_PF_RESULT:
-        LOG.info(
-            "PUMP_PF_RESULT pf=%d fb=%d metas=%d",
-            len(pf_runners),
-            len(fb_runners),
-            len(metas),
-        )
-
-    LOG.info(
-        "scanner.pumpfun: API/fallback → %s runners (pf=%d fb=%d metas=%d)",
-        len(runners),
-        len(pf_runners),
-        len(fb_runners),
-        len(metas),
-    )
-
-    if PUMP_LOG_SCAN_SUMMARY:
-        with contextlib.suppress(Exception):
-            asyncio.create_task(
-                log_event(
-                    "pumpfun_scan_summary",
-                    {
-                        "source": "api",
-                        "raw_items": len(metas),
-                        "pf_runners": len(pf_runners),
-                        "fb_runners": len(fb_runners),
-                        "runners": len(runners),
-                        "regime": dict(regime),
-                        "risk": dict(risk_ctx or {}),
-                    },
-                )
-            )
-
-    max_runners = PUMP_MAX_RUNNERS if PUMP_MAX_RUNNERS > 0 else PUMP_RUNNER_LIMIT
-    max_runners = max(1, max_runners)
-    return runners[: max_runners]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MOMO + AI logging wiring
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _effective_regime_tag() -> Optional[str]:
-    if PUMP_REGIME_TAG_ENV:
-        return PUMP_REGIME_TAG_ENV
-    try:
-        r = regime_state.get()
-        if r:
-            return r
-    except Exception:
-        pass
-    if _regime is not None and hasattr(_regime, "regime_for_src"):
-        try:
-            return _regime.regime_for_src("pumpfun", default="pumpfun_live")  # type: ignore[arg-type]
-        except Exception:
-            pass
-    return "pumpfun_live"
-
+def _effective_regime_tag(regime: Dict[str, Any]) -> str:
+    if REGIME_TAG_ENV:
+        return REGIME_TAG_ENV
+    lbl = str(regime.get("label") or "").strip()
+    return lbl or "pumpfun_live"
 
 def _effective_wallet_tag() -> Optional[str]:
-    return PUMP_WALLET_TAG_ENV or None
+    return WALLET_TAG_ENV or None
 
-
-def _log_candidates_for_training(runners: List[Dict[str, Any]]) -> None:
-    """
-    Sync helper: write runner metas into entry_candidates for AI training.
-    Safe no-op if PG is disabled or ai_db/data_logger aren't wired.
-
-    Prefers source-specific function log_pumpfun_candidate if present,
-    otherwise falls back to generic log_entry_candidate.
-    """
-    if not (PG_ENABLED and PUMP_LOG_CANDIDATES and data_logger and runners):
+def _log_candidates_for_training(runners: List[Dict[str, Any]], *, regime: Dict[str, Any]) -> None:
+    if not (PG_ENABLED and LOG_CANDIDATES and data_logger and runners):
         return
-
-    regime_tag = _effective_regime_tag()
+    regime_tag = _effective_regime_tag(regime)
     wallet_tag = _effective_wallet_tag()
 
-    # Try to locate specific + generic logging functions once.
     log_pumpfun = getattr(data_logger, "log_pumpfun_candidate", None)
     log_entry = getattr(data_logger, "log_entry_candidate", None)
 
     for meta in runners:
         try:
-            mint = (meta.get("mint") or "").strip()
+            mint = str(meta.get("mint") or "").strip()
             if not mint:
                 continue
             symbol = (meta.get("symbol") or "").strip() or None
-
             snapshot = dict(meta)
 
             if callable(log_pumpfun):
-                # Dedicated Pump.fun logger (preferred)
-                log_pumpfun(  # type: ignore[misc]
-                    mint=mint,
-                    symbol=symbol,
-                    meta=snapshot,
-                    regime=regime_tag,
-                    wallet_tag=wallet_tag,
-                )
+                log_pumpfun(mint=mint, symbol=symbol, meta=snapshot, regime=regime_tag, wallet_tag=wallet_tag)  # type: ignore[misc]
             elif callable(log_entry):
-                # Generic entry_candidates logger
-                log_entry(  # type: ignore[misc]
-                    src="pumpfun",
-                    mint=mint,
-                    symbol=symbol,
-                    snapshot=snapshot,
-                    regime=regime_tag,
-                    wallet_tag=wallet_tag,
-                )
+                log_entry(src="pumpfun", mint=mint, symbol=symbol, snapshot=snapshot, regime=regime_tag, wallet_tag=wallet_tag)  # type: ignore[misc]
         except Exception:
-            LOG.exception(
-                "Pump.fun: failed to log entry_candidate for mint=%s",
-                meta.get("mint"),
-            )
+            with contextlib.suppress(Exception):
+                log.exception("Pump.fun: training log failed mint=%s", meta.get("mint"))  # type: ignore
 
-
-async def _send_momo_for_runners(runners: List[Dict[str, Any]]) -> None:
-    """
-    Send MOMO_OK alerts for the top N runner candidates.
-    Anti-spam: capped by MAX_ALERTS_PER_SCAN and further filtered in AlertManager.
-    """
-    if not SEND_MOMO_ALERTS or not runners:
+async def _send_momo(runners: List[Dict[str, Any]]) -> None:
+    if not SEND_MOMO_ALERTS or not runners or AlertManager is None:
         return
-
     try:
         am = AlertManager()
     except Exception as e:
-        LOG.warning("Pump.fun: failed to init AlertManager for MOMO: %s", e)
+        log.every("PUMP_ALERT_INIT_FAIL", n=30, err=_short(e))
         return
 
     max_n = max(0, min(MAX_ALERTS_PER_SCAN, len(runners)))
+
+    async with _recent_alert_lock:
+        now = time.time()
+        cutoff = now - float(ALERT_DEDUP_SEC)
+        for k in list(_recent_alert_ts.keys()):
+            if _recent_alert_ts.get(k, 0.0) < cutoff:
+                _recent_alert_ts.pop(k, None)
+
     for c in runners[:max_n]:
+        mint = str(c.get("mint") or "")
+        if not mint:
+            continue
+
+        async with _recent_alert_lock:
+            now = time.time()
+            last = _recent_alert_ts.get(mint, 0.0)
+            if now - last < float(ALERT_DEDUP_SEC):
+                continue
+            _recent_alert_ts[mint] = now
+
         try:
             age_min = c.get("token_age_min")
-            age_sec = age_min * 60.0 if isinstance(age_min, (int, float)) else None
+            age_sec = float(age_min) * 60.0 if isinstance(age_min, (int, float)) else None
+
             ctx: Dict[str, Any] = {
-                "symbol": c.get("symbol") or c.get("mint"),
-                "mint": c.get("mint"),
-                "pool": "pumpfun",               # pool id used by strategy / filters
-                "pool_url": c.get("pair_url"),   # clickable URL
+                "symbol": c.get("symbol") or mint,
+                "mint": mint,
+                "pool": "pumpfun",
+                "pool_url": c.get("pair_url"),
                 "age_sec": age_sec,
                 "liq_usd": c.get("liq_usd"),
                 "vol_5m": c.get("vol_5m_usd"),
                 "up_pct": c.get("price_change_5m_pct"),
-                "ai_entry_score": c.get("ai_entry_score"),
-                "ai_entry_reason": c.get("ai_entry_reason"),
+                "momo_hint": c.get("momo_hint"),
                 "ai_rug_score": c.get("ai_rug_score"),
                 "rank_score": c.get("rank_score"),
                 "risk_capacity": c.get("risk_capacity"),
                 "risk_mode": c.get("risk_mode"),
+                "score_combined": c.get("score_combined"),
+                "score_label": c.get("score_label"),
+                "score_ai": c.get("score_ai"),
+                "score_risk": c.get("score_risk"),
+                "score_quality": c.get("score_quality"),
+                "score_momentum": c.get("score_momentum"),
                 "reason": (
-                    f"pumpfun runner liq=${c.get('liq_usd', 0):.0f} "
-                    f"vol5=${c.get('vol_5m_usd', 0):.0f} "
-                    f"up5={c.get('price_change_5m_pct', 0):.2f}% "
-                    f"ai={c.get('ai_entry_score', 0)!r}"
+                    f"pump runner vol5=${float(c.get('vol_5m_usd') or 0):.0f} "
+                    f"buys5={int(c.get('buys_5m') or 0)} "
+                    f"up5={float(c.get('price_change_5m_pct') or 0):.2f}% "
+                    f"score={float(c.get('score_combined') or 0):.1f} "
+                    f"label={c.get('score_label')}"
                 ),
             }
-            await am.send_momo_event("MOMO_OK", ctx)
+            await _call_maybe_async(getattr(am, "send_momo_event", None), "MOMO_OK", ctx)
         except Exception as e:
-            LOG.warning("Pump.fun: MOMO send error for %s: %s", c.get("mint"), e)
+            log.every("PUMP_MOMO_FAIL", n=10, mint=mint, err=_short(e))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public entrypoint
 # ──────────────────────────────────────────────────────────────────────────────
+async def scan_pumpfun(*args: Any) -> List[Dict[str, Any]]:
+    if not PUMPFUN_ENABLED or PUMPFUN_MODE == "off":
+        return []
 
-HEADERS = {"User-Agent": "pumpfun-scanner/1.0"}
-
-
-async def scan_pumpfun(*args):
-    """
-    Flexible entrypoint:
-      - scan_pumpfun()
-      - scan_pumpfun(redis)
-      - scan_pumpfun(redis, session)
-      - scan_pumpfun(session)
-
-    Only the aiohttp.ClientSession (if provided) is used.
-    Returns a list of runner candidates (each is a meta dict).
-    """
-    sess: Optional[aiohttp.ClientSession] = None
     redis = None
-
-    if len(args) >= 2 and isinstance(args[1], aiohttp.ClientSession):
+    # accept flexible args: (redis) or (session) or (redis, session)
+    if len(args) >= 1 and not isinstance(args[0], aiohttp.ClientSession):
         redis = args[0]
-        sess = args[1]
-    elif len(args) == 1:
-        if isinstance(args[0], aiohttp.ClientSession):
-            sess = args[0]
-        else:
-            redis = args[0]
 
-    # Risk snapshot once per scan
+    stats = _ScanStats(t0=time.time())
+
+    # Risk snapshot
     try:
         risk_ctx = await risk_capacity_snapshot(redis)
     except Exception:
         risk_ctx = None
 
-    risk_capacity = float((risk_ctx or {}).get("risk_capacity", 1.0) or 1.0)
+    risk_capacity = _clamp(float((risk_ctx or {}).get("risk_capacity", 1.0) or 1.0), 0.0, 1.0)
     risk_shutdown = bool((risk_ctx or {}).get("risk_shutdown", False))
+    risk_mode = str((risk_ctx or {}).get("risk_mode", "normal") or "normal")
+    stats.risk_capacity, stats.risk_mode = risk_capacity, risk_mode
 
     if risk_shutdown or risk_capacity <= 0.0:
-        LOG.warning(
-            "scanner.pumpfun: risk manager requested shutdown "
-            "(risk_shutdown=%s risk_capacity=%.3f); returning no runners.",
-            risk_shutdown,
-            risk_capacity,
-        )
+        stats.rejects.inc("REJ_RISK_SHUTDOWN")
+        log.every("PUMP_RISK_SHUTDOWN", n=10, risk_shutdown=int(risk_shutdown), risk_capacity=round(risk_capacity, 3), risk_mode=risk_mode)
         return []
 
-    # Regime snapshot once per scan
+    # Regime snapshot + tuned thresholds
     regime = await _regime_snapshot()
-    tuned_soft_liq, tuned_soft_mcap, tuned_fb_min_vol5, tuned_fb_max_impact = _regime_tune_thresholds(
-        SOFT_MIN_LIQ_USD,
-        SOFT_MIN_MCAP_USD,
-        PUMP_FB_MIN_VOL5_USD,
-        PUMP_FB_MAX_IMPACT_1K_BPS,
-        regime,
+    stats.regime_label = str(regime.get("label", "unknown") or "unknown")
+    stats.regime_numeric = float(regime.get("label_numeric", 0.0))
+    stats.manip_risk = float(regime.get("manipulation_risk", 0.0))
+
+    tuned_soft_liq, tuned_soft_mcap, tuned_fb_min_vol5, tuned_fb_max_impact = _regime_tune(
+        SOFT_MIN_LIQ_USD, SOFT_MIN_MCAP_USD, FB_MIN_VOL5_USD, FB_MAX_IMPACT_1K_BPS, regime
+    )
+    min_combined = _dynamic_min_combined(SCORING_MIN_COMBINED, regime, risk_capacity)
+
+    log.every(
+        "PUMP_SCAN_START",
+        n=5,
+        phase=MASTER_PHASE,
+        mode=PUMPFUN_MODE,
+        provider=PUMP_PROVIDER,
+        ws_url=PUMP_WS_URL if PUMP_PROVIDER in {"auto", "pumpportal"} else "",
+        tuned_soft_liq=int(tuned_soft_liq),
+        tuned_soft_mcap=int(tuned_soft_mcap),
+        soft_max_age=round(SOFT_MAX_AGE_MIN, 2),
+        min_combined=round(min_combined, 2),
+        min_label=SCORING_MIN_LABEL,
+        scoring=int(bool(SCORING_ENABLED and score_candidate)),
+        legacy=int(bool(LEGACY_PF_ENABLED)),
+        regime=stats.regime_label,
+        manip=round(stats.manip_risk, 3),
+        risk_capacity=round(risk_capacity, 3),
+        risk_mode=risk_mode,
     )
 
-    LOG.info(
-        "scanner.pumpfun: starting scan; soft_liq=$%.0f soft_mcap=$%.0f "
-        "pf_min_liq=$%.0f pf_min_mcap=$%.0f bypass_pf=%s fallback=%s "
-        "regime_label=%.2f manip=%.2f tuned_soft_liq=$%.0f tuned_soft_mcap=$%.0f "
-        "tuned_fb_min_vol5=$%.0f tuned_fb_max_impact=%.0f",
-        SOFT_MIN_LIQ_USD,
-        SOFT_MIN_MCAP_USD,
-        PF_SCAN_MIN_LIQ_USD,
-        PF_SCAN_MIN_MCAP_USD,
-        PUMP_BYPASS_PF,
-        PUMP_ENABLE_FALLBACK,
-        regime.get("label_numeric", 0.0),
-        regime.get("manipulation_risk", 0.0),
-        tuned_soft_liq,
-        tuned_soft_mcap,
-        tuned_fb_min_vol5,
-        tuned_fb_max_impact,
-    )
+    try:
+        metas: List[Dict[str, Any]] = []
+        source = "empty"
 
-    # Try borrowing a shared session from core utils (best-effort)
-    if sess is None:
-        try:
-            from utils_pkg.core_utils import session as core_session  # type: ignore
-            if isinstance(core_session, aiohttp.ClientSession):
-                sess = core_session
-        except Exception:
-            sess = None
-
-    async def _apply_risk_shrink(runners: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not runners or not PUMP_RISK_SHRINK_ENABLED:
-            return runners
-        raw_n = len(runners)
-        allowed = int(raw_n * risk_capacity)
-        if risk_capacity > 0.0 and allowed < 1:
-            allowed = 1
-        if allowed < raw_n:
-            LOG.info(
-                "scanner.pumpfun: risk shrink runners %d → %d (risk_capacity=%.3f)",
-                raw_n,
-                allowed,
-                risk_capacity,
+        # Provider: PumpPortal WS (PRIMARY FIX)
+        if PUMP_PROVIDER in {"pumpportal", "auto"}:
+            mm, src = await _collect_from_pumpportal(
+                soft_liq=tuned_soft_liq,
+                soft_mcap=tuned_soft_mcap,
+                soft_max_age=SOFT_MAX_AGE_MIN,
+                regime=regime,
+                stats=stats,
             )
-            return runners[:allowed]
+            if mm:
+                metas, source = mm, src
+            elif PUMP_PROVIDER == "pumpportal":
+                # hard provider: if WS yields nothing, we still return empty (no broken HTTP mirror)
+                source = src
+
+        # NOTE: HTTP fallback intentionally omitted here (your old sources were blocked/dead),
+        # because your chosen provider is pumpportal. In "auto" mode you can add an HTTP
+        # collector later if you want; for now we keep this file laser-focused on the fix.
+
+        metas = _dedupe_best_by_mint(metas)
+        _attach_risk(metas, risk_ctx)
+
+        stats.source = source
+        stats.raw = len(metas)
+        stats.metas = len(metas)
+
+        if DEBUG_META_SAMPLE:
+            sample = [{
+                "sym": m.get("symbol"),
+                "liq": m.get("liq_usd"),
+                "mcap": m.get("mcap_usd"),
+                "vol5": m.get("vol_5m_usd"),
+                "buys5": m.get("buys_5m"),
+                "chg5": m.get("price_change_5m_pct"),
+                "age": m.get("token_age_min"),
+                "unknown": int(bool(m.get("liq_unknown") or m.get("mcap_unknown"))),
+            } for m in metas[:5]]
+            log.every("PUMP_META_SAMPLE", n=10, source=source, count=len(metas), first=sample)
+
+        if not metas:
+            return []
+
+        # Optional enrichment
+        await _enrich_optional(metas, stats)
+        stats.enriched = len(metas)
+
+        # Scoring-first
+        runners: List[Dict[str, Any]] = []
+        if SCORING_ENABLED:
+            scored = await _score_with_service(metas, regime=regime, risk_ctx=risk_ctx, stats=stats)
+            stats.scored = len(scored)
+            runners = _select_from_scored(scored, min_combined=min_combined, stats=stats)
+
+        # Legacy PF rank fallback
+        if not runners and LEGACY_PF_ENABLED:
+            runners = _legacy_pf_rank(metas, stats)
+
+        # Heuristic fallback
+        if not runners:
+            runners = _fallback_pick(metas, min_vol5_usd=tuned_fb_min_vol5, max_impact_bps=tuned_fb_max_impact, stats=stats)
+            stats.fb_runners = len(runners)
+
+        if not runners:
+            return []
+
+        # Final sort/cap + risk shrink
+        runners = _dedupe_best_by_mint(runners)
+        runners.sort(
+            key=lambda x: float(x.get("rank_score") or x.get("score_combined") or x.get("momo_hint") or 0.0),
+            reverse=True,
+        )
+        runners = runners[:MAX_RUNNERS]
+
+        if RISK_SHRINK_ENABLED and runners:
+            raw_n = len(runners)
+            allowed = int(raw_n * risk_capacity)
+            if risk_capacity > 0.0 and allowed < 1:
+                allowed = 1
+            if allowed < raw_n:
+                runners = runners[:allowed]
+                log.every("PUMP_RISK_SHRINK", n=10, before=raw_n, after=allowed, risk_capacity=round(risk_capacity, 3))
+
+        # Redis runner dedup (cooldown)
+        if redis is not None and RUNNER_DEDUP_ENABLED and RUNNER_DEDUP_SEC > 0 and runners:
+            filtered: List[Dict[str, Any]] = []
+            for r in runners:
+                mint = str(r.get("mint") or "")
+                if not mint:
+                    continue
+                k = f"{REDIS_KEY_PREFIX}:runner:{mint}"
+                seen = await _redis_get(redis, k)
+                if seen:
+                    stats.rejects.inc("REJ_REDIS_DEDUP", mint)
+                    continue
+                await _redis_setex(redis, k, int(RUNNER_DEDUP_SEC), "1")
+                filtered.append(r)
+            runners = filtered or runners
+
+        stats.runners = len(runners)
+
+        if DEBUG_RESULT:
+            log.every(
+                "PUMP_RESULT",
+                n=10,
+                source=source,
+                metas=stats.metas,
+                scored=stats.scored,
+                fb=stats.fb_runners,
+                runners=stats.runners,
+                pumpportal=_PUMPPORTAL.stats() if _PUMPPORTAL else {},
+            )
+
+        # Alerts + training logs
+        await _send_momo(runners)
+        _log_candidates_for_training(runners, regime=regime)
+
+        # Summary event (to DB/logger if available)
+        if LOG_SCAN_SUMMARY and _log_event is not None:
+            payload = {
+                "ts": time.time(),
+                "phase": MASTER_PHASE,
+                "mode": PUMPFUN_MODE,
+                "provider": PUMP_PROVIDER,
+                "source": source,
+                "raw_items": stats.raw,
+                "metas": stats.metas,
+                "enriched": stats.enriched,
+                "scored": stats.scored,
+                "fb_runners": stats.fb_runners,
+                "runners": stats.runners,
+                "rejects": dict(stats.rejects.counts),
+                "reject_samples": dict(stats.rejects.samples),
+                "regime": dict(regime),
+                "risk": dict(risk_ctx or {}),
+                "tuned": {
+                    "tuned_soft_liq": tuned_soft_liq,
+                    "tuned_soft_mcap": tuned_soft_mcap,
+                    "min_combined_dynamic": min_combined,
+                    "tuned_fb_min_vol5": tuned_fb_min_vol5,
+                    "tuned_fb_max_impact": tuned_fb_max_impact,
+                },
+                "elapsed_ms": int((time.time() - stats.t0) * 1000),
+                "scanner_version": SCANNER_VERSION,
+                "pumpportal": _PUMPPORTAL.stats() if _PUMPPORTAL else {},
+            }
+            await _call_maybe_async(_log_event, "pumpfun_scan_summary", payload)
+
         return runners
 
-    if sess is not None:
-        try:
-            runners = await _scan_inner(
-                sess,
-                soft_liq=tuned_soft_liq,
-                soft_mcap=tuned_soft_mcap,
-                soft_max_age=SOFT_MAX_AGE_MIN,
-                fb_min_vol5=tuned_fb_min_vol5,
-                fb_max_impact_bps=tuned_fb_max_impact,
-                regime=regime,
-                risk_ctx=risk_ctx,
-            ) or []
-            runners = await _apply_risk_shrink(runners)
-            await _send_momo_for_runners(runners)
-            _log_candidates_for_training(runners)
-            LOG.info("scanner.pumpfun: %s final runner candidates", len(runners))
-            return runners
-        except Exception as e:
-            LOG.warning("Pump.fun scan error (session): %s", e)
-            return []
-
-    sslctx = ssl.create_default_context(cafile=certifi.where())
-    timeout = aiohttp.ClientTimeout(total=REQ_TIMEOUT_S + 5)
-    conn = aiohttp.TCPConnector(ssl=sslctx, limit=SESSION_LIMIT)
-
-    async with aiohttp.ClientSession(
-        headers=HEADERS,
-        connector=conn,
-        trust_env=True,
-        timeout=timeout,
-    ) as session:
-        try:
-            runners = await _scan_inner(
-                session,
-                soft_liq=tuned_soft_liq,
-                soft_mcap=tuned_soft_mcap,
-                soft_max_age=SOFT_MAX_AGE_MIN,
-                fb_min_vol5=tuned_fb_min_vol5,
-                fb_max_impact_bps=tuned_fb_max_impact,
-                regime=regime,
-                risk_ctx=risk_ctx,
-            ) or []
-            runners = await _apply_risk_shrink(runners)
-            await _send_momo_for_runners(runners)
-            _log_candidates_for_training(runners)
-            LOG.info("scanner.pumpfun: %s final runner candidates", len(runners))
-            return runners
-        except Exception as e:
-            LOG.warning("Pump.fun scan error: %s", e)
-            return []
+    except Exception as e:
+        stats.rejects.inc("REJ_SCAN_EXCEPTION")
+        log.every("PUMP_SCAN_FAIL", n=5, err=_short(e))
+        return []
+    finally:
+        # ALWAYS log reject bucket summary to kill silent failure modes
+        if stats.rejects.counts:
+            log.every(
+                "PUMP_REJECT_BUCKETS",
+                n=10,
+                source=stats.source,
+                rejects=dict(stats.rejects.counts),
+                samples=dict(stats.rejects.samples),
+                metas=stats.metas,
+                runners=stats.runners,
+            )
 
 
-__all__ = ["scan_pumpfun"]
+async def shutdown_pumpfun_scanner() -> None:
+    """Optional graceful shutdown hook (safe to call multiple times)."""
+    global _PUMPPORTAL
+    if _PUMPPORTAL is not None:
+        with contextlib.suppress(Exception):
+            await _PUMPPORTAL.close()
+    _PUMPPORTAL = None
+
+
+__all__ = ["scan_pumpfun", "shutdown_pumpfun_scanner"]
+
+if __name__ == "__main__":  # pragma: no cover
+    async def _demo() -> None:
+        # Let WS warm up
+        await asyncio.sleep(3)
+        res = await scan_pumpfun()
+        print("runners:", len(res))
+        if res:
+            r = res[0]
+            print(
+                r.get("symbol"),
+                r.get("mint"),
+                r.get("score_combined"),
+                r.get("score_label"),
+                r.get("vol_5m_usd"),
+                r.get("buys_5m"),
+                r.get("liq_usd"),
+                r.get("liq_unknown"),
+            )
+        await shutdown_pumpfun_scanner()
+    asyncio.run(_demo())

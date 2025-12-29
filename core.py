@@ -186,7 +186,7 @@ async def _graceful_cancel(tasks: list[asyncio.Task]):
 
 
 async def main():
-await ensure_proxy_ok()
+    await ensure_proxy_ok()
     # 1) env + config summary
     # Ensure Jito tip accounts env is populated when left blank
     await ensure_jito_tip_accounts_env()

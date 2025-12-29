@@ -1,191 +1,302 @@
 # utils_pkg/reinvestor.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
-utils_pkg/reinvestor.py
+Reinvestor — V3+++ / God-Tier LOCK-IN (Master Roadmap Phase 0–7)
+================================================================
 
-God-tier reinvestment flywheel (V4 / V3+++ / Phase 6–7)
-=======================================================
-
-Role
+Goal
 ----
-Turns *realized SOL profits* into a compounding engine that is:
+Turn realized proceeds into a compounding flywheel, safely + observably:
 
-  • Risk-aware        → respects global risk capacity, DD, trade caps & equity
-  • Strategy-aware    → follows self-learning plan, Kelly, equity curve
-  • Regime-aware      → scales aggressiveness by market regime & stress
-  • Tail-risk-aware   → leans harder to savings when tail risk is elevated
-  • Budget-aware      → respects spend budgets from risk_manager (if provided)
-  • AI-aware          → uses AI capacity signals & edge quality
-  • Infra-aware       → doesn’t push size when RPC/JUP infra is unhealthy
-  • Mode-aware        → snowball / balanced / harvest / repair / off
-  • Self-learning     → journals decisions & results back into the strategy brain
-  • Analytics-first   → exposes preview/explain endpoints for dashboards/backtests
-
-Core behaviour
---------------
-Given realized proceeds in SOL:
-
-    1) Enforce global guards:
-         - min profit (SOL / USD)
-         - daily DD / PnL locks
-         - equity floor (env + risk_manager flags)
-         - daily reinvest count caps
-         - min minutes between reinvests
-         - risk_manager.should_allow_new_entry + mode/capacity
-         - spend budget from risk_manager (if present)
-         - infra_guard blocks (halt/degrade)
-         - tail-risk hard gate (optional)
-         - capital mode → “off / repair / harvest / balanced / snowball”
-         - optional risk tags from risk_manager: e.g. "halt_all", "reinvestor_off"
-
-    2) Build a ReinvestContext from:
-         - risk_manager.risk_capacity_snapshot(...)
-         - self_learning_ai_strategy.get_strategy_params / get_perf_snapshot
-         - infra_guard.infra_features(...)
-         - plan / Kelly / regime / AI capacity snapshot
-         - spend budget / equity floor flags (if risk_manager exposes them)
-
-    3) Compute effective reinvest % (eff_pct) via scaling stack:
-           base REINVEST_PERCENT (from strategy brain / risk_manager)
-         × capacity_scale(risk_capacity, risk_mode, STRAT_MODE)
-         × dd_scale(daily DD band)
-         × kelly_scale(Kelly suggestion + confidence)
-         × plan_scale(plan_gap / status)
-         × regime_scale(regime label/stress/signal/gate)
-         × ai_scale(ai_capacity_delta)
-         × perf_scale(winrate + Sharpe-like)
-         × profile_scale(meta.profile/bucket)
-         × mode_scale(capital mode: snowball/harvest/repair/off)
-         × infra_scale(infra health / halted / degraded)
-         × tail_scale(tail_risk_score from risk_manager, if present)
-
-    4) Apply:
-         - ALWAYS savings skim (%)
-         - meta overrides (force_eff_pct, min/max_eff_pct)
-         - global clamps (REINVEST_MIN_EFF_PCT / REINVEST_MAX_EFF_PCT)
-         - equity-based caps (MAX_RISK_PER_TRADE * equity)
-         - USD caps (REINVEST_MAX_SINGLE_USD)
-         - optional budget fraction gate vs spend_remaining_usd
-
-    5) Split:
-         • savings_sol  = proceeds_sol - reinvest_sol
-         • reinvest_sol = proceeds_sol * eff_pct
-
-       Send savings to savings wallet (best-effort),
-       pick reinvest mint via:
-         0) meta["force_token_mint"] / ["target_mint"] override
-         1) smart_wallets.pick_reinvestment_target(...)
-         2) legacy find_reinvestment_token(...)
-
-    6) Execute buy via Jupiter router, persist position, journal to:
-         • self_learning_ai_strategy (note_reinvest_decision / result / skipped)
-         • Notion (log_to_notion)
-         • data_logger (log_event)
-         • Telegram alert
+  1) Build context   (risk/regime/perf/infra/tail/budget/plan)
+  2) Gate            (hard stops + health thresholds + idempotency + locks)
+  3) Split           (reinvest vs savings)
+  4) Select target   (smart_wallets preferred; legacy fallback)
+  5) Execute buy     (Jupiter via core_utils.swap_token_jupiter; drift tolerant)
+  6) Persist + hook  (positions + optional ai_sell_logic/exit_engine hooks)
+  7) Queue + worker  (Redis BLPOP; DLQ; stale-job drop; TG rate-limit)
 
 Public API
 ----------
-    async def reinvest(
-        proceeds_sol: float,
-        meta: dict | None = None,
-        redis=None,
-    ) -> str | None
+    async def reinvest(proceeds_sol: float, meta: dict|None = None, redis=None) -> str|None
+    async def queue_reinvest(proceeds_sol: float, meta: dict|None = None, redis=None) -> None
+    async def run_reinvest_worker(redis=None, poll_interval: float = 2.0, stop_evt: asyncio.Event|None = None) -> None
+    async def preview_reinvest_split(proceeds_sol: float, meta: dict|None = None, redis=None) -> dict|None
+    async def explain_reinvest_decision(proceeds_sol: float, meta: dict|None = None, redis=None) -> dict|None
+    async def handle_sell_filled_event(ev: dict, redis=None) -> None
+    async def dry_run_reinvest(proceeds_sol: float, meta: dict|None = None, redis=None) -> dict|None
 
-    async def queue_reinvest(
-        proceeds_sol: float,
-        meta: dict | None = None,
-        redis=None,
-    ) -> None
+    # extra helpers (Step 1+2 quality-of-life):
+    async def get_reinvest_health(redis=None) -> dict|None
+    async def get_last_reinvest_decision(redis=None) -> dict|None
+    async def get_recent_reinvest_decisions(limit: int = 50, redis=None) -> list[dict]
 
-    async def run_reinvest_worker(
-        redis=None,
-        poll_interval: float = 2.0,
-        stop_evt: asyncio.Event | None = None,
-    ) -> None
+Meta conventions (optional)
+---------------------------
+    force_token_mint / target_mint      -> force reinvest into this mint (still allow/deny checked)
+    dry_run                             -> simulate only; no swap; still decision + health snapshot
+    sandbox / sandbox_mode              -> implies dry_run
+    force_savings_only                  -> do not reinvest (route to savings)
+    force_reinvest_even_if_risk_blocked -> bypass most gates (NOT drawdown hard stop)
+    reinvest_profit_only                -> if consuming sell events, use realized profit only
+    ignore_*_gate flags                 -> selectively bypass gates (time/infra/health/balance)
 
-    async def get_reinvest_health(redis=None) -> dict | None
-
-    async def preview_reinvest_split(
-        proceeds_sol: float,
-        meta: dict | None = None,
-        redis=None,
-    ) -> dict | None
-
-    async def explain_reinvest_decision(
-        proceeds_sol: float,
-        meta: dict | None = None,
-        redis=None,
-    ) -> dict | None
-
-
-Meta fields
------------
-meta can optionally contain:
-    • force_savings_only: bool          → route 100% to savings (no reinvest)
-    • dry_run: bool                     → compute & log but no swap
-    • sandbox: bool                     → force sandbox/dry-run behaviour
-    • force_eff_pct: float              → override effective reinvest % (0–100)
-    • min_eff_pct / max_eff_pct: float  → local clamps on eff %
-    • force_token_mint: str             → reinvest into a specific token mint
-    • ignore_health_gate: bool          → allow even if health score is low
-    • ignore_time_gate: bool            → bypass min-minutes-between-reinvests
-    • ignore_infra_gate: bool           → bypass infra health gates
-    • force_reinvest_even_if_risk_blocked: bool
-        - *For backtests / simulations only*: allow reinvest even if
-          should_allow_new_entry() == False (still respects DD hard stops, etc.)
-    • mode / reinvest_mode: str         → per-job capital mode override
-
-    • tag: str                          → source tag for position payload / logs
-    • profile / bucket / reinvest_profile: str
-        - "core", "growth", "explore", "defensive", "degen" etc.
-    • origin_trade_id / origin_position_id: str
-    • cycle_id / strategy_version / debug tags: any extra labels for self-learning
+Notes
+-----
+- Engineering system. No profit guarantees.
+- Designed to tolerate signature drift across your utils_pkg modules.
 """
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import logging
 import os
-from dataclasses import dataclass
+import secrets
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
-# ============================================================================ #
-# Redis handling
-# ============================================================================ #
+# ──────────────────────────────────────────────────────────────────────────────
+# Logger
+# ──────────────────────────────────────────────────────────────────────────────
+def _get_logger() -> logging.Logger:
+    with contextlib.suppress(Exception):
+        from logging_setup import get_logger  # type: ignore
+        return get_logger("sniper.reinvestor")
+    lg = logging.getLogger("sniper.reinvestor")
+    if not lg.handlers:
+        logging.basicConfig(level=logging.INFO)
+    return lg
 
-try:  # optional dependency
+
+log = _get_logger()
+
+
+def _log_every(key: str, n: int = 30) -> bool:
+    """Simple in-process rate limiter for repetitive logs."""
+    try:
+        store = getattr(_log_every, "_store")  # type: ignore[attr-defined]
+    except Exception:
+        store = {}
+        setattr(_log_every, "_store", store)  # type: ignore[attr-defined]
+    c = int(store.get(key, 0)) + 1
+    store[key] = c
+    return c % max(1, int(n)) == 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Small utils
+# ──────────────────────────────────────────────────────────────────────────────
+SOL_MINT = "So11111111111111111111111111111111111111112"
+
+
+def _envs(k: str, d: str = "") -> str:
+    v = os.getenv(k)
+    return (v if v is not None else d).strip()
+
+
+def _envb(k: str, d: bool = False) -> bool:
+    v = _envs(k, "")
+    if v == "":
+        return d
+    return v.lower() in {"1", "true", "yes", "y", "on", "t"}
+
+
+def _envi(k: str, d: int) -> int:
+    try:
+        return int(_envs(k, str(d)))
+    except Exception:
+        return d
+
+
+def _envf(k: str, d: float) -> float:
+    try:
+        return float(_envs(k, str(d)))
+    except Exception:
+        return d
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_ts() -> float:
+    return _now_utc().timestamp()
+
+
+def _today_ymd() -> str:
+    return _now_utc().strftime("%Y%m%d")
+
+
+def _today_key(prefix: str) -> str:
+    return f"{prefix}:{_today_ymd()}"
+
+
+def _is_weekend(dt: Optional[datetime] = None) -> bool:
+    dt = dt or _now_utc()
+    return dt.weekday() >= 5
+
+
+def _safe_float(x: Any, d: float = 0.0) -> float:
+    try:
+        if x is None:
+            return d
+        return float(x)
+    except Exception:
+        return d
+
+
+def _safe_int(x: Any, d: int = 0) -> int:
+    try:
+        if x is None:
+            return d
+        return int(float(x))
+    except Exception:
+        return d
+
+
+def _maybe_decode(x: Any) -> Any:
+    if isinstance(x, (bytes, bytearray)):
+        with contextlib.suppress(Exception):
+            return x.decode("utf-8", errors="ignore")
+    return x
+
+
+async def _maybe_await(x: Any) -> Any:
+    return await x if asyncio.iscoroutine(x) else x
+
+
+async def _call_any(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """
+    Best-effort call adapter:
+      - tries fn(*args, **kwargs)
+      - if TypeError, retries without kwargs
+    """
+    if not callable(fn):
+        raise TypeError("fn not callable")
+    try:
+        return await _maybe_await(fn(*args, **kwargs))
+    except TypeError:
+        return await _maybe_await(fn(*args))
+
+
+def _phase() -> int:
+    try:
+        p = int(_envs("MASTER_PHASE", _envs("STRATEGY_PHASE", "7")) or "7")
+    except Exception:
+        p = 7
+    return max(0, min(7, p))
+
+
+def _normalize_slippage(x: float) -> float:
+    """
+    Accepts slippage as:
+      - fraction (0.005 = 0.5%)
+      - percent  (0.5 = 0.5%)  [treated as percent if >= 0.1]
+      - bps      (50 = 50 bps) [treated as bps if >= 5]
+    Returns fraction in [0, 0.25].
+    """
+    try:
+        v = float(x)
+    except Exception:
+        return 0.005
+    if v <= 0:
+        return 0.0
+    if v >= 5.0:
+        v = v / 10_000.0
+    elif v >= 0.1:
+        v = v / 100.0
+    return max(0.0, min(0.25, v))
+
+
+# Optional mint normalization (single source if available)
+try:
+    from utils_pkg.mints import normalize_mint  # type: ignore
+except Exception:  # pragma: no cover
+    def normalize_mint(x: str) -> str:
+        return (x or "").strip()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional redis.asyncio import
+# ──────────────────────────────────────────────────────────────────────────────
+try:
     import redis.asyncio as aioredis  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover
     aioredis = None  # type: ignore[assignment]
 
-# Shared Redis + core helpers
-from utils_pkg.core_utils import (
-    get_token_price,
-    swap_token_jupiter,
-    send_telegram,
-    log_to_notion,
-    transfer_to_savings,
+
+async def _redis_call(redis: Any, fn_name: str, *args: Any, **kwargs: Any) -> Any:
+    fn = getattr(redis, fn_name, None)
+    if not callable(fn):
+        raise AttributeError(fn_name)
+    try:
+        out = fn(*args, **kwargs)
+    except TypeError:
+        out = fn(*args)
+    return await _maybe_await(out)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core helpers (single source of truth) — tolerate sync/async drift
+# ──────────────────────────────────────────────────────────────────────────────
+from utils_pkg.core_utils import (  # type: ignore
     convert_sol_to_usd_amount,
+    get_token_price,
+    log_to_notion,
     redis as shared_redis,
+    send_telegram,
+    swap_token_jupiter,
+    transfer_to_savings,
 )
 
-# Infra health (RPC / JUP) — may be absent in older setups
 try:
-    from utils_pkg.infra_guard import (
+    from utils_pkg.core_utils import get_wallet_balance_sol  # type: ignore
+except Exception:  # pragma: no cover
+    get_wallet_balance_sol = None  # type: ignore[assignment]
+
+try:
+    from utils_pkg.data_logger import log_event  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    async def log_event(*_: Any, **__: Any) -> None:
+        return None
+
+
+# Position persistence — prefer shared positions.save_position, fallback to local file
+try:
+    from positions import save_position  # type: ignore
+except Exception:  # pragma: no cover
+    def save_position(mint: str, data: Dict[str, Any]) -> None:
+        os.makedirs("data", exist_ok=True)
+        path = os.path.join("data", "positions.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cur = json.load(f)
+        except Exception:
+            cur = {}
+        cur[mint] = data
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cur, f, indent=2)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional modules (soft imports)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from utils_pkg.infra_guard import (  # type: ignore
         infra_features,
         should_block_entries as infra_should_block_entries,
-    )  # type: ignore
+    )
 except Exception:  # pragma: no cover
-
     async def infra_features(redis=None) -> Dict[str, float]:
-        # Conservative "OK-ish" default if infra_guard not installed
         return {
             "infra_rpc_latency_ms": 0.0,
             "infra_jup_latency_ms": 0.0,
-            "infra_rpc_latency_norm": 0.0,
-            "infra_jup_latency_norm": 0.0,
             "infra_error_streak": 0.0,
             "infra_state_is_healthy": 1.0,
             "infra_state_is_degraded": 0.0,
@@ -198,28 +309,25 @@ except Exception:  # pragma: no cover
         return False
 
 
-# Self-learning brain (strategy knobs + stats + journaling hooks)
 try:
-    from utils_pkg.self_learning_ai_strategy import (
-        get_strategy_params,
+    from utils_pkg.self_learning_ai_strategy import (  # type: ignore
         get_perf_snapshot,
+        get_strategy_params,
         note_reinvest_decision,
         note_reinvest_result,
         note_reinvest_skipped,
     )
 except Exception:  # pragma: no cover
-
     async def get_strategy_params(_redis=None) -> Dict[str, Any]:
-        # Minimal safe defaults if the real module is missing
         return {
-            "REINVEST_PERCENT": float(os.getenv("REINVEST_PERCENT", "75.0")),
-            "STOP_LOSS_PERCENT": float(os.getenv("STOP_LOSS_PERCENT", "18.0")),
-            "SLIPPAGE": float(os.getenv("SLIPPAGE", "0.005")),
-            "MIN_SOL_BALANCE": float(os.getenv("MIN_SOL_BALANCE", "0.25")),
-            "MAX_RISK_PER_TRADE": float(os.getenv("MAX_RISK_PER_TRADE", "0.05")),
-            "STRAT_MODE": 1,
-            "HARD_HALT": False,
-            "PLAN_TARGET_APR_PCT": 180.0,
+            "REINVEST_PERCENT": float(_envs("REINVEST_PERCENT", "75.0")),
+            "STOP_LOSS_PERCENT": float(_envs("STOP_LOSS_PERCENT", "18.0")),
+            "SLIPPAGE": float(_envs("SLIPPAGE", "0.005")),
+            "MIN_SOL_BALANCE": float(_envs("MIN_SOL_BALANCE", "0.25")),
+            "MAX_RISK_PER_TRADE": float(_envs("MAX_RISK_PER_TRADE", "0.05")),
+            "STRAT_MODE": int(_envs("STRAT_MODE", "1")),
+            "HARD_HALT": _envb("HARD_HALT", False),
+            "PLAN_TARGET_APR_PCT": float(_envs("PLAN_TARGET_APR_PCT", "180.0")),
             "PLAN_GAP_PCT": 0.0,
             "PLAN_STATUS": "n/a",
         }
@@ -237,321 +345,625 @@ except Exception:  # pragma: no cover
         return None
 
 
-# Risk context (global capacity / mode / gating / budgets)
 try:
-    from utils_pkg.risk_manager import (
+    from utils_pkg.risk_manager import (  # type: ignore
+        note_spend,
         risk_capacity_snapshot,
         should_allow_new_entry,
-        note_spend,
     )
 except Exception:  # pragma: no cover
-
-    async def risk_capacity_snapshot(_redis=None) -> Dict[str, Any]:
+    async def risk_capacity_snapshot(_redis=None, **_: Any) -> Dict[str, Any]:
         return {
             "risk_capacity": 1.0,
             "risk_mode": 1,
-            "winrate20": 0.0,
-            "rolling_dd_pct": 0.0,
-            "equity_usd": 0.0,
-            "daily_realized_pnl_usd": 0.0,
             "daily_realized_pnl_pct": 0.0,
             "daily_drawdown_pct": 0.0,
+            "equity_usd": 0.0,
+            "daily_trades_count": 0,
+            "daily_trades_cap": 0,
+            "sandbox_mode": False,
             "regime_label": "neutral",
-            "regime_risk_multiplier": 1.0,
             "regime_label_numeric": 0.0,
             "regime_stress_score": 0.0,
             "regime_signal_strength": 0.5,
             "regime_entry_gate_factor": 1.0,
-            "consecutive_losses": 0,
-            "cooldown_active": False,
+            "regime_risk_multiplier": 1.0,
             "max_risk_per_trade": 0.05,
-            "min_sol_balance": 0.0,
+            "min_sol_balance": 0.25,
             "strat_mode": 1,
-            "plan_equity_today_usd": 0.0,
             "plan_gap_pct": 0.0,
             "plan_status": "n/a",
-            "strat_daily_spend_cap_pct": 0.0,
-            "strat_daily_spend_cap_usd": 0.0,
-            "strat_max_concurrent_override": None,
             "ai_capacity_delta": 0.0,
             "halt_reason": None,
-            "daily_trades_count": 0,
-            "daily_trades_cap": 0,
-            "sandbox_mode": False,
-            "kelly_raw": 0.0,
-            "kelly_pos_pct_cap": 0.0,
-            "equity_override_usd": 0.0,
             "tail_risk_score": 0.0,
             "daily_spend_remaining_usd": 1e12,
             "spend_budget_block": False,
             "equity_floor_usd": 0.0,
             "equity_below_floor": False,
-            # optional tags for higher-level control
             "risk_tags": [],
+            "kelly_raw": 0.02,
+            "kelly_pos_pct_cap": 0.08,
+            "kelly_confidence": 0.0,
         }
 
-    async def should_allow_new_entry(_redis=None) -> bool:
+    async def should_allow_new_entry(_redis=None, **_: Any) -> bool:
         return True
 
-    async def note_spend(_redis, usd: float) -> None:
+    async def note_spend(_redis, usd: float, **_: Any) -> None:
         return None
 
 
-# Optional smart-wallet target picker (whales / alpha feeds / AI ranking)
 try:
     from utils_pkg.smart_wallets import pick_reinvestment_target  # type: ignore
 except Exception:  # pragma: no cover
     pick_reinvestment_target = None  # type: ignore[assignment]
 
 
-# Positions persistence (canonical storage)
-try:
-    from positions import save_position  # type: ignore
-except Exception:  # pragma: no cover
-
-    def save_position(mint: str, data: Dict[str, Any]) -> None:
-        """
-        Simple JSON-file fallback; prod should use DB-backed positions.
-        """
-        os.makedirs("data", exist_ok=True)
-        path = os.path.join("data", "positions.json")
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                cur = json.load(f)
-        except Exception:
-            cur = {}
-        cur[mint] = data
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cur, f, indent=2)
-
-
-# Legacy safety scanner (fallback)
 try:
     from find_reinvestment_token import find_reinvestment_token  # type: ignore
 except Exception:  # pragma: no cover
-
-    async def find_reinvestment_token(
-        min_volume: float,
-        honeypot_filter: bool,
-        **_: Any,
-    ) -> Optional[str]:
+    async def find_reinvestment_token(min_volume: float, honeypot_filter: bool, **_: Any) -> Optional[str]:
         return None
 
 
-# Optional structured logger (data lake / analytics)
+# Optional: post-buy hooks (avoid circular imports)
 try:
-    from utils_pkg.data_logger import log_event  # type: ignore[attr-defined]
+    from utils_pkg.ai_sell_logic import schedule_after_buy as _sell_schedule_after_buy  # type: ignore
 except Exception:  # pragma: no cover
+    _sell_schedule_after_buy = None  # type: ignore[assignment]
 
-    async def log_event(*_: Any, **__: Any) -> None:
+try:
+    from utils_pkg.exit_engine import register_position_after_buy as _exit_register_after_buy  # type: ignore
+except Exception:  # pragma: no cover
+    _exit_register_after_buy = None  # type: ignore[assignment]
+
+# Optional: new auto-exit worker hook (soft import; safe if absent)
+try:
+    from utils_pkg.auto_exit_worker.exit_engine import register_position_after_buy as _autoexit_register_after_buy  # type: ignore
+except Exception:  # pragma: no cover
+    _autoexit_register_after_buy = None  # type: ignore[assignment]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Redis keys
+# ──────────────────────────────────────────────────────────────────────────────
+REINVEST_QUEUE = _envs("REINVEST_QUEUE_KEY", "reinvest:queue")
+REINVEST_DLQ = _envs("REINVEST_DLQ_KEY", "reinvest:dlq")
+
+REINVEST_HEALTH_KEY = _envs("REINVEST_HEALTH_KEY", "reinvest:health")
+REINVEST_DECISION_KEY = _envs("REINVEST_DECISION_KEY", "reinvest:last_decision")
+REINVEST_DECISION_LIST_KEY = _envs("REINVEST_DECISION_LIST_KEY", "reinvest:decisions")
+
+REINVEST_DAILY_COUNT_KEY = _envs("REINVEST_DAILY_COUNT_KEY", "reinvest:daily")
+REINVEST_LAST_TS_KEY = _envs("REINVEST_LAST_TS_KEY", "reinvest:last_ts")
+REINVEST_FAIL_TS_KEY = _envs("REINVEST_FAIL_TS_KEY", "reinvest:last_fail_ts")
+REINVEST_TG_LAST_TS_KEY = _envs("REINVEST_TG_LAST_TS_KEY", "reinvest:tg:last_ts")
+
+REINVEST_SEEN_PREFIX = _envs("REINVEST_SEEN_PREFIX", "reinvest:seen")
+REINVEST_LOCK_PREFIX = _envs("REINVEST_LOCK_PREFIX", "reinvest:lock")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
+def _parse_mint_set(val: str) -> set[str]:
+    out: set[str] = set()
+    for part in (val or "").replace(";", ",").split(","):
+        s = part.strip()
+        if len(s) > 30:
+            out.add(normalize_mint(s))
+    return out
+
+
+@dataclass(frozen=True)
+class ReinvestCfg:
+    enabled: bool
+    global_dry_run: bool
+
+    min_proceeds_sol: float
+    min_proceeds_usd: float
+
+    vol_min_usd: float
+    honeypot_check: bool
+
+    allow_mints: set[str]
+    deny_mints: set[str]
+
+    savings_wallet: Optional[str]
+    always_savings_pct: float
+    savings_after_swap: bool
+
+    block_weekends: bool
+    min_capacity: float
+    defensive_capacity: float
+    min_equity_sol: float
+
+    dd_soft_stop_pct: float
+    dd_hard_stop_pct: float
+    pnl_lock_pct: float
+
+    health_min_winrate: float
+    health_min_recent_winrate: float
+    health_min_sharpe: float
+    health_min_score: float
+
+    infra_min_health: float
+    block_if_infra_halted: bool
+    block_if_infra_degraded: bool
+
+    tail_soft: float
+    tail_hard: float
+    tail_gate: float
+
+    min_eff_pct: float
+    max_eff_pct: float
+    max_single_usd: float
+    max_budget_fraction: float  # fraction of daily remaining spend budget
+
+    max_reinvests_per_day: int
+    min_minutes_between: float
+    queue_max_age_s: float
+    cooldown_on_fail_min: float
+
+    worker_batch: int
+    queue_maxlen: int
+    worker_backoff_s: float
+
+    idempotency_ttl_h: float
+    lock_enabled: bool
+    lock_ttl_s: int
+    lock_scope: str  # "job" or "global"
+
+    tg_min_seconds: float
+    decisions_keep: int
+
+    phase: int
+
+    @staticmethod
+    def from_env() -> "ReinvestCfg":
+        ph = _phase()
+        default_batch = 5 if ph <= 2 else (10 if ph <= 5 else 14)
+
+        allow = _parse_mint_set(_envs("REINVEST_ALLOW_MINTS", _envs("REINVEST_ALLOWLIST", "")))
+        deny = _parse_mint_set(_envs("REINVEST_DENY_MINTS", _envs("REINVEST_BLOCKLIST", "")))
+
+        scope = (_envs("REINVEST_LOCK_SCOPE", "job") or "job").strip().lower()
+        if scope not in ("job", "global"):
+            scope = "job"
+
+        return ReinvestCfg(
+            enabled=_envb("REINVESTOR_ENABLED", True),
+            global_dry_run=_envb("REINVEST_GLOBAL_DRY_RUN", False),
+
+            min_proceeds_sol=max(0.0, _envf("REINVESTMENT_MIN_PROCEEDS_SOL", _envf("REINVESTMENT_MIN_PROFIT_SOL", 0.01))),
+            min_proceeds_usd=max(0.0, _envf("REINVESTMENT_MIN_PROCEEDS_USD", _envf("REINVESTMENT_MIN_PROFIT_USD", 0.0))),
+
+            vol_min_usd=max(0.0, _envf("REINVESTMENT_VOLUME_MIN_USD", _envf("REINVESTMENT_VOLUME_MIN", 5000.0))),
+            honeypot_check=_envb("REINVESTMENT_HONEYPOT_CHECK", True),
+
+            allow_mints=allow,
+            deny_mints=deny,
+
+            savings_wallet=_envs("SAVINGS_WALLET", _envs("SAVINGS_WALLET_ADDRESS", "")) or None,
+            always_savings_pct=max(0.0, min(95.0, _envf("REINVEST_ALWAYS_SAVINGS_PCT", 0.0))),
+            savings_after_swap=_envb("REINVEST_SAVINGS_AFTER_SWAP", True),
+
+            block_weekends=_envb("REINVEST_BLOCK_WEEKENDS", False),
+            min_capacity=max(0.0, min(1.0, _envf("REINVEST_MIN_CAPACITY", 0.15))),
+            defensive_capacity=max(0.0, min(1.0, _envf("REINVEST_DEF_CAPACITY", 0.40))),
+            min_equity_sol=max(0.0, _envf("REINVEST_MIN_EQUITY_SOL", 0.0)),
+
+            dd_soft_stop_pct=max(0.0, _envf("REINVEST_DD_SOFT_STOP_PCT", 8.0)),
+            dd_hard_stop_pct=max(0.0, _envf("REINVEST_DD_HARD_STOP_PCT", 15.0)),
+            pnl_lock_pct=max(0.0, _envf("REINVEST_PNL_LOCK_PCT", 20.0)),
+
+            health_min_winrate=max(0.0, min(1.0, _envf("REINVEST_HEALTH_MIN_WINRATE", 0.40))),
+
+            health_min_recent_winrate=max(0.0, min(1.0, _envf("REINVEST_HEALTH_MIN_RECENT_WINRATE", 0.38))),
+            health_min_sharpe=_envf("REINVEST_HEALTH_MIN_SHARPE", -0.2),
+            health_min_score=max(0.0, _envf("REINVEST_HEALTH_MIN_SCORE", 0.0)),
+
+            infra_min_health=max(0.0, _envf("REINVEST_INFRA_MIN_HEALTH", 0.0)),
+            block_if_infra_halted=_envb("REINVEST_BLOCK_IF_INFRA_HALTED", True),
+            block_if_infra_degraded=_envb("REINVEST_BLOCK_IF_INFRA_DEGRADED", False),
+
+            tail_soft=max(0.0, min(1.0, _envf("REINVEST_TAIL_RISK_SOFT", 0.60))),
+            tail_hard=max(0.0, min(1.0, _envf("REINVEST_TAIL_RISK_HARD", 0.85))),
+            tail_gate=max(0.0, min(1.0, _envf("REINVEST_TAIL_RISK_GATE", 0.0))),
+
+            min_eff_pct=max(0.0, _envf("REINVEST_MIN_EFF_PCT", 0.0)),
+            max_eff_pct=max(0.0, min(95.0, _envf("REINVEST_MAX_EFF_PCT", 95.0))),
+            max_single_usd=max(0.0, _envf("REINVEST_MAX_SINGLE_USD", 0.0)),
+            max_budget_fraction=max(0.0, min(1.0, _envf("REINVEST_MAX_BUDGET_FRACTION", 0.0))),
+
+            max_reinvests_per_day=max(0, _envi("REINVEST_MAX_REINVESTS_PER_DAY", 0)),
+            min_minutes_between=max(0.0, _envf("REINVEST_MIN_MINUTES_BETWEEN_REINVESTS", 0.0)),
+            queue_max_age_s=max(0.0, _envf("REINVEST_QUEUE_MAX_AGE_S", 0.0)),
+            cooldown_on_fail_min=max(0.0, _envf("REINVEST_COOLDOWN_ON_FAIL_MIN", 0.0)),
+
+            worker_batch=max(1, _envi("REINVEST_WORKER_BATCH", default_batch)),
+            queue_maxlen=max(0, _envi("REINVEST_QUEUE_MAXLEN", 0)),
+            worker_backoff_s=max(0.25, _envf("REINVEST_WORKER_BACKOFF_S", 1.0)),
+
+            idempotency_ttl_h=max(1.0, _envf("REINVEST_IDEMPOTENCY_TTL_H", 48.0)),
+            lock_enabled=_envb("REINVEST_LOCK_ENABLED", True),
+            lock_ttl_s=max(5, _envi("REINVEST_LOCK_TTL_S", 45)),
+            lock_scope=scope,
+
+            tg_min_seconds=max(0.0, _envf("REINVEST_TG_MIN_SECONDS", 2.5)),
+            decisions_keep=max(10, _envi("REINVEST_DECISIONS_KEEP", 200)),
+
+            phase=ph,
+        )
+
+
+CFG: ReinvestCfg = ReinvestCfg.from_env()
+
+
+def reload_reinvestor_config() -> None:
+    global CFG
+    CFG = ReinvestCfg.from_env()
+    log.info(
+        "REINVEST_CFG_RELOADED enabled=%s dry=%s phase=%s batch=%s lock_scope=%s",
+        int(CFG.enabled),
+        int(CFG.global_dry_run),
+        CFG.phase,
+        CFG.worker_batch,
+        CFG.lock_scope,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Redis client + counters
+# ──────────────────────────────────────────────────────────────────────────────
+async def _get_redis(url: Optional[str] = None):
+    if shared_redis is not None:
+        return shared_redis
+    if aioredis is None:
+        return None
+    ru = url or _envs("REDIS_URL", "redis://localhost:6379")
+    try:
+        return aioredis.from_url(ru, decode_responses=True)
+    except Exception:
         return None
 
 
-logger = logging.getLogger("reinvestor")
-if not logger.handlers:
-    logging.basicConfig(level=logging.INFO)
-
-SOL_MINT = "So11111111111111111111111111111111111111112"
-
-REINVEST_QUEUE = "reinvest:queue"            # Redis list for queued jobs
-REINVEST_HEALTH_KEY = "reinvest:health"      # last health snapshot JSON
-REINVEST_DAILY_COUNT_KEY = "reinvest:daily"  # daily reinvest count prefix
-REINVEST_LAST_TS_KEY = "reinvest:last_ts"    # last successful reinvest ts
-
-__all__ = [
-    "reinvest",
-    "queue_reinvest",
-    "run_reinvest_worker",
-    "get_reinvest_health",
-    "preview_reinvest_split",
-    "explain_reinvest_decision",
-]
-
-# ============================================================================ #
-# Env knobs
-# ============================================================================ #
-
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-
-# Minimum realized profit to even consider splitting (in SOL)
-REINVESTMENT_MIN_PROFIT_SOL = float(
-    os.getenv("REINVESTMENT_MIN_PROFIT_SOL", "0.01")
-)
-
-# Optional min profit in USD (0 = disabled)
-REINVESTMENT_MIN_PROFIT_USD = float(
-    os.getenv("REINVESTMENT_MIN_PROFIT_USD", "0.0")
-)
-
-# Liquidity/volume floor for reinvestment targets (24h volume, USD)
-REINVESTMENT_VOLUME_MIN_USD = float(
-    os.getenv("REINVESTMENT_VOLUME_MIN_USD")
-    or os.getenv("REINVESTMENT_VOLUME_MIN", "5000")
-)
-
-REINVESTMENT_HONEYPOT_CHECK = (
-    os.getenv("REINVESTMENT_HONEYPOT_CHECK", "true").strip().lower()
-    in ("1", "true", "yes", "on")
-)
-
-SAVINGS_WALLET = os.getenv("SAVINGS_WALLET") or os.getenv("SAVINGS_WALLET_ADDRESS")
-
-# Extra knobs for risk-aware scaling
-REINVEST_MIN_CAPACITY = float(os.getenv("REINVEST_MIN_CAPACITY", "0.15"))
-REINVEST_DEFENSIVE_CAPACITY = float(os.getenv("REINVEST_DEF_CAPACITY", "0.40"))
-REINVEST_MAX_EFF_PCT = float(os.getenv("REINVEST_MAX_EFF_PCT", "95.0"))
-# Global lower bound for eff % (0 = allow full shrink)
-REINVEST_MIN_EFF_PCT = float(os.getenv("REINVEST_MIN_EFF_PCT", "0.0"))
-
-# Hard-cap the USD size of any single reinvestment (0 = off)
-REINVEST_MAX_SINGLE_USD = float(os.getenv("REINVEST_MAX_SINGLE_USD", "0"))
-
-# Optional: max fraction of *remaining* daily budget any single reinvest
-# is allowed to consume. 0 = disabled.
-REINVEST_MAX_BUDGET_FRACTION = float(
-    os.getenv("REINVEST_MAX_BUDGET_FRACTION", "0.0")
-)
-
-# Daily drawdown soft / hard stops (magnitudes in %)
-REINVEST_DD_HARD_STOP_PCT = float(
-    os.getenv("REINVEST_DD_HARD_STOP_PCT", "15.0")
-)
-REINVEST_DD_SOFT_STOP_PCT = float(
-    os.getenv("REINVEST_DD_SOFT_STOP_PCT", "8.0")
-)
-
-# Daily PnL lockout: when day PnL ≥ this, stop reinvesting (0 = disabled)
-REINVEST_PNL_LOCK_PCT = float(
-    os.getenv("REINVEST_PNL_LOCK_PCT", "20.0")
-)
-
-# Optional global kill switch for reinvestor (useful for debugging / manual mode)
-REINVESTOR_ENABLED = (
-    os.getenv("REINVESTOR_ENABLED", "1").strip().lower()
-    in ("1", "true", "yes", "on")
-)
-
-# Optional global dry-run: if set, all reinvest() calls act as dry_run
-REINVEST_GLOBAL_DRY_RUN = (
-    os.getenv("REINVEST_GLOBAL_DRY_RUN", "0").strip().lower()
-    in ("1", "true", "yes", "on")
-)
-
-# How many jobs the worker will process in one batch before a small pause
-REINVEST_WORKER_BATCH = int(os.getenv("REINVEST_WORKER_BATCH", "10"))
-
-# Optional weekend / off-hours guard for auto-reinvestment (0=off)
-REINVEST_BLOCK_WEEKENDS = (
-    os.getenv("REINVEST_BLOCK_WEEKENDS", "0").strip().lower()
-    in ("1", "true", "yes", "on")
-)
-
-# Optional minimum equity threshold for reinvestment (SOL-equivalent)
-REINVEST_MIN_EQUITY_SOL = float(os.getenv("REINVEST_MIN_EQUITY_SOL", "0.0"))
-
-# Health / performance gating (per-metric)
-REINVEST_HEALTH_MIN_WINRATE = float(
-    os.getenv("REINVEST_HEALTH_MIN_WINRATE", "0.40")
-)
-REINVEST_HEALTH_MIN_RECENT_WINRATE = float(
-    os.getenv("REINVEST_HEALTH_MIN_RECENT_WINRATE", "0.38")
-)
-REINVEST_HEALTH_MIN_SHARPE = float(
-    os.getenv("REINVEST_HEALTH_MIN_SHARPE", "-0.2")
-)
-
-# Aggregate health score gate (0–100, 0 = disabled)
-REINVEST_HEALTH_MIN_SCORE = float(
-    os.getenv("REINVEST_HEALTH_MIN_SCORE", "0.0")
-)
-
-# Infra-based gating
-REINVEST_INFRA_MIN_HEALTH = float(
-    os.getenv("REINVEST_INFRA_MIN_HEALTH", "0.0")  # 0 = disabled
-)
-REINVEST_BLOCK_IF_INFRA_HALTED = (
-    os.getenv("REINVEST_BLOCK_IF_INFRA_HALTED", "1").strip().lower()
-    in ("1", "true", "yes", "on")
-)
-REINVEST_BLOCK_IF_INFRA_DEGRADED = (
-    os.getenv("REINVEST_BLOCK_IF_INFRA_DEGRADED", "0").strip().lower()
-    in ("1", "true", "yes", "on")
-)
-
-# Optional skim: always send this % of proceeds straight to savings (0–100)
-REINVEST_ALWAYS_SAVINGS_PCT = float(
-    os.getenv("REINVEST_ALWAYS_SAVINGS_PCT", "0.0")
-)
-
-# Optional anti-overtrading limits
-REINVEST_MAX_REINVESTS_PER_DAY = int(
-    os.getenv("REINVEST_MAX_REINVESTS_PER_DAY", "0")  # 0 = unlimited
-)
-
-REINVEST_MIN_MINUTES_BETWEEN_REINVESTS = float(
-    os.getenv("REINVEST_MIN_MINUTES_BETWEEN_REINVESTS", "0.0")
-)
-
-# Tail-risk scaling thresholds for the new tail_scale
-# tail_risk_score is assumed in [0,1]; higher = more tail risk.
-REINVEST_TAIL_RISK_SOFT = float(os.getenv("REINVEST_TAIL_RISK_SOFT", "0.60"))
-REINVEST_TAIL_RISK_HARD = float(os.getenv("REINVEST_TAIL_RISK_HARD", "0.85"))
-
-# Optional hard gate: if tail_risk_score >= this, route 100% to savings (0 = disabled)
-REINVEST_TAIL_RISK_GATE = float(os.getenv("REINVEST_TAIL_RISK_GATE", "0.0"))
-
-# Capital mode: snowball / balanced / harvest / repair / off / ...
-REINVEST_MODE = os.getenv("REINVEST_MODE", "balanced").strip().lower()
-
-# ============================================================================ #
-# Dataclasses / context
-# ============================================================================ #
+async def _get_key_float(redis, key: str) -> Optional[float]:
+    if not redis:
+        return None
+    try:
+        raw = _maybe_decode(await _redis_call(redis, "get", key))
+        return float(raw) if raw else None
+    except Exception:
+        return None
 
 
+async def _set_key_float(redis, key: str, val: float) -> None:
+    if not redis:
+        return
+    try:
+        await _redis_call(redis, "set", key, str(float(val)))
+    except Exception:
+        return
+
+
+async def _get_last_reinvest_ts(redis) -> Optional[float]:
+    return await _get_key_float(redis, REINVEST_LAST_TS_KEY)
+
+
+async def _set_last_reinvest_ts(redis, ts: Optional[float] = None) -> None:
+    await _set_key_float(redis, REINVEST_LAST_TS_KEY, float(ts if ts is not None else _utc_ts()))
+
+
+async def _set_last_fail_ts(redis, ts: Optional[float] = None) -> None:
+    await _set_key_float(redis, REINVEST_FAIL_TS_KEY, float(ts if ts is not None else _utc_ts()))
+
+
+async def _get_last_fail_ts(redis) -> Optional[float]:
+    return await _get_key_float(redis, REINVEST_FAIL_TS_KEY)
+
+
+async def _bump_daily_reinvest_counter(redis) -> None:
+    if not redis:
+        return
+    key = _today_key(REINVEST_DAILY_COUNT_KEY)
+    try:
+        pipe = getattr(redis, "pipeline", None)
+        if callable(pipe):
+            p = pipe()
+            p.incr(key)
+            p.expire(key, 60 * 60 * 36)
+            await _maybe_await(p.execute())
+            return
+        await _redis_call(redis, "incr", key)
+        await _redis_call(redis, "expire", key, 60 * 60 * 36)
+    except Exception:
+        return
+
+
+async def _get_daily_reinvest_count(redis) -> int:
+    if not redis:
+        return 0
+    key = _today_key(REINVEST_DAILY_COUNT_KEY)
+    try:
+        raw = _maybe_decode(await _redis_call(redis, "get", key))
+        return int(raw or "0")
+    except Exception:
+        return 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Idempotency + locks
+# ──────────────────────────────────────────────────────────────────────────────
+def _id_key_from_meta(meta: Dict[str, Any]) -> Optional[str]:
+    for k in ("job_id", "origin_trade_id", "origin_position_id", "cycle_id", "tx_sig", "txid"):
+        v = meta.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _ensure_job_id(meta: Dict[str, Any], proceeds_sol: float) -> None:
+    if _id_key_from_meta(meta):
+        return
+    base = json.dumps({"p": float(proceeds_sol), "m": meta}, sort_keys=True, default=str).encode("utf-8")
+    h = hashlib.sha256(base).hexdigest()[:16]
+    meta["job_id"] = f"reinv-{int(_utc_ts())}-{h}"
+
+
+async def _idempotency_claim(redis, meta: Dict[str, Any]) -> bool:
+    """
+    True  => claimed (not seen before) OR best-effort (no redis / no id).
+    False => already processed.
+    """
+    if not redis:
+        return True
+    jid = _id_key_from_meta(meta)
+    if not jid:
+        return True
+    key = f"{REINVEST_SEEN_PREFIX}:{jid}"
+    ttl_s = int(max(1.0, CFG.idempotency_ttl_h) * 3600)
+    try:
+        ok = await _redis_call(redis, "set", key, "1", nx=True, ex=ttl_s)
+        return bool(ok)
+    except Exception:
+        return True
+
+
+_RELEASE_LUA = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+
+
+def _lock_key(meta: Dict[str, Any]) -> str:
+    if CFG.lock_scope == "global":
+        return REINVEST_LOCK_PREFIX
+    jid = _id_key_from_meta(meta) or "noid"
+    return f"{REINVEST_LOCK_PREFIX}:{jid}"
+
+
+async def _acquire_lock(redis, key: str, ttl_s: int) -> Optional[str]:
+    if (not redis) or (not CFG.lock_enabled):
+        return None
+    token = secrets.token_hex(12)
+    try:
+        ok = await _redis_call(redis, "set", key, token, nx=True, ex=max(1, int(ttl_s)))
+        return token if ok else None
+    except Exception:
+        return None
+
+
+async def _release_lock(redis, key: str, token: Optional[str]) -> None:
+    if not redis or not token:
+        return
+    try:
+        ev = getattr(redis, "eval", None)
+        if callable(ev):
+            await _maybe_await(ev(_RELEASE_LUA, 1, key, token))
+            return
+    except Exception:
+        pass
+    try:
+        cur = _maybe_decode(await _redis_call(redis, "get", key))
+        if cur == token:
+            await _redis_call(redis, "delete", key)
+    except Exception:
+        return
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pricing helpers
+# ──────────────────────────────────────────────────────────────────────────────
+async def _sol_to_usd(amount_sol: float) -> float:
+    try:
+        usd = await _maybe_await(convert_sol_to_usd_amount(float(amount_sol)))
+        return float(usd or 0.0)
+    except Exception:
+        return 0.0
+
+
+async def _token_price_in_sol(mint: str) -> float:
+    mint = normalize_mint(mint)
+    try:
+        px_usd = await _maybe_await(get_token_price(mint))
+        if px_usd is None or float(px_usd) <= 0:
+            return 0.0
+        sol_usd = await _maybe_await(convert_sol_to_usd_amount(1.0))
+        if sol_usd is None or float(sol_usd) <= 0:
+            return 0.0
+        return float(px_usd) / float(sol_usd)
+    except Exception:
+        return 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Telegram helpers (rate-limited via redis when available)
+# ──────────────────────────────────────────────────────────────────────────────
+async def _safe_tg(msg: str, redis=None) -> None:
+    if not msg:
+        return
+    if redis and CFG.tg_min_seconds > 0:
+        try:
+            raw = _maybe_decode(await _redis_call(redis, "get", REINVEST_TG_LAST_TS_KEY))
+            last = float(raw) if raw else 0.0
+            if last and (_utc_ts() - last) < float(CFG.tg_min_seconds):
+                return
+            await _redis_call(redis, "set", REINVEST_TG_LAST_TS_KEY, str(_utc_ts()))
+        except Exception:
+            pass
+    with contextlib.suppress(Exception):
+        await _maybe_await(send_telegram(msg))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Savings transfer (signature drift tolerant)
+# ──────────────────────────────────────────────────────────────────────────────
+async def _send_to_savings(amount_sol: float, redis=None) -> None:
+    if amount_sol <= 0:
+        return
+    if not CFG.savings_wallet:
+        if _log_every("savings_wallet_missing", n=20):
+            log.info("[REINVEST] SAVINGS_WALLET not set; keeping %.6f SOL in main wallet.", amount_sol)
+        return
+
+    try:
+        try:
+            await _maybe_await(transfer_to_savings(float(amount_sol)))
+        except TypeError:
+            await _maybe_await(transfer_to_savings(float(amount_sol), wallet=CFG.savings_wallet))
+        usd = await _sol_to_usd(amount_sol)
+        await _safe_tg(f"🏦 Moved {amount_sol:.4f} SOL (~${usd:.2f}) to savings wallet.", redis=redis)
+        with contextlib.suppress(Exception):
+            await log_event("reinvest_savings_transfer", {"amount_sol": amount_sol, "amount_usd": usd, "ts": _now_utc().isoformat()})
+    except Exception as e:
+        log.warning("[REINVEST] Savings transfer failed: %s", str(e)[:200])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Target selection
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class TargetPick:
+    mint: str
+    score: float = 0.0
+    symbol: Optional[str] = None
+    raw: Any = None
+
+
+def _mint_allowed(mint: str) -> bool:
+    m = normalize_mint(mint)
+    if not m or len(m) <= 30:
+        return False
+    if m in CFG.deny_mints:
+        return False
+    if CFG.allow_mints and m not in CFG.allow_mints:
+        return False
+    return True
+
+
+async def _pick_target_mint(reinvest_sol: float, meta: Dict[str, Any], redis=None) -> Optional[TargetPick]:
+    forced = meta.get("force_token_mint") or meta.get("target_mint")
+    if isinstance(forced, str) and _mint_allowed(forced):
+        return TargetPick(mint=normalize_mint(forced), score=9e9, symbol=meta.get("target_symbol"), raw={"forced": True})
+
+    # Prefer smart_wallets
+    if pick_reinvestment_target is not None:
+        out = None
+        try:
+            out = await pick_reinvestment_target(
+                budget_sol=reinvest_sol,
+                min_24h_volume_usd=CFG.vol_min_usd,
+                redis=redis,
+                meta=meta,
+            )
+        except TypeError:
+            with contextlib.suppress(Exception):
+                out = await pick_reinvestment_target(reinvest_sol)  # type: ignore[misc]
+        except Exception:
+            out = None
+
+        if isinstance(out, str) and _mint_allowed(out):
+            return TargetPick(mint=normalize_mint(out), score=1.0, raw=out)
+
+        if isinstance(out, dict):
+            mint = out.get("mint") or out.get("token") or out.get("address")
+            if isinstance(mint, str) and _mint_allowed(mint):
+                sym = out.get("symbol") or out.get("sym")
+                sc = _safe_float(out.get("score"), 0.0)
+                return TargetPick(mint=normalize_mint(mint), score=sc, symbol=str(sym) if sym else None, raw=out)
+
+        if isinstance(out, (list, tuple)):
+            best: Optional[TargetPick] = None
+            for cand in out:
+                if not isinstance(cand, dict):
+                    continue
+                mint = cand.get("mint") or cand.get("token") or cand.get("address")
+                if not isinstance(mint, str) or not _mint_allowed(mint):
+                    continue
+                sc = _safe_float(cand.get("score"), 0.0)
+                sym = cand.get("symbol") or cand.get("sym")
+                tp = TargetPick(mint=normalize_mint(mint), score=sc, symbol=str(sym) if sym else None, raw=cand)
+                if best is None or tp.score > best.score:
+                    best = tp
+            if best is not None:
+                return best
+
+    # Legacy fallback
+    try:
+        mint = await find_reinvestment_token(min_volume=float(CFG.vol_min_usd), honeypot_filter=bool(CFG.honeypot_check))
+        if isinstance(mint, str) and _mint_allowed(mint):
+            return TargetPick(mint=normalize_mint(mint), score=0.0, raw={"legacy": True})
+    except Exception as e:
+        log.warning("[REINVEST] legacy find_reinvestment_token failed: %s", str(e)[:200])
+
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Context + scoring models
+# ──────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ReinvestContext:
-    # Inputs
     proceeds_sol: float
+    proceeds_usd: float
+    meta: Dict[str, Any]
 
-    # Risk context
-    risk_capacity: float          # [0..1]
-    risk_mode: int                # 0=OFF,1=NORMAL,2=AGG,3=DEF
+    risk_capacity: float
+    risk_mode: int
     risk_mode_override: Optional[int]
     halt_reason: Optional[str]
-    daily_pnl_pct: float          # percent, +10 == +10%
-    daily_dd_pct: float           # percent magnitude, 8 == 8% DD
+
+    daily_pnl_pct: float
+    daily_dd_pct: float
+
     equity_usd: float
     equity_sol: float
+
     daily_trades_count: int
     daily_trades_cap: int
     sandbox_mode: bool
 
-    # Regime signals (from risk_manager / regime module)
     regime_label: str
-    regime_label_numeric: float      # ~[-1..+1]
-    regime_stress_score: float       # [0..1]
-    regime_signal_strength: float    # [0..1]
-    regime_entry_gate_factor: float  # ~0.2..1.5
+    regime_label_numeric: float
+    regime_stress_score: float
+    regime_signal_strength: float
+    regime_entry_gate_factor: float
     regime_risk_multiplier: float
 
-    # Strategy parameters
     base_reinvest_pct: float
     stop_loss_percent: float
     slippage: float
     min_sol_balance: float
     max_risk_per_trade: float
-    strat_mode: int      # 0=DEF,1=NEU,2=AGG from self-learning brain
+    strat_mode: int
     hard_halt: bool
 
-    # Equity-plan insight
     plan_target_apr_pct: float
     plan_gap_pct: float
     plan_status: str
 
-    # Performance stats / Kelly
     kelly_suggestion: float
     kelly_confidence: float
     kelly_pos_cap_pct: float
+
     win_rate: float
     recent_win_rate: float
     pnl_mean: float
@@ -559,38 +971,28 @@ class ReinvestContext:
     sharpe_like: float
     recent_sharpe_like: float
 
-    # Tail risk (optional, 0..1; higher = more tail risk)
     tail_risk_score: float
-
-    # Budget / equity floor (optional, from risk_manager)
     spend_remaining_usd: float
     spend_budget_block: bool
     equity_floor_usd: float
     equity_below_floor: bool
+    risk_tags: List[str] = field(default_factory=list)
 
-    # Infra / infra_guard
-    infra_health_score: float
-    infra_rpc_latency_ms: float
-    infra_jup_latency_ms: float
-    infra_state_is_healthy: float
-    infra_state_is_degraded: float
-    infra_state_is_halted: float
-    infra_stability_score: float
-    infra_raw: Dict[str, Any]
+    infra_health_score: float = 1.0
+    infra_rpc_latency_ms: float = 0.0
+    infra_jup_latency_ms: float = 0.0
+    infra_state_is_healthy: float = 1.0
+    infra_state_is_degraded: float = 0.0
+    infra_state_is_halted: float = 0.0
+    infra_stability_score: float = 1.0
+    infra_raw: Dict[str, Any] = field(default_factory=dict)
 
-    # Raw snapshots for logging / analytics
-    risk_ctx_raw: Dict[str, Any]
-    perf_raw: Dict[str, Any]
-
-    # Meta
-    meta: Dict[str, Any]
+    risk_ctx_raw: Dict[str, Any] = field(default_factory=dict)
+    perf_raw: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class ReinvestScales:
-    """
-    Debug / introspection helper: how we got from base_reinvest_pct to eff_pct.
-    """
     base_pct: float
     cap_scale: float
     dd_scale: float
@@ -602,7 +1004,7 @@ class ReinvestScales:
     profile_scale: float
     mode_scale: float
     infra_scale: float
-    tail_scale: float  # tail-risk scaling factor
+    tail_scale: float
 
     @property
     def eff_pct(self) -> float:
@@ -622,370 +1024,115 @@ class ReinvestScales:
         )
 
     def as_dict(self) -> Dict[str, float]:
-        return {
-            "base_pct": self.base_pct,
-            "cap_scale": self.cap_scale,
-            "dd_scale": self.dd_scale,
-            "kelly_scale": self.kelly_scale,
-            "plan_scale": self.plan_scale,
-            "regime_scale": self.regime_scale,
-            "ai_scale": self.ai_scale,
-            "perf_scale": self.perf_scale,
-            "profile_scale": self.profile_scale,
-            "mode_scale": self.mode_scale,
-            "infra_scale": self.infra_scale,
-            "tail_scale": self.tail_scale,
-            "eff_pct": self.eff_pct,
+        d = {
+            "base_pct": float(self.base_pct),
+            "cap_scale": float(self.cap_scale),
+            "dd_scale": float(self.dd_scale),
+            "kelly_scale": float(self.kelly_scale),
+            "plan_scale": float(self.plan_scale),
+            "regime_scale": float(self.regime_scale),
+            "ai_scale": float(self.ai_scale),
+            "perf_scale": float(self.perf_scale),
+            "profile_scale": float(self.profile_scale),
+            "mode_scale": float(self.mode_scale),
+            "infra_scale": float(self.infra_scale),
+            "tail_scale": float(self.tail_scale),
         }
+        d["eff_pct"] = float(self.eff_pct)
+        return d
 
 
-# ============================================================================ #
-# Redis helper
-# ============================================================================ #
+async def _build_context(proceeds_sol: float, meta: Dict[str, Any], redis) -> Optional[ReinvestContext]:
+    meta = dict(meta or {})
+    proceeds_sol = float(proceeds_sol or 0.0)
+    proceeds_usd = await _sol_to_usd(proceeds_sol)
 
-
-async def _get_redis(url: Optional[str] = None):
-    """
-    Prefer shared Redis from core_utils. Fallback to local aioredis client.
-    """
-    if shared_redis is not None:
-        return shared_redis
-    if aioredis is None:
-        logger.warning(
-            "redis (async) not installed; reinvest queue will run in direct mode."
-        )
-        return None
+    # risk snapshot (tolerate signature drift)
     try:
-        return aioredis.from_url(url or REDIS_URL, decode_responses=True)
-    except Exception:
-        return None
-
-
-# ============================================================================ #
-# Utility helpers
-# ============================================================================ #
-
-
-async def _sol_to_usd(amount_sol: float) -> float:
-    try:
-        usd = await convert_sol_to_usd_amount(float(amount_sol))
-        return float(usd or 0.0)
-    except Exception:
-        return 0.0
-
-
-async def _token_price_in_sol(mint: str) -> float:
-    """
-    Convert token USD price to SOL-based price:
-        px_sol = px_usd / sol_usd
-    so it's consistent with risk_manager / positions expectations.
-    """
-    try:
-        px_usd = await get_token_price(mint)
-        if px_usd is None or px_usd <= 0:
-            return 0.0
-        sol_usd = await convert_sol_to_usd_amount(1.0)
-        if sol_usd is None or sol_usd <= 0:
-            return 0.0
-        return float(px_usd) / float(sol_usd)
-    except Exception as e:
-        logger.debug("[REINVEST] _token_price_in_sol failed for %s: %s", mint, e)
-        return 0.0
-
-
-async def _send_to_savings(amount_sol: float) -> None:
-    """
-    Best-effort savings transfer. If no savings wallet configured, no-op.
-    """
-    if amount_sol <= 0:
-        return
-    if not SAVINGS_WALLET:
-        logger.info(
-            "[REINVEST] SAVINGS_WALLET not set; keeping %.6f SOL in main wallet.",
-            amount_sol,
-        )
-        return
-    try:
-        await transfer_to_savings(float(amount_sol))
-        usd = await _sol_to_usd(amount_sol)
-        logger.info(
-            "[REINVEST] Moved %.6f SOL (~$%.2f) to savings wallet.", amount_sol, usd
-        )
-        await send_telegram(
-            f"🏦 Moved {amount_sol:.4f} SOL (~${usd:.2f}) to savings wallet."
-        )
-        try:
-            await log_event(
-                "reinvest_savings_transfer",
-                {"amount_sol": amount_sol, "amount_usd": usd},
-            )
-        except Exception:
-            pass
-    except Exception as e:
-        logger.warning("[REINVEST] Savings transfer failed: %s", e)
-
-
-def _is_weekend(dt: Optional[datetime] = None) -> bool:
-    dt = dt or datetime.now(timezone.utc)
-    # Monday=0 ... Sunday=6
-    return dt.weekday() >= 5
-
-
-def _today_key(prefix: str) -> str:
-    now = datetime.now(timezone.utc)
-    return f"{prefix}:{now.strftime('%Y%m%d')}"
-
-
-async def _get_last_reinvest_ts(redis) -> Optional[float]:
-    if not redis:
-        return None
-    try:
-        raw = await redis.get(REINVEST_LAST_TS_KEY)
-        if not raw:
-            return None
-        return float(raw)
-    except Exception:
-        return None
-
-
-async def _set_last_reinvest_ts(redis, ts: Optional[float] = None) -> None:
-    if not redis:
-        return
-    try:
-        if ts is None:
-            ts = datetime.now(timezone.utc).timestamp()
-        await redis.set(REINVEST_LAST_TS_KEY, str(float(ts)))
-    except Exception:
-        return
-
-
-# ============================================================================ #
-# Target selection helpers
-# ============================================================================ #
-
-
-async def _pick_target_mint(
-    reinvest_sol: float,
-    meta: Dict[str, Any],
-    redis=None,
-) -> Optional[str]:
-    """
-    Choose a mint for reinvestment using the smartest available source:
-
-        0) meta["force_token_mint"] override
-        1) utils_pkg.smart_wallets.pick_reinvestment_target (if present)
-        2) legacy find_reinvestment_token scanner
-
-    Returns token mint on success, else None.
-
-    pick_reinvestment_target can return:
-      - string mint
-      - dict with 'mint' key
-      - list of candidates [{'mint': ..., 'score': ...}, ...]
-    """
-    # 0) Hard override from meta (used by backtests / experiments / same-token scale-in)
-    forced = meta.get("force_token_mint") or meta.get("target_mint")
-    if isinstance(forced, str) and len(forced) > 30:
-        return forced
-
-    # 1) Smart wallets module (if wired)
-    if pick_reinvestment_target is not None:
-        target = None
-        try:
-            target = await pick_reinvestment_target(
-                budget_sol=reinvest_sol,
-                min_24h_volume_usd=REINVESTMENT_VOLUME_MIN_USD,
-                redis=redis,
-                meta=meta,
-            )
-        except TypeError:
-            # Fallback to older signatures
-            try:
-                target = await pick_reinvestment_target(reinvest_sol)
-            except Exception:
-                target = None
-        except Exception:
-            target = None
-
-        if target:
-            if isinstance(target, str):
-                return target
-
-            if isinstance(target, dict):
-                mint = (
-                    target.get("mint")
-                    or target.get("token")
-                    or target.get("address")
-                )
-                if isinstance(mint, str):
-                    return mint
-
-            if isinstance(target, list):
-                best_mint = None
-                best_score = float("-inf")
-                for cand in target:
-                    if not isinstance(cand, dict):
-                        continue
-                    mint = (
-                        cand.get("mint")
-                        or cand.get("token")
-                        or cand.get("address")
-                    )
-                    score = cand.get("score", 0.0)
-                    if isinstance(mint, str) and isinstance(score, (int, float)):
-                        if float(score) > best_score:
-                            best_score = float(score)
-                            best_mint = mint
-                if best_mint:
-                    return best_mint
-
-    # 2) Legacy scanner
-    try:
-        mint = await find_reinvestment_token(
-            min_volume=REINVESTMENT_VOLUME_MIN_USD,
-            honeypot_filter=REINVESTMENT_HONEYPOT_CHECK,
-        )
-        if isinstance(mint, str) and len(mint) > 30:
-            return mint
-    except Exception as e:
-        logger.warning("[REINVEST] legacy find_reinvestment_token failed: %s", e)
-
-    return None
-
-
-# ============================================================================ #
-# Context build (risk + strategy + perf + regime + infra)
-# ============================================================================ #
-
-
-async def _build_context(
-    proceeds_sol: float,
-    meta: Optional[Dict[str, Any]],
-    redis,
-) -> Optional[ReinvestContext]:
-    meta = meta or {}
-
-    # Risk context snapshot (risk_manager.risk_capacity_snapshot)
-    try:
-        # Newer risk_manager may support a `source` kwarg for analytics / logging
         risk_ctx = await risk_capacity_snapshot(redis, source="reinvestor")  # type: ignore[arg-type]
     except TypeError:
-        # Backwards compat with older signature
-        try:
-            risk_ctx = await risk_capacity_snapshot(redis)
-        except TypeError:
-            risk_ctx = await risk_capacity_snapshot()
+        risk_ctx = await risk_capacity_snapshot(redis)
+    except Exception:
+        risk_ctx = await risk_capacity_snapshot()
 
-    # Robust field extraction with sane fallbacks
     risk_capacity = float(risk_ctx.get("risk_capacity", 1.0))
     risk_mode = int(risk_ctx.get("risk_mode", 1))
-    risk_mode_override = risk_ctx.get("risk_mode_override")
+    rmo = risk_ctx.get("risk_mode_override")
+    risk_mode_override = int(rmo) if isinstance(rmo, (int, float, str)) and str(rmo).strip() != "" else None
+
     halt_reason = risk_ctx.get("halt_reason")
+    halt_reason = str(halt_reason) if halt_reason is not None else None
 
-    daily_pnl_pct = float(
-        risk_ctx.get("daily_realized_pnl_pct")
-        or risk_ctx.get("pnl_day_pct")
-        or 0.0
-    )
-
-    daily_dd_pct = float(
-        risk_ctx.get("daily_drawdown_pct")
-        or risk_ctx.get("daily_dd_pct")
-        or risk_ctx.get("rolling_dd_pct")
-        or 0.0
-    )
+    daily_pnl_pct = float(risk_ctx.get("daily_realized_pnl_pct") or risk_ctx.get("pnl_day_pct") or 0.0)
+    daily_dd_pct = float(risk_ctx.get("daily_drawdown_pct") or risk_ctx.get("daily_dd_pct") or risk_ctx.get("rolling_dd_pct") or 0.0)
 
     equity_usd = float(risk_ctx.get("equity_usd", 0.0))
-
     sandbox_mode = bool(risk_ctx.get("sandbox_mode", False))
-
-    # Daily trades
     daily_trades_count = int(risk_ctx.get("daily_trades_count", 0) or 0)
     daily_trades_cap = int(risk_ctx.get("daily_trades_cap", 0) or 0)
 
-    # Regime fields
     regime_label = str(risk_ctx.get("regime_label", "neutral") or "neutral")
     regime_label_numeric = float(risk_ctx.get("regime_label_numeric", 0.0))
     regime_stress_score = float(risk_ctx.get("regime_stress_score", 0.0))
     regime_signal_strength = float(risk_ctx.get("regime_signal_strength", 0.5))
-    regime_entry_gate_factor = float(
-        risk_ctx.get("regime_entry_gate_factor", 1.0)
-    )
-    regime_risk_multiplier = float(
-        risk_ctx.get("regime_risk_multiplier", 1.0)
-    )
+    regime_entry_gate_factor = float(risk_ctx.get("regime_entry_gate_factor", 1.0))
+    regime_risk_multiplier = float(risk_ctx.get("regime_risk_multiplier", 1.0))
 
-    # Tail risk / budgets / floors from risk_manager (optional)
     tail_risk_score = float(risk_ctx.get("tail_risk_score", 0.0) or 0.0)
-    spend_remaining_usd = float(
-        risk_ctx.get("daily_spend_remaining_usd", 1e12) or 1e12
-    )
+    spend_remaining_usd = float(risk_ctx.get("daily_spend_remaining_usd", 1e12) or 1e12)
     spend_budget_block = bool(risk_ctx.get("spend_budget_block", False))
     equity_floor_usd = float(risk_ctx.get("equity_floor_usd", 0.0) or 0.0)
     equity_below_floor = bool(risk_ctx.get("equity_below_floor", False))
 
-    # Derive equity_sol if possible (for max_risk_per_trade cap)
+    rt = risk_ctx.get("risk_tags", [])
+    if isinstance(rt, str):
+        risk_tags = [rt]
+    elif isinstance(rt, (list, tuple, set)):
+        risk_tags = [str(x) for x in rt]
+    else:
+        risk_tags = []
+
+    # equity_sol (derive from equity_usd / sol_usd)
     try:
-        sol_usd = await convert_sol_to_usd_amount(1.0)
-        equity_sol = equity_usd / sol_usd if sol_usd and sol_usd > 0 else 0.0
+        sol_usd = await _maybe_await(convert_sol_to_usd_amount(1.0))
+        equity_sol = equity_usd / float(sol_usd) if sol_usd and float(sol_usd) > 0 else 0.0
     except Exception:
         equity_sol = 0.0
 
-    # Strategy parameters + performance snapshot
     params = await get_strategy_params(redis)
     perf = await get_perf_snapshot(redis)
 
-    # Base reinvest % can come from brain or risk layer override
-    base_reinvest_pct = float(
-        risk_ctx.get("reinvest_base_pct")
-        or params.get("REINVEST_PERCENT", 75.0)
-    )
+    base_reinvest_pct = float(risk_ctx.get("reinvest_base_pct") or params.get("REINVEST_PERCENT", 75.0))
     stop_loss_percent = float(params.get("STOP_LOSS_PERCENT", 18.0))
-    slippage = float(params.get("SLIPPAGE", 0.005))
-    min_sol_balance = float(
-        params.get(
-            "MIN_SOL_BALANCE",
-            risk_ctx.get("min_sol_balance", 0.25),
-        )
-    )
-    max_risk_per_trade = float(
-        params.get(
-            "MAX_RISK_PER_TRADE",
-            risk_ctx.get("max_risk_per_trade", 0.05),
-        )
-    )
+    slippage = _normalize_slippage(float(params.get("SLIPPAGE", 0.005)))
+
+    min_sol_balance = float(params.get("MIN_SOL_BALANCE", risk_ctx.get("min_sol_balance", 0.25)))
+    max_risk_per_trade = float(params.get("MAX_RISK_PER_TRADE", risk_ctx.get("max_risk_per_trade", 0.05)))
+
     strat_mode = int(params.get("STRAT_MODE", risk_ctx.get("strat_mode", 1) or 1))
     hard_halt = bool(params.get("HARD_HALT", False))
 
     plan_target_apr_pct = float(params.get("PLAN_TARGET_APR_PCT", 180.0))
-    plan_gap_pct = float(
-        params.get("PLAN_GAP_PCT", risk_ctx.get("plan_gap_pct", 0.0))
-    )
-    plan_status = str(
-        params.get("PLAN_STATUS", risk_ctx.get("plan_status", "n/a")) or "n/a"
-    )
+    plan_gap_pct = float(params.get("PLAN_GAP_PCT", risk_ctx.get("plan_gap_pct", 0.0)))
+    plan_status = str(params.get("PLAN_STATUS", risk_ctx.get("plan_status", "n/a")) or "n/a")
 
-    # Kelly & perf: prefer self-learning's snapshot, fallback to risk_ctx fields
     kelly_from_perf = float(perf.get("kelly_suggestion", 0.0))
     kelly_from_risk = float(risk_ctx.get("kelly_raw", 0.0))
     kelly_suggestion = kelly_from_perf if kelly_from_perf != 0.0 else kelly_from_risk
     if kelly_suggestion == 0.0:
-        kelly_suggestion = 0.02  # gentle default
+        kelly_suggestion = 0.02
 
-    kelly_pos_cap_pct = float(risk_ctx.get("kelly_pos_pct_cap", 0.0))
-    kelly_confidence = float(perf.get("kelly_confidence", 0.0))
+    kelly_pos_cap_pct = float(risk_ctx.get("kelly_pos_pct_cap", 0.0) or 0.0)
+    kelly_confidence = float(perf.get("kelly_confidence", risk_ctx.get("kelly_confidence", 0.0)) or 0.0)
 
-    win_rate = float(perf.get("win_rate", risk_ctx.get("winrate20", 0.0)))
-    recent_win_rate = float(
-        perf.get("recent_win_rate", win_rate)
-    )
+    win_rate = float(perf.get("win_rate", risk_ctx.get("winrate20", 0.0)) or 0.0)
+    recent_win_rate = float(perf.get("recent_win_rate", win_rate) or win_rate)
 
-    pnl_mean = float(perf.get("pnl_mean", 0.0))
-    pnl_std = float(perf.get("pnl_std", 0.0))
-    sharpe_like = float(perf.get("sharpe_like", 0.0))
-    recent_sharpe_like = float(perf.get("recent_sharpe_like", sharpe_like))
+    pnl_mean = float(perf.get("pnl_mean", 0.0) or 0.0)
+    pnl_std = float(perf.get("pnl_std", 0.0) or 0.0)
+    sharpe_like = float(perf.get("sharpe_like", 0.0) or 0.0)
+    recent_sharpe_like = float(perf.get("recent_sharpe_like", sharpe_like) or sharpe_like)
 
-    # Infra snapshot
     infra = await infra_features(redis)
     infra_health_score = float(infra.get("infra_health_score", 1.0))
     infra_rpc_latency_ms = float(infra.get("infra_rpc_latency_ms", 0.0))
@@ -996,26 +1143,32 @@ async def _build_context(
     infra_stability_score = float(infra.get("infra_stability_score", 1.0))
 
     return ReinvestContext(
-        proceeds_sol=float(proceeds_sol),
+        proceeds_sol=proceeds_sol,
+        proceeds_usd=proceeds_usd,
+        meta=meta,
+
         risk_capacity=risk_capacity,
         risk_mode=risk_mode,
-        risk_mode_override=(
-            int(risk_mode_override) if risk_mode_override is not None else None
-        ),
-        halt_reason=str(halt_reason) if halt_reason is not None else None,
+        risk_mode_override=risk_mode_override,
+        halt_reason=halt_reason,
+
         daily_pnl_pct=daily_pnl_pct,
         daily_dd_pct=daily_dd_pct,
+
         equity_usd=equity_usd,
         equity_sol=equity_sol,
+
         daily_trades_count=daily_trades_count,
         daily_trades_cap=daily_trades_cap,
         sandbox_mode=sandbox_mode,
+
         regime_label=regime_label,
         regime_label_numeric=regime_label_numeric,
         regime_stress_score=regime_stress_score,
         regime_signal_strength=regime_signal_strength,
         regime_entry_gate_factor=regime_entry_gate_factor,
         regime_risk_multiplier=regime_risk_multiplier,
+
         base_reinvest_pct=base_reinvest_pct,
         stop_loss_percent=stop_loss_percent,
         slippage=slippage,
@@ -1023,23 +1176,29 @@ async def _build_context(
         max_risk_per_trade=max_risk_per_trade,
         strat_mode=strat_mode,
         hard_halt=hard_halt,
+
         plan_target_apr_pct=plan_target_apr_pct,
         plan_gap_pct=plan_gap_pct,
         plan_status=plan_status,
+
         kelly_suggestion=kelly_suggestion,
         kelly_confidence=kelly_confidence,
         kelly_pos_cap_pct=kelly_pos_cap_pct,
+
         win_rate=win_rate,
         recent_win_rate=recent_win_rate,
         pnl_mean=pnl_mean,
         pnl_std=pnl_std,
         sharpe_like=sharpe_like,
         recent_sharpe_like=recent_sharpe_like,
+
         tail_risk_score=tail_risk_score,
         spend_remaining_usd=spend_remaining_usd,
         spend_budget_block=spend_budget_block,
         equity_floor_usd=equity_floor_usd,
         equity_below_floor=equity_below_floor,
+        risk_tags=risk_tags,
+
         infra_health_score=infra_health_score,
         infra_rpc_latency_ms=infra_rpc_latency_ms,
         infra_jup_latency_ms=infra_jup_latency_ms,
@@ -1047,89 +1206,43 @@ async def _build_context(
         infra_state_is_degraded=infra_state_is_degraded,
         infra_state_is_halted=infra_state_is_halted,
         infra_stability_score=infra_stability_score,
-        infra_raw=infra,
-        risk_ctx_raw=risk_ctx,
-        perf_raw=perf,
-        meta=dict(meta),
+        infra_raw=dict(infra),
+
+        risk_ctx_raw=dict(risk_ctx),
+        perf_raw=dict(perf),
     )
 
 
-# ============================================================================ #
-# Health scoring
-# ============================================================================ #
-
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Health scoring + persistence
+# ──────────────────────────────────────────────────────────────────────────────
 def _compute_health_score(ctx: ReinvestContext) -> float:
-    """
-    Aggregate health score in [0, 100] combining:
-        • win rate (quality of edge)
-        • drawdown (capital pain)
-        • risk capacity (how much room is left)
-        • Sharpe-like risk-adjusted returns
-        • infra health (RPC / JUP quality)
-        • tail risk (if risk_manager exposes tail_risk_score ∈ [0,1])
-
-    If risk_manager already computed a global / reinvestor health_score, re-use it.
-    """
-
-    # If risk_manager exposes a pre-computed health score, prefer that
-    try:
-        pre = ctx.risk_ctx_raw.get("reinvest_health_score") or ctx.risk_ctx_raw.get(
-            "global_health_score"
-        )
-        if isinstance(pre, (int, float)) and pre >= 0:
+    with contextlib.suppress(Exception):
+        pre = ctx.risk_ctx_raw.get("reinvest_health_score") or ctx.risk_ctx_raw.get("global_health_score")
+        if isinstance(pre, (int, float)) and float(pre) >= 0:
             return float(pre)
-    except Exception:
-        pass
 
-    # Winrate: clamp to [0, 1] then map [0.30..0.70] → [0..1]
     wr = max(0.0, min(1.0, ctx.win_rate))
     wr_score = max(0.0, min(1.0, (wr - 0.30) / (0.70 - 0.30))) * 100.0
 
-    # Drawdown: 0% DD == 1, ≥ REINVEST_HEALTH_MAX_DD == 0
     dd = max(0.0, ctx.daily_dd_pct)
-    # use env max DD as in soft/hard band; default 25% if not overridden
-    max_dd_for_score = max(
-        REINVEST_DD_HARD_STOP_PCT, REINVEST_DD_SOFT_STOP_PCT, 25.0
-    )
-    dd_score = 100.0
-    if max_dd_for_score > 0:
-        dd_norm = max(
-            0.0,
-            1.0 - min(dd, max_dd_for_score) / max_dd_for_score,
-        )
-        dd_score = dd_norm * 100.0
+    max_dd_for_score = max(CFG.dd_hard_stop_pct, CFG.dd_soft_stop_pct, 25.0)
+    dd_norm = max(0.0, 1.0 - min(dd, max_dd_for_score) / max_dd_for_score) if max_dd_for_score > 0 else 1.0
+    dd_score = dd_norm * 100.0
 
-    # Capacity: clamp [0,1] → [0,100]
     cap = max(0.0, min(1.0, ctx.risk_capacity))
     cap_score = cap * 100.0
 
-    # Sharpe-like: treat -1.0 as "bad", +1.0 as "good", clamp further out.
     sharpe = ctx.recent_sharpe_like or ctx.sharpe_like or 0.0
     sharpe_clamped = max(-1.5, min(1.5, sharpe))
-    # Map [-1.0, +1.0] → [0, 1], with smooth clipping outside.
-    sharpe_score = (sharpe_clamped + 1.0) / 2.0
-    sharpe_score = max(0.0, min(1.0, sharpe_score)) * 100.0
+    sharpe_score = max(0.0, min(1.0, (sharpe_clamped + 1.0) / 2.0)) * 100.0
 
-    # Infra health: already in [0,1]
     infra_score = max(0.0, min(1.0, ctx.infra_health_score)) * 100.0
 
-    # Tail risk: if tail_risk_score not present, treat as no penalty (score=100)
-    tail_raw = getattr(ctx, "tail_risk_score", None)
-    if tail_raw is None:
-        tail_score = 100.0
-    else:
-        try:
-            t = float(tail_raw)
-        except Exception:
-            t = 0.0
-        t = max(0.0, min(1.0, t))
-        # High tail risk → lower score. t=0 → 100, t=1 → 0
-        tail_score = (1.0 - t) * 100.0
+    t = max(0.0, min(1.0, float(ctx.tail_risk_score or 0.0)))
+    tail_score = (1.0 - t) * 100.0
 
-    # Blend: slightly more weight on winrate, DD, capacity; Sharpe + infra + tail as
-    # tie-breakers / stability controls.
-    health_score = float(
+    return float(
         0.28 * wr_score
         + 0.20 * dd_score
         + 0.20 * cap_score
@@ -1137,239 +1250,212 @@ def _compute_health_score(ctx: ReinvestContext) -> float:
         + 0.10 * infra_score
         + 0.12 * tail_score
     )
-    return health_score
 
 
-# ============================================================================ #
-# Health snapshot (for dashboards/debug)
-# ============================================================================ #
-
-
-async def _update_reinvest_health(
-    redis,
-    ctx: ReinvestContext,
-    eff_pct: float,
-    reinvest_sol: float,
-    savings_sol: float,
-) -> None:
-    """
-    Lightweight health snapshot for dashboards / monitoring.
-    """
+async def _update_reinvest_health(redis, ctx: ReinvestContext, eff_pct: float, reinvest_sol: float, savings_sol: float, reason: str = "ok") -> None:
     if not redis:
         return
-
     try:
-        usd_reinvest = await _sol_to_usd(reinvest_sol)
-        usd_savings = await _sol_to_usd(savings_sol)
-
-        health_score = _compute_health_score(ctx)
-
         health_doc: Dict[str, Any] = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "eff_pct": eff_pct,
-            "reinvest_sol": reinvest_sol,
-            "savings_sol": savings_sol,
-            "reinvest_usd": usd_reinvest,
-            "savings_usd": usd_savings,
+            "ts": _now_utc().isoformat(),
+            "phase": int(CFG.phase),
+            "reason": reason,
+            "eff_pct": float(eff_pct),
+            "proceeds_sol": float(ctx.proceeds_sol),
+            "reinvest_sol": float(reinvest_sol),
+            "savings_sol": float(savings_sol),
+            "reinvest_usd": await _sol_to_usd(reinvest_sol),
+            "savings_usd": await _sol_to_usd(savings_sol),
+            "health_score": _compute_health_score(ctx),
+
             "risk_capacity": ctx.risk_capacity,
             "risk_mode": ctx.risk_mode,
             "risk_mode_override": ctx.risk_mode_override,
             "halt_reason": ctx.halt_reason,
+
             "daily_pnl_pct": ctx.daily_pnl_pct,
             "daily_dd_pct": ctx.daily_dd_pct,
             "win_rate": ctx.win_rate,
             "recent_win_rate": ctx.recent_win_rate,
             "sharpe_like": ctx.sharpe_like,
             "recent_sharpe_like": ctx.recent_sharpe_like,
-            "ai_capacity_delta": ctx.risk_ctx_raw.get("ai_capacity_delta", 0.0),
+
             "plan_status": ctx.plan_status,
             "plan_gap_pct": ctx.plan_gap_pct,
+
             "regime_label": ctx.regime_label,
             "regime_label_numeric": ctx.regime_label_numeric,
             "regime_stress_score": ctx.regime_stress_score,
             "regime_signal_strength": ctx.regime_signal_strength,
             "regime_entry_gate_factor": ctx.regime_entry_gate_factor,
-            "sandbox_mode": ctx.sandbox_mode,
+
+            "tail_risk_score": ctx.tail_risk_score,
+
+            "spend_remaining_usd": ctx.spend_remaining_usd,
+            "spend_budget_block": ctx.spend_budget_block,
+            "equity_floor_usd": ctx.equity_floor_usd,
+            "equity_below_floor": ctx.equity_below_floor,
+
             "daily_trades_count": ctx.daily_trades_count,
             "daily_trades_cap": ctx.daily_trades_cap,
-            # infra
+            "sandbox_mode": ctx.sandbox_mode,
+
             "infra_health_score": ctx.infra_health_score,
             "infra_rpc_latency_ms": ctx.infra_rpc_latency_ms,
             "infra_jup_latency_ms": ctx.infra_jup_latency_ms,
-            "infra_state_is_healthy": ctx.infra_state_is_healthy,
-            "infra_state_is_degraded": ctx.infra_state_is_degraded,
             "infra_state_is_halted": ctx.infra_state_is_halted,
+            "infra_state_is_degraded": ctx.infra_state_is_degraded,
             "infra_stability_score": ctx.infra_stability_score,
-            "tail_risk_score": getattr(
-                ctx, "tail_risk_score", ctx.risk_ctx_raw.get("tail_risk_score", 0.0)
-            ),
-            "spend_remaining_usd": getattr(ctx, "spend_remaining_usd", None),
-            "spend_budget_block": getattr(ctx, "spend_budget_block", False),
-            "equity_floor_usd": getattr(ctx, "equity_floor_usd", 0.0),
-            "equity_below_floor": getattr(ctx, "equity_below_floor", False),
-            "health_score": health_score,
         }
-
-        await redis.set(REINVEST_HEALTH_KEY, json.dumps(health_doc))
-
-        try:
+        await _redis_call(redis, "set", REINVEST_HEALTH_KEY, json.dumps(health_doc))
+        with contextlib.suppress(Exception):
             await log_event("reinvest_health", health_doc)
-        except Exception:
-            pass
-
     except Exception:
-        # Health snapshot is non-critical
         return
 
 
 async def get_reinvest_health(redis=None) -> Optional[Dict[str, Any]]:
-    """
-    Convenience helper: read the last health snapshot (JSON) from Redis.
-
-    Returns parsed dict or None if unavailable.
-    """
     if redis is None:
         redis = await _get_redis()
     if not redis:
         return None
     try:
-        raw = await redis.get(REINVEST_HEALTH_KEY)
-        if not raw:
-            return None
-        return json.loads(raw)
+        raw = _maybe_decode(await _redis_call(redis, "get", REINVEST_HEALTH_KEY))
+        return json.loads(raw) if raw else None
     except Exception:
         return None
 
 
-# ============================================================================ #
-# Effective reinvest % computation
-# ============================================================================ #
+async def get_last_reinvest_decision(redis=None) -> Optional[Dict[str, Any]]:
+    if redis is None:
+        redis = await _get_redis()
+    if not redis:
+        return None
+    try:
+        raw = _maybe_decode(await _redis_call(redis, "get", REINVEST_DECISION_KEY))
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
 
 
-def _kelly_scale_for_reinvest(ctx: ReinvestContext) -> float:
+async def get_recent_reinvest_decisions(limit: int = 50, redis=None) -> List[Dict[str, Any]]:
     """
-    Convert Kelly suggestion/confidence into a smooth multiplier for reinvest %.
+    Introspection helper:
+    Return the last N reinvest decisions from Redis (most recent first).
+    Best-effort; empty list if Redis unavailable.
     """
+    if redis is None:
+        redis = await _get_redis()
+    if not redis:
+        return []
+    limit = max(1, min(int(limit or 1), 1000))
+    try:
+        raw_list = await _redis_call(redis, "lrange", REINVEST_DECISION_LIST_KEY, 0, limit - 1)
+        out: List[Dict[str, Any]] = []
+        for item in raw_list or []:
+            try:
+                doc = json.loads(_maybe_decode(item))
+                if isinstance(doc, dict):
+                    out.append(doc)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+async def _persist_decision(redis, decision_doc: Dict[str, Any]) -> None:
+    if not redis:
+        return
+    try:
+        payload = json.dumps(decision_doc, default=str)
+        await _redis_call(redis, "set", REINVEST_DECISION_KEY, payload)
+        await _redis_call(redis, "lpush", REINVEST_DECISION_LIST_KEY, payload)
+        await _redis_call(redis, "ltrim", REINVEST_DECISION_LIST_KEY, 0, int(CFG.decisions_keep) - 1)
+    except Exception:
+        return
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Scales / effective % (stable logic)
+# ──────────────────────────────────────────────────────────────────────────────
+def _kelly_scale(ctx: ReinvestContext) -> float:
     kelly = max(0.0, ctx.kelly_suggestion)
-    # Use Kelly cap as natural "full risk" reference if available
-    kelly_target = ctx.kelly_pos_cap_pct if ctx.kelly_pos_cap_pct > 0 else 0.08
-    kelly_target = max(0.01, min(kelly_target, 0.15))
+    target = ctx.kelly_pos_cap_pct if ctx.kelly_pos_cap_pct > 0 else 0.08
+    target = max(0.01, min(float(target), 0.15))
 
     if kelly <= 0.005 or ctx.win_rate < 0.45 or ctx.pnl_mean < 0:
         base_scale = 0.5
     else:
-        ratio = min(2.0, max(0.3, kelly / kelly_target))
+        ratio = min(2.0, max(0.3, kelly / target))
         base_scale = 0.7 + 0.6 * ((ratio - 0.3) / (2.0 - 0.3))
 
-    conf = ctx.kelly_confidence
+    conf = float(ctx.kelly_confidence or 0.0)
     if 0.0 < conf < 1.0:
         return 1.0 + (base_scale - 1.0) * conf
     return base_scale
 
 
-def _capacity_base_scale(ctx: ReinvestContext) -> float:
-    """
-    Start scaling around risk capacity, risk_mode and STRAT_MODE.
-    """
+def _capacity_scale(ctx: ReinvestContext) -> float:
     cap = max(0.0, min(1.0, ctx.risk_capacity))
     scale = max(0.25, min(1.0, cap))
-
-    # risk_mode from risk_manager (0=off,1=neutral,2=aggressive,3=defensive)
     if ctx.risk_mode == 3:
         scale *= 0.5
     elif ctx.risk_mode == 2:
         scale *= 1.1
-
-    # STRAT_MODE from self-learning brain (0=DEF,1=NEU,2=AGG)
     if ctx.strat_mode == 0:
         scale *= 0.7
     elif ctx.strat_mode == 2:
         scale *= 1.1
-
     return scale
 
 
 def _drawdown_scale(ctx: ReinvestContext) -> float:
-    """
-    Soft shrink of reinvest % between DD soft/hard bands.
-
-    daily_dd_pct is POSITIVE magnitude:
-        - if < soft band: no change
-        - between soft and hard: smoothly decay to 0.2
-        - ≥ hard: handled earlier as savings-only
-    """
     dd = max(0.0, ctx.daily_dd_pct)
-    if (
-        REINVEST_DD_SOFT_STOP_PCT <= 0
-        or REINVEST_DD_HARD_STOP_PCT <= REINVEST_DD_SOFT_STOP_PCT
-    ):
+    if CFG.dd_soft_stop_pct <= 0 or CFG.dd_hard_stop_pct <= CFG.dd_soft_stop_pct:
         return 1.0
-
-    if dd < REINVEST_DD_SOFT_STOP_PCT:
+    if dd < CFG.dd_soft_stop_pct:
         return 1.0
-
-    span = REINVEST_DD_HARD_STOP_PCT - REINVEST_DD_SOFT_STOP_PCT
-    span = max(span, 0.001)
-    mag = min(REINVEST_DD_HARD_STOP_PCT, dd)
-    frac = (mag - REINVEST_DD_SOFT_STOP_PCT) / span
-    frac = max(0.0, min(1.0, frac))
+    span = max(CFG.dd_hard_stop_pct - CFG.dd_soft_stop_pct, 1e-6)
+    mag = min(CFG.dd_hard_stop_pct, dd)
+    frac = max(0.0, min(1.0, (mag - CFG.dd_soft_stop_pct) / span))
     return max(0.2, 1.0 - 0.8 * frac)
 
 
 def _plan_scale(ctx: ReinvestContext) -> float:
-    """
-    Equity-plan nudge:
-      • "behind" and not in bad DD → mild boost
-      • "ahead" with DD/vol issues → tilt more to savings
-    """
-    status = ctx.plan_status
-    gap = ctx.plan_gap_pct
-    dd = ctx.daily_dd_pct
-    vol = ctx.pnl_std
-    cap = ctx.risk_capacity
-
+    status, gap, dd, vol, cap = ctx.plan_status, ctx.plan_gap_pct, ctx.daily_dd_pct, ctx.pnl_std, ctx.risk_capacity
     scale = 1.0
     if status == "behind" and gap < -3.0:
-        if cap > 0.6 and dd < REINVEST_DD_SOFT_STOP_PCT:
+        if cap > 0.6 and dd < CFG.dd_soft_stop_pct:
             scale *= 1.05
     elif status == "ahead" and gap > 3.0:
-        if dd >= REINVEST_DD_SOFT_STOP_PCT or vol > 20.0:
+        if dd >= CFG.dd_soft_stop_pct or vol > 20.0:
             scale *= 0.9
     return scale
 
 
 def _regime_scale(ctx: ReinvestContext) -> float:
-    """
-    Regime-aware nudge:
-      • Bearish / high stress → shrink
-      • Bullish / strong signal, low stress → mild boost
-    """
-    regime_label = ctx.regime_label_numeric
-    regime_stress = ctx.regime_stress_score
-    regime_signal = ctx.regime_signal_strength
-    regime_gate = ctx.regime_entry_gate_factor
+    lab = ctx.regime_label_numeric
+    stress = ctx.regime_stress_score
+    sig = ctx.regime_signal_strength
+    gate = ctx.regime_entry_gate_factor
 
     scale = 1.0
-    if regime_label < -0.3 or regime_stress > 0.7:
+    if lab < -0.3 or stress > 0.7:
         scale *= 0.7
-    elif regime_label > 0.3 and regime_signal > 0.4 and regime_stress < 0.4:
+    elif lab > 0.3 and sig > 0.4 and stress < 0.4:
         scale *= 1.08
 
-    # Regime gate factor (if <1 tighten, if >1 slightly loosen)
-    if 0.1 <= regime_gate <= 2.0:
-        if regime_gate < 0.95:
-            scale *= (0.9 + 0.1 * regime_gate)
-        elif regime_gate > 1.05:
-            scale *= (1.0 + 0.05 * (regime_gate - 1.0))
-
+    if 0.1 <= gate <= 2.0:
+        if gate < 0.95:
+            scale *= (0.9 + 0.1 * gate)
+        elif gate > 1.05:
+            scale *= (1.0 + 0.05 * (gate - 1.0))
     return scale
 
 
-def _ai_capacity_scale(ctx: ReinvestContext) -> float:
-    """
-    AI-derived capacity delta: when AI says capacity is tight, lean more to savings.
-    """
-    delta = ctx.risk_ctx_raw.get("ai_capacity_delta", 0.0)
+def _ai_scale(ctx: ReinvestContext) -> float:
+    delta = float(ctx.risk_ctx_raw.get("ai_capacity_delta", 0.0) or 0.0)
     if delta < -0.6:
         return 0.7
     if delta < -0.1:
@@ -1382,14 +1468,8 @@ def _ai_capacity_scale(ctx: ReinvestContext) -> float:
 
 
 def _perf_scale(ctx: ReinvestContext) -> float:
-    """
-    Performance-based nudging:
-        • Poor recent WR + negative Sharpe → shrink
-        • Strong recent WR + good Sharpe → mild boost
-    """
     rec_wr = ctx.recent_win_rate or ctx.win_rate
     sharpe = ctx.recent_sharpe_like or ctx.sharpe_like
-
     scale = 1.0
     if rec_wr < 0.38 and sharpe < -0.2:
         scale *= 0.7
@@ -1399,241 +1479,260 @@ def _perf_scale(ctx: ReinvestContext) -> float:
 
 
 def _profile_scale(meta: Dict[str, Any]) -> float:
-    """
-    Meta-driven profile scaling:
-        profile / bucket / reinvest_profile ∈ {
-          "core", "growth", "explore", "defensive", "degen", ...
-        }
-    """
     raw = meta.get("profile") or meta.get("bucket") or meta.get("reinvest_profile")
     if raw is None:
         return 1.0
     try:
-        profile = str(raw).lower()
+        p = str(raw).lower()
     except Exception:
         return 1.0
-
-    scale = 1.0
-    if profile in ("core", "base"):
-        scale = 1.0
-    elif profile in ("growth", "momentum", "trend"):
-        scale = 1.05
-    elif profile in ("explore", "experimental", "beta"):
-        scale = 1.10
-    elif profile in ("defensive", "income", "savings"):
-        scale = 0.75
-    elif profile in ("degen", "aggressive"):
-        scale = 1.15
-
-    # Keep profile influence within sane bounds
-    return max(0.5, min(1.2, scale))
+    if p in ("core", "base"):
+        s = 1.0
+    elif p in ("growth", "momentum", "trend"):
+        s = 1.05
+    elif p in ("explore", "experimental", "beta"):
+        s = 1.10
+    elif p in ("defensive", "income", "savings"):
+        s = 0.75
+    elif p in ("degen", "aggressive"):
+        s = 1.15
+    else:
+        s = 1.0
+    return max(0.5, min(1.2, s))
 
 
 def _mode_scale(ctx: ReinvestContext) -> float:
-    """
-    Capital mode scaling layer on top of everything else.
-
-    Mode resolution priority:
-        1) meta["mode"] / meta["reinvest_mode"]
-        2) risk_ctx["reinvest_mode"] / risk_ctx["capital_mode"]
-        3) env REINVEST_MODE (default "balanced")
-
-    Modes (suggested semantics, but backward-compatible):
-        • "off", "savings_only"      →  very low reinvest (0x..0.1x)
-        • "repair", "rebuild"        →  shrink heavily, prioritise savings
-        • "harvest", "cashout"       →  moderate shrink vs balanced
-        • "balanced", "default"      →  neutral (1.0x)
-        • "snowball", "growth", "hyper" → mild boost (max ~1.12x)
-    """
-    # 1) meta override
     meta = ctx.meta or {}
-    raw = meta.get("mode") or meta.get("reinvest_mode")
-
-    # 2) risk_manager hint
-    if not raw:
-        raw = (
-            ctx.risk_ctx_raw.get("reinvest_mode")
-            or ctx.risk_ctx_raw.get("capital_mode")
-        )
-
-    # 3) env fallback
-    if not raw:
-        raw = REINVEST_MODE
-
+    raw = meta.get("mode") or meta.get("reinvest_mode") or ctx.risk_ctx_raw.get("reinvest_mode") or _envs("REINVEST_MODE", "balanced")
     try:
         mode = str(raw).strip().lower()
     except Exception:
         mode = "balanced"
 
-    # Default neutral
-    scale = 1.0
-
     if mode in ("off", "savings_only", "halt", "park"):
-        # Effectively turn off reinvest, but keep logic paths the same.
-        scale = 0.05
+        s = 0.05
     elif mode in ("repair", "rebuild", "recover", "capital_preserve"):
-        scale = 0.4
+        s = 0.4
     elif mode in ("harvest", "cashout", "skim"):
-        scale = 0.6
-    elif mode in ("balanced", "default", "normal"):
-        scale = 1.0
+        s = 0.6
     elif mode in ("snowball", "growth", "hyper", "aggressive_compound"):
-        scale = 1.12
+        s = 1.12
     else:
-        # Unknown modes default to neutral-ish
-        scale = 1.0
-
-    return max(0.0, min(1.25, scale))
+        s = 1.0
+    return max(0.0, min(1.25, s))
 
 
 def _infra_scale(ctx: ReinvestContext) -> float:
-    """
-    Infra-based scaling:
-        - Halted: heavily shrink (actual blocking is handled elsewhere).
-        - Degraded: mild shrink unless risk/strategy already extreme.
-        - Healthy + high stability: small boost.
-    """
     halted = ctx.infra_state_is_halted > 0.5
     degraded = ctx.infra_state_is_degraded > 0.5
     healthy = ctx.infra_state_is_healthy > 0.5
     infra_h = max(0.0, min(1.0, ctx.infra_health_score))
     stability = max(0.0, min(1.0, ctx.infra_stability_score))
-
     if halted:
         return 0.3
     if degraded:
         return 0.8
-
-    # Healthy path: if infra health + stability high, small boost
     if healthy and infra_h > 0.7 and stability > 0.7:
         return 1.03
     return 1.0
 
 
-def _tail_risk_scale(ctx: ReinvestContext) -> float:
-    """
-    Tail-risk scaling:
-        Uses ctx.tail_risk_score (0..1, higher = more tail risk)
-        if provided by risk_manager. If not present, returns 1.0 (no change).
-
-        • Below ~0.2 → slight boost (comfy environment)
-        • Between SOFT/HARD thresholds → linear shrink
-        • Above HARD → aggressive shrink to protect capital
-    """
-    raw = getattr(ctx, "tail_risk_score", None)
-    if raw is None:
-        return 1.0
-    try:
-        t = float(raw)
-    except Exception:
-        return 1.0
-
-    t = max(0.0, min(1.0, t))
-    soft = max(0.0, min(1.0, REINVEST_TAIL_RISK_SOFT))
-    hard = max(soft, min(1.0, REINVEST_TAIL_RISK_HARD))
-
-    # Very low tail risk → tiny boost
+def _tail_scale(ctx: ReinvestContext) -> float:
+    t = max(0.0, min(1.0, float(ctx.tail_risk_score or 0.0)))
+    soft = max(0.0, min(1.0, CFG.tail_soft))
+    hard = max(soft, min(1.0, CFG.tail_hard))
     if t <= 0.2:
         return 1.05
-
-    # Very high tail risk → strong shrink
     if t >= hard:
         return 0.5
-
-    # Mid band [soft, hard): smooth decay from 1.0 → 0.7
     if t >= soft:
         span = max(hard - soft, 1e-6)
         frac = (t - soft) / span
         return max(0.7, 1.0 - 0.3 * frac)
-
-    # Between 0.2 and soft, small neutral/slightly negative tilt
     return 0.95
 
 
 def _compute_scales(ctx: ReinvestContext) -> ReinvestScales:
-    """
-    Compute all the scaling factors and return a ReinvestScales object so we can
-    reuse the same logic for eff_pct and expose a detailed breakdown.
-    """
-    cap_scale = _capacity_base_scale(ctx)
-    dd_scale = _drawdown_scale(ctx)
-    kelly_scale = _kelly_scale_for_reinvest(ctx)
-    plan_scale = _plan_scale(ctx)
-    regime_scale = _regime_scale(ctx)
-    ai_scale = _ai_capacity_scale(ctx)
-    perf_scale = _perf_scale(ctx)
-    profile_scale = _profile_scale(ctx.meta)
-    mode_scale = _mode_scale(ctx)
-    infra_scale = _infra_scale(ctx)
-    tail_scale = _tail_risk_scale(ctx)
-
     return ReinvestScales(
-        base_pct=ctx.base_reinvest_pct,
-        cap_scale=cap_scale,
-        dd_scale=dd_scale,
-        kelly_scale=kelly_scale,
-        plan_scale=plan_scale,
-        regime_scale=regime_scale,
-        ai_scale=ai_scale,
-        perf_scale=perf_scale,
-        profile_scale=profile_scale,
-        mode_scale=mode_scale,
-        infra_scale=infra_scale,
-        tail_scale=tail_scale,
+        base_pct=float(ctx.base_reinvest_pct),
+        cap_scale=_capacity_scale(ctx),
+        dd_scale=_drawdown_scale(ctx),
+        kelly_scale=_kelly_scale(ctx),
+        plan_scale=_plan_scale(ctx),
+        regime_scale=_regime_scale(ctx),
+        ai_scale=_ai_scale(ctx),
+        perf_scale=_perf_scale(ctx),
+        profile_scale=_profile_scale(ctx.meta),
+        mode_scale=_mode_scale(ctx),
+        infra_scale=_infra_scale(ctx),
+        tail_scale=_tail_scale(ctx),
     )
 
 
 def _apply_meta_eff_overrides(eff_pct: float, meta: Dict[str, Any]) -> float:
-    """
-    Apply meta-based clamps (min/max) and hard override (force_eff_pct)
-    + global REINVEST_MIN_EFF_PCT / REINVEST_MAX_EFF_PCT bounds.
-    """
-    # Hard override wins (for backtests / experiments)
     if "force_eff_pct" in meta:
-        try:
+        with contextlib.suppress(Exception):
             forced = float(meta["force_eff_pct"])
-            return max(REINVEST_MIN_EFF_PCT, min(REINVEST_MAX_EFF_PCT, forced))
-        except Exception:
-            pass
+            return max(CFG.min_eff_pct, min(CFG.max_eff_pct, forced))
 
-    # Local meta min/max, falling back to global bounds
-    min_eff = float(meta.get("min_eff_pct", REINVEST_MIN_EFF_PCT) or REINVEST_MIN_EFF_PCT)
-    max_eff_local = float(meta.get("max_eff_pct", REINVEST_MAX_EFF_PCT) or REINVEST_MAX_EFF_PCT)
+    try:
+        min_eff_v = float(meta.get("min_eff_pct")) if meta.get("min_eff_pct") is not None else float(CFG.min_eff_pct)
+    except Exception:
+        min_eff_v = float(CFG.min_eff_pct)
 
-    # clamp in correct order
-    eff_pct = max(min_eff, eff_pct)
-    eff_pct = min(REINVEST_MAX_EFF_PCT, max_eff_local, eff_pct)
+    try:
+        max_eff_v = float(meta.get("max_eff_pct")) if meta.get("max_eff_pct") is not None else float(CFG.max_eff_pct)
+    except Exception:
+        max_eff_v = float(CFG.max_eff_pct)
+
+    eff_pct = max(min_eff_v, eff_pct)
+    eff_pct = min(CFG.max_eff_pct, max_eff_v, eff_pct)
     return max(0.0, eff_pct)
 
 
-def _compute_eff_reinvest_pct(ctx: ReinvestContext) -> Tuple[float, ReinvestScales]:
-    """
-    Compose all the scaling factors into a single effective reinvest %.
-    Returns:
-        (eff_pct_raw, scales)
-    """
+def _compute_eff_pct(ctx: ReinvestContext) -> Tuple[float, ReinvestScales]:
     scales = _compute_scales(ctx)
-    return float(scales.eff_pct), scales
+    eff = float(scales.eff_pct)
+    if CFG.always_savings_pct > 0:
+        eff = max(0.0, eff - float(CFG.always_savings_pct))
+    eff = _apply_meta_eff_overrides(eff, ctx.meta)
+    return eff, scales
 
 
-# ============================================================================ #
-# Skip helpers / journaling
-# ============================================================================ #
+# ──────────────────────────────────────────────────────────────────────────────
+# Gates + journaling
+# ──────────────────────────────────────────────────────────────────────────────
+async def _evaluate_gates(ctx: ReinvestContext, redis) -> Tuple[bool, str]:
+    meta = ctx.meta or {}
+    force_anyway = bool(meta.get("force_reinvest_even_if_risk_blocked", False))
+
+    if ctx.proceeds_sol <= 0:
+        return False, "no_proceeds"
+    if ctx.proceeds_sol < CFG.min_proceeds_sol:
+        return False, "below_min_proceeds_sol"
+    if CFG.min_proceeds_usd > 0 and ctx.proceeds_usd < CFG.min_proceeds_usd:
+        return False, "below_min_proceeds_usd"
+    if (not CFG.enabled) or meta.get("force_savings_only"):
+        return False, "reinvestor_disabled_or_forced_savings"
+    if CFG.block_weekends and _is_weekend() and not meta.get("ignore_time_gate"):
+        return False, "weekend_guard"
+
+    # daily cap
+    if redis and CFG.max_reinvests_per_day > 0:
+        if (await _get_daily_reinvest_count(redis)) >= CFG.max_reinvests_per_day:
+            return False, "daily_cap_reached"
+
+    # IMPORTANT: propagate sandbox -> dry_run (ctx.meta is authoritative later)
+    if ctx.sandbox_mode and not meta.get("dry_run"):
+        meta["dry_run"] = True
+
+    if ctx.equity_below_floor and not meta.get("ignore_health_gate"):
+        return False, "equity_below_floor_flag"
+    if CFG.min_equity_sol > 0 and ctx.equity_sol > 0 and ctx.equity_sol < CFG.min_equity_sol:
+        return False, "equity_below_min_env"
+
+    # cooldown on fail
+    if redis and CFG.cooldown_on_fail_min > 0 and not meta.get("ignore_time_gate"):
+        last_fail = await _get_last_fail_ts(redis)
+        if last_fail and (_utc_ts() - float(last_fail)) < float(CFG.cooldown_on_fail_min) * 60.0:
+            return False, "cooldown_on_fail"
+
+    # min spacing between reinvests
+    if CFG.min_minutes_between > 0 and redis and not meta.get("ignore_time_gate"):
+        last_ts = await _get_last_reinvest_ts(redis)
+        if last_ts:
+            elapsed_min = (_utc_ts() - float(last_ts)) / 60.0
+            if elapsed_min < CFG.min_minutes_between:
+                return False, "min_gap_between_reinvests"
+
+    if ctx.hard_halt and not force_anyway:
+        return False, "hard_halt"
+
+    if not force_anyway:
+        if any(tag in ("halt_all", "reinvestor_off", "reinvestor_hard_off", "halt_reinvestor") for tag in ctx.risk_tags):
+            return False, "risk_tag_halt"
+        if any(tag in ("reinvestor_soft_off", "cooldown_reinvestor") for tag in ctx.risk_tags):
+            return False, "risk_tag_soft_halt"
+
+    if ctx.daily_trades_cap > 0 and ctx.daily_trades_count >= ctx.daily_trades_cap and not force_anyway:
+        return False, "daily_trades_cap_reached"
+
+    if ctx.spend_budget_block and not force_anyway:
+        return False, "spend_budget_block"
+    if ctx.spend_remaining_usd is not None and ctx.spend_remaining_usd <= 0.0 and not force_anyway:
+        return False, "spend_budget_exhausted"
+
+    # risk manager entry gate
+    try:
+        allow_entry = await should_allow_new_entry(redis, source="reinvestor")  # type: ignore[arg-type]
+    except TypeError:
+        allow_entry = await should_allow_new_entry(redis)
+    except Exception:
+        allow_entry = True
+
+    if ((not allow_entry) or ctx.risk_capacity < CFG.min_capacity or ctx.risk_mode == 0) and not force_anyway:
+        return False, "risk_blocked"
+    if ctx.risk_mode == 3 and ctx.risk_capacity < CFG.defensive_capacity and not force_anyway:
+        return False, "defensive_capacity_low"
+
+    # hard stop drawdown always wins (even if force_anyway)
+    if CFG.dd_hard_stop_pct > 0 and ctx.daily_dd_pct >= CFG.dd_hard_stop_pct:
+        return False, "deep_drawdown"
+
+    if CFG.pnl_lock_pct > 0 and ctx.daily_pnl_pct >= CFG.pnl_lock_pct and not force_anyway:
+        return False, "pnl_day_high"
+
+    if (
+        (ctx.win_rate < CFG.health_min_winrate)
+        and (ctx.recent_win_rate < CFG.health_min_recent_winrate)
+        and (ctx.sharpe_like < CFG.health_min_sharpe)
+        and not meta.get("ignore_health_gate")
+        and not force_anyway
+    ):
+        return False, "perf_too_weak"
+
+    health = _compute_health_score(ctx)
+    if CFG.health_min_score > 0.0 and not meta.get("ignore_health_gate") and health < CFG.health_min_score and not force_anyway:
+        return False, "health_score_low"
+
+    if CFG.tail_gate > 0.0 and not meta.get("ignore_health_gate") and ctx.tail_risk_score >= CFG.tail_gate and not force_anyway:
+        return False, "tail_risk_high"
+
+    if not meta.get("ignore_infra_gate") and not force_anyway:
+        try:
+            infra_block = await infra_should_block_entries(redis)
+        except Exception:
+            infra_block = False
+
+        infra_halted = ctx.infra_state_is_halted > 0.5
+        infra_degraded = ctx.infra_state_is_degraded > 0.5
+
+        if infra_block and CFG.block_if_infra_halted:
+            return False, "infra_guard_block"
+        if infra_halted and CFG.block_if_infra_halted:
+            return False, "infra_halted"
+        if infra_degraded and CFG.block_if_infra_degraded:
+            return False, "infra_degraded"
+        if CFG.infra_min_health > 0.0 and ctx.infra_health_score < CFG.infra_min_health:
+            return False, "infra_health_low"
+
+    if ctx.regime_entry_gate_factor < 0.2 and not force_anyway:
+        return False, "regime_gate_low"
+    if float(ctx.risk_ctx_raw.get("ai_capacity_delta", 0.0) or 0.0) < -0.8 and not force_anyway:
+        return False, "ai_capacity_tight"
+
+    return True, "ok"
 
 
-async def _journal_skip(
-    reason: str,
-    proceeds_sol: float,
-    ctx: Optional[ReinvestContext],
-    meta: Dict[str, Any],
-    redis=None,
-) -> None:
-    """
-    Central place to announce & journal "skip reinvest" decisions.
-    """
-    ctx_payload: Dict[str, Any] = {}
+async def _journal_skip(reason: str, ctx: Optional[ReinvestContext], meta: Dict[str, Any], redis=None) -> None:
+    payload: Dict[str, Any] = {
+        "reason": reason,
+        "proceeds_sol": float(ctx.proceeds_sol) if ctx else _safe_float(meta.get("proceeds_sol"), 0.0),
+        "meta": dict(meta),
+        "ts": _now_utc().isoformat(),
+    }
     if ctx is not None:
-        ctx_payload = {
+        payload["ctx"] = {
             "risk_capacity": ctx.risk_capacity,
             "risk_mode": ctx.risk_mode,
             "risk_mode_override": ctx.risk_mode_override,
@@ -1646,1257 +1745,638 @@ async def _journal_skip(
             "sandbox_mode": ctx.sandbox_mode,
             "daily_trades_count": ctx.daily_trades_count,
             "daily_trades_cap": ctx.daily_trades_cap,
-            "infra_health_score": getattr(ctx, "infra_health_score", 1.0),
-            "infra_state_is_halted": getattr(ctx, "infra_state_is_halted", 0.0),
-            "infra_state_is_degraded": getattr(ctx, "infra_state_is_degraded", 0.0),
-            "tail_risk_score": getattr(
-                ctx, "tail_risk_score", ctx.risk_ctx_raw.get("tail_risk_score", 0.0)
-            ),
-            "spend_remaining_usd": getattr(ctx, "spend_remaining_usd", None),
-            "spend_budget_block": getattr(ctx, "spend_budget_block", False),
-            "risk_tags": ctx.risk_ctx_raw.get("risk_tags", []),
+            "infra_health_score": ctx.infra_health_score,
+            "infra_state_is_halted": ctx.infra_state_is_halted,
+            "infra_state_is_degraded": ctx.infra_state_is_degraded,
+            "tail_risk_score": ctx.tail_risk_score,
+            "spend_remaining_usd": ctx.spend_remaining_usd,
+            "spend_budget_block": ctx.spend_budget_block,
+            "risk_tags": ctx.risk_tags,
         }
 
-    try:
-        await note_reinvest_skipped(
-            reason=reason,
-            proceeds_sol=proceeds_sol,
-            ctx=ctx_payload,
-            meta=meta,
-            redis=redis,
-        )
-    except Exception:
-        pass
-
-    try:
-        await log_event(
-            "reinvest_skipped",
-            {
-                "reason": reason,
-                "proceeds_sol": proceeds_sol,
-                "meta": meta,
-                "ctx": getattr(ctx, "risk_ctx_raw", None) if ctx else None,
-                "infra": getattr(ctx, "infra_raw", None) if ctx else None,
-            },
-        )
-    except Exception:
-        pass
+    with contextlib.suppress(Exception):
+        await note_reinvest_skipped(reason=reason, proceeds_sol=payload["proceeds_sol"], ctx=(payload.get("ctx") or {}), meta=meta, redis=redis)
+    with contextlib.suppress(Exception):
+        await log_event("reinvest_skipped", payload)
 
 
-async def _bump_daily_reinvest_counter(redis) -> None:
-    if not redis:
-        return
-    try:
-        key = _today_key(REINVEST_DAILY_COUNT_KEY)
-        pipe = redis.pipeline()
-        pipe.incr(key)
-        pipe.expire(key, 60 * 60 * 36)  # ~1.5 days
-        await pipe.execute()
-    except Exception:
-        return
-
-
-async def _get_daily_reinvest_count(redis) -> int:
-    if not redis:
-        return 0
-    try:
-        key = _today_key(REINVEST_DAILY_COUNT_KEY)
-        raw = await redis.get(key)
-        return int(raw or "0")
-    except Exception:
-        return 0
-
-
-# ============================================================================ #
-# Core reinvest logic
-# ============================================================================ #
-
-
-async def reinvest(
-    proceeds_sol: float,
-    meta: Optional[Dict[str, Any]] = None,
-    redis=None,
-) -> Optional[str]:
+# ──────────────────────────────────────────────────────────────────────────────
+# Swap adapter (signature/return drift tolerant)
+# ──────────────────────────────────────────────────────────────────────────────
+async def _do_swap_buy(sol_in: float, out_mint: str, slippage: float) -> Tuple[bool, Optional[str], Any]:
     """
-    Split proceeds into savings + reinvest, risk-gated & quant-aware.
-
-    Returns:
-        new token mint on success, else None.
+    Normalizes multiple possible swap_token_jupiter signatures / return shapes.
+    Returns: (ok, tx_sig, raw_out)
     """
+    out = None
+    err: Optional[str] = None
+
+    out_mint = normalize_mint(out_mint)
+    slip = _normalize_slippage(slippage)
+
+    try:
+        out = await _maybe_await(swap_token_jupiter(SOL_MINT, out_mint, amount_float=sol_in, buy=True, slippage=slip))
+    except TypeError as e:
+        err = str(e)
+        with contextlib.suppress(Exception):
+            out = await _maybe_await(swap_token_jupiter(SOL_MINT, out_mint, sol_in, True, slip))
+        if out is None:
+            with contextlib.suppress(Exception):
+                out = await _maybe_await(swap_token_jupiter(SOL_MINT, out_mint, sol_in))
+    except Exception as e:
+        err = str(e)
+
+    if out is None:
+        return False, None, {"error": err or "swap_return_none"}
+
+    if isinstance(out, tuple) and len(out) >= 2:
+        ok = bool(out[0])
+        sig = out[1]
+        return ok, str(sig) if sig else None, out
+
+    if isinstance(out, dict):
+        ok = bool(out.get("ok", True))
+        sig = out.get("tx_sig") or out.get("signature") or out.get("sig")
+        return ok, str(sig) if sig else None, out
+
+    if isinstance(out, str):
+        return True, out, out
+
+    return bool(out), None, out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core reinvest
+# ──────────────────────────────────────────────────────────────────────────────
+async def reinvest(proceeds_sol: float, meta: Optional[Dict[str, Any]] = None, redis=None) -> Optional[str]:
     meta = dict(meta or {})
+    proceeds_sol = float(proceeds_sol or 0.0)
 
-    # Global dry-run override from env (useful for testing full stack)
-    if REINVEST_GLOBAL_DRY_RUN:
+    # global dry-run switches
+    if CFG.global_dry_run:
+        meta["dry_run"] = True
+    if meta.get("sandbox") or meta.get("sandbox_mode"):
         meta["dry_run"] = True
 
-    # Meta sandbox flag (for backtests/tools) — makes sure we never trade live.
-    if meta.get("sandbox"):
-        meta["dry_run"] = True
-
-    if proceeds_sol is None or proceeds_sol <= 0:
-        logger.info("[REINVEST] No proceeds to reinvest.")
-        return None
-
-    # If realized leg itself is tiny in SOL, just bank it.
-    if proceeds_sol < REINVESTMENT_MIN_PROFIT_SOL:
-        logger.info(
-            "[REINVEST] proceeds %.6f SOL below global threshold %.6f SOL; "
-            "sending all to savings.",
-            proceeds_sol,
-            REINVESTMENT_MIN_PROFIT_SOL,
-        )
-        await _journal_skip(
-            "below_min_profit_sol", proceeds_sol, None, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # Optional USD threshold
-    proceeds_usd = await _sol_to_usd(proceeds_sol)
-    if REINVESTMENT_MIN_PROFIT_USD > 0 and proceeds_usd < REINVESTMENT_MIN_PROFIT_USD:
-        logger.info(
-            "[REINVEST] proceeds ~$%.2f below USD threshold %.2f; sending to savings.",
-            proceeds_usd,
-            REINVESTMENT_MIN_PROFIT_USD,
-        )
-        await _journal_skip(
-            "below_min_profit_usd", proceeds_sol, None, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # Global kill-switch: all proceeds → savings
-    if not REINVESTOR_ENABLED or meta.get("force_savings_only"):
-        logger.info(
-            "[REINVEST] REINVESTOR disabled or force_savings_only "
-            "-> sending %.6f SOL to savings only.",
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "reinvestor_disabled_or_forced_savings",
-            proceeds_sol,
-            None,
-            meta,
-            redis=redis,
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
+    _ensure_job_id(meta, proceeds_sol)
+    meta.setdefault("proceeds_sol", proceeds_sol)
 
     if redis is None:
         redis = await _get_redis()
 
-    # Weekend guard (optional)
-    if REINVEST_BLOCK_WEEKENDS and _is_weekend() and not meta.get("ignore_time_gate"):
-        logger.info(
-            "[REINVEST] Weekend guard enabled; routing %.6f SOL to savings only.",
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "weekend_guard", proceeds_sol, None, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
+    t0 = time.monotonic()
+
+    # idempotency
+    if redis and not await _idempotency_claim(redis, meta):
+        log.info("[REINVEST] Idempotency: already processed. job_id=%s", meta.get("job_id"))
+        await _journal_skip("idempotency_already_processed", None, meta, redis=redis)
         return None
 
-    # Anti-overtrading: daily cap on reinvest count
-    if REINVEST_MAX_REINVESTS_PER_DAY > 0 and redis is not None:
-        daily_count = await _get_daily_reinvest_count(redis)
-        if daily_count >= REINVEST_MAX_REINVESTS_PER_DAY:
-            logger.info(
-                "[REINVEST] Daily reinvest cap reached (%d >= %d); "
-                "sending %.6f SOL to savings.",
-                daily_count,
-                REINVEST_MAX_REINVESTS_PER_DAY,
-                proceeds_sol,
-            )
-            await _journal_skip(
-                "daily_cap_reached", proceeds_sol, None, meta, redis=redis
-            )
-            await _send_to_savings(proceeds_sol)
+    # lock
+    lock_token: Optional[str] = None
+    lk = _lock_key(meta)
+    if redis and CFG.lock_enabled:
+        lock_token = await _acquire_lock(redis, lk, CFG.lock_ttl_s)
+        if not lock_token:
+            log.info("[REINVEST] Lock busy -> skip. key=%s", lk)
+            await _journal_skip("lock_busy", None, meta, redis=redis)
             return None
 
-    # ------------------------------------------------------------------ #
-    # Build context (risk + strategy + perf + regime + infra)
-    # ------------------------------------------------------------------ #
-    ctx = await _build_context(proceeds_sol, meta, redis)
-    if ctx is None:
-        logger.info("[REINVEST] Failed to build reinvest context; sending to savings.")
-        await _journal_skip(
-            "context_build_failed", proceeds_sol, None, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    risk_capacity = ctx.risk_capacity
-    risk_mode = ctx.risk_mode
-    daily_pnl_pct = ctx.daily_pnl_pct
-    daily_dd_pct = ctx.daily_dd_pct
-    equity_sol = ctx.equity_sol
-    strat_mode = ctx.strat_mode
-    hard_halt = ctx.hard_halt
-
-    tail_risk_score = getattr(ctx, "tail_risk_score", 0.0)
-    spend_remaining_usd = getattr(ctx, "spend_remaining_usd", float("inf"))
-    spend_budget_block = bool(getattr(ctx, "spend_budget_block", False))
-    equity_floor_usd = getattr(ctx, "equity_floor_usd", 0.0)
-    equity_below_floor = bool(getattr(ctx, "equity_below_floor", False))
-
-    regime_label = ctx.regime_label_numeric
-    regime_stress = ctx.regime_stress_score
-    regime_signal = ctx.regime_signal_strength
-    regime_gate = ctx.regime_entry_gate_factor
-    ai_capacity_delta = ctx.risk_ctx_raw.get("ai_capacity_delta", 0.0)
-
-    # Risk tags from risk_manager (optional, for higher-level control)
-    risk_tags_raw = ctx.risk_ctx_raw.get("risk_tags", [])
-    if isinstance(risk_tags_raw, str):
-        risk_tags = [risk_tags_raw]
-    elif isinstance(risk_tags_raw, (list, tuple, set)):
-        risk_tags = [str(x) for x in risk_tags_raw]
-    else:
-        risk_tags = []
-
-    # Daily trades cap from risk layer
-    daily_trades_count = ctx.daily_trades_count
-    daily_trades_cap = ctx.daily_trades_cap
-
-    # Infra flags
-    infra_halted = ctx.infra_state_is_halted > 0.5
-    infra_degraded = ctx.infra_state_is_degraded > 0.5
-    infra_health_score = ctx.infra_health_score
-
-    # If risk layer says sandbox_mode, force dry-run at this layer as well.
-    if ctx.sandbox_mode and not meta.get("dry_run"):
-        logger.info("[REINVEST] sandbox_mode=1 from risk_ctx; forcing dry_run.")
-        meta["dry_run"] = True
-
-    # Optional equity floor from risk_manager: if flagged, route straight to savings
-    if equity_below_floor and not meta.get("ignore_health_gate"):
-        logger.info(
-            "[REINVEST] equity_below_floor flag from risk_manager "
-            "(floor_usd=%.2f); routing %.6f SOL to savings.",
-            equity_floor_usd,
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "equity_below_floor_flag", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # Optional equity floor (env-level): if account is very small, focus on rebuilding
-    if (
-        REINVEST_MIN_EQUITY_SOL > 0
-        and equity_sol > 0
-        and equity_sol < REINVEST_MIN_EQUITY_SOL
-    ):
-        logger.info(
-            "[REINVEST] Equity %.4f SOL below REINVEST_MIN_EQUITY_SOL %.4f; "
-            "routing %.6f SOL to savings only.",
-            equity_sol,
-            REINVEST_MIN_EQUITY_SOL,
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "equity_below_min_env", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # Time-based throttling: avoid rapidly chaining reinvests in choppy regimes
-    if (
-        REINVEST_MIN_MINUTES_BETWEEN_REINVESTS > 0
-        and redis is not None
-        and not meta.get("ignore_time_gate")
-    ):
-        last_ts = await _get_last_reinvest_ts(redis)
-        if last_ts:
-            now_ts = datetime.now(timezone.utc).timestamp()
-            elapsed_min = (now_ts - last_ts) / 60.0
-            if elapsed_min < REINVEST_MIN_MINUTES_BETWEEN_REINVESTS:
-                logger.info(
-                    "[REINVEST] Last reinvest %.2f min ago (< %.2f min); "
-                    "sending %.6f SOL to savings.",
-                    elapsed_min,
-                    REINVEST_MIN_MINUTES_BETWEEN_REINVESTS,
-                    proceeds_sol,
-                )
-                await _journal_skip(
-                    "min_gap_between_reinvests",
-                    proceeds_sol,
-                    ctx,
-                    meta,
-                    redis=redis,
-                )
-                await _send_to_savings(proceeds_sol)
-                return None
-
-    # ------------------------------------------------------------------ #
-    # Risk gating: HARD_HALT + capacity + risk_mode + trade caps + budgets
-    # ------------------------------------------------------------------ #
     try:
-        # newer risk_manager may support a "source" argument for analytics
-        allow_entry = await should_allow_new_entry(redis, source="reinvestor")  # type: ignore[arg-type]
-    except TypeError:
-        # backwards compat: older signature without source kwarg
-        allow_entry = await should_allow_new_entry(redis)
-    except Exception:
-        logger.warning("[REINVEST] should_allow_new_entry failed; defaulting allow=True")
-        allow_entry = True
-
-    force_reinvest_even_if_risk_blocked = bool(
-        meta.get("force_reinvest_even_if_risk_blocked", False)
-    )
-
-    # Strategy-level hard halt from self-learning brain
-    if hard_halt and not force_reinvest_even_if_risk_blocked:
-        logger.info(
-            "[REINVEST] HARD_HALT from strategy params; routing %.6f SOL to savings.",
-            proceeds_sol,
-        )
-        await _journal_skip("hard_halt", proceeds_sol, ctx, meta, redis=redis)
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # Risk tags: allow risk_manager to hard/soft-disable reinvestor
-    if not force_reinvest_even_if_risk_blocked:
-        # Hard halts: anything that implies "reinvestor OFF"
-        if any(
-            tag in ("halt_all", "reinvestor_off", "reinvestor_hard_off", "halt_reinvestor")
-            for tag in risk_tags
-        ):
-            logger.info(
-                "[REINVEST] Risk tags %s request hard halt; "
-                "routing %.6f SOL to savings.",
-                risk_tags,
-                proceeds_sol,
-            )
-            await _journal_skip(
-                "risk_tag_halt", proceeds_sol, ctx, meta, redis=redis
-            )
-            await _send_to_savings(proceeds_sol)
+        ctx = await _build_context(proceeds_sol, meta, redis)
+        if ctx is None:
+            await _journal_skip("context_build_failed", None, meta, redis=redis)
+            await _send_to_savings(proceeds_sol, redis=redis)
             return None
 
-        # Soft halts: prefer savings for now (e.g. drawdown cooldown)
-        if any(
-            tag in ("reinvestor_soft_off", "cooldown_reinvestor")
-            for tag in risk_tags
-        ):
-            logger.info(
-                "[REINVEST] Risk tags %s request soft halt; "
-                "routing %.6f SOL to savings.",
-                risk_tags,
-                proceeds_sol,
-            )
-            await _journal_skip(
-                "risk_tag_soft_halt", proceeds_sol, ctx, meta, redis=redis
-            )
-            await _send_to_savings(proceeds_sol)
+        allowed, reason = await _evaluate_gates(ctx, redis)
+
+        # IMPORTANT: ctx.meta is authoritative (it may have been mutated by gates)
+        meta = ctx.meta
+
+        eff_pct, scales = _compute_eff_pct(ctx)
+        eff_pct = max(CFG.min_eff_pct, min(CFG.max_eff_pct, eff_pct))
+
+        reinvest_sol = proceeds_sol * (eff_pct / 100.0)
+        savings_sol = max(0.0, proceeds_sol - reinvest_sol)
+
+        # budget fraction cap (optional): reinvest <= max_budget_fraction * spend_remaining_usd
+        if CFG.max_budget_fraction > 0 and ctx.spend_remaining_usd and ctx.spend_remaining_usd > 0:
+            cap_usd = float(CFG.max_budget_fraction) * float(ctx.spend_remaining_usd)
+            if cap_usd > 0:
+                reinv_usd = await _sol_to_usd(reinvest_sol)
+                if reinv_usd > cap_usd and reinv_usd > 0:
+                    scale_down = cap_usd / max(reinv_usd, 1e-9)
+                    reinvest_sol = max(0.0, reinvest_sol * scale_down)
+                    savings_sol = max(0.0, proceeds_sol - reinvest_sol)
+
+        health_score = _compute_health_score(ctx)
+
+        # persist last decision (even on skip)
+        decision_doc = {
+            "ts": _now_utc().isoformat(),
+            "job_id": meta.get("job_id"),
+            "allowed": bool(allowed),
+            "reason": reason,
+            "proceeds_sol": proceeds_sol,
+            "proceeds_usd": ctx.proceeds_usd,
+            "eff_pct": eff_pct,
+            "reinvest_sol": reinvest_sol,
+            "savings_sol": savings_sol,
+            "health_score": health_score,
+            "scales": scales.as_dict(),
+            "risk_capacity": ctx.risk_capacity,
+            "risk_mode": ctx.risk_mode,
+            "plan_status": ctx.plan_status,
+            "plan_gap_pct": ctx.plan_gap_pct,
+            "infra_health_score": ctx.infra_health_score,
+            "tail_risk_score": ctx.tail_risk_score,
+            "meta": meta,
+        }
+        if redis:
+            await _persist_decision(redis, decision_doc)
+
+        if not allowed:
+            log.info("[REINVEST] Gate blocked (%s) -> savings.", reason)
+            await _journal_skip(reason, ctx, meta, redis=redis)
+            await _send_to_savings(proceeds_sol, redis=redis)
+            await _update_reinvest_health(redis, ctx, eff_pct=0.0, reinvest_sol=0.0, savings_sol=proceeds_sol, reason=reason)
             return None
 
-    # Global trades cap from risk layer
-    if (
-        daily_trades_cap > 0
-        and daily_trades_count >= daily_trades_cap
-        and not force_reinvest_even_if_risk_blocked
-    ):
-        logger.info(
-            "[REINVEST] daily_trades_count cap reached (%d >= %d); "
-            "sending %.6f SOL to savings.",
-            daily_trades_count,
-            daily_trades_cap,
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "daily_trades_cap_reached", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # Budget-based gating from risk_manager (if provided)
-    if spend_budget_block and not force_reinvest_even_if_risk_blocked:
-        logger.info(
-            "[REINVEST] Spend budget block from risk_manager; sending %.6f SOL to savings.",
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "spend_budget_block", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    if (
-        spend_remaining_usd is not None
-        and spend_remaining_usd <= 0.0
-        and not force_reinvest_even_if_risk_blocked
-    ):
-        logger.info(
-            "[REINVEST] No spend budget remaining (<=0 USD); sending %.6f SOL to savings.",
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "spend_budget_exhausted", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # Global hard blocks or very low capacity
-    if (
-        (not allow_entry) or risk_capacity < REINVEST_MIN_CAPACITY or risk_mode == 0
-    ) and not force_reinvest_even_if_risk_blocked:
-        logger.info(
-            "[REINVEST] Risk gating blocked new entries "
-            "(allow=%s, capacity=%.3f, mode=%s). Sending to savings only.",
-            allow_entry,
-            risk_capacity,
-            risk_mode,
-        )
-        await _journal_skip(
-            "risk_blocked", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # Defensive mode with very low capacity: treat as soft halt
-    if risk_mode == 3 and risk_capacity < REINVEST_DEFENSIVE_CAPACITY:
-        logger.info(
-            "[REINVEST] Defensive mode with low capacity (cap=%.3f < %.3f); "
-            "sending %.6f SOL to savings.",
-            risk_capacity,
-            REINVEST_DEFENSIVE_CAPACITY,
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "defensive_capacity_low", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # Deep daily DD (magnitude ≥ hard stop) → pure capital protection
-    if (
-        REINVEST_DD_HARD_STOP_PCT > 0
-        and daily_dd_pct >= REINVEST_DD_HARD_STOP_PCT
-    ):
-        logger.info(
-            "[REINVEST] Deep daily drawdown (%.2f%% ≥ %.2f%%) — "
-            "routing to savings only.",
-            daily_dd_pct,
-            REINVEST_DD_HARD_STOP_PCT,
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "deep_drawdown", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # Very high daily realized PnL: protect capital, avoid over-trading
-    if REINVEST_PNL_LOCK_PCT > 0 and daily_pnl_pct >= REINVEST_PNL_LOCK_PCT:
-        logger.info(
-            "[REINVEST] Daily PnL already high (%.2f%% ≥ %.2f%%) — "
-            "capital protection: sending %.6f SOL to savings.",
-            daily_pnl_pct,
-            REINVEST_PNL_LOCK_PCT,
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "pnl_day_high", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # Performance/health gating: if stats are too bad, don't spin up risk
-    if (
-        ctx.win_rate < REINVEST_HEALTH_MIN_WINRATE
-        and ctx.recent_win_rate < REINVEST_HEALTH_MIN_RECENT_WINRATE
-        and ctx.sharpe_like < REINVEST_HEALTH_MIN_SHARPE
-    ):
-        logger.info(
-            "[REINVEST] Performance too weak (WR=%.2f, recent=%.2f, Sharpe=%.2f); "
-            "sending %.6f SOL to savings.",
-            ctx.win_rate,
-            ctx.recent_win_rate,
-            ctx.sharpe_like,
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "perf_too_weak", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # Aggregate health score gating (optional, can be bypassed per-meta)
-    health_score = _compute_health_score(ctx)
-    if (
-        REINVEST_HEALTH_MIN_SCORE > 0.0
-        and not meta.get("ignore_health_gate")
-        and health_score < REINVEST_HEALTH_MIN_SCORE
-    ):
-        logger.info(
-            "[REINVEST] Health score low (%.1f < %.1f); "
-            "sending %.6f SOL to savings.",
-            health_score,
-            REINVEST_HEALTH_MIN_SCORE,
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "health_score_low", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # Tail-risk hard gate (optional)
-    if (
-        REINVEST_TAIL_RISK_GATE > 0.0
-        and not meta.get("ignore_health_gate")
-        and tail_risk_score >= REINVEST_TAIL_RISK_GATE
-    ):
-        logger.info(
-            "[REINVEST] Tail risk high (%.2f ≥ %.2f); sending %.6f SOL to savings.",
-            tail_risk_score,
-            REINVEST_TAIL_RISK_GATE,
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "tail_risk_high", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # ------------------------------------------------------------------ #
-    # Infra gating on top of risk_manager (via infra_guard)
-    # ------------------------------------------------------------------ #
-    if not meta.get("ignore_infra_gate"):
-        # Hard block if infra says "block entries" and flag is set
-        infra_block = await infra_should_block_entries(redis)
-        if infra_block and REINVEST_BLOCK_IF_INFRA_HALTED:
-            logger.info(
-                "[REINVEST] Infra guard requested block; sending %.6f SOL to savings.",
-                proceeds_sol,
-            )
-            await _journal_skip(
-                "infra_guard_block", proceeds_sol, ctx, meta, redis=redis
-            )
-            await _send_to_savings(proceeds_sol)
-            return None
-
-        # Block if infra state is HALTED explicitly
-        if infra_halted and REINVEST_BLOCK_IF_INFRA_HALTED:
-            logger.info(
-                "[REINVEST] Infra HALTED (health=%.2f); sending %.6f SOL to savings.",
-                infra_health_score,
-                proceeds_sol,
-            )
-            await _journal_skip(
-                "infra_halted", proceeds_sol, ctx, meta, redis=redis
-            )
-            await _send_to_savings(proceeds_sol)
-            return None
-
-        # Optional block on DEGRADE
-        if infra_degraded and REINVEST_BLOCK_IF_INFRA_DEGRADED:
-            logger.info(
-                "[REINVEST] Infra DEGRADED (health=%.2f); sending %.6f SOL to savings.",
-                infra_health_score,
-                proceeds_sol,
-            )
-            await _journal_skip(
-                "infra_degraded", proceeds_sol, ctx, meta, redis=redis
-            )
-            await _send_to_savings(proceeds_sol)
-            return None
-
-        # Min infra health threshold (0..1)
-        if (
-            REINVEST_INFRA_MIN_HEALTH > 0.0
-            and infra_health_score < REINVEST_INFRA_MIN_HEALTH
-        ):
-            logger.info(
-                "[REINVEST] Infra health low (%.2f < %.2f); sending %.6f SOL to savings.",
-                infra_health_score,
-                REINVEST_INFRA_MIN_HEALTH,
-                proceeds_sol,
-            )
-            await _journal_skip(
-                "infra_health_low", proceeds_sol, ctx, meta, redis=redis
-            )
-            await _send_to_savings(proceeds_sol)
-            return None
-
-    # Regime gate factor extremely low → treat like soft halt
-    if regime_gate < 0.2:
-        logger.info(
-            "[REINVEST] Regime gate factor very low (%.2f); sending %.6f SOL to savings.",
-            regime_gate,
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "regime_gate_low", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # If AI capacity delta says "very constrained", treat like a soft halt
-    if ai_capacity_delta < -0.8:
-        logger.info(
-            "[REINVEST] AI capacity strongly negative (%.3f); "
-            "routing %.6f SOL to savings.",
-            ai_capacity_delta,
-            proceeds_sol,
-        )
-        await _journal_skip(
-            "ai_capacity_tight", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        return None
-
-    # ------------------------------------------------------------------ #
-    # Effective reinvest % (core brain)
-    # ------------------------------------------------------------------ #
-    eff_pct_raw, scales = _compute_eff_reinvest_pct(ctx)
-
-    # Global skim: always send part of proceeds straight to savings
-    if REINVEST_ALWAYS_SAVINGS_PCT > 0:
-        eff_pct_raw = max(0.0, eff_pct_raw - REINVEST_ALWAYS_SAVINGS_PCT)
-
-    eff_pct = _apply_meta_eff_overrides(eff_pct_raw, ctx.meta)
-
-    reinvest_sol = proceeds_sol * (eff_pct / 100.0)
-    savings_sol = max(0.0, proceeds_sol - reinvest_sol)
-
-    # Optional: block if this one trade would eat too much of remaining budget
-    if (
-        REINVEST_MAX_BUDGET_FRACTION > 0.0
-        and spend_remaining_usd is not None
-        and spend_remaining_usd > 0.0
-    ):
-        usd_for_reinvest = await _sol_to_usd(reinvest_sol)
-        frac_of_budget = usd_for_reinvest / max(spend_remaining_usd, 1e-9)
-        if frac_of_budget > REINVEST_MAX_BUDGET_FRACTION:
-            logger.info(
-                "[REINVEST] Planned reinvest uses %.1f%% of remaining budget "
-                "(frac=%.3f > max=%.3f); sending %.6f SOL to savings.",
-                frac_of_budget * 100.0,
-                frac_of_budget,
-                REINVEST_MAX_BUDGET_FRACTION,
-                proceeds_sol,
-            )
-            await _journal_skip(
-                "reinvest_would_use_too_much_budget",
-                proceeds_sol,
-                ctx,
-                meta,
+        with contextlib.suppress(Exception):
+            await note_reinvest_decision(
+                proceeds_sol=proceeds_sol,
+                eff_pct_raw=float(scales.eff_pct),
+                eff_pct_final=float(eff_pct),
+                scales=scales.as_dict(),
+                ctx={
+                    "health_score": health_score,
+                    "risk_capacity": ctx.risk_capacity,
+                    "risk_mode": ctx.risk_mode,
+                    "risk_mode_override": ctx.risk_mode_override,
+                    "daily_pnl_pct": ctx.daily_pnl_pct,
+                    "daily_dd_pct": ctx.daily_dd_pct,
+                    "equity_sol": ctx.equity_sol,
+                    "plan_status": ctx.plan_status,
+                    "plan_gap_pct": ctx.plan_gap_pct,
+                    "kelly_suggestion": ctx.kelly_suggestion,
+                    "kelly_confidence": ctx.kelly_confidence,
+                    "regime_label_numeric": ctx.regime_label_numeric,
+                    "regime_stress_score": ctx.regime_stress_score,
+                    "regime_signal_strength": ctx.regime_signal_strength,
+                    "regime_entry_gate_factor": ctx.regime_entry_gate_factor,
+                    "ai_capacity_delta": float(ctx.risk_ctx_raw.get("ai_capacity_delta", 0.0) or 0.0),
+                    "infra_health_score": ctx.infra_health_score,
+                    "tail_risk_score": ctx.tail_risk_score,
+                    "spend_remaining_usd": ctx.spend_remaining_usd,
+                    "spend_budget_block": ctx.spend_budget_block,
+                },
+                meta=meta,
                 redis=redis,
             )
-            await _send_to_savings(proceeds_sol)
-            await _update_reinvest_health(
-                redis, ctx, eff_pct=0.0, reinvest_sol=0.0, savings_sol=proceeds_sol
-            )
+
+        # cap by per-trade risk vs equity
+        if ctx.equity_sol > 0 and ctx.max_risk_per_trade > 0:
+            cap_sol = float(ctx.max_risk_per_trade) * float(ctx.equity_sol)
+            if reinvest_sol > cap_sol:
+                reinvest_sol = cap_sol
+                savings_sol = max(0.0, proceeds_sol - reinvest_sol)
+
+        # USD hard cap
+        if CFG.max_single_usd > 0:
+            usd_full = await _sol_to_usd(reinvest_sol)
+            if usd_full > CFG.max_single_usd and usd_full > 0:
+                scale_down = float(CFG.max_single_usd) / max(float(usd_full), 1e-9)
+                reinvest_sol = max(0.0, reinvest_sol * scale_down)
+                savings_sol = max(0.0, proceeds_sol - reinvest_sol)
+
+        # too small reinvest leg -> savings
+        if reinvest_sol < CFG.min_proceeds_sol:
+            await _journal_skip("reinvest_leg_too_small", ctx, meta, redis=redis)
+            await _send_to_savings(proceeds_sol, redis=redis)
+            await _update_reinvest_health(redis, ctx, eff_pct=0.0, reinvest_sol=0.0, savings_sol=proceeds_sol, reason="too_small")
             return None
 
-    # Self-learning hook: log decision BEFORE caps
-    try:
-        await note_reinvest_decision(
-            proceeds_sol=proceeds_sol,
-            eff_pct_raw=eff_pct_raw,
-            eff_pct_final=eff_pct,
-            scales=scales.as_dict(),
-            ctx={  # keep it JSON-safe where possible
-                "risk_capacity": risk_capacity,
-                "risk_mode": risk_mode,
+        # optional min SOL reserve gate
+        if get_wallet_balance_sol is not None and not meta.get("ignore_balance_gate"):
+            with contextlib.suppress(Exception):
+                bal = float(await _maybe_await(get_wallet_balance_sol()))  # type: ignore[misc]
+                if (bal - proceeds_sol) >= 0 and (bal - proceeds_sol) < float(ctx.min_sol_balance):
+                    await _journal_skip("min_sol_reserve_gate", ctx, meta, redis=redis)
+                    await _send_to_savings(proceeds_sol, redis=redis)
+                    await _update_reinvest_health(redis, ctx, eff_pct=0.0, reinvest_sol=0.0, savings_sol=proceeds_sol, reason="min_reserve")
+                    return None
+
+        # dry run exits here
+        if meta.get("dry_run"):
+            await _update_reinvest_health(redis, ctx, eff_pct=eff_pct, reinvest_sol=reinvest_sol, savings_sol=savings_sol, reason="dry_run")
+            return None
+
+        # pick target
+        pick = await _pick_target_mint(reinvest_sol, meta=meta, redis=redis)
+        if not pick:
+            await _safe_tg("⚠️ Reinvestment skipped — no suitable target met filters right now.", redis=redis)
+            await _journal_skip("no_target", ctx, meta, redis=redis)
+            await _update_reinvest_health(redis, ctx, eff_pct=0.0, reinvest_sol=0.0, savings_sol=proceeds_sol, reason="no_target")
+            with contextlib.suppress(Exception):
+                await note_reinvest_result(
+                    mint=None,
+                    proceeds_sol=proceeds_sol,
+                    reinvest_sol=0.0,
+                    savings_sol=proceeds_sol,
+                    eff_pct=0.0,
+                    success=False,
+                    tx_sig=None,
+                    ctx={"health_score": health_score, "tail_risk_score": ctx.tail_risk_score},
+                    redis=redis,
+                )
+            return None
+
+        # savings before swap if configured
+        if savings_sol > 0 and (not CFG.savings_after_swap):
+            await _send_to_savings(savings_sol, redis=redis)
+
+        ok, tx_sig, raw_swap = await _do_swap_buy(reinvest_sol, pick.mint, ctx.slippage)
+        if not ok:
+            await _safe_tg(f"❌ Reinvestment buy failed for `{pick.mint}`.", redis=redis)
+            await _journal_skip("swap_failed", ctx, meta, redis=redis)
+            await _update_reinvest_health(redis, ctx, eff_pct=0.0, reinvest_sol=0.0, savings_sol=proceeds_sol, reason="swap_failed")
+            if redis and CFG.cooldown_on_fail_min > 0:
+                await _set_last_fail_ts(redis)
+            await _send_to_savings(proceeds_sol, redis=redis)
+            with contextlib.suppress(Exception):
+                await note_reinvest_result(
+                    mint=pick.mint,
+                    proceeds_sol=proceeds_sol,
+                    reinvest_sol=0.0,
+                    savings_sol=proceeds_sol,
+                    eff_pct=0.0,
+                    success=False,
+                    tx_sig=None,
+                    ctx={"health_score": health_score, "tail_risk_score": ctx.tail_risk_score, "swap": raw_swap},
+                    redis=redis,
+                )
+            return None
+
+        # savings after swap (default)
+        if savings_sol > 0 and CFG.savings_after_swap:
+            await _send_to_savings(savings_sol, redis=redis)
+
+        # persist position (+ optional hooks)
+        buy_price_sol = await _token_price_in_sol(pick.mint)
+        trailing_stop = (buy_price_sol * (1.0 - (ctx.stop_loss_percent / 100.0))) if buy_price_sol > 0 else 0.0
+        now_iso = _now_utc().isoformat()
+
+        infra_halted = bool(ctx.infra_state_is_halted > 0.5)
+        infra_degraded = bool(ctx.infra_state_is_degraded > 0.5)
+        ai_capacity_delta = float(ctx.risk_ctx_raw.get("ai_capacity_delta", 0.0) or 0.0)
+
+        position_payload: Dict[str, Any] = {
+            "token_address": pick.mint,
+            "buy_price": float(buy_price_sol),
+            "amount_invested_sol": float(reinvest_sol),
+            "timestamp": now_iso,
+            "trailing_stop": float(trailing_stop),
+            "source": meta.get("tag") or "reinvestor",
+            "origin_trade_id": meta.get("origin_trade_id"),
+            "origin_position_id": meta.get("origin_position_id"),
+            "meta": {
+                **meta,
+                "job_id": meta.get("job_id"),
+                "reinvest_pct": float(eff_pct),
+                "risk_capacity": ctx.risk_capacity,
+                "risk_mode": ctx.risk_mode,
                 "risk_mode_override": ctx.risk_mode_override,
-                "halt_reason": ctx.halt_reason,
-                "daily_pnl_pct": daily_pnl_pct,
-                "daily_dd_pct": daily_dd_pct,
-                "equity_sol": equity_sol,
-                "plan_status": ctx.plan_status,
-                "plan_gap_pct": ctx.plan_gap_pct,
+                "strat_mode": ctx.strat_mode,
                 "kelly_suggestion": ctx.kelly_suggestion,
                 "kelly_confidence": ctx.kelly_confidence,
-                "regime_label_numeric": regime_label,
-                "regime_stress_score": regime_stress,
-                "regime_signal_strength": regime_signal,
-                "regime_entry_gate_factor": regime_gate,
+                "daily_realized_pnl_pct": ctx.daily_pnl_pct,
+                "daily_drawdown_pct": ctx.daily_dd_pct,
+                "plan_status": ctx.plan_status,
+                "plan_gap_pct": ctx.plan_gap_pct,
+                "regime_label": ctx.regime_label,
+                "regime_label_numeric": ctx.regime_label_numeric,
+                "regime_stress_score": ctx.regime_stress_score,
+                "regime_signal_strength": ctx.regime_signal_strength,
+                "regime_entry_gate_factor": ctx.regime_entry_gate_factor,
                 "ai_capacity_delta": ai_capacity_delta,
                 "sandbox_mode": ctx.sandbox_mode,
                 "health_score": health_score,
-                "infra_health_score": infra_health_score,
+                "daily_trades_count": ctx.daily_trades_count,
+                "daily_trades_cap": ctx.daily_trades_cap,
+                "infra_health_score": ctx.infra_health_score,
                 "infra_state_is_halted": infra_halted,
                 "infra_state_is_degraded": infra_degraded,
-                "daily_trades_count": daily_trades_count,
-                "daily_trades_cap": daily_trades_cap,
-                "tail_risk_score": tail_risk_score,
-                "spend_remaining_usd": spend_remaining_usd,
-                "spend_budget_block": spend_budget_block,
-                "risk_tags": risk_tags,
-            },
-            meta=ctx.meta,
-            redis=redis,
-        )
-    except Exception:
-        pass
-
-    # Optional: cap by equity * max_risk_per_trade if equity_sol available
-    if equity_sol > 0 and ctx.max_risk_per_trade > 0:
-        max_by_risk = ctx.max_risk_per_trade * equity_sol
-        if reinvest_sol > max_by_risk:
-            logger.info(
-                "[REINVEST] Capping reinvest by max_risk_per_trade: "
-                "requested=%.6f, cap=%.6f (equity=%.4f SOL, max_risk=%.3f)",
-                reinvest_sol,
-                max_by_risk,
-                equity_sol,
-                ctx.max_risk_per_trade,
-            )
-            reinvest_sol = max_by_risk
-            savings_sol = max(0.0, proceeds_sol - reinvest_sol)
-
-    # Optional: USD hard cap
-    if REINVEST_MAX_SINGLE_USD > 0:
-        usd_for_full = await _sol_to_usd(reinvest_sol)
-        if usd_for_full > REINVEST_MAX_SINGLE_USD:
-            if usd_for_full > 0:
-                scale_down = REINVEST_MAX_SINGLE_USD / max(usd_for_full, 1e-9)
-                reinvest_sol *= scale_down
-                reinvest_sol = max(0.0, reinvest_sol)
-                savings_sol = max(0.0, proceeds_sol - reinvest_sol)
-                logger.info(
-                    "[REINVEST] Capped by REINVEST_MAX_SINGLE_USD: "
-                    "usd_full=%.2f, cap=%.2f, new_reinvest=%.6f SOL",
-                    usd_for_full,
-                    REINVEST_MAX_SINGLE_USD,
-                    reinvest_sol,
-                )
-
-    logger.info(
-        "[REINVEST] proceeds=%.6f SOL (~$%.2f) | base_pct=%.1f%% | eff_pct=%.1f%% "
-        "| risk_capacity=%.3f | risk_mode=%d | strat_mode=%d | "
-        "kelly=%.3f | reinvest=%.6f SOL | savings=%.6f SOL | "
-        "dailyPnL=%.2f%% | dailyDD=%.2f%% | plan_status=%s (gap=%.2f%%) "
-        "| regime=(%.2f, stress=%.2f, signal=%.2f, gate=%.2f) | ai_cap_delta=%.3f "
-        "| tail_risk=%.2f | infra_health=%.2f (halted=%s, degraded=%s) "
-        "| sandbox_mode=%s | health_score=%.1f | dailyTrades=%d/%d | risk_tags=%s",
-        proceeds_sol,
-        proceeds_usd,
-        ctx.base_reinvest_pct,
-        eff_pct,
-        risk_capacity,
-        risk_mode,
-        strat_mode,
-        ctx.kelly_suggestion,
-        reinvest_sol,
-        savings_sol,
-        daily_pnl_pct,
-        daily_dd_pct,
-        ctx.plan_status,
-        ctx.plan_gap_pct,
-        regime_label,
-        regime_stress,
-        regime_signal,
-        regime_gate,
-        ai_capacity_delta,
-        tail_risk_score,
-        infra_health_score,
-        infra_halted,
-        infra_degraded,
-        ctx.sandbox_mode,
-        health_score,
-        daily_trades_count,
-        daily_trades_cap,
-        risk_tags,
-    )
-
-    # If reinvest leg is too tiny, favour savings
-    if reinvest_sol < REINVESTMENT_MIN_PROFIT_SOL:
-        logger.info(
-            "[REINVEST] Reinvest leg %.6f SOL below threshold %.6f SOL; "
-            "sending all to savings.",
-            reinvest_sol,
-            REINVESTMENT_MIN_PROFIT_SOL,
-        )
-        await _journal_skip(
-            "reinvest_leg_too_small", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _send_to_savings(proceeds_sol)
-        await _update_reinvest_health(
-            redis, ctx, eff_pct=0.0, reinvest_sol=0.0, savings_sol=proceeds_sol
-        )
-        return None
-
-    # Move savings portion first (best-effort; doesn't block trade if it fails)
-    if savings_sol > 0:
-        await _send_to_savings(savings_sol)
-
-    # Dry-run mode: log + savings, but do not trade
-    if meta.get("dry_run"):
-        logger.info(
-            "[REINVEST] dry_run=1 — skipping actual buy; would reinvest %.6f SOL.",
-            reinvest_sol,
-        )
-        await _update_reinvest_health(redis, ctx, eff_pct, reinvest_sol, savings_sol)
-        return None
-
-    # ------------------------------------------------------------------ #
-    # Select target mint
-    # ------------------------------------------------------------------ #
-    new_mint = await _pick_target_mint(reinvest_sol, meta=meta, redis=redis)
-    if not new_mint:
-        await send_telegram(
-            "⚠️ Reinvestment skipped — no suitable target met filters right now."
-        )
-        logger.info("[REINVEST] No target candidate returned by pickers.")
-        await _journal_skip(
-            "no_target", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _update_reinvest_health(
-            redis, ctx, eff_pct=0.0, reinvest_sol=0.0, savings_sol=proceeds_sol
-        )
-        try:
-            await note_reinvest_result(
-                mint=None,
-                proceeds_sol=proceeds_sol,
-                reinvest_sol=0.0,
-                savings_sol=proceeds_sol,
-                eff_pct=0.0,
-                success=False,
-                tx_sig=None,
-                ctx={
-                    "health_score": health_score,
-                    "tail_risk_score": tail_risk_score,
-                },
-                redis=redis,
-            )
-        except Exception:
-            pass
-        return None
-
-    # ------------------------------------------------------------------ #
-    # Execute buy via Jupiter
-    # ------------------------------------------------------------------ #
-    try:
-        ok, tx_sig = await swap_token_jupiter(
-            SOL_MINT,
-            new_mint,
-            amount_float=reinvest_sol,
-            buy=True,
-            slippage=ctx.slippage,
-        )
-    except TypeError:
-        ok, tx_sig = await swap_token_jupiter(
-            SOL_MINT,
-            new_mint,
-            reinvest_sol,
-            True,
-            ctx.slippage,
-        )
-
-    if not ok:
-        await send_telegram(f"❌ Reinvestment buy failed for {new_mint}.")
-        logger.warning("[REINVEST] Swap failed for %s", new_mint)
-        await _journal_skip(
-            "swap_failed", proceeds_sol, ctx, meta, redis=redis
-        )
-        await _update_reinvest_health(
-            redis, ctx, eff_pct=0.0, reinvest_sol=0.0, savings_sol=proceeds_sol
-        )
-        try:
-            await note_reinvest_result(
-                mint=new_mint,
-                proceeds_sol=proceeds_sol,
-                reinvest_sol=0.0,
-                savings_sol=proceeds_sol,
-                eff_pct=0.0,
-                success=False,
-                tx_sig=None,
-                ctx={
-                    "health_score": health_score,
-                    "tail_risk_score": tail_risk_score,
-                },
-                redis=redis,
-            )
-        except Exception:
-            pass
-        return None
-
-    # Price in SOL per token (for consistent position schema)
-    buy_price_sol = await _token_price_in_sol(new_mint)
-    trailing_stop = (
-        buy_price_sol * (1.0 - (ctx.stop_loss_percent / 100.0))
-        if buy_price_sol > 0
-        else 0.0
-    )
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    position_payload: Dict[str, Any] = {
-        "token_address": new_mint,
-        "buy_price": float(buy_price_sol),
-        "amount_invested_sol": float(reinvest_sol),
-        "timestamp": now_iso,
-        "trailing_stop": float(trailing_stop),
-        "source": meta.get("tag") or "reinvestor",
-        "origin_trade_id": meta.get("origin_trade_id"),
-        "origin_position_id": meta.get("origin_position_id"),
-        "meta": {
-            **ctx.meta,
-            "reinvest_pct": eff_pct,
-            "risk_capacity": risk_capacity,
-            "risk_mode": risk_mode,
-            "risk_mode_override": ctx.risk_mode_override,
-            "strat_mode": strat_mode,
-            "kelly_suggestion": ctx.kelly_suggestion,
-            "kelly_confidence": ctx.kelly_confidence,
-            "daily_realized_pnl_pct": daily_pnl_pct,
-            "daily_drawdown_pct": daily_dd_pct,
-            "plan_status": ctx.plan_status,
-            "plan_gap_pct": ctx.plan_gap_pct,
-            "regime_label": ctx.regime_label,
-            "regime_label_numeric": regime_label,
-            "regime_stress_score": regime_stress,
-            "regime_signal_strength": regime_signal,
-            "regime_entry_gate_factor": regime_gate,
-            "ai_capacity_delta": ai_capacity_delta,
-            "sandbox_mode": ctx.sandbox_mode,
-            "health_score": health_score,
-            "daily_trades_count": daily_trades_count,
-            "daily_trades_cap": daily_trades_cap,
-            "infra_health_score": infra_health_score,
-            "infra_state_is_halted": infra_halted,
-            "infra_state_is_degraded": infra_degraded,
-            "infra_rpc_latency_ms": ctx.infra_rpc_latency_ms,
-            "infra_jup_latency_ms": ctx.infra_jup_latency_ms,
-            "infra_stability_score": ctx.infra_stability_score,
-            "tail_risk_score": tail_risk_score,
-            "spend_remaining_usd": spend_remaining_usd,
-            "spend_budget_block": spend_budget_block,
-            "risk_tags": risk_tags,
-            "scales": scales.as_dict(),
-        },
-    }
-    save_position(new_mint, position_payload)
-
-    # Count reinvest spend toward daily budget (using USD)
-    try:
-        usd_spent = await _sol_to_usd(reinvest_sol)
-        if usd_spent > 0:
-            try:
-                await note_spend(redis, usd_spent, source="reinvestor")  # type: ignore[arg-type]
-            except TypeError:
-                # backwards compat: old note_spend signature
-                await note_spend(redis, usd_spent)
-    except Exception:
-        pass
-
-    # Bump daily reinvest counter (for cap)
-    await _bump_daily_reinvest_counter(redis)
-    # Update last reinvest timestamp (for time-based throttling)
-    await _set_last_reinvest_ts(redis)
-
-    # Alerts / journaling
-    usd = await _sol_to_usd(reinvest_sol)
-
-    await send_telegram(
-        "🔁 *Reinvestment executed*\n"
-        f"• Token: `{new_mint}`\n"
-        f"• Size: {reinvest_sol:.4f} SOL (~${usd:.2f})\n"
-        f"• Entry(px SOL): {buy_price_sol:.10f}\n"
-        f"• SL%: {ctx.stop_loss_percent:.1f}  • Risk cap: {risk_capacity:.3f} "
-        f"(risk_mode={risk_mode}, strat_mode={strat_mode})\n"
-        f"• Kelly: {ctx.kelly_suggestion:.3f} (conf={ctx.kelly_confidence:.2f})  "
-        f"WR={ctx.win_rate:.2%}  μ={ctx.pnl_mean:+.2f}% σ={ctx.pnl_std:.2f}%\n"
-        f"• DailyPnL={daily_pnl_pct:+.2f}%  DD={daily_dd_pct:.2f}%  "
-        f"Plan={ctx.plan_status} (gap={ctx.plan_gap_pct:+.2f}%)\n"
-        f"• Regime: label={ctx.regime_label} num={regime_label:+.2f}, "
-        f"stress={regime_stress:.2f}, signal={regime_signal:.2f}, gate={regime_gate:.2f}  "
-        f"(ai_cap_delta={ai_capacity_delta:+.3f}, sandbox={ctx.sandbox_mode})\n"
-        f"• Tail risk: {tail_risk_score:.2f} "
-        f"(soft={REINVEST_TAIL_RISK_SOFT:.2f}, hard={REINVEST_TAIL_RISK_HARD:.2f}, "
-        f"gate={REINVEST_TAIL_RISK_GATE:.2f})\n"
-        f"• Infra: health={infra_health_score:.2f}, "
-        f"rpc={ctx.infra_rpc_latency_ms:.0f}ms, jup={ctx.infra_jup_latency_ms:.0f}ms, "
-        f"halted={infra_halted}, degraded={infra_degraded}\n"
-        f"• Health score: {health_score:.1f} | DailyTrades={daily_trades_count}/{daily_trades_cap}\n"
-        f"• Risk tags: {risk_tags}\n"
-        f"• Tx: `{tx_sig}`"
-    )
-
-    try:
-        await log_to_notion(
-            token=new_mint,
-            symbol=new_mint[:6],
-            balance=reinvest_sol,
-            entry=buy_price_sol,
-            current=buy_price_sol,
-            profit=0.0,
-            reason=(
-                "Reinvestment buy "
-                f"(eff_pct={eff_pct:.1f}%, cap={risk_capacity:.3f}, "
-                f"kelly={ctx.kelly_suggestion:.3f}, dd={daily_dd_pct:.2f}%, "
-                f"plan={ctx.plan_status}, gap={ctx.plan_gap_pct:+.2f}%, "
-                f"regime={ctx.regime_label}:{regime_label:+.2f}/"
-                f"{regime_stress:.2f}/{regime_signal:.2f}, ai_cap_delta={ai_capacity_delta:+.3f}, "
-                f"tail_risk={tail_risk_score:.2f}, "
-                f"infra_health={infra_health_score:.2f}, rpc={ctx.infra_rpc_latency_ms:.0f}ms, "
-                f"jup={ctx.infra_jup_latency_ms:.0f}ms, sandbox={ctx.sandbox_mode}, "
-                f"health_score={health_score:.1f}, "
-                f"dailyTrades={daily_trades_count}/{daily_trades_cap}, "
-                f"spend_remaining_usd={spend_remaining_usd:.2f}, "
-                f"spend_budget_block={spend_budget_block}, "
-                f"risk_tags={risk_tags}, "
-                f"mode={ctx.meta.get('mode') or ctx.meta.get('reinvest_mode') or ctx.risk_ctx_raw.get('reinvest_mode') or REINVEST_MODE}, "
-                f"scales={scales.as_dict()})"
-            ),
-        )
-    except Exception:
-        pass
-
-    # Structured data log
-    try:
-        await log_event(
-            "reinvest_executed",
-            {
-                "mint": new_mint,
-                "proceeds_sol": proceeds_sol,
-                "reinvest_sol": reinvest_sol,
-                "savings_sol": savings_sol,
-                "eff_pct": eff_pct,
-                "health_score": health_score,
-                "infra_health_score": infra_health_score,
-                "tail_risk_score": tail_risk_score,
-                "infra": ctx.infra_raw,
+                "infra_rpc_latency_ms": ctx.infra_rpc_latency_ms,
+                "infra_jup_latency_ms": ctx.infra_jup_latency_ms,
+                "infra_stability_score": ctx.infra_stability_score,
+                "tail_risk_score": ctx.tail_risk_score,
+                "spend_remaining_usd": ctx.spend_remaining_usd,
+                "spend_budget_block": ctx.spend_budget_block,
                 "scales": scales.as_dict(),
-                "params": {
-                    "STOP_LOSS_PERCENT": ctx.stop_loss_percent,
-                    "SLIPPAGE": ctx.slippage,
-                    "MIN_SOL_BALANCE": ctx.min_sol_balance,
-                    "MAX_RISK_PER_TRADE": ctx.max_risk_per_trade,
-                    "REINVEST_MIN_CAPACITY": REINVEST_MIN_CAPACITY,
-                    "REINVEST_DD_SOFT_STOP_PCT": REINVEST_DD_SOFT_STOP_PCT,
-                    "REINVEST_DD_HARD_STOP_PCT": REINVEST_DD_HARD_STOP_PCT,
-                    "REINVEST_MAX_SINGLE_USD": REINVEST_MAX_SINGLE_USD,
-                    "PLAN_TARGET_APR_PCT": ctx.plan_target_apr_pct,
-                    "PLAN_GAP_PCT": ctx.plan_gap_pct,
-                    "PLAN_STATUS": ctx.plan_status,
-                    "STRAT_MODE": ctx.strat_mode,
-                    "HARD_HALT": ctx.hard_halt,
-                    "REINVEST_ALWAYS_SAVINGS_PCT": REINVEST_ALWAYS_SAVINGS_PCT,
-                    "REINVEST_MIN_EQUITY_SOL": REINVEST_MIN_EQUITY_SOL,
-                    "REINVEST_MIN_MINUTES_BETWEEN_REINVESTS": REINVEST_MIN_MINUTES_BETWEEN_REINVESTS,
-                    "REINVEST_MAX_REINVESTS_PER_DAY": REINVEST_MAX_REINVESTS_PER_DAY,
-                    "REINVEST_HEALTH_MIN_SCORE": REINVEST_HEALTH_MIN_SCORE,
-                    "REINVEST_PNL_LOCK_PCT": REINVEST_PNL_LOCK_PCT,
-                    "REINVEST_INFRA_MIN_HEALTH": REINVEST_INFRA_MIN_HEALTH,
-                    "REINVEST_BLOCK_IF_INFRA_HALTED": REINVEST_BLOCK_IF_INFRA_HALTED,
-                    "REINVEST_BLOCK_IF_INFRA_DEGRADED": REINVEST_BLOCK_IF_INFRA_DEGRADED,
-                    "REINVESTMENT_MIN_PROFIT_USD": REINVESTMENT_MIN_PROFIT_USD,
-                    "REINVEST_TAIL_RISK_SOFT": REINVEST_TAIL_RISK_SOFT,
-                    "REINVEST_TAIL_RISK_HARD": REINVEST_TAIL_RISK_HARD,
-                    "REINVEST_TAIL_RISK_GATE": REINVEST_TAIL_RISK_GATE,
-                    "REINVEST_MIN_EFF_PCT": REINVEST_MIN_EFF_PCT,
-                    "REINVEST_MAX_EFF_PCT": REINVEST_MAX_EFF_PCT,
-                    "REINVEST_MAX_BUDGET_FRACTION": REINVEST_MAX_BUDGET_FRACTION,
-                    "REINVEST_MODE": REINVEST_MODE,
-                },
-                "risk_ctx": ctx.risk_ctx_raw,
-                "perf": ctx.perf_raw,
+                "target_score": pick.score,
+                "target_symbol": pick.symbol,
                 "tx_sig": tx_sig,
-                "meta": ctx.meta,
-                "risk_tags": risk_tags,
+                "swap_raw": raw_swap if isinstance(raw_swap, (dict, str)) else str(raw_swap)[:500],
             },
-        )
-    except Exception:
-        pass
+        }
+        await _maybe_await(save_position(pick.mint, position_payload))
 
-    await _update_reinvest_health(redis, ctx, eff_pct, reinvest_sol, savings_sol)
+        # optional: tell exit engine / auto-exit worker / AI sell logic about the new position
+        with contextlib.suppress(Exception):
+            if callable(_exit_register_after_buy):
+                await _maybe_await(_exit_register_after_buy(position_payload))  # type: ignore[misc]
+        with contextlib.suppress(Exception):
+            if callable(_autoexit_register_after_buy):
+                await _maybe_await(_autoexit_register_after_buy(position_payload))  # type: ignore[misc]
+        with contextlib.suppress(Exception):
+            if callable(_sell_schedule_after_buy):
+                await _maybe_await(_sell_schedule_after_buy(pick.mint, position_payload))  # type: ignore[misc]
 
-    # Self-learning hook: record successful result
-    try:
-        await note_reinvest_result(
-            mint=new_mint,
-            proceeds_sol=proceeds_sol,
-            reinvest_sol=reinvest_sol,
-            savings_sol=savings_sol,
-            eff_pct=eff_pct,
-            success=True,
-            tx_sig=tx_sig,
-            ctx={
-                "risk_capacity": risk_capacity,
-                "risk_mode": risk_mode,
-                "daily_pnl_pct": daily_pnl_pct,
-                "daily_dd_pct": daily_dd_pct,
-                "equity_sol": equity_sol,
-                "sandbox_mode": ctx.sandbox_mode,
-                "health_score": health_score,
-                "infra_health_score": infra_health_score,
-                "daily_trades_count": daily_trades_count,
-                "daily_trades_cap": daily_trades_cap,
-                "tail_risk_score": tail_risk_score,
-                "spend_remaining_usd": spend_remaining_usd,
-                "spend_budget_block": spend_budget_block,
-                "risk_tags": risk_tags,
-            },
+        # note spend
+        with contextlib.suppress(Exception):
+            usd_spent = await _sol_to_usd(reinvest_sol)
+            if usd_spent > 0:
+                try:
+                    await note_spend(redis, usd_spent, source="reinvestor")  # type: ignore[arg-type]
+                except TypeError:
+                    await note_spend(redis, usd_spent)
+
+        # counters
+        await _bump_daily_reinvest_counter(redis)
+        await _set_last_reinvest_ts(redis)
+
+        # alerts
+        usd = await _sol_to_usd(reinvest_sol)
+        await _safe_tg(
+            "🔁 *Reinvestment executed*\n"
+            f"• Token: `{pick.mint}`\n"
+            f"• Size: {reinvest_sol:.4f} SOL (~${usd:.2f})\n"
+            f"• Entry(px SOL): {buy_price_sol:.10f}\n"
+            f"• SL%: {ctx.stop_loss_percent:.1f}\n"
+            f"• Risk cap: {ctx.risk_capacity:.3f} (risk_mode={ctx.risk_mode}, strat_mode={ctx.strat_mode})\n"
+            f"• Kelly: {ctx.kelly_suggestion:.3f} (conf={ctx.kelly_confidence:.2f})  WR={ctx.win_rate:.2%}\n"
+            f"• DailyPnL={ctx.daily_pnl_pct:+.2f}%  DD={ctx.daily_dd_pct:.2f}%  Plan={ctx.plan_status} (gap={ctx.plan_gap_pct:+.2f}%)\n"
+            f"• Regime: {ctx.regime_label} num={ctx.regime_label_numeric:+.2f} stress={ctx.regime_stress_score:.2f} gate={ctx.regime_entry_gate_factor:.2f}\n"
+            f"• Tail risk: {ctx.tail_risk_score:.2f} | Infra health={ctx.infra_health_score:.2f} (halted={infra_halted}, degraded={infra_degraded})\n"
+            f"• Health score: {health_score:.1f}\n"
+            f"• Tx: `{tx_sig or 'n/a'}`",
             redis=redis,
         )
-    except Exception:
-        pass
 
-    logger.info("[REINVEST] ✅ Completed into %s (tx=%s)", new_mint, tx_sig)
-    return new_mint
+        # best-effort notion
+        with contextlib.suppress(Exception):
+            await _maybe_await(
+                log_to_notion(
+                    token=pick.mint,
+                    symbol=(pick.symbol or pick.mint[:6]),
+                    balance=reinvest_sol,
+                    entry=buy_price_sol,
+                    current=buy_price_sol,
+                    profit=0.0,
+                    reason=f"Reinvest buy eff_pct={eff_pct:.1f}% health={health_score:.1f} tail={ctx.tail_risk_score:.2f} infra={ctx.infra_health_score:.2f}",
+                )
+            )
+
+        with contextlib.suppress(Exception):
+            await log_event(
+                "reinvest_executed",
+                {
+                    "mint": pick.mint,
+                    "symbol": pick.symbol,
+                    "proceeds_sol": proceeds_sol,
+                    "reinvest_sol": reinvest_sol,
+                    "savings_sol": savings_sol,
+                    "eff_pct": eff_pct,
+                    "health_score": health_score,
+                    "tail_risk_score": ctx.tail_risk_score,
+                    "infra": ctx.infra_raw,
+                    "scales": scales.as_dict(),
+                    "risk_ctx": ctx.risk_ctx_raw,
+                    "perf": ctx.perf_raw,
+                    "tx_sig": tx_sig,
+                    "meta": meta,
+                    "ts": now_iso,
+                    "latency_s": max(0.0, time.monotonic() - t0),
+                },
+            )
+
+        await _update_reinvest_health(redis, ctx, eff_pct=eff_pct, reinvest_sol=reinvest_sol, savings_sol=savings_sol, reason="executed")
+
+        with contextlib.suppress(Exception):
+            await note_reinvest_result(
+                mint=pick.mint,
+                proceeds_sol=proceeds_sol,
+                reinvest_sol=reinvest_sol,
+                savings_sol=savings_sol,
+                eff_pct=eff_pct,
+                success=True,
+                tx_sig=tx_sig,
+                ctx={
+                    "risk_capacity": ctx.risk_capacity,
+                    "risk_mode": ctx.risk_mode,
+                    "daily_pnl_pct": ctx.daily_pnl_pct,
+                    "daily_dd_pct": ctx.daily_dd_pct,
+                    "equity_sol": ctx.equity_sol,
+                    "sandbox_mode": ctx.sandbox_mode,
+                    "health_score": health_score,
+                    "infra_health_score": ctx.infra_health_score,
+                    "tail_risk_score": ctx.tail_risk_score,
+                    "spend_remaining_usd": ctx.spend_remaining_usd,
+                    "spend_budget_block": ctx.spend_budget_block,
+                },
+                redis=redis,
+            )
+
+        log.info("[REINVEST] ✅ Completed into %s (tx=%s)", pick.mint, str(tx_sig)[:120])
+        return pick.mint
+
+    finally:
+        if redis and lock_token:
+            await _release_lock(redis, lk, lock_token)
 
 
-# ============================================================================ #
-# Queue & worker
-# ============================================================================ #
-
-
-async def queue_reinvest(
-    proceeds_sol: float,
-    meta: Optional[Dict[str, Any]] = None,
-    redis=None,
-) -> None:
-    """
-    Non-blocking: push a reinvest job onto a Redis queue.
-
-    If Redis is unavailable, falls back to direct `reinvest(...)`.
-    """
-    if proceeds_sol is None or proceeds_sol <= 0:
+# ──────────────────────────────────────────────────────────────────────────────
+# Queue + worker (+ DLQ)
+# ──────────────────────────────────────────────────────────────────────────────
+async def queue_reinvest(proceeds_sol: float, meta: Optional[Dict[str, Any]] = None, redis=None) -> None:
+    proceeds_sol = float(proceeds_sol or 0.0)
+    if proceeds_sol <= 0:
         return
+
+    meta = dict(meta or {})
+    _ensure_job_id(meta, proceeds_sol)
 
     if redis is None:
         redis = await _get_redis()
+
+    # no redis -> run direct
     if not redis:
-        # No Redis → run synchronously (still risk-aware)
         await reinvest(proceeds_sol, meta=meta, redis=None)
         return
 
-    job = {"proceeds_sol": float(proceeds_sol), "meta": meta or {}}
-    await redis.rpush(REINVEST_QUEUE, json.dumps(job))
-    logger.info("[REINVEST] Queued job: %s", job)
+    job = {
+        "proceeds_sol": proceeds_sol,
+        "meta": meta,
+        "enqueued_ts": _utc_ts(),
+        "enqueued_iso": _now_utc().isoformat(),
+    }
+    payload = json.dumps(job, separators=(",", ":"), ensure_ascii=False)
+
+    try:
+        await _redis_call(redis, "rpush", REINVEST_QUEUE, payload)
+        if CFG.queue_maxlen > 0:
+            with contextlib.suppress(Exception):
+                await _redis_call(redis, "ltrim", REINVEST_QUEUE, -int(CFG.queue_maxlen), -1)
+    except Exception as e:
+        log.warning("[REINVEST] Queue push failed; falling back to direct reinvest. err=%s", str(e)[:200])
+        await reinvest(proceeds_sol, meta=meta, redis=redis)
+
+    log.info("[REINVEST] Queued job proceeds=%.6f job_id=%s", proceeds_sol, meta.get("job_id"))
 
 
-async def run_reinvest_worker(
-    redis=None,
-    poll_interval: float = 2.0,
-    stop_evt: Optional[asyncio.Event] = None,
-) -> None:
-    """
-    Background worker: continuously pops jobs from REINVEST_QUEUE and
-    runs `reinvest(...)`.
+async def _push_dlq(redis, payload: str, err: str) -> None:
+    if not redis:
+        return
+    doc = {"payload": payload, "err": err[:300], "ts": _now_utc().isoformat()}
+    try:
+        await _redis_call(redis, "rpush", REINVEST_DLQ, json.dumps(doc))
+        await _redis_call(redis, "ltrim", REINVEST_DLQ, -500, -1)
+    except Exception:
+        return
 
-    You can fire this from scripts/main.py as:
 
-        from utils_pkg.reinvestor import run_reinvest_worker
-        ...
-        asyncio.create_task(
-            run_reinvest_worker(redis, poll_interval=2.0, stop_evt=stop_evt),
-            name="reinvest.worker",
-        )
-    """
+async def run_reinvest_worker(redis=None, poll_interval: float = 2.0, stop_evt: Optional[asyncio.Event] = None) -> None:
     if redis is None:
         redis = await _get_redis()
     if not redis:
-        logger.warning("Reinvest worker disabled: no Redis client.")
+        log.warning("[REINVEST] Worker disabled: no Redis client.")
         return
 
-    logger.info("🔁 Reinvest worker started (poll=%.1fs)", poll_interval)
+    # phase-based sane polling floors
+    if CFG.phase <= 2:
+        poll_interval = max(poll_interval, 2.0)
+    elif CFG.phase <= 5:
+        poll_interval = max(poll_interval, 1.5)
+    else:
+        poll_interval = max(poll_interval, 1.0)
+
+    log.info("[REINVEST] Worker started (poll=%.2fs batch=%d phase=%d)", poll_interval, CFG.worker_batch, CFG.phase)
+    backoff = float(CFG.worker_backoff_s)
 
     while True:
         if stop_evt is not None and stop_evt.is_set():
-            logger.info("🔁 Reinvest worker stopping on stop_evt.")
+            log.info("[REINVEST] Worker stopping on stop_evt.")
             break
 
+        processed = 0
         try:
-            processed = 0
-            # Batch processing for throughput; BLPOP handles blocking
-            while processed < max(1, REINVEST_WORKER_BATCH):
-                raw = await redis.blpop(
-                    REINVEST_QUEUE, timeout=int(max(1, poll_interval))
-                )
+            while processed < max(1, int(CFG.worker_batch)):
+                raw = await _redis_call(redis, "blpop", REINVEST_QUEUE, timeout=int(max(1, poll_interval)))
                 if not raw:
                     break
 
-                _, payload = raw
+                try:
+                    _, payload = raw
+                except Exception:
+                    payload = raw
+
+                payload = _maybe_decode(payload)
+
                 try:
                     job = json.loads(payload)
                 except Exception:
-                    logger.warning("[REINVEST] Invalid job payload: %s", payload)
+                    log.warning("[REINVEST] Invalid job payload: %s", str(payload)[:240])
+                    await _push_dlq(redis, str(payload)[:2000], "invalid_json")
                     continue
 
-                amt = float(job.get("proceeds_sol", 0.0))
+                # stale job guard (optional)
+                if CFG.queue_max_age_s > 0:
+                    enq = _safe_float(job.get("enqueued_ts"), 0.0)
+                    if enq and (_utc_ts() - enq) > float(CFG.queue_max_age_s):
+                        await _push_dlq(redis, payload[:4000], "stale_job_drop")
+                        continue
+
+                amt = float(job.get("proceeds_sol", 0.0) or 0.0)
                 meta = job.get("meta") or {}
+                if not isinstance(meta, dict):
+                    meta = {"meta_raw": meta}
 
                 if amt > 0:
                     await reinvest(amt, meta=meta, redis=redis)
+
                 processed += 1
 
             if processed == 0:
-                await asyncio.sleep(poll_interval)
+                await asyncio.sleep(float(poll_interval))
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.error("[REINVEST] Worker error: %s", e, exc_info=True)
-            await asyncio.sleep(1.0)
+            log.error("[REINVEST] Worker error: %s", e, exc_info=True)
+            await asyncio.sleep(backoff)
 
 
-# ============================================================================ #
-# Preview helper (for backtests / debugging)
-# ============================================================================ #
-
-
-async def preview_reinvest_split(
-    proceeds_sol: float,
-    meta: Optional[Dict[str, Any]] = None,
-    redis=None,
-) -> Optional[Dict[str, Any]]:
-    """
-    Dry "what would happen" helper.
-
-    It runs the same context build + eff_pct logic (no swaps, no savings move).
-
-    It returns a JSON-friendly dict describing:
-        - outcome: "skip" | "savings_only" | "reinvest"
-        - reason (for skip/savings_only)
-        - eff_pct_raw / eff_pct_final
-        - reinvest_sol / savings_sol
-        - health_score
-        - scales breakdown
-        - compact context excerpt
-
-    NOTE: this does *not* replay all hard risk/infra/tail gates from reinvest(). 
-    It is meant as a *local* eff_pct / scales inspector.
-    """
+# ──────────────────────────────────────────────────────────────────────────────
+# Preview + explain (+ high-level dry-run helper)
+# ──────────────────────────────────────────────────────────────────────────────
+async def preview_reinvest_split(proceeds_sol: float, meta: Optional[Dict[str, Any]] = None, redis=None) -> Optional[Dict[str, Any]]:
     meta = dict(meta or {})
-    meta.setdefault("sandbox", True)  # ensure we never trade
+    meta.setdefault("sandbox", True)  # hard safety
+    meta["dry_run"] = True            # enforce no-swap for preview
+    _ensure_job_id(meta, float(proceeds_sol or 0.0))
 
     if redis is None:
         redis = await _get_redis()
 
+    proceeds_sol = float(proceeds_sol or 0.0)
     ctx = await _build_context(proceeds_sol, meta, redis)
     if ctx is None:
-        return {
-            "outcome": "skip",
-            "reason": "context_build_failed",
-        }
+        return {"outcome": "skip", "reason": "context_build_failed", "proceeds_sol": proceeds_sol}
 
+    allowed, reason = await _evaluate_gates(ctx, redis)
     health_score = _compute_health_score(ctx)
-    eff_pct_raw, scales = _compute_eff_reinvest_pct(ctx)
-    eff_pct = _apply_meta_eff_overrides(eff_pct_raw, ctx.meta)
+    eff_pct, scales = _compute_eff_pct(ctx)
 
     reinvest_sol = proceeds_sol * (eff_pct / 100.0)
     savings_sol = max(0.0, proceeds_sol - reinvest_sol)
 
-    outcome = "reinvest"
-    reason = None
-    if proceeds_sol < REINVESTMENT_MIN_PROFIT_SOL:
-        outcome = "savings_only"
-        reason = "below_min_profit_sol"
-    elif reinvest_sol < REINVESTMENT_MIN_PROFIT_SOL:
-        outcome = "savings_only"
-        reason = "reinvest_leg_too_small"
+    if not allowed:
+        return {
+            "outcome": "savings_only",
+            "reason": reason,
+            "proceeds_sol": proceeds_sol,
+            "proceeds_usd": ctx.proceeds_usd,
+            "eff_pct_final": 0.0,
+            "reinvest_sol": 0.0,
+            "savings_sol": proceeds_sol,
+            "health_score": health_score,
+            "infra_health_score": ctx.infra_health_score,
+            "scales": scales.as_dict(),
+            "ctx": {
+                "risk_capacity": ctx.risk_capacity,
+                "risk_mode": ctx.risk_mode,
+                "daily_pnl_pct": ctx.daily_pnl_pct,
+                "daily_dd_pct": ctx.daily_dd_pct,
+                "equity_sol": ctx.equity_sol,
+                "plan_status": ctx.plan_status,
+                "plan_gap_pct": ctx.plan_gap_pct,
+                "tail_risk_score": ctx.tail_risk_score,
+                "spend_remaining_usd": ctx.spend_remaining_usd,
+                "spend_budget_block": ctx.spend_budget_block,
+                "infra_state_is_halted": ctx.infra_state_is_halted,
+                "infra_state_is_degraded": ctx.infra_state_is_degraded,
+            },
+        }
+
+    outcome = "reinvest" if reinvest_sol >= CFG.min_proceeds_sol else "savings_only"
+    reason2 = None if outcome == "reinvest" else "reinvest_leg_too_small"
 
     return {
         "outcome": outcome,
-        "reason": reason,
+        "reason": reason2,
         "proceeds_sol": proceeds_sol,
-        "eff_pct_raw": eff_pct_raw,
+        "proceeds_usd": ctx.proceeds_usd,
         "eff_pct_final": eff_pct,
         "reinvest_sol": reinvest_sol,
         "savings_sol": savings_sol,
@@ -2911,46 +2391,23 @@ async def preview_reinvest_split(
             "equity_sol": ctx.equity_sol,
             "plan_status": ctx.plan_status,
             "plan_gap_pct": ctx.plan_gap_pct,
-            "daily_trades_count": ctx.daily_trades_count,
-            "daily_trades_cap": ctx.daily_trades_cap,
+            "tail_risk_score": ctx.tail_risk_score,
+            "spend_remaining_usd": ctx.spend_remaining_usd,
+            "spend_budget_block": ctx.spend_budget_block,
             "infra_state_is_halted": ctx.infra_state_is_halted,
             "infra_state_is_degraded": ctx.infra_state_is_degraded,
-            "tail_risk_score": getattr(
-                ctx, "tail_risk_score", ctx.risk_ctx_raw.get("tail_risk_score", 0.0)
-            ),
-            "spend_remaining_usd": getattr(ctx, "spend_remaining_usd", None),
-            "spend_budget_block": getattr(ctx, "spend_budget_block", False),
         },
     }
 
 
-# ============================================================================ #
-# Human-friendly explanation helper
-# ============================================================================ #
-
-
-async def explain_reinvest_decision(
-    proceeds_sol: float,
-    meta: Optional[Dict[str, Any]] = None,
-    redis=None,
-) -> Optional[Dict[str, Any]]:
-    """
-    High-level "why" helper for dashboards / CLI / debugging.
-
-    Uses preview_reinvest_split(...) under the hood and adds a compact
-    explanation string plus top boosting/suppressing scales.
-    """
+async def explain_reinvest_decision(proceeds_sol: float, meta: Optional[Dict[str, Any]] = None, redis=None) -> Optional[Dict[str, Any]]:
     preview = await preview_reinvest_split(proceeds_sol, meta=meta, redis=redis)
     if not preview:
         return None
 
-    outcome = preview.get("outcome")
-    reason = preview.get("reason")
-    scales = (preview.get("scales") or {}) if isinstance(preview, dict) else {}
+    scales = preview.get("scales") or {}
     ctx = preview.get("ctx") or {}
 
-    # Identify top boosters / suppressors among scales
-    base_pct = scales.get("base_pct", 0.0)
     deltas: Dict[str, float] = {}
     for k in (
         "cap_scale",
@@ -2963,80 +2420,140 @@ async def explain_reinvest_decision(
         "profile_scale",
         "mode_scale",
         "infra_scale",
-        "tail_scale",  # expose tail-risk influence
+        "tail_scale",
     ):
-        v = float(scales.get(k, 1.0))
-        deltas[k] = v - 1.0
+        try:
+            deltas[k] = float(scales.get(k, 1.0)) - 1.0
+        except Exception:
+            deltas[k] = 0.0
 
-    def _fmt_scale(name: str) -> str:
-        name = name.replace("_scale", "")
-        return name
+    boost = sorted([(k, v) for k, v in deltas.items() if v > 0], key=lambda kv: kv[1], reverse=True)[:2]
+    suppress = sorted([(k, v) for k, v in deltas.items() if v < 0], key=lambda kv: kv[1])[:2]
 
-    boost = sorted(
-        [(k, v) for k, v in deltas.items() if v > 0],
-        key=lambda kv: kv[1],
-        reverse=True,
-    )[:2]
-    suppress = sorted(
-        [(k, v) for k, v in deltas.items() if v < 0],
-        key=lambda kv: kv[1],
-    )[:2]
+    def _fmt(k: str) -> str:
+        return k.replace("_scale", "")
 
-    boosts_text = ", ".join(
-        f"{_fmt_scale(k)}({v:+.2f})" for k, v in boost
-    ) or "none"
-    suppress_text = ", ".join(
-        f"{_fmt_scale(k)}({v:+.2f})" for k, v in suppress
-    ) or "none"
-
-    eff_pct = preview.get("eff_pct_final", 0.0)
-    health = preview.get("health_score", 0.0)
-    infra_health = preview.get("infra_health_score", 0.0)
-    tail_val = ctx.get("tail_risk_score", None)
-    try:
-        tail_str = f"{float(tail_val):.2f}" if tail_val is not None else "n/a"
-    except Exception:
-        tail_str = "n/a"
-
-    explanation = (
-        f"Outcome: {outcome} "
-        f"(reason={reason or 'n/a'}), "
-        f"base={base_pct:.1f}%, eff={eff_pct:.1f}%, "
-        f"health={health:.1f}, infra_health={infra_health:.1f}, "
-        f"tail_risk={tail_str}. "
-        f"Top boosts: {boosts_text}. "
-        f"Top suppressors: {suppress_text}. "
-        f"RiskCap={ctx.get('risk_capacity', 0):.2f}, "
-        f"DD={ctx.get('daily_dd_pct', 0):.2f}%, "
-        f"plan_gap={ctx.get('plan_gap_pct', 0):+.2f}%, "
-        f"infra_halted={bool(ctx.get('infra_state_is_halted', 0))}, "
-        f"infra_degraded={bool(ctx.get('infra_state_is_degraded', 0))}."
+    preview["explanation"] = (
+        f"Outcome={preview.get('outcome')} reason={preview.get('reason') or 'n/a'} | "
+        f"eff={float(preview.get('eff_pct_final', 0.0)):.1f}% | "
+        f"health={float(preview.get('health_score', 0.0)):.1f} "
+        f"infra={float(preview.get('infra_health_score', 0.0)):.2f} "
+        f"tail={ctx.get('tail_risk_score','n/a')} | "
+        f"boosts={', '.join(f'{_fmt(k)}({v:+.2f})' for k,v in boost) or 'none'} | "
+        f"suppressors={', '.join(f'{_fmt(k)}({v:+.2f})' for k,v in suppress) or 'none'}"
     )
-
-    preview["explanation"] = explanation
     preview["boosts"] = boost
     preview["suppressors"] = suppress
     return preview
 
 
-# ============================================================================ #
-# CLI / manual test
-# ============================================================================ #
+async def dry_run_reinvest(proceeds_sol: float, meta: Optional[Dict[str, Any]] = None, redis=None) -> Optional[Dict[str, Any]]:
+    """
+    High-level "what would happen" helper.
+
+    - Forces sandbox + dry_run
+    - Uses full context/scales logic
+    - Returns preview + (optional) best target candidate
+    """
+    meta = dict(meta or {})
+    meta.setdefault("sandbox", True)
+    meta["dry_run"] = True
+    prev = await preview_reinvest_split(proceeds_sol, meta=meta, redis=redis)
+    if not prev or prev.get("outcome") != "reinvest":
+        return prev
+
+    # optionally pick a target with the previewed reinvest_sol amount
+    reinvest_sol = float(prev.get("reinvest_sol", 0.0) or 0.0)
+    if reinvest_sol <= 0:
+        return prev
+
+    if redis is None:
+        redis = await _get_redis()
+
+    _ensure_job_id(meta, float(proceeds_sol or 0.0))
+    ctx_target_meta = dict(meta)
+    pick = await _pick_target_mint(reinvest_sol, meta=ctx_target_meta, redis=redis)
+    if pick:
+        prev["target"] = {
+            "mint": pick.mint,
+            "symbol": pick.symbol,
+            "score": pick.score,
+            "raw": pick.raw,
+        }
+    else:
+        prev["target"] = None
+
+    return prev
 
 
-if __name__ == "__main__":  # simple local demo
+# ──────────────────────────────────────────────────────────────────────────────
+# Wiring helper: consume sell-filled events (fixes "profit vs proceeds")
+# ──────────────────────────────────────────────────────────────────────────────
+async def handle_sell_filled_event(ev: Dict[str, Any], redis=None) -> None:
+    """
+    Adapter for exit-engine events.
+
+    Prefers proceeds fields if present; falls back to profit fields.
+    Supports:
+        meta["reinvest_profit_only"]=1 -> use realized_profit_sol
+    """
+    if not isinstance(ev, dict):
+        return
+
+    status = str(ev.get("status") or "").lower()
+    if status and status not in ("filled", "fill", "success"):
+        return
+
+    meta = dict(ev.get("meta") or {})
+    profit_only = bool(meta.get("reinvest_profit_only", False))
+
+    realized_profit = (
+        _safe_float(ev.get("realized_profit_sol"), 0.0)
+        or _safe_float(ev.get("profit_sol"), 0.0)
+        or _safe_float(ev.get("pnl_sol"), 0.0)
+    )
+    proceeds = (
+        _safe_float(ev.get("proceeds_sol"), 0.0)
+        or _safe_float(ev.get("received_sol"), 0.0)
+        or _safe_float(ev.get("out_sol"), 0.0)
+    )
+
+    proceeds_sol = realized_profit if profit_only else (proceeds if proceeds > 0 else realized_profit)
+    if proceeds_sol <= 0:
+        return
+
+    meta.setdefault("origin_trade_id", ev.get("trade_id") or ev.get("req_id") or ev.get("tx_sig"))
+    meta.setdefault("origin_position_id", ev.get("position_id") or ev.get("pos_id"))
+    meta.setdefault("tx_sig", ev.get("tx_sig") or ev.get("signature"))
+    meta.setdefault("tag", "exit_engine")
+
+    jid = meta.get("tx_sig") or meta.get("origin_trade_id") or str(int(time.time()))
+    meta.setdefault("job_id", f"sellfill-{jid}")
+
+    await queue_reinvest(proceeds_sol, meta=meta, redis=redis)
+
+
+__all__ = [
+    "reinvest",
+    "queue_reinvest",
+    "run_reinvest_worker",
+    "get_reinvest_health",
+    "get_last_reinvest_decision",
+    "get_recent_reinvest_decisions",
+    "preview_reinvest_split",
+    "explain_reinvest_decision",
+    "dry_run_reinvest",
+    "handle_sell_filled_event",
+    "reload_reinvestor_config",
+]
+
+
+if __name__ == "__main__":  # local sanity demo
     async def _demo():
         r = await _get_redis()
-        # Queue a dry-run job
-        await queue_reinvest(0.05, {"reason": "demo", "dry_run": True}, redis=r)
-        # Also print a local explanation
-        exp = await explain_reinvest_decision(
-            0.05,
-            {"reason": "demo", "sandbox": True},
-            redis=r,
-        )
-        print("Explain:", json.dumps(exp, indent=2, default=str))
-
+        await queue_reinvest(0.05, {"job_id": f"demo-{int(time.time())}", "dry_run": True}, redis=r)
+        exp = await explain_reinvest_decision(0.05, {"job_id": "demo-explain", "sandbox": True}, redis=r)
+        print(json.dumps(exp, indent=2, default=str))
         stop = asyncio.Event()
 
         async def stop_later():

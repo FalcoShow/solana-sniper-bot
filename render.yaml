@@ -1,14 +1,70 @@
-services:
-  - type: web
-    name: pump-health
-    env: python
-    buildCommand: |
-      pip install -r requirements.txt
-      python -m playwright install chromium
-    startCommand: python health.py --port $PORT
+# render.yaml — God-Tier Blueprint (Phase 0–7 LOCK-IN)
+# Single-service worker deployment:
+# - Worker runs bash ./start.sh (env-safe load → DSN/wallet normalize → preflight → orchestrator)
+# - No separate web service (avoids health.py drift/untracked file failures)
+# - Secrets are placeholders (sync:false) to be set in Render UI
+
+envVarGroups:
+  # ---------------------------
+  # Non-secret runtime defaults
+  # ---------------------------
+  - name: sniper-defaults
+    envVars:
+      # Python hygiene
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+
+      # Start.sh control-plane safe defaults
+      # (Do NOT force START_STRICT here; start.sh auto-detects Render and becomes strict)
+      - key: START_PRECHECKS
+        value: "1"
+      - key: START_PRECHECKS_CANARY
+        value: "0"
+      - key: START_ALLOW_SOURCE_ENV
+        value: "0"
+      - key: START_ENV_OVERRIDE
+        value: "0"
+
+      # Crash supervisor knobs (can override in UI)
+      - key: MAIN_RESTART_ON_CRASH
+        value: "1"
+      - key: MAIN_MAX_RESTARTS
+        value: "0"     # 0 = infinite
+      - key: MAIN_RESTART_BACKOFF_S
+        value: "3"
+      - key: MAIN_RESTART_MAX_BACKOFF_S
+        value: "30"
+      - key: MAIN_RESTART_JITTER_S
+        value: "2"
+
+      # Jupiter routing defaults (NO KEYS here)
+      - key: JUP_BASE_URL
+        value: "https://api.jup.ag"
+      - key: JUP_ALT_BASE_URLS
+        value: "https://api.jup.ag"
+      - key: JUP_AS_LEGACY
+        value: "1"
+      - key: JUP_USE_SHARED_ACCOUNTS
+        value: "1"
+      - key: JUP_ONLY_DIRECT
+        value: "0"
+
+      # Canary hard safety (OFF by default)
+      - key: CANARY_TRADE_ENABLED
+        value: "0"
+
+  # ---------------------------
+  # Playwright / pump.fun knobs
+  # ---------------------------
+  - name: playwright-common
     envVars:
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: /opt/render/project/src/.cache/ms-playwright
+
+  - name: pumpfun-common
+    envVars:
       - key: PUMPFUN_API_BASES
         value: https://frontend-api.pump.fun
       - key: PUMPFUN_DISABLE_PAGE_FETCH
@@ -24,27 +80,75 @@ services:
       - key: PUMPFUN_LOG_ERRORS_ONLY
         value: "1"
 
+  # ---------------------------
+  # Secrets (set in Render UI)
+  # ---------------------------
+  - name: sniper-secrets
+    envVars:
+      # DB (use ONE primary, but we support multiple)
+      - key: DATABASE_URL
+        sync: false
+      - key: POSTGRES_DSN
+        sync: false
+      - key: PG_DSN
+        sync: false
+      - key: PNL_DSN
+        sync: false
+
+      # Wallet material (choose one approach)
+      - key: KEYPAIR_PATH
+        sync: false
+      - key: WALLET_PRIVATE_KEY
+        sync: false
+      - key: WALLET_JSON
+        sync: false
+      - key: WALLET_JSON_B64
+        sync: false
+
+      # External keys
+      - key: JUP_PRO_KEY
+        sync: false
+      - key: JUP_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: NOTION_TOKEN
+        sync: false
+      - key: NOTION_DATABASE_ID
+        sync: false
+
+services:
+  # ---------------------------------------------------------------------------
+  # Worker: main trading/orchestrator service (start.sh control plane)
+  # ---------------------------------------------------------------------------
   - type: worker
     name: pump-sniper
     env: python
+    plan: starter
     buildCommand: |
       pip install -r requirements.txt
-      python -m playwright install chromium
-    startCommand: ./run_bot.sh
+
+      # Playwright is optional; keep it best-effort
+      python -m playwright install chromium || true
+
+      # Normalize CRLF -> LF for start.sh (Windows-safe, Linux/Render-safe)
+      python - <<'PY'
+from pathlib import Path
+p = Path("start.sh")
+if p.exists():
+    data = p.read_bytes()
+    data = data.replace(b"\r\n", b"\n")
+    p.write_bytes(data)
+PY
+
+      chmod +x start.sh || true
+    startCommand: bash ./start.sh
     envVars:
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/project/src/.cache/ms-playwright
-      - key: PUMPFUN_API_BASES
-        value: https://frontend-api.pump.fun
-      - key: PUMPFUN_DISABLE_PAGE_FETCH
-        value: "1"
-      - key: PUMPFUN_RETRY_MAX
-        value: "4"
-      - key: PUMPFUN_RETRY_BASE_MS
-        value: "800"
-      - key: PUMPFUN_BREAKER_FAILS
-        value: "6"
-      - key: PUMPFUN_BREAKER_COOL_MS
-        value: "120000"
-      - key: PUMPFUN_LOG_ERRORS_ONLY
-        value: "1"
+      - fromGroup: sniper-defaults
+      - fromGroup: playwright-common
+      - fromGroup: pumpfun-common
+      - fromGroup: sniper-secrets

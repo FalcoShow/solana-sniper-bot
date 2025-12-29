@@ -48,17 +48,18 @@ Turns macro + meme market + smart-wallets + account + infra context into:
 
 Design principles (God-tier):
 -----------------------------
-- Deterministic + stable: we smooth scores (EMA) and use hysteresis.
+- Deterministic + stable: smooth scores (EMA) and use hysteresis.
 - PnL-positive safety: warmup + stale clamps always reduce risk.
-- Backwards-compatible outputs: same singleton + helper functions.
-- Async safe: one lock, minimal work under lock.
-- “Strict inputs, graceful degradation”: normalize DD sign; tolerate missing scanner stats.
+- Backwards-compatible outputs: singleton + helper functions.
+- Async-safe: one lock; minimal work under lock (compute-heavy outside).
+- “Strict inputs, graceful degradation”: tolerate missing scanner stats; normalize DD sign.
 
-Consumed by:
-- risk_manager / Strategy (size, concurrency, throttles)
-- ai_entry_logic / ai_buy_scoring / ai_sell_logic
-- feature_builder / self_learning_ai_strategy
-- infra_guard
+Integration points:
+- Scanners call update_from_scanner_batch(...)
+- smart_wallets calls update_from_smart_wallets_global(...)
+- risk_manager/accounting calls update_from_account(...)
+- infra_guard/router/health calls update_from_infra(...)
+- scripts/main.py should call regime_state.ensure_background_task() on startup
 """
 
 import asyncio
@@ -66,20 +67,37 @@ import os
 import statistics
 import time
 from bisect import bisect_left
+from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from logging_setup import get_logger
 from utils_pkg.core_utils import get_sol_usd
 
-log = get_logger("sniper.regime")
+# ──────────────────────────────────────────────────────────────────────────────
+# Logger (robust to get_logger signature differences)
+# ──────────────────────────────────────────────────────────────────────────────
+def _get_log():
+    try:
+        return get_logger("sniper.regime")  # type: ignore[arg-type]
+    except TypeError:
+        try:
+            lg = get_logger()
+            if hasattr(lg, "getChild"):
+                return lg.getChild("regime")
+            return lg
+        except Exception:
+            import logging
+            return logging.getLogger("sniper.regime")
+
+
+log = _get_log()
 
 Regime = Literal["risk_on", "normal", "risk_off"]
-
+REGIME_VERSION = "v3+++_godtier_2025-12-22"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Env helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _env_float(key: str, default: float) -> float:
     try:
         return float(os.getenv(key, str(default)))
@@ -102,15 +120,23 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
-    if x < lo:
+    try:
+        xf = float(x)
+    except Exception:
         return lo
-    if x > hi:
+    if xf != xf:  # NaN
+        return lo
+    if xf < lo:
+        return lo
+    if xf > hi:
         return hi
-    return x
+    return xf
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
+        if x is None or isinstance(x, bool):
+            return default
         return float(x)
     except Exception:
         return default
@@ -120,19 +146,21 @@ def _norm_between(x: float, lo: float, hi: float) -> float:
     """Normalize x from [lo, hi] → [0,1], clipped."""
     if hi <= lo:
         return 0.5
-    return _clamp((x - lo) / (hi - lo), 0.0, 1.0)
+    return _clamp((float(x) - lo) / (hi - lo), 0.0, 1.0)
 
 
 def _ema(prev: float, new: float, alpha: float) -> float:
     a = _clamp(alpha, 0.0, 1.0)
-    return (1.0 - a) * prev + a * new
+    return (1.0 - a) * float(prev) + a * float(new)
 
 
 def _pct_ret(new: float, old: float) -> float:
     try:
-        if old <= 0.0:
+        o = float(old)
+        n = float(new)
+        if o <= 0.0:
             return 0.0
-        return (new / old - 1.0) * 100.0
+        return (n / o - 1.0) * 100.0
     except Exception:
         return 0.0
 
@@ -140,15 +168,14 @@ def _pct_ret(new: float, old: float) -> float:
 def _utc_hour(ts: Optional[float] = None) -> int:
     if ts is None:
         ts = time.time()
-    return int((ts // 3600) % 24)
+    return int(time.gmtime(ts).tm_hour)
 
 
 def _utc_weekday(ts: Optional[float] = None) -> int:
-    # 1970-01-01 was a Thursday (weekday=3 if Monday=0). We keep it simple:
+    """Monday=0 ... Sunday=6 (accurate via gmtime)."""
     if ts is None:
         ts = time.time()
-    days = int(ts // 86400)
-    return int((days + 3) % 7)  # Monday=0 approx
+    return int(time.gmtime(ts).tm_wday)
 
 
 def _session_of_day(ts: Optional[float] = None) -> str:
@@ -164,15 +191,21 @@ def _session_of_day(ts: Optional[float] = None) -> str:
 def _weekend_factor(ts: Optional[float] = None) -> float:
     """1.0 weekdays; ~0.7 on weekend (Sat/Sun) when enabled."""
     wd = _utc_weekday(ts)
-    if wd in (5, 6):  # Sat/Sun (approx)
+    if wd in (5, 6):  # Sat/Sun
         return 0.7
     return 1.0
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Core toggles
-# ──────────────────────────────────────────────────────────────────────────────
+async def _call_maybe_async(fn, *args, **kwargs) -> Any:
+    res = fn(*args, **kwargs)
+    if asyncio.iscoroutine(res):
+        return await res
+    return res
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core toggles / thresholds
+# ──────────────────────────────────────────────────────────────────────────────
 REGIME_ENABLED = _env_bool("REGIME_ENABLED", True)
 
 # Poll / history
@@ -192,8 +225,8 @@ REGIME_VOL_5M_HIGH_PCT = _env_float("REGIME_VOL_5M_HIGH_PCT", 2.5)
 
 # Hysteresis / smoothing
 REGIME_SMOOTH_SEC = _env_int("REGIME_SMOOTH_SEC", 300)  # min time between flips
-REGIME_SCORE_EMA_ALPHA = _env_float("REGIME_SCORE_EMA_ALPHA", 0.25)  # smooth scores
-REGIME_SWITCH_MIN_CONF = _env_float("REGIME_SWITCH_MIN_CONF", 0.55)  # require confidence to flip
+REGIME_SCORE_EMA_ALPHA = _env_float("REGIME_SCORE_EMA_ALPHA", 0.25)
+REGIME_SWITCH_MIN_CONF = _env_float("REGIME_SWITCH_MIN_CONF", 0.55)
 REGIME_SWITCH_MIN_SIG = _env_float("REGIME_SWITCH_MIN_SIG", 0.45)
 
 # Stale detection
@@ -218,7 +251,6 @@ RISK_MULT_RISK_ON = _env_float("REGIME_RISK_MULT_RISK_ON", 1.25)
 
 RISK_MULT_MIN_CAP = _env_float("REGIME_RISK_MULT_MIN_CAP", 0.4)
 RISK_MULT_MAX_CAP = _env_float("REGIME_RISK_MULT_MAX_CAP", 1.6)
-
 REGIME_DYNAMIC_MULT_SPAN = _env_float("REGIME_DYNAMIC_MULT_SPAN", 0.25)
 
 # Manipulation-driven forced risk_off
@@ -235,13 +267,15 @@ REGIME_ENTRY_TIGHTEN_MAX = _env_float("REGIME_ENTRY_TIGHTEN_MAX", 0.5)
 REGIME_ENTRY_LOOSEN_MAX = _env_float("REGIME_ENTRY_LOOSEN_MAX", 0.2)
 
 # Scanner smoothing
-REGIME_SCANNER_EMA_ALPHA = _env_float("REGIME_SCANNER_EMA_ALPHA", 0.30)
-REGIME_SCANNER_EMA_ALPHA = _clamp(REGIME_SCANNER_EMA_ALPHA, 0.0, 1.0)
+REGIME_SCANNER_EMA_ALPHA = _clamp(_env_float("REGIME_SCANNER_EMA_ALPHA", 0.30), 0.0, 1.0)
 
 # Optional override / debug
 REGIME_FORCE_LABEL_RAW = os.getenv("REGIME_FORCE_LABEL", "").strip().lower()
-REGIME_FORCE_LABEL = REGIME_FORCE_LABEL_RAW if REGIME_FORCE_LABEL_RAW in ("", "risk_on", "normal", "risk_off") else ""
+REGIME_FORCE_LABEL = (
+    REGIME_FORCE_LABEL_RAW if REGIME_FORCE_LABEL_RAW in ("", "risk_on", "normal", "risk_off") else ""
+)
 REGIME_DEBUG_LOG = _env_bool("REGIME_DEBUG_LOG", False)
+REGIME_DEBUG_EVERY_SEC = max(5, _env_int("REGIME_DEBUG_EVERY_SEC", 180))
 
 # Session / weekend extras
 REGIME_SESSION_BIAS_ENABLED = _env_bool("REGIME_SESSION_BIAS_ENABLED", True)
@@ -267,31 +301,37 @@ REGIME_WARMUP_RISK_CLAMP = _clamp(_env_float("REGIME_WARMUP_RISK_CLAMP", 0.75), 
 REGIME_STALE_RISK_CLAMP = _clamp(_env_float("REGIME_STALE_RISK_CLAMP", 0.70), 0.1, 1.0)
 REGIME_WARMUP_ENTRY_TIGHTEN_CAP = _clamp(_env_float("REGIME_WARMUP_ENTRY_TIGHTEN_CAP", 0.90), 0.6, 1.0)
 
+# Vol computation window controls
+REGIME_VOL_WINDOW_SEC = max(60, _env_int("REGIME_VOL_WINDOW_SEC", 5 * 60))          # default "vol_5m"
+REGIME_VOL_FALLBACK_SEC = max(REGIME_VOL_WINDOW_SEC, _env_int("REGIME_VOL_FALLBACK_SEC", 15 * 60))
+REGIME_VOL_MAX_GAP_MULT = _clamp(_env_float("REGIME_VOL_MAX_GAP_MULT", 4.0), 1.0, 20.0)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # History helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _rolling_return(history: List[Tuple[float, float]], horizon_sec: float) -> float:
-    """
-    % return over horizon using the first obs with ts >= now - horizon.
-    Uses binary search for speed.
-    """
+    """% return over horizon using the first obs with ts >= now - horizon."""
     if len(history) < 2:
         return 0.0
     now_ts = history[-1][0]
-    target_ts = now_ts - float(horizon_sec)
     newest = history[-1][1]
+    target_ts = now_ts - float(horizon_sec)
 
     ts_list = [t for (t, _) in history]
     idx = bisect_left(ts_list, target_ts)
-    if idx <= 0:
-        ref = history[0][1]
-    elif idx >= len(history):
-        ref = history[-1][1]
-    else:
-        ref = history[idx][1]
-    return _pct_ret(newest, ref)
+    ref_px = history[0][1] if idx <= 0 else history[min(idx, len(history) - 1)][1]
+    return _pct_ret(newest, ref_px)
+
+
+def _subset_history(history: List[Tuple[float, float]], horizon_sec: float) -> List[Tuple[float, float]]:
+    if len(history) < 2:
+        return history
+    now_ts = history[-1][0]
+    cutoff = now_ts - float(horizon_sec)
+    ts_list = [t for (t, _) in history]
+    idx = bisect_left(ts_list, cutoff)
+    return history[max(0, idx - 1) :]
 
 
 def _step_returns(history: List[Tuple[float, float]], max_gap_sec: float) -> List[float]:
@@ -307,10 +347,91 @@ def _step_returns(history: List[Tuple[float, float]], max_gap_sec: float) -> Lis
     return out
 
 
+def _calc_sol_stats(history: List[Tuple[float, float]]) -> Tuple[float, float, float]:
+    """Return (ret_5m, ret_1h, vol_window) from copied history."""
+    if len(history) < 2:
+        return 0.0, 0.0, 0.0
+
+    ret_5m = _rolling_return(history, 5 * 60)
+    ret_1h = _rolling_return(history, 60 * 60)
+
+    max_gap = max(15.0, float(REGIME_POLL_SEC) * float(REGIME_VOL_MAX_GAP_MULT))
+
+    # Vol: prefer last REGIME_VOL_WINDOW_SEC; fallback to REGIME_VOL_FALLBACK_SEC; then 1h
+    h1 = _subset_history(history, float(REGIME_VOL_WINDOW_SEC))
+    step1 = _step_returns(h1, max_gap_sec=max_gap)
+
+    if step1:
+        vol = float(statistics.pstdev(step1))
+    else:
+        h2 = _subset_history(history, float(REGIME_VOL_FALLBACK_SEC))
+        step2 = _step_returns(h2, max_gap_sec=max_gap)
+        if step2:
+            vol = float(statistics.pstdev(step2))
+        else:
+            h3 = _subset_history(history, 60 * 60)
+            step3 = _step_returns(h3, max_gap_sec=max_gap)
+            vol = float(statistics.pstdev(step3)) if step3 else 0.0
+
+    return float(ret_5m), float(ret_1h), float(vol)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Snapshot (safe read without holding lock too long)
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class _RegimeSnap:
+    regime: Regime
+    last_change_ts: float
+    last_eval_ts: float
+    last_px: float
+    history: Tuple[Tuple[float, float], ...]
+
+    consec_sol_fail: int
+
+    # Scores (smoothed)
+    trend_score: float
+    volatility_score: float
+    liquidity_score: float
+    manipulation_risk: float
+    choppy_score: float
+    confidence_score: float
+    meme_heat: float
+
+    # Scanner aggregates
+    meme_breadth_up_ratio: float
+    meme_liq_score: float
+    meme_pump_density: float
+    meme_rug_rate: float
+
+    # Smart/whale aggregates
+    smart_accum: float
+    smart_panic: float
+    whale_dom: float
+    smart_conflict: float
+    smart_risk: float
+
+    # Account
+    account_daily_pnl_pct: float
+    account_daily_dd_pct: float
+    account_consec_losses: int
+    account_risk_bias: float
+    account_equity_slope: float
+    account_intraday_vol: float
+    account_kelly_hint: float
+
+    # Infra
+    infra_degraded_score: float
+    infra_hard_block: bool
+
+    # External overrides
+    external_macro_bias: float
+    external_risk_off_flag: bool
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Regime engine
 # ──────────────────────────────────────────────────────────────────────────────
-
 class RegimeState:
     """
     Global macro + memecoin + infra regime engine.
@@ -376,11 +497,11 @@ class RegimeState:
         self._lock = asyncio.Lock()
         self._running_task: Optional[asyncio.Task] = None
         self._force_label_logged: bool = False
+        self._last_debug_ts: float = 0.0
 
     # ────────────────────────────────────────────────────────────────────
-    # Basic accessors
+    # Sync accessors (cheap)
     # ────────────────────────────────────────────────────────────────────
-
     def get(self) -> Regime:
         return self._regime
 
@@ -407,7 +528,10 @@ class RegimeState:
             return False
         if len(self._history) < 2:
             return True
-        span = self._history[-1][0] - self._history[0][0]
+        try:
+            span = self._history[-1][0] - self._history[0][0]
+        except Exception:
+            return True
         return span < float(REGIME_MIN_OBS_SEC)
 
     def is_stale(self) -> bool:
@@ -433,7 +557,6 @@ class RegimeState:
     # ────────────────────────────────────────────────────────────────────
     # Risk knobs
     # ────────────────────────────────────────────────────────────────────
-
     def _base_risk_mult(self) -> float:
         if self._regime == "risk_off":
             return max(0.0, RISK_MULT_RISK_OFF)
@@ -500,16 +623,16 @@ class RegimeState:
         if self.is_warmup() and val > REGIME_WARMUP_ENTRY_TIGHTEN_CAP:
             val = REGIME_WARMUP_ENTRY_TIGHTEN_CAP
 
-        return val
+        return float(val)
 
     def entry_gate_factor(self) -> float:
-        rm = self.risk_multiplier()
-        tighten = self.entry_tighten()
+        rm = float(self.risk_multiplier())
+        tighten = float(self.entry_tighten())
         stress = _clamp(self.regime_stress_score, 0.0, 1.0)
 
         stress_penalty = 1.0 - 0.40 * stress
         raw = rm * tighten * stress_penalty
-        return _clamp(raw, 0.2, 1.5)
+        return float(_clamp(raw, 0.2, 1.5))
 
     def slippage_hint_bps(self) -> int:
         vol = _clamp(self.volatility_score, 0.0, 1.0)
@@ -556,22 +679,27 @@ class RegimeState:
         return "balanced"
 
     # ────────────────────────────────────────────────────────────────────
-    # Export ctx
+    # Export ctx (backwards compatible)
     # ────────────────────────────────────────────────────────────────────
-
     def to_risk_ctx(self) -> Dict[str, Any]:
+        rm = float(self.risk_multiplier())
+        eg = float(self.entry_gate_factor())
         return {
+            "regime_version": REGIME_VERSION,
             "regime_label": self.label(),
             "regime_label_numeric": self.as_numeric(),
             "regime_risk_mode": self.risk_mode(),
-            "regime_risk_multiplier": self.risk_multiplier(),
-            "regime_entry_tighten": self.entry_tighten(),
-            "regime_entry_gate_factor": self.entry_gate_factor(),
+            "regime_risk_multiplier": rm,
+            "regime_mult": rm,  # legacy alias
+            "regime_entry_tighten": float(self.entry_tighten()),
+            "regime_entry_gate_factor": eg,
+            "regime_gate": eg,  # legacy alias
             "regime_slippage_hint_bps": float(self.slippage_hint_bps()),
             "regime_trend": float(self.trend_score),
             "regime_volatility": float(self.volatility_score),
             "regime_liquidity": float(self.liquidity_score),
             "regime_manipulation_risk": float(self.manipulation_risk),
+            "manipulation_risk": float(self.manipulation_risk),  # important for ai_risk_model
             "regime_meme_heat": float(self.meme_heat),
             "regime_stress_score": float(self.regime_stress_score),
             "regime_signal_strength": float(self.regime_signal_strength),
@@ -596,16 +724,20 @@ class RegimeState:
         }
 
     def to_entry_ctx(self) -> Dict[str, float]:
+        rm = float(self.risk_multiplier())
+        eg = float(self.entry_gate_factor())
         return {
-            "regime_label_numeric": self.as_numeric(),
+            "regime_label_numeric": float(self.as_numeric()),
             "regime_risk_mode": float(self.risk_mode()),
-            "regime_risk_multiplier": float(self.risk_multiplier()),
+            "regime_risk_multiplier": rm,
+            "regime_mult": rm,  # legacy alias
             "regime_entry_tighten": float(self.entry_tighten()),
-            "regime_entry_gate_factor": float(self.entry_gate_factor()),
+            "regime_entry_gate_factor": eg,
             "regime_stress_score": float(self.regime_stress_score),
             "regime_signal_strength": float(self.regime_signal_strength),
             "tradeability_score": float(self.tradeability_score),
             "macro_risk_score": float(self.macro_risk_score),
+            "manipulation_risk": float(self.manipulation_risk),
             "regime_should_throttle_entries": 1.0 if self.should_throttle_entries() else 0.0,
             "regime_should_pause_new_entries": 1.0 if self.should_pause_all_new_entries() else 0.0,
             "regime_is_stale": 1.0 if self.is_stale() else 0.0,
@@ -614,171 +746,45 @@ class RegimeState:
             "infra_hard_block": 1.0 if self.infra_hard_block else 0.0,
         }
 
-    async def features(self) -> Dict[str, float]:
-        async with self._lock:
-            regime = self._regime
-            last_change_ts = self._last_change_ts
-            last_eval_ts = self._last_eval_ts
-            last_px = self._last_px
-
-            # copy scores
-            trend = float(self.trend_score)
-            vol = float(self.volatility_score)
-            liq = float(self.liquidity_score)
-            manip = float(self.manipulation_risk)
-            choppy = float(self.choppy_score)
-            conf = float(self.confidence_score)
-            meme_heat = float(self.meme_heat)
-
-            macro = float(self.macro_risk_score)
-            stress = float(self.regime_stress_score)
-            sig = float(self.regime_signal_strength)
-            tradeable = float(self.tradeability_score)
-
-            meme_breadth = float(self._meme_breadth_up_ratio)
-            meme_liq = float(self._meme_liq_score)
-            meme_pump = float(self._meme_pump_density)
-            meme_rug = float(self._meme_rug_rate)
-
-            smart_acc = float(self._scanner_smart_accum)
-            smart_panic = float(self._scanner_smart_panic)
-            whale_dom = float(self._scanner_whale_dom)
-            smart_conflict = float(self._scanner_smart_conflict)
-            smart_risk = float(self._global_smart_risk)
-
-            acc_pnl = float(self.account_daily_pnl_pct)
-            acc_dd = float(self.account_daily_dd_pct)
-            acc_losses = float(self.account_consec_losses)
-            acc_bias = float(self.account_risk_bias)
-            acc_eq_slope = float(self.account_equity_slope)
-            acc_eq_vol = float(self.account_intraday_vol)
-            acc_kelly = float(self.account_kelly_hint)
-
-            ext_bias = float(self._external_macro_bias)
-            ext_risk_off = 1.0 if self._external_risk_off_flag else 0.0
-
-            infra_deg = float(self.infra_degraded_score)
-            infra_block = 1.0 if self.infra_hard_block else 0.0
-
-            hist = list(self._history)
-
-        now = time.time()
-        last_change_ago = max(0.0, now - last_change_ts)
-        last_eval_ago = max(0.0, now - last_eval_ts) if last_eval_ts > 0 else 1e9
-
-        numeric = {"risk_off": -1.0, "normal": 0.0, "risk_on": 1.0}[regime]
-        session = _session_of_day(now)
-        week_factor = _weekend_factor(now)
-
-        payload: Dict[str, float] = {
-            "regime_label_numeric": float(numeric),
-            "regime_numeric": float(numeric),
-            "regime_score": float(numeric),
-            "regime_risk_mode": float({"risk_off": 0, "normal": 1, "risk_on": 2}[regime]),
-            "regime_risk_multiplier": float(self.risk_multiplier()),
-            "regime_entry_tighten": float(self.entry_tighten()),
-            "regime_entry_gate_factor": float(self.entry_gate_factor()),
-            "regime_slippage_hint_bps": float(self.slippage_hint_bps()),
-            "regime_is_risk_on": 1.0 if regime == "risk_on" else 0.0,
-            "regime_is_risk_off": 1.0 if regime == "risk_off" else 0.0,
-            "regime_label": float(numeric),
-            "regime_last_change_sec_ago": float(last_change_ago),
-            "regime_last_eval_sec_ago": float(last_eval_ago),
-            "regime_is_stale": 1.0 if self.is_stale() else 0.0,
-            "regime_is_warmup": 1.0 if self.is_warmup() else 0.0,
-            "regime_hard_stop": 1.0 if self.is_hard_stop() else 0.0,
-            "trend_score": trend,
-            "volatility_score": vol,
-            "liquidity_score": liq,
-            "manipulation_risk": manip,
-            "regime_choppy_score": choppy,
-            "regime_confidence": conf,
-            "regime_meme_heat": meme_heat,
-            "macro_risk_score": macro,
-            "regime_stress_score": stress,
-            "regime_signal_strength": sig,
-            "tradeability_score": tradeable,
-            "regime_trend": trend,
-            "regime_volatility": vol,
-            "regime_liquidity": liq,
-            "regime_manipulation_risk": manip,
-            "meme_breadth_up_ratio": meme_breadth,
-            "meme_liq_score": meme_liq,
-            "meme_pump_density": meme_pump,
-            "meme_rug_rate": meme_rug,
-            "regime_smart_accum_avg": smart_acc,
-            "regime_smart_panic_avg": smart_panic,
-            "regime_whale_dom_avg": whale_dom,
-            "regime_smart_conflict_avg": smart_conflict,
-            "regime_smart_risk_avg": smart_risk,
-            "account_daily_pnl_pct": acc_pnl,
-            "account_daily_dd_pct": acc_dd,
-            "account_consec_losses": acc_losses,
-            "account_risk_bias": acc_bias,
-            "account_equity_slope": acc_eq_slope,
-            "account_intraday_vol": acc_eq_vol,
-            "account_kelly_hint": acc_kelly,
-            "regime_session_is_asia": 1.0 if session == "asia" else 0.0,
-            "regime_session_is_eu": 1.0 if session == "eu" else 0.0,
-            "regime_session_is_us": 1.0 if session == "us" else 0.0,
-            "regime_weekend_factor": float(week_factor),
-            "regime_external_macro_bias": ext_bias,
-            "regime_external_risk_off_flag": ext_risk_off,
-            "infra_degraded_score": infra_deg,
-            "infra_hard_block": infra_block,
-            "regime_is_choppy": 1.0 if choppy >= 0.6 else 0.0,
-            "regime_is_high_manip": 1.0 if manip >= 0.6 else 0.0,
-            "regime_is_high_vol": 1.0 if vol >= 0.7 else 0.0,
-            "regime_is_hot_meme": 1.0 if meme_heat >= 0.65 else 0.0,
-            "regime_should_throttle_entries": 1.0 if self.should_throttle_entries() else 0.0,
-            "regime_should_pause_new_entries": 1.0 if self.should_pause_all_new_entries() else 0.0,
-            "sol_last_px": float(last_px),
-        }
-
-        if len(hist) < 2:
-            payload.update({"sol_ret_5m_pct": 0.0, "sol_ret_1h_pct": 0.0, "sol_vol_5m_pct": 0.0})
-            return payload
-
-        ret_5m = _rolling_return(hist, 5 * 60)
-        ret_1h = _rolling_return(hist, 60 * 60)
-        step_rets_5m = _step_returns(hist, 5 * 60)
-        vol_5m = float(statistics.pstdev(step_rets_5m)) if step_rets_5m else 0.0
-        payload.update({"sol_ret_5m_pct": float(ret_5m), "sol_ret_1h_pct": float(ret_1h), "sol_vol_5m_pct": float(vol_5m)})
-        return payload
-
-    async def snapshot_features(self) -> Dict[str, float]:
-        return await self.features()
-
-    async def attach_features_to_meta(self, meta: Dict[str, Any]) -> None:
-        meta.update(await self.features())
-
     # ────────────────────────────────────────────────────────────────────
-    # External / AI hints
+    # Internal: snapshot + compute (min lock time)
     # ────────────────────────────────────────────────────────────────────
-
-    async def apply_external_macro_hint(
-        self,
-        *,
-        macro_bias: Optional[float] = None,
-        force_risk_off: Optional[bool] = None,
-    ) -> None:
-        async with self._lock:
-            if macro_bias is not None:
-                self._external_macro_bias = _clamp(float(macro_bias), -1.0, 1.0)
-            if force_risk_off is not None:
-                self._external_risk_off_flag = bool(force_risk_off)
-
-    async def apply_ai_macro_hint(
-        self,
-        *,
-        macro_bias: Optional[float] = None,
-        force_risk_off: Optional[bool] = None,
-    ) -> None:
-        await self.apply_external_macro_hint(macro_bias=macro_bias, force_risk_off=force_risk_off)
-
-    # ────────────────────────────────────────────────────────────────────
-    # Core recompute + regime decision
-    # ────────────────────────────────────────────────────────────────────
+    def _snapshot_unlocked(self) -> _RegimeSnap:
+        return _RegimeSnap(
+            regime=self._regime,
+            last_change_ts=self._last_change_ts,
+            last_eval_ts=self._last_eval_ts,
+            last_px=self._last_px,
+            history=tuple(self._history),
+            consec_sol_fail=self._consec_sol_fail,
+            trend_score=float(self.trend_score),
+            volatility_score=float(self.volatility_score),
+            liquidity_score=float(self.liquidity_score),
+            manipulation_risk=float(self.manipulation_risk),
+            choppy_score=float(self.choppy_score),
+            confidence_score=float(self.confidence_score),
+            meme_heat=float(self.meme_heat),
+            meme_breadth_up_ratio=float(self._meme_breadth_up_ratio),
+            meme_liq_score=float(self._meme_liq_score),
+            meme_pump_density=float(self._meme_pump_density),
+            meme_rug_rate=float(self._meme_rug_rate),
+            smart_accum=float(self._scanner_smart_accum),
+            smart_panic=float(self._scanner_smart_panic),
+            whale_dom=float(self._scanner_whale_dom),
+            smart_conflict=float(self._scanner_smart_conflict),
+            smart_risk=float(self._global_smart_risk),
+            account_daily_pnl_pct=float(self.account_daily_pnl_pct),
+            account_daily_dd_pct=float(self.account_daily_dd_pct),
+            account_consec_losses=int(self.account_consec_losses),
+            account_risk_bias=float(self.account_risk_bias),
+            account_equity_slope=float(self.account_equity_slope),
+            account_intraday_vol=float(self.account_intraday_vol),
+            account_kelly_hint=float(self.account_kelly_hint),
+            infra_degraded_score=float(self.infra_degraded_score),
+            infra_hard_block=bool(self.infra_hard_block),
+            external_macro_bias=float(self._external_macro_bias),
+            external_risk_off_flag=bool(self._external_risk_off_flag),
+        )
 
     def _decide_regime(self, *, ret_5m: float, ret_1h: float, vol_5m: float) -> Regime:
         # Manual override
@@ -786,7 +792,7 @@ class RegimeState:
             if not self._force_label_logged:
                 self._force_label_logged = True
                 if hasattr(log, "event"):
-                    log.event("REGIME_FORCE_LABEL", label=REGIME_FORCE_LABEL)
+                    log.event("REGIME_FORCE_LABEL", label=REGIME_FORCE_LABEL, version=REGIME_VERSION)
                 else:
                     log.warning("REGIME_FORCE_LABEL=%s (override)", REGIME_FORCE_LABEL)
             return REGIME_FORCE_LABEL  # type: ignore[return-value]
@@ -816,7 +822,9 @@ class RegimeState:
             return "risk_off"
 
         # Softer DD / streak
-        if (self.account_daily_dd_pct <= -abs(ACCOUNT_DD_RISK_OFF)) or (self.account_consec_losses >= ACCOUNT_CONSEC_LOSS_RISK_OFF):
+        if (self.account_daily_dd_pct <= -abs(ACCOUNT_DD_RISK_OFF)) or (
+            self.account_consec_losses >= ACCOUNT_CONSEC_LOSS_RISK_OFF
+        ):
             return "risk_off"
 
         # risk_on: aligned upside + ok vol + non-awful meme tape + not in DD
@@ -856,9 +864,8 @@ class RegimeState:
         return False
 
     def _recompute_scores_unlocked(self, *, ret_5m: float, ret_1h: float, vol_5m: float) -> None:
-        """
-        With lock held: recompute continuous regime scores and smooth them.
-        """
+        """With lock held: recompute continuous regime scores and smooth them."""
+
         # Trend (-1..+1): scale by target bands
         pos_5m = max(SOL_RISK_ON_RET_5M, 1e-6)
         pos_1h = max(SOL_RISK_ON_RET_1H, 1e-6)
@@ -941,7 +948,7 @@ class RegimeState:
         self.confidence_score = _ema(self.confidence_score, conf_raw, REGIME_SCORE_EMA_ALPHA)
 
         # Account risk bias (-1..+1)
-        dd = float(self.account_daily_dd_pct)      # negative
+        dd = float(self.account_daily_dd_pct)  # negative
         pnl = float(self.account_daily_pnl_pct)
         losses = int(self.account_consec_losses)
         eq_slope = float(self.account_equity_slope)
@@ -989,7 +996,7 @@ class RegimeState:
         macro_core += 0.20 * self._external_macro_bias
         macro_core += 0.05 * ((kelly_hint - 0.5) * 2.0)
 
-        # Smart-risk is exposed for AI; keep rule-based impact very mild:
+        # Smart-risk: exposed for AI; rule-based impact kept mild
         macro_core += 0.03 * ((smart_acc - smart_panic) * 2.0)
         macro_core -= 0.02 * self._global_smart_risk
 
@@ -1042,7 +1049,7 @@ class RegimeState:
 
         now = time.time()
 
-        # Confidence gates (God-tier stability): require minimum confidence/signal to flip unless strong switch
+        # Confidence gates: require min confidence/signal unless strong switch
         if not self._is_strong_switch(current=self._regime, target=new_regime, ret_5m=ret_5m, ret_1h=ret_1h):
             if self.confidence_score < REGIME_SWITCH_MIN_CONF or self.regime_signal_strength < REGIME_SWITCH_MIN_SIG:
                 return
@@ -1059,6 +1066,7 @@ class RegimeState:
         if hasattr(log, "event"):
             log.event(
                 "REGIME_SWITCH",
+                version=REGIME_VERSION,
                 old=old,
                 new=new_regime,
                 ret_5m=ret_5m,
@@ -1073,13 +1081,127 @@ class RegimeState:
                 infra_block=self.infra_hard_block,
             )
         else:
-            log.info("REGIME_SWITCH old=%s new=%s ret_5m=%.3f ret_1h=%.3f vol_5m=%.3f",
-                     old, new_regime, ret_5m, ret_1h, vol_5m)
+            log.info(
+                "REGIME_SWITCH v=%s old=%s new=%s ret_5m=%.3f ret_1h=%.3f vol=%.3f conf=%.2f sig=%.2f",
+                REGIME_VERSION, old, new_regime, ret_5m, ret_1h, vol_5m, self.confidence_score, self.regime_signal_strength
+            )
 
     # ────────────────────────────────────────────────────────────────────
-    # Macro loop
+    # Public: feature payloads (async, safe)
     # ────────────────────────────────────────────────────────────────────
+    async def features(self) -> Dict[str, float]:
+        async with self._lock:
+            snap = self._snapshot_unlocked()
 
+        now = time.time()
+        last_change_ago = max(0.0, now - snap.last_change_ts)
+        last_eval_ago = max(0.0, now - snap.last_eval_ts) if snap.last_eval_ts > 0 else 1e9
+
+        numeric = {"risk_off": -1.0, "normal": 0.0, "risk_on": 1.0}[snap.regime]
+        session = _session_of_day(now)
+        week_factor = _weekend_factor(now)
+
+        hist = list(snap.history)
+        ret_5m, ret_1h, vol_5m = _calc_sol_stats(hist)
+
+        payload: Dict[str, float] = {
+            # Keep numeric-only
+            "regime_label_numeric": float(numeric),
+            "regime_numeric": float(numeric),
+            "regime_risk_mode": float({"risk_off": 0, "normal": 1, "risk_on": 2}[snap.regime]),
+            "regime_risk_multiplier": float(self.risk_multiplier()),
+            "regime_mult": float(self.risk_multiplier()),  # legacy
+            "regime_entry_tighten": float(self.entry_tighten()),
+            "regime_entry_gate_factor": float(self.entry_gate_factor()),
+            "regime_slippage_hint_bps": float(self.slippage_hint_bps()),
+            "regime_is_risk_on": 1.0 if snap.regime == "risk_on" else 0.0,
+            "regime_is_risk_off": 1.0 if snap.regime == "risk_off" else 0.0,
+            "regime_last_change_sec_ago": float(last_change_ago),
+            "regime_last_eval_sec_ago": float(last_eval_ago),
+            "regime_is_stale": 1.0 if self.is_stale() else 0.0,
+            "regime_is_warmup": 1.0 if self.is_warmup() else 0.0,
+            "regime_hard_stop": 1.0 if self.is_hard_stop() else 0.0,
+            "trend_score": float(snap.trend_score),
+            "volatility_score": float(snap.volatility_score),
+            "liquidity_score": float(snap.liquidity_score),
+            "manipulation_risk": float(snap.manipulation_risk),
+            "regime_choppy_score": float(snap.choppy_score),
+            "regime_confidence": float(snap.confidence_score),
+            "regime_meme_heat": float(snap.meme_heat),
+            "macro_risk_score": float(self.macro_risk_score),
+            "regime_stress_score": float(self.regime_stress_score),
+            "regime_signal_strength": float(self.regime_signal_strength),
+            "tradeability_score": float(self.tradeability_score),
+            "meme_breadth_up_ratio": float(snap.meme_breadth_up_ratio),
+            "meme_liq_score": float(snap.meme_liq_score),
+            "meme_pump_density": float(snap.meme_pump_density),
+            "meme_rug_rate": float(snap.meme_rug_rate),
+            "regime_smart_accum_avg": float(snap.smart_accum),
+            "regime_smart_panic_avg": float(snap.smart_panic),
+            "regime_whale_dom_avg": float(snap.whale_dom),
+            "regime_smart_conflict_avg": float(snap.smart_conflict),
+            "regime_smart_risk_avg": float(snap.smart_risk),
+            "account_daily_pnl_pct": float(snap.account_daily_pnl_pct),
+            "account_daily_dd_pct": float(snap.account_daily_dd_pct),
+            "account_consec_losses": float(snap.account_consec_losses),
+            "account_risk_bias": float(snap.account_risk_bias),
+            "account_equity_slope": float(snap.account_equity_slope),
+            "account_intraday_vol": float(snap.account_intraday_vol),
+            "account_kelly_hint": float(snap.account_kelly_hint),
+            "regime_session_is_asia": 1.0 if session == "asia" else 0.0,
+            "regime_session_is_eu": 1.0 if session == "eu" else 0.0,
+            "regime_session_is_us": 1.0 if session == "us" else 0.0,
+            "regime_weekend_factor": float(week_factor),
+            "regime_external_macro_bias": float(snap.external_macro_bias),
+            "regime_external_risk_off_flag": 1.0 if snap.external_risk_off_flag else 0.0,
+            "infra_degraded_score": float(snap.infra_degraded_score),
+            "infra_hard_block": 1.0 if snap.infra_hard_block else 0.0,
+            "regime_is_choppy": 1.0 if snap.choppy_score >= 0.6 else 0.0,
+            "regime_is_high_manip": 1.0 if snap.manipulation_risk >= 0.6 else 0.0,
+            "regime_is_high_vol": 1.0 if snap.volatility_score >= 0.7 else 0.0,
+            "regime_is_hot_meme": 1.0 if snap.meme_heat >= 0.65 else 0.0,
+            "regime_should_throttle_entries": 1.0 if self.should_throttle_entries() else 0.0,
+            "regime_should_pause_new_entries": 1.0 if self.should_pause_all_new_entries() else 0.0,
+            "sol_last_px": float(snap.last_px),
+            "sol_ret_5m_pct": float(ret_5m),
+            "sol_ret_1h_pct": float(ret_1h),
+            "sol_vol_win_pct": float(vol_5m),
+            "regime_consec_sol_fail": float(snap.consec_sol_fail),
+        }
+        return payload
+
+    async def snapshot_features(self) -> Dict[str, float]:
+        return await self.features()
+
+    async def attach_features_to_meta(self, meta: Dict[str, Any]) -> None:
+        meta.update(await self.features())
+
+    # ────────────────────────────────────────────────────────────────────
+    # External / AI hints
+    # ────────────────────────────────────────────────────────────────────
+    async def apply_external_macro_hint(
+        self,
+        *,
+        macro_bias: Optional[float] = None,
+        force_risk_off: Optional[bool] = None,
+    ) -> None:
+        async with self._lock:
+            if macro_bias is not None:
+                self._external_macro_bias = _clamp(float(macro_bias), -1.0, 1.0)
+            if force_risk_off is not None:
+                self._external_risk_off_flag = bool(force_risk_off)
+
+    async def apply_ai_macro_hint(
+        self,
+        *,
+        macro_bias: Optional[float] = None,
+        force_risk_off: Optional[bool] = None,
+    ) -> None:
+        await self.apply_external_macro_hint(macro_bias=macro_bias, force_risk_off=force_risk_off)
+
+    # ────────────────────────────────────────────────────────────────────
+    # Macro loop (compute-heavy outside lock)
+    # ────────────────────────────────────────────────────────────────────
     async def refresh_once(self) -> None:
         if not REGIME_ENABLED:
             return
@@ -1087,58 +1209,76 @@ class RegimeState:
         px: float = 0.0
         try:
             if REGIME_SOL_FETCH_TIMEOUT_S > 0:
-                px = float(await asyncio.wait_for(get_sol_usd(), timeout=REGIME_SOL_FETCH_TIMEOUT_S))
+                px = float(await asyncio.wait_for(_call_maybe_async(get_sol_usd), timeout=REGIME_SOL_FETCH_TIMEOUT_S))
             else:
-                px = float(await get_sol_usd())
+                px = float(await _call_maybe_async(get_sol_usd))
         except Exception:
             px = 0.0
 
         now = time.time()
-
-        async with self._lock:
-            if px <= 0.0:
+        if px <= 0.0:
+            async with self._lock:
                 self._consec_sol_fail += 1
-                # if we keep failing, let stale logic clamp risk automatically
+                # Let stale clamp handle risk; optionally log
                 if self._consec_sol_fail >= REGIME_SOL_MAX_CONSEC_FAIL and REGIME_DEBUG_LOG:
-                    log.warning("REGIME_SOL_FETCH_FAIL consec=%s (px=0)", self._consec_sol_fail)
-                return
+                    if hasattr(log, "event"):
+                        log.event("REGIME_SOL_FETCH_FAIL", consec=self._consec_sol_fail)
+                    else:
+                        log.warning("REGIME_SOL_FETCH_FAIL consec=%s (px=0)", self._consec_sol_fail)
+            return
 
+        # Update history under lock; copy history for compute outside lock
+        async with self._lock:
             self._consec_sol_fail = 0
             self._last_px = px
             self._history.append((now, px))
 
-            # Trim to horizon + hard cap
             cutoff = now - float(REGIME_HISTORY_HORIZON_SEC)
             while len(self._history) > 2 and self._history[0][0] < cutoff:
                 self._history.pop(0)
             if REGIME_HISTORY_MAX_POINTS > 0 and len(self._history) > REGIME_HISTORY_MAX_POINTS:
                 self._history = self._history[-REGIME_HISTORY_MAX_POINTS :]
 
-            span = self._history[-1][0] - self._history[0][0]
-            if span < float(REGIME_MIN_OBS_SEC):
-                self._recompute_scores_unlocked(ret_5m=0.0, ret_1h=0.0, vol_5m=0.0)
-                self._last_eval_ts = now
-                if REGIME_DEBUG_LOG:
-                    log.debug("regime warmup: span=%.1fs label=%s", span, self._regime)
-                return
+            hist_copy = list(self._history)
 
-            ret_5m = _rolling_return(self._history, 5 * 60)
-            ret_1h = _rolling_return(self._history, 60 * 60)
-            step_rets_5m = _step_returns(self._history, 5 * 60)
-            vol_5m = float(statistics.pstdev(step_rets_5m)) if step_rets_5m else 0.0
+        # Compute stats outside lock
+        ret_5m, ret_1h, vol_5m = _calc_sol_stats(hist_copy)
 
+        # Apply regime + scores under lock
+        async with self._lock:
+            # Always recompute scores (even during warmup); safety clamps still apply in risk_multiplier/entry_tighten
             new_regime = self._decide_regime(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
             self._apply_regime_unlocked(new_regime, ret_5m, ret_1h, vol_5m)
             self._last_eval_ts = now
 
-            if REGIME_DEBUG_LOG:
-                log.debug(
-                    "regime step: px=%.4f ret_5m=%.3f ret_1h=%.3f vol_5m=%.3f "
-                    "trend=%.3f vol=%.3f liq=%.3f manip=%.3f conf=%.3f label=%s tradeable=%.3f",
-                    px, ret_5m, ret_1h, vol_5m,
-                    self.trend_score, self.volatility_score, self.liquidity_score,
-                    self.manipulation_risk, self.confidence_score, self._regime, self.tradeability_score
-                )
+            if REGIME_DEBUG_LOG and (now - self._last_debug_ts) >= float(REGIME_DEBUG_EVERY_SEC):
+                self._last_debug_ts = now
+                if hasattr(log, "event"):
+                    log.event(
+                        "REGIME_STEP",
+                        px=px,
+                        ret_5m=ret_5m,
+                        ret_1h=ret_1h,
+                        vol=vol_5m,
+                        trend=self.trend_score,
+                        vol_score=self.volatility_score,
+                        liq=self.liquidity_score,
+                        manip=self.manipulation_risk,
+                        conf=self.confidence_score,
+                        label=self._regime,
+                        tradeable=self.tradeability_score,
+                        warmup=self.is_warmup(),
+                        stale=self.is_stale(),
+                    )
+                else:
+                    log.debug(
+                        "REGIME_STEP px=%.4f ret_5m=%.3f ret_1h=%.3f vol=%.3f trend=%.2f volS=%.2f "
+                        "liq=%.2f manip=%.2f conf=%.2f label=%s tradeable=%.2f warmup=%s stale=%s",
+                        px, ret_5m, ret_1h, vol_5m,
+                        self.trend_score, self.volatility_score, self.liquidity_score,
+                        self.manipulation_risk, self.confidence_score, self._regime, self.tradeability_score,
+                        int(self.is_warmup()), int(self.is_stale())
+                    )
 
     async def refresh_loop(self) -> None:
         if not REGIME_ENABLED:
@@ -1149,9 +1289,9 @@ class RegimeState:
             return
 
         if hasattr(log, "event"):
-            log.event("REGIME_LOOP_START", poll_sec=REGIME_POLL_SEC, hist_sec=REGIME_HISTORY_HORIZON_SEC)
+            log.event("REGIME_LOOP_START", poll_sec=REGIME_POLL_SEC, hist_sec=REGIME_HISTORY_HORIZON_SEC, version=REGIME_VERSION)
         else:
-            log.info("REGIME_LOOP_START poll_sec=%s hist_sec=%s", REGIME_POLL_SEC, REGIME_HISTORY_HORIZON_SEC)
+            log.info("REGIME_LOOP_START poll_sec=%s hist_sec=%s v=%s", REGIME_POLL_SEC, REGIME_HISTORY_HORIZON_SEC, REGIME_VERSION)
 
         while True:
             try:
@@ -1164,6 +1304,7 @@ class RegimeState:
             await asyncio.sleep(max(5, REGIME_POLL_SEC))
 
     def ensure_background_task(self) -> None:
+        """Call once during startup (inside a running event loop)."""
         if not REGIME_ENABLED:
             return
         if self._running_task is None or self._running_task.done():
@@ -1176,7 +1317,6 @@ class RegimeState:
     # ────────────────────────────────────────────────────────────────────
     # Scanner integration
     # ────────────────────────────────────────────────────────────────────
-
     async def update_from_scanner_batch(
         self,
         *,
@@ -1192,11 +1332,12 @@ class RegimeState:
         whale_dom_avg: float = 0.0,
         smart_conflict_avg: float = 0.0,
     ) -> None:
-        if total_tokens <= 0:
+        if int(total_tokens) <= 0:
             return
 
-        up_ratio = _clamp(up_tokens / float(max(total_tokens, 1)), 0.0, 1.0)
-        liq_score = _norm_between(avg_liq_usd, MEME_LOW_LIQ_USD, MEME_HIGH_LIQ_USD)
+        total = max(1, int(total_tokens))
+        up_ratio = _clamp(int(up_tokens) / float(total), 0.0, 1.0)
+        liq_score = _norm_between(_safe_float(avg_liq_usd, 0.0), MEME_LOW_LIQ_USD, MEME_HIGH_LIQ_USD)
 
         pump_d = _clamp(_safe_float(pump_density), 0.0, 1.0)
         rug_r = _clamp(_safe_float(rug_rate), 0.0, 1.0)
@@ -1218,22 +1359,27 @@ class RegimeState:
             self._scanner_whale_dom = _ema(self._scanner_whale_dom, w_dom, a)
             self._scanner_smart_conflict = _ema(self._scanner_smart_conflict, s_conf, a)
 
-            # Recompute using latest SOL stats if present
-            if len(self._history) >= 2:
-                ret_5m = _rolling_return(self._history, 5 * 60)
-                ret_1h = _rolling_return(self._history, 60 * 60)
-                step_rets_5m = _step_returns(self._history, 5 * 60)
-                vol_5m = float(statistics.pstdev(step_rets_5m)) if step_rets_5m else 0.0
-            else:
-                ret_5m = ret_1h = vol_5m = 0.0
+            hist_copy = list(self._history)
 
+        ret_5m, ret_1h, vol_5m = _calc_sol_stats(hist_copy)
+
+        async with self._lock:
             self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
             self._last_eval_ts = time.time()
 
-            if REGIME_DEBUG_LOG:
-                log.debug("scanner_regime_update src=%s up=%.2f liq=%.2f pump=%.2f rug=%.2f",
-                          source, self._meme_breadth_up_ratio, self._meme_liq_score,
-                          self._meme_pump_density, self._meme_rug_rate)
+        if REGIME_DEBUG_LOG and hasattr(log, "event"):
+            log.event(
+                "REGIME_SCANNER_UPDATE",
+                source=source,
+                up_ratio=float(up_ratio),
+                liq_score=float(liq_score),
+                pump=float(pump_d),
+                rug=float(rug_r),
+                smart_acc=float(s_acc),
+                smart_panic=float(s_panic),
+                whale_dom=float(w_dom),
+                smart_conflict=float(s_conf),
+            )
 
     async def update_from_smart_wallets_global(
         self,
@@ -1246,56 +1392,45 @@ class RegimeState:
         smart_conflict_global: float,
         smart_risk_global: float,
     ) -> None:
+        a = REGIME_SCANNER_EMA_ALPHA
+        accum = max(0.0, _safe_float(smart_side_global)) * max(0.0, _safe_float(smart_heat_global))
+        panic = _clamp(_safe_float(smart_panic_global), 0.0, 1.0)
+        w_dom = _clamp(_safe_float(whale_heat_global), 0.0, 1.0)
+        conflict = _clamp(_safe_float(smart_conflict_global), 0.0, 1.0)
+        s_risk = _clamp(_safe_float(smart_risk_global), 0.0, 1.0)
+
         async with self._lock:
-            a = REGIME_SCANNER_EMA_ALPHA
-
-            accum = max(0.0, _safe_float(smart_side_global)) * max(0.0, _safe_float(smart_heat_global))
-            panic = _clamp(_safe_float(smart_panic_global), 0.0, 1.0)
-            w_dom = _clamp(_safe_float(whale_heat_global), 0.0, 1.0)
-            conflict = _clamp(_safe_float(smart_conflict_global), 0.0, 1.0)
-            s_risk = _clamp(_safe_float(smart_risk_global), 0.0, 1.0)
-
             self._scanner_smart_accum = _ema(self._scanner_smart_accum, accum, a)
             self._scanner_smart_panic = _ema(self._scanner_smart_panic, panic, a)
             self._scanner_whale_dom = _ema(self._scanner_whale_dom, w_dom, a)
             self._scanner_smart_conflict = _ema(self._scanner_smart_conflict, conflict, a)
             self._global_smart_risk = _ema(self._global_smart_risk, s_risk, a)
+            hist_copy = list(self._history)
 
-            if len(self._history) >= 2:
-                ret_5m = _rolling_return(self._history, 5 * 60)
-                ret_1h = _rolling_return(self._history, 60 * 60)
-                step_rets_5m = _step_returns(self._history, 5 * 60)
-                vol_5m = float(statistics.pstdev(step_rets_5m)) if step_rets_5m else 0.0
-            else:
-                ret_5m = ret_1h = vol_5m = 0.0
+        ret_5m, ret_1h, vol_5m = _calc_sol_stats(hist_copy)
 
+        async with self._lock:
             self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
             self._last_eval_ts = time.time()
 
     # ────────────────────────────────────────────────────────────────────
     # Infra integration
     # ────────────────────────────────────────────────────────────────────
-
     async def update_from_infra(self, *, infra_degraded_score: float, infra_hard_block: bool) -> None:
         async with self._lock:
             self.infra_degraded_score = _clamp(float(infra_degraded_score), 0.0, 1.0)
             self.infra_hard_block = bool(infra_hard_block)
+            hist_copy = list(self._history)
 
-            if len(self._history) >= 2:
-                ret_5m = _rolling_return(self._history, 5 * 60)
-                ret_1h = _rolling_return(self._history, 60 * 60)
-                step_rets_5m = _step_returns(self._history, 5 * 60)
-                vol_5m = float(statistics.pstdev(step_rets_5m)) if step_rets_5m else 0.0
-            else:
-                ret_5m = ret_1h = vol_5m = 0.0
+        ret_5m, ret_1h, vol_5m = _calc_sol_stats(hist_copy)
 
+        async with self._lock:
             self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
             self._last_eval_ts = time.time()
 
     # ────────────────────────────────────────────────────────────────────
     # Account integration
     # ────────────────────────────────────────────────────────────────────
-
     async def update_from_account(
         self,
         *,
@@ -1326,26 +1461,23 @@ class RegimeState:
             if kelly_fraction_hint is not None:
                 self.account_kelly_hint = _clamp(float(kelly_fraction_hint), 0.0, 1.0)
 
-            if len(self._history) >= 2:
-                ret_5m = _rolling_return(self._history, 5 * 60)
-                ret_1h = _rolling_return(self._history, 60 * 60)
-                step_rets_5m = _step_returns(self._history, 5 * 60)
-                vol_5m = float(statistics.pstdev(step_rets_5m)) if step_rets_5m else 0.0
-            else:
-                ret_5m = ret_1h = vol_5m = 0.0
+            hist_copy = list(self._history)
 
+        ret_5m, ret_1h, vol_5m = _calc_sol_stats(hist_copy)
+
+        async with self._lock:
             self._recompute_scores_unlocked(ret_5m=ret_5m, ret_1h=ret_1h, vol_5m=vol_5m)
             self._last_eval_ts = time.time()
 
     # ────────────────────────────────────────────────────────────────────
     # Debug summary
     # ────────────────────────────────────────────────────────────────────
-
     def debug_summary(self) -> str:
         return (
+            f"v={REGIME_VERSION} "
             f"regime={self._regime} "
             f"trend={self.trend_score:+.2f} "
-            f"vol={self.volatility_score:.2f} "
+            f"volS={self.volatility_score:.2f} "
             f"liq={self.liquidity_score:.2f} "
             f"manip={self.manipulation_risk:.2f} "
             f"meme_heat={self.meme_heat:.2f} "
@@ -1371,7 +1503,7 @@ class RegimeState:
 regime_state = RegimeState()
 
 
-# Convenience helpers
+# Convenience helpers (backwards-compatible)
 def regime_risk_ctx() -> Dict[str, Any]:
     return regime_state.to_risk_ctx()
 
@@ -1391,4 +1523,5 @@ __all__ = [
     "regime_risk_ctx",
     "regime_entry_ctx",
     "regime_features",
+    "REGIME_VERSION",
 ]

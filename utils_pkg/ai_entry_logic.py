@@ -1,4 +1,3 @@
-# utils_pkg/ai_entry_logic.py
 from __future__ import annotations
 
 """
@@ -16,110 +15,70 @@ risk/strategy context), this module decides:
     • Whether we should actually enter            → should_enter()
     • A short human-readable reason               → for logs / debugging
 
-Design
-------
-1) Deterministic heuristic baseline using:
-     - Multi-horizon momentum   (5s/15s/60s/300s + 1m/5m/15m/1h)
-     - Volatility regime        (dead vs sweet vs chaotic)
-     - Orderflow / microstruct  (buys, imbalance, intensity, vol/liq)
-     - Liquidity & mcap         (buckets + smooth log scales)
-     - Lifecycle / age          (very-new / newish / late / ancient)
-     - Smart wallets & whales   (alignment, breadth, crowd vs whale share)
-     - Global regime            (trend/liquidity/manipulation risk)
-     - AI fraud / rug / impact  (max penalties + hard veto)
-     - PairFilter scores        (momentum/final/risk-adjusted)
-     - Optional ai_buy_scoring  (ai_buy_score / ai_buy_ok_hard)
-     - FeatureBuilder composites:
-         * entry_quality_score
-         * entry_edge_score / edge_score
-         * entry_micro_alpha
-         * structural_quality_score
-         * entry_risk_score
-         * risk_capacity_score
-         * entry_tier_bucket
-         * position_size_scalar / position_size_bucket
-         * entry_kelly_frac / kelly_fraction
-         * is_dead_like / entry_block_flag
-     - Strategy brain hints:
-         * ai_entry_hint_score / entry_hint_score
-     - Session / RiskManager context:
-         * open_positions / max_positions
-         * daily_drawdown_pct / realized_pnl_pct
-         * rolling_win_rate_pct / recent_loss_streak
-         * risk_mode / risk_capacity
-         * hard_halt / plan_gap_pct / plan_status
-         * entry_score_gate (strategy-tuned floor)
-
-2) Optional OpenAI model (fine-tuned or base):
-     - Produces a 0..1 probability of “good trade”
-     - Blended with heuristic using ENTRY_AI_WEIGHT
-     - Multi-model routing via ENTRY_MODEL_ROUTING_JSON and hints:
-           features.entry_head / segment / regime_label / playbook
-     - Payload auto-trimmed to ENTRY_MAX_FEATURE_BYTES with a curated key set
-     - Uses either:
-         * New SDK:   OpenAI().chat.completions.create(...)
-         * Legacy:    openai.ChatCompletion.create(...)
-
-3) Per-source, per-playbook & regime-aware gating:
-     - Global floor (ENTRY_MIN_SCORE) plus per-source overrides
-     - Per-playbook overrides from self_learning_ai_strategy
-     - Dynamic floor auto-tuning via ai_maintenance_loop()
-     - Strategy-driven floor via risk API (ctx_entry_score_gate)
-     - Plan-aware threshold tilting via ctx_plan_gap_pct (behind vs ahead)
-     - Regime tightening in risk-off / high-manip regimes
-     - Risk-profile tweaks (conservative / balanced / aggressive)
-     - Session drawdown / exposure / capacity locks
-     - Optional edge / Kelly / hint hard gates
-
-4) Rich meta attachment (if ENTRY_ATTACH_META=1):
-     - features["entry_meta"] = {
-           heuristic_score, ai_score, blended_score,
-           buy_score, effective_threshold, base_threshold,
-           risk_profile, regime_risk_mode, source_key, playbook_key,
-           reason, pass,
-           flags (risk_off_tightening, manip_tightening,
-                  dd_lock, target_lock, fraud_lock, pos_full,
-                  streak_lock, ctx_lock, dynamic_floor,
-                  hard_halt, capacity_zero, ...),
-           breakdown: {
-               pf, buy, hint, mom, vol, flow, liq, age, wallet,
-               structure, quality, regime, impact_penalty,
-               rug_penalty, scanner_hint, ctx
-           }
-       }
+Key requirements
+----------------
+- Deterministic baseline (heuristic) always available.
+- Optional OpenAI overlay (fail-soft by default).
+- Explainability: "why entered / why rejected" loggable in *one line*.
+- Production-safe: no hard dependency cycles; no logger method assumptions.
 
 Public API
 ----------
   async score_entry(features) -> float
   async should_enter(features) -> (bool ok, float score, str reason)
-  score_entry_sync(features) -> float    (for scripts/tests)
+  score_entry_sync(features) -> float
 
-Internal API used by backtests
-------------------------------
-  _heuristic_score(features: dict) -> float
-  _ai_score(features: dict) -> Optional[float]
-  ai_maintenance_loop(stop_evt: asyncio.Event) -> None
-
-Diagnostics (for scripts/test_stack AI_ENTRY_LAYER)
----------------------------------------------------
+Diagnostics
+-----------
   async diag_snapshot() -> dict
-      – returns static config + dynamic floor + optional risk/regime snapshots
+
+Notes
+-----
+- This module expects FeatureBuilder to supply most features, but will
+  best-effort enrich risk context via utils_pkg.risk_manager if missing.
 """
 
 import asyncio
 import json
 import math
 import os
+import time
 from typing import Any, Dict, Optional, Tuple
 
 from logging_setup import get_logger
 
 log = get_logger(__name__)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Logger safety shims (so .event/.every never explode)
+# ──────────────────────────────────────────────────────────────────────────────
+if not hasattr(log, "every"):
+
+    def _every(_key: str, n: int = 200) -> bool:
+        # simple stable sampler: roughly 1/n based on time bucket
+        try:
+            return (hash(_key) ^ int(time.time() // 5)) % max(1, int(n)) == 0
+        except Exception:
+            return False
+
+    setattr(log, "every", _every)
+
+if not hasattr(log, "event"):
+
+    def _event(name: str, **fields: Any) -> None:
+        # fall back to structured-ish info log
+        try:
+            log.info("%s %s", name, json.dumps(fields, default=str)[:2000])
+        except Exception:
+            log.info("%s", name)
+
+    setattr(log, "event", _event)
+
 
 # ============================================================================ #
 # Env helpers
 # ============================================================================ #
+
 
 def _env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
@@ -173,102 +132,59 @@ def _log1p(x: float) -> float:
 # Core config (entry-level knobs)
 # ============================================================================ #
 
-# Fine-tuned / base entry model
-ENTRY_MODEL = (
-    os.getenv("ENTRY_MODEL_NAME", "").strip()
-    or os.getenv("ENTRY_MODEL", "").strip()
-)
+ENTRY_MODEL = (os.getenv("ENTRY_MODEL_NAME", "").strip() or os.getenv("ENTRY_MODEL", "").strip())
 
-# Optional multi-model routing:
-#   ENTRY_MODEL_ROUTING_JSON = '{"default": "ft:main", "pumpfun": "ft:pump"}'
 ENTRY_MODEL_ROUTING = _env_json("ENTRY_MODEL_ROUTING_JSON") or {}
 ENTRY_DEFAULT_HEAD = os.getenv("ENTRY_DEFAULT_HEAD", "default").strip() or "default"
 
-# Global AI toggle: if False we never hit OpenAI (heuristic only)
 ENTRY_AI_ENABLED = _env_bool("ENTRY_AI_ENABLED", True)
+ENTRY_AI_WEIGHT = max(0.0, min(1.0, _env_float("ENTRY_AI_WEIGHT", 0.70)))
 
-# Blend weight for AI vs heuristic (0..1)
-ENTRY_AI_WEIGHT = max(0.0, min(1.0, _env_float("ENTRY_AI_WEIGHT", 0.7)))
-
-# Minimum blended score required to enter (global floor; per-source can override upwards)
 ENTRY_MIN_SCORE = max(0.0, min(1.0, _env_float("ENTRY_MIN_SCORE", 0.55)))
 
-# Dynamic floor / auto-calibration
 ENTRY_DYNAMIC_MIN_ENABLED = _env_bool("ENTRY_DYNAMIC_MIN_ENABLED", True)
 ENTRY_DYNAMIC_MIN_LO = max(0.0, min(1.0, _env_float("ENTRY_DYNAMIC_MIN_LO", 0.48)))
 ENTRY_DYNAMIC_MIN_HI = max(0.0, min(1.0, _env_float("ENTRY_DYNAMIC_MIN_HI", 0.72)))
 ENTRY_DYNAMIC_STEP = max(0.001, min(0.05, _env_float("ENTRY_DYNAMIC_STEP", 0.01)))
 
-# Optional minimum AI-only score (0 disables)
 ENTRY_MIN_AI_SCORE = max(0.0, min(1.0, _env_float("ENTRY_MIN_AI_SCORE", 0.0)))
-
-# If True, raise on OpenAI failure. If False, fail-soft to heuristic.
 ENTRY_AI_STRICT = _env_bool("ENTRY_AI_STRICT", False)
 
-# Optional max token age in minutes for entries (0 = disabled here)
 ENTRY_MAX_AGE_MIN = max(0.0, _env_float("ENTRY_MAX_AGE_MIN", 0.0))
-
-# Optional min liquidity (USD) to consider entries at all
 ENTRY_MIN_LIQ_USD = max(0.0, _env_float("ENTRY_MIN_LIQ_USD", 10_000.0))
-
-# Hard fraud/rug-score cutoff (0..1)
 ENTRY_MAX_RUG_SCORE = max(0.0, min(1.0, _env_float("ENTRY_MAX_RUG_SCORE", 0.80)))
 
-# Use PairFilter scores as priors?
 ENTRY_USE_PF_SCORES = _env_bool("ENTRY_USE_PF_SCORES", True)
-
-# PF minimums, only applied if ENTRY_USE_PF_SCORES and scores present
 ENTRY_MIN_PF_FINAL = max(0.0, min(1.0, _env_float("ENTRY_MIN_PF_FINAL", 0.10)))
 ENTRY_MIN_PF_RISK_ADJ = max(0.0, min(1.0, _env_float("ENTRY_MIN_PF_RISK_ADJ", 0.08)))
 
-# Extra “dead coin” guards on top of PF
 ENTRY_MIN_5M_BUYS = max(0, _env_int("ENTRY_MIN_5M_BUYS", 0))
 ENTRY_MIN_5M_VOL_USD = max(0.0, _env_float("ENTRY_MIN_5M_VOL_USD", 0.0))
 
-# Regime tightening knobs
 ENTRY_REGIME_TIGHTEN_ENABLED = _env_bool("ENTRY_REGIME_TIGHTEN_ENABLED", True)
-ENTRY_RISK_OFF_EXTRA_MARGIN = max(
-    0.0, min(0.3, _env_float("ENTRY_RISK_OFF_EXTRA_MARGIN", 0.10))
-)
+ENTRY_RISK_OFF_EXTRA_MARGIN = max(0.0, min(0.3, _env_float("ENTRY_RISK_OFF_EXTRA_MARGIN", 0.10)))
 ENTRY_MANIP_HIGH = max(0.0, min(1.0, _env_float("ENTRY_MANIP_HIGH", 0.75)))
 
-# Smart-wallet & entry-micro usage
 ENTRY_SMART_WALLET_BOOST = _env_bool("ENTRY_SMART_WALLET_BOOST", True)
 ENTRY_MIN_ENTRY_MICRO = max(0.0, min(1.5, _env_float("ENTRY_MIN_ENTRY_MICRO", 0.0)))
-ENTRY_MIN_STRUCTURAL_QUALITY = max(
-    0.0, min(1.5, _env_float("ENTRY_MIN_STRUCTURAL_QUALITY", 0.0))
-)
+ENTRY_MIN_STRUCTURAL_QUALITY = max(0.0, min(1.5, _env_float("ENTRY_MIN_STRUCTURAL_QUALITY", 0.0)))
 ENTRY_FORBID_DEADLIKE = _env_bool("ENTRY_FORBID_DEADLIKE", False)
 
-# Pump-chasing penalty scaling
-ENTRY_PUMP_CHASE_MAX_PENALTY = max(
-    0.0, min(0.7, _env_float("ENTRY_PUMP_CHASE_MAX_PENALTY", 0.35))
-)
+ENTRY_PUMP_CHASE_MAX_PENALTY = max(0.0, min(0.7, _env_float("ENTRY_PUMP_CHASE_MAX_PENALTY", 0.35)))
 
-# Session / RiskManager integration
 ENTRY_CTX_MAX_DRAWDOWN_PCT = abs(_env_float("ENTRY_CTX_MAX_DRAWDOWN_PCT", 12.0))
-ENTRY_CTX_MAX_OPEN_POS_RATIO = max(
-    0.1, min(2.0, _env_float("ENTRY_CTX_MAX_OPEN_POS_RATIO", 1.0))
-)
-ENTRY_CTX_LOCK_AFTER_TARGET_PNL = _env_float(
-    "ENTRY_CTX_LOCK_AFTER_TARGET_PNL", 0.0
-)  # e.g. 5.0 = +5% day lock
+ENTRY_CTX_MAX_OPEN_POS_RATIO = max(0.1, min(2.0, _env_float("ENTRY_CTX_MAX_OPEN_POS_RATIO", 1.0)))
+ENTRY_CTX_LOCK_AFTER_TARGET_PNL = _env_float("ENTRY_CTX_LOCK_AFTER_TARGET_PNL", 0.0)
 
-# Require some risk capacity (from FeatureBuilder or RiskManager) to enter?
 ENTRY_REQUIRE_RISK_CAPACITY = _env_bool("ENTRY_REQUIRE_RISK_CAPACITY", False)
-ENTRY_MIN_RISK_CAPACITY = max(
-    0.0, min(1.0, _env_float("ENTRY_MIN_RISK_CAPACITY", 0.20))
-)
+ENTRY_MIN_RISK_CAPACITY = max(0.0, min(1.0, _env_float("ENTRY_MIN_RISK_CAPACITY", 0.20)))
 
-# Use FeatureBuilder entry_quality_score + position_size_scalar?
 ENTRY_USE_ENTRY_QUALITY = _env_bool("ENTRY_USE_ENTRY_QUALITY", True)
-ENTRY_MIN_ENTRY_QUALITY = max(
-    0.0, min(1.5, _env_float("ENTRY_MIN_ENTRY_QUALITY", 0.0))
-)
+ENTRY_MIN_ENTRY_QUALITY = max(0.0, min(1.5, _env_float("ENTRY_MIN_ENTRY_QUALITY", 0.0)))
+
 ENTRY_REQUIRE_POS_SIZE = _env_bool("ENTRY_REQUIRE_POS_SIZE", False)
 ENTRY_MIN_POS_SIZE = max(0.0, min(1.0, _env_float("ENTRY_MIN_POS_SIZE", 0.0)))
 
-# Optional edge / Kelly gating from FeatureBuilder / strategy brain
 ENTRY_USE_EDGE_SCORE = _env_bool("ENTRY_USE_EDGE_SCORE", True)
 ENTRY_MIN_EDGE_SCORE = max(0.0, min(1.0, _env_float("ENTRY_MIN_EDGE_SCORE", 0.0)))
 
@@ -276,64 +192,45 @@ ENTRY_USE_KELLY = _env_bool("ENTRY_USE_KELLY", False)
 ENTRY_MIN_KELLY = max(0.0, min(1.0, _env_float("ENTRY_MIN_KELLY", 0.0)))
 ENTRY_MAX_KELLY = max(0.0, min(1.0, _env_float("ENTRY_MAX_KELLY", 0.25)))
 
-# Optional prior from ai_buy_scoring
 ENTRY_USE_BUY_SCORE = _env_bool("ENTRY_USE_BUY_SCORE", True)
 ENTRY_MIN_BUY_SCORE = max(0.0, min(1.0, _env_float("ENTRY_MIN_BUY_SCORE", 0.0)))
 ENTRY_BUY_SCORE_WEIGHT = max(0.0, min(1.0, _env_float("ENTRY_BUY_SCORE_WEIGHT", 0.20)))
 ENTRY_BUY_HARD_FAIL = _env_bool("ENTRY_BUY_HARD_FAIL", False)
 
-# Optional prior from strategy brain entry-hint (self_learning_ai_strategy)
 ENTRY_USE_HINT_SCORE = _env_bool("ENTRY_USE_HINT_SCORE", True)
 ENTRY_MIN_HINT_SCORE = max(0.0, min(1.0, _env_float("ENTRY_MIN_HINT_SCORE", 0.0)))
 ENTRY_HINT_SCORE_WEIGHT = max(0.0, min(1.0, _env_float("ENTRY_HINT_SCORE_WEIGHT", 0.10)))
 ENTRY_HINT_HARD_FAIL = _env_bool("ENTRY_HINT_HARD_FAIL", False)
 
-# Plan-aware threshold tilting / blocking
 ENTRY_USE_PLAN_GAP_TILT = _env_bool("ENTRY_USE_PLAN_GAP_TILT", True)
 ENTRY_PLAN_GAP_TILT = max(0.0, min(0.2, _env_float("ENTRY_PLAN_GAP_TILT", 0.03)))
 ENTRY_PLAN_GAP_MAX_ABS = max(1.0, _env_float("ENTRY_PLAN_GAP_MAX_ABS", 25.0))
 
 ENTRY_PLAN_STATUS_BLOCK_ENABLED = _env_bool("ENTRY_PLAN_STATUS_BLOCK_ENABLED", True)
-ENTRY_PLAN_STATUS_BLOCK_KEYWORDS = (
-    os.getenv("ENTRY_PLAN_STATUS_BLOCK_KEYWORDS", "halt,no_trade")
-    .strip()
-    .lower()
-)
+ENTRY_PLAN_STATUS_BLOCK_KEYWORDS = os.getenv("ENTRY_PLAN_STATUS_BLOCK_KEYWORDS", "halt,no_trade").strip().lower()
 
-# Per-source threshold & score nudges (e.g. pumpfun tighter, momo looser)
-# Example:
-#   ENTRY_SOURCE_SCORE_OVERRIDES_JSON='{"pumpfun":0.62,"raydium":0.55,"momo":0.50}'
-#   ENTRY_SOURCE_SCORE_BONUS_JSON='{"momo":0.02}'
 ENTRY_SOURCE_SCORE_OVERRIDES = _env_json("ENTRY_SOURCE_SCORE_OVERRIDES_JSON") or {}
 ENTRY_SOURCE_SCORE_BONUS = _env_json("ENTRY_SOURCE_SCORE_BONUS_JSON") or {}
 
-# Per-playbook overrides & score nudges (strategy-level from self_learning_ai_strategy)
-# Example:
-#   ENTRY_PLAYBOOK_SCORE_OVERRIDES_JSON='{"scalp":0.60,"swing":0.52}'
-#   ENTRY_PLAYBOOK_SCORE_BONUS_JSON='{"high_conviction":0.02}'
 ENTRY_PLAYBOOK_SCORE_OVERRIDES = _env_json("ENTRY_PLAYBOOK_SCORE_OVERRIDES_JSON") or {}
 ENTRY_PLAYBOOK_SCORE_BONUS = _env_json("ENTRY_PLAYBOOK_SCORE_BONUS_JSON") or {}
 
-# AI call control
 ENTRY_AI_TIMEOUT_SEC = max(1.0, _env_float("ENTRY_AI_TIMEOUT_SEC", 8.0))
 ENTRY_MAX_FEATURE_BYTES = _env_int("ENTRY_MAX_FEATURE_BYTES", 50_000)
 
-# Extra debugging / meta
 ENTRY_DEBUG_LOG = _env_bool("ENTRY_DEBUG_LOG", False)
 ENTRY_DEBUG_LOG_FAIL = _env_bool("ENTRY_DEBUG_LOG_FAIL", True)
 ENTRY_ATTACH_META = _env_bool("ENTRY_ATTACH_META", True)
 
-# Risk profile (higher-level style): conservative / balanced / aggressive
-RISK_PROFILE = (
-    os.getenv("ENTRY_RISK_PROFILE", "")
-    or os.getenv("RISK_PROFILE", "")
-).strip().lower() or "balanced"
-
-# Optional regime risk-mode lock from env
+RISK_PROFILE = (os.getenv("ENTRY_RISK_PROFILE", "") or os.getenv("RISK_PROFILE", "")).strip().lower() or "balanced"
 ENTRY_REGIME_RISK_MODE_LOCK = _env_int("ENTRY_REGIME_RISK_MODE_LOCK", -1)
 
-# Dynamic min-score runtime value (updated by ai_maintenance_loop)
 _ENTRY_DYNAMIC_MIN_SCORE: Optional[float] = None
+_DYNAMIC_LOCK = asyncio.Lock()
+
+# Lightweight AI call throttle (per mint) to prevent spam/cost blowups
+_AI_COOLDOWN_SEC = max(0.0, _env_float("ENTRY_AI_COOLDOWN_SEC", 0.0))
+_AI_LAST_CALL: Dict[str, float] = {}
 
 
 # ============================================================================ #
@@ -341,16 +238,11 @@ _ENTRY_DYNAMIC_MIN_SCORE: Optional[float] = None
 # ============================================================================ #
 
 _CLIENT: Any = None
-_CLIENT_KIND: str = "none"  # "sdk" or "legacy"
+_CLIENT_KIND: str = "none"  # "sdk" | "legacy" | "none"
 
 
 def _ensure_client() -> Optional[Any]:
-    """
-    Try to import either the new `OpenAI` client (SDK v1+) or legacy `openai`
-    module (<=0.28). Returns a client object or None if unavailable.
-    """
     global _CLIENT, _CLIENT_KIND
-
     if _CLIENT is not None:
         return _CLIENT
 
@@ -360,12 +252,12 @@ def _ensure_client() -> Optional[Any]:
 
         _CLIENT = OpenAI()
         _CLIENT_KIND = "sdk"
-        log.info("ai_entry_logic: using OpenAI chat.completions client (SDK)")
+        log.info("ai_entry_logic: using OpenAI SDK client")
         return _CLIENT
     except Exception:
         pass
 
-    # Legacy client (openai<=0.28.x)
+    # Legacy (openai<=0.28)
     try:
         import openai  # type: ignore
 
@@ -373,7 +265,7 @@ def _ensure_client() -> Optional[Any]:
             openai.api_key = os.getenv("OPENAI_API_KEY", "")
         _CLIENT = openai
         _CLIENT_KIND = "legacy"
-        log.info("ai_entry_logic: using legacy openai.ChatCompletion client")
+        log.info("ai_entry_logic: using legacy openai client")
         return _CLIENT
     except Exception:
         log.warning("ai_entry_logic: no OpenAI client available; AI disabled")
@@ -383,23 +275,10 @@ def _ensure_client() -> Optional[Any]:
 
 
 def _pick_entry_model(features: Dict[str, Any]) -> Optional[str]:
-    """
-    Decide which fine-tuned model to use.
-
-    Priority:
-      1) features["entry_model_name"]
-      2) routing map ENTRY_MODEL_ROUTING_JSON using:
-           - features["entry_head"]
-           - features["segment"]
-           - features["regime_label"]
-      3) global ENTRY_MODEL
-    """
-    # Explicit override from features
     explicit = str(features.get("entry_model_name") or "").strip()
     if explicit:
         return explicit
 
-    # If no routing configured, use global default
     if not ENTRY_MODEL_ROUTING:
         return ENTRY_MODEL or None
 
@@ -413,11 +292,9 @@ def _pick_entry_model(features: Dict[str, Any]) -> Optional[str]:
     if head in ENTRY_MODEL_ROUTING:
         return str(ENTRY_MODEL_ROUTING[head])
 
-    # Fallback to "default" if defined
     if "default" in ENTRY_MODEL_ROUTING:
         return str(ENTRY_MODEL_ROUTING["default"])
 
-    # Last resort: global model
     return ENTRY_MODEL or None
 
 
@@ -425,46 +302,29 @@ def _pick_entry_model(features: Dict[str, Any]) -> Optional[str]:
 # Feature helpers
 # ============================================================================ #
 
+
 def _f(features: Dict[str, Any], key: str, default: float = 0.0) -> float:
     try:
-        v = features.get(key, default)
-        return float(v)
+        return float(features.get(key, default))
     except Exception:
         return float(default)
 
 
 def _i(features: Dict[str, Any], key: str, default: int = 0) -> int:
     try:
-        v = features.get(key, default)
-        return int(v)
+        return int(features.get(key, default))
     except Exception:
         return int(default)
 
 
 def _source_key(features: Dict[str, Any]) -> str:
-    """
-    Normalize the "source" of this candidate:
-      - scanner_source (string) > source (string) > segment (string) > scanner_source_id (numeric)
-    """
-    src = (
-        features.get("scanner_source")
-        or features.get("source")
-        or features.get("segment")
-        or ""
-    )
+    src = features.get("scanner_source") or features.get("source") or features.get("segment") or ""
     if isinstance(src, (int, float)):
         return f"id_{int(src)}"
     return str(src).strip().lower()
 
 
 def _playbook_key(features: Dict[str, Any]) -> str:
-    """
-    Normalize the "playbook" for this candidate, coming from self_learning_ai_strategy:
-
-      - entry_playbook (string)
-      - playbook_id / playbook_name
-      - strategy_playbook
-    """
     pb = (
         features.get("entry_playbook")
         or features.get("playbook_id")
@@ -476,9 +336,6 @@ def _playbook_key(features: Dict[str, Any]) -> str:
 
 
 def _global_min_threshold() -> float:
-    """
-    Global min-score floor, possibly dynamically tuned by ai_maintenance_loop().
-    """
     if not ENTRY_DYNAMIC_MIN_ENABLED:
         return ENTRY_MIN_SCORE
     if _ENTRY_DYNAMIC_MIN_SCORE is None:
@@ -487,28 +344,19 @@ def _global_min_threshold() -> float:
 
 
 def _source_min_threshold(features: Dict[str, Any]) -> float:
-    """
-    Per-source min score threshold, falling back to global dynamic floor.
-    """
     base = _global_min_threshold()
     key = _source_key(features)
     if not key:
         return base
     try:
         if key in ENTRY_SOURCE_SCORE_OVERRIDES:
-            return max(
-                base,
-                min(1.0, float(ENTRY_SOURCE_SCORE_OVERRIDES[key])),
-            )
+            return max(base, min(1.0, float(ENTRY_SOURCE_SCORE_OVERRIDES[key])))
     except Exception:
         pass
     return base
 
 
 def _source_score_bonus(features: Dict[str, Any]) -> float:
-    """
-    Optional per-source additive score nudge (tiny).
-    """
     key = _source_key(features)
     if not key:
         return 0.0
@@ -520,9 +368,6 @@ def _source_score_bonus(features: Dict[str, Any]) -> float:
 
 
 def _playbook_min_threshold(base: float, features: Dict[str, Any]) -> float:
-    """
-    Per-playbook min score threshold, layered on top of the per-source/global floor.
-    """
     key = _playbook_key(features)
     if not key:
         return base
@@ -536,9 +381,6 @@ def _playbook_min_threshold(base: float, features: Dict[str, Any]) -> float:
 
 
 def _playbook_score_bonus(features: Dict[str, Any]) -> float:
-    """
-    Optional per-playbook additive score nudge.
-    """
     key = _playbook_key(features)
     if not key:
         return 0.0
@@ -550,13 +392,6 @@ def _playbook_score_bonus(features: Dict[str, Any]) -> float:
 
 
 def _effective_risk_profile(features: Dict[str, Any]) -> str:
-    """
-    Decide the effective risk profile for this decision.
-
-    Order of precedence:
-      1) features["risk_profile"]      ← from risk API / self_learning
-      2) global env RISK_PROFILE / ENTRY_RISK_PROFILE
-    """
     rp = str(features.get("risk_profile") or "").strip().lower()
     if rp in ("conservative", "balanced", "aggressive"):
         return rp
@@ -564,33 +399,15 @@ def _effective_risk_profile(features: Dict[str, Any]) -> str:
 
 
 def _risk_profile_threshold_adjust(base: float, features: Dict[str, Any]) -> float:
-    """
-    Adjust threshold up/down for conservative vs aggressive profiles.
-    """
     rp = _effective_risk_profile(features)
-    adj = 0.0
     if rp == "conservative":
-        adj = 0.03
-    elif rp == "aggressive":
-        adj = -0.03
-    return _clip01(base + adj)
+        return _clip01(base + 0.03)
+    if rp == "aggressive":
+        return _clip01(base - 0.03)
+    return _clip01(base)
 
 
 def _effective_regime_mode(features: Dict[str, Any]) -> int:
-    """
-    Regime risk mode lock:
-
-      0 = risk_off  (tightest)
-      1 = normal
-      2 = risk_on   (loosest)
-
-    Priority:
-      1) features["regime_risk_mode_lock"]
-      2) env ENTRY_REGIME_RISK_MODE_LOCK
-      3) inferred from ctx_risk_mode if present (>=2 → risk_on, <=0 → risk_off)
-      4) -1 for "not locked" (caller uses raw regime signals)
-    """
-    # explicit per-candidate override
     mode_feat = features.get("regime_risk_mode_lock")
     try:
         if mode_feat is not None:
@@ -600,11 +417,9 @@ def _effective_regime_mode(features: Dict[str, Any]) -> int:
     except Exception:
         pass
 
-    # env-driven
     if ENTRY_REGIME_RISK_MODE_LOCK in (0, 1, 2):
         return ENTRY_REGIME_RISK_MODE_LOCK
 
-    # infer from ctx_risk_mode if present
     try:
         ctx_rm = _f(features, "ctx_risk_mode", _f(features, "risk_mode_raw", 1.0))
         if ctx_rm <= 0.0:
@@ -617,31 +432,54 @@ def _effective_regime_mode(features: Dict[str, Any]) -> int:
     return -1
 
 
+def _one_line_explain(features: Dict[str, Any], prefix: str = "") -> str:
+    """
+    Produce a stable one-line explanation using entry_meta breakdown.
+    Keeps it short and loggable.
+    """
+    try:
+        meta = features.get("entry_meta") or {}
+        b = meta.get("breakdown") or {}
+        if not isinstance(b, dict) or not b:
+            return prefix.strip()
+
+        items = []
+        for k, v in b.items():
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if abs(fv) < 0.06:
+                continue
+            items.append((k, fv))
+
+        if not items:
+            return prefix.strip()
+
+        pos = sorted([it for it in items if it[1] > 0], key=lambda x: -x[1])[:2]
+        neg = sorted([it for it in items if it[1] < 0], key=lambda x: x[1])[:2]
+
+        parts = []
+        if pos:
+            parts.append("top+=" + ",".join([f"{k}:{v:+.2f}" for k, v in pos]))
+        if neg:
+            parts.append("top-=" + ",".join([f"{k}:{v:+.2f}" for k, v in neg]))
+
+        expl = " ".join(parts)
+        if prefix:
+            return f"{prefix} | {expl}"
+        return expl
+    except Exception:
+        return prefix.strip()
+
+
 # ============================================================================ #
 # Heuristic scoring (deterministic)
 # ============================================================================ #
 
+
 def _heuristic_score(features: Dict[str, Any]) -> float:
-    """
-    Deterministic baseline tuned to FeatureBuilder V3+++ FeatureVector.
-
-    Uses:
-      - PairFilter scores
-      - FeatureBuilder composites & micro-alpha
-      - ai_buy_scoring prior (optional)
-      - ai_entry_hint_score prior (optional)
-      - Multi-horizon momentum & volatility
-      - Orderflow & microstructure
-      - Liquidity & mcap
-      - Smart wallets & whales
-      - Global regime (trend/liquidity/manip)
-      - AI fraud / rug / impact
-      - Session context (open positions, DD, risk mode, capacity, plan_gap)
-    """
-
-    # ------------------------------------------------------------------ #
-    # PairFilter scores (if present) – strong prior
-    # ------------------------------------------------------------------ #
+    # PairFilter priors
     pf_mom = _f(features, "pf_momentum_score", 0.0)
     pf_final = _f(features, "pf_final_score", 0.0)
     pf_risk_adj = _f(features, "pf_risk_adjusted_final", pf_final)
@@ -650,118 +488,78 @@ def _heuristic_score(features: Dict[str, Any]) -> float:
     if ENTRY_USE_PF_SCORES:
         pf_component = 0.55 * pf_risk_adj + 0.25 * pf_final + 0.15 * pf_mom
 
-    # ------------------------------------------------------------------ #
-    # Optional ai_buy_scoring prior
-    # ------------------------------------------------------------------ #
+    # ai_buy_scoring prior
     buy_component = 0.0
     if ENTRY_USE_BUY_SCORE:
         buy_score = _f(features, "ai_buy_score", 0.0)
-        buy_ok_hard = bool(
-            features.get("ai_buy_ok_hard")
-            or features.get("ai_buy_pass_gate")
-        )
-        if buy_score > 0.0 and (not ENTRY_MIN_BUY_SCORE or buy_score >= ENTRY_MIN_BUY_SCORE):
+        buy_ok_hard = bool(features.get("ai_buy_ok_hard") or features.get("ai_buy_pass_gate"))
+        if buy_score > 0.0 and (ENTRY_MIN_BUY_SCORE <= 0.0 or buy_score >= ENTRY_MIN_BUY_SCORE):
             buy_component = ENTRY_BUY_SCORE_WEIGHT * buy_score
         elif ENTRY_BUY_HARD_FAIL and buy_score > 0.0 and not buy_ok_hard:
-            buy_component -= 1.2  # strong negative prior
+            buy_component -= 1.2
 
-    # ------------------------------------------------------------------ #
-    # Optional strategy brain entry-hint prior
-    # ------------------------------------------------------------------ #
+    # strategy hint prior
     hint_component = 0.0
     if ENTRY_USE_HINT_SCORE:
-        hint_score = _f(
-            features,
-            "ai_entry_hint_score",
-            _f(features, "entry_hint_score", 0.0),
-        )
-        if hint_score > 0.0 and (not ENTRY_MIN_HINT_SCORE or hint_score >= ENTRY_MIN_HINT_SCORE):
+        hint_score = _f(features, "ai_entry_hint_score", _f(features, "entry_hint_score", 0.0))
+        if hint_score > 0.0 and (ENTRY_MIN_HINT_SCORE <= 0.0 or hint_score >= ENTRY_MIN_HINT_SCORE):
             hint_component = ENTRY_HINT_SCORE_WEIGHT * hint_score
 
-    # ------------------------------------------------------------------ #
-    # Momentum: multi-horizon + legacy fallback
-    # ------------------------------------------------------------------ #
-    mom_5s = _f(features, "mom_5s_pct", 0.0)
-    mom_15s = _f(features, "mom_15s_pct", 0.0)
-    mom_60s = _f(features, "mom_60s_pct", 0.0)
+    # momentum
+    mom_5s = max(-40.0, min(80.0, _f(features, "mom_5s_pct", 0.0)))
+    mom_15s = max(-60.0, min(120.0, _f(features, "mom_15s_pct", 0.0)))
+    mom_60s = max(-80.0, min(180.0, _f(features, "mom_60s_pct", 0.0)))
     mom_300s = _f(features, "mom_300s_pct", 0.0)
-
     if mom_300s == 0.0:
-        mom_300s = _f(
-            features,
-            "price_change_5m_pct",
-            _f(features, "chg5", 0.0),
-        )
-
-    chg_1m = _f(features, "price_change_1m_pct", 0.0)
-    chg_5m = _f(features, "price_change_5m_pct", chg_1m)
-    chg_15m = _f(features, "price_change_15m_pct", 0.0)
-    chg_1h = _f(features, "price_change_1h_pct", 0.0)
-
-    # Clamp extremes
-    mom_5s = max(-40.0, min(80.0, mom_5s))
-    mom_15s = max(-60.0, min(120.0, mom_15s))
-    mom_60s = max(-80.0, min(180.0, mom_60s))
+        mom_300s = _f(features, "price_change_5m_pct", _f(features, "chg5", 0.0))
     mom_300s = max(-80.0, min(220.0, mom_300s))
 
-    chg_1m = max(-60.0, min(80.0, chg_1m))
-    chg_5m = max(-60.0, min(120.0, chg_5m))
-    chg_15m = max(-80.0, min(180.0, chg_15m))
-    chg_1h = max(-90.0, min(250.0, chg_1h))
+    chg_1m = max(-60.0, min(80.0, _f(features, "price_change_1m_pct", 0.0)))
+    chg_5m = max(-60.0, min(120.0, _f(features, "price_change_5m_pct", chg_1m)))
+    chg_15m = max(-80.0, min(180.0, _f(features, "price_change_15m_pct", 0.0)))
+    chg_1h = max(-90.0, min(250.0, _f(features, "price_change_1h_pct", 0.0)))
 
     mom_score = 0.0
-    # Micro / short-term
     mom_score += max(0.0, mom_5s) * 0.010
     mom_score += max(0.0, mom_15s) * 0.006
     mom_score += max(0.0, mom_60s) * 0.003
     mom_score += max(0.0, mom_300s) * 0.002
-    # TF stacking
     mom_score += max(0.0, chg_1m) * 0.006
     mom_score += max(0.0, chg_5m) * 0.004
     mom_score += max(0.0, chg_15m) * 0.003
     mom_score += max(0.0, chg_1h) * 0.001
 
-    # Mean-reversion after big pump
     if chg_15m < 0.0 and chg_5m > 25.0:
         mom_score -= 0.18
     if mom_300s > 40.0 and mom_15s < 0.0:
         mom_score -= 0.15
 
-    # Explicit pump-chasing flag from FeatureBuilder
     pump_chase = _f(features, "is_pump_chasing_risk", 0.0)
     if pump_chase > 0.0:
         mom_score -= ENTRY_PUMP_CHASE_MAX_PENALTY * pump_chase
 
-    # ------------------------------------------------------------------ #
-    # Volatility windows
-    # ------------------------------------------------------------------ #
-    vol_15s = _f(features, "vol_15s", 0.0)
-    vol_60s = _f(features, "vol_60s", 0.0)
-    vol_300s = _f(features, "vol_300s", 0.0)
-
-    vol15_pct = vol_15s * 100.0
-    vol60_pct = vol_60s * 100.0
-    vol300_pct = vol_300s * 100.0
+    # volatility
+    vol15_pct = _f(features, "vol_15s", 0.0) * 100.0
+    vol60_pct = _f(features, "vol_60s", 0.0) * 100.0
+    vol300_pct = _f(features, "vol_300s", 0.0) * 100.0
 
     vol_score = 0.0
     for v in (vol15_pct, vol60_pct, vol300_pct):
         if v <= 0.2:
-            vol_score -= 0.12  # dead
+            vol_score -= 0.12
         elif 0.3 <= v <= 3.0:
-            vol_score += 0.12  # sweet
+            vol_score += 0.12
         elif 3.0 < v <= 8.0:
-            vol_score += 0.04  # spicy but okay
+            vol_score += 0.04
         elif v > 12.0:
-            vol_score -= 0.18  # chaos
+            vol_score -= 0.18
 
-    # ------------------------------------------------------------------ #
-    # Orderflow & microstructure
-    # ------------------------------------------------------------------ #
+    # orderflow
     buys_5m = _i(features, "buys_5m", 0)
     sells_5m = _i(features, "sells_5m", 0)
     trades_5m = _f(features, "txns_5m", buys_5m + sells_5m)
     imbalance_5m = _f(features, "orderflow_skew_5m", 0.0)  # -1..1
-    buy_ratio_5m = _f(features, "buy_ratio_5m", 0.5)      # 0..1
+    buy_ratio_5m = _f(features, "buy_ratio_5m", 0.5)
     buy_ratio_1m = _f(features, "buy_ratio_1m", 0.5)
 
     buy_intensity_5m = _f(features, "buy_intensity_5m", 0.0)
@@ -777,35 +575,27 @@ def _heuristic_score(features: Dict[str, Any]) -> float:
     flow_score += max(0.0, min(imbalance_5m, 1.0)) * 0.25
     flow_score += (buy_ratio_5m - 0.5) * 0.6
     flow_score += (buy_ratio_1m - 0.5) * 0.3
-
     flow_score += min(buy_intensity_5m * 300.0, 3.0) * 0.08
     flow_score -= min(sell_intensity_5m * 300.0, 3.0) * 0.05
-
     flow_score += min(vol_5m_usd / 5_000.0, 5.0) * 0.015
     flow_score += min(vol_per_tx_5m / 500.0, 4.0) * 0.02
     flow_score += min(vol_ratio_5m_24h, 0.4) * 0.25
 
-    # ------------------------------------------------------------------ #
-    # Liquidity / Market cap / buckets
-    # ------------------------------------------------------------------ #
+    # liquidity / mcap
     liq = _f(features, "liq_usd", 0.0)
-    log_liq = _log1p(liq)
     mcap = _f(features, "mcap_usd", 0.0)
+    log_liq = _log1p(liq)
     log_mcap = _log1p(mcap)
 
     liq_score = 0.0
-    # Bucket nudges
     liq_score += _f(features, "liq_bucket_ultra_low", 0.0) * -0.4
     liq_score += _f(features, "liq_bucket_low", 0.0) * -0.06
     liq_score += _f(features, "liq_bucket_sweet", 0.0) * 0.22
     liq_score += _f(features, "liq_bucket_mid", 0.0) * 0.16
     liq_score += _f(features, "liq_bucket_high", 0.0) * 0.08
 
-    # Fallback if buckets missing
-    if (
-        _f(features, "liq_bucket_ultra_low", -1.0) < 0
-        and _f(features, "liq_bucket_low", -1.0) < 0
-    ):
+    # fallback
+    if _f(features, "liq_bucket_ultra_low", -1.0) < 0 and _f(features, "liq_bucket_low", -1.0) < 0:
         if liq < 8_000:
             liq_score -= 0.4
         elif liq < 20_000:
@@ -817,17 +607,12 @@ def _heuristic_score(features: Dict[str, Any]) -> float:
         else:
             liq_score += 0.10
 
-    # mcap early/late buckets
     liq_score += _f(features, "mcap_bucket_early", 0.0) * 0.12
     liq_score += _f(features, "mcap_bucket_very_late", 0.0) * -0.08
-
-    # Mild contribution from log scales
     liq_score += (log_liq / 20.0) * 0.05
     liq_score += (log_mcap / 20.0) * 0.03
 
-    # ------------------------------------------------------------------ #
-    # Age / lifecycle
-    # ------------------------------------------------------------------ #
+    # age
     age_min = _f(features, "age_min", _f(features, "token_age_min", 0.0))
     is_very_new = _f(features, "is_very_new", 1.0 if age_min <= 30.0 else 0.0)
     is_newish = _f(features, "is_newish", 1.0 if 30.0 < age_min <= 180.0 else 0.0)
@@ -840,14 +625,11 @@ def _heuristic_score(features: Dict[str, Any]) -> float:
     if age_min > 24 * 60:
         age_score -= 0.35
 
-    # ------------------------------------------------------------------ #
-    # Smart wallets / whales / breadth
-    # ------------------------------------------------------------------ #
-    smart_wallet_score = _f(features, "smart_wallet_score", 0.0)  # 0..1-ish
+    # wallets
+    smart_wallet_score = _f(features, "smart_wallet_score", 0.0)
     whales_5m = _f(features, "whales_5m", 0.0)
-    whale_share_5m = _f(features, "whale_share_5m", 0.0)         # 0..1
+    whale_share_5m = _f(features, "whale_share_5m", 0.0)
     holders_growth_5m = _f(features, "holders_growth_5m", 0.0)
-
     unique_buyers_5m = _f(features, "unique_buyers_5m", 0.0)
     smart_wallet_count_5m = _f(features, "smart_wallet_count_5m", 0.0)
     smart_whale_alignment = _f(features, "smart_whale_alignment", 0.0)
@@ -856,20 +638,16 @@ def _heuristic_score(features: Dict[str, Any]) -> float:
     if ENTRY_SMART_WALLET_BOOST:
         wallet_score += smart_wallet_score * 0.7
         wallet_score += min(whales_5m, 8.0) * 0.03
-        # punish extreme whale domination
         if whale_share_5m > 0.7:
             wallet_score -= (whale_share_5m - 0.7) * 0.8
         else:
             wallet_score += whale_share_5m * 0.25
-
         wallet_score += min(unique_buyers_5m / 20.0, 1.5) * 0.10
         wallet_score += min(smart_wallet_count_5m / 5.0, 1.5) * 0.12
         wallet_score += max(-0.2, min(holders_growth_5m, 0.5)) * 0.4
         wallet_score += smart_whale_alignment * 0.4
 
-    # ------------------------------------------------------------------ #
-    # Structural quality & entry micro-alpha & entry_quality composite
-    # ------------------------------------------------------------------ #
+    # structure / quality
     structural_quality = _f(features, "structural_quality_score", 0.0)
     is_dead_like = _f(features, "is_dead_like", 0.0)
     entry_micro = _f(features, "entry_micro_alpha", 0.0)
@@ -880,88 +658,54 @@ def _heuristic_score(features: Dict[str, Any]) -> float:
     entry_tier_bucket = _f(features, "entry_tier_bucket", 0.0)
     pos_size_bucket = _f(features, "position_size_bucket", 0.0)
 
-    # God-tier extras: edge & Kelly from FeatureBuilder / strategy brain
-    edge_score = _f(
-        features,
-        "entry_edge_score",
-        _f(features, "edge_score", 0.0),
-    )
-    kelly_frac = _f(
-        features,
-        "entry_kelly_frac",
-        _f(features, "kelly_fraction", 0.0),
-    )
+    edge_score = _f(features, "entry_edge_score", _f(features, "edge_score", 0.0))
+    kelly_frac = _f(features, "entry_kelly_frac", _f(features, "kelly_fraction", 0.0))
 
     structure_score = 0.0
     structure_score += structural_quality * 0.30
     structure_score -= is_dead_like * 0.60
     structure_score += entry_micro * 0.60
     structure_score += (risk_capacity - 0.5) * 0.20
-
-    # Slight boost for higher discrete tiers (already derived from quality/size)
     structure_score += max(0.0, entry_tier_bucket - 1.0) * 0.06
     structure_score += max(0.0, pos_size_bucket - 1.0) * 0.04
 
     quality_term = 0.0
     if ENTRY_USE_ENTRY_QUALITY and entry_quality > 0.0:
-        norm_q = min(entry_quality / 1.2, 1.5)  # scale into ~0..1.5
-        quality_term += (norm_q - 0.6) * 0.40   # centered around 0.6
+        norm_q = min(entry_quality / 1.2, 1.5)
+        quality_term += (norm_q - 0.6) * 0.40
 
     quality_term += (pos_size_scalar - 0.5) * 0.25
     quality_term -= min(max(entry_risk_score, 0.0), 1.0) * 0.20
 
-    # Edge score contribution (soft; gate handled in should_enter)
     if ENTRY_USE_EDGE_SCORE and edge_score != 0.0:
         e = max(-0.3, min(edge_score, 0.8))
         quality_term += e * 0.40
 
-    # Kelly fraction contribution (soft; main gate handled in should_enter)
     if ENTRY_USE_KELLY and kelly_frac != 0.0:
         k = max(-0.5, min(kelly_frac, 0.5))
         quality_term += k * 0.25
 
-    # ------------------------------------------------------------------ #
-    # Regime alignment (macro)
-    # ------------------------------------------------------------------ #
-    regime_trend = _f(
-        features,
-        "regime_trend",
-        _f(features, "regime_score", 0.0),
-    )  # -1..1
-    regime_vol = _f(features, "regime_volatility", 0.0)           # 0..1
-    regime_liq = _f(features, "regime_liquidity", 0.5)            # 0..1
-    regime_manip = _f(features, "regime_manipulation_risk", 0.0)  # 0..1
+    # regime
+    regime_trend = _f(features, "regime_trend", _f(features, "regime_score", 0.0))
+    regime_vol = _f(features, "regime_volatility", 0.0)
+    regime_liq = _f(features, "regime_liquidity", 0.5)
+    regime_manip = _f(features, "regime_manipulation_risk", 0.0)
 
-    regime_is_risk_on = _f(
-        features, "regime_is_risk_on", 1.0 if regime_trend > 0.3 else 0.0
-    )
-    regime_is_risk_off = _f(
-        features, "regime_is_risk_off", 1.0 if regime_trend < -0.3 else 0.0
-    )
+    regime_is_risk_on = _f(features, "regime_is_risk_on", 1.0 if regime_trend > 0.3 else 0.0)
+    regime_is_risk_off = _f(features, "regime_is_risk_off", 1.0 if regime_trend < -0.3 else 0.0)
 
     regime_component = 0.0
     regime_component += regime_trend * 0.25
     regime_component += (regime_liq - 0.5) * 0.25
     regime_component -= max(0.0, regime_manip - 0.5) * 0.6
-
     regime_component += regime_is_risk_on * 0.05
     regime_component -= regime_is_risk_off * 0.05
-
     if regime_vol > 0.7:
         regime_component -= 0.08
 
-    # ------------------------------------------------------------------ #
-    # Fraud / rug / impact penalties
-    # ------------------------------------------------------------------ #
-    ai_fraud_raw = _f(
-        features,
-        "ai_fraud_score",
-        _f(features, "ai_rug_score_01", _f(features, "ai_rug_score", 0.0)),
-    )
-    if ai_fraud_raw > 1.5:
-        ai_fraud = max(0.0, min(1.0, ai_fraud_raw / 100.0))
-    else:
-        ai_fraud = max(0.0, min(1.0, ai_fraud_raw))
+    # fraud / impact
+    ai_fraud_raw = _f(features, "ai_fraud_score", _f(features, "ai_rug_score_01", _f(features, "ai_rug_score", 0.0)))
+    ai_fraud = max(0.0, min(1.0, ai_fraud_raw / 100.0)) if ai_fraud_raw > 1.5 else max(0.0, min(1.0, ai_fraud_raw))
 
     impact_1k_bps = _f(features, "impact_1k_bps", 0.0)
     impact_penalty = 0.0
@@ -972,50 +716,21 @@ def _heuristic_score(features: Dict[str, Any]) -> float:
 
     rug_penalty = -ai_fraud * 0.7
 
-    # ------------------------------------------------------------------ #
-    # Scanner hints (momentum flags etc.)
-    # ------------------------------------------------------------------ #
+    # scanner hints
     scanner_momo_ok = _f(features, "scanner_momentum_ok", 0.0)
     scanner_source_id = _f(features, "scanner_source_id", 0.0)
-    scanner_hint = 0.10 * scanner_momo_ok
-    if scanner_source_id == 4.0:  # e.g. "momo"
-        scanner_hint += 0.04
+    scanner_hint = 0.10 * scanner_momo_ok + (0.04 if scanner_source_id == 4.0 else 0.0)
 
-    # ------------------------------------------------------------------ #
-    # Session / risk context from RiskManager / Strategy
-    # ------------------------------------------------------------------ #
-    ctx_open = _f(
-        features,
-        "ctx_open_positions",
-        _f(features, "risk_open_positions", 0.0),
-    )
-    ctx_max = _f(
-        features,
-        "ctx_max_positions",
-        _f(features, "risk_max_positions", 0.0),
-    )
-    ctx_dd = _f(
-        features,
-        "ctx_daily_drawdown_pct",
-        _f(features, "risk_daily_dd_pct", 0.0),
-    )  # negative = loss
-    ctx_pnl = _f(
-        features,
-        "ctx_daily_realized_pnl_pct",
-        _f(features, "risk_daily_pnl_pct", 0.0),
-    )
-    ctx_risk_mode = _f(
-        features,
-        "ctx_risk_mode",
-        _f(features, "risk_mode_raw", 1.0),
-    )
+    # session / ctx
+    ctx_open = _f(features, "ctx_open_positions", _f(features, "risk_open_positions", 0.0))
+    ctx_max = _f(features, "ctx_max_positions", _f(features, "risk_max_positions", 0.0))
+    ctx_dd = _f(features, "ctx_daily_drawdown_pct", _f(features, "risk_daily_dd_pct", 0.0))
+    ctx_pnl = _f(features, "ctx_daily_realized_pnl_pct", _f(features, "risk_daily_pnl_pct", 0.0))
+    ctx_risk_mode = _f(features, "ctx_risk_mode", _f(features, "risk_mode_raw", 1.0))
     risk_capacity = _f(features, "risk_capacity_score", 1.0)
 
-    # New: win-rate & loss-streak nudges
     win_rate_pct = _f(features, "risk_win_rate_pct", 0.0)
     loss_streak = _f(features, "risk_loss_streak", 0.0)
-
-    # Plan-aware context
     plan_gap_pct = _f(features, "ctx_plan_gap_pct", 0.0)
 
     ctx_score = 0.0
@@ -1037,25 +752,18 @@ def _heuristic_score(features: Dict[str, Any]) -> float:
     if risk_capacity < 0.2:
         ctx_score -= 0.15
 
-    # Win-rate & streak:
     if win_rate_pct > 55.0:
         ctx_score += min((win_rate_pct - 55.0) / 25.0, 1.0) * 0.06
     if loss_streak >= 3:
         ctx_score -= min((loss_streak - 2.0) / 3.0, 1.0) * 0.14
 
-    # Plan gap tilt (soft; main threshold tilt handled later)
     if ENTRY_USE_PLAN_GAP_TILT and plan_gap_pct != 0.0:
         gap = max(-ENTRY_PLAN_GAP_MAX_ABS, min(ENTRY_PLAN_GAP_MAX_ABS, plan_gap_pct))
-        # Interpret gap>0 as "behind plan" (needs gentle push) unless DD is already bad
         if gap > 0.0 and ctx_dd > -ENTRY_CTX_MAX_DRAWDOWN_PCT * 0.5:
             ctx_score += (gap / ENTRY_PLAN_GAP_MAX_ABS) * (ENTRY_PLAN_GAP_TILT * 0.6)
         elif gap < 0.0:
-            # Ahead of plan -> slightly more cautious
             ctx_score -= (abs(gap) / ENTRY_PLAN_GAP_MAX_ABS) * (ENTRY_PLAN_GAP_TILT * 0.4)
 
-    # ------------------------------------------------------------------ #
-    # Combine into raw score
-    # ------------------------------------------------------------------ #
     raw = (
         pf_component
         + buy_component
@@ -1075,7 +783,6 @@ def _heuristic_score(features: Dict[str, Any]) -> float:
         + ctx_score
     )
 
-    # Hard crush for extreme fraud risk before logistic squash
     if ai_fraud >= 0.95:
         raw -= 4.0
 
@@ -1086,34 +793,6 @@ def _heuristic_score(features: Dict[str, Any]) -> float:
 
     score = _clip01(score)
 
-    if ENTRY_DEBUG_LOG:
-        sym = features.get("symbol") or features.get("mint") or "?"
-        log.debug(
-            "ENTRY_HEURISTIC sym=%s raw=%.3f score=%.3f "
-            "pf=%.3f buy=%.3f hint=%.3f mom=%.3f vol=%.3f flow=%.3f liq=%.3f age=%.3f "
-            "wallet=%.3f struct=%.3f qual=%.3f regime=%.3f impact=%.3f "
-            "rug=%.3f ctx=%.3f",
-            sym,
-            raw,
-            score,
-            pf_component,
-            buy_component,
-            hint_component,
-            mom_score,
-            vol_score,
-            flow_score,
-            liq_score,
-            age_score,
-            wallet_score,
-            structure_score,
-            quality_term,
-            regime_component,
-            impact_penalty,
-            rug_penalty,
-            ctx_score,
-        )
-
-    # Attach per-component breakdown into meta (for analysis / backtests)
     if ENTRY_ATTACH_META:
         meta = features.get("entry_meta") or {}
         breakdown = meta.get("breakdown") or {}
@@ -1140,6 +819,10 @@ def _heuristic_score(features: Dict[str, Any]) -> float:
         meta["breakdown"] = breakdown
         features["entry_meta"] = meta
 
+    if ENTRY_DEBUG_LOG and log.every("ENTRY_HEURISTIC", 200):
+        sym = features.get("symbol") or features.get("mint") or "?"
+        log.debug("ENTRY_HEURISTIC sym=%s raw=%.3f score=%.3f", sym, raw, score)
+
     return score
 
 
@@ -1147,14 +830,8 @@ def _heuristic_score(features: Dict[str, Any]) -> float:
 # RiskManager enrichment helper (risk API coupling)
 # ============================================================================ #
 
-async def _maybe_enrich_risk_context(features: Dict[str, Any]) -> None:
-    """
-    If FeatureBuilder didn't already inject risk context, pull a snapshot
-    from utils_pkg.risk_manager and patch into the feature dict.
 
-    This lets scanners that only know token-level features still be aware of
-    current portfolio risk / capacity and strategy-level risk API fields.
-    """
+async def _maybe_enrich_risk_context(features: Dict[str, Any]) -> None:
     needs_capacity = "risk_capacity_score" not in features
     needs_ctx = any(
         key not in features
@@ -1166,9 +843,6 @@ async def _maybe_enrich_risk_context(features: Dict[str, Any]) -> None:
             "ctx_risk_mode",
         )
     )
-
-    # Even if we don't strictly "need" capacity/ctx, we still want to sync
-    # hard_halt / risk_profile / plan fields / entry_score_gate if they exist.
     need_soft_extras = any(
         key not in features
         for key in (
@@ -1190,64 +864,37 @@ async def _maybe_enrich_risk_context(features: Dict[str, Any]) -> None:
         if not isinstance(snap, dict):
             return
 
-        # risk_capacity_score
         if needs_capacity:
             features.setdefault("risk_capacity_score", float(snap.get("risk_capacity", 1.0)))
 
-        # ctx_* fields
         if needs_ctx:
-            features.setdefault(
-                "ctx_open_positions",
-                float(snap.get("open_positions", 0.0)),
-            )
-            features.setdefault(
-                "ctx_max_positions",
-                float(snap.get("max_positions", 0.0)),
-            )
+            features.setdefault("ctx_open_positions", float(snap.get("open_positions", 0.0)))
+            features.setdefault("ctx_max_positions", float(snap.get("max_positions", 0.0)))
             features.setdefault(
                 "ctx_daily_drawdown_pct",
                 float(snap.get("daily_drawdown_pct", snap.get("max_dd_pct", 0.0))),
             )
-            features.setdefault(
-                "ctx_daily_realized_pnl_pct",
-                float(snap.get("daily_realized_pnl_pct", 0.0)),
-            )
+            features.setdefault("ctx_daily_realized_pnl_pct", float(snap.get("daily_realized_pnl_pct", 0.0)))
             features.setdefault("ctx_risk_mode", float(snap.get("risk_mode", 1.0)))
 
-            # Optional: rolling win-rate & loss streak
             if "rolling_win_rate_pct" in snap:
-                features.setdefault(
-                    "risk_win_rate_pct",
-                    float(snap.get("rolling_win_rate_pct", 0.0)),
-                )
+                features.setdefault("risk_win_rate_pct", float(snap.get("rolling_win_rate_pct", 0.0)))
             if "recent_loss_streak" in snap:
-                features.setdefault(
-                    "risk_loss_streak",
-                    float(snap.get("recent_loss_streak", 0.0)),
-                )
+                features.setdefault("risk_loss_streak", float(snap.get("recent_loss_streak", 0.0)))
 
-        # --- Soft extras from risk API (strategy alignment) -----------------
-        # risk_profile string
         if "risk_profile" in snap and "risk_profile" not in features:
             features["risk_profile"] = str(snap.get("risk_profile") or "balanced")
 
-        # hard_halt from risk/strategy (we expose as ctx_hard_halt + alias)
         if "hard_halt" in snap or "HARD_HALT" in snap:
             hh = bool(snap.get("hard_halt", snap.get("HARD_HALT", False)))
             features.setdefault("ctx_hard_halt", hh)
             features.setdefault("hard_halt", hh)
 
-        # Equity plan context
         if "plan_gap_pct" in snap and "ctx_plan_gap_pct" not in features:
             features["ctx_plan_gap_pct"] = float(snap.get("plan_gap_pct", 0.0))
         if "plan_status" in snap and "ctx_plan_status" not in features:
             features["ctx_plan_status"] = str(snap.get("plan_status", "n/a"))
-        if "plan_equity_today_usd" in snap and "ctx_plan_equity_today_usd" not in features:
-            features["ctx_plan_equity_today_usd"] = float(
-                snap.get("plan_equity_today_usd", 0.0)
-            )
 
-        # Strategy-driven entry score gate (fed from self_learning_ai_strategy)
         if "entry_score_gate" in snap and "ctx_entry_score_gate" not in features:
             try:
                 features["ctx_entry_score_gate"] = float(snap.get("entry_score_gate", 0.0))
@@ -1263,32 +910,35 @@ async def _maybe_enrich_risk_context(features: Dict[str, Any]) -> None:
 # OpenAI-based scoring
 # ============================================================================ #
 
+
 async def _ai_score(features: Dict[str, Any]) -> Optional[float]:
-    """
-    Call the OpenAI model (fine-tuned or base) to get a 0..1 score.
-    On any failure, returns None so callers can fall back to heuristic.
-    """
     if not ENTRY_AI_ENABLED:
         return None
     if not os.getenv("OPENAI_API_KEY"):
-        if ENTRY_DEBUG_LOG:
-            log.debug("ai_entry_logic: no OPENAI_API_KEY – skipping AI call")
         return None
 
     model = _pick_entry_model(features)
     if not model:
         return None
 
+    # throttle (per mint)
+    if _AI_COOLDOWN_SEC > 0:
+        key = str(features.get("mint") or features.get("symbol") or "")
+        if key:
+            now = time.time()
+            last = _AI_LAST_CALL.get(key, 0.0)
+            if now - last < _AI_COOLDOWN_SEC:
+                return None
+            _AI_LAST_CALL[key] = now
+
     client = _ensure_client()
     if client is None:
         return None
 
-    # Possibly shrink features for payload size
     feat = dict(features)
     try:
-        blob = json.dumps(feat, separators=(",", ":"), ensure_ascii=False)
-        if len(blob.encode("utf-8")) > ENTRY_MAX_FEATURE_BYTES:
-            # crude pruning: keep only key composites / scores / risk context
+        blob = json.dumps(feat, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if len(blob) > ENTRY_MAX_FEATURE_BYTES:
             keep_keys = {
                 "symbol",
                 "mint",
@@ -1341,28 +991,22 @@ async def _ai_score(features: Dict[str, Any]) -> Optional[float]:
                 "playbook_name",
             }
             feat = {k: v for k, v in feat.items() if k in keep_keys}
-            blob = json.dumps(feat, separators=(",", ":"), ensure_ascii=False)
     except Exception:
-        blob = json.dumps({"features": "encode_error"})
+        feat = {"features": "encode_error"}
 
-    payload = {
-        "features": feat,
-        "task": "score_entry_probability_0_to_1",
-    }
+    payload = {"features": feat, "task": "score_entry_probability_0_to_1"}
+
     prompt = (
-        "You are a trading classifier. Given the following JSON features for a token, "
-        "return ONLY a JSON object of the form {\"score\": <number between 0 and 1>} "
-        "representing the probability that entering NOW will be profitable.\n\n"
+        "Return ONLY JSON: {\"score\": <number between 0 and 1>}.\n"
+        "Score is probability that entering NOW will be profitable.\n\n"
         f"{json.dumps(payload, separators=(',', ':'), ensure_ascii=False)}"
     )
 
     try:
-        # New SDK path
         if _CLIENT_KIND == "sdk":
 
             def _do_req_sdk() -> Any:
                 try:
-                    # Modern JSON mode (SDK v1+)
                     return client.chat.completions.create(
                         model=model,
                         messages=[
@@ -1373,7 +1017,6 @@ async def _ai_score(features: Dict[str, Any]) -> Optional[float]:
                         response_format={"type": "json_object"},
                     )
                 except TypeError:
-                    # Fallback if this SDK version doesn't support response_format
                     return client.chat.completions.create(
                         model=model,
                         messages=[
@@ -1383,13 +1026,11 @@ async def _ai_score(features: Dict[str, Any]) -> Optional[float]:
                         temperature=0.0,
                     )
 
-            resp = await asyncio.wait_for(
-                asyncio.to_thread(_do_req_sdk),
-                timeout=ENTRY_AI_TIMEOUT_SEC,
-            )
-            content_str = resp.choices[0].message.content  # type: ignore[assignment]
+            resp = await asyncio.wait_for(asyncio.to_thread(_do_req_sdk), timeout=ENTRY_AI_TIMEOUT_SEC)
+            content_str = getattr(resp.choices[0].message, "content", None)  # type: ignore[attr-defined]
+            if not content_str:
+                return None
 
-        # Legacy openai<=0.28 path
         else:
 
             def _do_req_legacy() -> Any:
@@ -1402,31 +1043,20 @@ async def _ai_score(features: Dict[str, Any]) -> Optional[float]:
                     temperature=0.0,
                 )
 
-            resp = await asyncio.wait_for(
-                asyncio.to_thread(_do_req_legacy),
-                timeout=ENTRY_AI_TIMEOUT_SEC,
-            )
+            resp = await asyncio.wait_for(asyncio.to_thread(_do_req_legacy), timeout=ENTRY_AI_TIMEOUT_SEC)
             content_str = resp["choices"][0]["message"]["content"]  # type: ignore[index]
 
-        # Parse JSON
         try:
             obj = json.loads(content_str)
-            score = float(obj.get("score", 0.0))
-            score = _clip01(score)
+            score = _clip01(float(obj.get("score", 0.0)))
         except Exception:
-            # Fallback: try to parse a raw float
             try:
-                score = float(str(content_str).strip())
-                score = _clip01(score)
+                score = _clip01(float(str(content_str).strip()))
             except Exception:
                 if ENTRY_DEBUG_LOG_FAIL:
-                    log.warning(
-                        "ai_entry_logic: could not parse AI score content=%r",
-                        str(content_str)[:200],
-                    )
+                    log.warning("ai_entry_logic: could not parse AI score content=%r", str(content_str)[:200])
                 return None
 
-        # Optional hard floor on AI score
         if ENTRY_MIN_AI_SCORE > 0 and score < ENTRY_MIN_AI_SCORE:
             return None
 
@@ -1444,11 +1074,8 @@ async def _ai_score(features: Dict[str, Any]) -> Optional[float]:
 # Public API
 # ============================================================================ #
 
+
 async def score_entry(features: Dict[str, Any]) -> float:
-    """
-    Return a score in [0,1] = probability this is a 'good' trade.
-    """
-    # Optional risk capacity + context enrichment from utils_pkg.risk_manager
     await _maybe_enrich_risk_context(features)
 
     heuristic = _heuristic_score(features)
@@ -1459,11 +1086,7 @@ async def score_entry(features: Dict[str, Any]) -> float:
     else:
         blended = ENTRY_AI_WEIGHT * ai_score + (1.0 - ENTRY_AI_WEIGHT) * heuristic
 
-    blended = _clip01(
-        blended
-        + _source_score_bonus(features)
-        + _playbook_score_bonus(features)
-    )
+    blended = _clip01(blended + _source_score_bonus(features) + _playbook_score_bonus(features))
 
     if ENTRY_ATTACH_META:
         meta = features.get("entry_meta") or {}
@@ -1473,13 +1096,7 @@ async def score_entry(features: Dict[str, Any]) -> float:
                 "ai_score": float(ai_score) if ai_score is not None else None,
                 "blended_score": float(blended),
                 "buy_score": float(_f(features, "ai_buy_score", 0.0)),
-                "hint_score": float(
-                    _f(
-                        features,
-                        "ai_entry_hint_score",
-                        _f(features, "entry_hint_score", 0.0),
-                    )
-                ),
+                "hint_score": float(_f(features, "ai_entry_hint_score", _f(features, "entry_hint_score", 0.0))),
                 "source_key": _source_key(features),
                 "playbook_key": _playbook_key(features),
                 "risk_profile": _effective_risk_profile(features),
@@ -1492,231 +1109,109 @@ async def score_entry(features: Dict[str, Any]) -> float:
 
 
 async def should_enter(features: Dict[str, Any]) -> Tuple[bool, float, str]:
-    """
-    Convenience helper for Strategy:
-
-        ok, score, reason = await should_enter(feats)
-        if ok: ... proceed to buy ...
-    """
     score = await score_entry(features)
 
     liq = _f(features, "liq_usd", 0.0)
     age_min = _f(features, "age_min", _f(features, "token_age_min", 0.0))
 
-    # Regime
-    regime_trend = _f(
-        features,
-        "regime_trend",
-        _f(features, "regime_score", 0.0),
-    )
+    regime_trend = _f(features, "regime_trend", _f(features, "regime_score", 0.0))
     regime_manip = _f(features, "regime_manipulation_risk", 0.0)
 
-    # Structural
     structural_quality = _f(features, "structural_quality_score", 0.0)
     is_dead_like = _f(features, "is_dead_like", 0.0)
     entry_micro = _f(features, "entry_micro_alpha", 0.0)
 
-    # FeatureBuilder composites
     entry_quality = _f(features, "entry_quality_score", 0.0)
     pos_size_scalar = _f(features, "position_size_scalar", 1.0)
     entry_block_flag = _f(features, "entry_block_flag", 0.0)
     entry_tier_bucket = _f(features, "entry_tier_bucket", 0.0)
     pos_size_bucket = _f(features, "position_size_bucket", 0.0)
 
-    # Edge / Kelly
-    edge_score = _f(
-        features,
-        "entry_edge_score",
-        _f(features, "edge_score", 0.0),
-    )
-    kelly_frac = _f(
-        features,
-        "entry_kelly_frac",
-        _f(features, "kelly_fraction", 0.0),
-    )
+    edge_score = _f(features, "entry_edge_score", _f(features, "edge_score", 0.0))
+    kelly_frac = _f(features, "entry_kelly_frac", _f(features, "kelly_fraction", 0.0))
     has_edge = ("entry_edge_score" in features) or ("edge_score" in features)
     has_kelly = ("entry_kelly_frac" in features) or ("kelly_fraction" in features)
 
-    # Fraud / rug
-    ai_fraud_raw = _f(
-        features,
-        "ai_fraud_score",
-        _f(features, "ai_rug_score_01", _f(features, "ai_rug_score", 0.0)),
-    )
-    if ai_fraud_raw > 1.5:
-        ai_fraud = max(0.0, min(1.0, ai_fraud_raw / 100.0))
-    else:
-        ai_fraud = max(0.0, min(1.0, ai_fraud_raw))
+    ai_fraud_raw = _f(features, "ai_fraud_score", _f(features, "ai_rug_score_01", _f(features, "ai_rug_score", 0.0)))
+    ai_fraud = max(0.0, min(1.0, ai_fraud_raw / 100.0)) if ai_fraud_raw > 1.5 else max(0.0, min(1.0, ai_fraud_raw))
 
     pf_final = _f(features, "pf_final_score", 0.0)
-    pf_risk_adj = _f(
-        features,
-        "pf_risk_adjusted_final",
-        pf_final * (1.0 - ai_fraud) if pf_final > 0.0 else 0.0,
-    )
+    pf_risk_adj = _f(features, "pf_risk_adjusted_final", pf_final * (1.0 - ai_fraud) if pf_final > 0.0 else 0.0)
 
     buys_5m = _i(features, "buys_5m", 0)
     vol_5m_usd = _f(features, "vol_5m_usd", 0.0)
 
-    # Session context (support both ctx_* and risk_* naming)
-    ctx_open = _f(
-        features,
-        "ctx_open_positions",
-        _f(features, "risk_open_positions", 0.0),
-    )
-    ctx_max = _f(
-        features,
-        "ctx_max_positions",
-        _f(features, "risk_max_positions", 0.0),
-    )
-    ctx_dd = _f(
-        features,
-        "ctx_daily_drawdown_pct",
-        _f(features, "risk_daily_dd_pct", 0.0),
-    )
-    ctx_pnl = _f(
-        features,
-        "ctx_daily_realized_pnl_pct",
-        _f(features, "risk_daily_pnl_pct", 0.0),
-    )
-    ctx_risk_mode = _f(
-        features,
-        "ctx_risk_mode",
-        _f(features, "risk_mode_raw", 1.0),
-    )
+    ctx_open = _f(features, "ctx_open_positions", _f(features, "risk_open_positions", 0.0))
+    ctx_max = _f(features, "ctx_max_positions", _f(features, "risk_max_positions", 0.0))
+    ctx_dd = _f(features, "ctx_daily_drawdown_pct", _f(features, "risk_daily_dd_pct", 0.0))
+    ctx_pnl = _f(features, "ctx_daily_realized_pnl_pct", _f(features, "risk_daily_pnl_pct", 0.0))
+    ctx_risk_mode = _f(features, "ctx_risk_mode", _f(features, "risk_mode_raw", 1.0))
     risk_capacity = _f(features, "risk_capacity_score", 1.0)
 
-    # Win-rate / streak for hard-ish gating in conservative modes
     win_rate_pct = _f(features, "risk_win_rate_pct", 0.0)
     loss_streak = _f(features, "risk_loss_streak", 0.0)
 
-    # Risk-API extras
-    hard_halt = bool(
-        features.get("ctx_hard_halt")
-        or features.get("hard_halt")
-        or features.get("strategy_hard_halt")
-    )
+    hard_halt = bool(features.get("ctx_hard_halt") or features.get("hard_halt") or features.get("strategy_hard_halt"))
     plan_gap_pct = _f(features, "ctx_plan_gap_pct", 0.0)
     plan_status = str(features.get("ctx_plan_status", "n/a"))
 
-    # Regime risk-mode lock
     regime_mode_lock = _effective_regime_mode(features)
 
-    # Strategy brain hint score
-    hint_score = _f(
-        features,
-        "ai_entry_hint_score",
-        _f(features, "entry_hint_score", 0.0),
-    )
+    hint_score = _f(features, "ai_entry_hint_score", _f(features, "entry_hint_score", 0.0))
     has_hint = ("ai_entry_hint_score" in features) or ("entry_hint_score" in features)
-    hint_ok = bool(
-        features.get("ai_entry_hint_ok")
-        or features.get("entry_hint_ok")
-    )
+    hint_ok = bool(features.get("ai_entry_hint_ok") or features.get("entry_hint_ok"))
 
-    # Buy score hard guard (optional)
+    # ------------------------------------------------------------------ #
+    # Optional hard guards from priors
+    # ------------------------------------------------------------------ #
     if ENTRY_USE_BUY_SCORE and ENTRY_BUY_HARD_FAIL:
         buy_score = _f(features, "ai_buy_score", 0.0)
-        buy_ok_hard = bool(
-            features.get("ai_buy_ok_hard")
-            or features.get("ai_buy_pass_gate")
-        )
+        buy_ok_hard = bool(features.get("ai_buy_ok_hard") or features.get("ai_buy_pass_gate"))
         if buy_score > 0.0 and not buy_ok_hard:
             reason = "ai_buy_scoring_hard_fail"
             if ENTRY_ATTACH_META:
-                features.setdefault("entry_meta", {}).update(
-                    {"reason": reason, "pass": False, "effective_threshold": None}
-                )
-            return False, score, reason
+                features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
+            return False, score, _one_line_explain(features, reason)
 
-    # Entry-hint hard guard (optional)
     if ENTRY_USE_HINT_SCORE and ENTRY_HINT_HARD_FAIL and has_hint:
         if ENTRY_MIN_HINT_SCORE > 0 and hint_score < ENTRY_MIN_HINT_SCORE:
-            reason = (
-                f"entry_hint_below_min({hint_score:.3f} < {ENTRY_MIN_HINT_SCORE:.3f})"
-            )
+            reason = f"entry_hint_below_min({hint_score:.3f}<{ENTRY_MIN_HINT_SCORE:.3f})"
             if ENTRY_ATTACH_META:
-                features.setdefault("entry_meta", {}).update(
-                    {
-                        "reason": reason,
-                        "pass": False,
-                        "hint_score": float(hint_score),
-                    }
-                )
-            return False, score, reason
+                features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False, "hint_score": float(hint_score)})
+            return False, score, _one_line_explain(features, reason)
         if not hint_ok and hint_score > 0.0:
             reason = "entry_hint_hard_fail"
             if ENTRY_ATTACH_META:
-                features.setdefault("entry_meta", {}).update(
-                    {
-                        "reason": reason,
-                        "pass": False,
-                        "hint_score": float(hint_score),
-                    }
-                )
-            return False, score, reason
+                features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False, "hint_score": float(hint_score)})
+            return False, score, _one_line_explain(features, reason)
 
-    # Edge score hard-ish gate (only if configured + present)
-    if ENTRY_USE_EDGE_SCORE and ENTRY_MIN_EDGE_SCORE > 0 and has_edge:
-        if edge_score < ENTRY_MIN_EDGE_SCORE:
-            reason = (
-                f"low_entry_edge_score({edge_score:.3f} < {ENTRY_MIN_EDGE_SCORE:.3f})"
-            )
-            if ENTRY_ATTACH_META:
-                features.setdefault("entry_meta", {}).update(
-                    {
-                        "reason": reason,
-                        "pass": False,
-                        "edge_score": float(edge_score),
-                    }
-                )
-            return False, score, reason
+    if ENTRY_USE_EDGE_SCORE and ENTRY_MIN_EDGE_SCORE > 0 and has_edge and edge_score < ENTRY_MIN_EDGE_SCORE:
+        reason = f"low_entry_edge_score({edge_score:.3f}<{ENTRY_MIN_EDGE_SCORE:.3f})"
+        if ENTRY_ATTACH_META:
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False, "edge_score": float(edge_score)})
+        return False, score, _one_line_explain(features, reason)
 
-    # Kelly-based gate (only if explicitly enabled and present)
     if ENTRY_USE_KELLY and has_kelly:
         if kelly_frac <= 0.0:
-            reason = f"non_positive_kelly(kelly={kelly_frac:.3f}<=0)"
+            reason = f"non_positive_kelly({kelly_frac:.3f}<=0)"
             if ENTRY_ATTACH_META:
-                features.setdefault("entry_meta", {}).update(
-                    {
-                        "reason": reason,
-                        "pass": False,
-                        "kelly_frac": float(kelly_frac),
-                    }
-                )
-            return False, score, reason
+                features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False, "kelly_frac": float(kelly_frac)})
+            return False, score, _one_line_explain(features, reason)
         if ENTRY_MIN_KELLY > 0 and kelly_frac < ENTRY_MIN_KELLY:
-            reason = (
-                f"kelly_below_min(kelly={kelly_frac:.3f} < {ENTRY_MIN_KELLY:.3f})"
-            )
+            reason = f"kelly_below_min({kelly_frac:.3f}<{ENTRY_MIN_KELLY:.3f})"
             if ENTRY_ATTACH_META:
-                features.setdefault("entry_meta", {}).update(
-                    {
-                        "reason": reason,
-                        "pass": False,
-                        "kelly_frac": float(kelly_frac),
-                    }
-                )
-            return False, score, reason
-        # We don't hard-fail for very large Kelly; position sizing layer can clamp.
+                features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False, "kelly_frac": float(kelly_frac)})
+            return False, score, _one_line_explain(features, reason)
 
-    # ----------------------- Hard guards -------------------------------- #
-
-    # Risk API: global hard halt from risk_manager / strategy
+    # ------------------------------------------------------------------ #
+    # Hard guards (capital protection)
+    # ------------------------------------------------------------------ #
     if hard_halt:
         reason = "risk_api_hard_halt"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {
-                    "reason": reason,
-                    "pass": False,
-                    "hard_halt": True,
-                    "ctx_lock": True,
-                }
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False, "hard_halt": True})
         return False, score, reason
 
-    # Plan status based block (e.g. "halt", "no_trade") – opt-out via env
     if ENTRY_PLAN_STATUS_BLOCK_ENABLED and plan_status:
         ps_lc = plan_status.lower()
         for kw in ENTRY_PLAN_STATUS_BLOCK_KEYWORDS.split(","):
@@ -1724,237 +1219,131 @@ async def should_enter(features: Dict[str, Any]) -> Tuple[bool, float, str]:
             if kw and kw in ps_lc:
                 reason = f"plan_status_block({ps_lc})"
                 if ENTRY_ATTACH_META:
-                    features.setdefault("entry_meta", {}).update(
-                        {
-                            "reason": reason,
-                            "pass": False,
-                            "plan_status": plan_status,
-                            "ctx_lock": True,
-                        }
-                    )
+                    features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False, "plan_status": plan_status})
                 return False, score, reason
 
-    # Risk API: zero capacity
     if risk_capacity <= 0.0:
         reason = "risk_capacity_zero"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {
-                    "reason": reason,
-                    "pass": False,
-                    "capacity_zero": True,
-                    "risk_capacity": float(risk_capacity),
-                    "ctx_lock": True,
-                }
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False, "risk_capacity": float(risk_capacity)})
         return False, score, reason
 
-    # FeatureBuilder hard veto
     if entry_block_flag >= 0.5:
         reason = "entry_block_flag"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
         return False, score, reason
 
-    # Liquidity
     if liq < ENTRY_MIN_LIQ_USD:
-        reason = f"low_liq({liq:.0f} < {ENTRY_MIN_LIQ_USD:.0f})"
+        reason = f"low_liq({liq:.0f}<{ENTRY_MIN_LIQ_USD:.0f})"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
         return False, score, reason
 
-    # Session drawdown
     if ENTRY_CTX_MAX_DRAWDOWN_PCT > 0 and ctx_dd <= -ENTRY_CTX_MAX_DRAWDOWN_PCT:
-        reason = (
-            f"session_drawdown_limit(ctx_dd={ctx_dd:.2f}% <= "
-            f"-{ENTRY_CTX_MAX_DRAWDOWN_PCT:.1f}%)"
-        )
+        reason = f"session_drawdown_limit({ctx_dd:.2f}<=-{ENTRY_CTX_MAX_DRAWDOWN_PCT:.1f})"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False, "dd_lock": True}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False, "dd_lock": True})
         return False, score, reason
 
-    # Lock out once daily target hit unless in explicitly aggressive mode
-    if (
-        ENTRY_CTX_LOCK_AFTER_TARGET_PNL > 0
-        and ctx_pnl >= ENTRY_CTX_LOCK_AFTER_TARGET_PNL
-        and ctx_risk_mode <= 1.0
-    ):
-        reason = (
-            f"session_target_hit(ctx_pnl={ctx_pnl:.2f}% >= "
-            f"{ENTRY_CTX_LOCK_AFTER_TARGET_PNL:.2f}%)"
-        )
+    if ENTRY_CTX_LOCK_AFTER_TARGET_PNL > 0 and ctx_pnl >= ENTRY_CTX_LOCK_AFTER_TARGET_PNL and ctx_risk_mode <= 1.0:
+        reason = f"session_target_hit({ctx_pnl:.2f}>={ENTRY_CTX_LOCK_AFTER_TARGET_PNL:.2f})"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False, "target_lock": True}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False, "target_lock": True})
         return False, score, reason
 
-    # Exposure relative to max positions
     if ctx_max > 0 and ENTRY_CTX_MAX_OPEN_POS_RATIO > 0:
         ratio = ctx_open / ctx_max
-        limit = ENTRY_CTX_MAX_OPEN_POS_RATIO
-        if ratio >= limit:
-            reason = (
-                f"too_many_positions(open={ctx_open:.0f}/{ctx_max:.0f}, "
-                f"ratio={ratio:.2f}>=limit={limit:.2f})"
-            )
+        if ratio >= ENTRY_CTX_MAX_OPEN_POS_RATIO:
+            reason = f"too_many_positions({ctx_open:.0f}/{ctx_max:.0f},ratio={ratio:.2f})"
             if ENTRY_ATTACH_META:
-                features.setdefault("entry_meta", {}).update(
-                    {"reason": reason, "pass": False, "pos_full": True}
-                )
+                features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False, "pos_full": True})
             return False, score, reason
 
-    # Fraud / rug
     if ai_fraud >= ENTRY_MAX_RUG_SCORE:
-        reason = f"high_fraud_score({ai_fraud:.2f} >= {ENTRY_MAX_RUG_SCORE:.2f})"
+        reason = f"high_fraud_score({ai_fraud:.2f}>={ENTRY_MAX_RUG_SCORE:.2f})"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False, "fraud_lock": True}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False, "fraud_lock": True})
         return False, score, reason
 
-    # Age guard (optional, allow some buffer)
     if ENTRY_MAX_AGE_MIN > 0 and age_min > ENTRY_MAX_AGE_MIN * 2:
-        reason = f"too_old(age_min={age_min:.1f} > {ENTRY_MAX_AGE_MIN*2:.1f})"
+        reason = f"too_old({age_min:.1f}>{ENTRY_MAX_AGE_MIN*2:.1f})"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
         return False, score, reason
 
-    # Dead-like coins
     if ENTRY_FORBID_DEADLIKE and is_dead_like >= 0.5:
         reason = "dead_like_heuristic"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
         return False, score, reason
 
-    # Structural quality gate
     if ENTRY_MIN_STRUCTURAL_QUALITY > 0 and structural_quality < ENTRY_MIN_STRUCTURAL_QUALITY:
-        reason = (
-            f"low_structural_quality({structural_quality:.2f} "
-            f"< {ENTRY_MIN_STRUCTURAL_QUALITY:.2f})"
-        )
+        reason = f"low_structural_quality({structural_quality:.2f}<{ENTRY_MIN_STRUCTURAL_QUALITY:.2f})"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
         return False, score, reason
 
-    # Entry micro-alpha gate
     if ENTRY_MIN_ENTRY_MICRO > 0 and entry_micro < ENTRY_MIN_ENTRY_MICRO:
-        reason = (
-            f"low_entry_micro_alpha({entry_micro:.2f} < {ENTRY_MIN_ENTRY_MICRO:.2f})"
-        )
+        reason = f"low_entry_micro_alpha({entry_micro:.2f}<{ENTRY_MIN_ENTRY_MICRO:.2f})"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
         return False, score, reason
 
-    # Entry quality gate
     if ENTRY_USE_ENTRY_QUALITY and ENTRY_MIN_ENTRY_QUALITY > 0 and entry_quality < ENTRY_MIN_ENTRY_QUALITY:
-        reason = (
-            f"low_entry_quality({entry_quality:.2f} < {ENTRY_MIN_ENTRY_QUALITY:.2f})"
-        )
+        reason = f"low_entry_quality({entry_quality:.2f}<{ENTRY_MIN_ENTRY_QUALITY:.2f})"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
         return False, score, reason
 
-    # Position size scalar gate (optional)
     if ENTRY_REQUIRE_POS_SIZE and pos_size_scalar < ENTRY_MIN_POS_SIZE:
-        reason = (
-            f"small_position_size_scalar({pos_size_scalar:.2f} < "
-            f"{ENTRY_MIN_POS_SIZE:.2f})"
-        )
+        reason = f"small_position_size_scalar({pos_size_scalar:.2f}<{ENTRY_MIN_POS_SIZE:.2f})"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
         return False, score, reason
 
-    # Soft extra guards vs dead coins
     if ENTRY_MIN_5M_BUYS > 0 and buys_5m < ENTRY_MIN_5M_BUYS:
-        reason = f"low_recent_flow(buys_5m={buys_5m} < {ENTRY_MIN_5M_BUYS})"
+        reason = f"low_recent_flow(buys_5m={buys_5m}<{ENTRY_MIN_5M_BUYS})"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
         return False, score, reason
 
     if ENTRY_MIN_5M_VOL_USD > 0 and vol_5m_usd < ENTRY_MIN_5M_VOL_USD:
-        reason = (
-            f"low_recent_volume(vol_5m={vol_5m_usd:.0f} < {ENTRY_MIN_5M_VOL_USD:.0f})"
-        )
+        reason = f"low_recent_volume(vol_5m={vol_5m_usd:.0f}<{ENTRY_MIN_5M_VOL_USD:.0f})"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
         return False, score, reason
 
-    # PF floors (if enabled + present)
     if ENTRY_USE_PF_SCORES:
         if pf_final > 0.0 and pf_final < ENTRY_MIN_PF_FINAL:
-            reason = (
-                f"pf_final_below_min({pf_final:.3f} < {ENTRY_MIN_PF_FINAL:.3f})"
-            )
+            reason = f"pf_final_below_min({pf_final:.3f}<{ENTRY_MIN_PF_FINAL:.3f})"
             if ENTRY_ATTACH_META:
-                features.setdefault("entry_meta", {}).update(
-                    {"reason": reason, "pass": False}
-                )
+                features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
             return False, score, reason
         if pf_risk_adj > 0.0 and pf_risk_adj < ENTRY_MIN_PF_RISK_ADJ:
-            reason = (
-                f"pf_risk_adj_below_min({pf_risk_adj:.3f} < {ENTRY_MIN_PF_RISK_ADJ:.3f})"
-            )
+            reason = f"pf_risk_adj_below_min({pf_risk_adj:.3f}<{ENTRY_MIN_PF_RISK_ADJ:.3f})"
             if ENTRY_ATTACH_META:
-                features.setdefault("entry_meta", {}).update(
-                    {"reason": reason, "pass": False}
-                )
+                features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
             return False, score, reason
 
-    # Risk capacity requirement (soft vs ENTRY_MIN_RISK_CAPACITY)
     if ENTRY_REQUIRE_RISK_CAPACITY and risk_capacity < ENTRY_MIN_RISK_CAPACITY:
-        reason = (
-            f"low_risk_capacity({risk_capacity:.2f} < {ENTRY_MIN_RISK_CAPACITY:.2f})"
-        )
+        reason = f"low_risk_capacity({risk_capacity:.2f}<{ENTRY_MIN_RISK_CAPACITY:.2f})"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False})
         return False, score, reason
 
-    # Extra discipline for bad streaks in conservative / normal modes
     if loss_streak >= 4 and _effective_risk_profile(features) != "aggressive":
-        reason = f"loss_streak_guard(streak={loss_streak:.0f} >= 4)"
+        reason = f"loss_streak_guard({loss_streak:.0f}>=4)"
         if ENTRY_ATTACH_META:
-            features.setdefault("entry_meta", {}).update(
-                {"reason": reason, "pass": False, "streak_lock": True}
-            )
+            features.setdefault("entry_meta", {}).update({"reason": reason, "pass": False, "streak_lock": True})
         return False, score, reason
-
-    # Slight extra caution if win-rate is horrible AND we're conservative
-    if win_rate_pct > 0.0 and win_rate_pct < 40.0 and _effective_risk_profile(features) == "conservative":
-        # not a hard fail — threshold tightening already handled by dynamics
-        pass
 
     # ------------------------------------------------------------------ #
-    # Regime tightening + risk-profile thresholding + plan-aware tilt
+    # Thresholding: regime + profile + plan tilt
     # ------------------------------------------------------------------ #
     base_threshold = _source_min_threshold(features)
     base_threshold = _playbook_min_threshold(base_threshold, features)
 
-    # Strategy / risk API entry gate floor from risk_manager/self_learning
     ctx_entry_gate = _f(features, "ctx_entry_score_gate", 0.0)
     if ctx_entry_gate > 0.0:
         base_threshold = max(base_threshold, _clip01(ctx_entry_gate))
@@ -1963,12 +1352,9 @@ async def should_enter(features: Dict[str, Any]) -> Tuple[bool, float, str]:
     risk_off_flag = False
     manip_flag = False
 
-    # Apply regime lock interpretation
     if regime_mode_lock == 0:
-        # hard risk-off
         regime_trend = min(regime_trend, -0.8)
     elif regime_mode_lock == 2:
-        # risk-on
         regime_trend = max(regime_trend, 0.8)
 
     if ENTRY_REGIME_TIGHTEN_ENABLED:
@@ -1979,42 +1365,32 @@ async def should_enter(features: Dict[str, Any]) -> Tuple[bool, float, str]:
             tightened = max(tightened + 0.08, tightened)
             manip_flag = True
 
-    # Risk-profile tweak
     prof_threshold = _risk_profile_threshold_adjust(tightened, features)
 
-    # Threshold nudges from tiers (never below base)
     if entry_tier_bucket >= 3.0 and pos_size_bucket >= 3.0:
         prof_threshold = max(base_threshold, prof_threshold - 0.01)
     elif entry_tier_bucket <= 1.0 and pos_size_bucket <= 1.0:
         prof_threshold = min(1.0, prof_threshold + 0.01)
 
-    # Plan gap tilt on threshold (behind vs ahead of plan)
     plan_delta = 0.0
     if ENTRY_USE_PLAN_GAP_TILT and plan_gap_pct != 0.0:
         gap = max(-ENTRY_PLAN_GAP_MAX_ABS, min(ENTRY_PLAN_GAP_MAX_ABS, plan_gap_pct))
         before = prof_threshold
         if gap > 0.0 and ctx_dd > -ENTRY_CTX_MAX_DRAWDOWN_PCT * 0.5:
-            # Behind plan and DD not horrible: slightly loosen
             prof_threshold = max(
                 ENTRY_DYNAMIC_MIN_LO,
                 prof_threshold - (gap / ENTRY_PLAN_GAP_MAX_ABS) * ENTRY_PLAN_GAP_TILT,
             )
         elif gap < 0.0:
-            # Ahead of plan: slightly tighten
             prof_threshold = min(
                 1.0,
-                prof_threshold + (abs(gap) / ENTRY_PLAN_GAP_MAX_ABS)
-                * (ENTRY_PLAN_GAP_TILT * 0.5),
+                prof_threshold + (abs(gap) / ENTRY_PLAN_GAP_MAX_ABS) * (ENTRY_PLAN_GAP_TILT * 0.5),
             )
-        # Never below base
         prof_threshold = max(base_threshold, prof_threshold)
         plan_delta = prof_threshold - before
 
-    # Final threshold check
     if score < prof_threshold:
-        reason = (
-            f"score_below_threshold(score={score:.3f} < threshold={prof_threshold:.3f})"
-        )
+        reason = f"score_below_threshold({score:.3f}<{prof_threshold:.3f})"
         if ENTRY_ATTACH_META:
             features.setdefault("entry_meta", {}).update(
                 {
@@ -2035,9 +1411,9 @@ async def should_enter(features: Dict[str, Any]) -> Tuple[bool, float, str]:
                     "playbook_key": _playbook_key(features),
                 }
             )
-        return False, score, reason
+        return False, score, _one_line_explain(features, reason)
 
-    # If we got here, everything passes
+    # pass
     reason = "ok"
     if ENTRY_ATTACH_META:
         features.setdefault("entry_meta", {}).update(
@@ -2060,17 +1436,10 @@ async def should_enter(features: Dict[str, Any]) -> Tuple[bool, float, str]:
             }
         )
 
-    return True, score, reason
+    return True, score, _one_line_explain(features, reason)
 
 
 def score_entry_sync(features: Dict[str, Any]) -> float:
-    """
-    Synchronous wrapper over score_entry() for scripts / quick tests.
-
-    - If there is no running event loop, we create one and run the coroutine.
-    - If there is a running loop (async context), we fall back to heuristic-only
-      to avoid cross-loop issues.
-    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -2078,9 +1447,7 @@ def score_entry_sync(features: Dict[str, Any]) -> float:
 
     if loop and loop.is_running():
         if ENTRY_DEBUG_LOG:
-            log.debug(
-                "score_entry_sync called from async context; returning heuristic-only score"
-            )
+            log.debug("score_entry_sync called in async context; heuristic-only")
         return _heuristic_score(features)
 
     return asyncio.run(score_entry(features))
@@ -2090,15 +1457,8 @@ def score_entry_sync(features: Dict[str, Any]) -> float:
 # AI maintenance / calibration loop
 # ============================================================================ #
 
+
 async def ai_maintenance_loop(stop_evt: asyncio.Event) -> None:
-    """
-    Background loop to:
-      - Observe recent performance (win-rate / DD / realized PnL) via risk_manager
-        or data_logger summary.
-      - Gently auto-tune the global dynamic min-score floor inside
-        [ENTRY_DYNAMIC_MIN_LO, ENTRY_DYNAMIC_MIN_HI].
-      - Optionally tilt based on plan_gap_pct (behind vs ahead of plan).
-    """
     global _ENTRY_DYNAMIC_MIN_SCORE
 
     if not ENTRY_DYNAMIC_MIN_ENABLED:
@@ -2108,9 +1468,9 @@ async def ai_maintenance_loop(stop_evt: asyncio.Event) -> None:
     interval_sec = max(30.0, _env_float("ENTRY_AI_MAINT_INTERVAL_SEC", 180.0))
     backoff = interval_sec
 
-    # Initialize to base floor if not set
-    if _ENTRY_DYNAMIC_MIN_SCORE is None:
-        _ENTRY_DYNAMIC_MIN_SCORE = ENTRY_MIN_SCORE
+    async with _DYNAMIC_LOCK:
+        if _ENTRY_DYNAMIC_MIN_SCORE is None:
+            _ENTRY_DYNAMIC_MIN_SCORE = ENTRY_MIN_SCORE
 
     log.event(
         "AI_MAINT_START",
@@ -2122,7 +1482,6 @@ async def ai_maintenance_loop(stop_evt: asyncio.Event) -> None:
 
     while not stop_evt.is_set():
         try:
-            # --- Gather risk snapshot from risk_manager (primary) ---
             snap: Dict[str, Any] = {}
             try:
                 from utils_pkg import risk_manager as _rm  # type: ignore
@@ -2134,27 +1493,13 @@ async def ai_maintenance_loop(stop_evt: asyncio.Event) -> None:
 
             win_rate = float(snap.get("rolling_win_rate_pct", 0.0))
             daily_pnl_pct = float(snap.get("daily_realized_pnl_pct", 0.0))
-            daily_dd_pct = float(
-                snap.get("daily_drawdown_pct", snap.get("max_dd_pct", 0.0))
-            )
+            daily_dd_pct = float(snap.get("daily_drawdown_pct", snap.get("max_dd_pct", 0.0)))
             loss_streak = float(snap.get("recent_loss_streak", 0.0))
             plan_gap_pct = float(snap.get("plan_gap_pct", 0.0))
-
-            # Optional: refine with data_logger summary if exposed
-            try:
-                from utils_pkg.data_logger import summarize_trading_day  # type: ignore[attr-defined]
-
-                summary = await summarize_trading_day()
-                if isinstance(summary, dict):
-                    win_rate = float(summary.get("win_rate_pct", win_rate))
-                    daily_pnl_pct = float(summary.get("realized_pnl_pct", daily_pnl_pct))
-            except Exception:
-                pass
 
             prev_floor = _global_min_threshold()
             new_floor = prev_floor
 
-            # --- Simple adaptive policy --------------------------------
             dd_bad = daily_dd_pct <= -ENTRY_CTX_MAX_DRAWDOWN_PCT * 0.5
             win_good = win_rate >= 55.0
             win_excellent = win_rate >= 65.0
@@ -2162,50 +1507,22 @@ async def ai_maintenance_loop(stop_evt: asyncio.Event) -> None:
             pnl_bad = daily_pnl_pct <= -3.0
             streak_bad = loss_streak >= 4.0
 
-            # Tighten conditions
             if dd_bad or pnl_bad or streak_bad:
-                new_floor = min(
-                    ENTRY_DYNAMIC_MIN_HI,
-                    prev_floor + ENTRY_DYNAMIC_STEP,
-                )
-            # Loosen conditions
+                new_floor = min(ENTRY_DYNAMIC_MIN_HI, prev_floor + ENTRY_DYNAMIC_STEP)
             elif (win_excellent and daily_pnl_pct >= 6.0) or (win_good and pnl_good):
-                new_floor = max(
-                    ENTRY_DYNAMIC_MIN_LO,
-                    prev_floor - ENTRY_DYNAMIC_STEP,
-                )
+                new_floor = max(ENTRY_DYNAMIC_MIN_LO, prev_floor - ENTRY_DYNAMIC_STEP)
 
-            # Additional gentle tilt based on plan gap if floor hasn't moved:
             if ENTRY_USE_PLAN_GAP_TILT and new_floor == prev_floor and plan_gap_pct != 0.0:
                 gap = max(-ENTRY_PLAN_GAP_MAX_ABS, min(ENTRY_PLAN_GAP_MAX_ABS, plan_gap_pct))
                 if gap > 0.0 and daily_dd_pct > -ENTRY_CTX_MAX_DRAWDOWN_PCT * 0.3:
-                    # Behind plan & DD ok-ish: tiny loosen
-                    new_floor = max(
-                        ENTRY_DYNAMIC_MIN_LO,
-                        prev_floor - ENTRY_DYNAMIC_STEP * 0.5,
-                    )
+                    new_floor = max(ENTRY_DYNAMIC_MIN_LO, prev_floor - ENTRY_DYNAMIC_STEP * 0.5)
                 elif gap < 0.0 and daily_pnl_pct >= 0.0:
-                    # Ahead of plan & not losing: tiny tighten
-                    new_floor = min(
-                        ENTRY_DYNAMIC_MIN_HI,
-                        prev_floor + ENTRY_DYNAMIC_STEP * 0.5,
-                    )
+                    new_floor = min(ENTRY_DYNAMIC_MIN_HI, prev_floor + ENTRY_DYNAMIC_STEP * 0.5)
 
-            # Clamp and assign
             new_floor = max(ENTRY_DYNAMIC_MIN_LO, min(ENTRY_DYNAMIC_MIN_HI, new_floor))
-            _ENTRY_DYNAMIC_MIN_SCORE = new_floor
 
-            if ENTRY_DEBUG_LOG:
-                log.debug(
-                    "ai_maintenance: floor prev=%.3f new=%.3f win=%.1f pnl=%.2f dd=%.2f streak=%.1f gap=%.2f",
-                    prev_floor,
-                    new_floor,
-                    win_rate,
-                    daily_pnl_pct,
-                    daily_dd_pct,
-                    loss_streak,
-                    plan_gap_pct,
-                )
+            async with _DYNAMIC_LOCK:
+                _ENTRY_DYNAMIC_MIN_SCORE = new_floor
 
             log.event(
                 "AI_MAINT_STEP",
@@ -2224,10 +1541,8 @@ async def ai_maintenance_loop(stop_evt: asyncio.Event) -> None:
             raise
         except Exception as e:
             log.event("AI_MAINT_ERROR", error=str(e))
-            # small backoff on error
             backoff = min(backoff * 1.5, max(600.0, interval_sec * 4))
 
-        # Wait with cancellation-awareness
         remaining = backoff
         while remaining > 0 and not stop_evt.is_set():
             sl = min(5.0, remaining)
@@ -2241,16 +1556,8 @@ async def ai_maintenance_loop(stop_evt: asyncio.Event) -> None:
 # Diagnostics snapshot (for scripts/test_stack AI_ENTRY_LAYER)
 # ============================================================================ #
 
+
 async def diag_snapshot() -> Dict[str, Any]:
-    """
-    Lightweight async diagnostics snapshot for the AI entry layer.
-
-    Used by scripts/test_stack (AI_ENTRY_LAYER) to verify that:
-
-      • Env-driven config is wired (toggles, thresholds, dynamic floor)
-      • RiskManager & Regime modules are reachable (best-effort)
-      • Dynamic floor is inside expected bounds
-    """
     cfg = {
         "ENTRY_AI_ENABLED": ENTRY_AI_ENABLED,
         "ENTRY_AI_WEIGHT": ENTRY_AI_WEIGHT,
@@ -2312,6 +1619,7 @@ async def diag_snapshot() -> Dict[str, Any]:
         "ENTRY_SOURCE_SCORE_BONUS": ENTRY_SOURCE_SCORE_BONUS,
         "ENTRY_PLAYBOOK_SCORE_OVERRIDES": ENTRY_PLAYBOOK_SCORE_OVERRIDES,
         "ENTRY_PLAYBOOK_SCORE_BONUS": ENTRY_PLAYBOOK_SCORE_BONUS,
+        "ENTRY_AI_COOLDOWN_SEC": _AI_COOLDOWN_SEC,
     }
 
     out: Dict[str, Any] = {
@@ -2324,13 +1632,11 @@ async def diag_snapshot() -> Dict[str, Any]:
         "playbook_score_bonus": ENTRY_PLAYBOOK_SCORE_BONUS,
     }
 
-    # Best-effort risk snapshot
     try:
         from utils_pkg import risk_manager as _rm  # type: ignore
 
         snap = await _rm.risk_capacity_snapshot()
         if isinstance(snap, dict):
-            # keep a small subset to avoid huge dumps
             out["risk_capacity_snapshot"] = {
                 "risk_capacity": snap.get("risk_capacity"),
                 "risk_mode": snap.get("risk_mode"),
@@ -2348,7 +1654,6 @@ async def diag_snapshot() -> Dict[str, Any]:
     except Exception as e:
         out["risk_error"] = f"risk_manager_snapshot_failed: {e}"
 
-    # Best-effort regime snapshot
     try:
         from utils_pkg.regime import regime_state  # type: ignore
 
@@ -2366,3 +1671,14 @@ async def diag_snapshot() -> Dict[str, Any]:
         out["regime_error"] = f"regime_state_features_failed: {e}"
 
     return out
+
+
+__all__ = [
+    "score_entry",
+    "should_enter",
+    "score_entry_sync",
+    "_heuristic_score",
+    "_ai_score",
+    "ai_maintenance_loop",
+    "diag_snapshot",
+]

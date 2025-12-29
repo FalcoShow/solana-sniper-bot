@@ -1,77 +1,94 @@
 # ============================================================
-# Solana Sniper Bot — V3+++ / Quant-Grade Requirements
+# Solana Sniper Bot — V3+++ / Quant-Grade Requirements (LOCK-IN)
 # ============================================================
 #
-# This file is designed to be:
-#   • Compatible with Python 3.11+ (Render) and 3.13 (local)
-#   • Deterministic enough for prod, but not over-pinned
-#   • Split into logical sections so you can tweak easily
+# Goals:
+#   • Render (Python 3.11+) + Local (Python 3.13) compatible
+#   • Deterministic installs (hard pins)
+#   • "Core runtime" stays lean; heavy/optional sections are clearly marked
 #
-# If Render slug size ever becomes a problem, the first things
-# to optionally trim are the "Quant / Analytics" and "Web UI"
-# sections (pandas, scipy, FastAPI, Playwright, etc.).
+# Notes:
+#   • Keep ONLY ONE primary Postgres driver unless you *know* you need both.
+#   • If slug size becomes an issue, comment out OPTIONAL sections first.
 # ============================================================
 
 # ------------------------------------------------------------
-# Core async HTTP / networking
+# Core async HTTP / networking (required)
 # ------------------------------------------------------------
-aiohttp==3.9.5
+aiohttp==3.13.2
 httpx==0.28.1
 requests==2.32.3
-websockets==11.0.3
-brotli>=1.1.0            # decode Cloudflare 'br' responses
+websockets==15.0.1
+brotli==1.2.0
+certifi==2025.11.12
+tenacity==9.1.2
 
 # ------------------------------------------------------------
-# Storage / cache / config
+# Storage / cache / config (required)
 # ------------------------------------------------------------
-redis==5.3.1             # Upstash / Render Redis client
-aiosqlite==0.21.0        # Local lightweight DB / caching
-python-dotenv==1.0.1     # .env loader for local dev
+redis==7.1.0
+aiosqlite==0.22.0
+python-dotenv==1.1.1
 
 # ------------------------------------------------------------
-# Database stack (Postgres / PnL / AI DB)
+# Database stack (required for AI DB / PnL DB)
 # ------------------------------------------------------------
-SQLAlchemy==2.0.44       # ORM / query builder
-asyncpg==0.29.0          # Async driver for SQLAlchemy
-psycopg2-binary==2.9.11  # Sync PG paths used by ai_db / legacy
-psycopg[binary]==3.3.2   # Modern psycopg3 (binary wheels)
+SQLAlchemy==2.0.45
+asyncpg==0.30.0
+
+# Prefer modern psycopg3. (Remove psycopg2 unless you still import it somewhere.)
+psycopg[binary]==3.3.2
+
+# If (and ONLY if) you still have legacy imports that require psycopg2:
+# psycopg2-binary==2.9.11
 
 # ------------------------------------------------------------
-# Solana + crypto tooling
+# Solana + crypto tooling (required)
 # ------------------------------------------------------------
-solana==0.36.9
-solders==0.26.0
+solana==0.36.10
+solders==0.27.1
 base58==2.1.1
 
 # ------------------------------------------------------------
-# Quant / analytics / ML helpers
+# Serialization / settings / typing (required)
 # ------------------------------------------------------------
-numpy==2.0.2
-pandas==2.2.2
-scipy==1.13.1
-scikit-learn==1.5.1
-
-# ------------------------------------------------------------
-# AI / LLM integration
-# ------------------------------------------------------------
-openai>=1.54.0           # used by AI risk / scoring layers
-
-# ------------------------------------------------------------
-# Web / API surface (optional but nice)
-# ------------------------------------------------------------
-fastapi==0.120.0
-uvicorn==0.38.0
-
-# ------------------------------------------------------------
-# Tooling / automation / scraping (optional)
-# ------------------------------------------------------------
-playwright==1.55.0       # browser automation (optional alpha feeds, etc.)
-
-# ------------------------------------------------------------
-# Utilities / compatibility
-# ------------------------------------------------------------
+orjson==3.11.3
+pydantic==2.12.3
 typing-extensions==4.15.0
-certifi==2024.2.2
-tenacity==9.0.0          # general-purpose retry helper
-orjson==3.10.7           # fast JSON for logs / APIs
-pydantic==2.9.2          # typed settings / validation
+
+# ------------------------------------------------------------
+# AI / LLM integration (required if AI modules enabled)
+# ------------------------------------------------------------
+openai==2.14.0
+
+# ------------------------------------------------------------
+# Web / API surface (optional)
+# ------------------------------------------------------------
+fastapi==0.127.0
+uvicorn[standard]==0.40.0
+
+# ------------------------------------------------------------
+# Performance extras (optional; safe markers)
+# ------------------------------------------------------------
+uvloop==0.21.0; platform_system!="Windows"
+httptools==0.6.1; platform_system!="Windows"
+
+# ------------------------------------------------------------
+# Observability / ops (optional but useful; small footprint)
+# ------------------------------------------------------------
+psutil==6.1.1
+python-json-logger==2.0.7
+
+# ------------------------------------------------------------
+# Quant / analytics / ML helpers (OPTIONAL — enable only if used)
+# Keeping SciPy / scikit-learn optional avoids wheel/build pain on some setups.
+# ------------------------------------------------------------
+numpy==2.4.0
+pandas==2.3.3
+# scipy==1.16.3
+# scikit-learn==1.8.0
+
+# ------------------------------------------------------------
+# Tooling / automation / scraping (OPTIONAL — big)
+# ------------------------------------------------------------
+# playwright==1.57.0
