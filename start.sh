@@ -599,7 +599,7 @@ if is_true "${START_RUN_CHECK_ENV}"; then
   if is_true "${START_STRICT}"; then
     ce_args+=(--strict)
   fi
-  CHECK_ENV_JSON=1 CHECK_ENV_JSON_ONLY=1 "$PYTHON" -m scripts.check_env "${ce_args[@]}" >/dev/null \
+  CHECK_ENV_JSON=1 CHECK_ENV_JSON_ONLY=1 "$PYTHON" -m scripts.check_env "${ce_args[@]}" \
     || die "check_env failed"
   log "check_env OK"
 else
