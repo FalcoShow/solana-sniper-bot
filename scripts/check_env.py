@@ -432,9 +432,6 @@ def _safe_section(rep: Report, section: str, fn, *, critical: bool = False) -> N
 # =============================================================================
 
 def _resolve_trade_sol() -> Tuple[Optional[float], str]:
-    """
-    Returns (trade_sol, source_key). Never returns a non-tuple.
-    """
     for k in ("PF_TRADE_SOL", "BUY_SOL_PER_TRADE", "TRADE_SOL", "ENTRY_MIN_INITIAL_BUY_SOL"):
         raw = _envs(k, "")
         if not raw:
@@ -447,20 +444,12 @@ def _resolve_trade_sol() -> Tuple[Optional[float], str]:
 
 
 def _resolve_slippage_bps() -> Tuple[Optional[int], str]:
-    """
-    Returns (slippage_bps, source_key). Never returns a non-tuple.
-
-    IMPORTANT: This function is the root-cause fix for the unpack crash
-    you hit in preflight: caller expects (value, key) always.
-    """
     for k in ("PF_SLIPPAGE_BPS", "SLIPPAGE_BPS", "JUP_SLIPPAGE_BPS"):
         raw = _envs(k, "")
         if not raw:
             continue
         try:
-            # allow "50" or "50.0"
-            bps = int(float(raw))
-            return bps, k
+            return int(float(raw)), k
         except Exception:
             return None, k
     return None, ""
@@ -648,7 +637,6 @@ def _validate_trading_numbers(rep: Report) -> None:
     slip_bps, slip_key = _resolve_slippage_bps()
     buys_possible = _buys_effectively_possible()
 
-    # hard type validation (never crashes because resolvers are tuple-stable)
     if trade_key and trade_sol is None:
         rep.fatal("bad_trade_sol", sec, {trade_key: "must be a float"})
     if slip_key and slip_bps is None:
@@ -711,10 +699,6 @@ def _validate_trading_numbers(rep: Report) -> None:
 
 
 def _decode_b64_preview(s: str, max_bytes: int = 65536) -> Tuple[bool, str]:
-    """
-    Decode base64 safely without leaking content.
-    Returns (ok, note). Note is non-sensitive.
-    """
     if not s:
         return False, "empty"
     try:
@@ -860,12 +844,27 @@ def _dsn_sslmode(dsn: str) -> str:
         return "require" if "sslmode=require" in low else ""
 
 
-def _dsn_scheme_ok(dsn: str) -> bool:
+def _dsn_scheme_parts(dsn: str) -> Tuple[str, str, str]:
+    """
+    Returns (base_scheme, full_scheme, driver_suffix)
+      - postgresql://...          -> ("postgresql","postgresql","")
+      - postgresql+asyncpg://...  -> ("postgresql","postgresql+asyncpg","asyncpg")
+    Never throws.
+    """
     try:
-        p = urlparse(dsn)
-        return (p.scheme or "").lower() in {"postgres", "postgresql"}
+        scheme = (urlparse(dsn).scheme or "").lower().strip()
     except Exception:
-        return False
+        scheme = ""
+    if "+" in scheme:
+        base, rest = scheme.split("+", 1)
+        return base, scheme, rest
+    return scheme, scheme, ""
+
+
+def _dsn_scheme_ok(dsn: str) -> bool:
+    base, _, _ = _dsn_scheme_parts(dsn)
+    # accept SQLAlchemy-style driver schemes too (postgresql+asyncpg)
+    return base in {"postgres", "postgresql"}
 
 
 def _validate_db(rep: Report) -> None:
@@ -876,10 +875,19 @@ def _validate_db(rep: Report) -> None:
     present = {k: bool(_envs(k, "")) for k in dsn_candidates}
     has_any = any(present.values())
 
+    schemes: Dict[str, Any] = {}
+    for k in dsn_candidates:
+        v = _envs(k, "")
+        if not v:
+            continue
+        base, full, driver = _dsn_scheme_parts(v)
+        schemes[k] = {"base": base, "scheme": full, "driver": driver or None}
+
     rep.info["db"] = {
         "SKIP_DSN_REQUIRED": _bool01(not required),
         "has_any_dsn": _bool01(has_any),
         "present": present,
+        "schemes": schemes,
         "DATABASE_URL": _mask_value("DATABASE_URL", os.getenv("DATABASE_URL")),
         "POSTGRES_DSN": _mask_value("POSTGRES_DSN", os.getenv("POSTGRES_DSN")),
         "PG_DSN": _mask_value("PG_DSN", os.getenv("PG_DSN")),
@@ -901,8 +909,16 @@ def _validate_db(rep: Report) -> None:
         v = _envs(k, "")
         if not v:
             continue
+
+        base, full, driver = _dsn_scheme_parts(v)
         if not _dsn_scheme_ok(v):
-            rep.warn("dsn_scheme_suspicious", sec, {"var": k, "note": "Expected postgres:// or postgresql://", "value": _mask_value(k, v)})
+            # IMPORTANT: we do NOT print DSN; we print scheme-only diagnostics
+            rep.warn(
+                "dsn_scheme_suspicious",
+                sec,
+                {"var": k, "scheme": full or "(missing)", "base": base or "(missing)", "note": "Expected postgres:// or postgresql:// (or postgresql+driver://)"},
+                hint="Set this DSN to a Postgres URL (Render provides postgresql://...).",
+            )
 
         host = _host_from_urlish(v)
         if host.endswith(".render.com") and _dsn_sslmode(v) != "require":
@@ -910,7 +926,7 @@ def _validate_db(rep: Report) -> None:
                 "render_dsn_missing_sslmode",
                 sec,
                 {"var": k, "host": host, "expected": "sslmode=require"},
-                hint="Your start.sh normalizes DSNs; ensure boot actually runs start.sh.",
+                hint="Your start.sh may normalize DSNs. If this persists, add ?sslmode=require to the DSN.",
             )
 
 
@@ -1078,10 +1094,6 @@ def _apply_strict(rep: Report) -> None:
 
 
 def _build_diff_summary(rep: Report) -> None:
-    """
-    Redacted "diff" summary of expected vs actual.
-    We list missing/invalid buckets by *key name*, never by value.
-    """
     missing_required: List[str] = []
     malformed: List[str] = []
 
@@ -1192,10 +1204,6 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _report_unhandled_exception(e: BaseException) -> Report:
-    """
-    Absolute last-resort safety net.
-    check_env must NEVER crash preflight/start.sh – it must return JSON + RC_FATAL.
-    """
     rep = Report(ok=False)
     try:
         _validate_runtime(rep)
@@ -1226,7 +1234,6 @@ def _report_unhandled_exception(e: BaseException) -> Report:
 
 
 def main() -> None:
-    # Best-effort: make stdout/stderr tolerant of non-UTF8 consoles
     for stream in (sys.stdout, sys.stderr):
         try:
             if hasattr(stream, "reconfigure"):
@@ -1236,7 +1243,6 @@ def main() -> None:
 
     args = _parse_args()
 
-    # CLI flags override env (best-effort)
     if args.json:
         os.environ["CHECK_ENV_JSON"] = "1"
     if args.json_only:
