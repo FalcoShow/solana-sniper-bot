@@ -1,0 +1,135 @@
+# .pre-commit-config.yaml
+# God-Tier Overhaul — local guardrails so "last overhaul" stays locked.
+#
+# Design:
+#   - Commit-stage hooks must be HIGH SIGNAL and LOW FRICTION.
+#   - Full “quant-grade strictness” stays available via `pre-commit run --hook-stage manual -a`.
+#   - Avoid Windows pitfalls (python3 alias, ruff-format args, etc).
+
+minimum_pre_commit_version: "3.6.0"
+
+default_language_version:
+  # Windows-safe: "python3" is often NOT present as an executable.
+  python: python
+
+# Default stage for normal commits.
+default_stages: [pre-commit]
+
+exclude: |
+  (?x)(
+    ^\.git/|
+    ^\.venv/|
+    ^venv/|
+    ^build/|
+    ^dist/|
+    ^node_modules/|
+    ^__pycache__/|
+    ^\.pytest_cache/|
+    ^\.ruff_cache/|
+    ^\.mypy_cache/|
+    ^data/|
+    ^exports/|
+    ^\.cache/
+  )
+
+repos:
+  # ---------------------------------------------------------------------------
+  # Basic hygiene
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=2048"]
+
+  # ---------------------------------------------------------------------------
+  # Ruff: format first, then lint (commit-safe)
+  #
+  # IMPORTANT:
+  #   - ruff-format hook ALREADY runs `ruff format`.
+  #     Do NOT pass `format` as args (Windows will interpret it as a filename).
+  #
+  # Commit-stage contract:
+  #   - Always format staged Python files
+  #   - Only fail commit for "real problems" (E/F/I + bugbear)
+  #   - Auto-fix where safe; re-stage required if fixes applied
+  #
+  # Manual stage:
+  #   - Full repo contract (runs against ".")
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.2
+    hooks:
+      # Auto-format python on commit (staged files only)
+      - id: ruff-format
+        name: ruff-format (auto)
+        files: \.(py|pyi)$
+        stages: [pre-commit]
+
+      # Commit-safe lint: high signal only (staged files only)
+      - id: ruff
+        name: ruff (commit-safe)
+        files: \.(py|pyi)$
+        stages: [pre-commit]
+        args:
+          - --fix
+          - --show-fixes
+          - --exit-non-zero-on-fix
+          # High-signal only
+          - --select=E,F,I,B,B9
+          # Repo realities / intentional patterns
+          - --ignore=E402,E501,B008
+
+      # Manual: full repo contract (explicitly run against ".")
+      - id: ruff
+        name: ruff (full contract - manual)
+        stages: [manual]
+        pass_filenames: false
+        args:
+          - --fix
+          - --show-fixes
+          - --exit-non-zero-on-fix
+          - .
+
+      # Manual: format check only (CI-like, explicit ".")
+      - id: ruff-format
+        name: ruff-format (check - manual)
+        stages: [manual]
+        pass_filenames: false
+        args:
+          - --check
+          - .
+
+  # ---------------------------------------------------------------------------
+  # Mypy (keep manual until the type surface is fully stabilized)
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.14.1
+    hooks:
+      - id: mypy
+        args: ["--config-file", "mypy.ini"]
+        stages: [manual]
+
+  # ---------------------------------------------------------------------------
+  # Local heavy checks (manual)
+  #   - Keep these wired, but don't block commits.
+  # ---------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: ci-smoke
+        name: ci_smoke (no-network imports)
+        entry: python scripts/ci_smoke.py
+        language: system
+        pass_filenames: false
+        stages: [manual]
+
+      - id: pytest-contract
+        name: pytest (no network / no integration)
+        entry: python -m pytest -q -m "not integration and not network"
+        language: system
+        pass_filenames: false
+        stages: [manual]
