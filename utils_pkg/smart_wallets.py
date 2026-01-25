@@ -9,29 +9,31 @@ Production goals:
 - Backwards compatible names + helpers
 - Runtime-tunable via env snapshot TTL
 - Quant-grade features for entry/exit IQ + regime/risk_manager
-- Bounded memory + tiny per-mint cache
+- Bounded memory + per-mint caches
 - Safe, deterministic behavior (never blocks on I/O; no external deps)
 
 Primary consumers (expected):
 - utils_pkg/feature_builder.py (wallet_signals / flattened meta)
 - utils_pkg/ai_entry_logic.py / ai_buy_scoring.py
-- pump filters / scanners (observe_* adapters)
+- scanners (observe_* adapters)
 - risk_manager / regime / self_learning_ai_strategy
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from logging_setup import get_logger
 
 log = get_logger("sniper.smart_wallets")
 
+
 # =============================================================================
-# Env helpers
+# Env helpers (strictly local parsing; no side-effects)
 # =============================================================================
 
 
@@ -67,11 +69,11 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
-def _env_list(key: str) -> List[str]:
+def _env_list(key: str) -> list[str]:
     raw = os.getenv(key, "").strip()
     if not raw:
         return []
-    out: List[str] = []
+    out: list[str] = []
     for chunk in raw.replace("\n", ",").split(","):
         c = chunk.strip()
         if c:
@@ -106,23 +108,25 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def _decay_factor(dt: float, half_life: float) -> float:
-    """Standard exponential half-life decay factor."""
+    """Exponential half-life decay factor."""
     if half_life <= 0.0 or dt <= 0.0:
         return 1.0
     return 0.5 ** (dt / half_life)
 
 
-def _decay_update(value: float, last_ts: float, now: float, half_life: float, *, increment: float = 0.0) -> float:
+def _decay_update(
+    value: float, last_ts: float, now: float, half_life: float, *, increment: float = 0.0
+) -> float:
     dt = max(0.0, now - last_ts)
     decayed = value * _decay_factor(dt, half_life)
     return decayed + increment
 
 
 def _to_01_from_count(count: float, scale: float) -> float:
-    """Soft-clip a non-negative count into [0,1]."""
+    """Soft clip a non-negative count into [0,1]."""
     sc = max(1e-6, float(scale))
     x = max(0.0, float(count)) / sc
-    return float(1.0 if x >= 1.0 else x)
+    return 1.0 if x >= 1.0 else float(x)
 
 
 def _net_minus_one_to_one(pos: float, neg: float) -> float:
@@ -142,7 +146,6 @@ def _net_minus_one_to_one(pos: float, neg: float) -> float:
 
 @dataclass(frozen=True)
 class _Cfg:
-    # refresh controls
     cfg_ttl_sec: float
 
     # phase/mode
@@ -157,8 +160,8 @@ class _Cfg:
 
     # weights / mapping
     min_score_for_rich_features: float
-    cluster_weights: Dict[str, float]
-    profile_overrides: Dict[str, Any]
+    cluster_weights: dict[str, float]
+    profile_overrides: dict[str, Any]
     alpha_clusters: set[str]
 
     # smart decay & contribution
@@ -223,10 +226,10 @@ class _Cfg:
     debug_log: bool
 
 
-_CFG: Optional[_Cfg] = None
+_CFG: _Cfg | None = None
 _CFG_AT: float = 0.0
 
-# Back-compat global names (refreshed from cfg)
+# Back-compat globals (refreshed from cfg)
 MASTER_PHASE: int = 7
 SMART_WALLET_MODE: str = "full"
 SMART_WALLET_ENABLED: bool = True
@@ -265,7 +268,7 @@ def _load_cfg() -> _Cfg:
     default_mode = _compute_default_mode(phase)
     mode = os.getenv("SMART_WALLET_MODE", default_mode).strip().lower()
     if mode not in {"off", "simple", "alpha", "full"}:
-        mode = "full"
+        mode = default_mode
 
     enabled = _env_bool("SMART_WALLET_ENABLED", mode != "off")
     whale_enabled = _env_bool("SMART_WALLET_WHALE_ENABLED", mode != "off")
@@ -284,28 +287,23 @@ def _load_cfg() -> _Cfg:
 
     alpha_clusters = set(n.lower() for n in _env_list("SMART_WALLET_ALPHA_CLUSTERS"))
 
-    # core knobs
     smart_half_life = _env_float("SMART_WALLET_DECAY_HALF_LIFE_SEC", 900.0)
     smart_max_abs = _env_float("SMART_WALLET_MAX_SCORE", 1.2)
     smart_min_notional = _env_float("SMART_WALLET_MIN_NOTIONAL_USD", 50.0)
     smart_max_contrib = _env_float("SMART_WALLET_MAX_CONTRIB_PER_TRADE", 1.0)
     smart_sell_mult = _env_float("SMART_WALLET_SELL_MULTIPLIER", 0.5)
 
-    # smart volume & spoof control (no per-trader tracking; uses aggregate averages)
     smart_vol_hl = _env_float("SMART_WALLET_VOLUME_HALF_LIFE_SEC", 600.0)
     spoof_avg_usd = _env_float("SMART_WALLET_SPOOF_AVG_NOTIONAL_USD", 120.0)
 
-    # whales
     whale_min_usd = _env_float("SMART_WALLET_WHALE_MIN_NOTIONAL_USD", 1_000.0)
     whale_min_sol = _env_float("SMART_WALLET_WHALE_MIN_NOTIONAL_SOL", 5.0)
     whale_half_life = _env_float("SMART_WALLET_WHALE_HALF_LIFE_SEC", 300.0)
     footprint_anchor = _env_float("SMART_WALLET_WHALE_FOOTPRINT_ANCHOR_USD", 50_000.0)
 
-    # breadth uniques
     unique_gap = _env_float("SMART_WALLET_UNIQUE_ADDR_MIN_GAP_SEC", 60.0)
     unique_half_life = _env_float("SMART_WALLET_UNIQUE_HALF_LIFE_SEC", whale_half_life)
 
-    # scales
     smart_event_scale = _env_float("SMART_WALLET_COUNT_SCORE_SCALE", 5.0)
     whale_side_scale = _env_float("SMART_WALLET_WHALE_SIDE_SCORE_SCALE", 5.0)
     unique_buyers_scale = _env_float("SMART_WALLET_UNIQUE_BUYERS_SCALE", 10.0)
@@ -313,24 +311,18 @@ def _load_cfg() -> _Cfg:
 
     whale_dom_thr = _env_float("SMART_WALLET_WHALE_DOM_THRESHOLD", 0.7)
     conflict_net_min = _env_float("SMART_WALLET_CONFLICT_NET_MIN", 0.4)
-
     accum_alpha_scale = _env_float("SMART_WALLET_ACCUM_ALPHA_SCALE", 1.0)
     panic_dump_scale = _env_float("SMART_WALLET_PANIC_DUMP_SCALE", 1.0)
 
-    # signal meta
     recency_sec = _env_float("SMART_WALLET_SIGNAL_RECENCY_SEC", 900.0)
     min_events_conf = _env_float("SMART_WALLET_SIGNAL_MIN_EVENTS_FOR_CONF", 3.0)
 
-    # cache + memory bounds
     feature_cache_sec = _env_float("SMART_WALLET_FEATURE_CACHE_SEC", 0.5)
     max_mints = int(_env_float("SMART_WALLET_MAX_MINTS", 4000))
     idle_prune_sec = _env_float("SMART_WALLET_IDLE_PRUNE_SEC", 7200.0)
-
-    # per-mint address-map cap (prevents bloat when scanners feed raw buyer wallets)
     max_addrs_per_mint = int(_env_float("SMART_WALLET_MAX_ADDRS_PER_MINT", 1500))
     addr_prune_older_sec = _env_float("SMART_WALLET_ADDR_PRUNE_OLDER_SEC", 6 * 3600.0)
 
-    # reinvest safety
     reinvest_only = _env_set("SMART_WALLET_REINVEST_ONLY_MINTS")
     reinvest_excl = _env_set("SMART_WALLET_REINVEST_EXCLUDE_MINTS")
     reinvest_require_tradeable = _env_bool("SMART_WALLET_REINVEST_REQUIRE_TRADEABLE", True)
@@ -338,7 +330,6 @@ def _load_cfg() -> _Cfg:
     reinvest_max_risk = _env_float("SMART_WALLET_REINVEST_MAX_RISK", 0.70)
     reinvest_max_conflict = _env_float("SMART_WALLET_REINVEST_MAX_CONFLICT", 0.75)
 
-    # tradeable thresholds
     trade_min_conf = _env_float("SMART_WALLET_TRADEABLE_MIN_CONF", 0.25)
     trade_min_qual = _env_float("SMART_WALLET_TRADEABLE_MIN_QUALITY", 0.25)
     trade_min_heat = _env_float("SMART_WALLET_TRADEABLE_MIN_HEAT", 0.10)
@@ -430,7 +421,7 @@ class SmartWalletMeta:
     cluster: str
     weight: float  # -2..+2 (negative = anti/exit wallet)
     is_anti: bool = False
-    half_life_override_sec: Optional[float] = None
+    half_life_override_sec: float | None = None
 
 
 class SmartWalletRegistry:
@@ -445,7 +436,7 @@ class SmartWalletRegistry:
     """
 
     def __init__(self) -> None:
-        self._by_addr: Dict[str, SmartWalletMeta] = {}
+        self._by_addr: dict[str, SmartWalletMeta] = {}
         self._load_from_env()
 
     @staticmethod
@@ -463,26 +454,22 @@ class SmartWalletRegistry:
                 continue
 
             addrs = spec.get("addresses") or spec.get("wallets") or []
-            if not isinstance(addrs, (list, tuple)):
+            if not isinstance(addrs, list | tuple):
                 continue
 
             cname = str(cluster_name or default_cluster).strip() or default_cluster
 
-            # base weight
             try:
                 weight = float(spec.get("weight", -1.0 if is_anti else 1.0))
             except Exception:
                 weight = -1.0 if is_anti else 1.0
             weight = _clamp(weight, -2.0, 2.0)
 
-            # overrides
+            # optional per-cluster weight override
             if isinstance(cfg.cluster_weights, dict) and cname in cfg.cluster_weights:
-                try:
+                with contextlib.suppress(Exception):
                     weight = _clamp(float(cfg.cluster_weights[cname]), -2.0, 2.0)
-                except Exception:
-                    pass
 
-            # per-cluster half-life override
             hl = None
             if "half_life_sec" in spec and spec["half_life_sec"] is not None:
                 try:
@@ -501,7 +488,9 @@ class SmartWalletRegistry:
                     half_life_override_sec=hl,
                 )
 
-    def _load_flat_list(self, addrs: List[str], *, is_anti: bool, default_cluster: str, weight: float) -> None:
+    def _load_flat_list(
+        self, addrs: list[str], *, is_anti: bool, default_cluster: str, weight: float
+    ) -> None:
         weight = _clamp(float(weight), -2.0, 2.0)
         for addr in addrs:
             addr_norm = self._normalize_addr(addr)
@@ -524,22 +513,24 @@ class SmartWalletRegistry:
 
         self._by_addr.clear()
 
-        # smart side
+        # smart
         self._load_clusters_from_json(clusters, is_anti=False, default_cluster="smart_default")
         if flat_list:
-            self._load_flat_list(flat_list, is_anti=False, default_cluster="smart_default", weight=1.0)
+            self._load_flat_list(
+                flat_list, is_anti=False, default_cluster="smart_default", weight=1.0
+            )
 
-        # anti side
+        # anti
         self._load_clusters_from_json(anti_clusters, is_anti=True, default_cluster="anti_default")
         if anti_flat:
-            self._load_flat_list(anti_flat, is_anti=True, default_cluster="anti_default", weight=-1.0)
+            self._load_flat_list(
+                anti_flat, is_anti=True, default_cluster="anti_default", weight=-1.0
+            )
 
         if hasattr(log, "event"):
             log.event("SMART_REGISTRY_LOADED", count=len(self._by_addr))
         else:
             log.info("SMART_REGISTRY_LOADED count=%d", len(self._by_addr))
-
-    # ---- runtime controls -------------------------------------------------
 
     def reload_from_env(self) -> None:
         self._load_from_env()
@@ -551,7 +542,7 @@ class SmartWalletRegistry:
         cluster: str = "runtime_smart",
         weight: float = 1.0,
         is_anti: bool = False,
-        half_life_override_sec: Optional[float] = None,
+        half_life_override_sec: float | None = None,
     ) -> None:
         addr_norm = self._normalize_addr(address)
         if not addr_norm:
@@ -565,17 +556,13 @@ class SmartWalletRegistry:
         )
 
     def remove_wallet(self, address: str) -> None:
-        addr_norm = self._normalize_addr(address)
-        self._by_addr.pop(addr_norm, None)
-
-    # ---- query API --------------------------------------------------------
+        self._by_addr.pop(self._normalize_addr(address), None)
 
     @property
-    def by_addr(self) -> Dict[str, SmartWalletMeta]:
-        # back-compat convenience (read-only expectation)
+    def by_addr(self) -> dict[str, SmartWalletMeta]:
         return self._by_addr
 
-    def get_meta(self, address: str) -> Optional[SmartWalletMeta]:
+    def get_meta(self, address: str) -> SmartWalletMeta | None:
         return self._by_addr.get(self._normalize_addr(address))
 
     def is_smart(self, address: str) -> bool:
@@ -586,11 +573,11 @@ class SmartWalletRegistry:
         m = self.get_meta(address)
         return bool(m and m.weight < 0)
 
-    def cluster_for_addr(self, address: str) -> Optional[str]:
+    def cluster_for_addr(self, address: str) -> str | None:
         m = self.get_meta(address)
         return m.cluster if m else None
 
-    def weight_for_addr(self, address: str) -> Optional[float]:
+    def weight_for_addr(self, address: str) -> float | None:
         m = self.get_meta(address)
         return m.weight if m else None
 
@@ -602,9 +589,9 @@ class SmartWalletRegistry:
         hl = "default" if m.half_life_override_sec is None else f"{m.half_life_override_sec:.0f}s"
         return f"{address}: cluster={m.cluster}, role={role}, weight={m.weight:.2f}, half_life={hl}"
 
-    def summary(self) -> Dict[str, Any]:
+    def summary(self) -> dict[str, Any]:
         cfg = _get_cfg()
-        clusters: Dict[str, int] = {}
+        clusters: dict[str, int] = {}
         smart = anti = 0
         for meta in self._by_addr.values():
             clusters[meta.cluster] = clusters.get(meta.cluster, 0) + 1
@@ -612,7 +599,14 @@ class SmartWalletRegistry:
                 smart += 1
             else:
                 anti += 1
-        return {"total": len(self._by_addr), "smart_count": smart, "anti_count": anti, "clusters": clusters, "mode": cfg.mode, "phase": cfg.phase}
+        return {
+            "total": len(self._by_addr),
+            "smart_count": smart,
+            "anti_count": anti,
+            "clusters": clusters,
+            "mode": cfg.mode,
+            "phase": cfg.phase,
+        }
 
 
 REGISTRY = SmartWalletRegistry()
@@ -628,7 +622,7 @@ class SmartWalletTracker:
     Tracks recent smart-wallet + whale + breadth activity per mint with decay.
     All state is in-memory. NO network calls.
 
-    Core API:
+    API:
       - observe_swap(...) / observe_swap_event(...) / bulk_observe_swap_events(...)
       - build_features(mint) -> Dict[str, float]
       - attach_features_to_meta(meta, mint)
@@ -642,51 +636,51 @@ class SmartWalletTracker:
 
     def __init__(self) -> None:
         # signed smart flow
-        self._scores: Dict[str, float] = {}
-        self._last_ts: Dict[str, float] = {}
-        self._last_buy_ts: Dict[str, float] = {}
-        self._last_sell_ts: Dict[str, float] = {}
-        self._last_cluster: Dict[str, str] = {}
+        self._scores: dict[str, float] = {}
+        self._last_ts: dict[str, float] = {}
+        self._last_buy_ts: dict[str, float] = {}
+        self._last_sell_ts: dict[str, float] = {}
+        self._last_cluster: dict[str, str] = {}
 
         # smart event count (decayed)
-        self._smart_event_score: Dict[str, float] = {}
-        self._smart_event_last_ts: Dict[str, float] = {}
+        self._smart_event_score: dict[str, float] = {}
+        self._smart_event_last_ts: dict[str, float] = {}
 
         # smart side counts (decayed)
-        self._smart_buy_count: Dict[str, float] = {}
-        self._smart_sell_count: Dict[str, float] = {}
-        self._smart_side_last_ts: Dict[str, float] = {}
+        self._smart_buy_count: dict[str, float] = {}
+        self._smart_sell_count: dict[str, float] = {}
+        self._smart_side_last_ts: dict[str, float] = {}
 
         # smart notional volume (decayed)
-        self._smart_volume: Dict[str, float] = {}
-        self._smart_volume_last_ts: Dict[str, float] = {}
+        self._smart_volume: dict[str, float] = {}
+        self._smart_volume_last_ts: dict[str, float] = {}
 
         # whales count + volume (decayed)
-        self._whale_count: Dict[str, float] = {}
-        self._whale_volume: Dict[str, float] = {}
-        self._whale_last_ts: Dict[str, float] = {}
+        self._whale_count: dict[str, float] = {}
+        self._whale_volume: dict[str, float] = {}
+        self._whale_last_ts: dict[str, float] = {}
 
         # whale side counts (decayed)
-        self._whale_buy_count: Dict[str, float] = {}
-        self._whale_sell_count: Dict[str, float] = {}
-        self._whale_side_last_ts: Dict[str, float] = {}
+        self._whale_buy_count: dict[str, float] = {}
+        self._whale_sell_count: dict[str, float] = {}
+        self._whale_side_last_ts: dict[str, float] = {}
 
         # breadth uniques (all)
-        self._addr_last_seen: Dict[str, Dict[str, float]] = {}
-        self._unique_score: Dict[str, float] = {}
-        self._unique_last_ts: Dict[str, float] = {}
+        self._addr_last_seen: dict[str, dict[str, float]] = {}
+        self._unique_score: dict[str, float] = {}
+        self._unique_last_ts: dict[str, float] = {}
 
         # breadth uniques (smart subset)
-        self._smart_addr_last_seen: Dict[str, Dict[str, float]] = {}
-        self._smart_unique_score: Dict[str, float] = {}
-        self._smart_unique_last_ts: Dict[str, float] = {}
+        self._smart_addr_last_seen: dict[str, dict[str, float]] = {}
+        self._smart_unique_score: dict[str, float] = {}
+        self._smart_unique_last_ts: dict[str, float] = {}
 
         # housekeeping
-        self._last_any_activity_ts: Dict[str, float] = {}
+        self._last_any_activity_ts: dict[str, float] = {}
         self._op_counter: int = 0
 
         # per-mint feature cache: mint -> (ts, feats)
-        self._feature_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
+        self._feature_cache: dict[str, tuple[float, dict[str, float]]] = {}
 
         self._lock = asyncio.Lock()
 
@@ -764,7 +758,7 @@ class SmartWalletTracker:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _normalize_notional(amount_usd: Optional[float], amount_sol: Optional[float]) -> float:
+    def _normalize_notional(amount_usd: float | None, amount_sol: float | None) -> float:
         """
         Normalize trade size into rough USD notional.
         If only SOL is provided, uses crude 100 USD/SOL proxy (good enough for bucketing).
@@ -799,16 +793,15 @@ class SmartWalletTracker:
         if amt_usd <= 0.0:
             return 0.0
 
-        if amt_usd < cfg.smart_min_notional_usd and cfg.smart_min_notional_usd > 0:
+        if cfg.smart_min_notional_usd > 0 and amt_usd < cfg.smart_min_notional_usd:
             return 0.1 * (amt_usd / max(cfg.smart_min_notional_usd, 1.0))
 
         # roughly: $5k = 1.0 contrib (then capped)
         val = amt_usd / 5_000.0
-        val = _clamp(val, 0.0, max(cfg.smart_max_contrib_per_trade, 0.0))
-        return float(val)
+        return float(_clamp(val, 0.0, max(cfg.smart_max_contrib_per_trade, 0.0)))
 
     @staticmethod
-    def _is_whale(amt_usd: float, amt_sol: Optional[float], cfg: _Cfg) -> bool:
+    def _is_whale(amt_usd: float, amt_sol: float | None, cfg: _Cfg) -> bool:
         if amt_usd >= cfg.whale_min_notional_usd:
             return True
         if amt_sol is not None:
@@ -819,23 +812,20 @@ class SmartWalletTracker:
                 pass
         return False
 
-    def _touch_mint(self, mint: str, now: float) -> None:
+    def _touch_mint_locked(self, mint: str, now: float) -> None:
         self._last_any_activity_ts[mint] = now
         self._op_counter += 1
         self._feature_cache.pop(mint, None)  # invalidate cache on mutation
 
-    def _prune_addr_map_locked(self, addr_map: Dict[str, float], *, now: float, cfg: _Cfg) -> None:
-        """Bound per-mint address map size; remove very old entries first."""
+    def _prune_addr_map_locked(self, addr_map: dict[str, float], *, now: float, cfg: _Cfg) -> None:
         if not addr_map:
             return
-        # time-based prune
+
         older_than = now - cfg.addr_prune_older_sec
-        if older_than > 0:
-            # common fast path: skip if map small
-            if len(addr_map) > max(200, cfg.max_addrs_per_mint):
-                for k in [a for a, ts in addr_map.items() if ts < older_than]:
-                    addr_map.pop(k, None)
-        # size-based prune (drop oldest)
+        if older_than > 0 and len(addr_map) > max(200, cfg.max_addrs_per_mint):
+            for k in [a for a, ts in addr_map.items() if ts < older_than]:
+                addr_map.pop(k, None)
+
         if cfg.max_addrs_per_mint > 0 and len(addr_map) > cfg.max_addrs_per_mint:
             items = sorted(addr_map.items(), key=lambda kv: kv[1])  # oldest first
             drop_n = len(items) - cfg.max_addrs_per_mint
@@ -843,10 +833,6 @@ class SmartWalletTracker:
                 addr_map.pop(items[i][0], None)
 
     def _maybe_prune_locked(self, now: float, cfg: _Cfg) -> None:
-        """
-        Best-effort pruning to keep memory bounded.
-        Triggered opportunistically (every ~500 ops) under lock.
-        """
         if cfg.max_mints <= 0:
             return
         if self._op_counter % 500 != 0:
@@ -859,7 +845,6 @@ class SmartWalletTracker:
         idle_threshold = now - cfg.idle_prune_sec
         stale = [m for m in mints if self._last_any_activity_ts.get(m, 0.0) < idle_threshold]
 
-        # If no stale mints but we exceed max_mints, drop oldest (LRU-style).
         if not stale:
             mints_sorted = sorted(mints, key=lambda m: self._last_any_activity_ts.get(m, 0.0))
             stale = mints_sorted[: max(0, len(mints_sorted) - cfg.max_mints)]
@@ -896,9 +881,23 @@ class SmartWalletTracker:
                 d.pop(mint, None)
 
         if hasattr(log, "event"):
-            log.event("SMART_PRUNE_MINTS", pruned=len(stale), remaining=len(self._last_any_activity_ts))
+            log.event(
+                "SMART_PRUNE_MINTS", pruned=len(stale), remaining=len(self._last_any_activity_ts)
+            )
         else:
-            log.info("SMART_PRUNE_MINTS pruned=%d remaining=%d", len(stale), len(self._last_any_activity_ts))
+            log.info(
+                "SMART_PRUNE_MINTS pruned=%d remaining=%d",
+                len(stale),
+                len(self._last_any_activity_ts),
+            )
+
+    def _get_decayed_smart_score_locked(self, mint: str, now: float, cfg: _Cfg) -> float:
+        old = self._scores.get(mint, 0.0)
+        last_ts = self._last_ts.get(mint, now)
+        new = _decay_update(old, last_ts, now, cfg.smart_half_life_sec, increment=0.0)
+        self._scores[mint] = new
+        self._last_ts[mint] = now
+        return float(new)
 
     # ------------------------------------------------------------------
     # Ingest (observe)
@@ -915,11 +914,6 @@ class SmartWalletTracker:
     ) -> None:
         """
         Ingest a single swap event (best effort, NO I/O).
-
-        mint: token mint
-        trader: trader wallet address
-        amount_usd / amount_sol: notional estimate (USD preferred; SOL accepted)
-        side: "buy" or "sell" from trader perspective
         """
         mint = (mint or "").strip()
         trader = (trader or "").strip()
@@ -927,7 +921,9 @@ class SmartWalletTracker:
             return
 
         cfg = _get_cfg()
-        if cfg.mode == "off" or (not cfg.enabled and not cfg.whale_enabled and not cfg.breadth_enabled):
+        if cfg.mode == "off" or (
+            not cfg.enabled and not cfg.whale_enabled and not cfg.breadth_enabled
+        ):
             return
 
         now = time.time()
@@ -940,15 +936,18 @@ class SmartWalletTracker:
         meta = REGISTRY.get_meta(trader) if cfg.enabled else None
 
         async with self._lock:
-            self._touch_mint(mint, now)
+            self._touch_mint_locked(mint, now)
 
             # ---------------------- SMART FLOW ----------------------
             if cfg.enabled and meta is not None:
-                # alpha-only filter
-                meta_for_use: Optional[SmartWalletMeta] = meta
+                meta_for_use: SmartWalletMeta | None = meta
                 if cfg.alpha_only:
                     cl = (meta.cluster or "").lower()
-                    if ("alpha" not in cl) and ("smart" not in cl) and (cl not in cfg.alpha_clusters):
+                    if (
+                        ("alpha" not in cl)
+                        and ("smart" not in cl)
+                        and (cl not in cfg.alpha_clusters)
+                    ):
                         meta_for_use = None
 
                 if meta_for_use is not None:
@@ -958,20 +957,34 @@ class SmartWalletTracker:
                         last_ts = self._last_ts.get(mint, now)
 
                         half_life = meta_for_use.half_life_override_sec or cfg.smart_half_life_sec
-                        score_decayed = _decay_update(old_score, last_ts, now, half_life, increment=0.0)
+                        score_decayed = _decay_update(
+                            old_score, last_ts, now, half_life, increment=0.0
+                        )
 
                         base_w = _clamp(float(meta_for_use.weight), -2.0, 2.0)
 
                         # direction: wallet weight + side
                         if base_w >= 0:
-                            direction = 1.0 if (is_buy or not (is_buy or is_sell)) else -cfg.smart_sell_multiplier
+                            direction = (
+                                1.0
+                                if (is_buy or not (is_buy or is_sell))
+                                else -cfg.smart_sell_multiplier
+                            )
                             signed_w = base_w
                         else:
-                            direction = -1.0 if (is_buy or not (is_buy or is_sell)) else cfg.smart_sell_multiplier
+                            direction = (
+                                -1.0
+                                if (is_buy or not (is_buy or is_sell))
+                                else cfg.smart_sell_multiplier
+                            )
                             signed_w = abs(base_w)
 
                         contrib = contrib_norm * direction * signed_w
-                        new_score = _clamp(score_decayed + contrib, -cfg.smart_max_abs_score, cfg.smart_max_abs_score)
+                        new_score = _clamp(
+                            score_decayed + contrib,
+                            -cfg.smart_max_abs_score,
+                            cfg.smart_max_abs_score,
+                        )
 
                         self._scores[mint] = new_score
                         self._last_ts[mint] = now
@@ -984,7 +997,9 @@ class SmartWalletTracker:
                         # smart event count (decayed)
                         ev_old = self._smart_event_score.get(mint, 0.0)
                         ev_last = self._smart_event_last_ts.get(mint, now)
-                        self._smart_event_score[mint] = _decay_update(ev_old, ev_last, now, cfg.smart_half_life_sec, increment=1.0)
+                        self._smart_event_score[mint] = _decay_update(
+                            ev_old, ev_last, now, cfg.smart_half_life_sec, increment=1.0
+                        )
                         self._smart_event_last_ts[mint] = now
 
                         # smart side counts (decayed)
@@ -995,14 +1010,24 @@ class SmartWalletTracker:
                         sb_inc = 1.0 if (is_buy or not (is_buy or is_sell)) else 0.0
                         ss_inc = 1.0 if is_sell else 0.0
 
-                        self._smart_buy_count[mint] = _decay_update(sb_old, side_last, now, cfg.smart_half_life_sec, increment=sb_inc)
-                        self._smart_sell_count[mint] = _decay_update(ss_old, side_last, now, cfg.smart_half_life_sec, increment=ss_inc)
+                        self._smart_buy_count[mint] = _decay_update(
+                            sb_old, side_last, now, cfg.smart_half_life_sec, increment=sb_inc
+                        )
+                        self._smart_sell_count[mint] = _decay_update(
+                            ss_old, side_last, now, cfg.smart_half_life_sec, increment=ss_inc
+                        )
                         self._smart_side_last_ts[mint] = now
 
                         # smart volume (decayed)
                         v_old = self._smart_volume.get(mint, 0.0)
                         v_last = self._smart_volume_last_ts.get(mint, now)
-                        self._smart_volume[mint] = _decay_update(v_old, v_last, now, cfg.smart_volume_half_life_sec, increment=max(0.0, amt_usd))
+                        self._smart_volume[mint] = _decay_update(
+                            v_old,
+                            v_last,
+                            now,
+                            cfg.smart_volume_half_life_sec,
+                            increment=max(0.0, amt_usd),
+                        )
                         self._smart_volume_last_ts[mint] = now
 
                         # smart unique buyers subset
@@ -1014,11 +1039,14 @@ class SmartWalletTracker:
                         su_old = self._smart_unique_score.get(mint, 0.0)
                         su_last = self._smart_unique_last_ts.get(mint, now)
                         self._smart_unique_score[mint] = _decay_update(
-                            su_old, su_last, now, cfg.unique_half_life_sec, increment=1.0 if is_new else 0.0
+                            su_old,
+                            su_last,
+                            now,
+                            cfg.unique_half_life_sec,
+                            increment=1.0 if is_new else 0.0,
                         )
                         self._smart_unique_last_ts[mint] = now
 
-                        # bound address map
                         if cfg.max_addrs_per_mint > 0:
                             self._prune_addr_map_locked(addr_map, now=now, cfg=cfg)
 
@@ -1041,8 +1069,12 @@ class SmartWalletTracker:
                 wv_old = self._whale_volume.get(mint, 0.0)
                 wc_last = self._whale_last_ts.get(mint, now)
 
-                self._whale_count[mint] = _decay_update(wc_old, wc_last, now, cfg.whale_half_life_sec, increment=1.0)
-                self._whale_volume[mint] = _decay_update(wv_old, wc_last, now, cfg.whale_half_life_sec, increment=max(0.0, amt_usd))
+                self._whale_count[mint] = _decay_update(
+                    wc_old, wc_last, now, cfg.whale_half_life_sec, increment=1.0
+                )
+                self._whale_volume[mint] = _decay_update(
+                    wv_old, wc_last, now, cfg.whale_half_life_sec, increment=max(0.0, amt_usd)
+                )
                 self._whale_last_ts[mint] = now
 
                 wb_old = self._whale_buy_count.get(mint, 0.0)
@@ -1052,11 +1084,15 @@ class SmartWalletTracker:
                 wb_inc = 1.0 if (is_buy or not (is_buy or is_sell)) else 0.0
                 ws_inc = 1.0 if is_sell else 0.0
 
-                self._whale_buy_count[mint] = _decay_update(wb_old, side_last, now, cfg.whale_half_life_sec, increment=wb_inc)
-                self._whale_sell_count[mint] = _decay_update(ws_old, side_last, now, cfg.whale_half_life_sec, increment=ws_inc)
+                self._whale_buy_count[mint] = _decay_update(
+                    wb_old, side_last, now, cfg.whale_half_life_sec, increment=wb_inc
+                )
+                self._whale_sell_count[mint] = _decay_update(
+                    ws_old, side_last, now, cfg.whale_half_life_sec, increment=ws_inc
+                )
                 self._whale_side_last_ts[mint] = now
 
-            # ---------------------- BREADTH (uniques) ----------------------
+            # ---------------------- BREADTH ----------------------
             if cfg.breadth_enabled:
                 addr_map_all = self._addr_last_seen.setdefault(mint, {})
                 last_seen_all = addr_map_all.get(trader, 0.0)
@@ -1065,17 +1101,17 @@ class SmartWalletTracker:
 
                 u_old = self._unique_score.get(mint, 0.0)
                 u_last = self._unique_last_ts.get(mint, now)
-                self._unique_score[mint] = _decay_update(u_old, u_last, now, cfg.unique_half_life_sec, increment=1.0 if is_new else 0.0)
+                self._unique_score[mint] = _decay_update(
+                    u_old, u_last, now, cfg.unique_half_life_sec, increment=1.0 if is_new else 0.0
+                )
                 self._unique_last_ts[mint] = now
 
-                # bound address map
                 if cfg.max_addrs_per_mint > 0:
                     self._prune_addr_map_locked(addr_map_all, now=now, cfg=cfg)
 
-            # prune opportunistically
             self._maybe_prune_locked(now, cfg)
 
-    async def observe_swap_event(self, ev: Dict[str, Any]) -> None:
+    async def observe_swap_event(self, ev: dict[str, Any]) -> None:
         """
         Generic adapter for scanner/trader events.
 
@@ -1086,8 +1122,16 @@ class SmartWalletTracker:
           notional SOL: amount_sol / size_sol / notional_sol
           side: side / direction ("buy"/"sell")
         """
-        mint = ev.get("mint") or ev.get("mintAddress") or ev.get("mint_address") or ev.get("tokenMint")
-        trader = ev.get("trader") or ev.get("owner") or ev.get("wallet") or ev.get("user") or ev.get("buyer")
+        mint = (
+            ev.get("mint") or ev.get("mintAddress") or ev.get("mint_address") or ev.get("tokenMint")
+        )
+        trader = (
+            ev.get("trader")
+            or ev.get("owner")
+            or ev.get("wallet")
+            or ev.get("user")
+            or ev.get("buyer")
+        )
         if not mint or not trader:
             return
 
@@ -1104,9 +1148,15 @@ class SmartWalletTracker:
         except Exception:
             amt_sol_f = None
 
-        await self.observe_swap(mint=str(mint), trader=str(trader), amount_usd=amt_usd_f, amount_sol=amt_sol_f, side=str(side))
+        await self.observe_swap(
+            mint=str(mint),
+            trader=str(trader),
+            amount_usd=amt_usd_f,
+            amount_sol=amt_sol_f,
+            side=str(side),
+        )
 
-    async def bulk_observe_swap_events(self, events: List[Dict[str, Any]]) -> None:
+    async def bulk_observe_swap_events(self, events: list[dict[str, Any]]) -> None:
         for ev in events:
             try:
                 await self.observe_swap_event(ev)
@@ -1115,10 +1165,12 @@ class SmartWalletTracker:
                     log.exception("SMART_BULK_EVENT_FAIL ev=%s", ev)
 
     # ------------------------------------------------------------------
-    # Read + features
+    # Features
     # ------------------------------------------------------------------
 
-    async def _maybe_cached_features(self, mint: str, now: float, cfg: _Cfg) -> Optional[Dict[str, float]]:
+    async def _maybe_cached_features(
+        self, mint: str, now: float, cfg: _Cfg
+    ) -> dict[str, float] | None:
         if cfg.feature_cache_sec <= 0.0:
             return None
         async with self._lock:
@@ -1130,19 +1182,13 @@ class SmartWalletTracker:
             return None
         return dict(feats)
 
-    async def _store_cached_features(self, mint: str, feats: Dict[str, float], now: float, cfg: _Cfg) -> None:
+    async def _store_cached_features(
+        self, mint: str, feats: dict[str, float], now: float, cfg: _Cfg
+    ) -> None:
         if cfg.feature_cache_sec <= 0.0:
             return
         async with self._lock:
             self._feature_cache[mint] = (now, dict(feats))
-
-    async def _get_decayed_smart_score_locked(self, mint: str, now: float, cfg: _Cfg) -> float:
-        old = self._scores.get(mint, 0.0)
-        last_ts = self._last_ts.get(mint, now)
-        new = _decay_update(old, last_ts, now, cfg.smart_half_life_sec, increment=0.0)
-        self._scores[mint] = new
-        self._last_ts[mint] = now
-        return float(new)
 
     async def get_raw_score(self, mint: str) -> float:
         cfg = _get_cfg()
@@ -1153,7 +1199,7 @@ class SmartWalletTracker:
             return 0.0
         now = time.time()
         async with self._lock:
-            return await self._get_decayed_smart_score_locked(mint, now, cfg)
+            return self._get_decayed_smart_score_locked(mint, now, cfg)
 
     async def get_score_01(self, mint: str) -> float:
         cfg = _get_cfg()
@@ -1163,12 +1209,12 @@ class SmartWalletTracker:
         x = _clamp(raw / max(cfg.smart_max_abs_score, 1e-6), -1.0, 1.0)
         return float(0.5 * (x + 1.0))
 
-    async def build_features(self, mint: str) -> Dict[str, float]:
+    async def build_features(self, mint: str) -> dict[str, float]:
         """
         Build wallet_signals for a given mint.
 
         IMPORTANT: Keys returned here are relied upon by other modules.
-        This method must remain stable and deterministic.
+        This method remains stable and deterministic.
         """
         cfg = _get_cfg()
         mint = (mint or "").strip()
@@ -1179,7 +1225,11 @@ class SmartWalletTracker:
             return cached
 
         # Neutral defaults if off / empty
-        if not mint or cfg.mode == "off" or (not cfg.enabled and not cfg.whale_enabled and not cfg.breadth_enabled):
+        if (
+            not mint
+            or cfg.mode == "off"
+            or (not cfg.enabled and not cfg.whale_enabled and not cfg.breadth_enabled)
+        ):
             feats = {
                 "smart_wallet_score": 0.5,
                 "smart_flow_raw": 0.0,
@@ -1232,12 +1282,13 @@ class SmartWalletTracker:
             await self._store_cached_features(mint, feats, now, cfg)
             return feats
 
-        # Snapshot internal state under lock (single coherent view)
+        # Snapshot internal state under lock
         async with self._lock:
-            # smart flow
             if cfg.enabled:
-                raw_smart = await self._get_decayed_smart_score_locked(mint, now, cfg)
-                smart_01 = 0.5 * (_clamp(raw_smart / max(cfg.smart_max_abs_score, 1e-6), -1.0, 1.0) + 1.0)
+                raw_smart = self._get_decayed_smart_score_locked(mint, now, cfg)
+                smart_01 = 0.5 * (
+                    _clamp(raw_smart / max(cfg.smart_max_abs_score, 1e-6), -1.0, 1.0) + 1.0
+                )
             else:
                 raw_smart = 0.0
                 smart_01 = 0.5
@@ -1246,7 +1297,6 @@ class SmartWalletTracker:
             last_sell_ts = self._last_sell_ts.get(mint, 0.0)
             last_cluster = self._last_cluster.get(mint, "")
 
-            # smart event count + side counts
             ev_score = self._smart_event_score.get(mint, 0.0)
             ev_last_ts = self._smart_event_last_ts.get(mint, now)
 
@@ -1254,11 +1304,9 @@ class SmartWalletTracker:
             ss = self._smart_sell_count.get(mint, 0.0)
             smart_side_last_ts = self._smart_side_last_ts.get(mint, now)
 
-            # smart volume
             sv = self._smart_volume.get(mint, 0.0)
             sv_last_ts = self._smart_volume_last_ts.get(mint, now)
 
-            # whales
             wc = self._whale_count.get(mint, 0.0)
             wv = self._whale_volume.get(mint, 0.0)
             wc_last_ts = self._whale_last_ts.get(mint, now)
@@ -1267,7 +1315,6 @@ class SmartWalletTracker:
             ws = self._whale_sell_count.get(mint, 0.0)
             whale_side_last_ts = self._whale_side_last_ts.get(mint, now)
 
-            # breadth
             u_score = self._unique_score.get(mint, 0.0)
             u_last_ts = self._unique_last_ts.get(mint, now)
 
@@ -1277,10 +1324,10 @@ class SmartWalletTracker:
         buy_ago = float(now - last_buy_ts) if last_buy_ts > 0 else 1e9
         sell_ago = float(now - last_sell_ts) if last_sell_ts > 0 else 1e9
 
-        # smart event count (decayed to now)
-        smart_wallet_count_5m = ev_score * _decay_factor(max(0.0, now - ev_last_ts), cfg.smart_half_life_sec)
+        smart_wallet_count_5m = ev_score * _decay_factor(
+            max(0.0, now - ev_last_ts), cfg.smart_half_life_sec
+        )
 
-        # smart side scores (decayed to now)
         decay_s = _decay_factor(max(0.0, now - smart_side_last_ts), cfg.smart_half_life_sec)
         sb_dec = sb * decay_s
         ss_dec = ss * decay_s
@@ -1288,17 +1335,18 @@ class SmartWalletTracker:
         smart_sell_score_5m = _to_01_from_count(ss_dec, cfg.smart_event_scale)
         smart_net_side_5m = _net_minus_one_to_one(sb_dec, ss_dec)
 
-        # smart volume (decayed to now)
         decay_sv = _decay_factor(max(0.0, now - sv_last_ts), cfg.smart_volume_half_life_sec)
         smart_vol_5m_usd = sv * decay_sv
-        smart_avg_trade_usd = 0.0 if smart_wallet_count_5m <= 0 else (smart_vol_5m_usd / max(smart_wallet_count_5m, 1.0))
+        smart_avg_trade_usd = (
+            0.0
+            if smart_wallet_count_5m <= 0
+            else (smart_vol_5m_usd / max(smart_wallet_count_5m, 1.0))
+        )
 
-        # whales count/volume
         decay_w = _decay_factor(max(0.0, now - wc_last_ts), cfg.whale_half_life_sec)
         whales_5m = wc * decay_w
         whale_vol_5m_usd = wv * decay_w
 
-        # whale side scores
         decay_ws = _decay_factor(max(0.0, now - whale_side_last_ts), cfg.whale_half_life_sec)
         wb_dec = wb * decay_ws
         ws_dec = ws * decay_ws
@@ -1306,40 +1354,42 @@ class SmartWalletTracker:
         whale_sell_score = _to_01_from_count(ws_dec, cfg.whale_side_scale)
         whale_net_side_5m = _net_minus_one_to_one(wb_dec, ws_dec)
 
-        # breadth uniques
         decay_u = _decay_factor(max(0.0, now - u_last_ts), cfg.unique_half_life_sec)
         unique_buyers_5m = u_score * decay_u
 
         decay_su = _decay_factor(max(0.0, now - su_last_ts), cfg.unique_half_life_sec)
         smart_unique_buyers_5m = su_score * decay_su
 
-        # whale share of uniques
-        whale_share_5m = 0.0 if unique_buyers_5m <= 0 else _clamp(whales_5m / max(unique_buyers_5m, 1.0), 0.0, 1.0)
-
-        # holders growth proxy
+        whale_share_5m = (
+            0.0
+            if unique_buyers_5m <= 0
+            else _clamp(whales_5m / max(unique_buyers_5m, 1.0), 0.0, 1.0)
+        )
         holders_growth_5m = min(unique_buyers_5m / max(cfg.unique_buyers_scale, 1.0), 0.5)
 
-        # alpha cluster flag
         cluster_lower = (last_cluster or "").lower()
-        is_alpha_cluster = ("alpha" in cluster_lower) or ("smart" in cluster_lower) or (cluster_lower in cfg.alpha_clusters)
+        is_alpha_cluster = (
+            ("alpha" in cluster_lower)
+            or ("smart" in cluster_lower)
+            or (cluster_lower in cfg.alpha_clusters)
+        )
         smart_last_cluster_is_alpha = 1.0 if is_alpha_cluster else 0.0
 
-        # alpha bias (more weight if last seen cluster was alpha-ish)
         smart_alpha_bias = 0.0
         if smart_wallet_count_5m > 0 and is_alpha_cluster:
             smart_alpha_bias = min(1.0, smart_wallet_count_5m / max(cfg.smart_event_scale, 1.0))
 
-        # alignment & domination
-        smart_whale_alignment = smart_net_side_5m * whale_net_side_5m  # -1..+1
+        smart_whale_alignment = smart_net_side_5m * whale_net_side_5m
         smart_whale_alignment_abs = abs(smart_whale_alignment)
 
         if whale_share_5m <= cfg.whale_dom_threshold:
             whale_domination_5m = 0.0
         else:
             denom = max(1e-6, 1.0 - cfg.whale_dom_threshold)
-            whale_domination_5m = _clamp((whale_share_5m - cfg.whale_dom_threshold) / denom, 0.0, 1.0)
+            whale_domination_5m = _clamp(
+                (whale_share_5m - cfg.whale_dom_threshold) / denom, 0.0, 1.0
+            )
 
-        # conflict when strong opposite sides
         smart_vs_whale_conflict = 0.0
         if (
             abs(smart_net_side_5m) >= cfg.conflict_net_min
@@ -1348,36 +1398,40 @@ class SmartWalletTracker:
         ):
             smart_vs_whale_conflict = min(1.0, abs(smart_net_side_5m - whale_net_side_5m) / 2.0)
 
-        # accumulation vs panic dump
         accum_raw = max(0.0, smart_net_side_5m) * max(0.0, whale_net_side_5m)
         if smart_alpha_bias > 0:
-            accum_raw *= (1.0 + 0.5 * smart_alpha_bias)
+            accum_raw *= 1.0 + 0.5 * smart_alpha_bias
         smart_accumulation_score = _clamp(accum_raw * cfg.accum_alpha_scale, 0.0, 1.0)
 
         dump_raw = max(0.0, -smart_net_side_5m) * max(0.0, -whale_net_side_5m)
-        dump_raw *= (1.0 + whale_domination_5m)
+        dump_raw *= 1.0 + whale_domination_5m
         smart_panic_dump_score = _clamp(dump_raw * cfg.panic_dump_scale, 0.0, 1.0)
 
-        # whale liquidity footprint
-        whale_liquidity_footprint = _clamp(whale_vol_5m_usd / cfg.whale_footprint_anchor_usd, 0.0, 1.0)
+        whale_liquidity_footprint = _clamp(
+            whale_vol_5m_usd / cfg.whale_footprint_anchor_usd, 0.0, 1.0
+        )
 
-        # -------------------- anti-spoof proxy --------------------
-        # Many tiny "smart" events with low avg notional tends to be noisier.
         smart_spoofiness = 0.0
         if smart_wallet_count_5m >= 2.0:
             avg = smart_avg_trade_usd
-            # if avg << threshold => high spoofiness
-            smart_spoofiness = _clamp(1.0 - (avg / max(cfg.smart_spoof_avg_notional_usd, 1e-6)), 0.0, 1.0)
+            smart_spoofiness = _clamp(
+                1.0 - (avg / max(cfg.smart_spoof_avg_notional_usd, 1e-6)), 0.0, 1.0
+            )
 
-        # -------------------- Meta AI signals --------------------
         last_active_ts = max(last_buy_ts, last_sell_ts)
         if last_active_ts <= 0:
             recency_factor = 0.0
         else:
             age = now - last_active_ts
-            recency_factor = 0.0 if age >= cfg.signal_recency_sec else max(0.0, 1.0 - age / cfg.signal_recency_sec)
+            recency_factor = (
+                0.0
+                if age >= cfg.signal_recency_sec
+                else max(0.0, 1.0 - age / cfg.signal_recency_sec)
+            )
 
-        volume_factor = _to_01_from_count(smart_wallet_count_5m, max(cfg.signal_min_events_for_conf, 1e-6))
+        volume_factor = _to_01_from_count(
+            smart_wallet_count_5m, max(cfg.signal_min_events_for_conf, 1e-6)
+        )
         smart_signal_confidence = _clamp(0.6 * recency_factor + 0.4 * volume_factor, 0.0, 1.0)
 
         quality_raw = 0.0
@@ -1395,49 +1449,57 @@ class SmartWalletTracker:
         risk_raw *= min(1.0, abs(smart_net_side_5m) + abs(whale_net_side_5m))
         smart_risk_flag = _clamp(risk_raw, 0.0, 1.0)
 
-        # convenience sides
-        smart_recent_side = 1.0 if smart_net_side_5m > 0.15 else (-1.0 if smart_net_side_5m < -0.15 else 0.0)
-        whale_recent_side = 1.0 if whale_net_side_5m > 0.15 else (-1.0 if whale_net_side_5m < -0.15 else 0.0)
+        smart_recent_side = (
+            1.0 if smart_net_side_5m > 0.15 else (-1.0 if smart_net_side_5m < -0.15 else 0.0)
+        )
+        whale_recent_side = (
+            1.0 if whale_net_side_5m > 0.15 else (-1.0 if whale_net_side_5m < -0.15 else 0.0)
+        )
 
-        # crowding: smart uniques / uniques
-        smart_crowding_score = 0.0 if unique_buyers_5m <= 0 else _clamp(smart_unique_buyers_5m / max(unique_buyers_5m, 1.0), 0.0, 1.0)
-
-        # compressed state
+        smart_crowding_score = (
+            0.0
+            if unique_buyers_5m <= 0
+            else _clamp(smart_unique_buyers_5m / max(unique_buyers_5m, 1.0), 0.0, 1.0)
+        )
         smart_signal_state = smart_net_side_5m * smart_signal_quality * smart_signal_confidence
 
-        # heat scores
-        smart_heat_score = _clamp(abs(smart_net_side_5m) * smart_signal_confidence * (0.5 + 0.5 * smart_signal_quality), 0.0, 1.0)
+        smart_heat_score = _clamp(
+            abs(smart_net_side_5m) * smart_signal_confidence * (0.5 + 0.5 * smart_signal_quality),
+            0.0,
+            1.0,
+        )
         whale_heat_score = _clamp(
-            abs(whale_net_side_5m) * min(1.0, whales_5m / max(1.0, cfg.smart_event_scale)) * (0.5 + 0.5 * whale_liquidity_footprint),
+            abs(whale_net_side_5m)
+            * min(1.0, whales_5m / max(1.0, cfg.smart_event_scale))
+            * (0.5 + 0.5 * whale_liquidity_footprint),
             0.0,
             1.0,
         )
 
-        # fade secondary details if too weak
         if smart_heat_score < cfg.min_score_for_rich_features:
             smart_vs_whale_conflict *= 0.5
             whale_domination_5m *= 0.5
             smart_risk_flag *= 0.5
             smart_spoofiness *= 0.5
 
-        # pressure ratio: whale heat vs combined
         total_heat = smart_heat_score + whale_heat_score
-        smart_whale_pressure_ratio = 0.0 if total_heat <= 0 else min(1.0, whale_heat_score / max(total_heat, 1e-6))
+        smart_whale_pressure_ratio = (
+            0.0 if total_heat <= 0 else min(1.0, whale_heat_score / max(total_heat, 1e-6))
+        )
 
-        # entry/exit hints (PnL-focused)
         smart_entry_boost_hint = smart_signal_state  # [-1..+1]
         smart_exit_pressure_hint = _clamp(
-            smart_panic_dump_score * (0.5 + 0.5 * whale_domination_5m) * (0.5 + 0.5 * smart_risk_flag),
+            smart_panic_dump_score
+            * (0.5 + 0.5 * whale_domination_5m)
+            * (0.5 + 0.5 * smart_risk_flag),
             0.0,
             1.0,
         )
 
-        # regime tags
         regime_accum = 1.0 if smart_accumulation_score >= 0.5 else 0.0
         regime_panic = 1.0 if smart_panic_dump_score >= 0.5 else 0.0
         regime_conflict = 1.0 if smart_vs_whale_conflict >= 0.5 else 0.0
 
-        # chop when low heat and no dominance
         if (
             smart_heat_score < max(cfg.tradeable_min_heat, 0.12)
             and whale_heat_score < max(cfg.tradeable_min_heat, 0.12)
@@ -1448,7 +1510,6 @@ class SmartWalletTracker:
         else:
             regime_chop = 0.0
 
-        # regime code
         if regime_accum >= 0.5 and regime_panic < 0.5:
             smart_whale_regime_code = 1.0
         elif regime_panic >= 0.5 and regime_accum < 0.5:
@@ -1460,7 +1521,6 @@ class SmartWalletTracker:
         else:
             smart_whale_regime_code = 4.0
 
-        # tradeable flag (safe to consume downstream)
         is_tradeable = (
             smart_signal_confidence >= cfg.tradeable_min_conf
             and smart_signal_quality >= cfg.tradeable_min_quality
@@ -1469,34 +1529,28 @@ class SmartWalletTracker:
         )
         smart_tradeable_flag = 1.0 if is_tradeable else 0.0
 
-        feats: Dict[str, float] = {
-            # headline
+        feats: dict[str, float] = {
             "smart_wallet_score": float(smart_01),
             "smart_flow_raw": float(raw_smart),
             "smart_last_buy_sec_ago": float(buy_ago),
             "smart_last_sell_sec_ago": float(sell_ago),
             "smart_last_cluster_is_alpha": float(smart_last_cluster_is_alpha),
-            # smart side/breadth
             "smart_wallet_count_5m": float(smart_wallet_count_5m),
             "smart_buy_score_5m": float(smart_buy_score_5m),
             "smart_sell_score_5m": float(smart_sell_score_5m),
             "smart_net_side_5m": float(smart_net_side_5m),
             "smart_unique_buyers_5m": float(smart_unique_buyers_5m),
-            # smart volume quality
             "smart_vol_5m_usd": float(smart_vol_5m_usd),
             "smart_avg_trade_usd": float(smart_avg_trade_usd),
             "smart_spoofiness": float(smart_spoofiness),
-            # whales
             "whales_5m": float(whales_5m),
             "whale_vol_5m_usd": float(whale_vol_5m_usd),
             "whale_buy_score": float(whale_buy_score),
             "whale_sell_score": float(whale_sell_score),
             "whale_net_side_5m": float(whale_net_side_5m),
-            # breadth
             "unique_buyers_5m": float(unique_buyers_5m),
             "whale_share_5m": float(whale_share_5m),
             "holders_growth_5m": float(holders_growth_5m),
-            # quant extras
             "smart_alpha_bias": float(smart_alpha_bias),
             "smart_whale_alignment": float(smart_whale_alignment),
             "smart_whale_alignment_abs": float(smart_whale_alignment_abs),
@@ -1505,23 +1559,18 @@ class SmartWalletTracker:
             "smart_accumulation_score": float(smart_accumulation_score),
             "smart_panic_dump_score": float(smart_panic_dump_score),
             "whale_liquidity_footprint": float(whale_liquidity_footprint),
-            # meta AI signals
             "smart_signal_confidence": float(smart_signal_confidence),
             "smart_signal_quality": float(smart_signal_quality),
             "smart_risk_flag": float(smart_risk_flag),
-            # convenience + compressed
             "smart_recent_side": float(smart_recent_side),
             "whale_recent_side": float(whale_recent_side),
             "smart_crowding_score": float(smart_crowding_score),
             "smart_signal_state": float(smart_signal_state),
-            # heats
             "smart_heat_score": float(smart_heat_score),
             "whale_heat_score": float(whale_heat_score),
-            # edge helpers
             "smart_whale_pressure_ratio": float(smart_whale_pressure_ratio),
             "smart_entry_boost_hint": float(smart_entry_boost_hint),
             "smart_exit_pressure_hint": float(smart_exit_pressure_hint),
-            # regime/tradeability tags
             "smart_regime_accumulation": float(regime_accum),
             "smart_regime_panic": float(regime_panic),
             "smart_regime_conflict": float(regime_conflict),
@@ -1531,25 +1580,20 @@ class SmartWalletTracker:
         }
 
         if cfg.debug_log:
-            log.debug("SMART_FEATURES mint=%s feats=%s", mint, {k: round(v, 3) for k, v in feats.items()})
+            log.debug(
+                "SMART_FEATURES mint=%s feats=%s", mint, {k: round(v, 3) for k, v in feats.items()}
+            )
 
         await self._store_cached_features(mint, feats, now, cfg)
         return feats
 
-    async def attach_features_to_meta(self, meta: Dict[str, Any], mint: str) -> None:
-        """
-        Back-compat helper:
-        - Adds flattened features to meta (meta.update)
-        - Also stores nested copy at meta["wallet_signals"] (safe for FeatureBuilder)
-        """
+    async def attach_features_to_meta(self, meta: dict[str, Any], mint: str) -> None:
         feats = await self.build_features(mint)
-        try:
+        with contextlib.suppress(Exception):
             meta["wallet_signals"] = dict(feats)
-        except Exception:
-            pass
         meta.update(feats)
 
-    async def snapshot(self, mint: str) -> Dict[str, Any]:
+    async def snapshot(self, mint: str) -> dict[str, Any]:
         feats = await self.build_features(mint)
         keys = [
             "smart_wallet_score",
@@ -1569,11 +1613,13 @@ class SmartWalletTracker:
         ]
         return {k: float(feats.get(k, 0.0)) for k in keys}
 
-    async def top_active_mints(self, *, limit: int = 20, min_heat: float = 0.0) -> List[Dict[str, Any]]:
+    async def top_active_mints(
+        self, *, limit: int = 20, min_heat: float = 0.0
+    ) -> list[dict[str, Any]]:
         async with self._lock:
             mints = list(self._last_any_activity_ts.keys())
 
-        results: List[Dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
         for mint in mints:
             feats = await self.build_features(mint)
             s_heat = float(feats.get("smart_heat_score", 0.0))
@@ -1597,10 +1643,9 @@ class SmartWalletTracker:
         results.sort(key=lambda x: x["total_heat"], reverse=True)
         return results[:limit] if limit > 0 else results
 
-    async def global_regime_hint(self, *, limit: int = 50, min_heat: float = 0.1) -> Dict[str, float]:
-        """
-        Compact global hint for regime / risk_manager / self_learning_ai_strategy.
-        """
+    async def global_regime_hint(
+        self, *, limit: int = 50, min_heat: float = 0.1
+    ) -> dict[str, float]:
         top = await self.top_active_mints(limit=limit, min_heat=min_heat)
         if not top:
             return {
@@ -1648,9 +1693,7 @@ class SmartWalletTracker:
             sum_tradeable += tradeable
             n += 1
 
-        if n <= 0:
-            n = 1
-
+        n = max(1, n)
         smart_heat_global = _clamp(sum_s_heat / n, 0.0, 1.0)
         whale_heat_global = _clamp(sum_w_heat / n, 0.0, 1.0)
 
@@ -1677,7 +1720,7 @@ class SmartWalletTracker:
             "smart_tradeable_global": float(smart_tradeable_global),
         }
 
-    async def entry_hint(self, mint: str) -> Dict[str, Any]:
+    async def entry_hint(self, mint: str) -> dict[str, Any]:
         feats = await self.build_features(mint)
         return {
             "boost": float(feats.get("smart_entry_boost_hint", 0.0)),
@@ -1692,7 +1735,7 @@ class SmartWalletTracker:
             "pressure_ratio": float(feats.get("smart_whale_pressure_ratio", 0.0)),
         }
 
-    async def exit_hint(self, mint: str) -> Dict[str, Any]:
+    async def exit_hint(self, mint: str) -> dict[str, Any]:
         feats = await self.build_features(mint)
         return {
             "panic_pressure": float(feats.get("smart_exit_pressure_hint", 0.0)),
@@ -1728,7 +1771,9 @@ class SmartWalletTracker:
             f"panic={panic:.2f} risk={risk:.2f}"
         )
 
-    async def has_meaningful_signal(self, mint: str, *, min_conf: float = 0.2, min_heat: float = 0.1) -> bool:
+    async def has_meaningful_signal(
+        self, mint: str, *, min_conf: float = 0.2, min_heat: float = 0.1
+    ) -> bool:
         feats = await self.build_features(mint)
         conf = float(feats.get("smart_signal_confidence", 0.0))
         s_heat = float(feats.get("smart_heat_score", 0.0))
@@ -1748,7 +1793,7 @@ smart_wallets = TRACKER
 # =============================================================================
 
 
-async def build_risk_ctx_smart(*, limit: int = 50, min_heat: float = 0.1) -> Dict[str, float]:
+async def build_risk_ctx_smart(*, limit: int = 50, min_heat: float = 0.1) -> dict[str, float]:
     return await TRACKER.global_regime_hint(limit=limit, min_heat=min_heat)
 
 
@@ -1761,11 +1806,11 @@ async def pick_reinvestment_target(
     budget_sol: float | None = None,
     *,
     min_24h_volume_usd: float | None = None,
-    redis: Any = None,  # kept for signature compatibility
-    meta: Optional[Dict[str, Any]] = None,
-    universe: Optional[Dict[str, Dict[str, Any]]] = None,
+    redis: Any = None,  # signature compatibility
+    meta: dict[str, Any] | None = None,
+    universe: dict[str, dict[str, Any]] | None = None,
     **_: Any,
-) -> Optional[Dict[str, Any] | str]:
+) -> dict[str, Any] | str | None:
     """
     Returns either:
       • dict: {"mint": <str>, "score": <float>, "features": {...}} (preferred)
@@ -1779,7 +1824,6 @@ async def pick_reinvestment_target(
     profile_raw = meta.get("profile") or meta.get("bucket") or meta.get("reinvest_profile")
     profile = str(profile_raw).lower() if profile_raw is not None else ""
 
-    # base profile tuning
     if profile in ("defensive", "income", "savings"):
         risk_penalty = 1.2
         min_conf = 0.25
@@ -1797,7 +1841,6 @@ async def pick_reinvestment_target(
         min_conf = 0.20
         min_heat = 0.10
 
-    # optional per-profile overrides from env JSON
     try:
         if isinstance(cfg.profile_overrides, dict) and profile:
             override = cfg.profile_overrides.get(profile)
@@ -1811,7 +1854,6 @@ async def pick_reinvestment_target(
     except Exception:
         pass
 
-    # micro-budget safety
     if budget_sol is not None:
         try:
             b = float(budget_sol)
@@ -1821,18 +1863,16 @@ async def pick_reinvestment_target(
         except Exception:
             pass
 
-    # start from hottest mints
     candidates = await TRACKER.top_active_mints(limit=80, min_heat=min_heat)
     if not candidates:
         return None
 
     best_score = float("-inf")
-    best_payload: Optional[Dict[str, Any]] = None
+    best_payload: dict[str, Any] | None = None
 
     for row in candidates:
         mint = row["mint"]
 
-        # static include/exclude
         if cfg.reinvest_only_mints and mint not in cfg.reinvest_only_mints:
             continue
         if mint in cfg.reinvest_exclude_mints:
@@ -1840,18 +1880,17 @@ async def pick_reinvestment_target(
 
         feats = await TRACKER.build_features(mint)
 
-        boost = float(feats.get("smart_entry_boost_hint", 0.0))         # -1..+1
-        conf = float(feats.get("smart_signal_confidence", 0.0))         # 0..1
-        qual = float(feats.get("smart_signal_quality", 0.0))            # 0..1
-        risk_flag = float(feats.get("smart_risk_flag", 0.0))            # 0..1
-        panic = float(feats.get("smart_exit_pressure_hint", 0.0))       # 0..1
-        conflict = float(feats.get("smart_vs_whale_conflict", 0.0))     # 0..1
-        whale_dom = float(feats.get("whale_domination_5m", 0.0))        # 0..1
+        boost = float(feats.get("smart_entry_boost_hint", 0.0))  # -1..+1
+        conf = float(feats.get("smart_signal_confidence", 0.0))  # 0..1
+        qual = float(feats.get("smart_signal_quality", 0.0))  # 0..1
+        risk_flag = float(feats.get("smart_risk_flag", 0.0))  # 0..1
+        panic = float(feats.get("smart_exit_pressure_hint", 0.0))  # 0..1
+        conflict = float(feats.get("smart_vs_whale_conflict", 0.0))  # 0..1
+        whale_dom = float(feats.get("whale_domination_5m", 0.0))  # 0..1
         s_heat = float(feats.get("smart_heat_score", 0.0))
         w_heat = float(feats.get("whale_heat_score", 0.0))
         tradeable = float(feats.get("smart_tradeable_flag", 0.0))
 
-        # optional universe volume filter
         if min_24h_volume_usd is not None and universe is not None:
             meta_row = universe.get(mint) or {}
             try:
@@ -1861,13 +1900,11 @@ async def pick_reinvestment_target(
             if vol_24h < float(min_24h_volume_usd):
                 continue
 
-        # must have positive alpha and enough confidence
         if conf < min_conf:
             continue
         if boost <= 0.0:
             continue
 
-        # safety gates
         if cfg.reinvest_require_tradeable and tradeable < 0.5:
             continue
         if panic > cfg.reinvest_max_panic:
@@ -1877,10 +1914,9 @@ async def pick_reinvestment_target(
         if conflict > cfg.reinvest_max_conflict:
             continue
 
-        # PnL-focused score
         core_alpha = boost * conf * (0.5 + 0.5 * qual)
         heat_bonus = 0.15 * s_heat + 0.05 * w_heat
-        penalty = (0.8 * panic + 0.7 * conflict + 0.9 * risk_flag * risk_penalty + 0.3 * whale_dom)
+        penalty = 0.8 * panic + 0.7 * conflict + 0.9 * risk_flag * risk_penalty + 0.3 * whale_dom
         score = core_alpha + heat_bonus - penalty
 
         if score > best_score:
@@ -1906,22 +1942,27 @@ async def pick_reinvestment_target(
 
 
 __all__ = [
+    "REGISTRY",
+    "TRACKER",
     "SmartWalletMeta",
     "SmartWalletRegistry",
     "SmartWalletTracker",
-    "REGISTRY",
-    "TRACKER",
-    "smart_wallets",
     "build_risk_ctx_smart",
     "pick_reinvestment_target",
+    "smart_wallets",
 ]
 
 
 if __name__ == "__main__":  # pragma: no cover
+
     async def _demo() -> None:
         REGISTRY.register_wallet("wallet_smart_1", cluster="ct_alpha_snipers", weight=1.5)
-        await TRACKER.observe_swap(mint="DEMO_MINT", trader="wallet_smart_1", amount_usd=1500.0, side="buy")
-        await TRACKER.observe_swap(mint="DEMO_MINT", trader="wallet_whale_1", amount_usd=12000.0, side="buy")
+        await TRACKER.observe_swap(
+            mint="DEMO_MINT", trader="wallet_smart_1", amount_usd=1500.0, side="buy"
+        )
+        await TRACKER.observe_swap(
+            mint="DEMO_MINT", trader="wallet_whale_1", amount_usd=12000.0, side="buy"
+        )
 
         feats = await TRACKER.build_features("DEMO_MINT")
         desc = await TRACKER.describe_mint("DEMO_MINT")

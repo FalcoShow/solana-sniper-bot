@@ -6,14 +6,13 @@ utils_pkg/rpc_failover.py — RPC selection + failover (V3+++ LOCK-IN)
 
 Goal
 ----
-Pick and keep the *best* Solana RPC endpoint without thrashing:
+Pick and keep the best Solana RPC endpoint without thrashing:
 - latency-aware + health-aware scoring
 - banlist support (static + dynamic)
 - sticky selection + hysteresis (never flip-flop)
 - cooldowns after failures
 - async-only probing (no network at import time)
-
-This module is intentionally dependency-light (aiohttp only).
+- concurrency-safe: single-flight probe/selection (no races)
 
 Public API (stable)
 -------------------
@@ -32,40 +31,6 @@ Runtime hooks (used by wallet/client code):
 - unban(url) -> None
 - stats() -> dict
 - close_http() -> None
-
-Env knobs (safe defaults)
--------------------------
-# Candidates (HTTP):
-RPC_URL / SOL_RPC_URL / SOLANA_RPC_URL / HELIUS_RPC_URL / HEALTHCHECK_RPC_URL
-SOLANA_RPC_FALLBACKS / RPC_URLS / RPC_URL_FALLBACKS / RPC_URL_FALLBACK_1/2
-SOLANA_RPC_URLS / SOL_RPC_URLS / SOLANA_RPC_FALLBACK_URLS (csv/semicolon)
-
-# Policy:
-RPC_BANLIST="https://bad1,..."
-RPC_STICKY_TTL_SEC=120
-RPC_MIN_SWITCH_SEC=45
-RPC_RECHECK_SEC=20
-RPC_FAIL_COOLDOWN_SEC=30
-RPC_FAILS_TO_COOLDOWN=2
-RPC_FAILS_TO_EJECT=6
-RPC_EJECT_TTL_SEC=900
-RPC_PROBE_TIMEOUT_SEC=3.5
-RPC_PROBE_PARALLEL=4
-RPC_MAX_PROBE_CANDIDATES=12
-RPC_HEALTH_METHOD="getHealth" (fallbacks to getLatestBlockhash if needed)
-RPC_HYSTERESIS_MARGIN=0.20   (20% relative improvement needed to switch)
-RPC_EWMA_ALPHA=0.20
-RPC_PREFER_ENV_ORDER=1
-
-# WS candidates:
-WS_URL / SOLANA_WS_URL / SOL_WS_URL / HELIUS_WS_URL / HEALTHCHECK_WS_URL
-SOLANA_WS_FALLBACKS / WS_URLS / WS_URL_FALLBACKS / WS_URL_FALLBACK_1/2
-SOLANA_WS_URLS / SOL_WS_URLS
-
-Notes
------
-- “Never thrash” is achieved via: sticky TTL + min switch interval + hysteresis margin.
-- No network at import time; probing only happens inside async functions.
 """
 
 import asyncio
@@ -74,9 +39,14 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
-import aiohttp
+# aiohttp is optional at import-time (so local envs don’t hard-crash).
+try:
+    import aiohttp  # type: ignore
+except Exception:  # pragma: no cover
+    aiohttp = None  # type: ignore
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging shim (repo-compatible: log.event + log.every)
@@ -105,23 +75,25 @@ if not hasattr(log, "event"):
         with contextlib.suppress(Exception):
             log.info("%s %s", name, kw)
 
-    setattr(log, "event", _event)  # type: ignore[attr-defined]
+    log.event = _event  # type: ignore[attr-defined]
 
 if not hasattr(log, "every"):
 
-    def _every(key: str, n: int = 30, msg: Optional[str] = None, **kw: Any) -> None:  # pragma: no cover
+    def _every(
+        key: str, n: int = 30, msg: str | None = None, **kw: Any
+    ) -> None:  # pragma: no cover
         try:
             now = time.monotonic()
             store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
             last = float(store.get(key, 0.0))
             if (now - last) >= float(max(1, int(n))):
                 store[key] = now
-                setattr(_every, "_store", store)  # type: ignore[attr-defined]
-                getattr(log, "event")(msg or key, **kw)
+                _every._store = store  # type: ignore[attr-defined]
+                log.event(msg or key, **kw)
         except Exception:
             return None
 
-    setattr(log, "every", _every)  # type: ignore[attr-defined]
+    log.every = _every  # type: ignore[attr-defined]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -173,19 +145,18 @@ def _wall() -> float:
     return time.time()
 
 
-def _split_list(val: str) -> List[str]:
+def _split_list(val: str) -> list[str]:
     s = (val or "").strip()
     if not s:
         return []
-    # allow comma / semicolon / whitespace / newline
     s = s.replace(";", ",").replace("\n", ",").replace("\t", ",")
     parts = [p.strip() for p in s.split(",")]
     return [p for p in parts if p]
 
 
-def _dedupe_preserve(items: List[str]) -> List[str]:
+def _dedupe_preserve(items: list[str]) -> list[str]:
     seen: set[str] = set()
-    out: List[str] = []
+    out: list[str] = []
     for it in items:
         it = (it or "").strip()
         if it and it not in seen:
@@ -224,13 +195,14 @@ def _http_to_ws(u: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 # Candidate gathering (backwards compatible)
 # ──────────────────────────────────────────────────────────────────────────────
-def gather_http_candidates(env=os.environ) -> List[str]:
+def gather_http_candidates(env=os.environ) -> list[str]:
     primaries = [
         "HEALTHCHECK_RPC_URL",
         "RPC_URL",
         "SOL_RPC_URL",
         "SOLANA_RPC_URL",
         "HELIUS_RPC_URL",
+        "HEALTHCHECK_RPC_HTTP",
     ]
     lists = [
         "SOLANA_RPC_FALLBACKS",
@@ -248,7 +220,7 @@ def gather_http_candidates(env=os.environ) -> List[str]:
         "SOLANA_RPC_FALLBACK_2",
     ]
 
-    urls: List[str] = []
+    urls: list[str] = []
     for k in primaries:
         v = (env.get(k) or "").strip()
         if v:
@@ -271,13 +243,14 @@ def gather_http_candidates(env=os.environ) -> List[str]:
     return urls
 
 
-def gather_ws_candidates(env=os.environ) -> List[str]:
+def gather_ws_candidates(env=os.environ) -> list[str]:
     primaries = [
         "HEALTHCHECK_WS_URL",
         "WS_URL",
         "SOL_WS_URL",
         "SOLANA_WS_URL",
         "HELIUS_WS_URL",
+        "HEALTHCHECK_RPC_WS",
     ]
     lists = [
         "SOLANA_WS_FALLBACKS",
@@ -294,7 +267,7 @@ def gather_ws_candidates(env=os.environ) -> List[str]:
         "SOLANA_WS_FALLBACK_2",
     ]
 
-    urls: List[str] = []
+    urls: list[str] = []
     for k in primaries:
         v = (env.get(k) or "").strip()
         if v:
@@ -318,7 +291,33 @@ def gather_ws_candidates(env=os.environ) -> List[str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# State / scoring
+# Policy
+# ──────────────────────────────────────────────────────────────────────────────
+def _policy() -> dict[str, Any]:
+    return {
+        "sticky_ttl_sec": max(10, _env_int("RPC_STICKY_TTL_SEC", 120)),
+        "min_switch_sec": max(10, _env_int("RPC_MIN_SWITCH_SEC", 45)),
+        "recheck_sec": max(5, _env_int("RPC_RECHECK_SEC", 20)),
+        "probe_timeout_sec": max(1.0, _env_float("RPC_PROBE_TIMEOUT_SEC", 3.5)),
+        "probe_parallel": max(1, _env_int("RPC_PROBE_PARALLEL", 4)),
+        "max_probe_candidates": max(3, _env_int("RPC_MAX_PROBE_CANDIDATES", 12)),
+        "fails_to_cooldown": max(1, _env_int("RPC_FAILS_TO_COOLDOWN", 2)),
+        "fail_cooldown_sec": max(5, _env_int("RPC_FAIL_COOLDOWN_SEC", 30)),
+        "fails_to_eject": max(2, _env_int("RPC_FAILS_TO_EJECT", 6)),
+        "eject_ttl_sec": max(60, _env_int("RPC_EJECT_TTL_SEC", 900)),
+        "hysteresis_margin": max(0.05, float(_env_float("RPC_HYSTERESIS_MARGIN", 0.20))),
+        "ewma_alpha": min(0.9, max(0.05, float(_env_float("RPC_EWMA_ALPHA", 0.20)))),
+        "health_method": (_env_str("RPC_HEALTH_METHOD", "getHealth") or "getHealth").strip(),
+        "prefer_env_order": _env_bool("RPC_PREFER_ENV_ORDER", True),
+        "randomize_subset": _env_bool("RPC_RANDOMIZE_SUBSET", False),
+        "aiohttp_limit": max(10, _env_int("RPC_AIOHTTP_LIMIT", 50)),
+        "probe_jitter_ms": max(0, _env_int("RPC_PROBE_JITTER_MS", 50)),
+        "treat_429_hard_fail": _env_bool("RPC_429_HARD_FAIL", True),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# State
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass
 class _RPCState:
@@ -336,26 +335,17 @@ class _RPCState:
         return tmono >= self.cooldown_until_mono and tmono >= self.eject_until_mono
 
     def score(self, tmono: float) -> float:
-        """
-        Higher is better.
-        We prefer:
-          - lower latency (ewma)
-          - recently ok
-          - fewer fails
-          - not in cooldown/eject
-        """
         if not self.allowed(tmono):
             return -1e9
 
         latency = max(1.0, float(self.ewma_ms))
-        base = 10000.0 / latency  # 0..10000-ish
+        base = 10000.0 / latency
 
-        # staleness penalty: if no ok in last 60s, penalize gradually
         if self.last_ok_mono <= 0:
             stale_pen = 1.0
         else:
             age_s = max(0.0, tmono - self.last_ok_mono)
-            stale_pen = min(3.0, age_s / 60.0)  # 0..3
+            stale_pen = min(3.0, age_s / 60.0)
 
         fail_pen = float(self.fail_count) * 2.0
         return float(base - fail_pen - stale_pen)
@@ -368,12 +358,13 @@ class _Ban:
 
 
 _LOCK = asyncio.Lock()
-_STATES: Dict[str, _RPCState] = {}
-_BANS: Dict[str, _Ban] = {}
 
-# Sticky selection memory
-_CHOSEN_HTTP: Optional[str] = None
-_CHOSEN_WS: Optional[str] = None
+_STATES: dict[str, _RPCState] = {}
+_BANS: dict[str, _Ban] = {}
+
+_CHOSEN_HTTP: str | None = None
+_CHOSEN_WS: str | None = None
+
 _STICKY_UNTIL_HTTP_MONO: float = 0.0
 _STICKY_UNTIL_WS_MONO: float = 0.0
 _LAST_SWITCH_HTTP_MONO: float = 0.0
@@ -381,49 +372,35 @@ _LAST_SWITCH_WS_MONO: float = 0.0
 _LAST_PROBE_HTTP_MONO: float = 0.0
 _LAST_PROBE_WS_MONO: float = 0.0
 
-# Lazy shared aiohttp session
-_SESSION: Optional[aiohttp.ClientSession] = None
+_SESSION = None
 _SESSION_LOCK = asyncio.Lock()
 
 
-def _policy() -> Dict[str, Any]:
-    return {
-        "sticky_ttl_sec": max(10, _env_int("RPC_STICKY_TTL_SEC", 120)),
-        "min_switch_sec": max(10, _env_int("RPC_MIN_SWITCH_SEC", 45)),
-        "recheck_sec": max(5, _env_int("RPC_RECHECK_SEC", 20)),
-        "probe_timeout_sec": max(1.0, _env_float("RPC_PROBE_TIMEOUT_SEC", 3.5)),
-        "probe_parallel": max(1, _env_int("RPC_PROBE_PARALLEL", 4)),
-        "max_probe_candidates": max(3, _env_int("RPC_MAX_PROBE_CANDIDATES", 12)),
-        "fails_to_cooldown": max(1, _env_int("RPC_FAILS_TO_COOLDOWN", 2)),
-        "fail_cooldown_sec": max(5, _env_int("RPC_FAIL_COOLDOWN_SEC", 30)),
-        "fails_to_eject": max(2, _env_int("RPC_FAILS_TO_EJECT", 6)),
-        "eject_ttl_sec": max(60, _env_int("RPC_EJECT_TTL_SEC", 900)),
-        "hysteresis_margin": max(0.05, float(_env_float("RPC_HYSTERESIS_MARGIN", 0.20))),  # relative improvement
-        "ewma_alpha": min(0.9, max(0.05, float(_env_float("RPC_EWMA_ALPHA", 0.20)))),
-        "health_method": (_env_str("RPC_HEALTH_METHOD", "getHealth") or "getHealth").strip(),
-        "prefer_env_order": _env_bool("RPC_PREFER_ENV_ORDER", True),
-    }
+def _ensure_aiohttp() -> None:
+    if aiohttp is None:
+        raise RuntimeError("aiohttp_missing: install with `py -m pip install aiohttp`")
 
 
-async def _get_session() -> aiohttp.ClientSession:
+async def _get_session():
     global _SESSION
+    _ensure_aiohttp()
     if _SESSION is not None and not _SESSION.closed:
         return _SESSION
     async with _SESSION_LOCK:
         if _SESSION is not None and not _SESSION.closed:
             return _SESSION
-        timeout = aiohttp.ClientTimeout(total=max(1.0, _env_float("RPC_PROBE_TIMEOUT_SEC", 3.5)))
+        pol = _policy()
+        timeout = aiohttp.ClientTimeout(total=float(pol["probe_timeout_sec"]))
         connector = aiohttp.TCPConnector(
-            limit=max(10, _env_int("RPC_AIOHTTP_LIMIT", 50)),
+            limit=int(pol["aiohttp_limit"]),
             ttl_dns_cache=60,
             enable_cleanup_closed=True,
         )
-        _SESSION = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        _SESSION = aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=True)
         return _SESSION
 
 
 async def close_http() -> None:
-    """Close shared aiohttp session (optional)."""
     global _SESSION
     if _SESSION is not None and not _SESSION.closed:
         with contextlib.suppress(Exception):
@@ -439,7 +416,7 @@ def _ensure_state(url: str) -> _RPCState:
     return st
 
 
-def _is_banned(url: str, tmono: Optional[float] = None) -> bool:
+def _is_banned(url: str, tmono: float | None = None) -> bool:
     t = _mono() if tmono is None else float(tmono)
     b = _BANS.get(url)
     if not b:
@@ -450,12 +427,12 @@ def _is_banned(url: str, tmono: Optional[float] = None) -> bool:
     return True
 
 
-def _apply_static_banlist(candidates: List[str]) -> List[str]:
+def _apply_static_banlist(candidates: list[str]) -> list[str]:
     raw = _env_str("RPC_BANLIST", "")
     if not raw:
         return candidates
     banned = set(_normalize_http_url(x) for x in _split_list(raw))
-    out: List[str] = []
+    out: list[str] = []
     for u in candidates:
         uu = _normalize_http_url(u)
         if uu and uu not in banned:
@@ -463,8 +440,7 @@ def _apply_static_banlist(candidates: List[str]) -> List[str]:
     return out
 
 
-def ban(url: str, reason: str = "", ttl_sec: Optional[int] = None) -> None:
-    """Dynamically ban an RPC URL for a time window."""
+def ban(url: str, reason: str = "", ttl_sec: int | None = None) -> None:
     u = _normalize_http_url(url)
     if not u:
         return
@@ -480,7 +456,7 @@ def unban(url: str) -> None:
         _BANS.pop(u, None)
 
 
-def report_ok(url: str, latency_ms: Optional[float] = None, note: str = "") -> None:
+def report_ok(url: str, latency_ms: float | None = None, note: str = "") -> None:
     u = _normalize_http_url(url)
     if not u:
         return
@@ -497,16 +473,14 @@ def report_ok(url: str, latency_ms: Optional[float] = None, note: str = "") -> N
         ms = float(max(1.0, latency_ms))
         st.ewma_ms = (1.0 - alpha) * float(st.ewma_ms) + alpha * ms
 
-    # success gently forgives failure streaks
     if st.fail_count > 0:
         st.fail_count = max(0, st.fail_count - 1)
 
-    # clear cooldown/eject on healthy ok (eject is also cleared; we keep bans separate)
     st.cooldown_until_mono = 0.0
     st.eject_until_mono = 0.0
 
 
-def report_fail(url: str, note: str = "", *, status: Optional[int] = None) -> None:
+def report_fail(url: str, note: str = "", *, status: int | None = None) -> None:
     u = _normalize_http_url(url)
     if not u:
         return
@@ -518,11 +492,14 @@ def report_fail(url: str, note: str = "", *, status: Optional[int] = None) -> No
     if note:
         st.note = note
 
-    # cooldown after small cluster of fails
-    if st.fail_count >= int(pol["fails_to_cooldown"]):
-        st.cooldown_until_mono = max(st.cooldown_until_mono, _mono() + float(pol["fail_cooldown_sec"]))
+    if status == 429 and bool(pol["treat_429_hard_fail"]):
+        st.fail_count += int(pol["fails_to_cooldown"])
 
-    # eject after repeated fails (internal; separate from explicit ban())
+    if st.fail_count >= int(pol["fails_to_cooldown"]):
+        st.cooldown_until_mono = max(
+            st.cooldown_until_mono, _mono() + float(pol["fail_cooldown_sec"])
+        )
+
     if st.fail_count >= int(pol["fails_to_eject"]):
         st.eject_until_mono = max(st.eject_until_mono, _mono() + float(pol["eject_ttl_sec"]))
         log.every(
@@ -537,11 +514,16 @@ def report_fail(url: str, note: str = "", *, status: Optional[int] = None) -> No
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Probing
+# Probing (no network until called)
 # ──────────────────────────────────────────────────────────────────────────────
-async def _rpc_call(session: aiohttp.ClientSession, url: str, payload: Dict[str, Any], timeout_sec: float) -> Tuple[int, Any]:
+async def _rpc_call(
+    session, url: str, payload: dict[str, Any], timeout_sec: float
+) -> tuple[int, Any]:
+    _ensure_aiohttp()
     to = aiohttp.ClientTimeout(total=max(1.0, float(timeout_sec)))
-    async with session.post(url, json=payload, timeout=to, headers={"content-type": "application/json"}) as r:
+    async with session.post(
+        url, json=payload, timeout=to, headers={"content-type": "application/json"}
+    ) as r:
         status = int(r.status)
         try:
             data = await r.json(content_type=None)
@@ -555,39 +537,37 @@ def _is_health_ok(method: str, status: int, data: Any) -> bool:
         return False
     if not isinstance(data, dict):
         return False
+    if data.get("error"):
+        return False
 
     if method == "getHealth":
         res = data.get("result")
-        # Common variants: "ok" / {"Ok":{}} / {"ok": true}
         return res == "ok" or res == {"Ok": {}} or res == {"ok": True}
 
     if method == "getLatestBlockhash":
-        res = data.get("result")
-        return bool(res)
+        return bool(data.get("result"))
 
     return bool(data.get("result"))
 
 
-async def _probe_http(url: str, timeout: float) -> Tuple[bool, float, str]:
-    """
-    Returns: (ok, latency_ms, note)
-    """
+async def _probe_http(url: str, timeout: float) -> tuple[bool, float, str, int | None]:
     u = _normalize_http_url(url)
     if not u:
-        return False, 9999.0, "bad_url"
+        return False, 9999.0, "bad_url", None
 
     tmono = _mono()
     if _is_banned(u, tmono=tmono):
-        return False, 9999.0, "banned"
+        return False, 9999.0, "banned", None
 
     st = _ensure_state(u)
     if not st.allowed(tmono):
-        return False, 9999.0, "cooldown"
+        return False, 9999.0, "cooldown", None
 
     pol = _policy()
     method = str(pol["health_method"] or "getHealth").strip()
-    payload_health: Dict[str, Any] = {"jsonrpc": "2.0", "id": 1, "method": method}
-    payload_bh: Dict[str, Any] = {
+
+    payload_health: dict[str, Any] = {"jsonrpc": "2.0", "id": 1, "method": method}
+    payload_bh: dict[str, Any] = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getLatestBlockhash",
@@ -596,29 +576,29 @@ async def _probe_http(url: str, timeout: float) -> Tuple[bool, float, str]:
 
     session = await _get_session()
 
-    # small jitter to avoid herd effect
-    await asyncio.sleep(random.random() * 0.05)
+    jitter_ms = int(pol["probe_jitter_ms"])
+    if jitter_ms > 0:
+        await asyncio.sleep(random.random() * (jitter_ms / 1000.0))
 
     t0 = _mono()
     try:
         status, data = await _rpc_call(session, u, payload_health, timeout)
         dt_ms = (_mono() - t0) * 1000.0
         if _is_health_ok(method, status, data):
-            return True, float(dt_ms), f"{method}:ok"
+            return True, float(dt_ms), f"{method}:ok", status
 
-        # fallback to getLatestBlockhash (some RPCs block getHealth)
         t1 = _mono()
         status2, data2 = await _rpc_call(session, u, payload_bh, timeout)
         dt_ms2 = (_mono() - t1) * 1000.0
         if _is_health_ok("getLatestBlockhash", status2, data2):
-            return True, float(dt_ms2), "latestBlockhash:ok"
+            return True, float(dt_ms2), "latestBlockhash:ok", status2
 
-        return False, float(max(dt_ms, dt_ms2)), f"unhealthy:{status}/{status2}"
+        return False, float(max(dt_ms, dt_ms2)), f"unhealthy:{status}/{status2}", status2
     except asyncio.CancelledError:
         raise
     except Exception as e:
         dt_ms = (_mono() - t0) * 1000.0
-        return False, float(dt_ms), f"{type(e).__name__}:{_short(e, 180)}"
+        return False, float(dt_ms), f"{type(e).__name__}:{_short(e, 180)}", None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -628,33 +608,32 @@ def _score_url(url: str, tmono: float) -> float:
     return _ensure_state(url).score(tmono)
 
 
-def _pick_subset(candidates: List[str], max_n: int) -> List[str]:
-    # preserve order but cap length (probing too many is wasteful)
-    return candidates[: max(1, int(max_n))]
+def _pick_subset(candidates: list[str], max_n: int, randomize: bool) -> list[str]:
+    c = candidates[:]
+    if randomize and len(c) > 1:
+        head, tail = c[:1], c[1:]
+        random.shuffle(tail)
+        c = head + tail
+    return c[: max(1, int(max_n))]
 
 
-async def _select_best_http(candidates: List[str], *, force_probe: bool) -> Tuple[str, List[Tuple[str, bool, str, float]]]:
-    """
-    Returns: (chosen_url, notes) where notes entries are (url, ok, note, latency_ms)
-    """
+async def _select_best_http(
+    candidates: list[str],
+    *,
+    force_probe: bool,
+) -> tuple[str, list[tuple[str, bool, str, float]]]:
     global _CHOSEN_HTTP, _STICKY_UNTIL_HTTP_MONO, _LAST_SWITCH_HTTP_MONO, _LAST_PROBE_HTTP_MONO
 
     pol = _policy()
     tmono = _mono()
 
-    # sanitize candidates
     candidates = [_normalize_http_url(u) for u in candidates if u]
     candidates = _dedupe_preserve([u for u in candidates if u])
-
-    # apply static banlist from env
     candidates = _apply_static_banlist(candidates)
-
-    # filter dynamic bans
     candidates = [u for u in candidates if not _is_banned(u, tmono=tmono)]
     if not candidates:
         candidates = [PUBLIC_HTTP]
 
-    # sticky: if still within sticky window, return current (no probing)
     if (
         (not force_probe)
         and _CHOSEN_HTTP
@@ -663,79 +642,73 @@ async def _select_best_http(candidates: List[str], *, force_probe: bool) -> Tupl
     ):
         return _CHOSEN_HTTP, [(_CHOSEN_HTTP, True, "sticky", 0.0)]
 
-    # if we have a chosen and it's currently allowed, we can throttle probes
     if _CHOSEN_HTTP and (not force_probe):
-        chosen_norm = _normalize_http_url(_CHOSEN_HTTP)
-        if chosen_norm in candidates:
-            st = _ensure_state(chosen_norm)
-            if st.allowed(tmono):
-                # too soon since last probe? keep chosen
-                if (tmono - float(_LAST_PROBE_HTTP_MONO)) < float(pol["recheck_sec"]):
-                    _STICKY_UNTIL_HTTP_MONO = tmono + float(pol["sticky_ttl_sec"])
-                    return chosen_norm, [(chosen_norm, True, "recheck_throttled", 0.0)]
+        cur = _normalize_http_url(_CHOSEN_HTTP)
+        if cur in candidates:
+            st = _ensure_state(cur)
+            if st.allowed(tmono) and (tmono - float(_LAST_PROBE_HTTP_MONO)) < float(
+                pol["recheck_sec"]
+            ):
+                _STICKY_UNTIL_HTTP_MONO = tmono + float(pol["sticky_ttl_sec"])
+                return cur, [(cur, True, "recheck_throttled", 0.0)]
 
-    # commit probe time
     _LAST_PROBE_HTTP_MONO = tmono
 
-    # probe a capped subset (preserve env order)
-    subset = _pick_subset(candidates, int(pol["max_probe_candidates"]))
+    subset = _pick_subset(
+        candidates,
+        int(pol["max_probe_candidates"]),
+        randomize=bool(pol["randomize_subset"]) and not bool(pol["prefer_env_order"]),
+    )
+
     timeout = float(pol["probe_timeout_sec"])
     sem = asyncio.Semaphore(int(pol["probe_parallel"]))
 
-    async def _one(u: str) -> Tuple[str, bool, str, float]:
+    async def _one(u: str) -> tuple[str, bool, str, float, int | None]:
         uu = _normalize_http_url(u)
         if not uu:
-            return u, False, "bad_url", 9999.0
+            return u, False, "bad_url", 9999.0, None
         async with sem:
-            ok, ms, note = await _probe_http(uu, timeout=timeout)
-            return uu, ok, note, float(ms)
+            ok, ms, note, status = await _probe_http(uu, timeout=timeout)
+            return uu, ok, note, float(ms), status
 
     tasks = [asyncio.create_task(_one(u)) for u in subset]
-    notes: List[Tuple[str, bool, str, float]] = []
+    notes: list[tuple[str, bool, str, float]] = []
 
-    for coro in asyncio.as_completed(tasks):
-        u, ok, note, ms = await coro
-        notes.append((u, ok, note, ms))
-        if ok:
-            report_ok(u, latency_ms=ms, note=note)
-        else:
-            report_fail(u, note=note)
+    try:
+        for coro in asyncio.as_completed(tasks):
+            u, ok, note, ms, status = await coro
+            notes.append((u, ok, note, ms))
+            if ok:
+                report_ok(u, latency_ms=ms, note=note)
+            else:
+                report_fail(u, note=note, status=status)
+    finally:
+        for tsk in tasks:
+            if not tsk.done():
+                tsk.cancel()
 
-    for tsk in tasks:
-        if not tsk.done():
-            tsk.cancel()
-
-    ok_urls = [u for (u, ok, _note, _ms) in notes if ok]
-    ok_urls = _dedupe_preserve(ok_urls)
+    ok_urls = _dedupe_preserve([u for (u, ok, _note, _ms) in notes if ok])
 
     if not ok_urls:
-        # If nothing is OK, keep current if it exists in candidates; else last resort.
         if _CHOSEN_HTTP and _normalize_http_url(_CHOSEN_HTTP) in candidates:
             _STICKY_UNTIL_HTTP_MONO = tmono + float(pol["sticky_ttl_sec"])
             return _normalize_http_url(_CHOSEN_HTTP), notes
         return candidates[-1], notes
 
-    # choose highest score among OK urls
     ok_urls.sort(key=lambda u: _score_url(u, tmono), reverse=True)
     winner = ok_urls[0]
 
-    # hysteresis: avoid switching away from current unless meaningfully better
     if _CHOSEN_HTTP:
         cur = _normalize_http_url(_CHOSEN_HTTP)
-        if cur and cur in candidates:
-            cur_st = _ensure_state(cur)
-
-            if cur_st.allowed(tmono):
-                # min switch interval
-                if (tmono - float(_LAST_SWITCH_HTTP_MONO)) < float(pol["min_switch_sec"]):
+        if cur and cur in candidates and _ensure_state(cur).allowed(tmono):
+            if (tmono - float(_LAST_SWITCH_HTTP_MONO)) < float(pol["min_switch_sec"]):
+                winner = cur
+            elif winner != cur:
+                cur_score = _ensure_state(cur).score(tmono)
+                win_score = _ensure_state(winner).score(tmono)
+                margin = float(pol["hysteresis_margin"])
+                if win_score < (cur_score * (1.0 + margin)):
                     winner = cur
-                else:
-                    if winner != cur:
-                        cur_score = cur_st.score(tmono)
-                        win_score = _ensure_state(winner).score(tmono)
-                        margin = float(pol["hysteresis_margin"])
-                        if win_score < (cur_score * (1.0 + margin)):
-                            winner = cur
 
     if winner != _CHOSEN_HTTP:
         _LAST_SWITCH_HTTP_MONO = tmono
@@ -746,14 +719,12 @@ async def _select_best_http(candidates: List[str], *, force_probe: bool) -> Tupl
     return winner, notes
 
 
-async def _select_best_ws(ws_candidates: List[str], http_chosen: str, *, force_probe: bool) -> Tuple[str, List[Tuple[str, bool, str, float]]]:
-    """
-    WS endpoints are not probed via websocket handshake here (keeps it cheap).
-    Policy:
-      - If WS_URL (or SOLANA_WS_URL/HELIUS_WS_URL) explicitly set, prefer it.
-      - Else derive from chosen HTTP.
-      - Else first candidate/public.
-    """
+async def _select_best_ws(
+    ws_candidates: list[str],
+    http_chosen: str,
+    *,
+    force_probe: bool,
+) -> tuple[str, list[tuple[str, bool, str, float]]]:
     global _CHOSEN_WS, _STICKY_UNTIL_WS_MONO, _LAST_SWITCH_WS_MONO, _LAST_PROBE_WS_MONO
 
     pol = _policy()
@@ -768,7 +739,6 @@ async def _select_best_ws(ws_candidates: List[str], http_chosen: str, *, force_p
         if PUBLIC_WS not in ws_candidates:
             ws_candidates.append(PUBLIC_WS)
 
-    # sticky
     if (
         (not force_probe)
         and _CHOSEN_WS
@@ -777,7 +747,6 @@ async def _select_best_ws(ws_candidates: List[str], http_chosen: str, *, force_p
     ):
         return _CHOSEN_WS, [(_CHOSEN_WS, True, "sticky", 0.0)]
 
-    # throttle
     if _CHOSEN_WS and (not force_probe):
         if (tmono - float(_LAST_PROBE_WS_MONO)) < float(pol["recheck_sec"]):
             _STICKY_UNTIL_WS_MONO = tmono + float(pol["sticky_ttl_sec"])
@@ -785,23 +754,23 @@ async def _select_best_ws(ws_candidates: List[str], http_chosen: str, *, force_p
 
     _LAST_PROBE_WS_MONO = tmono
 
-    explicit = _normalize_ws_url(
-        _env_str(
-            "WS_URL",
-            _env_str("SOLANA_WS_URL", _env_str("SOL_WS_URL", _env_str("HELIUS_WS_URL", ""))),
-        )
+    # Explicit WS overrides (if user set them)
+    explicit = (
+        _env_str("HEALTHCHECK_WS_URL")
+        or _env_str("WS_URL")
+        or _env_str("SOLANA_WS_URL")
+        or _env_str("SOL_WS_URL")
+        or _env_str("HELIUS_WS_URL")
+        or ""
     )
+    explicit = _normalize_ws_url(explicit)
 
     if explicit and explicit in ws_candidates:
         winner = explicit
     else:
-        derived = _http_to_ws(http_chosen)
-        if derived:
-            winner = _normalize_ws_url(derived)
-        else:
-            winner = ws_candidates[0] if ws_candidates else PUBLIC_WS
+        derived = _normalize_ws_url(_http_to_ws(http_chosen)) if http_chosen else ""
+        winner = derived or (ws_candidates[0] if ws_candidates else PUBLIC_WS)
 
-    # no thrash: min switch interval for WS too
     if _CHOSEN_WS and winner != _CHOSEN_WS:
         if (tmono - float(_LAST_SWITCH_WS_MONO)) < float(pol["min_switch_sec"]):
             winner = _CHOSEN_WS
@@ -816,42 +785,45 @@ async def _select_best_ws(ws_candidates: List[str], http_chosen: str, *, force_p
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public async getters
+# Public async getters (concurrency-safe)
+#   FIXED: no nested lock / no deadlock
 # ──────────────────────────────────────────────────────────────────────────────
-async def get_http_url(force_probe: bool = False) -> str:
-    async with _LOCK:
-        candidates = gather_http_candidates()
+async def _get_http_url_locked(force_probe: bool) -> str:
+    candidates = gather_http_candidates()
     chosen, _ = await _select_best_http(candidates, force_probe=bool(force_probe))
     return chosen
 
 
-async def get_ws_url(force_probe: bool = False) -> str:
-    http_chosen = await get_http_url(force_probe=bool(force_probe))
+async def get_http_url(force_probe: bool = False) -> str:
     async with _LOCK:
+        return await _get_http_url_locked(bool(force_probe))
+
+
+async def get_ws_url(force_probe: bool = False) -> str:
+    async with _LOCK:
+        http_chosen = await _get_http_url_locked(bool(force_probe))
         ws_candidates = gather_ws_candidates()
-    ws, _ = await _select_best_ws(ws_candidates, http_chosen, force_probe=bool(force_probe))
-    return ws
+        ws, _ = await _select_best_ws(ws_candidates, http_chosen, force_probe=bool(force_probe))
+        return ws
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Backwards-compatible helpers
 # ──────────────────────────────────────────────────────────────────────────────
 async def resolve_http_first_alive(
-    candidates: Optional[List[str]] = None,
+    candidates: list[str] | None = None,
     timeout: float = 3.5,
-) -> Tuple[str, List[Tuple[str, bool, str]]]:
-    """
-    Backwards compatible: returns (chosen_url, notes)
-    notes: list[(url, ok, why)]
-    """
+) -> tuple[str, list[tuple[str, bool, str]]]:
     if candidates is None:
         candidates = gather_http_candidates()
 
-    # Temporarily honor provided timeout via env override for probe only.
     old = os.getenv("RPC_PROBE_TIMEOUT_SEC")
     os.environ["RPC_PROBE_TIMEOUT_SEC"] = str(timeout)
     try:
-        chosen, notes4 = await _select_best_http([_normalize_http_url(u) for u in candidates], force_probe=True)
+        async with _LOCK:
+            chosen, notes4 = await _select_best_http(
+                [_normalize_http_url(u) for u in candidates], force_probe=True
+            )
         notes3 = [(u, ok, why) for (u, ok, why, _ms) in notes4]
         return chosen, notes3
     finally:
@@ -862,46 +834,43 @@ async def resolve_http_first_alive(
 
 
 def pick_http_url_sync(timeout: float = 3.5) -> str:
-    """
-    Sync helper (avoid using inside an event loop).
-    """
     try:
         _ = asyncio.get_running_loop()
-        raise RuntimeError("pick_http_url_sync called inside running event loop; use await get_http_url()")
+        raise RuntimeError(
+            "pick_http_url_sync called inside running event loop; use await get_http_url()"
+        )
     except RuntimeError as e:
         if "no running event loop" not in str(e).lower():
             raise
-    return asyncio.run(get_http_url(force_probe=True))
+    old = os.getenv("RPC_PROBE_TIMEOUT_SEC")
+    os.environ["RPC_PROBE_TIMEOUT_SEC"] = str(timeout)
+    try:
+        return asyncio.run(get_http_url(force_probe=True))
+    finally:
+        if old is None:
+            os.environ.pop("RPC_PROBE_TIMEOUT_SEC", None)
+        else:
+            os.environ["RPC_PROBE_TIMEOUT_SEC"] = old
 
 
 async def apply_failover_to_env(
-    timeout_s: Optional[float] = None,
-    timeout: Optional[float] = None,
+    timeout_s: float | None = None,
+    timeout: float | None = None,
     *,
     env=os.environ,
-) -> Tuple[str, Any]:
-    """
-    Picks best HTTP and writes env["RPC_URL"] + env["SOL_RPC_URL"] (and best-effort WS_URL).
-    Returns (chosen, notes). Notes are backwards compatible with older callers (list-of-tuples),
-    plus extra diagnostics in a dict if you want them.
-    """
-    # accept either arg name
+) -> tuple[str, Any]:
     to = float(timeout_s if timeout_s is not None else (timeout if timeout is not None else 3.5))
-
     chosen, notes3 = await resolve_http_first_alive(timeout=to)
 
-    # write both common names for downstream compatibility
     env["RPC_URL"] = str(chosen)
     env["SOL_RPC_URL"] = str(chosen)
 
-    # best-effort WS update (cheap, no probing)
     ws = ""
     with contextlib.suppress(Exception):
         ws = await get_ws_url(force_probe=True)
         if ws:
             env["WS_URL"] = str(ws)
 
-    # include richer notes without breaking old consumers
     rich = {
         "chosen_http": chosen,
         "chosen_ws": ws or None,
@@ -914,18 +883,22 @@ async def apply_failover_to_env(
 # ──────────────────────────────────────────────────────────────────────────────
 # Diagnostics
 # ──────────────────────────────────────────────────────────────────────────────
-def stats() -> Dict[str, Any]:
+def stats() -> dict[str, Any]:
     pol = _policy()
     tmono = _mono()
 
-    states: Dict[str, Any] = {}
+    states: dict[str, Any] = {}
     for u, s in _STATES.items():
         states[u] = {
             "ewma_ms": float(s.ewma_ms),
             "ok": int(s.ok_count),
             "fail": int(s.fail_count),
-            "last_ok_age_s": (None if s.last_ok_mono <= 0 else float(max(0.0, tmono - s.last_ok_mono))),
-            "last_fail_age_s": (None if s.last_fail_mono <= 0 else float(max(0.0, tmono - s.last_fail_mono))),
+            "last_ok_age_s": (
+                None if s.last_ok_mono <= 0 else float(max(0.0, tmono - s.last_ok_mono))
+            ),
+            "last_fail_age_s": (
+                None if s.last_fail_mono <= 0 else float(max(0.0, tmono - s.last_fail_mono))
+            ),
             "cooldown_left_s": float(max(0.0, s.cooldown_until_mono - tmono)),
             "eject_left_s": float(max(0.0, s.eject_until_mono - tmono)),
             "note": s.note,
@@ -933,7 +906,10 @@ def stats() -> Dict[str, Any]:
             "banned": bool(_is_banned(u, tmono=tmono)),
         }
 
-    bans = {u: {"reason": b.reason, "ttl_left_s": float(max(0.0, b.until_mono - tmono))} for u, b in _BANS.items()}
+    bans = {
+        u: {"reason": b.reason, "ttl_left_s": float(max(0.0, b.until_mono - tmono))}
+        for u, b in _BANS.items()
+    }
 
     return {
         "policy": pol,
@@ -941,10 +917,18 @@ def stats() -> Dict[str, Any]:
         "chosen_ws": _CHOSEN_WS,
         "sticky_left_http_s": float(max(0.0, _STICKY_UNTIL_HTTP_MONO - tmono)),
         "sticky_left_ws_s": float(max(0.0, _STICKY_UNTIL_WS_MONO - tmono)),
-        "last_switch_http_age_s": (None if _LAST_SWITCH_HTTP_MONO <= 0 else float(max(0.0, tmono - _LAST_SWITCH_HTTP_MONO))),
-        "last_switch_ws_age_s": (None if _LAST_SWITCH_WS_MONO <= 0 else float(max(0.0, tmono - _LAST_SWITCH_WS_MONO))),
-        "last_probe_http_age_s": (None if _LAST_PROBE_HTTP_MONO <= 0 else float(max(0.0, tmono - _LAST_PROBE_HTTP_MONO))),
-        "last_probe_ws_age_s": (None if _LAST_PROBE_WS_MONO <= 0 else float(max(0.0, tmono - _LAST_PROBE_WS_MONO))),
+        "last_switch_http_age_s": (
+            None if _LAST_SWITCH_HTTP_MONO <= 0 else float(max(0.0, tmono - _LAST_SWITCH_HTTP_MONO))
+        ),
+        "last_switch_ws_age_s": (
+            None if _LAST_SWITCH_WS_MONO <= 0 else float(max(0.0, tmono - _LAST_SWITCH_WS_MONO))
+        ),
+        "last_probe_http_age_s": (
+            None if _LAST_PROBE_HTTP_MONO <= 0 else float(max(0.0, tmono - _LAST_PROBE_HTTP_MONO))
+        ),
+        "last_probe_ws_age_s": (
+            None if _LAST_PROBE_WS_MONO <= 0 else float(max(0.0, tmono - _LAST_PROBE_WS_MONO))
+        ),
         "states": states,
         "bans": bans,
         "ts": _wall(),
@@ -954,17 +938,17 @@ def stats() -> Dict[str, Any]:
 __all__ = [
     "PUBLIC_HTTP",
     "PUBLIC_WS",
+    "apply_failover_to_env",
+    "ban",
+    "close_http",
     "gather_http_candidates",
     "gather_ws_candidates",
     "get_http_url",
     "get_ws_url",
-    "resolve_http_first_alive",
     "pick_http_url_sync",
-    "apply_failover_to_env",
-    "report_ok",
     "report_fail",
-    "ban",
-    "unban",
+    "report_ok",
+    "resolve_http_first_alive",
     "stats",
-    "close_http",
+    "unban",
 ]

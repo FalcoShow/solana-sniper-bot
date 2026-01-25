@@ -1,0 +1,72 @@
+﻿diff --git a/scripts/main.py b/scripts/main.py
+--- a/scripts/main.py
++++ b/scripts/main.py
+@@
+ def _json_dumps(x: Any, max_len: int = 250_000) -> str:
+     try:
+         s = json.dumps(x, ensure_ascii=False, separators=(",", ":"), default=str)
+         return (s[:max_len] + "…") if len(s) > max_len else s
+     except Exception:
+         return "{}"
+
++def _hash_prefix(seed: str, n: int = 12) -> str:
++    """
++    Deterministic non-crypto hash for IDs (run_id/trace_id).
++    Uses blake2s to avoid any sha1-related security lint noise.
++    """
++    nn = max(4, int(n))
++    # hexdigest length is 2*digest_size; ensure we can slice nn hex chars
++    digest_size = max(1, min(32, (nn + 1) // 2))
++    h = hashlib.blake2s(seed.encode("utf-8", "ignore"), digest_size=digest_size)
++    return h.hexdigest()[:nn]
++
+@@
+ def _trace_id_for(mint: str, source: str, ui: JSONDict, ts: float, run_id: str) -> str:
+     seed = f"{mint}|{source}|{ui.get('pair') or ui.get('pairAddress') or ''}|{int(ts)}|{run_id}"
+-    return hashlib.sha1(seed.encode("utf-8", "ignore")).hexdigest()[:12]
++    return _hash_prefix(seed, 12)
+
+@@
+ async def _run_preflight_if_enabled(run_id: str) -> None:
+-    if not _envb("RUN_PREFLIGHT_IN_MAIN", False):
++    def _should_run_preflight_in_main() -> bool:
++        # Explicit override wins
++        if os.getenv("RUN_PREFLIGHT_IN_MAIN") is not None:
++            return _envb("RUN_PREFLIGHT_IN_MAIN", False)
++        # Never run preflight implicitly during tests / safe-mode
++        if _envb("SAFE_MODE", False) or os.getenv("PYTEST_CURRENT_TEST"):
++            return False
++        # Default-on in Render/prod; opt-in locally via MAIN_RUN_PREFLIGHT_DEFAULT=1
++        return _is_render() or _envb("MAIN_RUN_PREFLIGHT_DEFAULT", False)
++
++    if not _should_run_preflight_in_main():
+         return
+     if not _module_exists("scripts.preflight"):
+         log.event("PREFLIGHT_MISSING", run_id=run_id)
+         if _fast_fail():
+             raise RuntimeError("scripts.preflight missing")
+         return
+
+     exe = sys.executable or "python"
+     args = [exe, "-m", "scripts.preflight"]
+-    if _envb("PREFLIGHT_STRICT", False):
++    # In Render/prod, strict-by-default unless explicitly disabled.
++    if _envb("PREFLIGHT_STRICT", _is_render()):
+         args.append("--strict")
+     if _envb("PREFLIGHT_JSON", False):
+         args.append("--json")
+@@
+ async def main(stop_evt: asyncio.Event | None = None) -> None:
+@@
+     if not RUN_ID or _envb("MAIN_FORCE_NEW_RUN_ID", True):
+         base = f"{time.time()}|{os.getpid()}|{socket.gethostname()}|{random.random()}"
+         RUN_ID = (
+-            os.getenv("RUN_ID", "") or hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()[:10]
++            os.getenv("RUN_ID", "") or _hash_prefix(base, 10)
+         ).strip()
+
+     if not _JITTER_DISABLED:
+         with contextlib.suppress(Exception):
+-            seed = int(hashlib.sha1(RUN_ID.encode("utf-8", "ignore")).hexdigest()[:8], 16)
++            seed = int(_hash_prefix(RUN_ID, 8), 16)
+             random.seed(seed)

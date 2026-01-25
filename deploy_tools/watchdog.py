@@ -1,38 +1,685 @@
 #!/usr/bin/env python3
-import re, subprocess, time, os, sys
+from __future__ import annotations
 
-LOGFILE = "/tmp/sniper_live.out"   # where start.sh logs to (see go_live.sh)
-BACKUP = "/opt/render/project/src/.env.bak.last"  # set as created by your go_live flow
-ROLLBACK_SCRIPT = "/opt/render/project/src/deploy_tools/rollback.sh"
-PATTERNS = [
-    (re.compile(r'JUP_BREAKER_RESET'), 3, 60),   # 3 occurrences within 60s -> rollback
-    (re.compile(r'ROUTEGUARD_RESET|ROUTEGUARD_MAX_IMPACT_BPS'), 2, 40),
-    (re.compile(r'quote.*error|QuoteError|no route'), 5, 120),
-]
+"""
+deploy_tools/watchdog.py — V3+++ Watchdog (LOCK-IN)
+===================================================
 
-def tail(file):
-    p = subprocess.Popen(['tail','-n','0','-F', file], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return p
+Goal:
+  Detect "stuck loops" and repeated failure patterns, then take safe action:
+    - restart (default)
+    - rollback + restart (optional if a backup is available)
 
-def main():
-    if not os.path.exists(LOGFILE):
-        print("Logfile not found:", LOGFILE); sys.exit(1)
-    p = tail(LOGFILE)
-    window = []
-    while True:
-        line = p.stdout.readline()
+Key design points:
+  - No external Python deps
+  - Safe process control via PIDFILE (no pkill -f)
+  - Log tailing implemented in-process (handles rotation/truncation)
+  - Actions are rate-limited + protected by a lock
+  - Optional Telegram notifications (NO hardcoded secrets)
+  - Render + local friendly paths:
+        .run/sniper.pid
+        /tmp/sniper_live.out (or .run/sniper_live.out)
+
+Configuration:
+  Environment variables (all optional):
+    WATCHDOG_LOGFILE=/tmp/sniper_live.out
+    WATCHDOG_PIDFILE=<repo>/.run/sniper.pid
+    WATCHDOG_START_SH=<repo>/start.sh
+    WATCHDOG_OUTFILE=<repo>/.run/sniper_live.out
+    WATCHDOG_BACKUP=<path to env backup for rollback> (optional)
+    WATCHDOG_ROLLBACK_SH=<repo>/deploy_tools/rollback.sh
+    WATCHDOG_DRYRUN=1
+    WATCHDOG_COOLDOWN_S=120
+    WATCHDOG_MAX_ACTIONS=3
+    WATCHDOG_MAX_ACTIONS_WINDOW_S=900
+    WATCHDOG_STALL_S=300
+    WATCHDOG_PROGRESS_REGEX=<regex>     (default is sane)
+    WATCHDOG_ERROR_RULES=<semicolon separated rules>
+        Example:
+          "JUP_BREAKER_RESET|rollback|3|60;ROUTEGUARD_RESET|restart|2|40"
+        Format per rule:
+          <regex>|<action>|<count>|<seconds>
+        action: restart | rollback
+
+    WATCHDOG_POLL_S=0.25               (how often to poll when no new log lines)
+
+  Telegram (optional):
+    TELEGRAM_BOT_TOKEN=...
+    TELEGRAM_CHAT_ID=...
+
+Run:
+  python deploy_tools/watchdog.py
+"""
+
+import contextlib
+import errno
+import logging
+import os
+import pathlib
+import re
+import signal
+import subprocess
+import time
+from collections import deque
+from dataclasses import dataclass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────────────
+def _utc_ts() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _setup_logging() -> logging.Logger:
+    lvl = os.getenv("WATCHDOG_LOGLEVEL", "INFO").upper().strip() or "INFO"
+    logging.basicConfig(
+        level=getattr(logging, lvl, logging.INFO),
+        format="[watchdog] %(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    )
+    # force UTC timestamps
+    logging.Formatter.converter = time.gmtime  # type: ignore[attr-defined]
+    return logging.getLogger("watchdog")
+
+
+LOG = _setup_logging()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class Rule:
+    pattern: re.Pattern[str]
+    action: str  # "restart" | "rollback"
+    count: int
+    window_s: int
+
+
+@dataclass(frozen=True)
+class Config:
+    repo_root: pathlib.Path
+    run_dir: pathlib.Path
+
+    logfile: pathlib.Path
+    pidfile: pathlib.Path
+    start_sh: pathlib.Path
+    outfile: pathlib.Path
+
+    rollback_sh: pathlib.Path
+    backup_path: pathlib.Path | None
+
+    dryrun: bool
+    cooldown_s: int
+
+    max_actions: int
+    max_actions_window_s: int
+
+    stall_s: int
+    progress_regex: re.Pattern[str]
+
+    rules: list[Rule]
+
+    poll_s: float
+
+    telegram_bot_token: str
+    telegram_chat_id: str
+
+
+def _truthy(v: str) -> bool:
+    return (v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _parse_rules(spec: str) -> list[Rule]:
+    """
+    WATCHDOG_ERROR_RULES format:
+      "REGEX|ACTION|COUNT|SECONDS;REGEX|ACTION|COUNT|SECONDS;..."
+
+    Example:
+      "JUP_BREAKER_RESET|rollback|3|60;ROUTEGUARD_RESET|restart|2|40"
+    """
+    rules: list[Rule] = []
+    spec = (spec or "").strip()
+    if not spec:
+        # safe defaults (explicit actions)
+        defaults = [
+            (r"JUP_BREAKER_RESET", "rollback", 3, 60),
+            (r"ROUTEGUARD_RESET|ROUTEGUARD_MAX_IMPACT_BPS", "restart", 2, 40),
+            (r"\bquote\b.*\berror\b|QuoteError|no route", "restart", 5, 120),
+        ]
+        for rx, act, n, s in defaults:
+            rules.append(Rule(re.compile(rx), act, int(n), int(s)))
+        return rules
+
+    for chunk in spec.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [p.strip() for p in chunk.split("|")]
+        if len(parts) != 4:
+            raise ValueError(f"Bad WATCHDOG_ERROR_RULES rule: {chunk!r}")
+        rx, act, n, sec = parts
+        act = act.lower()
+        if act not in {"restart", "rollback"}:
+            raise ValueError(f"Rule action must be restart/rollback, got: {act!r}")
+        rules.append(Rule(re.compile(rx), act, int(n), int(sec)))
+    return rules
+
+
+def _resolve_path(repo_root: pathlib.Path, p: str) -> pathlib.Path:
+    """
+    If env gives a relative path, anchor it at repo_root for predictability.
+    """
+    path = pathlib.Path(p)
+    if not path.is_absolute():
+        return (repo_root / path).resolve()
+    return path
+
+
+def load_config() -> Config:
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    run_dir = _resolve_path(repo_root, os.getenv("RUN_DIR", str(repo_root / ".run")))
+
+    logfile = _resolve_path(repo_root, os.getenv("WATCHDOG_LOGFILE", "/tmp/sniper_live.out"))
+    pidfile = _resolve_path(repo_root, os.getenv("WATCHDOG_PIDFILE", str(run_dir / "sniper.pid")))
+    start_sh = _resolve_path(repo_root, os.getenv("WATCHDOG_START_SH", str(repo_root / "start.sh")))
+    outfile = _resolve_path(
+        repo_root, os.getenv("WATCHDOG_OUTFILE", str(run_dir / "sniper_live.out"))
+    )
+
+    rollback_sh = _resolve_path(
+        repo_root,
+        os.getenv("WATCHDOG_ROLLBACK_SH", str(repo_root / "deploy_tools" / "rollback.sh")),
+    )
+    backup_raw = (os.getenv("WATCHDOG_BACKUP", "") or "").strip()
+    backup_path = _resolve_path(repo_root, backup_raw) if backup_raw else None
+
+    dryrun = _truthy(os.getenv("WATCHDOG_DRYRUN", "0"))
+    cooldown_s = int(float(os.getenv("WATCHDOG_COOLDOWN_S", "120") or "120"))
+
+    max_actions = int(float(os.getenv("WATCHDOG_MAX_ACTIONS", "3") or "3"))
+    max_actions_window_s = int(float(os.getenv("WATCHDOG_MAX_ACTIONS_WINDOW_S", "900") or "900"))
+
+    stall_s = int(float(os.getenv("WATCHDOG_STALL_S", "300") or "300"))
+
+    progress_spec = (os.getenv("WATCHDOG_PROGRESS_REGEX", "") or "").strip()
+    if not progress_spec:
+        # "progress" means the bot is alive and doing work (tune to your logs)
+        progress_spec = r"scanner|SCAN|candidate|on_new_token|on_trade|heartbeat|tick|loop|processed|RAY_META|PF_"
+    progress_regex = re.compile(progress_spec, re.IGNORECASE)
+
+    rules = _parse_rules(os.getenv("WATCHDOG_ERROR_RULES", ""))
+
+    poll_s = float(os.getenv("WATCHDOG_POLL_S", "0.25") or "0.25")
+    poll_s = max(0.05, min(5.0, poll_s))
+
+    tg_token = (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
+    tg_chat = (os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
+
+    return Config(
+        repo_root=repo_root,
+        run_dir=run_dir,
+        logfile=logfile,
+        pidfile=pidfile,
+        start_sh=start_sh,
+        outfile=outfile,
+        rollback_sh=rollback_sh,
+        backup_path=backup_path,
+        dryrun=dryrun,
+        cooldown_s=cooldown_s,
+        max_actions=max_actions,
+        max_actions_window_s=max_actions_window_s,
+        stall_s=stall_s,
+        progress_regex=progress_regex,
+        rules=rules,
+        poll_s=poll_s,
+        telegram_bot_token=tg_token,
+        telegram_chat_id=tg_chat,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Telegram (optional) — uses curl if present, never required
+# ──────────────────────────────────────────────────────────────────────────────
+def tg_send(cfg: Config, msg: str) -> None:
+    if not cfg.telegram_bot_token or not cfg.telegram_chat_id:
+        return
+    with contextlib.suppress(Exception):
+        subprocess.run(
+            [
+                "curl",
+                "-sS",
+                "-X",
+                "POST",
+                f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage",
+                "-d",
+                f"chat_id={cfg.telegram_chat_id}",
+                "-d",
+                f"text={msg}",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PIDFILE-based process control
+# ──────────────────────────────────────────────────────────────────────────────
+def read_pid(pidfile: pathlib.Path) -> int | None:
+    try:
+        raw = pidfile.read_text(encoding="utf-8").strip()
+        if not raw:
+            return None
+        return int(raw)
+    except Exception:
+        return None
+
+
+def pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _kill_pid(pid: int, sig: int) -> None:
+    with contextlib.suppress(Exception):
+        os.kill(pid, sig)
+
+
+def stop_via_pidfile(pidfile: pathlib.Path, timeout_s: float = 3.0) -> None:
+    pid = read_pid(pidfile)
+    if not pid:
+        return
+    if not pid_is_alive(pid):
+        with contextlib.suppress(Exception):
+            pidfile.unlink()
+        return
+
+    LOG.warning("Stopping existing process pid=%s (pidfile=%s)", pid, pidfile)
+
+    # Graceful
+    with contextlib.suppress(Exception):
+        _kill_pid(pid, signal.SIGTERM)
+
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        if not pid_is_alive(pid):
+            break
+        time.sleep(0.15)
+
+    # Hard
+    if pid_is_alive(pid):
+        LOG.error("Process did not stop on SIGTERM; forcing kill pid=%s", pid)
+        with contextlib.suppress(Exception):
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                _kill_pid(pid, signal.SIGKILL)
+
+    with contextlib.suppress(Exception):
+        pidfile.unlink()
+
+
+def start_background(start_sh: pathlib.Path, outfile: pathlib.Path, pidfile: pathlib.Path) -> int:
+    if not start_sh.exists():
+        raise FileNotFoundError(f"start.sh not found at {start_sh}")
+
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    pidfile.parent.mkdir(parents=True, exist_ok=True)
+
+    # Detach group on unix
+    kwargs: dict[str, object] = {}
+    if os.name != "nt":
+        kwargs["preexec_fn"] = os.setsid  # type: ignore[assignment]
+
+    with open(outfile, "a", encoding="utf-8") as out:
+        p = subprocess.Popen(
+            ["bash", str(start_sh)],
+            stdout=out,
+            stderr=out,
+            cwd=str(start_sh.parent),
+            env=os.environ.copy(),
+            **kwargs,
+        )
+
+    pidfile.write_text(str(p.pid), encoding="utf-8")
+    return p.pid
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Locking for actions
+# ──────────────────────────────────────────────────────────────────────────────
+class ActionLock:
+    """
+    Simple lockfile using O_EXCL to prevent concurrent restarts/rollbacks.
+    """
+
+    def __init__(self, path: pathlib.Path) -> None:
+        self.path = path
+        self.fd: int | None = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(self.fd, f"ts={_utc_ts()} pid={os.getpid()}\n".encode())
+            return True
+        except OSError as err:
+            if err.errno == errno.EEXIST:
+                return False
+            raise
+
+    def release(self) -> None:
+        try:
+            if self.fd is not None:
+                os.close(self.fd)
+        except Exception:
+            pass
+        try:
+            if self.path.exists():
+                self.path.unlink()
+        except Exception:
+            pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Log tailer (rotation/truncation-safe)
+# ──────────────────────────────────────────────────────────────────────────────
+class Tailer:
+    def __init__(self, path: pathlib.Path) -> None:
+        self.path = path
+        self.f = None
+        self._inode = None
+        self._pos = 0
+
+    def _open(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(self.path, encoding="utf-8", errors="replace")
+        st = os.fstat(self.f.fileno())
+        self._inode = (st.st_ino, st.st_dev)
+        self.f.seek(0, os.SEEK_END)
+        self._pos = self.f.tell()
+
+    def _needs_reopen(self) -> bool:
+        try:
+            st = self.path.stat()
+            cur_inode = (st.st_ino, st.st_dev)
+            # inode changed => rotated/replaced
+            if self._inode is not None and cur_inode != self._inode:
+                return True
+            # truncated => reopen and seek end
+            if st.st_size < self._pos:
+                return True
+            return False
+        except FileNotFoundError:
+            return True
+        except Exception:
+            return False
+
+    def readline(self) -> str | None:
+        if self.f is None:
+            if self.path.exists():
+                self._open()
+            else:
+                return None
+
+        if self._needs_reopen():
+            with contextlib.suppress(Exception):
+                self.f.close()
+            self.f = None
+            self._inode = None
+            self._pos = 0
+            return None
+
+        line = self.f.readline()
         if not line:
-            time.sleep(0.1); continue
+            return None
+        self._pos = self.f.tell()
+        return line.rstrip("\n")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Policy / state
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class Event:
+    ts: float
+    line: str
+
+
+def find_latest_env_backup(repo_root: pathlib.Path) -> pathlib.Path | None:
+    """
+    Prefer a newest .env.bak.* in repo root if WATCHDOG_BACKUP isn't set.
+    """
+    candidates = list(repo_root.glob(".env.bak.*"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _prune_times(q: deque[float], window_s: int) -> None:
+    now = time.time()
+    while q and (now - q[0]) > float(window_s):
+        q.popleft()
+
+
+def too_many_actions(action_times: deque[float], cfg: Config) -> bool:
+    _prune_times(action_times, cfg.max_actions_window_s)
+    return len(action_times) >= cfg.max_actions
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Actions (lock-safe, no deadlocks)
+# ──────────────────────────────────────────────────────────────────────────────
+def _restart_unlocked(cfg: Config, reason: str) -> None:
+    stop_via_pidfile(cfg.pidfile)
+    pid = start_background(cfg.start_sh, cfg.outfile, cfg.pidfile)
+    LOG.warning("Restarted pid=%s reason=%s", pid, reason)
+
+
+def do_restart(cfg: Config, reason: str) -> None:
+    LOG.error("ACTION=restart reason=%s", reason)
+    tg_send(cfg, f"[WATCHDOG] restart: {reason}")
+
+    if cfg.dryrun:
+        LOG.warning("DRYRUN=1 -> not restarting")
+        return
+
+    lock = ActionLock(cfg.run_dir / "watchdog.action.lock")
+    if not lock.acquire():
+        LOG.warning("Action lock already held; skipping restart")
+        return
+
+    try:
+        _restart_unlocked(cfg, reason=reason)
+    finally:
+        lock.release()
+
+
+def _rollback_unlocked(cfg: Config, reason: str) -> None:
+    backup = cfg.backup_path or find_latest_env_backup(cfg.repo_root)
+    if backup is None or not backup.exists():
+        LOG.error("No backup available for rollback; fallback to restart")
+        _restart_unlocked(cfg, reason=f"{reason} (no backup)")
+        return
+
+    if not cfg.rollback_sh.exists():
+        LOG.error("rollback.sh missing at %s; fallback to restart", cfg.rollback_sh)
+        _restart_unlocked(cfg, reason=f"{reason} (rollback.sh missing)")
+        return
+
+    env = os.environ.copy()
+    env.setdefault("RESTART", "1")
+    LOG.error("Calling rollback.sh backup=%s", backup)
+    subprocess.run(["bash", str(cfg.rollback_sh), str(backup)], env=env, check=False)
+
+
+def do_rollback(cfg: Config, reason: str) -> None:
+    LOG.error("ACTION=rollback reason=%s", reason)
+    tg_send(cfg, f"[WATCHDOG] rollback: {reason}")
+
+    if cfg.dryrun:
+        LOG.warning("DRYRUN=1 -> not rolling back")
+        return
+
+    lock = ActionLock(cfg.run_dir / "watchdog.action.lock")
+    if not lock.acquire():
+        LOG.warning("Action lock already held; skipping rollback")
+        return
+
+    try:
+        _rollback_unlocked(cfg, reason=reason)
+    finally:
+        lock.release()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main loop
+# ──────────────────────────────────────────────────────────────────────────────
+def main() -> int:
+    cfg = load_config()
+    cfg.run_dir.mkdir(parents=True, exist_ok=True)
+
+    LOG.info("repo_root=%s", cfg.repo_root)
+    LOG.info("logfile=%s", cfg.logfile)
+    LOG.info("pidfile=%s", cfg.pidfile)
+    LOG.info("start_sh=%s", cfg.start_sh)
+    LOG.info("outfile=%s", cfg.outfile)
+    LOG.info("rollback_sh=%s", cfg.rollback_sh)
+    LOG.info("backup=%s", str(cfg.backup_path) if cfg.backup_path else "(auto)")
+    LOG.info(
+        "dryrun=%s cooldown_s=%s stall_s=%s poll_s=%s",
+        cfg.dryrun,
+        cfg.cooldown_s,
+        cfg.stall_s,
+        cfg.poll_s,
+    )
+
+    tailer = Tailer(cfg.logfile)
+
+    # Recent events window (kept for debugging; not used for counting anymore)
+    window: deque[Event] = deque(maxlen=5000)
+
+    # Action throttling
+    action_times: deque[float] = deque()
+    last_action_at = 0.0
+
+    # Per-rule hit timestamps (fast O(1) checks)
+    rule_hits: list[deque[float]] = [deque() for _ in cfg.rules]
+
+    # Progress tracking
+    last_progress_at: float | None = None
+
+    # If logfile doesn't exist yet, wait
+    while not cfg.logfile.exists():
+        LOG.warning("Waiting for logfile to appear: %s", cfg.logfile)
+        time.sleep(1.0)
+
+    LOG.info("Watchdog running…")
+
+    while True:
+        line = tailer.readline()
         now = time.time()
-        window.append((now, line))
-        # expire
-        window = [(t,l) for (t,l) in window if now - t < 180]
-        for pattern, count, secs in PATTERNS:
-            matches = [1 for (t,l) in window if pattern.search(l) and now - t < secs]
-            if len(matches) >= count:
-                print("ALARM: pattern", pattern.pattern, "seen", len(matches), "times; triggering rollback")
-                subprocess.call([ROLLBACK_SCRIPT, BACKUP])
-                sys.exit(0)
+
+        if line is None:
+            time.sleep(cfg.poll_s)
+
+            # If pidfile exists but process is dead -> restart quickly
+            pid = read_pid(cfg.pidfile)
+            if pid and not pid_is_alive(pid):
+                if now - last_action_at >= cfg.cooldown_s:
+                    if not too_many_actions(action_times, cfg):
+                        action_times.append(now)
+                        last_action_at = now
+                        do_restart(cfg, reason="pidfile process not alive")
+                continue
+
+            # Stall detection
+            if last_progress_at is not None:
+                age = now - last_progress_at
+                if age >= cfg.stall_s:
+                    if now - last_action_at >= cfg.cooldown_s:
+                        if too_many_actions(action_times, cfg):
+                            LOG.error("STALL detected but throttled. age_s=%.1f", age)
+                            tg_send(cfg, f"[WATCHDOG] stall throttled: no progress for {int(age)}s")
+                        else:
+                            action_times.append(now)
+                            last_action_at = now
+                            do_restart(
+                                cfg,
+                                reason=(
+                                    f"stall: no progress for {int(age)}s "
+                                    f"(regex={cfg.progress_regex.pattern})"
+                                ),
+                            )
+                continue
+
+            continue
+
+        # got a line
+        window.append(Event(ts=now, line=line))
+
+        # progress update
+        if cfg.progress_regex.search(line):
+            last_progress_at = now
+
+        # rule hit update
+        triggered_action: str | None = None
+        triggered_reason: str | None = None
+
+        for idx, rule in enumerate(cfg.rules):
+            if rule.pattern.search(line):
+                hits = rule_hits[idx]
+                hits.append(now)
+                # prune older than window
+                while hits and (now - hits[0]) > float(rule.window_s):
+                    hits.popleft()
+                if len(hits) >= rule.count:
+                    triggered_action = rule.action
+                    triggered_reason = (
+                        f"rule={rule.pattern.pattern} hits>={rule.count} in {rule.window_s}s"
+                    )
+                    break
+
+        if triggered_action is None:
+            continue
+
+        # cooldown / max-actions gating
+        if now - last_action_at < cfg.cooldown_s:
+            LOG.warning("Rule matched but in cooldown: %s", triggered_reason)
+            continue
+
+        if too_many_actions(action_times, cfg):
+            LOG.error("Rule matched but throttled (too many actions): %s", triggered_reason)
+            tg_send(cfg, f"[WATCHDOG] throttled: {triggered_reason}")
+            continue
+
+        action_times.append(now)
+        last_action_at = now
+
+        if triggered_action == "rollback":
+            do_rollback(cfg, reason=triggered_reason or "rule")
+        else:
+            do_restart(cfg, reason=triggered_reason or "rule")
+
+    # unreachable
+    # return 0
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        LOG.warning("KeyboardInterrupt -> exit")
+        # B904: explicitly suppress the exception context/cause
+        raise SystemExit(0) from None

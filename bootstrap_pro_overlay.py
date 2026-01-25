@@ -36,18 +36,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
 
 # third-party
 try:
-    from dotenv import load_dotenv, find_dotenv
+    from dotenv import find_dotenv, load_dotenv
 except Exception:
     load_dotenv = None
     find_dotenv = None
@@ -113,8 +110,8 @@ class CheckResult:
 # ---------------------------
 # Env validation
 # ---------------------------
-def validate_env() -> List[CheckResult]:
-    out: List[CheckResult] = []
+def validate_env() -> list[CheckResult]:
+    out: list[CheckResult] = []
 
     # Wallet
     wp = os.getenv("WALLET_PUBKEY", "")
@@ -124,7 +121,9 @@ def validate_env() -> List[CheckResult]:
 
     # RPC
     rpc = os.getenv("HELIUS_RPC_URL", "") or os.getenv("RPC_URL", "")
-    out.append(CheckResult("HELIUS_RPC_URL/RPC_URL", bool(rpc), f"value={'set' if rpc else 'missing'}"))
+    out.append(
+        CheckResult("HELIUS_RPC_URL/RPC_URL", bool(rpc), f"value={'set' if rpc else 'missing'}")
+    )
 
     # Redis
     red_url = os.getenv("REDIS_URL", "")
@@ -148,21 +147,41 @@ def validate_env() -> List[CheckResult]:
     # Notion
     notion_key = os.getenv("NOTION_API_KEY", "")
     notion_db = os.getenv("NOTION_DB_TRADES", "")
-    out.append(CheckResult("NOTION_API_KEY", True, f"value={'set' if notion_key else 'missing (ok if disabled)'}"))
-    out.append(CheckResult("NOTION_DB_TRADES", True, f"value={'set' if notion_db else 'missing (ok if disabled)'}"))
+    out.append(
+        CheckResult(
+            "NOTION_API_KEY", True, f"value={'set' if notion_key else 'missing (ok if disabled)'}"
+        )
+    )
+    out.append(
+        CheckResult(
+            "NOTION_DB_TRADES", True, f"value={'set' if notion_db else 'missing (ok if disabled)'}"
+        )
+    )
 
     # Telegram
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     tg_chat = os.getenv("TELEGRAM_CHAT_ID", "")
-    out.append(CheckResult("TELEGRAM_BOT_TOKEN", True, f"value={'set' if tg_token else 'missing (ok if disabled)'}"))
-    out.append(CheckResult("TELEGRAM_CHAT_ID", True, f"value={'set' if tg_chat else 'missing (ok if disabled)'}"))
+    out.append(
+        CheckResult(
+            "TELEGRAM_BOT_TOKEN", True, f"value={'set' if tg_token else 'missing (ok if disabled)'}"
+        )
+    )
+    out.append(
+        CheckResult(
+            "TELEGRAM_CHAT_ID", True, f"value={'set' if tg_chat else 'missing (ok if disabled)'}"
+        )
+    )
 
     # Jupiter
     out.append(CheckResult("JUPITER v6", True, "public; no API key required"))
 
     # OpenAI (optional)
     openai_key = os.getenv("OPENAI_API_KEY", "")
-    out.append(CheckResult("OPENAI_API_KEY", True, f"value={'set' if openai_key else 'missing (ok if disabled)'}"))
+    out.append(
+        CheckResult(
+            "OPENAI_API_KEY", True, f"value={'set' if openai_key else 'missing (ok if disabled)'}"
+        )
+    )
 
     return out
 
@@ -293,7 +312,15 @@ async def notion_db_check(session: aiohttp.ClientSession, timeout: int = 12) -> 
             props = (data.get("properties") or {}).keys()
             # expected props (configurable via env mapping)
             title_prop = os.getenv("NOTION_TITLE_PROP", "Token")
-            req = {title_prop, "Mint", "Entry Price", "Current Price", "Profit", "Reason", "Timestamp"}
+            req = {
+                title_prop,
+                "Mint",
+                "Entry Price",
+                "Current Price",
+                "Profit",
+                "Reason",
+                "Timestamp",
+            }
             missing = [p for p in req if p not in props]
             if missing:
                 return CheckResult("Notion DB", False, f"missing properties: {', '.join(missing)}")
@@ -316,8 +343,7 @@ def check_telegram_format() -> CheckResult:
 # Render README helper
 # ---------------------------
 RENDER_START = (
-    "python -m scripts.sniper_bot --mode prod --enable-daytrader --enable-sniper "
-    "--log-level INFO"
+    "python -m scripts.sniper_bot --mode prod --enable-daytrader --enable-sniper --log-level INFO"
 )
 
 ENV_KEYS = [
@@ -350,6 +376,7 @@ ENV_KEYS = [
     "CURATED_WHALE_WALLETS",
 ]
 
+
 def emit_render_readme() -> None:
     print("\n" + "=" * 72)
     print("Render: Start Command & ENV checklist")
@@ -368,7 +395,7 @@ def emit_render_readme() -> None:
 # Orchestrator
 # ---------------------------
 async def run_checks(args: argparse.Namespace) -> int:
-    results: List[CheckResult] = []
+    results: list[CheckResult] = []
 
     # Env pass
     results.extend(validate_env())
@@ -406,12 +433,14 @@ async def run_checks(args: argparse.Namespace) -> int:
     return 0 if bad == 0 else 2
 
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Bootstrap/Readiness for sniper/daytrader stack")
     p.add_argument("--check-all", action="store_true", help="run all connectivity checks")
     p.add_argument("--migrate-db", action="store_true", help="create/alter trades table & indexes")
     p.add_argument("--notion-check", action="store_true", help="validate Notion properties")
-    p.add_argument("--emit-render-readme", action="store_true", help="print Render Start & env list")
+    p.add_argument(
+        "--emit-render-readme", action="store_true", help="print Render Start & env list"
+    )
     p.add_argument("--timeout", type=int, default=12, help="HTTP timeouts (sec)")
     p.add_argument("--verbose", action="store_true")
     return p.parse_args(argv)
@@ -428,7 +457,7 @@ def maybe_load_dotenv():
             LOG.warning(f".env load failed: {e}")
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.verbose:
         LOG.setLevel(logging.DEBUG)

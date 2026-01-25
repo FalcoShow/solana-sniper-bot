@@ -13,7 +13,7 @@ async def main() -> None:
         # Grab just 1 event (with a timeout) so we don't hang forever.
         try:
             msg = await asyncio.wait_for(agen.__anext__(), timeout=30.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             print("Timed out waiting for pump event")
             return
 

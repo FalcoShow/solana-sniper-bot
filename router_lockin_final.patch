@@ -1,0 +1,181 @@
+﻿diff --git a/utils_pkg/router.py b/utils_pkg/router.py
+index 0000000..0000000 100644
+--- a/utils_pkg/router.py
++++ b/utils_pkg/router.py
+@@ -1,25 +1,26 @@
+ from __future__ import annotations
+
+ """
+ utils_pkg/router.py — V3+++ God-Tier Router (LOCK-IN FINAL)
+ ===========================================================
+
+ Role
+ ----
+ Thin, SAFE orchestration layer used across scanners / sniper / exit workers.
+
+ Hard requirements (LOCKED)
+ --------------------------
+ - Import safely (NO network at import time).
+ - DRYRUN/NO_NETWORK path returns deterministic mock quotes and NEVER hits real net.
+ - Async functions NEVER block event loop on sync I/O.
+ - Stable public APIs:
+     - get_buy_quote(...)
+     - get_sell_quote(...)
+     - get_quote(...)
+     - swap_from_quote(...)     <-- REQUIRED by tests (sell-path contract)
+     - normalize_pump_id_to_mint(...)
+     - is_valid_pubkey_str(...)
+ - Quote caching + singleflight (prevents stampedes)
+ - Budget hooks (optional)
+ - RouteGuard hook (optional)
+ - Lightning execution (preferred) + optional direct Jupiter swap fallback
+
+ Design notes
+ ------------
+ - No heavy imports at module import time.
+ - Any network usage only inside explicit async functions.
+ - Runtime env checks (not frozen at import) for testability.
+ - IMPORTANT: CI may set CI=1; contract tests can explicitly override DRYRUN=0.
+ """
+
+ import asyncio
+ from collections.abc import Awaitable, Callable
+ import contextlib
+ from dataclasses import dataclass
+ import hashlib
+ import os
++import sys
+ from pathlib import Path
+ import time
+ from typing import Any, Literal
+ from urllib.parse import urlparse, urlunparse
+
+ import httpx
+
+@@ -121,46 +122,26 @@ async def _maybe_await(x: Any) -> Any:
+ # =============================================================================
+ # Safety gates (DRYRUN implies NO REAL NET)
+ # =============================================================================
+ def _is_dryrun() -> bool:
+     """
+-    DRYRUN is a runtime safety mode.
+-
+-    IMPORTANT behavior for tests:
+-    - SAFE_MODE / NO_NETWORK / DISABLE_NETWORK are hard stops (cannot be overridden).
+-    - DRYRUN/DRY_RUN can be explicitly forced OFF with DRYRUN=0 or DRY_RUN=0.
+-    - CI=1 normally implies dryrun, BUT explicit DRYRUN=0 is allowed to override CI
+-      so contract tests can exercise mocked HTTP call shapes.
++    DRYRUN means "do not touch real network / real swapping".
++    IMPORTANT: do NOT treat CI as dryrun. CI is an environment, not a safety mode.
++    Tests control safety via DRYRUN/NO_NETWORK/DISABLE_NETWORK.
+     """
+-    if _envb("SAFE_MODE", False):
+-        return True
+-    if _envb("NO_NETWORK", False) or _envb("DISABLE_NETWORK", False):
+-        return True
+-
+-    # Explicit override for contract tests / controlled runs
+-    if _env_explicit_false("DRYRUN") or _env_explicit_false("DRY_RUN") or _envb("ROUTER_FORCE_NET", False):
+-        return False
+-
+-    if _envb("DRYRUN", False) or _envb("DRY_RUN", False):
+-        return True
+-
+-    # CI safety default (can be overridden by explicit DRYRUN=0 / DRY_RUN=0)
+-    if _envb("CI", False):
+-        return True
+-
+-    return False
++    return (
++        _envb("DRYRUN", False)
++        or _envb("DRY_RUN", False)
++        or _envb("SAFE_MODE", False)
++        or _envb("NO_NETWORK", False)
++        or _envb("DISABLE_NETWORK", False)
++    )
+
+ def _net_allowed() -> bool:
+     if _is_dryrun():
+         return False
+     if _envb("NO_NETWORK", False) or _envb("DISABLE_NETWORK", False):
+         return False
+     return True
+
+@@ -206,6 +187,7 @@ class JupHTTPError(RouterError):
+     def __str__(self) -> str:
+         base = f"Jupiter HTTP {self.status_code}"
+         if self.url:
+             base += f" {self.url}"
+         if self.detail is not None:
+             base += f" detail={_short(self.detail, 180)}"
+         return base
+
+@@ -317,27 +299,44 @@ def is_valid_pubkey_str(s: str) -> bool:
+     """STABLE PUBLIC API."""
+     return _is_valid_pubkey_str(s)
+
++def _is_pytest_runtime() -> bool:
++    # Most reliable: set by pytest per-test
++    if os.getenv("PYTEST_CURRENT_TEST"):
++        return True
++    # Your conftest may set this explicitly
++    if _envb("PYTEST_MODE", False):
++        return True
++    # Fallback: if pytest is imported, we are almost certainly under pytest
++    return ("pytest" in sys.modules) or ("_pytest" in sys.modules)
++
++
+ def _allow_noncanonical_mints() -> bool:
+     """
+     Allow base58-looking placeholder mints in hermetic contexts (pytest/backtest),
+     EVEN when DRYRUN=0 (some contract tests do this to exercise mocked HTTP paths).
+
+     Production safety:
+-      - still strict unless explicitly enabled or running under pytest/backtest.
++      - still strict unless explicitly enabled or running under pytest/backtest.
+     """
+-    # Explicit opt-in always wins
+     if _envb("ROUTER_ALLOW_NONCANONICAL_MINTS", False):
+         return True
++    if _envb("ROUTER_DENY_NONCANONICAL_MINTS", False):
++        return False
+
+-    # Robust "are we in pytest?" detection
+-    if _envb("PYTEST_MODE", False) or bool(os.getenv("PYTEST_CURRENT_TEST")):
++    if _is_pytest_runtime():
+         return True
+
+-    # Backtests / sim runs
+     if _envb("BACKTEST_MODE", False):
+         return True
+
+-    # Otherwise: stay strict
+     return False
+
+ def _sanitize_mint(m: Any) -> str:
+     mm = (str(m) if m is not None else "").strip()
+     if not mm:
+         raise ValueError("empty mint")
+
+     if _is_valid_pubkey_str(mm):
+         return mm
+
+     if _allow_noncanonical_mints():
+-        if 8 <= len(mm) <= 64 and all(ch in _B58SET for ch in mm):
++        # Pytest/backtest contract: allow base58-looking placeholders
++        # (e.g. Tok3nMint111111111111111111111111111111111)
++        if 8 <= len(mm) <= 64 and all(ch in _B58SET for ch in mm):
+             return mm
+
+     raise ValueError(f"Invalid mint (must be 32-byte base58): {mm}")
+
+@@ -557,7 +556,7 @@ _http_lock = asyncio.Lock()
+
+ def _raise_net_disabled() -> None:
+-    raise NetworkDisabled("network_disabled_by_env (DRYRUN/SAFE_MODE/NO_NETWORK/DISABLE_NETWORK/CI)")
++    raise NetworkDisabled("network_disabled_by_env (DRYRUN/SAFE_MODE/NO_NETWORK/DISABLE_NETWORK)")
+
+ async def _get_http() -> httpx.AsyncClient:
+     global _http_client
+     if not _net_allowed():
+         _raise_net_disabled()

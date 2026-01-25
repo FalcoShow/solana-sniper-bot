@@ -1,22 +1,58 @@
-# perps/risk.py
-import os, math
+# perps/__init__.py
+"""
+perps package
+=============
 
-def params():
-    lev_cap = float(os.getenv("PERPS_LEVERAGE_CAP", "2.0"))
-    sleeve_pct = float(os.getenv("PERPS_SLEEVE_PCT", "0.30"))  # portion of equity max on perps
-    var_daily_pct = float(os.getenv("PERPS_VAR_LIMIT_PCT", "0.06"))  # 6% daily VaR budget
-    return lev_cap, sleeve_pct, var_daily_pct
+This package is an *optional* PERPS layer that must NOT silently compete with the
+main sniper/spot path. It provides:
 
-def max_notional(equity_usd: float):
-    _, sleeve_pct, _ = params()
-    return sleeve_pct * equity_usd
+- alpha helpers (tiny rule gates)
+- a Drift connector (feature-flagged, dry-run capable)
+- perps risk sizing helpers (pure functions)
 
-def ticket_notional(equity_usd: float, atr_pct: float, risk_per_trade: float = None):
-    r = risk_per_trade or float(os.getenv("PERPS_RISK_PER_TRADE", "0.005"))
-    # approximate position sizing: risk = ATR% * notional ≈ r * equity => notional ≈ (r/ATR%) * equity
-    if atr_pct <= 0.0005: atr_pct = 0.0005
-    return min((r / atr_pct) * equity_usd, max_notional(equity_usd))
+No side effects on import.
+"""
 
-def clamp_leverage(req_lev: float):
-    lev_cap, _, _ = params()
-    return min(req_lev, lev_cap)
+from __future__ import annotations
+
+# Alpha gates
+from .alpha import should_long, should_short
+
+# Connector (Drift)
+from .connector_drift import DriftPerps, HealthInfo, OrderResult, PerpsConfig, PositionInfo
+
+# Risk helpers (canonical in perps/risk.py)
+from .risk import (
+    PerpsRiskConfig,
+    clamp_leverage,
+    max_notional,
+    params,
+    risk_summary,
+    ticket_notional,
+)
+
+# Backward-compat aliases in case anything imported weird names historically
+max_notional_usd = max_notional
+ticket_notional_usd = ticket_notional
+
+__all__ = [
+    # connector
+    "DriftPerps",
+    "HealthInfo",
+    "OrderResult",
+    "PerpsConfig",
+    # risk
+    "PerpsRiskConfig",
+    "PositionInfo",
+    "clamp_leverage",
+    "max_notional",
+    # aliases
+    "max_notional_usd",
+    "params",
+    "risk_summary",
+    # alpha
+    "should_long",
+    "should_short",
+    "ticket_notional",
+    "ticket_notional_usd",
+]

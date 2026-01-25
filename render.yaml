@@ -1,8 +1,18 @@
+# yaml-language-server: $schema=https://render.com/schema/render.yaml.json
 # render.yaml — God-Tier Blueprint (Phase 0–7 LOCK-IN)
-# Single-service worker deployment:
-# - Worker runs bash ./start.sh (env-safe load → DSN/wallet normalize → preflight → orchestrator)
-# - No separate web service (avoids health.py drift/untracked file failures)
-# - Secrets are placeholders (sync:false) to be set in Render UI
+#
+# Topology:
+#   - 1x Worker (pump-sniper): bash ./start.sh
+#   - 1x Postgres (sniper-db): private-only (ipAllowList: [])
+#   - 1x Key Value (sniper-redis): private-only (ipAllowList: [])
+#
+# IMPORTANT:
+# - Keep secrets OUT of envVarGroups (no sync:false there).
+# - Put secrets under the worker's envVars with sync:false.
+# - Prefer fromService/fromDatabase wiring for REDIS_URL / DATABASE_URL, and let start.sh normalize.
+
+previews:
+  generation: off
 
 envVarGroups:
   # ---------------------------
@@ -10,63 +20,87 @@ envVarGroups:
   # ---------------------------
   - name: sniper-defaults
     envVars:
+      # Python runtime pin (Render supports PYTHON_VERSION as fully-qualified x.y.z)
+      - key: PYTHON_VERSION
+        value: "3.13.4"
+
       # Python hygiene
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: PYTHONDONTWRITEBYTECODE
         value: "1"
+      - key: PYTHONUTF8
+        value: "1"
+      - key: PYTHONFAULTHANDLER
+        value: "1"
 
-      # Start.sh control-plane safe defaults
-      # (Do NOT force START_STRICT here; start.sh auto-detects Render and becomes strict)
+      # start.sh control-plane defaults
+      - key: RUN_MODE
+        value: "bot"
+      - key: START_STRICT
+        value: "1"              # fail-closed on Render
+      - key: START_RUN_CHECK_ENV
+        value: "1"
       - key: START_PRECHECKS
         value: "1"
-      - key: START_PRECHECKS_CANARY
+      - key: START_RUN_CI_SMOKE
         value: "0"
+
+      # dotenv loader controls (Render should not read repo .env files)
+      - key: START_NO_DOTENV
+        value: "1"
       - key: START_ALLOW_SOURCE_ENV
         value: "0"
       - key: START_ENV_OVERRIDE
         value: "0"
 
-      # Crash supervisor knobs (can override in UI)
+      # DB normalization / safety
+      - key: START_NORMALIZE_DSN
+        value: "1"
+      - key: START_ADD_SSLMODE
+        value: "1"
+      - key: SKIP_DSN_REQUIRED
+        value: "0"
+
+      # crash supervisor knobs
       - key: MAIN_RESTART_ON_CRASH
         value: "1"
       - key: MAIN_MAX_RESTARTS
-        value: "0"     # 0 = infinite
+        value: "0"   # 0 = infinite
       - key: MAIN_RESTART_BACKOFF_S
         value: "3"
       - key: MAIN_RESTART_MAX_BACKOFF_S
         value: "30"
       - key: MAIN_RESTART_JITTER_S
         value: "2"
+      - key: MAIN_NO_RESTART_EXIT_CODES
+        value: "130,143"
+      - key: MAIN_USE_SETSID
+        value: "1"
 
-      # Jupiter routing defaults (NO KEYS here)
-      - key: JUP_BASE_URL
-        value: "https://api.jup.ag"
-      - key: JUP_ALT_BASE_URLS
-        value: "https://api.jup.ag"
-      - key: JUP_AS_LEGACY
-        value: "1"
-      - key: JUP_USE_SHARED_ACCOUNTS
-        value: "1"
-      - key: JUP_ONLY_DIRECT
+      # logging
+      - key: LOG_LEVEL
+        value: "INFO"
+
+      # dirs (match start.sh defaults)
+      - key: DATA_DIR
+        value: "/opt/render/data"
+      - key: SECRETS_DIR
+        value: "/opt/render/.secrets"
+
+      # redis synthesis defaults (start.sh will honor REDIS_URL if provided)
+      - key: REDIS_DB
         value: "0"
-
-      # Canary hard safety (OFF by default)
-      - key: CANARY_TRADE_ENABLED
+      - key: REDIS_TLS
         value: "0"
 
   # ---------------------------
-  # Playwright / pump.fun knobs
+  # Pump.fun knobs (non-secret)
   # ---------------------------
-  - name: playwright-common
-    envVars:
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/project/src/.cache/ms-playwright
-
   - name: pumpfun-common
     envVars:
       - key: PUMPFUN_API_BASES
-        value: https://frontend-api.pump.fun
+        value: "https://frontend-api.pump.fun"
       - key: PUMPFUN_DISABLE_PAGE_FETCH
         value: "1"
       - key: PUMPFUN_RETRY_MAX
@@ -81,21 +115,121 @@ envVarGroups:
         value: "1"
 
   # ---------------------------
-  # Secrets (set in Render UI)
+  # Jupiter routing defaults (NO KEYS here)
   # ---------------------------
-  - name: sniper-secrets
+  - name: jupiter-defaults
     envVars:
-      # DB (use ONE primary, but we support multiple)
-      - key: DATABASE_URL
-        sync: false
-      - key: POSTGRES_DSN
-        sync: false
-      - key: PG_DSN
-        sync: false
-      - key: PNL_DSN
-        sync: false
+      - key: JUP_BASE_URL
+        value: "https://api.jup.ag"
+      - key: JUP_ALT_BASE_URLS
+        value: "https://api.jup.ag"
+      - key: JUP_AS_LEGACY
+        value: "1"
+      - key: JUP_USE_SHARED_ACCOUNTS
+        value: "1"
+      - key: JUP_ONLY_DIRECT
+        value: "0"
 
-      # Wallet material (choose one approach)
+services:
+  # ---------------------------------------------------------------------------
+  # Key Value (Redis) — private-only
+  # ---------------------------------------------------------------------------
+  - type: keyvalue
+    name: sniper-redis
+    plan: free
+    region: oregon
+    ipAllowList: []
+    maxmemoryPolicy: allkeys-lru
+
+  # ---------------------------------------------------------------------------
+  # Worker: main trading/orchestrator service
+  # ---------------------------------------------------------------------------
+  - type: worker
+    name: pump-sniper
+    runtime: python
+    plan: starter
+    region: oregon
+
+    buildCommand: |
+      python -m pip install --upgrade pip
+      python -m pip install -r requirements.txt
+
+      # Normalize CRLF -> LF for start.sh (Windows-safe, Render-safe)
+      python - <<'PY'
+      from pathlib import Path
+      p = Path("start.sh")
+      if p.exists():
+          p.write_bytes(p.read_bytes().replace(b"\r\n", b"\n"))
+      PY
+
+      chmod +x start.sh || true
+
+      # Fast shell syntax sanity (no env/secrets required)
+      bash ./start.sh bash-syntax
+
+      # Fast Python syntax sanity
+      python -m compileall -q .
+
+      # Playwright is optional; install browsers only if playwright exists
+      python - <<'PY'
+      import importlib.util, subprocess, sys
+      if importlib.util.find_spec("playwright") is not None:
+          subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
+      PY
+
+    startCommand: bash ./start.sh
+
+    disk:
+      name: data
+      mountPath: /opt/render/data
+      sizeGB: 10
+
+    envVars:
+      # groups
+      - fromGroup: sniper-defaults
+      - fromGroup: pumpfun-common
+      - fromGroup: jupiter-defaults
+
+      # ---- wiring (private network) ----
+
+      # Redis connection string (preferred)
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: sniper-redis
+          property: connectionString
+
+      # Redis host/port (kept for compatibility; start.sh can synthesize too)
+      - key: REDIS_HOST
+        fromService:
+          type: keyvalue
+          name: sniper-redis
+          property: host
+      - key: REDIS_PORT
+        fromService:
+          type: keyvalue
+          name: sniper-redis
+          property: port
+
+      # Postgres DSNs — set multiple common keys for maximum compatibility
+      - key: PG_DSN_INTERNAL
+        fromDatabase:
+          name: sniper-db
+          property: connectionString
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sniper-db
+          property: connectionString
+      - key: POSTGRES_DSN
+        fromDatabase:
+          name: sniper-db
+          property: connectionString
+
+      # Optional safety: OFF by default (your code should honor this)
+      - key: CANARY_TRADE_ENABLED
+        value: "0"
+
+      # ---- secrets (set in Render UI after first deploy) ----
       - key: KEYPAIR_PATH
         sync: false
       - key: WALLET_PRIVATE_KEY
@@ -105,50 +239,29 @@ envVarGroups:
       - key: WALLET_JSON_B64
         sync: false
 
-      # External keys
       - key: JUP_PRO_KEY
         sync: false
       - key: JUP_API_KEY
         sync: false
+
       - key: OPENAI_API_KEY
         sync: false
+
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: DISCORD_TOKEN
         sync: false
+
       - key: NOTION_TOKEN
         sync: false
       - key: NOTION_DATABASE_ID
         sync: false
 
-services:
+databases:
   # ---------------------------------------------------------------------------
-  # Worker: main trading/orchestrator service (start.sh control plane)
+  # Postgres — private-only
   # ---------------------------------------------------------------------------
-  - type: worker
-    name: pump-sniper
-    env: python
-    plan: starter
-    buildCommand: |
-      pip install -r requirements.txt
-
-      # Playwright is optional; keep it best-effort
-      python -m playwright install chromium || true
-
-      # Normalize CRLF -> LF for start.sh (Windows-safe, Linux/Render-safe)
-      python - <<'PY'
-from pathlib import Path
-p = Path("start.sh")
-if p.exists():
-    data = p.read_bytes()
-    data = data.replace(b"\r\n", b"\n")
-    p.write_bytes(data)
-PY
-
-      chmod +x start.sh || true
-    startCommand: bash ./start.sh
-    envVars:
-      - fromGroup: sniper-defaults
-      - fromGroup: playwright-common
-      - fromGroup: pumpfun-common
-      - fromGroup: sniper-secrets
+  - name: sniper-db
+    plan: basic-1gb
+    region: oregon
+    ipAllowList: []

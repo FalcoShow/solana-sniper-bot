@@ -1,60 +1,46 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
-utils_pkg/lightning_impl.py — Jupiter Metis Swap execution layer (V3+++ LOCK-IN)
-===============================================================================
+utils_pkg/lightning_impl.py — Jupiter execution layer (V3+++ LOCK-IN)
+====================================================================
 
-Execution engine behind utils_pkg/router.py (and used by scripts/smoke_lightning.py).
+Execution engine behind utils_pkg/router.py.
 
-LOCK-IN invariants
-------------------
-- No network at import time.
-- Async-only HTTP via a single lazy httpx.AsyncClient.
-- Correct Metis endpoints by default:
-      Quote: /swap/v1/quote
-      Swap : /swap/v1/swap
-  Override via env:
-      JUP_QUOTE_PATH, JUP_SWAP_PATH
-- Multi-base failover (JUP_ALT_BASE_URLS) + per-base cooldown + simple scoring.
-- AUTH failures (401/403) detected; can hard-stop via STRICT_AUTH.
-- DRYRUN safety:
-      DRYRUN=1 and LIGHTNING_DRYRUN_BUILD_TX=0 => never builds tx, never sends
-      DRYRUN=1 and LIGHTNING_DRYRUN_BUILD_TX=1 => builds tx, never sends
-- Prequote pass-through: if router passes quoteResponse, we POST it unmodified.
-- Backwards-compatible return shapes:
-      - buy_via_lightning(...) -> Optional[str]
-      - sell_via_lightning(...) -> Optional[str]
-      - return_meta=True -> (sig|None, meta_dict)
-      - return_receipt=True OR LIGHTNING_RETURN_RECEIPTS=1 -> receipt dict
-      - LIGHTNING_ALWAYS_RETURN_META=1 -> receipt dict even when not requested
-- Mint sanity:
-      - validates base58-ish mint strings
-      - warns and auto-fixes a known USDC typo that causes TOKEN_NOT_TRADABLE
-- “Recognizable quote functions” for smoke tests:
-      get_quote(...), get_buy_quote(...), get_sell_quote(...), quote = get_quote
+Key upgrades in this LOCK-IN rewrite
+------------------------------------
+1) Correct endpoint model (no more invalid URL combos):
+   - Supports Metis swap API:
+       https://api.jup.ag/swap/v1/quote
+       https://api.jup.ag/swap/v1/swap
+   - Supports Public v6 API:
+       https://quote-api.jup.ag/v6/quote
+       https://quote-api.jup.ag/v6/swap
+   - Uses env FIRST if provided (full URLs, comma-separated):
+       JUP_QUOTE_URL, JUP_SWAP_URL
+   - Otherwise falls back to:
+       JUP_BASE_URL (+ JUP_QUOTE_PATH/JUP_SWAP_PATH)
 
-CRITICAL FIX (your current failure)
------------------------------------
-Your logs show:
-  "Using http2=True, but the 'h2' package is not installed..."
-That caused Lightning quotes to error and fall back to direct HTTP.
+2) Per-endpoint failover:
+   - cooldown + score per *endpoint URL* (not only base)
+   - last_good boosts the next choice
 
-This rewrite makes HTTP/2 *optional*:
-- If JUP_HTTP2=1 but h2 is not installed -> auto-disable HTTP/2 and continue.
-- Default is safe and stable (HTTP/1.1 works fine with Jupiter/Metis).
+3) Safe, production-friendly:
+   - no network at import time
+   - single lazy httpx.AsyncClient
+   - qps gate + concurrency guard
+   - breaker + retry with jitter
+   - DRYRUN semantics preserved
 
-Public API expected by router
------------------------------
-- _jup_headers()
-- _variant_flags()
-- get_quote() / quote()
-- get_buy_quote()
-- get_sell_quote()
-- buy_via_lightning()
-- sell_via_lightning()
-- close_http()
-- stats()
+4) Router compatibility:
+   - get_quote / quote
+   - get_buy_quote / get_sell_quote
+   - buy_via_lightning / sell_via_lightning
+   - close_http, stats, _variant_flags
+
+Notes
+-----
+- If quote-api.jup.ag DNS fails on your machine, keep Metis endpoints first
+  in JUP_QUOTE_URL/JUP_SWAP_URL, or remove quote-api from the list.
 """
 
 import asyncio
@@ -64,7 +50,8 @@ import inspect
 import os
 import random
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
@@ -73,9 +60,11 @@ import httpx
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from logging_setup import get_logger  # type: ignore
+
     log = get_logger(__name__)  # type: ignore
 except Exception:  # pragma: no cover
     import logging
+
     log = logging.getLogger(__name__)  # type: ignore[assignment]
 
 
@@ -88,30 +77,36 @@ def _short(x: Any, n: int = 360) -> str:
 
 
 if not hasattr(log, "event"):
+
     def _event(name: str, **kw: Any) -> None:  # pragma: no cover
         with contextlib.suppress(Exception):
             log.info("%s %s", name, kw)
-    setattr(log, "event", _event)  # type: ignore[attr-defined]
+
+    log.event = _event  # type: ignore[attr-defined]
 
 
 if not hasattr(log, "every"):
-    def _every(key: str, n: int = 30, msg: Optional[str] = None, **kw: Any) -> None:  # pragma: no cover
+
+    def _every(
+        key: str, n: int = 30, msg: str | None = None, **kw: Any
+    ) -> None:  # pragma: no cover
         try:
             now = time.monotonic()
             store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
             last = float(store.get(key, 0.0))
             if (now - last) >= float(max(1, int(n))):
                 store[key] = now
-                setattr(_every, "_store", store)  # type: ignore[attr-defined]
-                getattr(log, "event")(msg or key, **kw)
+                _every._store = store  # type: ignore[attr-defined]
+                log.event(msg or key, **kw)
         except Exception:
             return None
-    setattr(log, "every", _every)  # type: ignore[attr-defined]
+
+    log.every = _every  # type: ignore[attr-defined]
 
 
 def _warn(name: str, **kw: Any) -> None:
     with contextlib.suppress(Exception):
-        getattr(log, "event")(name, **kw)
+        log.event(name, **kw)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -120,11 +115,20 @@ def _warn(name: str, **kw: Any) -> None:
 try:
     from utils_pkg import budget  # type: ignore
 except Exception:  # pragma: no cover
+
     class _BudgetNoop:
-        def before_quote(self, units: int = 1) -> bool: return True
-        def after_quote(self, units: int = 1) -> None: return None
-        def before_swap(self, units: int = 1) -> bool: return True
-        def after_swap(self, units: int = 1) -> None: return None
+        def before_quote(self, units: int = 1) -> bool:
+            return True
+
+        def after_quote(self, units: int = 1) -> None:
+            return None
+
+        def before_swap(self, units: int = 1) -> bool:
+            return True
+
+        def after_swap(self, units: int = 1) -> None:
+            return None
+
     budget = _BudgetNoop()  # type: ignore
 
 
@@ -141,55 +145,81 @@ async def _budget_call(fn: Any, *a: Any, **kw: Any) -> Any:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Canonical mints (mainnet)
+# Wallet helpers (lazy)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from utils_pkg.solana_wallet import (  # type: ignore
+        get_pubkey_str,
+        load_keypair,
+        sign_and_send_b64_tx,
+    )
+
+    try:
+        from utils_pkg.solana_wallet import _send_b64_with_diag  # type: ignore
+    except Exception:  # pragma: no cover
+        _send_b64_with_diag = None  # type: ignore
+except Exception:  # pragma: no cover
+    get_pubkey_str = None  # type: ignore
+    load_keypair = None  # type: ignore
+    sign_and_send_b64_tx = None  # type: ignore
+    _send_b64_with_diag = None  # type: ignore
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Mint helpers
 # ──────────────────────────────────────────────────────────────────────────────
 KNOWN_SOL_MINT = "So11111111111111111111111111111111111111112"
 KNOWN_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 KNOWN_BAD_USDC_TYPO = "EPjFWdd5AufqSSqeMzQ1NzxypaC8G4weEGKzwyTDt1v"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Imports (no network at import time)
-# ──────────────────────────────────────────────────────────────────────────────
 try:
-    from utils_pkg.mints import normalize_mint, SOL_MINT as CANON_SOL_MINT, USDC_MINT as CANON_USDC_MINT  # type: ignore
+    from utils_pkg.mints import (  # type: ignore
+        SOL_MINT as CANON_SOL_MINT,
+        USDC_MINT as CANON_USDC_MINT,
+        normalize_mint,
+    )
 except Exception:  # pragma: no cover
+
     def normalize_mint(x: str) -> str:  # type: ignore
         return (x or "").strip()
+
     CANON_SOL_MINT = KNOWN_SOL_MINT
     CANON_USDC_MINT = KNOWN_USDC_MINT
 
-if str(CANON_USDC_MINT) != KNOWN_USDC_MINT:
-    _warn(
-        "MINT_CONST_MISMATCH",
-        what="USDC_MINT",
-        repo_value=str(CANON_USDC_MINT),
-        expected=KNOWN_USDC_MINT,
-        hint="Fix utils_pkg/mints.py USDC_MINT; wrong USDC causes TOKEN_NOT_TRADABLE.",
-    )
-    CANON_USDC_MINT = KNOWN_USDC_MINT
 
-from utils_pkg.solana_wallet import get_pubkey_str, load_keypair, sign_and_send_b64_tx  # type: ignore
-
-try:  # pragma: no cover
-    from utils_pkg.solana_wallet import _send_b64_with_diag  # type: ignore
-except Exception:  # pragma: no cover
-    _send_b64_with_diag = None  # type: ignore
+_BASE58_ALPH = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
 
-# =============================================================================
-# Errors
-# =============================================================================
-class JupHTTPError(RuntimeError):
-    def __init__(self, status: int, url: str, body: Any):
-        self.status = int(status)
-        self.url = str(url)
-        self.body = body
-        super().__init__(f"HTTP {self.status} {self.url}")
+def _looks_like_mint(s: str) -> bool:
+    s = (s or "").strip()
+    if not (32 <= len(s) <= 44):
+        return False
+    return all(ch in _BASE58_ALPH for ch in s)
 
 
-# =============================================================================
+def _fix_common_mint_typos(m: str) -> str:
+    mm = (m or "").strip()
+    if mm == KNOWN_BAD_USDC_TYPO:
+        _warn("MINT_AUTO_FIX", bad=mm, fixed=KNOWN_USDC_MINT, what="USDC typo")
+        return KNOWN_USDC_MINT
+    return mm
+
+
+def _normalize_and_validate_mint(m: str, *, label: str) -> str:
+    mm = normalize_mint(m)
+    mm = _fix_common_mint_typos(mm)
+    if not _looks_like_mint(mm):
+        raise ValueError(f"invalid_mint:{label}")
+    return mm
+
+
+def _same_mint(a: str, b: str) -> bool:
+    return normalize_mint(a) == normalize_mint(b)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Env helpers
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
 _FALSE = {"0", "false", "f", "no", "n", "off"}
 
@@ -225,7 +255,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
-def _env_tristate(name: str) -> Optional[bool]:
+def _env_tristate(name: str) -> bool | None:
     v = os.getenv(name)
     if v is None:
         return None
@@ -250,219 +280,405 @@ def _intish(x: Any, default: int = 0) -> int:
         return int(default)
 
 
-async def _maybe_await(x: Any) -> Any:
-    if inspect.isawaitable(x):
-        return await x
-    return x
-
-
-async def _to_thread(fn, *a, **kw):
-    try:
-        return await asyncio.to_thread(fn, *a, **kw)  # py3.9+
-    except AttributeError:  # pragma: no cover
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: fn(*a, **kw))
-
-
 def _mono() -> float:
     return time.monotonic()
 
 
-# =============================================================================
-# Mint validation / normalization
-# =============================================================================
-_BASE58_ALPH = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+# ──────────────────────────────────────────────────────────────────────────────
+# HTTP/2 detection (optional)
+# ──────────────────────────────────────────────────────────────────────────────
+_H2_AVAILABLE = importlib.util.find_spec("h2") is not None
 
 
-def _looks_like_mint(s: str) -> bool:
-    s = (s or "").strip()
-    if not (32 <= len(s) <= 44):
+def _effective_http2() -> bool:
+    req = _env_bool("JUP_HTTP2", False)
+    if not req:
         return False
-    return all(ch in _BASE58_ALPH for ch in s)
+    return _H2_AVAILABLE
 
 
-def _fix_common_mint_typos(m: str) -> str:
-    mm = (m or "").strip()
-    if mm == KNOWN_BAD_USDC_TYPO:
-        _warn("MINT_AUTO_FIX", bad=mm, fixed=KNOWN_USDC_MINT, what="USDC typo")
-        return KNOWN_USDC_MINT
-    return mm
-
-
-def _normalize_and_validate_mint(m: str, *, label: str) -> str:
-    m2 = normalize_mint(m)
-    m2 = _fix_common_mint_typos(m2)
-    if not _looks_like_mint(m2):
-        raise ValueError(f"invalid_mint:{label}")
-    return m2
-
-
-# =============================================================================
-# Config (Metis Swap API + execution knobs)
-# =============================================================================
-LIGHTNING_VERSION = "v3+++_lockin_lightning_2025-12-23"
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
 LAMPORTS_PER_SOL = 1_000_000_000
+LIGHTNING_VERSION = "v3+++_lockin_lightning_2026-01-05"
 
 SOL_MINT = _env_str("SOL_MINT", str(CANON_SOL_MINT or KNOWN_SOL_MINT))
 USDC_MINT = _env_str("USDC_MINT", str(CANON_USDC_MINT or KNOWN_USDC_MINT))
 
-DEFAULT_BASE = "https://api.jup.ag"
-PUBLIC_BASE = "https://public.jupiterapi.com"
+DEFAULT_METIS_BASE = "https://api.jup.ag"
+DEFAULT_PUBLIC_BASE = "https://quote-api.jup.ag"
 
-BASE = (_env_str("JUP_BASE_URL") or _env_str("JUP_UPSTREAM") or DEFAULT_BASE).rstrip("/")
+DEFAULT_METIS_QUOTE_PATH = "/swap/v1/quote"
+DEFAULT_METIS_SWAP_PATH = "/swap/v1/swap"
+DEFAULT_V6_QUOTE_PATH = "/v6/quote"
+DEFAULT_V6_SWAP_PATH = "/v6/swap"
 
-ALT_BASES_RAW = _env_str("JUP_ALT_BASE_URLS", "")
-ALT_BASES: List[str] = []
-for part in (ALT_BASES_RAW.split(",") if ALT_BASES_RAW else []):
-    u = (part or "").strip().rstrip("/")
-    if u and u != BASE and u not in ALT_BASES:
-        ALT_BASES.append(u)
 
-ALLOW_PUBLIC_FALLBACK = _env_bool("JUP_ALLOW_PUBLIC_FALLBACK", False)
-BASE_URLS: List[str] = [BASE] + ALT_BASES
-if ALLOW_PUBLIC_FALLBACK and PUBLIC_BASE not in BASE_URLS:
-    BASE_URLS.append(PUBLIC_BASE)
+def _mask_key(k: str) -> str:
+    k = (k or "").strip()
+    if not k:
+        return ""
+    if len(k) <= 8:
+        return "*" * len(k)
+    return k[:3] + ("*" * (len(k) - 6)) + k[-3:]
 
-QUOTE_PATH = (_env_str("JUP_QUOTE_PATH", "/swap/v1/quote") or "/swap/v1/quote").strip()
-SWAP_PATH = (_env_str("JUP_SWAP_PATH", "/swap/v1/swap") or "/swap/v1/swap").strip()
 
-ONLY_DIRECT = _env_bool("JUP_ONLY_DIRECT", _env_bool("JUP_ONLY_DIRECT_ROUTES", False))
-RESTRICT_INTERMEDIATE = _env_bool("JUP_RESTRICT_INTERMEDIATE_TOKENS", True)
-DEFAULT_SLIPPAGE_BPS = _clamp_i(_env_int("PF_SLIPPAGE_BPS", _env_int("SLIPPAGE_BPS", 30)), 1, 5000)
-MAX_ACCOUNTS = max(0, _env_int("JUP_MAX_ACCOUNTS", 0))  # 0 => omit
-PLATFORM_FEE_BPS = _clamp_i(_env_int("JUP_PLATFORM_FEE_BPS", 0), 0, 10_000)
-INSTRUCTION_VERSION = _env_str("JUP_INSTRUCTION_VERSION", "").strip()
+def _parse_csv(val: str) -> list[str]:
+    out: list[str] = []
+    for part in (val or "").split(","):
+        s = (part or "").strip()
+        if s:
+            out.append(s)
+    return out
 
-AS_LEGACY_TX = _env_bool("JUP_AS_LEGACY_TX", _env_bool("JUP_AS_LEGACY", False))
-WRAP_UNWRAP_SOL = _env_bool("PF_WRAP_UNWRAP_SOL", True)
 
-COMPUTE_UNIT_LIMIT = max(0, _env_int("PF_COMPUTE_UNIT_LIMIT", 0))
-COMPUTE_UNIT_PRICE_MICRO = max(0, _env_int("PF_COMPUTE_UNIT_PRICE_MICRO", _env_int("JUP_COMPUTE_UNIT_PRICE_MICRO", 0)))
+def _join_url(base: str, path: str) -> str:
+    b = (base or "").rstrip("/")
+    p = (path or "").strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    return b + p
 
-FORCE_SHARED = _env_bool("JUP_FORCE_SHARED_ACCOUNTS", False)
-_SHARED_TRISTATE = _env_tristate("JUP_USE_SHARED_ACCOUNTS")
-USE_SHARED_ACCOUNTS = bool(_SHARED_TRISTATE) if _SHARED_TRISTATE is not None else False
-if FORCE_SHARED:
-    USE_SHARED_ACCOUNTS = True
 
-USE_TOKEN_LEDGER = _env_bool("JUP_USE_TOKEN_LEDGER", False)
-FEE_ACCOUNT = _env_str("JUP_FEE_ACCOUNT", "")
-TRACKING_ACCOUNT = _env_str("JUP_TRACKING_ACCOUNT", "")
-PAYER = _env_str("JUP_PAYER", "")
+def _ensure_full_quote_url(s: str) -> str:
+    """
+    Accepts either a full URL, or a base host. Converts base host into correct default:
+      - quote-api.* -> /v6/quote
+      - api.jup.ag  -> /swap/v1/quote
+    """
+    t = (s or "").strip().rstrip("/")
+    if not t:
+        return ""
+    if t.startswith("http://") or t.startswith("https://"):
+        # If it's already a full endpoint URL (has /...), leave it.
+        # If it's only a base (no slash beyond scheme), append best default.
+        try:
+            after = t.split("://", 1)[1]
+            if "/" not in after:
+                if "quote-api" in after:
+                    return _join_url(t, DEFAULT_V6_QUOTE_PATH)
+                return _join_url(t, DEFAULT_METIS_QUOTE_PATH)
+        except Exception:
+            pass
+        return t
+    # treat as host-ish
+    if "quote-api" in t:
+        return "https://" + t + DEFAULT_V6_QUOTE_PATH
+    return "https://" + t + DEFAULT_METIS_QUOTE_PATH
 
-DYNAMIC_SLIPPAGE = _env_bool("JUP_DYNAMIC_SLIPPAGE", False)
-SKIP_USER_ACCOUNTS_RPC_CALLS = _env_bool("JUP_SKIP_USER_ACCOUNTS_RPC_CALLS", False)
-BLOCKHASH_SLOTS_TO_EXPIRY = max(0, _env_int("JUP_BLOCKHASH_SLOTS_TO_EXPIRY", 0))
 
-def _micro_to_lamports(micro: int) -> int:
-    try:
-        return int(round(max(0, int(micro)) / 1_000_000))
-    except Exception:
-        return 0
+def _ensure_full_swap_url(s: str) -> str:
+    t = (s or "").strip().rstrip("/")
+    if not t:
+        return ""
+    if t.startswith("http://") or t.startswith("https://"):
+        try:
+            after = t.split("://", 1)[1]
+            if "/" not in after:
+                if "quote-api" in after:
+                    return _join_url(t, DEFAULT_V6_SWAP_PATH)
+                return _join_url(t, DEFAULT_METIS_SWAP_PATH)
+        except Exception:
+            pass
+        return t
+    if "quote-api" in t:
+        return "https://" + t + DEFAULT_V6_SWAP_PATH
+    return "https://" + t + DEFAULT_METIS_SWAP_PATH
 
-_fallback_micro = _env_int("JITO_FEE_MICROLAMPORTS", 0)
-PF_PRIORITY_LAMPORTS = max(0, _env_int("PF_PRIORITY_LAMPORTS", _micro_to_lamports(_fallback_micro)))
-PF_PRIORITY_SOL = max(0.0, _env_float("PF_PRIORITY_SOL", 0.0))
 
-HTTP_TIMEOUT_SEC = max(5.0, _env_float("JUP_HTTP_TIMEOUT_SEC", 20.0))
-HTTP_RETRY_MAX = max(0, _env_int("JUP_HTTP_RETRY_MAX", 2))
-HTTP_RETRY_BACKOFF_SEC = max(0.1, _env_float("JUP_HTTP_RETRY_BACKOFF_SEC", 0.8))
-HTTP_RETRY_JITTER_SEC = max(0.0, _env_float("JUP_HTTP_RETRY_JITTER_SEC", 0.25))
+@dataclass(frozen=True)
+class _Cfg:
+    # endpoint URLs (full)
+    quote_urls: list[str]
+    swap_urls: list[str]
 
-# ===== HTTP/2 FIX: only enable if requested AND h2 is installed =====
-_HTTP2_REQUESTED = _env_bool("JUP_HTTP2", False)  # default SAFE (HTTP/1.1)
-_H2_AVAILABLE = importlib.util.find_spec("h2") is not None
-HTTP2 = bool(_HTTP2_REQUESTED and _H2_AVAILABLE)
-if _HTTP2_REQUESTED and not _H2_AVAILABLE:
-    log.every(
-        "JUP_HTTP2_AUTO_DISABLED",
-        n=120,
-        msg="JUP_HTTP2_AUTO_DISABLED",
-        hint="You set JUP_HTTP2=1 but 'h2' isn't installed; continuing with HTTP/1.1.",
+    # quote params
+    only_direct: bool
+    restrict_intermediate: bool
+    default_slippage_bps: int
+    as_legacy_tx: bool
+
+    # swap build options
+    wrap_unwrap_sol: bool
+    dynamic_slippage: bool
+    skip_user_accounts_rpc_calls: bool
+    use_token_ledger: bool
+    use_shared_accounts: bool
+    force_shared: bool
+    blockhash_slots_to_expiry: int
+    compute_unit_limit: int
+    compute_unit_price_micro: int
+    platform_fee_bps: int
+    fee_account: str
+    tracking_account: str
+    payer: str
+
+    # http
+    timeout_sec: float
+    connect_timeout: float
+    pool_timeout: float
+    max_keepalive: int
+    max_conn: int
+    tls_verify: bool
+    http2_effective: bool
+
+    # rate
+    max_qps: int
+    max_concurrency: int
+
+    # retry + breaker
+    retry_max: int
+    backoff_sec: float
+    jitter_sec: float
+    breaker_enabled: bool
+    fail_limit: int
+    breaker_cooldown_sec: float
+
+    # per-endpoint cooldown
+    endpoint_fail_limit: int
+    endpoint_cooldown_sec: float
+
+    # misc
+    unroutable_ttl_sec: int
+    requote_bump_pct: int
+    quote_ttl_sec: float
+    strict_auth: bool
+
+    # dryrun + safety
+    dry_run: bool
+    dryrun_build_tx: bool
+    disable_buys: bool
+    disable_sells: bool
+    kill_switch: bool
+    skip_preflight: bool
+
+    # headers
+    has_api_key: bool
+    api_key_mask: str
+
+
+_CFG: _Cfg | None = None
+_CFG_TS: float = 0.0
+
+
+def _load_cfg() -> _Cfg:
+    # endpoints from env (full URLs, comma-separated)
+    q_urls_raw = _env_str("JUP_QUOTE_URLS", _env_str("JUP_QUOTE_URL", "")).strip()
+    s_urls_raw = _env_str("JUP_SWAP_URLS", _env_str("JUP_SWAP_URL", "")).strip()
+
+    quote_urls: list[str] = []
+    swap_urls: list[str] = []
+
+    if q_urls_raw:
+        for x in _parse_csv(q_urls_raw):
+            u = _ensure_full_quote_url(x)
+            if u and u not in quote_urls:
+                quote_urls.append(u)
+
+    if s_urls_raw:
+        for x in _parse_csv(s_urls_raw):
+            u = _ensure_full_swap_url(x)
+            if u and u not in swap_urls:
+                swap_urls.append(u)
+
+    # fallback to base+path model
+    base = (
+        _env_str("JUP_BASE_URL", "") or _env_str("JUP_UPSTREAM", "") or DEFAULT_METIS_BASE
+    ).rstrip("/")
+    alt = _env_str("JUP_ALT_BASE_URLS", "")
+    bases = [base]
+    for b in _parse_csv(alt):
+        bb = (b or "").strip().rstrip("/")
+        if bb and bb not in bases:
+            bases.append(bb)
+
+    quote_path = _env_str("JUP_QUOTE_PATH", "").strip()
+    swap_path = _env_str("JUP_SWAP_PATH", "").strip()
+
+    # smart defaults if not specified
+    # if the base looks like quote-api => v6 defaults, else metis defaults
+    def _default_qp(b: str) -> str:
+        return DEFAULT_V6_QUOTE_PATH if "quote-api" in b else DEFAULT_METIS_QUOTE_PATH
+
+    def _default_sp(b: str) -> str:
+        return DEFAULT_V6_SWAP_PATH if "quote-api" in b else DEFAULT_METIS_SWAP_PATH
+
+    for b in bases:
+        if not quote_urls:
+            quote_urls.append(_join_url(b, quote_path or _default_qp(b)))
+        if not swap_urls:
+            swap_urls.append(_join_url(b, swap_path or _default_sp(b)))
+
+    # Always allow quote failover between “known good” defaults if env gave only one side
+    # (Keeps the bot alive if one domain is blocked)
+    if DEFAULT_METIS_BASE not in [u.split("/")[0] + "//" + u.split("/")[2] for u in quote_urls]:
+        # add metis quote as last resort
+        with contextlib.suppress(Exception):
+            u = _join_url(DEFAULT_METIS_BASE, DEFAULT_METIS_QUOTE_PATH)
+            if u not in quote_urls:
+                quote_urls.append(u)
+
+    if DEFAULT_METIS_BASE not in [u.split("/")[0] + "//" + u.split("/")[2] for u in swap_urls]:
+        with contextlib.suppress(Exception):
+            u = _join_url(DEFAULT_METIS_BASE, DEFAULT_METIS_SWAP_PATH)
+            if u not in swap_urls:
+                swap_urls.append(u)
+
+    only_direct = _env_bool("JUP_ONLY_DIRECT", _env_bool("JUP_ONLY_DIRECT_ROUTES", False))
+    restrict_intermediate = _env_bool("JUP_RESTRICT_INTERMEDIATE_TOKENS", True)
+
+    default_slippage_bps = _clamp_i(
+        _env_int("PF_SLIPPAGE_BPS", _env_int("SLIPPAGE_BPS", 30)), 1, 5000
+    )
+    as_legacy_tx = _env_bool("JUP_AS_LEGACY_TX", _env_bool("JUP_AS_LEGACY", False))
+
+    wrap_unwrap = _env_bool("PF_WRAP_UNWRAP_SOL", True)
+    dynamic_slippage = _env_bool("JUP_DYNAMIC_SLIPPAGE", False)
+    skip_user_accounts_rpc = _env_bool("JUP_SKIP_USER_ACCOUNTS_RPC_CALLS", False)
+
+    use_token_ledger = _env_bool("JUP_USE_TOKEN_LEDGER", False)
+
+    force_shared = _env_bool("JUP_FORCE_SHARED_ACCOUNTS", False)
+    tri = _env_tristate("JUP_USE_SHARED_ACCOUNTS")
+    use_shared = bool(tri) if tri is not None else _env_bool("JUP_USE_SHARED_ACCOUNTS", False)
+    if force_shared:
+        use_shared = True
+
+    blockhash_slots_to_expiry = max(0, _env_int("JUP_BLOCKHASH_SLOTS_TO_EXPIRY", 0))
+    compute_unit_limit = max(0, _env_int("PF_COMPUTE_UNIT_LIMIT", 0))
+    compute_unit_price_micro = max(
+        0, _env_int("PF_COMPUTE_UNIT_PRICE_MICRO", _env_int("JUP_COMPUTE_UNIT_PRICE_MICRO", 0))
     )
 
-HTTP_MAX_KEEPALIVE = max(5, _env_int("JUP_HTTP_MAX_KEEPALIVE", 20))
-HTTP_MAX_CONN = max(10, _env_int("JUP_HTTP_MAX_CONN", 60))
-HTTP_CONNECT_TIMEOUT = max(2.0, _env_float("JUP_HTTP_CONNECT_TIMEOUT", 5.0))
-HTTP_POOL_TIMEOUT = max(2.0, _env_float("JUP_HTTP_POOL_TIMEOUT", 5.0))
+    platform_fee_bps = _clamp_i(_env_int("JUP_PLATFORM_FEE_BPS", 0), 0, 10_000)
+    fee_account = _env_str("JUP_FEE_ACCOUNT", "")
+    tracking_account = _env_str("JUP_TRACKING_ACCOUNT", "")
+    payer = _env_str("JUP_PAYER", "")
 
-JUP_MAX_QPS = max(1, _env_int("JUP_MAX_QPS", 2))
-_JUP_MIN_INTERVAL = 1.0 / float(JUP_MAX_QPS)
+    timeout_sec = max(5.0, _env_float("JUP_HTTP_TIMEOUT_SEC", 20.0))
+    connect_timeout = max(2.0, _env_float("JUP_HTTP_CONNECT_TIMEOUT", 5.0))
+    pool_timeout = max(2.0, _env_float("JUP_HTTP_POOL_TIMEOUT", 5.0))
+    max_keepalive = max(5, _env_int("JUP_HTTP_MAX_KEEPALIVE", 20))
+    max_conn = max(10, _env_int("JUP_HTTP_MAX_CONN", 60))
+    tls_verify = _env_bool("JUP_TLS_VERIFY", True)
+    http2_effective = bool(_effective_http2())
 
-JUP_MAX_CONCURRENCY = max(1, _env_int("JUP_MAX_CONCURRENCY", 8))
-_CONCURRENCY = asyncio.Semaphore(JUP_MAX_CONCURRENCY)
+    max_qps = max(1, _env_int("JUP_MAX_QPS", 2))
+    max_concurrency = max(1, _env_int("JUP_MAX_CONCURRENCY", 8))
 
-_RATE_LOCK = asyncio.Lock()
-_LAST_TS: float = 0.0
+    retry_max = max(0, _env_int("JUP_HTTP_RETRY_MAX", 2))
+    backoff = max(0.1, _env_float("JUP_HTTP_RETRY_BACKOFF_SEC", 0.8))
+    jitter = max(0.0, _env_float("JUP_HTTP_RETRY_JITTER_SEC", 0.25))
 
-BREAKER_ENABLED = _env_bool("JUP_BREAKER_ENABLED", True)
-_FAIL_COUNT = 0
-_FAIL_LIMIT = max(1, _env_int("JUP_FAIL_LIMIT", 8))
-_BREAKER_COOLDOWN = max(5.0, _env_float("JUP_BREAKER_COOLDOWN_SEC", 30.0))
-_BREAKER_UNTIL: float = 0.0
+    breaker_enabled = _env_bool("JUP_BREAKER_ENABLED", True)
+    fail_limit = max(1, _env_int("JUP_FAIL_LIMIT", 8))
+    breaker_cooldown = max(5.0, _env_float("JUP_BREAKER_COOLDOWN_SEC", 30.0))
 
-BASE_FAIL_LIMIT = max(1, _env_int("JUP_BASE_FAIL_LIMIT", 4))
-BASE_COOLDOWN_SEC = max(5.0, _env_float("JUP_BASE_COOLDOWN_SEC", 20.0))
-_BASE_FAILS: Dict[str, int] = {}
-_BASE_UNTIL: Dict[str, float] = {}
-_BASE_SCORE: Dict[str, int] = {}
+    endpoint_fail_limit = max(1, _env_int("JUP_ENDPOINT_FAIL_LIMIT", 3))
+    endpoint_cooldown = max(5.0, _env_float("JUP_ENDPOINT_COOLDOWN_SEC", 20.0))
 
-UNROUTABLE_TTL_SEC = max(30, _env_int("JUP_UNROUTABLE_TTL_SEC", 1800))
-REQUOTE_BUMP_PCT = max(1, _env_int("JUP_REQUOTE_BUMP_PCT", 5))
-_UNROUTABLE_UNTIL: Dict[Tuple[str, str], float] = {}
-_UNROUTABLE_LOCK = asyncio.Lock()
+    unroutable_ttl = max(30, _env_int("JUP_UNROUTABLE_TTL_SEC", 1800))
+    requote_bump_pct = max(1, _env_int("JUP_REQUOTE_BUMP_PCT", 5))
+    quote_ttl_sec = max(0.0, float(_env_float("LIGHTNING_QUOTE_TTL_SEC", 0.0)))
 
-DRY_RUN = _env_bool("DRYRUN", False) or _env_bool("DRY_RUN", False) or _env_bool("IS_DRYRUN", False)
-DRYRUN_BUILD_TX = _env_bool("LIGHTNING_DRYRUN_BUILD_TX", False)
+    strict_auth = _env_bool("ROUTER_STRICT_AUTH", _env_bool("JUP_STRICT_AUTH", False))
 
-LIGHTNING_RETURN_RECEIPTS = _env_bool("LIGHTNING_RETURN_RECEIPTS", False)
-LIGHTNING_ALWAYS_RETURN_META = _env_bool("LIGHTNING_ALWAYS_RETURN_META", False)
-LIGHTNING_INCLUDE_FULL_QUOTE = _env_bool("LIGHTNING_INCLUDE_FULL_QUOTE", True)
+    dry_run = (
+        _env_bool("DRYRUN", False) or _env_bool("DRY_RUN", False) or _env_bool("IS_DRYRUN", False)
+    )
+    dryrun_build_tx = _env_bool("LIGHTNING_DRYRUN_BUILD_TX", False)
 
-LIGHTNING_USE_ROUTEGUARD = _env_bool("LIGHTNING_USE_ROUTEGUARD", False)
+    disable_buys = _env_bool("DISABLE_BUYS", False)
+    disable_sells = _env_bool("DISABLE_SELLS", False)
+    kill_switch = _env_bool("KILL_SWITCH", False)
+    skip_preflight = _env_bool("SOLANA_SKIP_PREFLIGHT", True)
 
-DISABLE_BUYS = _env_bool("DISABLE_BUYS", False)
-DISABLE_SELLS = _env_bool("DISABLE_SELLS", False)
-KILL_SWITCH = _env_bool("KILL_SWITCH", False)
+    api_key = _env_str("JUP_API_KEY", _env_str("JUP_PRO_KEY", _env_str("JUP_KEY", "")))
+    has_key = bool(api_key.strip())
+    api_key_mask = _mask_key(api_key)
 
-SEND_SKIP_PREFLIGHT = _env_bool("SOLANA_SKIP_PREFLIGHT", True)
-STRICT_AUTH = _env_bool("ROUTER_STRICT_AUTH", _env_bool("JUP_STRICT_AUTH", False))
+    return _Cfg(
+        quote_urls=quote_urls,
+        swap_urls=swap_urls,
+        only_direct=only_direct,
+        restrict_intermediate=restrict_intermediate,
+        default_slippage_bps=default_slippage_bps,
+        as_legacy_tx=as_legacy_tx,
+        wrap_unwrap_sol=wrap_unwrap,
+        dynamic_slippage=dynamic_slippage,
+        skip_user_accounts_rpc_calls=skip_user_accounts_rpc,
+        use_token_ledger=use_token_ledger,
+        use_shared_accounts=use_shared,
+        force_shared=force_shared,
+        blockhash_slots_to_expiry=blockhash_slots_to_expiry,
+        compute_unit_limit=compute_unit_limit,
+        compute_unit_price_micro=compute_unit_price_micro,
+        platform_fee_bps=platform_fee_bps,
+        fee_account=fee_account,
+        tracking_account=tracking_account,
+        payer=payer,
+        timeout_sec=timeout_sec,
+        connect_timeout=connect_timeout,
+        pool_timeout=pool_timeout,
+        max_keepalive=max_keepalive,
+        max_conn=max_conn,
+        tls_verify=tls_verify,
+        http2_effective=http2_effective,
+        max_qps=max_qps,
+        max_concurrency=max_concurrency,
+        retry_max=retry_max,
+        backoff_sec=backoff,
+        jitter_sec=jitter,
+        breaker_enabled=breaker_enabled,
+        fail_limit=fail_limit,
+        breaker_cooldown_sec=breaker_cooldown,
+        endpoint_fail_limit=endpoint_fail_limit,
+        endpoint_cooldown_sec=endpoint_cooldown,
+        unroutable_ttl_sec=unroutable_ttl,
+        requote_bump_pct=requote_bump_pct,
+        quote_ttl_sec=quote_ttl_sec,
+        strict_auth=strict_auth,
+        dry_run=dry_run,
+        dryrun_build_tx=dryrun_build_tx,
+        disable_buys=disable_buys,
+        disable_sells=disable_sells,
+        kill_switch=kill_switch,
+        skip_preflight=skip_preflight,
+        has_api_key=has_key,
+        api_key_mask=api_key_mask,
+    )
 
-QUOTE_TTL_SEC = max(0.0, float(_env_float("LIGHTNING_QUOTE_TTL_SEC", 0.0)))  # default OFF
-_QUOTE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-_QUOTE_FLIGHT: Dict[str, asyncio.Future[Any]] = {}
+
+def _cfg() -> _Cfg:
+    global _CFG, _CFG_TS
+    # reload if env changes in-process (helps your PowerShell tests)
+    # You can tune by setting LIGHTNING_CFG_TTL_SEC if you want.
+    ttl = max(0.0, float(_env_float("LIGHTNING_CFG_TTL_SEC", 0.0)))
+    now = time.time()
+    if _CFG is None or (ttl > 0 and (now - _CFG_TS) > ttl):
+        _CFG = _load_cfg()
+        _CFG_TS = now
+    return _CFG
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Quote cache + singleflight
+# ──────────────────────────────────────────────────────────────────────────────
+_QUOTE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_QUOTE_FLIGHT: dict[str, asyncio.Future[Any]] = {}
 _QUOTE_LOCK = asyncio.Lock()
 
-_LAST_GOOD_BASE: Optional[str] = None
 
-_STATS: Dict[str, int] = {
-    "quote_ok": 0,
-    "quote_fail": 0,
-    "swap_build_ok": 0,
-    "swap_build_fail": 0,
-    "send_ok": 0,
-    "send_fail": 0,
-    "no_route": 0,
-    "breaker_trip": 0,
-    "base_cooldown": 0,
-    "auth_fail": 0,
-    "invalid_mint": 0,
-    "token_not_tradable": 0,
-    "prequote_build_fail": 0,
-    "prequote_requote": 0,
-    "noop_same_mint": 0,
-    "all_bases_cooldown": 0,
-    "http2_disabled_runtime": 0,
-}
-
-
-def _qkey(inp: str, out: str, amount: int, sbps: int, only_direct: Optional[bool]) -> str:
-    od = ONLY_DIRECT if only_direct is None else bool(only_direct)
+def _qkey(inp: str, out: str, amount: int, sbps: int, only_direct: bool | None) -> str:
+    c = _cfg()
+    od = c.only_direct if only_direct is None else bool(only_direct)
     return f"{inp}:{out}:{int(amount)}:{int(sbps)}:{'D' if od else 'A'}"
 
 
-def _cache_get(key: str) -> Optional[Dict[str, Any]]:
-    if QUOTE_TTL_SEC <= 0:
+def _cache_get(key: str) -> dict[str, Any] | None:
+    ttl = float(_cfg().quote_ttl_sec)
+    if ttl <= 0:
         return None
     rec = _QUOTE_CACHE.get(key)
     if not rec:
@@ -474,10 +690,11 @@ def _cache_get(key: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _cache_set(key: str, payload: Dict[str, Any]) -> None:
-    if QUOTE_TTL_SEC <= 0:
+def _cache_set(key: str, payload: dict[str, Any]) -> None:
+    ttl = float(_cfg().quote_ttl_sec)
+    if ttl <= 0:
         return
-    _QUOTE_CACHE[key] = (_mono() + float(QUOTE_TTL_SEC), payload)
+    _QUOTE_CACHE[key] = (_mono() + ttl, payload)
     if len(_QUOTE_CACHE) > 5000:
         items = sorted(_QUOTE_CACHE.items(), key=lambda kv: kv[1][0])
         cut = max(1, int(len(items) * 0.2))
@@ -500,9 +717,9 @@ async def _singleflight(key: str, maker) -> Any:
                 _QUOTE_FLIGHT.pop(key, None)
 
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 # Response classifiers
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
 def _route_not_found(body: Any) -> bool:
     try:
         if isinstance(body, dict):
@@ -551,36 +768,189 @@ def _is_token_not_tradable(body: Any) -> bool:
             msg = str(body.get("error") or body.get("message") or "")
             if code == "TOKEN_NOT_TRADABLE":
                 return True
-            return ("not tradable" in msg.lower())
+            return "not tradable" in msg.lower()
         if isinstance(body, str):
-            return ("not tradable" in body.lower())
+            return "not tradable" in body.lower()
     except Exception:
         pass
     return False
 
 
-# =============================================================================
+def _is_transient_status(code: int) -> bool:
+    return int(code) in (408, 425, 429, 500, 502, 503, 504)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stats + breaker + endpoint scoring
+# ──────────────────────────────────────────────────────────────────────────────
+_STATS: dict[str, int] = {
+    "quote_ok": 0,
+    "quote_fail": 0,
+    "swap_build_ok": 0,
+    "swap_build_fail": 0,
+    "send_ok": 0,
+    "send_fail": 0,
+    "no_route": 0,
+    "breaker_trip": 0,
+    "auth_fail": 0,
+    "invalid_mint": 0,
+    "token_not_tradable": 0,
+    "prequote_build_fail": 0,
+    "prequote_requote": 0,
+    "noop_same_mint": 0,
+    "wallet_missing": 0,
+    "budget_block": 0,
+    "endpoint_cooldown": 0,
+    "all_endpoints_cooldown": 0,
+}
+
+_BREAKER_UNTIL: float = 0.0
+_FAIL_COUNT: int = 0
+
+_ENDPOINT_FAILS: dict[str, int] = {}
+_ENDPOINT_UNTIL: dict[str, float] = {}
+_ENDPOINT_SCORE: dict[str, int] = {}
+_LAST_GOOD_QUOTE_URL: str | None = None
+_LAST_GOOD_SWAP_URL: str | None = None
+
+_UNROUTABLE_TTL: dict[tuple[str, str], float] = {}
+_UNROUTABLE_LOCK = asyncio.Lock()
+
+_RATE_LOCK = asyncio.Lock()
+_LAST_TS: float = 0.0
+
+_CONCURRENCY: asyncio.Semaphore | None = None
+
+
+def _sem() -> asyncio.Semaphore:
+    global _CONCURRENCY
+    c = _cfg()
+    if _CONCURRENCY is None or _CONCURRENCY._value != int(c.max_concurrency):  # type: ignore[attr-defined]
+        _CONCURRENCY = asyncio.Semaphore(int(c.max_concurrency))
+    return _CONCURRENCY
+
+
+def _breaker_check() -> None:
+    c = _cfg()
+    if not c.breaker_enabled:
+        return
+    if time.time() < _BREAKER_UNTIL:
+        raise RuntimeError("jup_breaker_active")
+
+
+def _breaker_success() -> None:
+    global _FAIL_COUNT, _BREAKER_UNTIL
+    _FAIL_COUNT = 0
+    _BREAKER_UNTIL = 0.0
+
+
+def _breaker_fail(tag: str = "") -> None:
+    global _FAIL_COUNT, _BREAKER_UNTIL
+    c = _cfg()
+    if not c.breaker_enabled:
+        return
+    if tag in {"no_route", "token_not_tradable", "invalid_mint"}:
+        return
+    _FAIL_COUNT += 1
+    if int(c.fail_limit) <= _FAIL_COUNT:
+        _BREAKER_UNTIL = time.time() + float(c.breaker_cooldown_sec)
+        _STATS["breaker_trip"] += 1
+        _warn("JUP_BREAKER_TRIPPED", until=_BREAKER_UNTIL, fails=_FAIL_COUNT)
+
+
+async def _qps_gate() -> None:
+    global _LAST_TS
+    c = _cfg()
+    min_interval = 1.0 / float(max(1, int(c.max_qps)))
+    async with _RATE_LOCK:
+        now = time.monotonic()
+        wait_for = float(min_interval) - float(now - _LAST_TS)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        _LAST_TS = time.monotonic()
+
+
+async def _sleep_backoff(attempt: int) -> None:
+    c = _cfg()
+    base = float(c.backoff_sec) * (2 ** max(0, int(attempt)))
+    jitter = float(c.jitter_sec) * (0.5 + random.random()) if c.jitter_sec > 0 else 0.0
+    await asyncio.sleep(base + jitter)
+
+
+def _safe_json(r: httpx.Response) -> Any:
+    try:
+        return r.json()
+    except Exception:
+        with contextlib.suppress(Exception):
+            return {"text": (r.text or "")[:2000]}
+        return {"text": ""}
+
+
+def _endpoint_allowed(url: str) -> bool:
+    until = float(_ENDPOINT_UNTIL.get(url, 0.0) or 0.0)
+    return time.time() >= until
+
+
+def _endpoint_note_ok(url: str) -> None:
+    _ENDPOINT_FAILS[url] = 0
+    _ENDPOINT_UNTIL.pop(url, None)
+    _ENDPOINT_SCORE[url] = int(_ENDPOINT_SCORE.get(url, 0)) + 1
+
+
+def _endpoint_note_fail(url: str) -> None:
+    c = _cfg()
+    n = int(_ENDPOINT_FAILS.get(url, 0)) + 1
+    _ENDPOINT_FAILS[url] = n
+    _ENDPOINT_SCORE[url] = int(_ENDPOINT_SCORE.get(url, 0)) - 1
+    if n >= int(c.endpoint_fail_limit):
+        _ENDPOINT_UNTIL[url] = time.time() + float(c.endpoint_cooldown_sec)
+        _STATS["endpoint_cooldown"] += 1
+        _warn("JUP_ENDPOINT_COOLDOWN", url=url[:140], fails=n, cooldown_sec=c.endpoint_cooldown_sec)
+
+
+def _prefer_order(urls: list[str], last_good: str | None) -> list[str]:
+    allowed = [u for u in urls if _endpoint_allowed(u)]
+    if not allowed:
+        _STATS["all_endpoints_cooldown"] += 1
+        return []
+    allowed.sort(key=lambda u: int(_ENDPOINT_SCORE.get(u, 0)), reverse=True)
+    if last_good and last_good in allowed:
+        allowed = [last_good] + [u for u in allowed if u != last_good]
+    return allowed
+
+
+async def _is_unroutable_pair(inp: str, out: str) -> bool:
+    async with _UNROUTABLE_LOCK:
+        exp = _UNROUTABLE_TTL.get((inp, out))
+        return bool(exp and exp > time.time())
+
+
+async def _mark_unroutable(inp: str, out: str, ttl: int | None = None) -> None:
+    c = _cfg()
+    async with _UNROUTABLE_LOCK:
+        _UNROUTABLE_TTL[(inp, out)] = time.time() + float(ttl or c.unroutable_ttl_sec)
+        if len(_UNROUTABLE_TTL) > 5000:
+            now = time.time()
+            for k, exp in list(_UNROUTABLE_TTL.items()):
+                if exp <= now:
+                    _UNROUTABLE_TTL.pop(k, None)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # HTTP client (singleton, lazy)
-# =============================================================================
-_client: Optional[httpx.AsyncClient] = None
-_headers_snapshot: Optional[Tuple[str, str, str, bool]] = None  # (api_key, bearer, ua, http2)
+# ──────────────────────────────────────────────────────────────────────────────
+_client: httpx.AsyncClient | None = None
+_headers_snapshot: tuple[str, str, str, bool, bool] | None = (
+    None  # (api_key, bearer, ua, http2, verify)
+)
 
 
-def _mask_key(k: str) -> str:
-    k = (k or "").strip()
-    if not k:
-        return ""
-    if len(k) <= 8:
-        return "*" * len(k)
-    return k[:3] + ("*" * (len(k) - 6)) + k[-3:]
-
-
-def _jup_headers() -> Dict[str, str]:
+def _jup_headers() -> dict[str, str]:
     api_key = _env_str("JUP_API_KEY", _env_str("JUP_PRO_KEY", _env_str("JUP_KEY", "")))
     bearer = _env_str("JUP_BEARER", _env_str("JUP_ACCESS_TOKEN", ""))
     ua = _env_str("JUP_USER_AGENT", "pnlsniper")
 
-    h: Dict[str, str] = {
+    h: dict[str, str] = {
         "accept": "application/json",
         "content-type": "application/json",
         "user-agent": ua,
@@ -596,44 +966,38 @@ def _jup_headers() -> Dict[str, str]:
     return h
 
 
-def _effective_http2() -> bool:
-    """
-    Dynamic re-check:
-    - respects env JUP_HTTP2
-    - only enables if h2 is installed
-    """
-    req = _env_bool("JUP_HTTP2", False)
-    if not req:
-        return False
-    if importlib.util.find_spec("h2") is None:
-        return False
-    return True
-
-
 def _get_client() -> httpx.AsyncClient:
     global _client, _headers_snapshot
+    c = _cfg()
 
     api_key = _env_str("JUP_API_KEY", _env_str("JUP_PRO_KEY", _env_str("JUP_KEY", "")))
     bearer = _env_str("JUP_BEARER", _env_str("JUP_ACCESS_TOKEN", ""))
     ua = _env_str("JUP_USER_AGENT", "pnlsniper")
-    http2_eff = _effective_http2()
-    snap = (api_key, bearer, ua, bool(http2_eff))
+    snap = (api_key, bearer, ua, bool(c.http2_effective), bool(c.tls_verify))
 
-    if _client is None or _client.is_closed or (_headers_snapshot is not None and snap != _headers_snapshot):
+    if (
+        _client is None
+        or _client.is_closed
+        or (_headers_snapshot is not None and snap != _headers_snapshot)
+    ):
         old = _client
-        limits = httpx.Limits(max_keepalive_connections=int(HTTP_MAX_KEEPALIVE), max_connections=int(HTTP_MAX_CONN))
+        limits = httpx.Limits(
+            max_keepalive_connections=int(c.max_keepalive), max_connections=int(c.max_conn)
+        )
         timeout = httpx.Timeout(
-            connect=float(HTTP_CONNECT_TIMEOUT),
-            read=float(HTTP_TIMEOUT_SEC),
-            write=float(HTTP_TIMEOUT_SEC),
-            pool=float(HTTP_POOL_TIMEOUT),
+            connect=float(c.connect_timeout),
+            read=float(c.timeout_sec),
+            write=float(c.timeout_sec),
+            pool=float(c.pool_timeout),
         )
         _client = httpx.AsyncClient(
             timeout=timeout,
             limits=limits,
             headers=_jup_headers(),
-            http2=bool(http2_eff),
+            http2=bool(c.http2_effective),
             follow_redirects=True,
+            verify=bool(c.tls_verify),
+            trust_env=True,
         )
         _headers_snapshot = snap
 
@@ -644,7 +1008,6 @@ def _get_client() -> httpx.AsyncClient:
                     loop.create_task(old.aclose())
                 except Exception:
                     pass
-
     return _client
 
 
@@ -657,122 +1020,9 @@ async def close_http() -> None:
     _headers_snapshot = None
 
 
-# =============================================================================
-# Keypair/pubkey cache (non-blocking)
-# =============================================================================
-_KP_LOCK = asyncio.Lock()
-_KP = None
-_PUBKEY_STR: Optional[str] = None
-
-
-async def _get_keypair_cached():
-    global _KP, _PUBKEY_STR
-    if _KP is not None and _PUBKEY_STR:
-        return _KP, _PUBKEY_STR
-    async with _KP_LOCK:
-        if _KP is not None and _PUBKEY_STR:
-            return _KP, _PUBKEY_STR
-        kp = await _to_thread(load_keypair)
-        pk = await _to_thread(get_pubkey_str, kp)
-        _KP = kp
-        _PUBKEY_STR = str(pk)
-        return _KP, _PUBKEY_STR
-
-
-# =============================================================================
-# Rate limiting + breaker + base scoring
-# =============================================================================
-async def _qps_gate() -> None:
-    global _LAST_TS
-    async with _RATE_LOCK:
-        now = time.monotonic()
-        wait_for = float(_JUP_MIN_INTERVAL) - float(now - _LAST_TS)
-        if wait_for > 0:
-            await asyncio.sleep(wait_for)
-        _LAST_TS = time.monotonic()
-
-
-def _breaker_check() -> None:
-    if not BREAKER_ENABLED:
-        return
-    if time.time() < _BREAKER_UNTIL:
-        raise RuntimeError("jup_breaker_active")
-
-
-def _breaker_success() -> None:
-    global _FAIL_COUNT, _BREAKER_UNTIL
-    _FAIL_COUNT = 0
-    _BREAKER_UNTIL = 0.0
-
-
-def _breaker_fail(tag: str = "") -> None:
-    global _FAIL_COUNT, _BREAKER_UNTIL
-    if tag in {"no_route", "token_not_tradable", "invalid_mint"}:
-        return
-    _FAIL_COUNT += 1
-    if _FAIL_COUNT >= _FAIL_LIMIT:
-        _BREAKER_UNTIL = time.time() + float(_BREAKER_COOLDOWN)
-        _STATS["breaker_trip"] += 1
-        _warn("JUP_BREAKER_TRIPPED", until=_BREAKER_UNTIL, fails=_FAIL_COUNT)
-
-
-def _is_transient_status(code: int) -> bool:
-    return int(code) in (408, 425, 429, 500, 502, 503, 504)
-
-
-async def _sleep_backoff(attempt: int) -> None:
-    base = float(HTTP_RETRY_BACKOFF_SEC) * (2 ** max(0, int(attempt)))
-    jitter = float(HTTP_RETRY_JITTER_SEC) * (0.5 + random.random()) if HTTP_RETRY_JITTER_SEC > 0 else 0.0
-    await asyncio.sleep(base + jitter)
-
-
-def _safe_json(r: httpx.Response) -> Any:
-    try:
-        return r.json()
-    except Exception:
-        with contextlib.suppress(Exception):
-            return {"text": (r.text or "")[:2000]}
-        return {"text": ""}
-
-
-def _base_allowed(base: str) -> bool:
-    until = float(_BASE_UNTIL.get(base, 0.0) or 0.0)
-    return time.time() >= until
-
-
-def _base_note_ok(base: str) -> None:
-    _BASE_FAILS[base] = 0
-    _BASE_UNTIL.pop(base, None)
-    _BASE_SCORE[base] = int(_BASE_SCORE.get(base, 0)) + 1
-
-
-def _base_note_fail(base: str) -> None:
-    n = int(_BASE_FAILS.get(base, 0)) + 1
-    _BASE_FAILS[base] = n
-    _BASE_SCORE[base] = int(_BASE_SCORE.get(base, 0)) - 1
-    if n >= int(BASE_FAIL_LIMIT):
-        _BASE_UNTIL[base] = time.time() + float(BASE_COOLDOWN_SEC)
-        _STATS["base_cooldown"] += 1
-        _warn("JUP_BASE_COOLDOWN", base=base, fails=n, cooldown_sec=BASE_COOLDOWN_SEC)
-
-
-def _bases_in_preferred_order() -> List[str]:
-    allowed = [b for b in BASE_URLS if _base_allowed(b)]
-    if not allowed:
-        _STATS["all_bases_cooldown"] += 1
-        soonest = min((float(_BASE_UNTIL.get(b, 0.0) or 0.0) for b in BASE_URLS), default=0.0)
-        wait_s = max(0.0, soonest - time.time()) if soonest else 0.0
-        log.every("JUP_ALL_BASES_COOLDOWN", n=10, msg="JUP_ALL_BASES_COOLDOWN", wait_s=round(wait_s, 3))
-        return []
-    allowed.sort(key=lambda b: int(_BASE_SCORE.get(b, 0)), reverse=True)
-    if _LAST_GOOD_BASE and _LAST_GOOD_BASE in allowed:
-        allowed = [_LAST_GOOD_BASE] + [b for b in allowed if b != _LAST_GOOD_BASE]
-    return allowed
-
-
-# =============================================================================
-# Budget + HTTP request wrapper
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
+# Budget wrapper + hardened request
+# ──────────────────────────────────────────────────────────────────────────────
 async def _budget_before(is_get: bool, units: int) -> bool:
     if is_get:
         ok = await _budget_call(getattr(budget, "before_quote", None), units=int(units))
@@ -798,16 +1048,10 @@ async def _http_json(
     method: str,
     url: str,
     *,
-    params: Optional[Dict[str, Any]] = None,
-    json_body: Optional[Dict[str, Any]] = None,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
     budget_units: int = 1,
 ) -> Any:
-    """
-    Hardened HTTP wrapper:
-    - breaker + qps + concurrency
-    - retries on transient
-    - auto-recovers if HTTP/2 requested but h2 missing (no Lightning failure)
-    """
     _breaker_check()
     await _qps_gate()
 
@@ -817,50 +1061,57 @@ async def _http_json(
 
     try:
         if not await _budget_before(is_get=is_get, units=int(budget_units)):
+            _STATS["budget_block"] += 1
             raise RuntimeError("quote_blocked_by_budget" if is_get else "swap_blocked_by_budget")
         budget_granted = True
 
-        for attempt in range(0, int(HTTP_RETRY_MAX) + 1):
-            c = _get_client()
+        c = _cfg()
+        for attempt in range(0, int(c.retry_max) + 1):
+            cli = _get_client()
             try:
-                async with _CONCURRENCY:
+                async with _sem():
                     if is_get:
-                        r = await c.get(url, params=params)
+                        r = await cli.get(url, params=params)
                     else:
-                        r = await c.post(url, json=json_body)
+                        r = await cli.post(url, json=json_body)
 
                 body = _safe_json(r)
-
                 if r.status_code in (200, 201):
                     if isinstance(body, dict) and body.get("error"):
                         _breaker_fail(tag="")
-                        raise JupHTTPError(status=r.status_code, url=url, body=body)
+                        raise RuntimeError(f"jup_error_in_200:{_short(body, 220)}")
                     _breaker_success()
                     return body
 
                 if _is_auth_fail(r.status_code, body):
                     _STATS["auth_fail"] += 1
                     _breaker_fail(tag="auth")
-                    raise JupHTTPError(status=r.status_code, url=url, body=body)
+                    raise httpx.HTTPStatusError("auth", request=r.request, response=r)
 
                 if _route_not_found(body):
                     _breaker_fail(tag="no_route")
-                    raise JupHTTPError(status=r.status_code, url=url, body=body)
+                    raise RuntimeError("jup_no_route")
 
                 if _is_token_not_tradable(body):
                     _breaker_fail(tag="token_not_tradable")
-                    raise JupHTTPError(status=r.status_code, url=url, body=body)
+                    raise RuntimeError("jup_token_not_tradable")
 
-                if _is_transient_status(r.status_code) and attempt < int(HTTP_RETRY_MAX):
-                    _warn("JUP_HTTP_RETRY", url=url[:140], status=r.status_code, attempt=attempt, body=_short(body, 260))
+                if _is_transient_status(r.status_code) and attempt < int(c.retry_max):
+                    _warn(
+                        "JUP_HTTP_RETRY",
+                        url=url[:140],
+                        status=r.status_code,
+                        attempt=attempt,
+                        body=_short(body, 240),
+                    )
                     await _sleep_backoff(attempt)
                     continue
 
                 _breaker_fail(tag="")
-                raise JupHTTPError(status=r.status_code, url=url, body=body)
+                raise httpx.HTTPStatusError("http", request=r.request, response=r)
 
             except (httpx.TimeoutException, httpx.NetworkError) as e:
-                if attempt < int(HTTP_RETRY_MAX):
+                if attempt < int(c.retry_max):
                     _warn("JUP_NET_RETRY", url=url[:140], attempt=attempt, err=_short(e, 220))
                     await _sleep_backoff(attempt)
                     continue
@@ -868,17 +1119,11 @@ async def _http_json(
                 raise
 
             except Exception as e:
-                # If httpx throws the classic "h2 not installed" error, auto-disable http2 and retry once.
                 msg = str(e)
-                if ("'h2' package is not installed" in msg or "http2=True" in msg) and attempt < int(HTTP_RETRY_MAX):
-                    _STATS["http2_disabled_runtime"] += 1
-                    log.every(
-                        "JUP_HTTP2_DISABLED_RUNTIME",
-                        n=120,
-                        msg="JUP_HTTP2_DISABLED_RUNTIME",
-                        hint="HTTP/2 failed due to missing h2; continuing with HTTP/1.1.",
-                    )
-                    # force rebuild client without http2 by closing snapshot
+                if (
+                    "'h2' package is not installed" in msg or "http2=True" in msg
+                ) and attempt < int(c.retry_max):
+                    log.every("JUP_HTTP2_DISABLED_RUNTIME", n=120, msg="JUP_HTTP2_DISABLED_RUNTIME")
                     await close_http()
                     await _sleep_backoff(attempt)
                     continue
@@ -887,90 +1132,41 @@ async def _http_json(
     finally:
         dt_ms = int((time.monotonic() - t0) * 1000)
         if dt_ms > 2500:
-            log.every("JUP_SLOW_HTTP", n=20, msg="JUP_SLOW_HTTP", method=method, url=url[:120], ms=dt_ms)
+            log.every(
+                "JUP_SLOW_HTTP", n=20, msg="JUP_SLOW_HTTP", method=method, url=url[:120], ms=dt_ms
+            )
         if budget_granted:
             with contextlib.suppress(Exception):
                 await _budget_after(is_get=is_get, units=int(budget_units))
 
 
-# =============================================================================
-# Endpoint builders
-# =============================================================================
-def _join(base: str, path: str) -> str:
-    b = (base or "").rstrip("/")
-    p = (path or "").strip()
-    if not p.startswith("/"):
-        p = "/" + p
-    return b + p
-
-
-def _quote_url(base: str) -> str:
-    return _join(base, QUOTE_PATH)
-
-
-def _swap_url(base: str) -> str:
-    return _join(base, SWAP_PATH)
-
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Quote params
+# ──────────────────────────────────────────────────────────────────────────────
 def _quote_params(
     *,
     input_mint: str,
     output_mint: str,
     amount: int,
     slippage_bps: int,
-    only_direct: Optional[bool] = None,
-) -> Dict[str, Any]:
-    od = ONLY_DIRECT if only_direct is None else bool(only_direct)
-    p: Dict[str, Any] = {
+    only_direct: bool | None = None,
+) -> dict[str, Any]:
+    c = _cfg()
+    od = c.only_direct if only_direct is None else bool(only_direct)
+    return {
         "inputMint": input_mint,
         "outputMint": output_mint,
         "amount": str(int(amount)),
         "slippageBps": int(slippage_bps),
         "swapMode": "ExactIn",
         "onlyDirectRoutes": od,
-        "asLegacyTransaction": bool(AS_LEGACY_TX),
-        "restrictIntermediateTokens": bool(RESTRICT_INTERMEDIATE),
+        "asLegacyTransaction": bool(c.as_legacy_tx),
+        "restrictIntermediateTokens": bool(c.restrict_intermediate),
     }
-    if INSTRUCTION_VERSION:
-        p["instructionVersion"] = INSTRUCTION_VERSION
-    if MAX_ACCOUNTS > 0:
-        p["maxAccounts"] = int(MAX_ACCOUNTS)
-    if PLATFORM_FEE_BPS > 0:
-        p["platformFeeBps"] = int(PLATFORM_FEE_BPS)
-    return p
 
 
-def _choose_priority_lamports() -> Optional[int]:
-    if PF_PRIORITY_LAMPORTS > 0:
-        return int(PF_PRIORITY_LAMPORTS)
-    if PF_PRIORITY_SOL > 0:
-        with contextlib.suppress(Exception):
-            return int(float(PF_PRIORITY_SOL) * float(LAMPORTS_PER_SOL))
-    return None
-
-
-async def _gc_unroutable_unlocked() -> None:
-    now = time.time()
-    for k, exp in list(_UNROUTABLE_UNTIL.items()):
-        if exp <= now:
-            _UNROUTABLE_UNTIL.pop(k, None)
-
-
-async def _is_unroutable_pair(inp: str, out: str) -> bool:
-    async with _UNROUTABLE_LOCK:
-        exp = _UNROUTABLE_UNTIL.get((inp, out))
-        return bool(exp and exp > time.time())
-
-
-async def _mark_unroutable(inp: str, out: str, ttl: Optional[int] = None) -> None:
-    async with _UNROUTABLE_LOCK:
-        _UNROUTABLE_UNTIL[(inp, out)] = time.time() + float(ttl or UNROUTABLE_TTL_SEC)
-        if len(_UNROUTABLE_UNTIL) > 5000:
-            await _gc_unroutable_unlocked()
-
-
-def _compact_route_summary(q: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
+def _compact_route_summary(q: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {
         "inAmount": q.get("inAmount"),
         "outAmount": q.get("outAmount"),
         "priceImpactPct": q.get("priceImpactPct"),
@@ -986,29 +1182,18 @@ def _compact_route_summary(q: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _remember_last_good(base: str) -> None:
-    global _LAST_GOOD_BASE
-    _LAST_GOOD_BASE = str(base)
-
-
-# =============================================================================
-# Quote core (multi-base + bump + unroutable cache)
-# =============================================================================
-async def _get_quote_once(*, base: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    js = await _http_json("GET", _quote_url(base), params=params, budget_units=1)
-    if not isinstance(js, dict):
-        raise RuntimeError("jup_quote_non_dict")
-    return js
-
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Quote core (multi-url + requote bump + unroutable)
+# ──────────────────────────────────────────────────────────────────────────────
 async def _get_quote_kwonly(
     *,
     input_mint: str,
     output_mint: str,
     amount: int,
     slippage_bps: int,
-    only_direct: Optional[bool] = None,
-) -> Tuple[str, Dict[str, Any]]:
+    only_direct: bool | None = None,
+) -> tuple[str, dict[str, Any]]:
+    c = _cfg()
     if int(amount) <= 0:
         raise RuntimeError("amount<=0")
 
@@ -1031,111 +1216,117 @@ async def _get_quote_kwonly(
         only_direct=only_direct,
     )
 
-    last_err: Optional[BaseException] = None
-    saw_no_route = False
-    saw_token_not_tradable = False
+    urls = _prefer_order(c.quote_urls, _LAST_GOOD_QUOTE_URL)
+    if not urls:
+        raise RuntimeError("jup_all_endpoints_cooldown")
+
+    last_err: BaseException | None = None
     bumped_done = False
+    saw_no_route = False
 
-    bases = _bases_in_preferred_order()
-    if not bases:
-        raise RuntimeError("jup_all_bases_cooldown")
-
-    for base in bases:
+    for url in urls:
         try:
-            js = await _get_quote_once(base=base, params=params)
+            js = await _http_json("GET", url, params=params, budget_units=1)
+            if not isinstance(js, dict):
+                raise RuntimeError("jup_quote_non_dict")
             _STATS["quote_ok"] += 1
-            _base_note_ok(base)
-            _remember_last_good(base)
-            log.every("JUP_QUOTE_OK", n=40, msg="JUP_QUOTE_OK", base=base, inp=inp, out=out)
-            return base, js
+            _endpoint_note_ok(url)
+            globals()["_LAST_GOOD_QUOTE_URL"] = url
+            log.every("JUP_QUOTE_OK", n=40, msg="JUP_QUOTE_OK", url=url[:80], inp=inp, out=out)
+            return url, js
 
-        except JupHTTPError as e:
+        except RuntimeError as e:
             last_err = e
-            body = e.body
+            tag = str(e)
 
-            if _is_auth_fail(e.status, body):
-                _base_note_fail(base)
-                _warn(
-                    "JUP_AUTH_FAIL",
-                    base=base,
-                    status=e.status,
-                    has_api_key=bool(_env_str("JUP_API_KEY", _env_str("JUP_PRO_KEY", _env_str("JUP_KEY", "")))),
-                    api_key_mask=_mask_key(_env_str("JUP_API_KEY", _env_str("JUP_PRO_KEY", _env_str("JUP_KEY", "")))),
-                    hint="Set JUP_API_KEY (or JUP_PRO_KEY) to a valid Metis key.",
-                    body=_short(body, 260),
-                )
-                if STRICT_AUTH:
-                    raise RuntimeError("jup_unauthorized") from e
-                continue
-
-            if _is_token_not_tradable(body):
-                saw_token_not_tradable = True
-                _STATS["token_not_tradable"] += 1
-                _base_note_fail(base)
-                _warn("JUP_TOKEN_NOT_TRADABLE", base=base, status=e.status, body=_short(body, 260))
-                break
-
-            if _route_not_found(body):
+            if tag == "jup_no_route":
                 saw_no_route = True
-
                 if not bumped_done:
                     bumped_done = True
-                    bumped = max(int(int(amount) * (100 + int(REQUOTE_BUMP_PCT)) / 100), int(amount) + 1)
-                    log.every("JUP_REQUOTE_BUMP", n=25, msg="JUP_REQUOTE_BUMP", base=base, amt=int(amount), bumped=bumped)
+                    bumped = max(
+                        int(int(amount) * (100 + int(c.requote_bump_pct)) / 100), int(amount) + 1
+                    )
+                    log.every(
+                        "JUP_REQUOTE_BUMP",
+                        n=25,
+                        msg="JUP_REQUOTE_BUMP",
+                        url=url[:80],
+                        amt=int(amount),
+                        bumped=bumped,
+                    )
                     try:
-                        params2 = _quote_params(
-                            input_mint=inp,
-                            output_mint=out,
-                            amount=bumped,
-                            slippage_bps=int(slippage_bps),
-                            only_direct=only_direct,
-                        )
-                        js2 = await _get_quote_once(base=base, params=params2)
-                        _STATS["quote_ok"] += 1
-                        _base_note_ok(base)
-                        _remember_last_good(base)
-                        log.every("JUP_QUOTE_OK_BUMPED", n=25, msg="JUP_QUOTE_OK_BUMPED", base=base)
-                        return base, js2
+                        params2 = dict(params)
+                        params2["amount"] = str(int(bumped))
+                        js2 = await _http_json("GET", url, params=params2, budget_units=1)
+                        if isinstance(js2, dict):
+                            _STATS["quote_ok"] += 1
+                            _endpoint_note_ok(url)
+                            globals()["_LAST_GOOD_QUOTE_URL"] = url
+                            log.every(
+                                "JUP_QUOTE_OK_BUMPED", n=25, msg="JUP_QUOTE_OK_BUMPED", url=url[:80]
+                            )
+                            return url, js2
                     except Exception:
                         pass
 
                 _STATS["quote_fail"] += 1
-                _base_note_fail(base)
+                _endpoint_note_fail(url)
                 continue
 
+            if tag == "jup_token_not_tradable":
+                _STATS["token_not_tradable"] += 1
+                _endpoint_note_fail(url)
+                raise
+
             _STATS["quote_fail"] += 1
-            _base_note_fail(base)
-            _warn("JUP_QUOTE_FAIL", base=base, status=e.status, body=_short(body, 260))
+            _endpoint_note_fail(url)
             continue
 
-        except RuntimeError as e:
+        except httpx.HTTPStatusError as e:
             last_err = e
-            _STATS["quote_fail"] += 1
-            _base_note_fail(base)
-            _warn("JUP_QUOTE_RT_FAIL", base=base, err=_short(e, 220))
+            resp = e.response
+            body = None
+            with contextlib.suppress(Exception):
+                body = resp.json()
+
+            if _is_auth_fail(resp.status_code, body):
+                _endpoint_note_fail(url)
+                _warn(
+                    "JUP_AUTH_FAIL",
+                    url=url[:140],
+                    status=int(resp.status_code),
+                    has_api_key=bool(_cfg().has_api_key),
+                    api_key_mask=_cfg().api_key_mask,
+                    hint="Auth failed (401/403). If this is Metis /swap/v1, ensure JUP_API_KEY is valid.",
+                    body=_short(body, 240),
+                )
+                if _cfg().strict_auth:
+                    raise RuntimeError("jup_unauthorized") from e
+                continue
+
+            if _is_transient_status(resp.status_code):
+                _endpoint_note_fail(url)
+                continue
+
+            _endpoint_note_fail(url)
             continue
 
         except BaseException as e:
             last_err = e
             _STATS["quote_fail"] += 1
-            _base_note_fail(base)
-            _warn("JUP_QUOTE_UNKNOWN_FAIL", base=base, err=_short(e, 220))
+            _endpoint_note_fail(url)
+            _warn("JUP_QUOTE_UNKNOWN_FAIL", url=url[:140], err=_short(e, 220))
             continue
-
-    if saw_token_not_tradable:
-        raise RuntimeError("jup_token_not_tradable")
 
     if saw_no_route:
         await _mark_unroutable(inp, out)
         _STATS["no_route"] += 1
         raise RuntimeError("jup_no_route")
 
-    if last_err:
-        raise last_err
-    raise RuntimeError("jup_quote_failed")
+    raise last_err or RuntimeError("jup_quote_failed")
 
 
-async def _get_quote(*args: Any, **kwargs: Any) -> Tuple[str, Dict[str, Any]]:
+async def _get_quote(*args: Any, **kwargs: Any) -> tuple[str, dict[str, Any]]:
     if args and not kwargs and len(args) == 4:
         return await _get_quote_kwonly(
             input_mint=str(args[0]),
@@ -1146,208 +1337,25 @@ async def _get_quote(*args: Any, **kwargs: Any) -> Tuple[str, Dict[str, Any]]:
     return await _get_quote_kwonly(**kwargs)
 
 
-# =============================================================================
-# Swap build + send
-# =============================================================================
-async def _build_swap_tx(*, base_url: str, user_pubkey: str, quote: Dict[str, Any]) -> str:
-    dynamic_cu = not (COMPUTE_UNIT_LIMIT and COMPUTE_UNIT_LIMIT > 0)
-
-    body: Dict[str, Any] = {
-        "quoteResponse": quote,  # DO NOT MODIFY
-        "userPublicKey": user_pubkey,
-        "wrapAndUnwrapSol": bool(WRAP_UNWRAP_SOL),
-        "dynamicComputeUnitLimit": bool(dynamic_cu),
-        "asLegacyTransaction": bool(AS_LEGACY_TX),
-        "useSharedAccounts": bool(USE_SHARED_ACCOUNTS),
-        "skipUserAccountsRpcCalls": bool(SKIP_USER_ACCOUNTS_RPC_CALLS),
-        "dynamicSlippage": bool(DYNAMIC_SLIPPAGE),
-    }
-
-    if USE_TOKEN_LEDGER:
-        body["useTokenLedger"] = True
-    if PAYER:
-        body["payer"] = PAYER
-    if PLATFORM_FEE_BPS > 0 and FEE_ACCOUNT:
-        body["feeAccount"] = FEE_ACCOUNT
-    if TRACKING_ACCOUNT:
-        body["trackingAccount"] = TRACKING_ACCOUNT
-
-    prio = _choose_priority_lamports()
-    if prio is not None and prio > 0:
-        body["prioritizationFeeLamports"] = int(prio)
-    if COMPUTE_UNIT_PRICE_MICRO > 0:
-        body["computeUnitPriceMicroLamports"] = int(COMPUTE_UNIT_PRICE_MICRO)
-    if not dynamic_cu:
-        body["computeUnitLimit"] = int(COMPUTE_UNIT_LIMIT)
-    if BLOCKHASH_SLOTS_TO_EXPIRY > 0:
-        body["blockhashSlotsToExpiry"] = int(BLOCKHASH_SLOTS_TO_EXPIRY)
-
-    js_any = await _http_json("POST", _swap_url(base_url), json_body=body, budget_units=2)
-    if not isinstance(js_any, dict):
-        _STATS["swap_build_fail"] += 1
-        raise RuntimeError("jup_swap_non_dict")
-    tx_b64 = js_any.get("swapTransaction")
-    if not tx_b64:
-        _STATS["swap_build_fail"] += 1
-        raise RuntimeError(f"jup_swap_missing_tx: {_short(js_any, 520)}")
-
-    _STATS["swap_build_ok"] += 1
-    _base_note_ok(base_url)
-    _remember_last_good(base_url)
-    log.every("JUP_SWAP_BUILT", n=30, msg="JUP_SWAP_BUILT", base=base_url, shared=USE_SHARED_ACCOUNTS, legacy=int(AS_LEGACY_TX))
-    return str(tx_b64)
-
-
-async def _send_tx_b64(tx_b64: str) -> str:
-    try:
-        if _send_b64_with_diag is not None:
-            with contextlib.suppress(Exception):
-                sig = await _maybe_await(_send_b64_with_diag(tx_b64, skip_preflight=SEND_SKIP_PREFLIGHT))  # type: ignore[misc]
-                if sig:
-                    _STATS["send_ok"] += 1
-                    return str(sig)
-    except Exception:
-        pass
-
-    kp, _ = await _get_keypair_cached()
-    try:
-        sig2 = await _maybe_await(sign_and_send_b64_tx(tx_b64, kp, skip_preflight=SEND_SKIP_PREFLIGHT))
-    except TypeError:
-        sig2 = await _maybe_await(sign_and_send_b64_tx(tx_b64, kp))  # type: ignore[misc]
-    _STATS["send_ok"] += 1
-    return str(sig2)
-
-
-async def _try_build_from_prequote_anywhere(*, user_pk: str, quote: Dict[str, Any]) -> Tuple[str, str]:
-    bases = _bases_in_preferred_order()
-    if not bases:
-        raise RuntimeError("jup_all_bases_cooldown")
-    last_err: Optional[BaseException] = None
-    for base in bases:
-        try:
-            tx_b64 = await _build_swap_tx(base_url=base, user_pubkey=user_pk, quote=quote)
-            return base, tx_b64
-        except BaseException as e:
-            last_err = e
-            _base_note_fail(base)
-            continue
-    raise last_err or RuntimeError("swap_build_failed_all")
-
-
-# =============================================================================
-# Receipts / meta
-# =============================================================================
-def _expected_out_sol(quote: Optional[Dict[str, Any]]) -> Tuple[Optional[int], Optional[float]]:
-    if not isinstance(quote, dict):
-        return None, None
-    out_raw = _intish(quote.get("outAmount"), 0)
-    if out_raw <= 0:
-        return None, None
-    return int(out_raw), float(out_raw) / float(LAMPORTS_PER_SOL)
-
-
-def _mk_receipt(
-    *,
-    ok: bool,
-    side: str,
-    base_url: str,
-    input_mint: str,
-    output_mint: str,
-    slippage_bps: int,
-    quote: Optional[Dict[str, Any]] = None,
-    sig: Optional[str] = None,
-    err: Optional[str] = None,
-    meta: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    q = quote or {}
-    in_raw = _intish(q.get("inAmount"), 0) if isinstance(q, dict) else 0
-    out_raw = _intish(q.get("outAmount"), 0) if isinstance(q, dict) else 0
-
-    out_lamports, out_sol = (None, None)
-    if str(side).upper() == "SELL" and normalize_mint(output_mint) == normalize_mint(SOL_MINT):
-        out_lamports, out_sol = _expected_out_sol(q)
-
-    receipt: Dict[str, Any] = {
-        "ok": bool(ok),
-        "side": str(side).upper(),
-        "sig": sig,
-        "signature": sig,
-        "tx_sig": sig,
-        "base_url": str(base_url),
-        "inputMint": str(input_mint),
-        "outputMint": str(output_mint),
-        "in_amount_raw": int(in_raw),
-        "out_amount_raw": int(out_raw),
-        "out_lamports": out_lamports,
-        "out_sol": out_sol,
-        "priceImpactPct": q.get("priceImpactPct") if isinstance(q, dict) else None,
-        "slippage_bps": int(slippage_bps),
-        "routeSummary": _compact_route_summary(q) if isinstance(q, dict) else {},
-        "err": err,
-        "ts": float(time.time()),
-        "lightning_version": LIGHTNING_VERSION,
-    }
-    if meta is not None:
-        receipt["meta"] = meta
-    if LIGHTNING_INCLUDE_FULL_QUOTE:
-        receipt["quote"] = q
-    return receipt
-
-
-def _mk_meta_buy(*, mint: str, base: str, quote: Dict[str, Any], lamports_in: int) -> Dict[str, Any]:
-    in_raw = _intish(quote.get("inAmount"), lamports_in)
-    out_raw = _intish(quote.get("outAmount"), 0)
-    return {
-        "mint": mint,
-        "in_amount_raw": int(in_raw),
-        "amount_raw": int(out_raw),  # legacy key
-        "inAmount": int(in_raw),
-        "outAmount": int(out_raw),
-        "priceImpactPct": quote.get("priceImpactPct"),
-        "base_url": base,
-    }
-
-
-def _extract_prequote(*qs: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    for q in qs:
-        if isinstance(q, dict) and q:
-            return q
-    return None
-
-
-async def _maybe_routeguard_preflight(*, mint: str, lamports_in: int) -> Tuple[bool, Optional[Dict[str, Any]]]:
-    if not LIGHTNING_USE_ROUTEGUARD:
-        return True, None
-    try:
-        from utils_pkg import routeguard  # local import
-        fn = getattr(routeguard, "preflight", None)
-        if callable(fn):
-            ok, q = await fn(mint=str(mint), lamports_in=int(lamports_in))  # type: ignore[misc]
-            return bool(ok), (q if isinstance(q, dict) else None)
-    except Exception as e:
-        log.every("LIGHTNING_RG_ERR", n=10, msg="LIGHTNING_RG_ERR", err=_short(e, 220))
-    return True, None
-
-
-# =============================================================================
-# “Recognizable” quote functions (router + smoke_lightning friendly)
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
+# Public quote functions (router expects these)
+# ──────────────────────────────────────────────────────────────────────────────
 async def get_quote(
     input_mint: str,
     output_mint: str,
     amount: int,
-    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
-    only_direct: Optional[bool] = None,
-) -> Dict[str, Any]:
-    sbps = _clamp_i(int(slippage_bps), 1, 5000)
-    base, q = await _get_quote(
+    slippage_bps: int = 0,
+    only_direct: bool | None = None,
+) -> dict[str, Any]:
+    c = _cfg()
+    sbps = _clamp_i(int(slippage_bps or c.default_slippage_bps), 1, 5000)
+    _, q = await _get_quote(
         input_mint=str(input_mint),
         output_mint=str(output_mint),
         amount=int(amount),
         slippage_bps=sbps,
         only_direct=only_direct,
     )
-    _remember_last_good(base)
     return q
 
 
@@ -1357,13 +1365,14 @@ quote = get_quote
 async def get_buy_quote(
     *,
     mint: str,
-    lamports_in: Optional[int] = None,
-    amount_sol: Optional[float] = None,
-    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
-    only_direct: Optional[bool] = None,
+    lamports_in: int | None = None,
+    amount_sol: float | None = None,
+    slippage_bps: int = 0,
+    only_direct: bool | None = None,
     **_kw: Any,
-) -> Dict[str, Any]:
-    sbps = _clamp_i(int(slippage_bps), 1, 5000)
+) -> dict[str, Any]:
+    c = _cfg()
+    sbps = _clamp_i(int(slippage_bps or c.default_slippage_bps), 1, 5000)
     if lamports_in is None:
         lamports_in = max(1, int(float(amount_sol or 0.0) * float(LAMPORTS_PER_SOL)))
     lamports = max(1, int(lamports_in))
@@ -1393,11 +1402,12 @@ async def get_sell_quote(
     *,
     mint: str,
     amount_raw: int,
-    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
-    only_direct: Optional[bool] = None,
+    slippage_bps: int = 0,
+    only_direct: bool | None = None,
     **_kw: Any,
-) -> Dict[str, Any]:
-    sbps = _clamp_i(int(slippage_bps), 1, 5000)
+) -> dict[str, Any]:
+    c = _cfg()
+    sbps = _clamp_i(int(slippage_bps or c.default_slippage_bps), 1, 5000)
     m = _normalize_and_validate_mint(mint, label="mint")
     amt = max(1, int(amount_raw))
 
@@ -1421,526 +1431,672 @@ async def get_sell_quote(
     return await _singleflight(key, _mk)
 
 
-# =============================================================================
-# Public swap API (router depends on these)
-# =============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
+# Swap build + send
+# ──────────────────────────────────────────────────────────────────────────────
+_KP_LOCK = asyncio.Lock()
+_KP = None
+_PUBKEY_STR: str | None = None
+
+
+async def _to_thread(fn, *a, **kw):
+    try:
+        return await asyncio.to_thread(fn, *a, **kw)
+    except AttributeError:  # pragma: no cover
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: fn(*a, **kw))
+
+
+async def _get_keypair_cached():
+    global _KP, _PUBKEY_STR
+    if _KP is not None and _PUBKEY_STR:
+        return _KP, _PUBKEY_STR
+    if load_keypair is None or get_pubkey_str is None:
+        _STATS["wallet_missing"] += 1
+        raise RuntimeError("wallet_layer_unavailable")
+    async with _KP_LOCK:
+        if _KP is not None and _PUBKEY_STR:
+            return _KP, _PUBKEY_STR
+        kp = await _to_thread(load_keypair)
+        pk = await _to_thread(get_pubkey_str, kp)
+        _KP = kp
+        _PUBKEY_STR = str(pk)
+        return _KP, _PUBKEY_STR
+
+
+def _prequote_matches(quote_obj: dict[str, Any], inp: str, out: str, amount: int) -> bool:
+    if not isinstance(quote_obj, dict) or not quote_obj:
+        return False
+    q_in = str(quote_obj.get("inputMint") or quote_obj.get("inputMintAddress") or "").strip()
+    q_out = str(quote_obj.get("outputMint") or quote_obj.get("outputMintAddress") or "").strip()
+    if q_in and not _same_mint(q_in, inp):
+        return False
+    if q_out and not _same_mint(q_out, out):
+        return False
+    q_amt = quote_obj.get("inAmount")
+    if q_amt is not None:
+        with contextlib.suppress(Exception):
+            if int(str(q_amt)) != int(amount):
+                return False
+    return True
+
+
+def _extract_prequote(*qs: dict[str, Any] | None) -> dict[str, Any] | None:
+    for q in qs:
+        if isinstance(q, dict) and q:
+            return q
+    return None
+
+
+async def _build_swap_tx(*, swap_url: str, user_pubkey: str, quote_obj: dict[str, Any]) -> str:
+    c = _cfg()
+    dynamic_cu = not (c.compute_unit_limit and c.compute_unit_limit > 0)
+
+    body: dict[str, Any] = {
+        "quoteResponse": quote_obj,  # DO NOT MODIFY
+        "userPublicKey": user_pubkey,
+        "wrapAndUnwrapSol": bool(c.wrap_unwrap_sol),
+        "dynamicComputeUnitLimit": bool(dynamic_cu),
+        "asLegacyTransaction": bool(c.as_legacy_tx),
+        "useSharedAccounts": bool(c.use_shared_accounts),
+        "skipUserAccountsRpcCalls": bool(c.skip_user_accounts_rpc_calls),
+        "dynamicSlippage": bool(c.dynamic_slippage),
+    }
+    if c.use_token_ledger:
+        body["useTokenLedger"] = True
+    if c.payer:
+        body["payer"] = c.payer
+    if c.platform_fee_bps > 0 and c.fee_account:
+        body["platformFeeBps"] = int(c.platform_fee_bps)
+        body["feeAccount"] = c.fee_account
+    if c.tracking_account:
+        body["trackingAccount"] = c.tracking_account
+    if c.compute_unit_price_micro > 0:
+        body["computeUnitPriceMicroLamports"] = int(c.compute_unit_price_micro)
+    if not dynamic_cu and c.compute_unit_limit > 0:
+        body["computeUnitLimit"] = int(c.compute_unit_limit)
+    if c.blockhash_slots_to_expiry > 0:
+        body["blockhashSlotsToExpiry"] = int(c.blockhash_slots_to_expiry)
+
+    js = await _http_json("POST", swap_url, json_body=body, budget_units=2)
+    if not isinstance(js, dict):
+        _STATS["swap_build_fail"] += 1
+        raise RuntimeError("jup_swap_non_dict")
+    tx_b64 = js.get("swapTransaction")
+    if not tx_b64:
+        _STATS["swap_build_fail"] += 1
+        raise RuntimeError(f"jup_swap_missing_tx:{_short(js, 360)}")
+
+    _STATS["swap_build_ok"] += 1
+    _endpoint_note_ok(swap_url)
+    globals()["_LAST_GOOD_SWAP_URL"] = swap_url
+    log.every(
+        "JUP_SWAP_BUILT", n=30, msg="JUP_SWAP_BUILT", url=swap_url[:80], legacy=int(c.as_legacy_tx)
+    )
+    return str(tx_b64)
+
+
+async def _send_tx_b64(tx_b64: str) -> str:
+    c = _cfg()
+    if sign_and_send_b64_tx is None:
+        _STATS["wallet_missing"] += 1
+        raise RuntimeError("wallet_layer_unavailable")
+
+    # optional enhanced sender
+    try:
+        if _send_b64_with_diag is not None:
+            with contextlib.suppress(Exception):
+                sig = _send_b64_with_diag(tx_b64, skip_preflight=bool(c.skip_preflight))  # type: ignore[misc]
+                if inspect.isawaitable(sig):
+                    sig = await sig
+                if sig:
+                    _STATS["send_ok"] += 1
+                    return str(sig)
+    except Exception:
+        pass
+
+    kp, _ = await _get_keypair_cached()
+    try:
+        sig2 = sign_and_send_b64_tx(tx_b64, kp, skip_preflight=bool(c.skip_preflight))
+        if inspect.isawaitable(sig2):
+            sig2 = await sig2
+    except TypeError:
+        sig2 = sign_and_send_b64_tx(tx_b64, kp)  # type: ignore[misc]
+        if inspect.isawaitable(sig2):
+            sig2 = await sig2
+    _STATS["send_ok"] += 1
+    return str(sig2)
+
+
+def _expected_out_sol(quote_obj: dict[str, Any] | None) -> tuple[int | None, float | None]:
+    if not isinstance(quote_obj, dict):
+        return None, None
+    out_raw = _intish(quote_obj.get("outAmount"), 0)
+    if out_raw <= 0:
+        return None, None
+    return int(out_raw), float(out_raw) / float(LAMPORTS_PER_SOL)
+
+
+def _mk_receipt(
+    *,
+    ok: bool,
+    side: str,
+    quote_url: str,
+    swap_url: str,
+    input_mint: str,
+    output_mint: str,
+    slippage_bps: int,
+    quote_obj: dict[str, Any] | None = None,
+    sig: str | None = None,
+    err: str | None = None,
+    meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    q = quote_obj or {}
+    in_raw = _intish(q.get("inAmount"), 0) if isinstance(q, dict) else 0
+    out_raw = _intish(q.get("outAmount"), 0) if isinstance(q, dict) else 0
+    receipt: dict[str, Any] = {
+        "ok": bool(ok),
+        "side": str(side).upper(),
+        "sig": sig,
+        "signature": sig,
+        "tx_sig": sig,
+        "quote_url": str(quote_url),
+        "swap_url": str(swap_url),
+        "inputMint": str(input_mint),
+        "outputMint": str(output_mint),
+        "in_amount_raw": int(in_raw),
+        "out_amount_raw": int(out_raw),
+        "priceImpactPct": q.get("priceImpactPct") if isinstance(q, dict) else None,
+        "slippage_bps": int(slippage_bps),
+        "routeSummary": _compact_route_summary(q) if isinstance(q, dict) else {},
+        "err": err,
+        "ts": float(time.time()),
+        "lightning_version": LIGHTNING_VERSION,
+    }
+    if meta is not None:
+        receipt["meta"] = meta
+    # keep full quote optional (default on, but safe)
+    if _env_bool("LIGHTNING_INCLUDE_FULL_QUOTE", True):
+        receipt["quote"] = q
+    return receipt
+
+
+async def _try_build_from_prequote_anywhere(
+    *, user_pk: str, quote_obj: dict[str, Any]
+) -> tuple[str, str]:
+    c = _cfg()
+    swap_urls = _prefer_order(c.swap_urls, _LAST_GOOD_SWAP_URL)
+    if not swap_urls:
+        raise RuntimeError("jup_all_endpoints_cooldown")
+    last_err: BaseException | None = None
+    for su in swap_urls:
+        try:
+            tx_b64 = await _build_swap_tx(swap_url=su, user_pubkey=user_pk, quote_obj=quote_obj)
+            return su, tx_b64
+        except BaseException as e:
+            last_err = e
+            _endpoint_note_fail(su)
+            continue
+    raise last_err or RuntimeError("swap_build_failed_all")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public swap API (router expects these)
+# ──────────────────────────────────────────────────────────────────────────────
 async def buy_via_lightning(
     *,
     mint: str,
     amount_sol: float,
-    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    slippage_bps: int = 0,
     return_meta: bool = False,
     return_receipt: bool = False,
-    prequote: Optional[Dict[str, Any]] = None,
-    quote: Optional[Dict[str, Any]] = None,
-    prefetched_quote: Optional[Dict[str, Any]] = None,
+    prequote: dict[str, Any] | None = None,
+    quote: dict[str, Any] | None = None,
+    prefetched_quote: dict[str, Any] | None = None,
+    quoteResponse: dict[str, Any] | None = None,
     **_ignored: Any,
-) -> Union[Optional[str], Tuple[Optional[str], Dict[str, Any]], Dict[str, Any]]:
-    sbps = _clamp_i(int(slippage_bps), 1, 5000)
+) -> str | None | tuple[str | None, dict[str, Any]] | dict[str, Any]:
+    c = _cfg()
+    sbps = _clamp_i(int(slippage_bps or c.default_slippage_bps), 1, 5000)
     lamports_in = max(1, int(float(amount_sol) * float(LAMPORTS_PER_SOL)))
     m = _normalize_and_validate_mint(mint, label="mint")
 
-    if normalize_mint(m) == normalize_mint(SOL_MINT):
+    # safety
+    if _same_mint(m, SOL_MINT):
         _STATS["noop_same_mint"] += 1
         rec = _mk_receipt(
             ok=True,
             side="BUY",
-            base_url=BASE_URLS[0],
+            quote_url=c.quote_urls[0],
+            swap_url=c.swap_urls[0],
             input_mint=SOL_MINT,
             output_mint=m,
             slippage_bps=sbps,
-            quote={"inAmount": str(lamports_in), "outAmount": str(lamports_in), "priceImpactPct": 0.0, "routePlan": []},
+            quote_obj={
+                "inputMint": SOL_MINT,
+                "outputMint": m,
+                "inAmount": str(lamports_in),
+                "outAmount": str(lamports_in),
+                "priceImpactPct": 0.0,
+                "routePlan": [],
+            },
             sig=None,
             err="noop_same_mint",
             meta={"mint": m, "in_amount_raw": lamports_in, "amount_raw": lamports_in},
         )
-        if return_receipt or LIGHTNING_RETURN_RECEIPTS:
-            return rec
-        if return_meta:
-            return None, {"mint": m, "in_amount_raw": lamports_in, "amount_raw": lamports_in}
-        return rec if LIGHTNING_ALWAYS_RETURN_META else None
+        return rec if return_receipt else ((None, rec.get("meta", {})) if return_meta else None)
 
-    if KILL_SWITCH or DISABLE_BUYS:
+    if c.kill_switch or c.disable_buys:
         rec = _mk_receipt(
             ok=False,
             side="BUY",
-            base_url=BASE_URLS[0],
+            quote_url=c.quote_urls[0],
+            swap_url=c.swap_urls[0],
             input_mint=SOL_MINT,
             output_mint=m,
             slippage_bps=sbps,
-            quote=None,
+            quote_obj=None,
             sig=None,
             err="buys_disabled",
-            meta=None,
         )
-        if return_receipt or LIGHTNING_RETURN_RECEIPTS:
-            return rec
-        if return_meta:
-            return None, {}
-        return rec if LIGHTNING_ALWAYS_RETURN_META else None
+        return rec if return_receipt else ((None, {}) if return_meta else None)
 
-    base_used = BASE_URLS[0]
-    q: Dict[str, Any] = {}
-    meta: Dict[str, Any] = {}
+    # get or accept quote
+    supplied = _extract_prequote(quoteResponse, prequote, quote, prefetched_quote)
 
-    ok_rg, rg_quote = await _maybe_routeguard_preflight(mint=m, lamports_in=lamports_in)
-    if not ok_rg:
-        rec = _mk_receipt(
-            ok=False,
-            side="BUY",
-            base_url=base_used,
-            input_mint=SOL_MINT,
-            output_mint=m,
-            slippage_bps=sbps,
-            quote=None,
-            sig=None,
-            err="routeguard_blocked",
-            meta=None,
-        )
-        if return_receipt or LIGHTNING_RETURN_RECEIPTS:
-            return rec
-        if return_meta:
-            return None, {}
-        return rec if LIGHTNING_ALWAYS_RETURN_META else None
-
-    supplied = _extract_prequote(rg_quote if isinstance(rg_quote, dict) else None, prequote, quote, prefetched_quote)
+    quote_url_used = c.quote_urls[0]
+    swap_url_used = c.swap_urls[0]
+    q: dict[str, Any] = {}
+    meta: dict[str, Any] = {"mint": m, "in_amount_raw": lamports_in}
 
     try:
+        if supplied is not None and not _prequote_matches(supplied, SOL_MINT, m, lamports_in):
+            supplied = None
+
         if supplied is not None:
             q = supplied
-            meta = _mk_meta_buy(mint=m, base=base_used, quote=q, lamports_in=lamports_in)
         else:
-            base_used, q = await _get_quote(
-                input_mint=SOL_MINT,
-                output_mint=m,
-                amount=lamports_in,
-                slippage_bps=sbps,
+            quote_url_used, q = await _get_quote(
+                input_mint=SOL_MINT, output_mint=m, amount=lamports_in, slippage_bps=sbps
             )
-            meta = _mk_meta_buy(mint=m, base=base_used, quote=q, lamports_in=lamports_in)
 
-        if DRY_RUN and not DRYRUN_BUILD_TX:
+        meta["quote_url"] = quote_url_used
+        meta["outAmount"] = _intish(q.get("outAmount"), 0)
+
+        # DRYRUN semantics
+        if c.dry_run and not c.dryrun_build_tx:
             rec = _mk_receipt(
                 ok=True,
                 side="BUY",
-                base_url=str(meta.get("base_url", base_used)),
+                quote_url=quote_url_used,
+                swap_url=swap_url_used,
                 input_mint=SOL_MINT,
                 output_mint=m,
                 slippage_bps=sbps,
-                quote=q,
+                quote_obj=q,
                 sig=None,
                 err=None,
                 meta=meta,
             )
-            if return_receipt or LIGHTNING_RETURN_RECEIPTS:
-                return rec
-            if return_meta:
-                return None, meta
-            return rec if LIGHTNING_ALWAYS_RETURN_META else None
+            return rec if return_receipt else ((None, meta) if return_meta else None)
 
         _, user_pk = await _get_keypair_cached()
 
         if supplied is not None:
             try:
-                base_used, tx_b64 = await _try_build_from_prequote_anywhere(user_pk=user_pk, quote=q)
-                meta["base_url"] = base_used
+                swap_url_used, tx_b64 = await _try_build_from_prequote_anywhere(
+                    user_pk=user_pk, quote_obj=q
+                )
             except Exception as e:
                 _STATS["prequote_build_fail"] += 1
-                _warn("PREQUOTE_BUILD_FAIL", err=_short(e, 240))
+                _warn("PREQUOTE_BUILD_FAIL", err=_short(e, 220))
                 _STATS["prequote_requote"] += 1
-                base_used, q = await _get_quote(
-                    input_mint=SOL_MINT,
-                    output_mint=m,
-                    amount=lamports_in,
-                    slippage_bps=sbps,
+                quote_url_used, q = await _get_quote(
+                    input_mint=SOL_MINT, output_mint=m, amount=lamports_in, slippage_bps=sbps
                 )
-                meta = _mk_meta_buy(mint=m, base=base_used, quote=q, lamports_in=lamports_in)
-                tx_b64 = await _build_swap_tx(base_url=base_used, user_pubkey=user_pk, quote=q)
+                swap_url_used, tx_b64 = await _try_build_from_prequote_anywhere(
+                    user_pk=user_pk, quote_obj=q
+                )
         else:
-            tx_b64 = await _build_swap_tx(base_url=base_used, user_pubkey=user_pk, quote=q)
+            swap_urls = _prefer_order(c.swap_urls, _LAST_GOOD_SWAP_URL)
+            if not swap_urls:
+                raise RuntimeError("jup_all_endpoints_cooldown")
+            last_build_err: BaseException | None = None
+            for su in swap_urls:
+                try:
+                    tx_b64 = await _build_swap_tx(swap_url=su, user_pubkey=user_pk, quote_obj=q)
+                    swap_url_used = su
+                    break
+                except BaseException as e:
+                    last_build_err = e
+                    _endpoint_note_fail(su)
+                    continue
+            else:
+                raise last_build_err or RuntimeError("swap_build_failed_all")
 
-        if DRY_RUN:
+        meta["swap_url"] = swap_url_used
+
+        if c.dry_run:
             rec = _mk_receipt(
                 ok=True,
                 side="BUY",
-                base_url=base_used,
+                quote_url=quote_url_used,
+                swap_url=swap_url_used,
                 input_mint=SOL_MINT,
                 output_mint=m,
                 slippage_bps=sbps,
-                quote=q,
+                quote_obj=q,
                 sig=None,
                 err=None,
                 meta=meta,
             )
-            if return_receipt or LIGHTNING_RETURN_RECEIPTS:
-                return rec
-            if return_meta:
-                return None, meta
-            return rec if LIGHTNING_ALWAYS_RETURN_META else None
+            return rec if return_receipt else ((None, meta) if return_meta else None)
 
         sig = await _send_tx_b64(tx_b64)
-        log.event("ENTRY_TX_OK", sig=sig, mint=m, lamports_in=lamports_in, out_raw=meta.get("amount_raw"), base=base_used)
+        log.event("ENTRY_TX_OK", sig=sig, mint=m, lamports_in=lamports_in, quote_url=quote_url_used)
 
         rec = _mk_receipt(
             ok=True,
             side="BUY",
-            base_url=base_used,
+            quote_url=quote_url_used,
+            swap_url=swap_url_used,
             input_mint=SOL_MINT,
             output_mint=m,
             slippage_bps=sbps,
-            quote=q,
+            quote_obj=q,
             sig=sig,
             err=None,
             meta=meta,
         )
-
-        if return_receipt or LIGHTNING_RETURN_RECEIPTS:
+        if return_receipt:
             return rec
         if return_meta:
             return sig, meta
-        return rec if LIGHTNING_ALWAYS_RETURN_META else sig
-
-    except RuntimeError as e:
-        tag = str(e)
-        if tag in {"jup_no_route", "jup_no_route_cached", "jup_breaker_active", "jup_unauthorized", "jup_token_not_tradable", "jup_all_bases_cooldown"}:
-            log.every("ENTRY_SKIP", n=20, msg="ENTRY_SKIP", mint=m, tag=tag)
-            if tag.startswith("jup_no_route"):
-                _STATS["no_route"] += 1
-        rec = _mk_receipt(
-            ok=False,
-            side="BUY",
-            base_url=base_used,
-            input_mint=SOL_MINT,
-            output_mint=m,
-            slippage_bps=sbps,
-            quote=q or None,
-            sig=None,
-            err=tag,
-            meta=meta or None,
-        )
-        if return_receipt or LIGHTNING_RETURN_RECEIPTS:
-            return rec
-        if return_meta:
-            return None, (meta or {})
-        return rec if LIGHTNING_ALWAYS_RETURN_META else None
+        return sig
 
     except Exception as e:
         _STATS["send_fail"] += 1
-        _warn("ENTRY_TX_FAIL", err=_short(e, 240), mint=m, base=base_used)
         rec = _mk_receipt(
             ok=False,
             side="BUY",
-            base_url=base_used,
+            quote_url=quote_url_used,
+            swap_url=swap_url_used,
             input_mint=SOL_MINT,
             output_mint=m,
             slippage_bps=sbps,
-            quote=q or None,
+            quote_obj=q or None,
             sig=None,
             err=str(e),
             meta=meta or None,
         )
-        if return_receipt or LIGHTNING_RETURN_RECEIPTS:
+        if return_receipt:
             return rec
         if return_meta:
             return None, (meta or {})
-        return rec if LIGHTNING_ALWAYS_RETURN_META else None
+        return None
 
 
 async def sell_via_lightning(
     *,
     mint: str,
-    token_program: Optional[str] = None,
+    token_program: str | None = None,
     amount_raw: int,
-    slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    slippage_bps: int = 0,
     return_receipt: bool = False,
-    prequote: Optional[Dict[str, Any]] = None,
-    quote: Optional[Dict[str, Any]] = None,
-    prefetched_quote: Optional[Dict[str, Any]] = None,
+    prequote: dict[str, Any] | None = None,
+    quote: dict[str, Any] | None = None,
+    prefetched_quote: dict[str, Any] | None = None,
+    quoteResponse: dict[str, Any] | None = None,
     **_ignored: Any,
-) -> Union[Optional[str], Dict[str, Any]]:
+) -> str | None | dict[str, Any]:
     del token_program
 
-    sbps = _clamp_i(int(slippage_bps), 1, 5000)
+    c = _cfg()
+    sbps = _clamp_i(int(slippage_bps or c.default_slippage_bps), 1, 5000)
     amt = int(amount_raw)
     m = _normalize_and_validate_mint(mint, label="mint")
 
-    if normalize_mint(m) == normalize_mint(SOL_MINT):
-        _STATS["noop_same_mint"] += 1
-        rec = _mk_receipt(
-            ok=True,
-            side="SELL",
-            base_url=BASE_URLS[0],
-            input_mint=m,
-            output_mint=SOL_MINT,
-            slippage_bps=sbps,
-            quote={"inAmount": str(amt), "outAmount": str(amt), "priceImpactPct": 0.0, "routePlan": []},
-            sig=None,
-            err="noop_same_mint",
-            meta={"expected_out_lamports": amt, "expected_out_sol": float(amt) / float(LAMPORTS_PER_SOL)},
-        )
-        if return_receipt or LIGHTNING_RETURN_RECEIPTS:
-            return rec
-        return rec if LIGHTNING_ALWAYS_RETURN_META else None
-
-    if KILL_SWITCH or DISABLE_SELLS or amt <= 0:
+    if c.kill_switch or c.disable_sells or amt <= 0:
         rec = _mk_receipt(
             ok=False,
             side="SELL",
-            base_url=BASE_URLS[0],
+            quote_url=c.quote_urls[0],
+            swap_url=c.swap_urls[0],
             input_mint=m,
             output_mint=SOL_MINT,
             slippage_bps=sbps,
-            quote=None,
+            quote_obj=None,
             sig=None,
-            err="sells_disabled" if (KILL_SWITCH or DISABLE_SELLS) else "amount_raw<=0",
-            meta=None,
+            err="sells_disabled" if (c.kill_switch or c.disable_sells) else "amount_raw<=0",
         )
-        if return_receipt or LIGHTNING_RETURN_RECEIPTS:
-            return rec
-        return rec if LIGHTNING_ALWAYS_RETURN_META else None
+        return rec if return_receipt else None
 
-    base_used = BASE_URLS[0]
-    q: Dict[str, Any] = {}
-    supplied = _extract_prequote(prequote, quote, prefetched_quote)
+    quote_url_used = c.quote_urls[0]
+    swap_url_used = c.swap_urls[0]
+    supplied = _extract_prequote(quoteResponse, prequote, quote, prefetched_quote)
+    q: dict[str, Any] = {}
 
     try:
+        if supplied is not None and not _prequote_matches(supplied, m, SOL_MINT, amt):
+            supplied = None
+
         if supplied is not None:
             q = supplied
         else:
-            base_used, q = await _get_quote(
-                input_mint=m,
-                output_mint=SOL_MINT,
-                amount=amt,
-                slippage_bps=sbps,
+            quote_url_used, q = await _get_quote(
+                input_mint=m, output_mint=SOL_MINT, amount=amt, slippage_bps=sbps
             )
 
         exp_lamports, exp_sol = _expected_out_sol(q)
 
-        if DRY_RUN and not DRYRUN_BUILD_TX:
+        if c.dry_run and not c.dryrun_build_tx:
             rec = _mk_receipt(
                 ok=True,
                 side="SELL",
-                base_url=base_used,
+                quote_url=quote_url_used,
+                swap_url=swap_url_used,
                 input_mint=m,
                 output_mint=SOL_MINT,
                 slippage_bps=sbps,
-                quote=q,
+                quote_obj=q,
                 sig=None,
                 err=None,
                 meta={"expected_out_lamports": exp_lamports, "expected_out_sol": exp_sol},
             )
-            if return_receipt or LIGHTNING_RETURN_RECEIPTS:
-                return rec
-            return rec if LIGHTNING_ALWAYS_RETURN_META else None
+            return rec if return_receipt else None
 
         _, user_pk = await _get_keypair_cached()
 
         if supplied is not None:
-            try:
-                base_used, tx_b64 = await _try_build_from_prequote_anywhere(user_pk=user_pk, quote=q)
-            except Exception as e:
-                _STATS["prequote_build_fail"] += 1
-                _warn("PREQUOTE_BUILD_FAIL_SELL", err=_short(e, 240))
-                _STATS["prequote_requote"] += 1
-                base_used, q = await _get_quote(
-                    input_mint=m,
-                    output_mint=SOL_MINT,
-                    amount=amt,
-                    slippage_bps=sbps,
-                )
-                tx_b64 = await _build_swap_tx(base_url=base_used, user_pubkey=user_pk, quote=q)
+            swap_url_used, tx_b64 = await _try_build_from_prequote_anywhere(
+                user_pk=user_pk, quote_obj=q
+            )
         else:
-            tx_b64 = await _build_swap_tx(base_url=base_used, user_pubkey=user_pk, quote=q)
+            swap_urls = _prefer_order(c.swap_urls, _LAST_GOOD_SWAP_URL)
+            if not swap_urls:
+                raise RuntimeError("jup_all_endpoints_cooldown")
+            last_build_err: BaseException | None = None
+            for su in swap_urls:
+                try:
+                    tx_b64 = await _build_swap_tx(swap_url=su, user_pubkey=user_pk, quote_obj=q)
+                    swap_url_used = su
+                    break
+                except BaseException as e:
+                    last_build_err = e
+                    _endpoint_note_fail(su)
+                    continue
+            else:
+                raise last_build_err or RuntimeError("swap_build_failed_all")
 
-        if DRY_RUN:
+        if c.dry_run:
             rec = _mk_receipt(
                 ok=True,
                 side="SELL",
-                base_url=base_used,
+                quote_url=quote_url_used,
+                swap_url=swap_url_used,
                 input_mint=m,
                 output_mint=SOL_MINT,
                 slippage_bps=sbps,
-                quote=q,
+                quote_obj=q,
                 sig=None,
                 err=None,
                 meta={"expected_out_lamports": exp_lamports, "expected_out_sol": exp_sol},
             )
-            if return_receipt or LIGHTNING_RETURN_RECEIPTS:
-                return rec
-            return rec if LIGHTNING_ALWAYS_RETURN_META else None
+            return rec if return_receipt else None
 
         sig = await _send_tx_b64(tx_b64)
-        log.event("EXIT_TX_OK", sig=sig, mint=m, amount_raw=amt, base=base_used, expected_out_sol=exp_sol)
+        log.event(
+            "EXIT_TX_OK",
+            sig=sig,
+            mint=m,
+            amount_raw=amt,
+            quote_url=quote_url_used,
+            expected_out_sol=exp_sol,
+        )
 
         rec = _mk_receipt(
             ok=True,
             side="SELL",
-            base_url=base_used,
+            quote_url=quote_url_used,
+            swap_url=swap_url_used,
             input_mint=m,
             output_mint=SOL_MINT,
             slippage_bps=sbps,
-            quote=q,
+            quote_obj=q,
             sig=sig,
             err=None,
             meta={"expected_out_lamports": exp_lamports, "expected_out_sol": exp_sol},
         )
-        if return_receipt or LIGHTNING_RETURN_RECEIPTS:
-            return rec
-        return rec if LIGHTNING_ALWAYS_RETURN_META else sig
-
-    except RuntimeError as e:
-        tag = str(e)
-        if tag in {"jup_no_route", "jup_no_route_cached", "jup_breaker_active", "jup_unauthorized", "jup_token_not_tradable", "jup_all_bases_cooldown"}:
-            log.every("EXIT_SKIP", n=20, msg="EXIT_SKIP", mint=m, tag=tag)
-            if tag.startswith("jup_no_route"):
-                _STATS["no_route"] += 1
-        rec = _mk_receipt(
-            ok=False,
-            side="SELL",
-            base_url=base_used,
-            input_mint=m,
-            output_mint=SOL_MINT,
-            slippage_bps=sbps,
-            quote=q or None,
-            sig=None,
-            err=tag,
-            meta={"expected_out_lamports": None, "expected_out_sol": None},
-        )
-        if return_receipt or LIGHTNING_RETURN_RECEIPTS:
-            return rec
-        return rec if LIGHTNING_ALWAYS_RETURN_META else None
+        return rec if return_receipt else sig
 
     except Exception as e:
         _STATS["send_fail"] += 1
-        _warn("EXIT_TX_FAIL", err=_short(e, 240), mint=m, base=base_used)
         rec = _mk_receipt(
             ok=False,
             side="SELL",
-            base_url=base_used,
+            quote_url=quote_url_used,
+            swap_url=swap_url_used,
             input_mint=m,
             output_mint=SOL_MINT,
             slippage_bps=sbps,
-            quote=q or None,
+            quote_obj=q or None,
             sig=None,
             err=str(e),
             meta={"expected_out_lamports": None, "expected_out_sol": None},
         )
-        if return_receipt or LIGHTNING_RETURN_RECEIPTS:
-            return rec
-        return rec if LIGHTNING_ALWAYS_RETURN_META else None
+        return rec if return_receipt else None
 
 
-# =============================================================================
-# Debug helpers
-# =============================================================================
-async def debug_get_quote_sol_to_usdc(amount_sol: float = 0.002, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Dict[str, Any]:
+# ──────────────────────────────────────────────────────────────────────────────
+# Debug + stats
+# ──────────────────────────────────────────────────────────────────────────────
+async def debug_get_quote_sol_to_usdc(
+    amount_sol: float = 0.002, slippage_bps: int = 0
+) -> dict[str, Any]:
+    c = _cfg()
     lamports = max(1, int(float(amount_sol) * float(LAMPORTS_PER_SOL)))
-    return await get_quote(SOL_MINT, USDC_MINT, lamports, int(slippage_bps))
+    return await get_quote(
+        SOL_MINT, USDC_MINT, lamports, int(slippage_bps or c.default_slippage_bps)
+    )
 
 
-async def debug_build_only_sol_to_usdc(amount_sol: float = 0.002, slippage_bps: int = DEFAULT_SLIPPAGE_BPS) -> Tuple[int, int, str]:
+async def debug_build_only_sol_to_usdc(
+    amount_sol: float = 0.002, slippage_bps: int = 0
+) -> tuple[int, int, str]:
+    c = _cfg()
     lamports = max(1, int(float(amount_sol) * float(LAMPORTS_PER_SOL)))
-    base, q = await _get_quote(
+    quote_url, q = await _get_quote(
         input_mint=SOL_MINT,
         output_mint=USDC_MINT,
         amount=lamports,
-        slippage_bps=_clamp_i(int(slippage_bps), 1, 5000),
+        slippage_bps=_clamp_i(int(slippage_bps or c.default_slippage_bps), 1, 5000),
     )
     _, user_pk = await _get_keypair_cached()
-    tx_b64 = await _build_swap_tx(base_url=base, user_pubkey=user_pk, quote=q)
-    return _intish(q.get("inAmount"), lamports), len(tx_b64), base
+    swap_url = _prefer_order(c.swap_urls, _LAST_GOOD_SWAP_URL)[0]
+    tx_b64 = await _build_swap_tx(swap_url=swap_url, user_pubkey=user_pk, quote_obj=q)
+    return _intish(q.get("inAmount"), lamports), len(tx_b64), quote_url
 
 
-def stats() -> Dict[str, Any]:
+def stats() -> dict[str, Any]:
+    c = _cfg()
     return {
         "lightning_version": LIGHTNING_VERSION,
-        "base_urls": list(BASE_URLS),
-        "quote_path": QUOTE_PATH,
-        "swap_path": SWAP_PATH,
-        "last_good_base": _LAST_GOOD_BASE,
-        "breaker_enabled": bool(BREAKER_ENABLED),
-        "breaker_fail_limit": int(_FAIL_LIMIT),
+        "quote_urls": list(c.quote_urls),
+        "swap_urls": list(c.swap_urls),
+        "last_good_quote_url": _LAST_GOOD_QUOTE_URL,
+        "last_good_swap_url": _LAST_GOOD_SWAP_URL,
         "breaker_until": float(_BREAKER_UNTIL),
-        "base_fail_limit": int(BASE_FAIL_LIMIT),
-        "base_cooldown_sec": float(BASE_COOLDOWN_SEC),
-        "base_fails": dict(_BASE_FAILS),
-        "base_until": dict(_BASE_UNTIL),
-        "base_score": dict(_BASE_SCORE),
-        "unroutable_pairs": len(_UNROUTABLE_UNTIL),
-        "quote_ttl_sec": float(QUOTE_TTL_SEC),
-        "strict_auth": bool(STRICT_AUTH),
+        "endpoint_fails": dict(_ENDPOINT_FAILS),
+        "endpoint_until": dict(_ENDPOINT_UNTIL),
+        "endpoint_score": dict(_ENDPOINT_SCORE),
+        "unroutable_pairs": len(_UNROUTABLE_TTL),
         "http2_requested": bool(_env_bool("JUP_HTTP2", False)),
-        "http2_effective": bool(_effective_http2()),
+        "http2_effective": bool(c.http2_effective),
+        "tls_verify": bool(c.tls_verify),
+        "has_api_key": bool(c.has_api_key),
+        "api_key_mask": c.api_key_mask,
+        "cfg": {
+            "only_direct": bool(c.only_direct),
+            "restrict_intermediate": bool(c.restrict_intermediate),
+            "default_slippage_bps": int(c.default_slippage_bps),
+            "as_legacy_tx": bool(c.as_legacy_tx),
+            "max_qps": int(c.max_qps),
+            "max_concurrency": int(c.max_concurrency),
+            "retry_max": int(c.retry_max),
+            "endpoint_fail_limit": int(c.endpoint_fail_limit),
+            "endpoint_cooldown_sec": float(c.endpoint_cooldown_sec),
+            "strict_auth": bool(c.strict_auth),
+            "dry_run": bool(c.dry_run),
+            "dryrun_build_tx": bool(c.dryrun_build_tx),
+        },
         "stats": dict(_STATS),
     }
 
 
-def _variant_flags() -> Dict[str, Any]:
-    api_key = _env_str("JUP_API_KEY", _env_str("JUP_PRO_KEY", _env_str("JUP_KEY", "")))
+def _variant_flags() -> dict[str, Any]:
+    c = _cfg()
     return {
         "lightning_version": LIGHTNING_VERSION,
-        "base_urls": BASE_URLS,
-        "quote_path": QUOTE_PATH,
-        "swap_path": SWAP_PATH,
-        "only_direct": ONLY_DIRECT,
-        "restrict_intermediate_tokens": RESTRICT_INTERMEDIATE,
-        "max_accounts": MAX_ACCOUNTS,
-        "platform_fee_bps": PLATFORM_FEE_BPS,
-        "instruction_version": INSTRUCTION_VERSION,
-        "as_legacy_tx": AS_LEGACY_TX,
-        "wrap_unwrap_sol": WRAP_UNWRAP_SOL,
-        "compute_unit_limit": COMPUTE_UNIT_LIMIT,
-        "compute_unit_price_micro": COMPUTE_UNIT_PRICE_MICRO,
-        "use_shared_accounts": USE_SHARED_ACCOUNTS,
-        "use_token_ledger": USE_TOKEN_LEDGER,
-        "fee_account_set": bool(FEE_ACCOUNT),
-        "tracking_account_set": bool(TRACKING_ACCOUNT),
-        "payer_set": bool(PAYER),
-        "dynamic_slippage": DYNAMIC_SLIPPAGE,
-        "skip_user_accounts_rpc_calls": SKIP_USER_ACCOUNTS_RPC_CALLS,
-        "blockhash_slots_to_expiry": BLOCKHASH_SLOTS_TO_EXPIRY,
-        "priority_lamports": PF_PRIORITY_LAMPORTS,
-        "priority_sol": PF_PRIORITY_SOL,
-        "timeout_sec": HTTP_TIMEOUT_SEC,
-        "retry_max": HTTP_RETRY_MAX,
-        "http2_requested": bool(_env_bool("JUP_HTTP2", False)),
-        "http2_effective": bool(_effective_http2()),
-        "dryrun": DRY_RUN,
-        "dryrun_build_tx": DRYRUN_BUILD_TX,
-        "return_receipts_default": LIGHTNING_RETURN_RECEIPTS,
-        "always_return_meta": LIGHTNING_ALWAYS_RETURN_META,
-        "include_full_quote": LIGHTNING_INCLUDE_FULL_QUOTE,
-        "qps": JUP_MAX_QPS,
-        "max_concurrency": JUP_MAX_CONCURRENCY,
-        "unroutable_ttl_sec": UNROUTABLE_TTL_SEC,
-        "requote_bump_pct": REQUOTE_BUMP_PCT,
-        "base_fail_limit": BASE_FAIL_LIMIT,
-        "base_cooldown_sec": BASE_COOLDOWN_SEC,
-        "disable_buys": DISABLE_BUYS,
-        "disable_sells": DISABLE_SELLS,
-        "kill_switch": KILL_SWITCH,
-        "skip_preflight": SEND_SKIP_PREFLIGHT,
-        "quote_ttl_sec": QUOTE_TTL_SEC,
-        "strict_auth": STRICT_AUTH,
-        "has_api_key": bool(api_key),
-        "api_key_mask": _mask_key(api_key),
+        "quote_urls": list(c.quote_urls),
+        "swap_urls": list(c.swap_urls),
+        "only_direct": bool(c.only_direct),
+        "restrict_intermediate_tokens": bool(c.restrict_intermediate),
+        "as_legacy_tx": bool(c.as_legacy_tx),
+        "wrap_unwrap_sol": bool(c.wrap_unwrap_sol),
+        "dynamic_slippage": bool(c.dynamic_slippage),
+        "skip_user_accounts_rpc_calls": bool(c.skip_user_accounts_rpc_calls),
+        "use_shared_accounts": bool(c.use_shared_accounts),
+        "use_token_ledger": bool(c.use_token_ledger),
+        "compute_unit_limit": int(c.compute_unit_limit),
+        "compute_unit_price_micro": int(c.compute_unit_price_micro),
+        "platform_fee_bps": int(c.platform_fee_bps),
+        "fee_account_set": bool(c.fee_account),
+        "tracking_account_set": bool(c.tracking_account),
+        "payer_set": bool(c.payer),
+        "timeout_sec": float(c.timeout_sec),
+        "qps": int(c.max_qps),
+        "max_concurrency": int(c.max_concurrency),
+        "unroutable_ttl_sec": int(c.unroutable_ttl_sec),
+        "requote_bump_pct": int(c.requote_bump_pct),
+        "quote_ttl_sec": float(c.quote_ttl_sec),
+        "strict_auth": bool(c.strict_auth),
+        "has_api_key": bool(c.has_api_key),
+        "api_key_mask": c.api_key_mask,
         "stats": dict(_STATS),
     }
 
 
 __all__ = [
-    "BASE",
-    "BASE_URLS",
-    "ONLY_DIRECT",
-    "_variant_flags",
     "_jup_headers",
-    "get_quote",
-    "quote",
-    "get_buy_quote",
-    "get_sell_quote",
+    "_variant_flags",
     "buy_via_lightning",
-    "sell_via_lightning",
-    "debug_get_quote_sol_to_usdc",
-    "debug_build_only_sol_to_usdc",
-    "stats",
     "close_http",
+    "debug_build_only_sol_to_usdc",
+    "debug_get_quote_sol_to_usdc",
+    "get_buy_quote",
+    "get_quote",
+    "get_sell_quote",
+    "quote",
+    "sell_via_lightning",
+    "stats",
 ]

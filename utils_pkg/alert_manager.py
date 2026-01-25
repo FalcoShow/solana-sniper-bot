@@ -4,53 +4,53 @@ from __future__ import annotations
 """
 utils_pkg/alert_manager.py
 
-AlertManager (God-Tier / production-grade)
-==========================================
+AlertManager — God-Tier / production-grade (V3+++)
+==================================================
 
-Single place to fan out alerts to:
-
+Single canonical fanout for alerts:
   • Telegram
   • Discord (webhook)
-  • Notion (optional: per-fill DB row OR via core_utils.log_trade_event)
+  • Notion (optional: direct DB row OR via core_utils.log_trade_event)
 
-Core requirements
------------------
-- Batched + rate-limited sending (prevents spam + API bans)
-- "Critical-only" mode switch (keep the bot quiet unless it matters)
+Hard requirements (LOCK-IN)
+---------------------------
+- Batched + rate-limited sending (avoid spam / bans / throttling)
+- Critical-only mode switch
 - MOMO events:
-    - Only whitelisted positive events allowed
+    - only whitelisted positive events allowed
     - MOMO_SKIP_* ignored
-    - Cooldown per (event, symbol) using core_utils Redis (no duplicate redis clients)
+    - cooldown per (event, symbol) using core_utils Redis (no competing redis clients)
+- Accepts `session=` kwarg (core_utils may instantiate AlertManager(session=session))
+- Must NOT create competing global clients. No global aiohttp sessions. No global redis.
+- Never crash the bot: all send paths are best-effort; failures are swallowed + logged.
 
-Integration
------------
-core_utils.py attempts:
-  from .alert_manager import AlertManager
-and may instantiate with:
-  AlertManager(session=session)
-
-So this class MUST accept `session` kwarg and must not create competing global clients.
-
-Public async API used by the rest of the bot:
-  - await am.notify_text(text, level="INFO")
-  - await am.notify_error(label, err, extra=None)
+Public async API
+----------------
+  - await am.notify_text(text, level="INFO", key="", channels=("tg","discord"))
+  - await am.notify_error(label, err, extra=None, level="ERROR", key="")
   - await am.notify_trade_fill(...)
-  - await am.notify_reject(bucket, ctx)   (helps eliminate "silent no-buy")
+  - await am.notify_reject(bucket, ctx)
   - await am.send_momo_event(event, ctx)
 
+Compatibility helpers (used by older code)
+------------------------------------------
+  - await am.send_buy_alert(...)
+  - await am.send_sell_alert(...)
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from datetime import UTC, datetime
+from typing import Any
 
 import aiohttp
 
-# safe logger fallback
+# logger (structured-friendly)
 try:  # pragma: no cover
     from logging_setup import get_logger  # type: ignore
 except Exception:  # pragma: no cover
@@ -62,11 +62,18 @@ except Exception:  # pragma: no cover
 
 log = get_logger(__name__)
 
+# metrics bump (optional)
+try:  # pragma: no cover
+    from logging_setup import bump  # type: ignore
+except Exception:  # pragma: no cover
+
+    def bump(*_a: Any, **_k: Any) -> None:  # type: ignore
+        return None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Env helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-
 def _b(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
@@ -105,17 +112,17 @@ def _dryrun_on() -> bool:
 
 def _clip(s: str, n: int) -> str:
     s = (s or "").strip()
-    return s if len(s) <= n else s[: n - 1] + "…"
+    return s if len(s) <= n else s[: max(0, n - 1)] + "…"
 
 
-def _json_dumps(obj: Any) -> str:
+def _json(obj: Any) -> str:
     try:
-        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     except Exception:
         return "{}"
 
 
-def _parse_csv_env(name: str) -> List[str]:
+def _parse_csv_env(name: str) -> list[str]:
     raw = _s(name, "")
     if not raw:
         return []
@@ -124,11 +131,9 @@ def _parse_csv_env(name: str) -> List[str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Levels + alert item
+# Levels
 # ──────────────────────────────────────────────────────────────────────────────
-
-
-_LEVELS = ("DEBUG", "INFO", "IMPORTANT", "CRITICAL", "ERROR")
+_LEVELS: tuple[str, ...] = ("DEBUG", "INFO", "IMPORTANT", "CRITICAL", "ERROR")
 
 
 def _lvl_norm(x: str) -> str:
@@ -137,27 +142,16 @@ def _lvl_norm(x: str) -> str:
 
 
 def _lvl_rank(x: str) -> int:
-    x = _lvl_norm(x)
-    return _LEVELS.index(x)
-
-
-@dataclass
-class _AlertItem:
-    text: str
-    level: str = "INFO"
-    channels: Tuple[str, ...] = ("tg", "discord")  # tg, discord
-    key: str = ""  # for dedupe/cooldown (optional)
-    ts: float = 0.0
+    return _LEVELS.index(_lvl_norm(x))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MOMO config
 # ──────────────────────────────────────────────────────────────────────────────
-
 _DEFAULT_GOOD_MOMO = {"MOMO_OK", "MOMO_TAKE", "MOMO_LONG", "MOMO_SCALP"}
 GOOD_MOMO_EVENTS = set(_parse_csv_env("MOMO_GOOD_EVENTS")) or _DEFAULT_GOOD_MOMO
 
-MOMO_LABELS: Dict[str, str] = {
+MOMO_LABELS: dict[str, str] = {
     "MOMO_OK": "Momentum OK",
     "MOMO_TAKE": "Momentum TAKE",
     "MOMO_LONG": "Momentum LONG",
@@ -169,25 +163,42 @@ MOMO_COOLDOWN_SEC = _i("MOMENTUM_ALERT_COOLDOWN_SEC", 300)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Internal alert item
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class _AlertItem:
+    text: str
+    level: str
+    channels: tuple[str, ...]
+    key: str
+    ts: float
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # AlertManager
 # ──────────────────────────────────────────────────────────────────────────────
-
-
 class AlertManager:
     """
     Batched + rate-limited alert fanout.
+
+    Channels:
+      - "tg"      Telegram
+      - "discord" Discord webhook
+
+    Notes:
+      - This is designed to be instantiated once and reused.
+      - It is safe to instantiate multiple times, but avoid it in production.
     """
 
-    # Telegram safe limit: 4096; keep margin for parse_mode
-    _TG_MAX = 3500
-    # Discord message limit: 2000
-    _DISCORD_MAX = 1800
+    # hard-ish platform limits
+    _TG_MAX = 3500  # telegram sendMessage: 4096, keep headroom
+    _DISCORD_MAX = 1800  # discord content: 2000, keep headroom
 
-    def __init__(self, session: Optional[aiohttp.ClientSession] = None) -> None:
-        # master switches
+    def __init__(self, session: aiohttp.ClientSession | None = None) -> None:
+        # master switch
         self.enabled = _b("ALERTS_ENABLED", True)
 
-        # "critical-only" mode (quiet unless level >= IMPORTANT/CRITICAL/ERROR)
+        # critical-only mode
         self.critical_only = (
             _b("ALERTS_CRITICAL_ONLY", False)
             or _b("ALERT_CRITICAL_ONLY", False)
@@ -195,16 +206,16 @@ class AlertManager:
         )
         self.critical_min_level = _lvl_norm(_s("ALERTS_CRITICAL_MIN_LEVEL", "IMPORTANT"))
 
+        # allow alerts during DRY_RUN?
+        self.allow_dryrun = _b("ALERTS_ALLOW_DRYRUN", True)
+
         # channel toggles
         self.tg_enabled = _b("ALERTS_TELEGRAM_ENABLED", True)
         self.discord_enabled = _b("ALERTS_DISCORD_ENABLED", False)
 
-        # allow sending in DRYRUN?
-        self.allow_dryrun = _b("ALERTS_ALLOW_DRYRUN", True)
-
-        # batching
+        # batching + queue
         self.batch_enabled = _b("ALERTS_BATCH_ENABLED", True)
-        self.flush_sec = max(0.1, _f("ALERTS_FLUSH_SEC", 1.0))
+        self.flush_sec = max(0.10, _f("ALERTS_FLUSH_SEC", 1.0))
         self.max_per_flush = max(1, _i("ALERTS_MAX_PER_FLUSH", 25))
         self.max_queue = max(100, _i("ALERTS_MAX_QUEUE", 2000))
 
@@ -212,44 +223,47 @@ class AlertManager:
         self.tg_min_interval = max(0.0, _f("ALERTS_TG_MIN_INTERVAL_SEC", 0.8))
         self.discord_min_interval = max(0.0, _f("ALERTS_DISCORD_MIN_INTERVAL_SEC", 1.2))
 
-        # dedupe (avoid repeating same key/text rapidly)
+        # dedupe
         self.dedupe_ttl_sec = max(0, _i("ALERTS_DEDUPE_TTL_SEC", 25))
+
+        # http
+        self.http_timeout_sec = max(3.0, _f("ALERTS_HTTP_TIMEOUT_SEC", 12.0))
 
         # MOMO cooldown
         self.momo_cooldown_sec = max(0, MOMO_COOLDOWN_SEC)
 
-        # Telegram config (compat with core_utils envs)
+        # Telegram config (compat with core_utils)
         self.tg_token = _s("TELEGRAM_BOT_TOKEN")
         self.tg_chat = _s("TELEGRAM_CHAT_ID")
-        self.tg_parse_mode = _s("TELEGRAM_PARSE_MODE", "HTML").strip()  # default HTML like core_utils
+        self.tg_parse_mode = _s("TELEGRAM_PARSE_MODE", "HTML").strip()  # HTML default
 
-        # Discord webhook (compat)
+        # Discord config
         self.discord_webhook = _s("DISCORD_WEBHOOK_URL", _s("DISCORD_WEBHOOK", ""))
 
-        # Notion per-fill DB (optional). If missing, we can fall back to core_utils.log_trade_event.
+        # Notion optional
         self.notion_enabled = _b("ALERTS_NOTION_ENABLED", False)
         self.allow_dryrun_notion = _b("ALERTS_NOTION_ALLOW_DRYRUN", True)
         self.notion_token = _s("NOTION_TOKEN", _s("NOTION_API_KEY", ""))
         self.notion_trades_db = _s("NOTION_TRADES_DB_ID", "")
         self.notion_version = _s("NOTION_VERSION", "2022-06-28")
 
-        # Optional: log reject buckets (helps kill silent no-buy)
+        # reject alerts
         self.rejects_enabled = _b("ALERTS_REJECTS_ENABLED", True)
         self.rejects_level = _lvl_norm(_s("ALERTS_REJECTS_LEVEL", "INFO"))
 
         # lifecycle
         self._external_session = session is not None
-        self._session: Optional[aiohttp.ClientSession] = session
-        self._queue: "asyncio.Queue[_AlertItem]" = asyncio.Queue(maxsize=self.max_queue)
-        self._worker: Optional[asyncio.Task[None]] = None
+        self._session: aiohttp.ClientSession | None = session
+        self._queue: asyncio.Queue[_AlertItem] = asyncio.Queue(maxsize=self.max_queue)
+        self._worker: asyncio.Task[None] | None = None
         self._closed = False
 
-        # throttles
-        self._last_send: Dict[str, float] = {"tg": 0.0, "discord": 0.0}
+        # send throttles
+        self._last_send: dict[str, float] = {"tg": 0.0, "discord": 0.0}
 
-        # dedupe cache (in-memory fast path)
-        self._dedupe_mem: Dict[str, float] = {}
-        self._momo_mem: Dict[str, float] = {}
+        # in-memory dedupe (fast path)
+        self._dedupe_mem: dict[str, float] = {}
+        self._momo_mem: dict[str, float] = {}
 
         log.info(
             "ALERT_MANAGER_READY",
@@ -257,52 +271,47 @@ class AlertManager:
                 "enabled": self.enabled,
                 "critical_only": self.critical_only,
                 "critical_min_level": self.critical_min_level,
-                "tg": bool(self.tg_token and self.tg_chat) and self.tg_enabled,
-                "discord": bool(self.discord_webhook) and self.discord_enabled,
-                "batch": self.batch_enabled,
+                "tg_enabled": int(self._tg_ok()),
+                "discord_enabled": int(self._discord_ok()),
+                "batch_enabled": self.batch_enabled,
                 "flush_sec": self.flush_sec,
-                "dryrun": _dryrun_on(),
+                "dryrun": int(_dryrun_on()),
             },
         )
 
     # ────────────────────────────────────────────────────────────────────
-    # Session / worker lifecycle
+    # lifecycle
     # ────────────────────────────────────────────────────────────────────
-
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is not None and not self._session.closed:
             return self._session
-        # local session only if none provided (avoid duplicates)
+        # create only if not provided
         self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=_f("ALERTS_HTTP_TIMEOUT_SEC", 12.0))
+            timeout=aiohttp.ClientTimeout(total=self.http_timeout_sec)
         )
         return self._session
 
     async def _ensure_worker(self) -> None:
         if self._worker is not None and not self._worker.done():
             return
-        self._worker = asyncio.create_task(self._flush_loop(), name="alert_manager:flush_loop")
+        self._worker = asyncio.create_task(self._flush_loop(), name="alert_manager.flush_loop")
 
     async def close(self) -> None:
         self._closed = True
         if self._worker is not None:
             self._worker.cancel()
-            try:
+            with contextlib.suppress(Exception):
                 await self._worker
-            except Exception:
-                pass
         self._worker = None
+
         if not self._external_session and self._session is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await self._session.close()
-            except Exception:
-                pass
         self._session = None
 
     # ────────────────────────────────────────────────────────────────────
-    # Filtering: critical-only + dryrun
+    # gates
     # ────────────────────────────────────────────────────────────────────
-
     def _allowed_by_level(self, level: str) -> bool:
         if not self.critical_only:
             return True
@@ -312,18 +321,19 @@ class AlertManager:
         return self.allow_dryrun or (not _dryrun_on())
 
     def _tg_ok(self) -> bool:
-        return self.enabled and self.tg_enabled and bool(self.tg_token and self.tg_chat)
+        return bool(self.enabled and self.tg_enabled and self.tg_token and self.tg_chat)
 
     def _discord_ok(self) -> bool:
-        return self.enabled and self.discord_enabled and bool(self.discord_webhook)
+        return bool(self.enabled and self.discord_enabled and self.discord_webhook)
 
     def _notion_ok(self) -> bool:
-        return self.enabled and self.notion_enabled and bool(self.notion_token and self.notion_trades_db)
+        return bool(
+            self.enabled and self.notion_enabled and self.notion_token and self.notion_trades_db
+        )
 
     # ────────────────────────────────────────────────────────────────────
-    # Dedupe (in-memory; Redis optional for momo cooldown only)
+    # dedupe (in-memory)
     # ────────────────────────────────────────────────────────────────────
-
     def _dedupe_hit(self, key: str) -> bool:
         if self.dedupe_ttl_sec <= 0:
             return False
@@ -332,28 +342,31 @@ class AlertManager:
             return False
         now = time.time()
         t = self._dedupe_mem.get(k)
-        if t is not None and (now - t) < self.dedupe_ttl_sec:
+        if t is not None and (now - t) < float(self.dedupe_ttl_sec):
             return True
         self._dedupe_mem[k] = now
-        # prune occasionally
-        if len(self._dedupe_mem) > 5000:
-            cutoff = now - float(self.dedupe_ttl_sec) * 2
+
+        # occasional prune to bound memory
+        if len(self._dedupe_mem) > 8000:
+            cutoff = now - float(self.dedupe_ttl_sec) * 3.0
             self._dedupe_mem = {kk: vv for kk, vv in self._dedupe_mem.items() if vv >= cutoff}
         return False
 
     # ────────────────────────────────────────────────────────────────────
-    # Enqueue / immediate send paths
+    # enqueue
     # ────────────────────────────────────────────────────────────────────
-
     async def _enqueue(self, item: _AlertItem) -> None:
         if self._closed or not self.enabled:
             return
         if not self._allowed_in_dryrun():
             return
-        item.level = _lvl_norm(item.level)
-        if not self._allowed_by_level(item.level):
+
+        level = _lvl_norm(item.level)
+        if not self._allowed_by_level(level):
             return
-        if item.key and self._dedupe_hit(item.key):
+
+        key = (item.key or "").strip()
+        if key and self._dedupe_hit(key):
             return
 
         if not self.batch_enabled:
@@ -361,37 +374,69 @@ class AlertManager:
             return
 
         await self._ensure_worker()
+
+        # Backpressure / drop policy:
+        # - if queue is full: drop DEBUG/INFO first
+        # - keep CRITICAL/ERROR by evicting one older low-priority item if possible
         try:
-            self._queue.put_nowait(item)
+            self._queue.put_nowait(_AlertItem(item.text, level, item.channels, key, item.ts))
         except asyncio.QueueFull:
-            # If queue is full, drop non-critical first
-            if _lvl_rank(item.level) >= _lvl_rank("CRITICAL"):
-                # force put by removing one old item
+            if _lvl_rank(level) < _lvl_rank("CRITICAL"):
+                bump("alerts_drop")
+                return
+
+            # best-effort eviction: pop a few items and keep the last critical
+            evicted = 0
+            kept: list[_AlertItem] = []
+            try:
+                # drain a small window, keep critical-ish ones
+                for _ in range(20):
+                    try:
+                        old = self._queue.get_nowait()
+                    except Exception:
+                        break
+                    if _lvl_rank(old.level) >= _lvl_rank("CRITICAL") and len(kept) < 5:
+                        kept.append(old)
+                    else:
+                        evicted += 1
+            except Exception:
+                pass
+
+            # reinsert kept items
+            for it in kept:
                 try:
-                    _ = self._queue.get_nowait()
-                    self._queue.put_nowait(item)
+                    self._queue.put_nowait(it)
                 except Exception:
-                    pass
+                    break
+
+            # try insert critical item
+            with contextlib.suppress(Exception):
+                self._queue.put_nowait(_AlertItem(item.text, level, item.channels, key, item.ts))
+
+            bump("alerts_drop_evicted")
+            log.warning("ALERT_QUEUE_FULL", extra={"evicted": evicted, "kept": len(kept)})
 
     async def _send_item_immediate(self, item: _AlertItem) -> None:
-        # no batching: direct fanout
+        # direct fanout without batching (still throttled)
         if "tg" in item.channels:
+            await self._throttle("tg")
             await self._send_tg(item.text)
         if "discord" in item.channels:
+            await self._throttle("discord")
             await self._send_discord(item.text)
 
     # ────────────────────────────────────────────────────────────────────
-    # Flush loop (batching)
+    # batching loop
     # ────────────────────────────────────────────────────────────────────
-
     async def _flush_loop(self) -> None:
         try:
             while not self._closed:
-                batch: List[_AlertItem] = []
+                batch: list[_AlertItem] = []
+                # wait for at least one, or time out to flush cycle
                 try:
                     it = await asyncio.wait_for(self._queue.get(), timeout=self.flush_sec)
                     batch.append(it)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     batch = []
 
                 # drain quickly up to cap
@@ -404,53 +449,50 @@ class AlertManager:
                 if not batch:
                     continue
 
-                # group per channel
-                tg_texts: List[str] = []
-                dc_texts: List[str] = []
+                tg_parts: list[str] = []
+                dc_parts: list[str] = []
+
                 for it in batch:
                     if "tg" in it.channels:
-                        tg_texts.append(it.text)
+                        tg_parts.append(it.text)
                     if "discord" in it.channels:
-                        dc_texts.append(it.text)
+                        dc_parts.append(it.text)
 
-                if tg_texts:
-                    await self._send_batched("tg", tg_texts)
-                if dc_texts:
-                    await self._send_batched("discord", dc_texts)
+                if tg_parts and self._tg_ok():
+                    await self._send_batched("tg", tg_parts)
+                if dc_parts and self._discord_ok():
+                    await self._send_batched("discord", dc_parts)
 
         except asyncio.CancelledError:
             return
         except Exception as e:
-            log.warning("ALERT_FLUSH_LOOP_CRASH", extra={"err": str(e)[:240]})
+            log.warning("ALERT_FLUSH_LOOP_CRASH", extra={"err": _clip(str(e), 240)})
 
-    async def _send_batched(self, channel: str, parts: List[str]) -> None:
-        """
-        Join parts into chunks under the channel max length, then send with throttle.
-        """
-        if channel == "tg" and not self._tg_ok():
-            return
-        if channel == "discord" and not self._discord_ok():
-            return
-
+    async def _send_batched(self, channel: str, parts: Sequence[str]) -> None:
         max_len = self._TG_MAX if channel == "tg" else self._DISCORD_MAX
-        joiner = "\n\n"  # readable separation
-        chunks: List[str] = []
+        joiner = "\n\n"
+
+        chunks: list[str] = []
         cur = ""
+
         for p in parts:
             p = (p or "").strip()
             if not p:
                 continue
             if len(p) > max_len:
                 p = _clip(p, max_len)
+
             if not cur:
                 cur = p
                 continue
+
             cand = cur + joiner + p
             if len(cand) <= max_len:
                 cur = cand
             else:
                 chunks.append(cur)
                 cur = p
+
         if cur:
             chunks.append(cur)
 
@@ -462,9 +504,6 @@ class AlertManager:
                 await self._send_discord(msg)
 
     async def _throttle(self, channel: str) -> None:
-        """
-        Simple min-interval throttle.
-        """
         now = time.time()
         last = self._last_send.get(channel, 0.0)
         min_int = self.tg_min_interval if channel == "tg" else self.discord_min_interval
@@ -474,17 +513,16 @@ class AlertManager:
         self._last_send[channel] = time.time()
 
     # ────────────────────────────────────────────────────────────────────
-    # Telegram / Discord implementations
+    # Telegram / Discord senders (best-effort)
     # ────────────────────────────────────────────────────────────────────
-
     async def _send_tg(self, text: str) -> None:
         if not self._tg_ok():
             return
         s = await self._ensure_session()
         url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "chat_id": self.tg_chat,
-            "text": text,
+            "text": _clip(text, self._TG_MAX),
             "disable_web_page_preview": True,
         }
         if self.tg_parse_mode:
@@ -492,33 +530,67 @@ class AlertManager:
 
         try:
             async with s.post(url, json=payload) as resp:
+                # Telegram can return 429 (rate limit) with retry_after in JSON.
+                if resp.status == 429:
+                    try:
+                        data = await resp.json()
+                        retry = float((data.get("parameters") or {}).get("retry_after") or 1.0)
+                        await asyncio.sleep(min(max(0.5, retry), 5.0))
+                        bump("alerts_tg_429")
+                    except Exception:
+                        bump("alerts_tg_429")
+                    return
                 if resp.status != 200:
                     body = await resp.text()
-                    log.warning("ALERT_TG_FAIL", extra={"status": resp.status, "body": body[:400]})
+                    log.warning(
+                        "ALERT_TG_FAIL", extra={"status": resp.status, "body": _clip(body, 400)}
+                    )
+                    bump("alerts_tg_fail")
+                else:
+                    bump("alerts_tg_ok")
         except Exception as e:
-            log.warning("ALERT_TG_EXC", extra={"err": str(e)[:240]})
+            log.warning("ALERT_TG_EXC", extra={"err": _clip(str(e), 240)})
+            bump("alerts_tg_exc")
 
     async def _send_discord(self, text: str) -> None:
         if not self._discord_ok():
             return
         s = await self._ensure_session()
+        payload = {"content": _clip(text, self._DISCORD_MAX)}
         try:
-            async with s.post(self.discord_webhook, json={"content": text}) as resp:
+            async with s.post(self.discord_webhook, json=payload) as resp:
+                if resp.status == 429:
+                    # Discord webhook rate limits; try honor Retry-After if present
+                    retry_after = resp.headers.get("Retry-After")
+                    try:
+                        if retry_after:
+                            await asyncio.sleep(min(max(0.5, float(retry_after)), 5.0))
+                    except Exception:
+                        pass
+                    bump("alerts_dc_429")
+                    return
                 if resp.status >= 300:
                     body = await resp.text()
-                    log.warning("ALERT_DISCORD_FAIL", extra={"status": resp.status, "body": body[:400]})
+                    log.warning(
+                        "ALERT_DISCORD_FAIL",
+                        extra={"status": resp.status, "body": _clip(body, 400)},
+                    )
+                    bump("alerts_dc_fail")
+                else:
+                    bump("alerts_dc_ok")
         except Exception as e:
-            log.warning("ALERT_DISCORD_EXC", extra={"err": str(e)[:240]})
+            log.warning("ALERT_DISCORD_EXC", extra={"err": _clip(str(e), 240)})
+            bump("alerts_dc_exc")
 
     # ────────────────────────────────────────────────────────────────────
-    # Notion: optional per-fill DB insert (if NOTION_TRADES_DB_ID set)
+    # Notion (optional direct DB insert)
     # ────────────────────────────────────────────────────────────────────
-
-    async def _notion_insert_trade_row(self, props: Dict[str, Any]) -> None:
+    async def _notion_insert_trade_row(self, props: dict[str, Any]) -> None:
         if not self._notion_ok():
             return
         if _dryrun_on() and not self.allow_dryrun_notion:
             return
+
         s = await self._ensure_session()
         headers = {
             "Authorization": f"Bearer {self.notion_token}",
@@ -526,105 +598,157 @@ class AlertManager:
             "Content-Type": "application/json",
         }
         body = {"parent": {"database_id": self.notion_trades_db}, "properties": props}
+
         try:
-            async with s.post("https://api.notion.com/v1/pages", headers=headers, json=body) as resp:
+            async with s.post(
+                "https://api.notion.com/v1/pages", headers=headers, json=body
+            ) as resp:
                 if resp.status >= 300:
                     txt = await resp.text()
-                    log.warning("ALERT_NOTION_FAIL", extra={"status": resp.status, "body": txt[:600]})
+                    log.warning(
+                        "ALERT_NOTION_FAIL", extra={"status": resp.status, "body": _clip(txt, 600)}
+                    )
+                    bump("alerts_notion_fail")
+                else:
+                    bump("alerts_notion_ok")
         except Exception as e:
-            log.warning("ALERT_NOTION_EXC", extra={"err": str(e)[:240]})
+            log.warning("ALERT_NOTION_EXC", extra={"err": _clip(str(e), 240)})
+            bump("alerts_notion_exc")
 
     # ────────────────────────────────────────────────────────────────────
     # Public API
     # ────────────────────────────────────────────────────────────────────
-
-    async def notify_text(self, text: str, *, level: str = "INFO", key: str = "") -> None:
-        text = (text or "").strip()
-        if not text:
+    async def notify_text(
+        self,
+        text: str,
+        *,
+        level: str = "INFO",
+        key: str = "",
+        channels: tuple[str, ...] = ("tg", "discord"),
+    ) -> None:
+        t = (text or "").strip()
+        if not t:
             return
-        await self._enqueue(_AlertItem(text=text, level=level, channels=("tg", "discord"), key=key or text, ts=time.time()))
+        await self._enqueue(
+            _AlertItem(
+                text=t, level=_lvl_norm(level), channels=channels, key=key or t, ts=time.time()
+            )
+        )
 
     async def notify_error(
         self,
         label: str,
         err: Exception | str,
-        extra: Optional[Mapping[str, Any]] = None,
+        extra: Mapping[str, Any] | None = None,
         *,
         level: str = "ERROR",
         key: str = "",
+        channels: tuple[str, ...] = ("tg", "discord"),
     ) -> None:
-        lines = [f"⚠️ {label}", f"err={_clip(str(err), 400)}"]
+        lines = [f"⚠️ {label}", f"err={_clip(str(err), 500)}"]
         if extra:
             for k, v in extra.items():
-                lines.append(f"{k}={_clip(str(v), 200)}")
+                lines.append(f"{k}={_clip(str(v), 250)}")
         msg = "\n".join(lines)
-        await self._enqueue(_AlertItem(text=msg, level=level, channels=("tg", "discord"), key=key or f"err:{label}", ts=time.time()))
+        await self._enqueue(
+            _AlertItem(
+                text=msg,
+                level=_lvl_norm(level),
+                channels=channels,
+                key=key or f"err:{label}",
+                ts=time.time(),
+            )
+        )
 
-    async def notify_reject(self, bucket: str, ctx: Mapping[str, Any], *, level: Optional[str] = None) -> None:
+    async def notify_reject(
+        self,
+        bucket: str,
+        ctx: Mapping[str, Any],
+        *,
+        level: str | None = None,
+        channels: tuple[str, ...] = ("tg", "discord"),
+    ) -> None:
         """
-        Standardized reject alert (optional).
-        Use this when scanners/sniper reject a candidate to prevent "silent no-buy".
+        Standardized reject alert (helps eliminate "silent no-buy").
         """
         if not self.rejects_enabled:
             return
+
         lvl = _lvl_norm(level or self.rejects_level)
         mint = str(ctx.get("mint") or ctx.get("token") or "")
         sym = str(ctx.get("symbol") or ctx.get("sym") or "")
         pool = str(ctx.get("pool") or ctx.get("pair") or "")
         score = ctx.get("score")
-        why = ctx.get("why") or ctx.get("reason") or ""
+        why = ctx.get("why") or ctx.get("reason") or ctx.get("reject_reason") or ""
 
         msg = (
             f"⛔ REJECT {bucket}\n"
             f"symbol={sym or '-'} pool={pool or '-'}\n"
             f"mint={mint or '-'}\n"
             f"score={score if score is not None else '-'}\n"
-            f"why={_clip(str(why), 500)}"
+            f"why={_clip(str(why), 600)}"
         )
-        dedupe_key = f"rej:{bucket}:{sym or mint}:{pool}"
-        await self._enqueue(_AlertItem(text=msg, level=lvl, channels=("tg", "discord"), key=dedupe_key, ts=time.time()))
+        dedupe_key = f"rej:{bucket}:{sym or mint}:{pool}".lower()
+        await self._enqueue(
+            _AlertItem(text=msg, level=lvl, channels=channels, key=dedupe_key, ts=time.time())
+        )
 
     async def notify_trade_fill(
         self,
         *,
         side: str,  # BUY / SELL
         mint: str,
-        symbol: Optional[str],
-        pool: str,
-        sig: Optional[str],
-        spend_sol: Optional[float] = None,
-        out_amount_raw: Optional[int] = None,
+        symbol: str | None,
+        pool: str = "",
+        sig: str | None = None,
+        spend_sol: float | None = None,
+        out_amount_raw: int | None = None,
         reason: str = "FILL",
         level: str = "IMPORTANT",
-        extra: Optional[Dict[str, Any]] = None,
+        extra: dict[str, Any] | None = None,
+        channels: tuple[str, ...] = ("tg", "discord"),
     ) -> None:
         """
         Trade fill fanout:
-          - Telegram/Discord message (batched)
-          - Notion (optional): either per-fill DB insert OR core_utils.log_trade_event
+          - Telegram/Discord (batched)
+          - Notion direct insert (if configured) else best-effort core_utils.log_trade_event fallback
         """
         side_u = (side or "").strip().upper() or "BUY"
         tx_url = ""
         if sig:
             tx_url = sig if sig.startswith("http") else f"https://solscan.io/tx/{sig}"
 
-        msg = (
-            f"✅ {side_u} FILLED\n"
-            f"symbol={symbol or '-'} pool={pool or '-'}\n"
-            f"mint={mint}\n"
-            f"spendSOL={spend_sol if spend_sol is not None else '-'} outRaw={out_amount_raw if out_amount_raw is not None else '-'}\n"
-            f"reason={_clip(reason, 220)}\n"
-            f"tx={tx_url or '—'}"
-        )
-        await self._enqueue(_AlertItem(text=msg, level=level, channels=("tg", "discord"), key=f"fill:{side_u}:{mint}:{pool}", ts=time.time()))
+        lines = [
+            f"✅ {side_u} FILLED",
+            f"symbol={symbol or '-'} pool={pool or '-'}",
+            f"mint={mint}",
+            f"spendSOL={spend_sol if spend_sol is not None else '-'} outRaw={out_amount_raw if out_amount_raw is not None else '-'}",
+            f"reason={_clip(reason, 240)}",
+        ]
+        if tx_url:
+            lines.append(f"tx={tx_url}")
+        if extra:
+            # keep it compact
+            lines.append(f"extra={_clip(_json(extra), 700)}")
 
-        # Notion per-fill DB (optional)
+        msg = "\n".join(lines)
+        await self._enqueue(
+            _AlertItem(
+                text=msg,
+                level=_lvl_norm(level),
+                channels=channels,
+                key=f"fill:{side_u}:{mint}:{pool}".lower(),
+                ts=time.time(),
+            )
+        )
+
+        # Notion (direct)
         if self._notion_ok():
-            now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            side_select = "Buy" if side_u.startswith("B") else "Sell"
-            props: Dict[str, Any] = {
-                "Name": {"title": [{"text": {"content": f"{side_select} {symbol or mint[:6]}…"}}]},
-                "Side": {"select": {"name": side_select}},
+            now_iso = datetime.now(UTC).isoformat(timespec="seconds")
+            side_name = "Buy" if side_u.startswith("B") else "Sell"
+            props: dict[str, Any] = {
+                "Name": {"title": [{"text": {"content": f"{side_name} {symbol or mint[:6]}"}}]},
+                "Side": {"select": {"name": side_name}},
                 "Symbol": {"rich_text": [{"text": {"content": symbol or ""}}]},
                 "Pool": {"rich_text": [{"text": {"content": pool or ""}}]},
                 "Mint": {"rich_text": [{"text": {"content": mint}}]},
@@ -639,29 +763,67 @@ class AlertManager:
             await self._notion_insert_trade_row(props)
             return
 
-        # Fallback: use core_utils unified logging (PG + Notion mapping) if available
+        # Fallback to core_utils unified logger (best-effort)
         try:
-            from . import core_utils as cu  # local import to avoid cycles
+            from . import core_utils as cu  # local import (avoid cycles)
 
-            # logs to PG + (optional) Notion via core_utils
-            await cu.log_trade_event(
-                token=mint,
-                symbol=str(symbol or ""),
-                balance=float(spend_sol or 0.0),
-                entry=float(0.0),
-                current=float(0.0),
-                profit=float(0.0),
-                reason=f"{side_u}:{reason}",
-                side=side_u.lower(),
-                signature=sig,
-            )
+            fn = getattr(cu, "log_trade_event", None)
+            if callable(fn):
+                await fn(
+                    token=mint,
+                    symbol=str(symbol or ""),
+                    balance=float(spend_sol or 0.0),
+                    entry=0.0,
+                    current=0.0,
+                    profit=0.0,
+                    reason=f"{side_u}:{reason}",
+                    side=side_u.lower(),
+                    signature=sig,
+                )
         except Exception:
             pass
 
-    # ────────────────────────────────────────────────────────────────────
-    # MOMO events (scanner signals)
-    # ────────────────────────────────────────────────────────────────────
+    # Compatibility helpers (older code paths)
+    async def send_buy_alert(
+        self,
+        symbol: str,
+        price: float,
+        url: str = "",
+        *,
+        sol_value: float | None = None,
+        reason: str = "BUY",
+        level: str = "IMPORTANT",
+    ) -> None:
+        msg = f"🟢 BUY {symbol}\nprice={price}\nsol={sol_value if sol_value is not None else '-'}"
+        if url:
+            msg += f"\n{url}"
+        await self.notify_text(msg, level=level, key=f"buy:{symbol}:{reason}".lower())
 
+    async def send_sell_alert(
+        self,
+        symbol: str,
+        price: float,
+        profit_sol: float = 0.0,
+        url: str = "",
+        *,
+        sol_value: float | None = None,
+        reason: str = "SELL",
+        level: str = "IMPORTANT",
+    ) -> None:
+        msg = (
+            f"🔴 SELL {symbol}\n"
+            f"price={price}\n"
+            f"pnlSOL={profit_sol:.6f}\n"
+            f"sizeSOL={sol_value if sol_value is not None else '-'}\n"
+            f"reason={reason}"
+        )
+        if url:
+            msg += f"\n{url}"
+        await self.notify_text(msg, level=level, key=f"sell:{symbol}:{reason}".lower())
+
+    # ────────────────────────────────────────────────────────────────────
+    # MOMO events
+    # ────────────────────────────────────────────────────────────────────
     async def _momo_cooldown_hit(self, event: str, symbol: str) -> bool:
         """
         Cooldown per (event, symbol). Uses core_utils Redis if available,
@@ -672,14 +834,14 @@ class AlertManager:
 
         key = f"{MOMO_REDIS_PREFIX}:{event}:{symbol}".lower()
 
-        # Try redis via core_utils (native or Upstash REST)
+        # Redis via core_utils (no competing clients)
         try:
             from . import core_utils as cu  # local import
 
             r = await cu.get_redis_async()
             if r is not None:
-                # Upstash REST wrapper may not have EXISTS; use GET as exists check.
                 try:
+                    # Upstash REST wrapper might not expose exists(); use get as fallback.
                     if hasattr(r, "exists"):
                         exists = await r.exists(key)  # type: ignore[attr-defined]
                         if int(exists or 0) > 0:
@@ -688,27 +850,26 @@ class AlertManager:
                         v = await r.get(key)
                         if v is not None:
                             return True
-                    await r.set(key, "1", ex=self.momo_cooldown_sec)
+                    await r.set(key, "1", ex=int(self.momo_cooldown_sec))
                     return False
                 except Exception:
-                    # fall through to memory
                     pass
         except Exception:
             pass
 
-        # In-memory fallback (per-process)
+        # in-memory fallback
         now = time.time()
         t = self._momo_mem.get(key)
-        if t is not None and (now - t) < self.momo_cooldown_sec:
+        if t is not None and (now - t) < float(self.momo_cooldown_sec):
             return True
         self._momo_mem[key] = now
         return False
 
-    async def send_momo_event(self, event: str, ctx: Dict[str, Any]) -> None:
+    async def send_momo_event(self, event: str, ctx: dict[str, Any]) -> None:
         """
         - Ignore MOMO_SKIP_*
         - Only allow GOOD_MOMO_EVENTS
-        - Apply cooldown per (event,symbol)
+        - Apply cooldown per (event, symbol)
         """
         event_u = (event or "").strip().upper()
         if not event_u:
@@ -718,24 +879,42 @@ class AlertManager:
         if event_u not in GOOD_MOMO_EVENTS:
             return
 
-        symbol = str(ctx.get("symbol") or ctx.get("sym") or ctx.get("mint") or ctx.get("name") or "?").strip()
-        if not symbol:
-            symbol = "?"
-
+        symbol = (
+            str(
+                ctx.get("symbol") or ctx.get("sym") or ctx.get("name") or ctx.get("mint") or "?"
+            ).strip()
+            or "?"
+        )
         if await self._momo_cooldown_hit(event_u, symbol):
             return
 
         pool = str(ctx.get("pool") or ctx.get("pair") or "-").strip()
-        reason = str(ctx.get("reason") or "").strip()
-
         label = MOMO_LABELS.get(event_u, event_u)
-        lines = [f"📈 {label}", f"symbol={symbol}", f"pool={pool}"]
 
-        # common extras (only if present)
-        for k in ("age_sec", "age_min", "liq_usd", "vol_5m", "vol_5m_usd", "up_pct", "fraud_score", "momentum", "final"):
+        lines: list[str] = [f"📈 {label}", f"symbol={symbol}", f"pool={pool}"]
+
+        # only include common numeric fields if present
+        for k in (
+            "age_sec",
+            "age_min",
+            "liq",
+            "liq_usd",
+            "vol5",
+            "vol_5m",
+            "vol_5m_usd",
+            "buys5",
+            "sells5",
+            "chg5",
+            "up_pct",
+            "fraud_score",
+            "momentum",
+            "final",
+            "score",
+        ):
             if k in ctx and ctx[k] is not None:
                 lines.append(f"{k}={ctx[k]}")
 
+        reason = str(ctx.get("reason") or ctx.get("why") or "").strip()
         if reason:
             lines.append(f"reason={_clip(reason, 420)}")
 
@@ -745,7 +924,25 @@ class AlertManager:
             lines.append(f"tx={tx_url}")
 
         msg = "\n".join(lines)
-        await self.notify_text(msg, level="IMPORTANT", key=f"momo:{event_u}:{symbol}:{pool}")
+        await self.notify_text(
+            msg, level="IMPORTANT", key=f"momo:{event_u}:{symbol}:{pool}".lower()
+        )
+
+    # ────────────────────────────────────────────────────────────────────
+    # optional: lightweight health snapshot
+    # ────────────────────────────────────────────────────────────────────
+    def health(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "critical_only": self.critical_only,
+            "critical_min_level": self.critical_min_level,
+            "queue_size": int(self._queue.qsize()),
+            "tg_ok": int(self._tg_ok()),
+            "discord_ok": int(self._discord_ok()),
+            "batch_enabled": int(self.batch_enabled),
+            "flush_sec": float(self.flush_sec),
+            "last_send": dict(self._last_send),
+        }
 
 
-__all__ = ["AlertManager", "GOOD_MOMO_EVENTS", "MOMO_LABELS"]
+__all__ = ["GOOD_MOMO_EVENTS", "MOMO_LABELS", "AlertManager"]

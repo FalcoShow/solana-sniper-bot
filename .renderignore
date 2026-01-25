@@ -1,9 +1,97 @@
+# ==============================================================================
+# .renderignore — minimize upload context to Render (fast, deterministic builds)
+# ==============================================================================
+# Render uploads your repo to build/run. Anything excluded here:
+#   - is NOT sent to Render
+#   - cannot be referenced during build/runtime
+#
+# Goals:
+#   1) Keep deploys fast (exclude big local junk)
+#   2) Avoid leaking secrets (exclude .env, key material)
+#   3) Keep build deterministic (exclude local caches/artifacts)
+#
+# IMPORTANT:
+# - Do NOT exclude source code needed at runtime.
+# - Do NOT exclude requirements.txt / start.sh / render.yaml / Procfile if used.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Python caches / local venvs
+# ------------------------------------------------------------------------------
 .venv/
+venv/
 venv*/
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ------------------------------------------------------------------------------
+# Local env/secrets (never upload)
+# ------------------------------------------------------------------------------
+.env
+.env.*
+.envrc
+etc/secrets/
+secrets/
+.private/
+private/
+
+# Key material
+id.json
+keypair.json
+*.pem
+*.p12
+*.pfx
+*.key
+*.keystore
+*.seed
+*.mnemonic
+*.wallet
+
+# ------------------------------------------------------------------------------
+# Local data / artifacts (big + not needed in deploy)
+# ------------------------------------------------------------------------------
 exports/
-*.csv
-*.log
+artifacts/
+snapshots/
+reports/
+backtests/
+datasets/
+data/
+
+# Database / state files
 state.sqlite3
 database.sqlite
+*.sqlite
+*.sqlite3
+*.db
+
+# Logs
+*.log
+logs/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Node junk (if present)
+node_modules/
+.pnpm-store/
+.next/
+out/
+dist/
+
+# ------------------------------------------------------------------------------
+# Keep: do NOT exclude these (examples)
+# ------------------------------------------------------------------------------
+# !requirements.txt
+# !start.sh
+# !render.yaml
+# !Procfile
+# !src/**

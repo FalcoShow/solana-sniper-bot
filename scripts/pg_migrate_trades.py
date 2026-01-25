@@ -15,19 +15,18 @@ Usage:
 
 from __future__ import annotations
 
-import os
-import sys
 import argparse
 import asyncio
-from typing import List
+import os
+import sys
 
 # Allow running as a standalone file OR -m scripts.pg_migrate_trades
 if __name__ == "__main__" and __package__ is None:
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from sqlalchemy import text  # type: ignore
-from utils_pkg.core_utils import init_resources, close_resources, get_pg_engine
 
+from utils_pkg.core_utils import close_resources, get_pg_engine, init_resources
 
 DDL_CREATE_TRADES = """
 CREATE TABLE IF NOT EXISTS trades (
@@ -40,7 +39,7 @@ CREATE TABLE IF NOT EXISTS trades (
 """
 
 # Columns you’ve been writing in recent runs (added if missing)
-DDL_ALTERS: List[str] = [
+DDL_ALTERS: list[str] = [
     "ALTER TABLE trades ADD COLUMN IF NOT EXISTS amount DOUBLE PRECISION",
     "ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry DOUBLE PRECISION",
     "ALTER TABLE trades ADD COLUMN IF NOT EXISTS current DOUBLE PRECISION",
@@ -50,7 +49,7 @@ DDL_ALTERS: List[str] = [
 ]
 
 # Helpful indexes (no-ops if already present)
-DDL_INDEXES: List[str] = [
+DDL_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades (ts)",
     "CREATE INDEX IF NOT EXISTS idx_trades_token ON trades (token)",
     "CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol)",

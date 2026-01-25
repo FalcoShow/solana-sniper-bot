@@ -1,0 +1,220 @@
+{
+  "schema_version": "1",
+  "source": "dexscreener_snapshot",
+  "captured_at_utc": "2026-01-06T00:00:00Z",
+  "notes": "Static fixture for unit/contract tests. Synthetic but shaped like Dexscreener pairs payload. No network.",
+  "pairs": [
+    {
+      "chainId": "solana",
+      "dexId": "raydium",
+      "pairAddress": "9Qp9w9n9pQp9w9n9pQp9w9n9pQp9w9n9pQp9w9n9pQp9",
+      "url": "https://dexscreener.com/solana/9Qp9w9n9pQp9w9n9pQp9w9n9pQp9w9n9pQp9w9n9pQp9",
+      "baseToken": {
+        "address": "9xQeWvG816bUx9EPfLk7pQyG2kYQWqY8XJg1p9aVbFhS",
+        "name": "Test A",
+        "symbol": "TESTA"
+      },
+      "quoteToken": {
+        "address": "So11111111111111111111111111111111111111112",
+        "name": "Wrapped SOL",
+        "symbol": "SOL"
+      },
+      "priceNative": "0.000020",
+      "priceUsd": "0.0042",
+      "liquidity": {
+        "usd": 215000.5,
+        "base": 51000000.0,
+        "quote": 1020.0
+      },
+      "volume": {
+        "m5": 12850.25,
+        "h1": 142000.0,
+        "h6": 420000.0,
+        "h24": 980000.0
+      },
+      "txns": {
+        "m5": { "buys": 42, "sells": 31 },
+        "h1": { "buys": 420, "sells": 365 },
+        "h24": { "buys": 9100, "sells": 8600 }
+      },
+      "priceChange": {
+        "m5": 6.8,
+        "h1": 18.5,
+        "h24": 44.0
+      },
+      "fdv": 1200000.0,
+      "marketCap": 980000.0,
+      "pairCreatedAt": 1767656850000,
+
+      "sym": "TESTA",
+      "mint": "9xQeWvG816bUx9EPfLk7pQyG2kYQWqY8XJg1p9aVbFhS",
+      "liq": 215000.5,
+      "vol5": 12850.25,
+      "buys5": 42,
+      "sells5": 31,
+      "chg5": 6.8,
+      "age_min": 12.5,
+      "source": "dexscreener",
+      "ts": 1767657600
+    },
+    {
+      "chainId": "solana",
+      "dexId": "raydium",
+      "pairAddress": "7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7B",
+      "url": "https://dexscreener.com/solana/7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7Bb7B",
+      "baseToken": {
+        "address": "7kbnvuGBxxj8AG9qp8Scn56muWGaRaFqxg1FsRp3PaFT",
+        "name": "Test B",
+        "symbol": "TESTB"
+      },
+      "quoteToken": {
+        "address": "So11111111111111111111111111111111111111112",
+        "name": "Wrapped SOL",
+        "symbol": "SOL"
+      },
+      "priceNative": "0.0000043",
+      "priceUsd": "0.00091",
+      "liquidity": {
+        "usd": 68000.0,
+        "base": 76000000.0,
+        "quote": 320.0
+      },
+      "volume": {
+        "m5": 2450.1,
+        "h1": 24000.0,
+        "h6": 82000.0,
+        "h24": 210000.0
+      },
+      "txns": {
+        "m5": { "buys": 9, "sells": 14 },
+        "h1": { "buys": 95, "sells": 121 },
+        "h24": { "buys": 2300, "sells": 2600 }
+      },
+      "priceChange": {
+        "m5": -4.2,
+        "h1": -12.5,
+        "h24": -28.0
+      },
+      "fdv": 410000.0,
+      "marketCap": 310000.0,
+      "pairCreatedAt": 1767654120000,
+
+      "sym": "TESTB",
+      "mint": "7kbnvuGBxxj8AG9qp8Scn56muWGaRaFqxg1FsRp3PaFT",
+      "liq": 68000.0,
+      "vol5": 2450.1,
+      "buys5": 9,
+      "sells5": 14,
+      "chg5": -4.2,
+      "age_min": 58.0,
+      "source": "dexscreener",
+      "ts": 1767657600
+    },
+    {
+      "chainId": "solana",
+      "dexId": "raydium",
+      "pairAddress": "DezDezDezDezDezDezDezDezDezDezDezDezDezDezDezD",
+      "url": "https://dexscreener.com/solana/DezDezDezDezDezDezDezDezDezDezDezDezDezDezDezD",
+      "baseToken": {
+        "address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+        "name": "Test C",
+        "symbol": "TESTC"
+      },
+      "quoteToken": {
+        "address": "So11111111111111111111111111111111111111112",
+        "name": "Wrapped SOL",
+        "symbol": "SOL"
+      },
+      "priceNative": "0.00000015",
+      "priceUsd": "0.000032",
+      "liquidity": {
+        "usd": 520000.0,
+        "base": 16000000000.0,
+        "quote": 2450.0
+      },
+      "volume": {
+        "m5": 40250.0,
+        "h1": 410000.0,
+        "h6": 920000.0,
+        "h24": 2100000.0
+      },
+      "txns": {
+        "m5": { "buys": 120, "sells": 88 },
+        "h1": { "buys": 1180, "sells": 940 },
+        "h24": { "buys": 21000, "sells": 17000 }
+      },
+      "priceChange": {
+        "m5": 14.9,
+        "h1": 55.0,
+        "h24": 140.0
+      },
+      "fdv": 6500000.0,
+      "marketCap": 5400000.0,
+      "pairCreatedAt": 1767657408000,
+
+      "sym": "TESTC",
+      "mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+      "liq": 520000.0,
+      "vol5": 40250.0,
+      "buys5": 120,
+      "sells5": 88,
+      "chg5": 14.9,
+      "age_min": 3.2,
+      "source": "dexscreener",
+      "ts": 1767657600
+    },
+    {
+      "chainId": "solana",
+      "dexId": "raydium",
+      "pairAddress": "DeadDeadDeadDeadDeadDeadDeadDeadDeadDeadDeadDeadD",
+      "url": "https://dexscreener.com/solana/DeadDeadDeadDeadDeadDeadDeadDeadDeadDeadDeadDeadD",
+      "baseToken": {
+        "address": "11111111111111111111111111111111DEADDEADDEAD",
+        "name": "Dead Token",
+        "symbol": "DEAD1"
+      },
+      "quoteToken": {
+        "address": "So11111111111111111111111111111111111111112",
+        "name": "Wrapped SOL",
+        "symbol": "SOL"
+      },
+      "priceNative": "0.000000000004",
+      "priceUsd": "0.0000008",
+      "liquidity": {
+        "usd": 5200.0,
+        "base": 6500000000.0,
+        "quote": 0.05
+      },
+      "volume": {
+        "m5": 12.0,
+        "h1": 120.0,
+        "h6": 210.0,
+        "h24": 600.0
+      },
+      "txns": {
+        "m5": { "buys": 0, "sells": 1 },
+        "h1": { "buys": 4, "sells": 9 },
+        "h24": { "buys": 40, "sells": 88 }
+      },
+      "priceChange": {
+        "m5": -22.0,
+        "h1": -55.0,
+        "h24": -80.0
+      },
+      "fdv": 90000.0,
+      "marketCap": 60000.0,
+      "pairCreatedAt": 1767643200000,
+
+      "sym": "DEAD1",
+      "mint": "11111111111111111111111111111111DEADDEADDEAD",
+      "liq": 5200.0,
+      "vol5": 12.0,
+      "buys5": 0,
+      "sells5": 1,
+      "chg5": -22.0,
+      "age_min": 240.0,
+      "source": "dexscreener",
+      "ts": 1767657600
+    }
+  ]
+}

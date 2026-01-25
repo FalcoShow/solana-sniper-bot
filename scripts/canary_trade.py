@@ -1,51 +1,51 @@
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 from __future__ import annotations
 
 """
-scripts/canary_trade.py — God-Tier Canary Trade (Phase 0–7 LOCK-IN)
-===================================================================
+scripts/canary_trade.py — God-Tier Canary Trade (P0 LOCK-IN)
+===========================================================
 
-Purpose
--------
-SAFE, deterministic pipeline canary that validates end-to-end plumbing:
+SAFE, deterministic pipeline canary that validates end-to-end plumbing.
 
-  1) Quote path (always): SOL -> TOKEN and TOKEN -> SOL (quote-only)
-  2) Optional build path: quote -> swap tx (base64)  (NO signing / NO sending)
-  3) Optional simulate path: swap tx -> simulateTransaction (sigVerify=false)
-  4) Optional entry path (DRYRUN by default): invoke maybe_buy() safely
-  5) LIVE mode exists but is HARD-LOCKED behind env + CLI confirms
+Stages
+------
+1) quote     : SOL -> TOKEN quote (+ optional TOKEN -> SOL quote probe)
+2) build     : quote + build swap tx (base64)  (NO signing / NO sending)
+3) simulate  : build + simulateTransaction (sigVerify=false, replaceRecentBlockhash=true)
+4) dryrun    : invoke maybe_buy() in DRYRUN mode (no broadcast expected)
+5) live      : real trade (HARD-LOCKED behind env + CLI confirmations)
 
 Hard safety rules
 -----------------
-- DEFAULT MODE IS DRYRUN (no broadcast expected)
-- QUOTE/BUILD/SIMULATE NEVER sign or send
-- DRYRUN forces DRYRUN=1 in-process BEFORE importing entry modules
-- Any entry invocation (even DRYRUN) requires CANARY_TRADE_ENABLED=1
+- Default stage is DRYRUN (no broadcast expected).
+- quote/build/simulate NEVER sign or send.
+- dryrun forces DRYRUN=1 *before* importing entry modules.
+- Any entry invocation requires CANARY_TRADE_ENABLED=1
 - LIVE requires explicit multi-lock:
-      CANARY_TRADE_ENABLED=1
-      CANARY_MODE=live
-      CANARY_LIVE=1
-      CANARY_CONFIRM=YES
-      --live-confirm YES
+    CANARY_TRADE_ENABLED=1
+    CANARY_MODE=live
+    CANARY_LIVE=1
+    CANARY_CONFIRM=YES
+    --live-confirm YES
 
 Optional sell-back (LIVE) requires extra locks:
-      CANARY_SELL_BACK=1
-      CANARY_SELL_CONFIRM=YES
-      --sell-back
+    CANARY_SELL_BACK=1
+    CANARY_SELL_CONFIRM=YES
+    --sell-back
 
 Exit codes
 ----------
 0   pass
-2   fail (broken path / blocked config / required component missing)
+2   fail / blocked / broken path
 130 ctrl-c
 
-Run
----
+Examples
+--------
 python -m scripts.canary_trade
 python -m scripts.canary_trade --stage quote --json
 python -m scripts.canary_trade --stage simulate --mint USDC --amount-sol 0.01 --slippage-bps 60
 
-LIVE (real trades) — requires env locks + explicit CLI confirm
+LIVE (real trades)
 python -m scripts.canary_trade --stage live --live-confirm YES
 python -m scripts.canary_trade --stage live --live-confirm YES --sell-back
 """
@@ -62,17 +62,30 @@ import re
 import sys
 import time
 import traceback
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any
 
-# Optional local dev .env (never required)
+# -----------------------------------------------------------------------------
+# Optional local dev .env (never required in Render)
+# -----------------------------------------------------------------------------
 with contextlib.suppress(Exception):
     from dotenv import find_dotenv, load_dotenv  # type: ignore
 
-    load_dotenv(find_dotenv())
+    load_dotenv(find_dotenv(), override=False)
+
 
 # -----------------------------------------------------------------------------
-# Human logs -> STDERR, JSON -> STDOUT
+# Repo root importability (so python -m works consistently)
+# -----------------------------------------------------------------------------
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+# -----------------------------------------------------------------------------
+# Small structured logging helpers
 # -----------------------------------------------------------------------------
 def _ts() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -127,7 +140,7 @@ def _envf(k: str, d: float) -> float:
 
 
 # -----------------------------------------------------------------------------
-# Redaction / safety
+# Redaction / safety (never print secrets)
 # -----------------------------------------------------------------------------
 _URL_CRED_RE = re.compile(r"(://)([^/@\s]+)@")
 _APIKEY_RE = re.compile(r"(?i)(x-api-key:\s*)([^\s]+)")
@@ -143,6 +156,7 @@ def _sanitize_text(text: Any) -> str:
     s = _APIKEY_RE.sub(r"\1***", s)
     s = _BEARER_RE.sub(r"\1***", s)
 
+    # redact exact env values if present in string
     sensitive_keys = [
         "JUP_PRO_KEY",
         "JUP_API_KEY",
@@ -193,18 +207,19 @@ def _safe_jsonable(x: Any) -> Any:
 def _mask_url(u: str) -> str:
     if not u:
         return ""
-    try:
-        out = _URL_CRED_RE.sub(r"\1***@", str(u))
-        if "?" in out:
-            out = out.split("?", 1)[0] + "?..."
-        return out
-    except Exception:
-        return str(u)
+    out = _URL_CRED_RE.sub(r"\1***@", str(u))
+    if "?" in out:
+        out = out.split("?", 1)[0] + "?..."
+    return out
 
 
 # -----------------------------------------------------------------------------
 # Generic helpers
 # -----------------------------------------------------------------------------
+def _sol_to_lamports(sol: float) -> int:
+    return int(round(float(sol) * 1_000_000_000))
+
+
 def _to_int(x: Any, default: int = 0) -> int:
     try:
         if x is None or isinstance(x, bool):
@@ -221,11 +236,7 @@ def _to_int(x: Any, default: int = 0) -> int:
         return int(default)
 
 
-def _sol_to_lamports(sol: float) -> int:
-    return int(round(float(sol) * 1_000_000_000))
-
-
-def _pick(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+def _pick(d: dict[str, Any], *keys: str, default: Any = None) -> Any:
     for k in keys:
         if k in d and d.get(k) is not None:
             return d.get(k)
@@ -233,12 +244,12 @@ def _pick(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
 
 
 # -----------------------------------------------------------------------------
-# Signature drift tolerant calling
+# Signature-drift tolerant calling
 # -----------------------------------------------------------------------------
-def _filter_kwargs(fn: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+def _filter_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     try:
         sig = inspect.signature(fn)
-        params = sig.parameters.values()
+        params = list(sig.parameters.values())
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
             return kwargs
         allowed = {p.name for p in params}
@@ -257,10 +268,10 @@ async def _call(fn: Any, *args: Any, **kwargs: Any) -> Any:
 
 async def _try_call_named(
     target: Any,
-    names: Tuple[str, ...],
-    variants: List[Tuple[Tuple[Any, ...], Dict[str, Any]]],
+    names: tuple[str, ...],
+    variants: list[tuple[tuple[Any, ...], dict[str, Any]]],
     timeout_s: float,
-) -> Tuple[bool, Any, str]:
+) -> tuple[bool, Any, str]:
     last_err = "no_callable_found"
     for nm in names:
         fn = getattr(target, nm, None)
@@ -269,12 +280,14 @@ async def _try_call_named(
         for args, kwargs in variants:
             try:
                 kw = _filter_kwargs(fn, dict(kwargs))
-                val = await asyncio.wait_for(_call(fn, *args, **kw), timeout=max(1.0, float(timeout_s)))
+                val = await asyncio.wait_for(
+                    _call(fn, *args, **kw), timeout=max(1.0, float(timeout_s))
+                )
                 return True, val, nm
             except TypeError as e:
                 last_err = _sanitize_text(f"{nm}: {e}")
                 continue
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 last_err = f"{nm}: timeout"
                 continue
             except Exception as e:
@@ -291,11 +304,12 @@ def _try_import(name: str) -> Any:
 # -----------------------------------------------------------------------------
 # RPC selection + simulateTransaction (for simulate stage)
 # -----------------------------------------------------------------------------
-async def _rpc_post(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
+async def _rpc_post(url: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
     url = str(url).strip()
     if not url:
         raise RuntimeError("empty RPC url")
 
+    # Prefer httpx if installed
     with contextlib.suppress(Exception):
         import httpx  # type: ignore
 
@@ -305,12 +319,15 @@ async def _rpc_post(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict
                 raise RuntimeError(f"rpc status={r.status_code} body={r.text[:180]!r}")
             return r.json()
 
+    # Fallback stdlib
     import urllib.request
 
-    def _do() -> Dict[str, Any]:
+    def _do() -> dict[str, Any]:
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers={"content-type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310
+        req = urllib.request.Request(
+            url, data=data, headers={"content-type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             body = resp.read().decode("utf-8", "ignore")
             return json.loads(body)
 
@@ -318,7 +335,12 @@ async def _rpc_post(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict
 
 
 async def _rpc_get_latest_blockhash(url: str, timeout_s: float) -> str:
-    payload = {"jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "processed"}]}
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getLatestBlockhash",
+        "params": [{"commitment": "processed"}],
+    }
     data = await _rpc_post(url, payload, timeout_s=timeout_s)
     bh = None
     with contextlib.suppress(Exception):
@@ -328,8 +350,8 @@ async def _rpc_get_latest_blockhash(url: str, timeout_s: float) -> str:
     return str(bh)
 
 
-def _candidate_rpcs() -> List[str]:
-    out: List[str] = []
+def _candidate_rpcs() -> list[str]:
+    out: list[str] = []
     for k in ("RPC_URL", "SOL_RPC_URL"):
         v = _envs(k, "")
         if v:
@@ -337,8 +359,8 @@ def _candidate_rpcs() -> List[str]:
     for k in ("RPC_URLS", "SOL_RPC_URLS", "SOLANA_RPC_URLS"):
         out.extend([p.strip() for p in _envs(k, "").replace(";", ",").split(",") if p.strip()])
 
-    seen: Set[str] = set()
-    uniq: List[str] = []
+    seen: set[str] = set()
+    uniq: list[str] = []
     for x in out:
         if x and x not in seen:
             uniq.append(x)
@@ -346,7 +368,7 @@ def _candidate_rpcs() -> List[str]:
     return uniq
 
 
-async def _select_rpc(timeout_s: float) -> Tuple[str, Dict[str, Any]]:
+async def _select_rpc(timeout_s: float) -> tuple[str, dict[str, Any]]:
     """
     Prefer utils_pkg.rpc_failover.apply_failover_to_env() if present, else internal probe.
     """
@@ -361,7 +383,7 @@ async def _select_rpc(timeout_s: float) -> Tuple[str, Dict[str, Any]]:
         if ok:
             chosen = os.getenv("RPC_URL") or os.getenv("SOL_RPC_URL") or ""
             notes = None
-            if isinstance(val, (tuple, list)) and len(val) >= 1:
+            if isinstance(val, tuple | list) and len(val) >= 1:
                 chosen = str(val[0] or chosen or "")
                 notes = val[1] if len(val) >= 2 else None
             if chosen:
@@ -372,30 +394,32 @@ async def _select_rpc(timeout_s: float) -> Tuple[str, Dict[str, Any]]:
     cands = _candidate_rpcs()
     if not cands:
         raise RuntimeError("no RPC candidates (set RPC_URL or SOL_RPC_URL or *_URLS)")
-    best: Optional[Tuple[str, int, str]] = None
-    last_err = None
+
+    best: tuple[str, int, str] | None = None
+    last_err: str | None = None
     for u in cands[:12]:
         t0 = time.time()
         try:
-            bh = await asyncio.wait_for(_rpc_get_latest_blockhash(u, timeout_s=timeout_s), timeout=max(1.0, timeout_s + 1.0))
+            bh = await asyncio.wait_for(
+                _rpc_get_latest_blockhash(u, timeout_s=timeout_s), timeout=max(1.0, timeout_s + 1.0)
+            )
             ms = int((time.time() - t0) * 1000)
             if best is None or ms < best[1]:
                 best = (u, ms, bh)
         except Exception as e:
             last_err = _short_exc(e)
             continue
+
     if not best:
         raise RuntimeError(f"no reachable RPC from {len(cands)} candidates; last_err={last_err}")
+
     u, ms, bh = best
     os.environ["RPC_URL"] = u
     os.environ["SOL_RPC_URL"] = u
     return u, {"via": "internal_probe_best_latency", "latency_ms": ms, "blockhash": bh}
 
 
-async def _simulate_b64_tx(rpc_url: str, tx_b64: str, timeout_s: float) -> Dict[str, Any]:
-    """
-    Simulate without signature verification.
-    """
+async def _simulate_b64_tx(rpc_url: str, tx_b64: str, timeout_s: float) -> dict[str, Any]:
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -411,10 +435,10 @@ async def _simulate_b64_tx(rpc_url: str, tx_b64: str, timeout_s: float) -> Dict[
         ],
     }
     data = await _rpc_post(rpc_url, payload, timeout_s=timeout_s)
-    with contextlib.suppress(Exception):
-        if "error" in data and data["error"]:
-            return {"ok": False, "error": _safe_jsonable(data["error"])}
-    res = data.get("result") or {}
+    if isinstance(data, dict) and data.get("error"):
+        return {"ok": False, "error": _safe_jsonable(data.get("error"))}
+
+    res = (data or {}).get("result") or {}
     value = res.get("value") or {}
     err = value.get("err")
     logs = value.get("logs")
@@ -427,18 +451,16 @@ async def _simulate_b64_tx(rpc_url: str, tx_b64: str, timeout_s: float) -> Dict[
 
 
 # -----------------------------------------------------------------------------
-# Mints normalization (LOCK-IN)
+# Mint normalization (LOCK-IN to utils_pkg.mints if present)
 # -----------------------------------------------------------------------------
 def _normalize_mint_or_symbol(mint_input: str) -> str:
     mint_input = str(mint_input or "").strip()
     if not mint_input:
         return ""
-
     mints = _try_import("utils_pkg.mints")
     if mints is None:
         return mint_input
 
-    # try_normalize_mint preferred
     fn = getattr(mints, "try_normalize_mint", None)
     if callable(fn):
         with contextlib.suppress(Exception):
@@ -446,7 +468,6 @@ def _normalize_mint_or_symbol(mint_input: str) -> str:
             if out:
                 return str(out)
 
-    # normalize_mint fallback
     fn2 = getattr(mints, "normalize_mint", None)
     if callable(fn2):
         with contextlib.suppress(Exception):
@@ -454,7 +475,6 @@ def _normalize_mint_or_symbol(mint_input: str) -> str:
             if out:
                 return str(out)
 
-    # common consts
     for const in ("USDC_MINT", "SOL_MINT"):
         if mint_input.upper() == const.split("_")[0]:
             v = getattr(mints, const, None)
@@ -464,23 +484,20 @@ def _normalize_mint_or_symbol(mint_input: str) -> str:
     return mint_input
 
 
-def _get_mint_constants() -> Tuple[str, str]:
+def _get_mint_constants() -> tuple[str, str]:
     mints = _try_import("utils_pkg.mints")
     sol = _envs("SOL_MINT", "So11111111111111111111111111111111111111112").strip()
     usdc = _envs("USDC_MINT", "").strip()
     if mints is not None:
         sol = str(getattr(mints, "SOL_MINT", sol) or sol)
         usdc = str(getattr(mints, "USDC_MINT", usdc) or usdc)
-    if not usdc:
-        # keep it empty if project doesn't define; script can still run with explicit mint
-        usdc = ""
     return sol, usdc
 
 
 # -----------------------------------------------------------------------------
 # Router helpers: quote / build swap tx
 # -----------------------------------------------------------------------------
-async def _resolve_router_target(router_mod: Any, timeout_s: float) -> Tuple[Any, str]:
+async def _resolve_router_target(router_mod: Any, timeout_s: float) -> tuple[Any, str]:
     if callable(getattr(router_mod, "get_router", None)):
         ok, obj, used = await _try_call_named(
             router_mod,
@@ -527,14 +544,27 @@ async def _get_buy_quote(
     slippage_bps: int,
     sol_mint: str,
     timeout_s: float,
-) -> Tuple[Optional[Dict[str, Any]], str]:
-    # Dedicated buy-quote
+) -> tuple[dict[str, Any] | None, str]:
     ok, q, used = await _try_call_named(
         target,
         ("get_buy_quote", "buy_quote", "quote_buy"),
         variants=[
-            ((), {"mint": out_mint, "amount_sol": float(amount_sol), "slippage_bps": int(slippage_bps)}),
-            ((), {"mint": out_mint, "amount_sol": float(amount_sol), "slippageBps": int(slippage_bps)}),
+            (
+                (),
+                {
+                    "mint": out_mint,
+                    "amount_sol": float(amount_sol),
+                    "slippage_bps": int(slippage_bps),
+                },
+            ),
+            (
+                (),
+                {
+                    "mint": out_mint,
+                    "amount_sol": float(amount_sol),
+                    "slippageBps": int(slippage_bps),
+                },
+            ),
             ((out_mint, float(amount_sol), int(slippage_bps)), {}),
         ],
         timeout_s=timeout_s,
@@ -547,8 +577,24 @@ async def _get_buy_quote(
         target,
         ("get_quote", "quote", "get_swap_quote", "swap_quote", "jup_quote", "jupiter_quote"),
         variants=[
-            ((), {"inputMint": sol_mint, "outputMint": out_mint, "amount": int(lamports), "slippageBps": int(slippage_bps)}),
-            ((), {"input_mint": sol_mint, "output_mint": out_mint, "amount": int(lamports), "slippage_bps": int(slippage_bps)}),
+            (
+                (),
+                {
+                    "inputMint": sol_mint,
+                    "outputMint": out_mint,
+                    "amount": int(lamports),
+                    "slippageBps": int(slippage_bps),
+                },
+            ),
+            (
+                (),
+                {
+                    "input_mint": sol_mint,
+                    "output_mint": out_mint,
+                    "amount": int(lamports),
+                    "slippage_bps": int(slippage_bps),
+                },
+            ),
             ((sol_mint, out_mint, int(lamports)), {"slippageBps": int(slippage_bps)}),
         ],
         timeout_s=timeout_s,
@@ -567,14 +613,20 @@ async def _get_sell_quote(
     slippage_bps: int,
     sol_mint: str,
     timeout_s: float,
-) -> Tuple[Optional[Dict[str, Any]], str]:
+) -> tuple[dict[str, Any] | None, str]:
     amount_raw = int(max(1, int(amount_raw)))
     ok, q, used = await _try_call_named(
         target,
         ("get_sell_quote", "sell_quote", "quote_sell"),
         variants=[
-            ((), {"mint": in_mint, "amount_raw": int(amount_raw), "slippage_bps": int(slippage_bps)}),
-            ((), {"mint": in_mint, "amount_raw": int(amount_raw), "slippageBps": int(slippage_bps)}),
+            (
+                (),
+                {"mint": in_mint, "amount_raw": int(amount_raw), "slippage_bps": int(slippage_bps)},
+            ),
+            (
+                (),
+                {"mint": in_mint, "amount_raw": int(amount_raw), "slippageBps": int(slippage_bps)},
+            ),
             ((in_mint, int(amount_raw), int(slippage_bps)), {}),
         ],
         timeout_s=timeout_s,
@@ -586,8 +638,24 @@ async def _get_sell_quote(
         target,
         ("get_quote", "quote", "get_swap_quote", "swap_quote", "jup_quote", "jupiter_quote"),
         variants=[
-            ((), {"inputMint": in_mint, "outputMint": sol_mint, "amount": int(amount_raw), "slippageBps": int(slippage_bps)}),
-            ((), {"input_mint": in_mint, "output_mint": sol_mint, "amount": int(amount_raw), "slippage_bps": int(slippage_bps)}),
+            (
+                (),
+                {
+                    "inputMint": in_mint,
+                    "outputMint": sol_mint,
+                    "amount": int(amount_raw),
+                    "slippageBps": int(slippage_bps),
+                },
+            ),
+            (
+                (),
+                {
+                    "input_mint": in_mint,
+                    "output_mint": sol_mint,
+                    "amount": int(amount_raw),
+                    "slippage_bps": int(slippage_bps),
+                },
+            ),
             ((in_mint, sol_mint, int(amount_raw)), {"slippageBps": int(slippage_bps)}),
         ],
         timeout_s=timeout_s,
@@ -598,7 +666,7 @@ async def _get_sell_quote(
     return None, _sanitize_text(f"{used} | {used2}")
 
 
-def _get_user_pubkey() -> Tuple[str, str]:
+def _get_user_pubkey() -> tuple[str, str]:
     """
     Prefer CANARY_USER_PUBKEY. If absent, optionally derive from keypair IF CANARY_ALLOW_KEYLOAD=1.
     Never prints secrets.
@@ -614,7 +682,6 @@ def _get_user_pubkey() -> Tuple[str, str]:
     if sw is None:
         return "", "solana_wallet_missing"
 
-    # Try get_pubkey_str()
     fn = getattr(sw, "get_pubkey_str", None)
     if callable(fn):
         with contextlib.suppress(Exception):
@@ -622,32 +689,30 @@ def _get_user_pubkey() -> Tuple[str, str]:
             if v:
                 return str(v), "solana_wallet.get_pubkey_str"
 
-    # Try load_keypair + pubkey
     fn_load = getattr(sw, "load_keypair", None)
     if callable(fn_load):
         with contextlib.suppress(Exception):
             kp = fn_load()
-            # common patterns: kp.pubkey() / kp.public_key
             if hasattr(kp, "pubkey") and callable(getattr(kp, "pubkey", None)):
                 return str(kp.pubkey()), "solana_wallet.load_keypair.pubkey()"
             if hasattr(kp, "public_key"):
-                return str(getattr(kp, "public_key")), "solana_wallet.load_keypair.public_key"
+                return str(kp.public_key), "solana_wallet.load_keypair.public_key"
+
     return "", "could_not_derive_pubkey"
 
 
 async def _build_swap_tx_b64(
     *,
     router_target: Any,
-    quote: Dict[str, Any],
+    quote: dict[str, Any],
     user_pubkey: str,
     wrap_unwrap_sol: bool,
     timeout_s: float,
-) -> Tuple[Optional[str], str, Dict[str, Any]]:
+) -> tuple[str | None, str, dict[str, Any]]:
     """
-    Build tx via router if supported; else fall back to lightning_impl.
-    Returns (tx_b64, via, extra)
+    Build tx via router if supported; else fall back to utils_pkg.lightning_impl.
+    Returns (tx_b64, via, extra).
     """
-    # Router path first
     ok, res, used = await _try_call_named(
         router_target,
         (
@@ -660,22 +725,45 @@ async def _build_swap_tx_b64(
             "swap_transaction",
         ),
         variants=[
-            ((), {"quote": quote, "user_pubkey": user_pubkey, "wrap_unwrap_sol": wrap_unwrap_sol, "timeout_s": timeout_s}),
-            ((), {"quote_response": quote, "userPublicKey": user_pubkey, "wrapAndUnwrapSol": wrap_unwrap_sol, "timeout_s": timeout_s}),
-            ((), {"quote": quote, "userPublicKey": user_pubkey, "wrapAndUnwrapSol": wrap_unwrap_sol}),
+            (
+                (),
+                {
+                    "quote": quote,
+                    "user_pubkey": user_pubkey,
+                    "wrap_unwrap_sol": wrap_unwrap_sol,
+                    "timeout_s": timeout_s,
+                },
+            ),
+            (
+                (),
+                {
+                    "quote_response": quote,
+                    "userPublicKey": user_pubkey,
+                    "wrapAndUnwrapSol": wrap_unwrap_sol,
+                    "timeout_s": timeout_s,
+                },
+            ),
+            (
+                (),
+                {"quote": quote, "userPublicKey": user_pubkey, "wrapAndUnwrapSol": wrap_unwrap_sol},
+            ),
             ((quote, user_pubkey), {"wrapAndUnwrapSol": wrap_unwrap_sol}),
         ],
         timeout_s=timeout_s,
     )
     if ok:
         if isinstance(res, dict):
-            tx = res.get("swapTransaction") or res.get("swap_transaction") or res.get("tx_b64") or res.get("transaction")
+            tx = (
+                res.get("swapTransaction")
+                or res.get("swap_transaction")
+                or res.get("tx_b64")
+                or res.get("transaction")
+            )
             if isinstance(tx, str) and tx.strip():
                 return tx.strip(), f"router.{used}", {"keys": list(res.keys())[:18]}
         if isinstance(res, str) and res.strip():
             return res.strip(), f"router.{used}", {}
 
-    # Lightning fallback
     L = _try_import("utils_pkg.lightning_impl")
     if L is None:
         return None, f"router_failed({used})_and_lightning_missing", {}
@@ -684,26 +772,51 @@ async def _build_swap_tx_b64(
         L,
         ("swap", "build_swap_tx", "get_swap_tx", "swap_tx", "swap_transaction"),
         variants=[
-            ((), {"quoteResponse": quote, "userPublicKey": user_pubkey, "wrapAndUnwrapSol": wrap_unwrap_sol, "timeout_s": timeout_s}),
-            ((), {"quote_response": quote, "user_pubkey": user_pubkey, "wrap_unwrap_sol": wrap_unwrap_sol, "timeout_s": timeout_s}),
+            (
+                (),
+                {
+                    "quoteResponse": quote,
+                    "userPublicKey": user_pubkey,
+                    "wrapAndUnwrapSol": wrap_unwrap_sol,
+                    "timeout_s": timeout_s,
+                },
+            ),
+            (
+                (),
+                {
+                    "quote_response": quote,
+                    "user_pubkey": user_pubkey,
+                    "wrap_unwrap_sol": wrap_unwrap_sol,
+                    "timeout_s": timeout_s,
+                },
+            ),
             ((), {"quote": quote, "user_pubkey": user_pubkey, "wrap_unwrap_sol": wrap_unwrap_sol}),
         ],
         timeout_s=timeout_s,
     )
     if ok2:
         if isinstance(res2, dict):
-            tx = res2.get("swapTransaction") or res2.get("swap_transaction") or res2.get("tx_b64") or res2.get("transaction")
+            tx = (
+                res2.get("swapTransaction")
+                or res2.get("swap_transaction")
+                or res2.get("tx_b64")
+                or res2.get("transaction")
+            )
             if isinstance(tx, str) and tx.strip():
                 return tx.strip(), f"lightning_impl.{used2}", {"keys": list(res2.keys())[:18]}
         if isinstance(res2, str) and res2.strip():
             return res2.strip(), f"lightning_impl.{used2}", {}
+
     return None, f"build_failed(router={used}, lightning={used2})", {}
 
 
 # -----------------------------------------------------------------------------
-# Entry / exit wiring
+# Entry/exit wiring (avoid competing engines; canonical exit engine only by default)
 # -----------------------------------------------------------------------------
-def _resolve_entry_executor() -> Optional[Callable[..., Any]]:
+def _resolve_entry_executor() -> Callable[..., Any] | None:
+    """
+    Find a maybe_buy() entrypoint. This script is tolerant to module refactors.
+    """
     for mod_name in (
         "sniper.entry_executor",
         "sniper.sniper",
@@ -721,7 +834,7 @@ def _resolve_entry_executor() -> Optional[Callable[..., Any]]:
     return None
 
 
-def _resolve_sell_executor() -> Optional[Callable[..., Any]]:
+def _resolve_sell_executor() -> Callable[..., Any] | None:
     for mod_name in (
         "sniper.entry_executor",
         "utils_pkg.pump_trader",
@@ -738,23 +851,32 @@ def _resolve_sell_executor() -> Optional[Callable[..., Any]]:
     return None
 
 
-def _resolve_exit_forwarders() -> List[Tuple[str, Callable[[Dict[str, Any]], Any]]]:
-    out: List[Tuple[str, Callable[[Dict[str, Any]], Any]]] = []
+def _resolve_exit_forwarders() -> list[tuple[str, Callable[[dict[str, Any]], Any]]]:
+    """
+    Default: forward ONLY to canonical utils_pkg.exit_engine if it exposes a hook.
+    Optional: forward to worker exit engine ONLY if CANARY_FORWARD_TO_WORKER=1.
+    """
+    out: list[tuple[str, Callable[[dict[str, Any]], Any]]] = []
     with contextlib.suppress(Exception):
         m = importlib.import_module("utils_pkg.exit_engine")
         fn = getattr(m, "on_buy_filled", None) or getattr(m, "on_buy_filled_event", None)
         if callable(fn):
             out.append(("utils_pkg.exit_engine", fn))
-    with contextlib.suppress(Exception):
-        m2 = importlib.import_module("utils_pkg.auto_exit_worker.exit_engine")
-        fn2 = getattr(m2, "on_buy_filled", None) or getattr(m2, "on_buy_filled_event", None)
-        if callable(fn2):
-            out.append(("utils_pkg.auto_exit_worker.exit_engine", fn2))
+
+    if _envb("CANARY_FORWARD_TO_WORKER", False):
+        with contextlib.suppress(Exception):
+            m2 = importlib.import_module("utils_pkg.auto_exit_worker.exit_engine")
+            fn2 = getattr(m2, "on_buy_filled", None) or getattr(m2, "on_buy_filled_event", None)
+            if callable(fn2):
+                out.append(("utils_pkg.auto_exit_worker.exit_engine", fn2))
+
     return out
 
 
-async def _forward_buy_filled(forwarders: List[Tuple[str, Callable[[Dict[str, Any]], Any]]], payload: Dict[str, Any]) -> Dict[str, Any]:
-    called: Dict[str, Any] = {}
+async def _forward_buy_filled(
+    forwarders: list[tuple[str, Callable[[dict[str, Any]], Any]]], payload: dict[str, Any]
+) -> dict[str, Any]:
+    called: dict[str, Any] = {}
     for name, fn in forwarders:
         try:
             await _call(fn, payload)
@@ -764,7 +886,7 @@ async def _forward_buy_filled(forwarders: List[Tuple[str, Callable[[Dict[str, An
     return called
 
 
-def _live_allowed(cli_confirm: str) -> Tuple[bool, str]:
+def _live_allowed(cli_confirm: str) -> tuple[bool, str]:
     if not _envb("CANARY_TRADE_ENABLED", False):
         return False, "CANARY_TRADE_ENABLED!=1"
     if _envs("CANARY_MODE", "").strip().lower() != "live":
@@ -778,7 +900,7 @@ def _live_allowed(cli_confirm: str) -> Tuple[bool, str]:
     return True, "ok"
 
 
-def _sell_back_allowed() -> Tuple[bool, str]:
+def _sell_back_allowed() -> tuple[bool, str]:
     if not _envb("CANARY_SELL_BACK", False):
         return False, "CANARY_SELL_BACK!=1"
     if _envs("CANARY_SELL_CONFIRM", "").strip().upper() != "YES":
@@ -787,7 +909,7 @@ def _sell_back_allowed() -> Tuple[bool, str]:
 
 
 # -----------------------------------------------------------------------------
-# Core resources (best-effort; stabilizes entry path)
+# Core resources (best-effort)
 # -----------------------------------------------------------------------------
 async def _core_init(timeout_s: float) -> str:
     if _envb("CANARY_SKIP_CORE_INIT", False):
@@ -820,20 +942,22 @@ async def _core_close(timeout_s: float) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Callback latch
+# Canary callback latch
 # -----------------------------------------------------------------------------
 @dataclass
 class CanaryEvents:
     submitted: int = 0
     filled: int = 0
     failed: int = 0
-    last_payload: Dict[str, Any] = field(default_factory=dict)
+    last_payload: dict[str, Any] = field(default_factory=dict)
     filled_qty_raw: int = 0
-    forwarded: Dict[str, Any] = field(default_factory=dict)
+    forwarded: dict[str, Any] = field(default_factory=dict)
 
 
-def _mk_cb(async_fn: Callable[[Dict[str, Any]], Awaitable[None]]) -> Callable[[Dict[str, Any]], None]:
-    def _cb(payload: Dict[str, Any]) -> None:
+def _mk_cb(
+    async_fn: Callable[[dict[str, Any]], Awaitable[None]],
+) -> Callable[[dict[str, Any]], None]:
+    def _cb(payload: dict[str, Any]) -> None:
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(async_fn(payload or {}))
@@ -847,13 +971,13 @@ async def _invoke_maybe_buy(
     maybe_buy: Callable[..., Any],
     *,
     mint: str,
-    ui: Dict[str, Any],
+    ui: dict[str, Any],
     amount_sol: float,
     slippage_bps: int,
     dryrun: bool,
-    callbacks: Dict[str, Callable[[Dict[str, Any]], None]],
+    callbacks: dict[str, Callable[[dict[str, Any]], None]],
     timeout_s: float,
-) -> Tuple[bool, Any, str]:
+) -> tuple[bool, Any, str]:
     sig_txt = ""
     with contextlib.suppress(Exception):
         sig_txt = str(inspect.signature(maybe_buy))
@@ -869,13 +993,9 @@ async def _invoke_maybe_buy(
         "dryrun": bool(dryrun),
         "DRYRUN": bool(dryrun),
         **callbacks,
-        # hints (only passed if accepted)
+        # safe hints (only passed if accepted by signature)
         "is_canary": True,
         "canary": True,
-        "force": True,
-        "force_enter": True,
-        "bypass_gate": True,
-        "ignore_gate": True,
     }
 
     # A) kwargs-only
@@ -902,7 +1022,10 @@ async def _invoke_maybe_buy(
     # C) (mint, amount_sol, slippage) + kwargs
     try:
         kw = _filter_kwargs(maybe_buy, dict(base_kwargs))
-        res = await asyncio.wait_for(_call(maybe_buy, mint, float(amount_sol), int(slippage_bps), **kw), timeout=max(1.0, timeout_s))
+        res = await asyncio.wait_for(
+            _call(maybe_buy, mint, float(amount_sol), int(slippage_bps), **kw),
+            timeout=max(1.0, timeout_s),
+        )
         return True, res, f"(mint,amount,slip,**kw) {sig_txt}".strip()
     except TypeError as e:
         return False, None, _sanitize_text(f"positional: {e}")
@@ -911,9 +1034,9 @@ async def _invoke_maybe_buy(
 
 
 # -----------------------------------------------------------------------------
-# Optional canary logging (best-effort)
+# Best-effort canary logging hook (optional)
 # -----------------------------------------------------------------------------
-async def _best_effort_log_canary(payload: Dict[str, Any]) -> None:
+async def _best_effort_log_canary(payload: dict[str, Any]) -> None:
     if _envb("CANARY_SKIP_LOGGER", False):
         return
     dl = _try_import("utils_pkg.data_logger")
@@ -936,17 +1059,31 @@ async def _amain() -> int:
         "--stage",
         default=_envs("CANARY_STAGE", "dryrun"),
         choices=["quote", "build", "simulate", "dryrun", "live"],
-        help="quote=quotes only; build=quote+build tx; simulate=build+simulate; dryrun=invoke entry in dryrun; live=real trade (HARD LOCKED)",
+        help="quote/build/simulate are non-trading; dryrun invokes entry in DRYRUN; live performs real trade (HARD LOCKED)",
     )
-    ap.add_argument("--mint", default=_envs("CANARY_MINT", "USDC"), help="symbol/mint/url/blob (normalized via utils_pkg.mints)")
+    ap.add_argument(
+        "--mint",
+        default=_envs("CANARY_MINT", "USDC"),
+        help="symbol/mint (normalized via utils_pkg.mints)",
+    )
     ap.add_argument("--amount-sol", type=float, default=float(_envf("CANARY_AMOUNT_SOL", 0.01)))
     ap.add_argument("--slippage-bps", type=int, default=int(_envi("CANARY_SLIPPAGE_BPS", 60)))
     ap.add_argument("--timeout", type=float, default=float(_envf("CANARY_TIMEOUT_S", 18.0)))
-    ap.add_argument("--post-wait", type=float, default=float(_envf("CANARY_POST_WAIT_S", 2.0)), help="seconds to wait for callbacks")
+    ap.add_argument("--post-wait", type=float, default=float(_envf("CANARY_POST_WAIT_S", 2.0)))
     ap.add_argument("--json", action="store_true", default=_envb("CANARY_JSON", False))
     ap.add_argument("--json-only", action="store_true", default=_envb("CANARY_JSON_ONLY", False))
-    ap.add_argument("--strict", action="store_true", default=_envb("CANARY_STRICT", False), help="fail if sell quote/build/sim missing when stage requires it")
-    ap.add_argument("--sell-back", action="store_true", default=False, help="LIVE ONLY; requires extra env locks")
+    ap.add_argument(
+        "--strict",
+        action="store_true",
+        default=_envb("CANARY_STRICT", False),
+        help="fail if required sub-stage cannot run",
+    )
+    ap.add_argument(
+        "--sell-back",
+        action="store_true",
+        default=False,
+        help="LIVE ONLY; requires extra env locks",
+    )
     ap.add_argument("--live-confirm", type=str, default="", help="LIVE ONLY: must be YES")
     args = ap.parse_args()
 
@@ -957,7 +1094,7 @@ async def _amain() -> int:
     t0 = time.time()
     stage = str(args.stage).lower().strip()
 
-    # Clamp for safety
+    # Clamp & sanitize
     max_live_sol = float(_envf("CANARY_MAX_LIVE_SOL", 0.02))
     amount_sol = max(0.000001, float(args.amount_sol))
     if stage == "live":
@@ -967,33 +1104,25 @@ async def _amain() -> int:
     timeout_s = max(4.0, float(args.timeout))
     post_wait_s = float(max(0.0, min(12.0, float(args.post_wait))))
 
-    # Ensure repo root importability
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-
     sol_mint, usdc_mint = _get_mint_constants()
 
     mint_input = str(args.mint).strip()
-    out_mint = _normalize_mint_or_symbol(mint_input)
-    if not out_mint:
-        out_mint = mint_input
-    out_mint = out_mint.strip()
+    out_mint = _normalize_mint_or_symbol(mint_input).strip() or mint_input
     if not out_mint:
         _hlog("FAIL empty mint after normalization", quiet=quiet)
         return 2
 
-    # Enforce DRYRUN env BEFORE importing entry modules
-    if stage in ("dryrun", "quote", "build", "simulate"):
+    # IMPORTANT: force DRYRUN env BEFORE importing entry modules
+    if stage in ("quote", "build", "simulate", "dryrun"):
         os.environ["DRYRUN"] = "1"
         os.environ["PF_DRYRUN"] = "1"
         os.environ["BUY_DRYRUN"] = "1"
-    elif stage == "live":
+    else:
         os.environ["DRYRUN"] = "0"
         os.environ["PF_DRYRUN"] = "0"
         os.environ["BUY_DRYRUN"] = "0"
 
-    out: Dict[str, Any] = {
+    out: dict[str, Any] = {
         "ok": False,
         "ts": _ts(),
         "stage": stage,
@@ -1019,12 +1148,13 @@ async def _amain() -> int:
         "elapsed_ms": 0,
     }
 
-    # Import router
+    # Import canonical router
     try:
         from utils_pkg import router as router_mod  # type: ignore
     except Exception as e:
         out["router"] = {"ok": False, "err": _short_exc(e)}
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
+        await _best_effort_log_canary(out)
         if json_mode:
             print(json.dumps(_safe_jsonable(out), ensure_ascii=False, default=str))
         else:
@@ -1032,10 +1162,13 @@ async def _amain() -> int:
         return 2
 
     router_target, router_used = await _resolve_router_target(router_mod, timeout_s=timeout_s)
-    out["router"] = {"ok": True, "target": router_used}
-    out["router"]["bootstrap"] = await _router_bootstrap(router_target, timeout_s=timeout_s)
+    out["router"] = {
+        "ok": True,
+        "target": router_used,
+        "bootstrap": await _router_bootstrap(router_target, timeout_s=timeout_s),
+    }
 
-    # 1) Quote (required for ALL stages)
+    # 1) Quote (required for all stages)
     buy_q, buy_via = await _get_buy_quote(
         router_target,
         out_mint=out_mint,
@@ -1055,7 +1188,10 @@ async def _amain() -> int:
             _hlog(f"FAIL buy_quote via={buy_via}", quiet=quiet)
         return 2
 
-    out_raw = _to_int(_pick(buy_q, "outAmount", "out_amount_raw", "outAmountRaw", "outputAmount", default=0), default=0)
+    out_raw = _to_int(
+        _pick(buy_q, "outAmount", "out_amount_raw", "outAmountRaw", "outputAmount", default=0),
+        default=0,
+    )
     rp = buy_q.get("routePlan")
     out["quotes"]["buy"] = {
         "ok": True,
@@ -1066,6 +1202,7 @@ async def _amain() -> int:
         "keys": list(buy_q.keys())[:18],
     }
 
+    # optional reverse quote probe
     sell_ok = False
     sell_via = "skipped"
     if out_raw > 0:
@@ -1091,25 +1228,32 @@ async def _amain() -> int:
         if json_mode:
             print(json.dumps(_safe_jsonable(out), ensure_ascii=False, default=str))
         else:
-            _hlog(f"OK stage=quote buy_via={buy_via} sell_via={sell_via} elapsed_ms={out['elapsed_ms']}", quiet=quiet)
+            _hlog(
+                f"OK stage=quote buy_via={buy_via} sell_via={sell_via} elapsed_ms={out['elapsed_ms']}",
+                quiet=quiet,
+            )
         return 0
 
-    # For build/simulate: require user pubkey
+    # 2) Build tx (requires pubkey)
     wrap_unwrap_sol = _envb("CANARY_WRAP_UNWRAP_SOL", True)
-
-    tx_b64: Optional[str] = None
+    tx_b64: str | None = None
     build_via = "skipped"
-    build_extra: Dict[str, Any] = {}
+    build_extra: dict[str, Any] = {}
 
     if stage in ("build", "simulate"):
         user_pk, pk_via = _get_user_pubkey()
         out["build"]["user_pubkey_via"] = pk_via
         out["build"]["user_pubkey_set"] = bool(user_pk)
+
         if not user_pk:
             out["build"]["ok"] = False
-            out["build"]["err"] = "missing user pubkey (set CANARY_USER_PUBKEY or CANARY_ALLOW_KEYLOAD=1)"
+            out["build"]["err"] = (
+                "missing user pubkey (set CANARY_USER_PUBKEY or CANARY_ALLOW_KEYLOAD=1)"
+            )
             if args.strict:
-                out["router"]["shutdown"] = await _router_shutdown(router_target, timeout_s=timeout_s)
+                out["router"]["shutdown"] = await _router_shutdown(
+                    router_target, timeout_s=timeout_s
+                )
                 out["elapsed_ms"] = int((time.time() - t0) * 1000)
                 await _best_effort_log_canary(out)
                 if json_mode:
@@ -1130,8 +1274,11 @@ async def _amain() -> int:
             out["build"]["extra"] = _safe_jsonable(build_extra)
             if tx_b64:
                 out["build"]["tx_b64_len"] = len(tx_b64)
+
             if (not tx_b64) and args.strict:
-                out["router"]["shutdown"] = await _router_shutdown(router_target, timeout_s=timeout_s)
+                out["router"]["shutdown"] = await _router_shutdown(
+                    router_target, timeout_s=timeout_s
+                )
                 out["elapsed_ms"] = int((time.time() - t0) * 1000)
                 await _best_effort_log_canary(out)
                 if json_mode:
@@ -1149,15 +1296,20 @@ async def _amain() -> int:
                 print(json.dumps(_safe_jsonable(out), ensure_ascii=False, default=str))
             else:
                 status = "OK" if out["ok"] else "FAIL"
-                _hlog(f"{status} stage=build build_via={build_via} elapsed_ms={out['elapsed_ms']}", quiet=quiet)
+                _hlog(
+                    f"{status} stage=build build_via={build_via} elapsed_ms={out['elapsed_ms']}",
+                    quiet=quiet,
+                )
             return 0 if out["ok"] else 2
 
-    # Simulate stage: requires tx and rpc
+    # 3) Simulate
     if stage == "simulate":
         if not tx_b64:
             out["simulate"] = {"ok": False, "err": "no tx_b64 to simulate"}
             if args.strict:
-                out["router"]["shutdown"] = await _router_shutdown(router_target, timeout_s=timeout_s)
+                out["router"]["shutdown"] = await _router_shutdown(
+                    router_target, timeout_s=timeout_s
+                )
                 out["elapsed_ms"] = int((time.time() - t0) * 1000)
                 await _best_effort_log_canary(out)
                 if json_mode:
@@ -1165,16 +1317,24 @@ async def _amain() -> int:
                 else:
                     _hlog("FAIL simulate requires built tx", quiet=quiet)
                 return 2
-        try:
-            rpc_url, rpc_meta = await _select_rpc(timeout_s=max(2.0, min(10.0, timeout_s)))
-            out["rpc"] = {"ok": True, "url": _mask_url(rpc_url)[:180], "meta": _safe_jsonable(rpc_meta)}
-            sim = await _simulate_b64_tx(rpc_url, tx_b64 or "", timeout_s=max(3.0, min(20.0, timeout_s)))
-            out["simulate"] = sim
-            out["ok"] = bool(sim.get("ok")) or (not args.strict)
-        except Exception as e:
-            out["rpc"] = {"ok": False, "err": _short_exc(e)}
-            out["simulate"] = {"ok": False}
-            out["ok"] = False
+            out["ok"] = True
+        else:
+            try:
+                rpc_url, rpc_meta = await _select_rpc(timeout_s=max(2.0, min(10.0, timeout_s)))
+                out["rpc"] = {
+                    "ok": True,
+                    "url": _mask_url(rpc_url)[:180],
+                    "meta": _safe_jsonable(rpc_meta),
+                }
+                sim = await _simulate_b64_tx(
+                    rpc_url, tx_b64, timeout_s=max(3.0, min(20.0, timeout_s))
+                )
+                out["simulate"] = sim
+                out["ok"] = bool(sim.get("ok")) or (not args.strict)
+            except Exception as e:
+                out["rpc"] = {"ok": False, "err": _short_exc(e)}
+                out["simulate"] = {"ok": False}
+                out["ok"] = False
 
         out["router"]["shutdown"] = await _router_shutdown(router_target, timeout_s=timeout_s)
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
@@ -1183,11 +1343,13 @@ async def _amain() -> int:
             print(json.dumps(_safe_jsonable(out), ensure_ascii=False, default=str))
         else:
             status = "OK" if out["ok"] else "FAIL"
-            _hlog(f"{status} stage=simulate build_via={build_via} rpc_ok={int(bool(out['rpc'].get('ok')))} elapsed_ms={out['elapsed_ms']}", quiet=quiet)
+            _hlog(
+                f"{status} stage=simulate build_via={build_via} rpc_ok={int(bool(out['rpc'].get('ok')))} elapsed_ms={out['elapsed_ms']}",
+                quiet=quiet,
+            )
         return 0 if out["ok"] else 2
 
-    # Entry stages: dryrun/live
-    # Guard: to touch trader (even DRYRUN), require CANARY_TRADE_ENABLED=1
+    # 4/5) dryrun/live (entry invocation)
     if not _envb("CANARY_TRADE_ENABLED", False):
         out["entry"] = {"ok": False, "note": "CANARY_TRADE_ENABLED!=1 (refusing to call trader)"}
         out["router"]["shutdown"] = await _router_shutdown(router_target, timeout_s=timeout_s)
@@ -1199,7 +1361,7 @@ async def _amain() -> int:
             _hlog("FAIL CANARY_TRADE_ENABLED!=1", quiet=quiet)
         return 2
 
-    dryrun = (stage == "dryrun")
+    dryrun = stage == "dryrun"
     if stage == "live":
         ok_live, why = _live_allowed(args.live_confirm)
         if not ok_live:
@@ -1213,7 +1375,6 @@ async def _amain() -> int:
                 _hlog(f"FAIL live_blocked {why}", quiet=quiet)
             return 2
 
-    # Init core resources (best-effort)
     out["core"]["init"] = await _core_init(timeout_s=min(timeout_s, 12.0))
 
     maybe_buy = _resolve_entry_executor()
@@ -1232,8 +1393,7 @@ async def _amain() -> int:
             _hlog("FAIL maybe_buy_not_found", quiet=quiet)
         return 2
 
-    # Canary UI payload (no secrets)
-    ui: Dict[str, Any] = {
+    ui: dict[str, Any] = {
         "mint": out_mint,
         "pool": "canary",
         "source": "scripts.canary_trade",
@@ -1244,18 +1404,23 @@ async def _amain() -> int:
         "stage": stage,
     }
 
-    async def _on_submitted_async(p: Dict[str, Any]) -> None:
+    async def _on_submitted_async(p: dict[str, Any]) -> None:
         events.submitted += 1
         events.last_payload = dict(p or {})
 
-    async def _on_filled_async(p: Dict[str, Any]) -> None:
+    async def _on_filled_async(p: dict[str, Any]) -> None:
         events.filled += 1
         events.last_payload = dict(p or {})
-        events.filled_qty_raw = _to_int(_pick(p or {}, "qty_raw", "amount_raw", "out_amount_raw", "filled_amount_raw", default=0), default=0)
+        events.filled_qty_raw = _to_int(
+            _pick(
+                p or {}, "qty_raw", "amount_raw", "out_amount_raw", "filled_amount_raw", default=0
+            ),
+            default=0,
+        )
         if not _envb("CANARY_SKIP_EXIT_FORWARD", False) and forwarders:
             events.forwarded = await _forward_buy_filled(forwarders, dict(p or {}))
 
-    async def _on_failed_async(p: Dict[str, Any]) -> None:
+    async def _on_failed_async(p: dict[str, Any]) -> None:
         events.failed += 1
         events.last_payload = dict(p or {})
 
@@ -1290,11 +1455,17 @@ async def _amain() -> int:
             "invoked": bool(invoked_ok),
             "invoke_used": invoke_used,
             "dryrun": int(dryrun),
-            "events": {"submitted": events.submitted, "filled": events.filled, "failed": events.failed},
+            "events": {
+                "submitted": events.submitted,
+                "filled": events.filled,
+                "failed": events.failed,
+            },
             "filled_qty_raw": int(events.filled_qty_raw),
             "forwarded": _safe_jsonable(events.forwarded),
             "result_type": type(res_obj).__name__ if res_obj is not None else None,
-            "result": _safe_jsonable(res_obj) if isinstance(res_obj, (dict, str, int, float, bool, type(None))) else (type(res_obj).__name__ if res_obj is not None else None),
+            "result": _safe_jsonable(res_obj)
+            if isinstance(res_obj, dict | str | int | float | bool | type(None))
+            else (type(res_obj).__name__ if res_obj is not None else None),
         }
 
         # PASS RULES:
@@ -1306,10 +1477,14 @@ async def _amain() -> int:
             out["ok"] = bool(invoked_ok) and (bool(res_obj) or events.filled > 0)
 
     except Exception as e:
-        out["entry"] = {"invoked": False, "err": _short_exc(e), "trace": _sanitize_text(traceback.format_exc()[:1400])}
+        out["entry"] = {
+            "invoked": False,
+            "err": _short_exc(e),
+            "trace": _sanitize_text(traceback.format_exc()[:1400]),
+        }
         out["ok"] = False
 
-    # Optional LIVE sell-back (extra locks)
+    # Optional LIVE sell-back
     if stage == "live" and out["ok"] and bool(args.sell_back):
         ok_sb, why_sb = _sell_back_allowed()
         if not ok_sb:
@@ -1319,7 +1494,10 @@ async def _amain() -> int:
             if sell_fn is None:
                 out["entry"]["sell_back"] = {"attempted": False, "note": "no_sell_executor_found"}
             elif events.filled_qty_raw <= 0:
-                out["entry"]["sell_back"] = {"attempted": False, "note": "no_filled_qty_raw_detected"}
+                out["entry"]["sell_back"] = {
+                    "attempted": False,
+                    "note": "no_filled_qty_raw_detected",
+                }
             else:
                 frac = float(_envf("CANARY_SELL_BACK_FRACTION", 0.90))
                 frac = max(0.01, min(1.0, frac))
@@ -1336,12 +1514,22 @@ async def _amain() -> int:
                     },
                 )
                 try:
-                    ok_s = await asyncio.wait_for(_call(sell_fn, **sell_kw), timeout=max(timeout_s, 25.0))
-                    out["entry"]["sell_back"] = {"attempted": True, "ok": bool(ok_s), "amount_raw": amt}
+                    ok_s = await asyncio.wait_for(
+                        _call(sell_fn, **sell_kw), timeout=max(timeout_s, 25.0)
+                    )
+                    out["entry"]["sell_back"] = {
+                        "attempted": True,
+                        "ok": bool(ok_s),
+                        "amount_raw": amt,
+                    }
                     if not ok_s:
                         out["ok"] = False
                 except Exception as e:
-                    out["entry"]["sell_back"] = {"attempted": True, "ok": False, "err": _short_exc(e)}
+                    out["entry"]["sell_back"] = {
+                        "attempted": True,
+                        "ok": False,
+                        "err": _short_exc(e),
+                    }
                     out["ok"] = False
 
     out["exit_wiring"] = {
@@ -1349,10 +1537,8 @@ async def _amain() -> int:
         "buy_filled_forwarded": _safe_jsonable(events.forwarded),
     }
 
-    # Close core + router
     out["core"]["close"] = await _core_close(timeout_s=min(timeout_s, 10.0))
     out["router"]["shutdown"] = await _router_shutdown(router_target, timeout_s=timeout_s)
-
     out["elapsed_ms"] = int((time.time() - t0) * 1000)
 
     await _best_effort_log_canary(out)

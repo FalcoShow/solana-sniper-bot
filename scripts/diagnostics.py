@@ -2,173 +2,141 @@
 from __future__ import annotations
 
 """
-Deep diagnostics / sanity checker (V3+++ / quant-grade).
+Deep diagnostics / sanity checker (V3+++ / quant-grade, P0-ready).
+
+Purpose
+-------
+Fast, high-signal answer to: "Is everything wired correctly and safe to trade?"
+
+What it checks (best-effort, never hard-crashes)
+------------------------------------------------
+- Env presence (names only; no secrets)
+- Core infra init/close (utils_pkg.core_utils.init_resources / close_resources)
+- Postgres / ai_db connectivity (ai_db.describe_backend + ai_db.ping)
+- Redis connectivity + halt flags
+- Market data (SOL/USD quote)
+- Router/Jupiter module import + lightweight describe
+- Regime engine refresh + features
+- Risk manager limits + capacity + allow_new_entry
+- Entry AI module presence + diag snapshot (if available)
+- Wider AI stack module presence
+- Optional mini backtest sanity run (if backtest engine present)
 
 Usage
 -----
+  python -m scripts.diagnostics
+  python -m scripts.diagnostics --json
+  python -m scripts.diagnostics --out exports/diagnostics.json --json
+  python -m scripts.diagnostics --no-backtest
+  python -m scripts.diagnostics --deep
+  python -m scripts.diagnostics --timeout 15
 
-Basic run (most common):
-
-    python -m scripts.diagnostics
-
-Options:
-
-    python -m scripts.diagnostics --json                  # machine-readable
-    python -m scripts.diagnostics --no-backtest           # skip quick BT
-    python -m scripts.diagnostics --days-back 7           # backtest horizon
-    python -m scripts.diagnostics --limit-candidates 200  # BT cap
-    python -m scripts.diagnostics --deep                  # heavier checks
-
-Goals
------
-
-  - Quickly answer: "Is everything wired correctly and safe to trade?"
-
-  - Check & summarize:
-        • Environment + feature flags
-        • Postgres / ai_db connectivity
-        • Redis connectivity & infra:halt flag
-        • Core market data: SOL price
-        • Router / Jupiter stack (importable + basic describe)
-        • Regime engine state (trend/vol/liquidity/manipulation)
-        • Risk manager limits + risk capacity (0..1 / mode 0..3)
-        • Entry AI / feature pipeline sanity (if modules available)
-        • Wider AI stack presence (buy scoring, feature builder, self-learning)
-        • Optional mini backtest sanity (small sample, short horizon)
-
-  - Never crash on errors: instead, capture them in the report with
-    ok=false and an error message.
-
-  - Emit either human-readable text or JSON for dashboards / scripts.
+Exit codes
+----------
+0  => all critical checks OK
+1  => one or more critical checks failed
+2  => diagnostics crashed unexpectedly (should be rare)
 """
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Dict, Optional
+import time
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 from logging_setup import get_logger
 
 log = get_logger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Core infra / quant modules (best-effort imports where appropriate)
-# ──────────────────────────────────────────────────────────────────────────────
+# Ensure repo root importable (running as module already, but keep consistent)
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from utils_pkg.core_utils import (
-    get_sol_usd,
-    redis as shared_redis,
-)
-from utils_pkg.regime import regime_state
-from utils_pkg import ai_db
-from utils_pkg.risk_manager import (
-    current_limits,
-    risk_snapshot,
-    risk_capacity_snapshot,
-    risk_capacity_score,
-    should_allow_new_entry,
-)
-
-# Optional: router / Jupiter stack
+# Optional dotenv (local convenience only)
 try:  # pragma: no cover
-    from utils_pkg import router as _router_mod  # type: ignore[assignment]
+    from dotenv import find_dotenv, load_dotenv  # type: ignore
 except Exception:  # pragma: no cover
-    _router_mod = None  # type: ignore[assignment]
+    load_dotenv = None  # type: ignore
+    find_dotenv = None  # type: ignore
 
-# Optional: backtest engine & AI entry logic (wrapped in try/except)
-try:  # pragma: no cover
-    from utils_pkg.backtest_engine import run_backtest
-except Exception:  # pragma: no cover
-    run_backtest = None  # type: ignore[assignment]
-
-try:  # pragma: no cover
-    from utils_pkg import ai_entry_logic
-except Exception:  # pragma: no cover
-    ai_entry_logic = None  # type: ignore[assignment]
-
-# Optional: wider AI stack modules
-try:  # pragma: no cover
-    from utils_pkg import ai_buy_scoring as _ai_buy_scoring  # type: ignore[assignment]
-except Exception:  # pragma: no cover
-    _ai_buy_scoring = None  # type: ignore[assignment]
-
-try:  # pragma: no cover
-    from utils_pkg import feature_builder as _feature_builder  # type: ignore[assignment]
-except Exception:  # pragma: no cover
-    _feature_builder = None  # type: ignore[assignment]
-
-try:  # pragma: no cover
-    from utils_pkg import self_learning_ai_strategy as _self_learning  # type: ignore[assignment]
-except Exception:  # pragma: no cover
-    _self_learning = None  # type: ignore[assignment]
-
-try:  # pragma: no cover
-    from utils_pkg import ai_sell_logic as _ai_sell_logic  # type: ignore[assignment]
-except Exception:  # pragma: no cover
-    _ai_sell_logic = None  # type: ignore[assignment]
+if load_dotenv and find_dotenv:
+    with contextlib.suppress(Exception):
+        load_dotenv(find_dotenv(), override=False)
 
 
-# =============================================================================
-# Small helpers
-# =============================================================================
+# ──────────────────────────────────────────────────────────────
+# Constants / knobs
+# ──────────────────────────────────────────────────────────────
+
+HALT_KEYS = ["halt:infra", "halt:manual", "halt:daily_loss", "infra:halt", "infra:halt_reason"]
+
+# Names only. Never print values.
+ENV_KEY_GROUPS: dict[str, Sequence[str]] = {
+    "wallet": ("WALLET_PRIVATE_KEY", "KEYPAIR_PATH", "WALLET_PUBKEY"),
+    "rpc": ("RPC_URL", "HELIUS_RPC_URL"),
+    "redis": ("REDIS_URL",),
+    "postgres": ("POSTGRES_DSN", "PG_DSN", "PG_DSN_EXTERNAL", "PG_DSN_INTERNAL"),
+    "notion": ("NOTION_TOKEN", "NOTION_API_KEY", "NOTION_DATABASE_ID", "NOTION_DB_TRADES"),
+    "alerts": ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "DISCORD_BOT_TOKEN"),
+    "ai": ("OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_BASE_URL"),
+}
+
+CRITICAL_GROUPS = ("wallet", "rpc")  # things that must exist for live trading to function
+SOFT_CRITICAL_GROUPS = ("redis", "postgres")  # strongly recommended for full pipeline
 
 
-def _env_bool(key: str, default: bool = False) -> bool:
-    v = os.getenv(key)
-    if v is None:
-        return default
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+# ──────────────────────────────────────────────────────────────
+# Data structures
+# ──────────────────────────────────────────────────────────────
 
 
-def _safe_str(v: Any, max_len: int = 64) -> str:
-    s = str(v)
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _safe_str(x: Any, max_len: int = 220) -> str:
+    try:
+        s = str(x)
+    except Exception:
+        s = repr(x)
     if len(s) > max_len:
         return s[: max_len - 3] + "..."
     return s
-
-
-async def _get_redis():
-    """
-    Prefer shared redis from core_utils; if not available, we just report
-    "no redis" instead of failing.
-    """
-    try:
-        if shared_redis is not None:
-            return shared_redis
-    except Exception:
-        pass
-    return None
-
-
-# =============================================================================
-# Result structures
-# =============================================================================
 
 
 @dataclass
 class CheckResult:
     ok: bool
     detail: str = ""
-    extra: Dict[str, Any] | None = None
+    error: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+    duration_ms: int = 0
 
-    def to_dict(self) -> Dict[str, Any]:
-        d = {
+    def to_dict(self) -> dict[str, Any]:
+        return {
             "ok": bool(self.ok),
             "detail": self.detail,
+            "error": self.error,
+            "extra": self.extra,
+            "duration_ms": self.duration_ms,
         }
-        if self.extra:
-            d["extra"] = self.extra
-        return d
 
 
 @dataclass
 class DiagnosticsReport:
     generated_at: str
-    env: Dict[str, Any]
+    args: dict[str, Any]
+    env: dict[str, Any]
+    env_presence: dict[str, Any]
+    infra: CheckResult
     db: CheckResult
     redis: CheckResult
     market_data: CheckResult
@@ -177,12 +145,16 @@ class DiagnosticsReport:
     router: CheckResult
     entry_ai: CheckResult
     ai_stack: CheckResult
-    backtest: Optional[CheckResult] = None
+    backtest: CheckResult | None = None
+    summary: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "generated_at": self.generated_at,
+            "args": self.args,
             "env": self.env,
+            "env_presence": self.env_presence,
+            "infra": self.infra.to_dict(),
             "db": self.db.to_dict(),
             "redis": self.redis.to_dict(),
             "market_data": self.market_data.to_dict(),
@@ -192,555 +164,853 @@ class DiagnosticsReport:
             "entry_ai": self.entry_ai.to_dict(),
             "ai_stack": self.ai_stack.to_dict(),
             "backtest": self.backtest.to_dict() if self.backtest else None,
+            "summary": self.summary,
         }
 
 
-# =============================================================================
-# Individual checks
-# =============================================================================
+# ──────────────────────────────────────────────────────────────
+# Generic wrappers
+# ──────────────────────────────────────────────────────────────
+
+
+async def _maybe_await(x: Any) -> Any:
+    if asyncio.iscoroutine(x):
+        return await x
+    return x
+
+
+async def run_check(
+    name: str,
+    fn: Callable[[], Awaitable[CheckResult]],
+    *,
+    timeout_s: int,
+) -> CheckResult:
+    t0 = time.perf_counter()
+    try:
+        res = await asyncio.wait_for(fn(), timeout=timeout_s)
+        if not isinstance(res, CheckResult):
+            res = CheckResult(ok=False, detail=f"{name}: invalid result type {type(res)}")
+    except TimeoutError:
+        res = CheckResult(ok=False, detail=f"{name} timed out after {timeout_s}s", error="timeout")
+    except Exception as e:
+        res = CheckResult(ok=False, detail=f"{name} failed", error=_safe_str(e))
+    res.duration_ms = int((time.perf_counter() - t0) * 1000)
+    return res
+
+
+def _atomic_write(path: Path, data: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    tmp.replace(path)
+
+
+# ──────────────────────────────────────────────────────────────
+# Env summary
+# ──────────────────────────────────────────────────────────────
+
+
+def collect_env_summary() -> dict[str, Any]:
+    """
+    Only non-secret knobs (values trimmed). This is for human context,
+    but we avoid obvious secret keys.
+    """
+
+    def _get(k: str, max_len: int = 60) -> str | None:
+        v = os.getenv(k)
+        if not v:
+            return None
+        return _safe_str(v, max_len=max_len)
+
+    keys = [
+        "NETWORK",
+        "SOLANA_CLUSTER",
+        "RISK_PROFILE",
+        "ENTRY_MOMENTUM_ENABLED",
+        "ENTRY_AI_ENABLED",
+        "AI_ENTRY_ENABLED",
+        "REGIME_ENABLED",
+        "RISK_MANAGER_ENABLED",
+        "EXIT_ENGINE_ENABLED",
+        "RISK_MODE_OVERRIDE",
+        "MAX_CONCURRENT_POS",
+        "DAILY_SPEND_CAP_PCT",
+        "STOP_AFTER_DAILY_PROFIT_PCT",
+        "STOP_AFTER_DAILY_LOSS_PCT",
+        "ENTRY_MIN_INITIAL_BUY_SOL",
+        "BUY_SOL_PER_TRADE",
+        "SCANNER_MIN_BUYS_5M",
+    ]
+    out: dict[str, Any] = {}
+    for k in keys:
+        v = _get(k)
+        if v is not None:
+            out[k] = v
+    return out
+
+
+def env_presence_summary() -> dict[str, Any]:
+    """
+    Presence-only: for each group, list which keys exist (names only).
+    """
+    groups: dict[str, dict[str, Any]] = {}
+    for g, ks in ENV_KEY_GROUPS.items():
+        present = [k for k in ks if os.getenv(k) not in (None, "")]
+        missing = [k for k in ks if k not in present]
+        groups[g] = {"present": present, "missing": missing}
+    # rollups
+    crit_missing = []
+    for g in CRITICAL_GROUPS:
+        crit_missing.extend(groups.get(g, {}).get("missing", []))
+    soft_missing = []
+    for g in SOFT_CRITICAL_GROUPS:
+        soft_missing.extend(groups.get(g, {}).get("missing", []))
+    return {
+        "groups": groups,
+        "critical_missing": sorted(set(crit_missing)),
+        "soft_missing": sorted(set(soft_missing)),
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# Shared infra init/close
+# ──────────────────────────────────────────────────────────────
+
+
+async def check_infra_init() -> CheckResult:
+    """
+    Bring up shared resources if available: init_resources().
+    We treat failure as critical because market/redis checks depend on it.
+    """
+    try:
+        from utils_pkg import core_utils as cu  # type: ignore
+    except Exception as e:
+        return CheckResult(
+            ok=False, detail="utils_pkg.core_utils not importable", error=_safe_str(e)
+        )
+
+    init_fn = getattr(cu, "init_resources", None)
+    if not callable(init_fn):
+        # Not fatal, but likely indicates drift.
+        return CheckResult(ok=True, detail="core_utils.init_resources not found (skipping init).")
+
+    try:
+        await _maybe_await(init_fn())
+        return CheckResult(ok=True, detail="init_resources OK")
+    except Exception as e:
+        return CheckResult(ok=False, detail="init_resources failed", error=_safe_str(e))
+
+
+async def close_infra_best_effort() -> None:
+    try:
+        from utils_pkg import core_utils as cu  # type: ignore
+
+        close_fn = getattr(cu, "close_resources", None)
+        if callable(close_fn):
+            await _maybe_await(close_fn())
+    except Exception:
+        return
+
+
+# ──────────────────────────────────────────────────────────────
+# Individual checks (best-effort)
+# ──────────────────────────────────────────────────────────────
 
 
 async def check_db() -> CheckResult:
     try:
-        backend_desc = ai_db.describe_backend()
+        from utils_pkg import ai_db  # type: ignore
     except Exception as e:
-        return CheckResult(False, f"describe_backend failed: {e!r}")
+        return CheckResult(ok=False, detail="utils_pkg.ai_db not importable", error=_safe_str(e))
+
+    extra: dict[str, Any] = {}
+    try:
+        desc = ai_db.describe_backend()
+        extra["backend"] = desc
+    except Exception as e:
+        extra["describe_backend_error"] = _safe_str(e)
 
     try:
-        ok = ai_db.ping()
+        ping_fn = getattr(ai_db, "ping", None)
+        if not callable(ping_fn):
+            return CheckResult(ok=False, detail="ai_db.ping not found", extra=extra)
+        ok = await _maybe_await(ping_fn())
     except Exception as e:
-        return CheckResult(False, f"ai_db.ping() raised: {e!r}")
+        return CheckResult(ok=False, detail="ai_db.ping raised", error=_safe_str(e), extra=extra)
 
     if not ok:
-        return CheckResult(False, "ai_db.ping() returned False")
+        return CheckResult(ok=False, detail="Postgres ping returned False", extra=extra)
 
-    return CheckResult(
-        True,
-        "Postgres reachable",
-        extra={
-            "backend": backend_desc,
-        },
-    )
+    return CheckResult(ok=True, detail="Postgres reachable", extra=extra)
+
+
+async def _get_redis_client() -> tuple[Any | None, dict[str, Any]]:
+    """
+    Prefer canonical async getter if available; otherwise use exported client.
+    """
+    meta: dict[str, Any] = {}
+    try:
+        from utils_pkg import core_utils as cu  # type: ignore
+    except Exception as e:
+        meta["core_utils_import_error"] = _safe_str(e)
+        return None, meta
+
+    # 1) canonical async getter (preferred)
+    get_fn = getattr(cu, "get_redis_async", None)
+    if callable(get_fn):
+        try:
+            r = await _maybe_await(get_fn())
+            if r is not None:
+                meta["redis_source"] = "core_utils.get_redis_async"
+                return r, meta
+        except Exception as e:
+            meta["get_redis_async_error"] = _safe_str(e)
+
+    # 2) exported client
+    try:
+        r = getattr(cu, "redis", None)
+        if r is not None:
+            meta["redis_source"] = "core_utils.redis"
+            return r, meta
+    except Exception as e:
+        meta["redis_attr_error"] = _safe_str(e)
+
+    return None, meta
 
 
 async def check_redis() -> CheckResult:
-    redis = await _get_redis()
-    if redis is None:
-        return CheckResult(False, "No Redis client available from core_utils.")
+    r, meta = await _get_redis_client()
+    if r is None:
+        return CheckResult(ok=False, detail="No Redis client available", extra=meta)
 
     try:
-        pong = await redis.ping()
+        pong = await _maybe_await(r.ping())
     except Exception as e:
-        return CheckResult(False, f"redis.ping() failed: {e!r}")
+        return CheckResult(ok=False, detail="redis.ping failed", error=_safe_str(e), extra=meta)
 
-    if pong is not True:
-        return CheckResult(False, f"redis.ping() returned {pong!r}")
+    if pong not in (True, "PONG", b"PONG"):
+        meta["ping_return"] = pong
+        return CheckResult(ok=False, detail="redis.ping returned unexpected value", extra=meta)
 
-    # infra:halt flag + basic keys presence
+    extra = dict(meta)
+    # Halt flags
+    halts: dict[str, Any] = {}
     try:
-        halted = await redis.get("infra:halt")
-        halt_reason = await redis.get("infra:halt_reason")
-        has_metrics = bool(await redis.exists("metrics:winrate20"))
+        for k in HALT_KEYS:
+            try:
+                v = await _maybe_await(r.get(k))
+            except Exception:
+                v = None
+            if v is not None:
+                halts[k] = v
     except Exception as e:
-        return CheckResult(
-            True,
-            "Redis reachable, but metadata fetch failed.",
-            extra={"error": str(e)},
-        )
+        extra["halt_read_error"] = _safe_str(e)
 
-    extra = {
-        "infra_halt": halted == "1",
-        "infra_halt_reason": halt_reason,
-        "has_winrate20": has_metrics,
-    }
+    extra["halts"] = halts
+    halted = False
+    # Any known halt key indicating stop
+    if str(halts.get("halt:infra", "")).strip() in {"1", "true", "True"}:
+        halted = True
+    if str(halts.get("infra:halt", "")).strip() in {"1", "true", "True"}:
+        halted = True
+    if str(halts.get("halt:manual", "")).strip() in {"1", "true", "True"}:
+        halted = True
+    if str(halts.get("halt:daily_loss", "")).strip() in {"1", "true", "True"}:
+        halted = True
+
     detail = "Redis reachable"
-    if halted == "1":
-        detail += " (infra:halt=1 – entries blocked)"
+    if halted:
+        detail += " (HALT ACTIVE — entries likely blocked)"
 
-    return CheckResult(True, detail, extra=extra)
+    return CheckResult(ok=True, detail=detail, extra=extra)
 
 
 async def check_market_data() -> CheckResult:
     try:
-        sol_usd = await get_sol_usd()
+        from utils_pkg import core_utils as cu  # type: ignore
     except Exception as e:
-        return CheckResult(False, f"get_sol_usd() failed: {e!r}")
+        return CheckResult(ok=False, detail="core_utils not importable", error=_safe_str(e))
 
-    if not sol_usd or sol_usd <= 0:
-        return CheckResult(False, f"Invalid SOL/USD quote: {sol_usd!r}")
+    get_fn = getattr(cu, "get_sol_usd", None)
+    if not callable(get_fn):
+        return CheckResult(ok=False, detail="core_utils.get_sol_usd not found")
 
-    return CheckResult(
-        True,
-        "Market data OK",
-        extra={
-            "sol_usd": float(sol_usd),
-        },
-    )
+    try:
+        sol = await _maybe_await(get_fn())
+    except Exception as e:
+        return CheckResult(ok=False, detail="get_sol_usd failed", error=_safe_str(e))
+
+    try:
+        sol_f = float(sol)
+    except Exception:
+        sol_f = -1.0
+
+    if sol_f <= 0:
+        return CheckResult(ok=False, detail=f"Invalid SOL/USD quote: {sol!r}")
+
+    return CheckResult(ok=True, detail="Market data OK", extra={"sol_usd": sol_f})
+
+
+async def check_router() -> CheckResult:
+    try:
+        from utils_pkg import router as r  # type: ignore
+    except Exception as e:
+        return CheckResult(ok=False, detail="utils_pkg.router not importable", error=_safe_str(e))
+
+    extra: dict[str, Any] = {}
+    # lightweight describe (never swaps)
+    try:
+        describe = getattr(r, "describe_router", None)
+        if callable(describe):
+            extra["describe_router"] = await _maybe_await(describe())
+    except Exception as e:
+        extra["describe_router_error"] = _safe_str(e)
+
+    # common config constants (best-effort)
+    for k in ("JUP_BASE_URL", "JUPITER_BASE_URL", "BASE_URL", "ROUTE_GUARD", "ROUTE_GUARD_MODE"):
+        try:
+            v = getattr(r, k, None)
+            if v is not None:
+                extra[k] = v
+        except Exception:
+            continue
+
+    detail = "Router import OK"
+    if "describe_router" in extra:
+        detail = "Router OK: " + _safe_str(extra["describe_router"], 140)
+
+    return CheckResult(ok=True, detail=detail, extra=extra)
 
 
 async def check_regime() -> CheckResult:
     try:
-        # Force at least one refresh so we have recent stats
-        await regime_state.refresh_once()
-        feats = await regime_state.features()
+        from utils_pkg.regime import regime_state  # type: ignore
     except Exception as e:
-        return CheckResult(False, f"regime_state check failed: {e!r}")
+        return CheckResult(
+            ok=False, detail="utils_pkg.regime.regime_state not importable", error=_safe_str(e)
+        )
 
-    label_num = feats.get("regime_label_numeric", 0.0)
-    trend = feats.get("trend_score", 0.0)
-    vol = feats.get("volatility_score", 0.0)
-    liq = feats.get("liquidity_score", 0.5)
-    manip = feats.get("manipulation_risk", 0.0)
-
+    extra: dict[str, Any] = {}
     try:
-        regime_label = regime_state.label()
+        refresh = getattr(regime_state, "refresh_once", None)
+        if callable(refresh):
+            await _maybe_await(refresh())
+        feats = await _maybe_await(regime_state.features())
+        if isinstance(feats, dict):
+            extra.update(feats)
+    except Exception as e:
+        return CheckResult(ok=False, detail="regime_state failed", error=_safe_str(e))
+
+    # Compact summary
+    label = None
+    try:
+        label_fn = getattr(regime_state, "label", None)
+        if callable(label_fn):
+            label = await _maybe_await(label_fn())
     except Exception:
-        regime_label = feats.get("regime_label", "unknown")
+        label = None
 
-    detail = (
-        f"Regime={regime_label} "
-        f"(trend={trend:+.3f}, vol={vol:.3f}, liq={liq:.3f}, manip={manip:.3f})"
-    )
+    def _f(key: str, default: float = 0.0) -> float:
+        try:
+            return float(extra.get(key, default))
+        except Exception:
+            return float(default)
 
+    trend = _f("trend_score", 0.0)
+    vol = _f("volatility_score", 0.0)
+    liq = _f("liquidity_score", 0.5)
+    manip = _f("manipulation_risk", _f("regime_manipulation_risk", 0.0))
+    regime_label = label or extra.get("regime_label") or "unknown"
+
+    detail = f"Regime={regime_label} (trend={trend:+.3f}, vol={vol:.3f}, liq={liq:.3f}, manip={manip:.3f})"
+    # keep extra bounded for JSON (but don’t delete; just avoid huge payloads)
     return CheckResult(
-        True,
-        detail,
+        ok=True,
+        detail=detail,
         extra={
             "regime_label": regime_label,
-            "regime_label_numeric": label_num,
             "trend_score": trend,
             "volatility_score": vol,
             "liquidity_score": liq,
             "manipulation_risk": manip,
+            # keep raw too if you want dashboards to consume it
+            "raw": extra,
         },
     )
 
 
 async def check_risk() -> CheckResult:
     try:
-        limits = await current_limits()
-        snap = await risk_snapshot()
-        cap_snap = await risk_capacity_snapshot()
-        capacity = await risk_capacity_score()
-        can_enter = await should_allow_new_entry()
+        from utils_pkg.risk_manager import (  # type: ignore
+            current_limits,
+            risk_capacity_score,
+            risk_capacity_snapshot,
+            risk_snapshot,
+            should_allow_new_entry,
+        )
     except Exception as e:
-        return CheckResult(False, f"Risk manager check failed: {e!r}")
+        return CheckResult(
+            ok=False, detail="utils_pkg.risk_manager not importable", error=_safe_str(e)
+        )
+
+    try:
+        limits_task = asyncio.create_task(current_limits())
+        snap_task = asyncio.create_task(risk_snapshot())
+        cap_task = asyncio.create_task(risk_capacity_snapshot())
+        score_task = asyncio.create_task(risk_capacity_score())
+        allow_task = asyncio.create_task(should_allow_new_entry())
+
+        limits = await limits_task
+        snap = await snap_task
+        cap = await cap_task
+        score = await score_task
+        allow = await allow_task
+    except Exception as e:
+        return CheckResult(ok=False, detail="Risk manager calls failed", error=_safe_str(e))
+
+    # Compact summary
+    def _getf(d: dict[str, Any], k: str, default: float = 0.0) -> float:
+        try:
+            return float(d.get(k, default))
+        except Exception:
+            return float(default)
+
+    ticket = _getf(limits, "ticket_usd", 0.0)
+    equity = _getf(limits, "equity_usd", 0.0)
+    max_conc = int(limits.get("max_concurrent") or 0)
+    risk_mode = int(limits.get("risk_mode") or 1)
+    daily_spend = _getf(limits, "daily_spend_usd", 0.0)
+
+    winrate20 = _getf(cap, "winrate20", 0.0)
+    rolling_dd = _getf(cap, "rolling_dd_pct", 0.0)
+    day_pnl_pct = _getf(cap, "daily_realized_pnl_pct", 0.0)
 
     detail = (
-        f"ticket≈${limits['ticket_usd']:.2f}, "
-        f"max_conc={limits['max_concurrent']}, "
-        f"risk_mode={limits.get('risk_mode', 1)}, "
-        f"capacity={capacity:.3f}, "
-        f"allow_new_entry={bool(can_enter)}"
+        f"equity=${equity:.2f}, ticket=${ticket:.2f}, max_conc={max_conc}, "
+        f"risk_mode={risk_mode}, capacity={float(score):.3f}, allow_new_entry={bool(allow)}"
     )
 
     extra = {
-        "equity_usd": limits.get("equity_usd", 0.0),
-        "ticket_usd": limits.get("ticket_usd", 0.0),
-        "pos_pct_cap": limits.get("pos_pct_cap", 0.0),
-        "max_concurrent": limits.get("max_concurrent", 0),
-        "daily_spend_usd": limits.get("daily_spend_usd", 0.0),
-        "risk_capacity": capacity,
-        "risk_mode": limits.get("risk_mode", 1),
-        "risk_mode_override": limits.get("risk_mode_override"),
-        "allow_new_entry": bool(can_enter),
-        # a few performance fields
-        "winrate20": cap_snap.get("winrate20", 0.5),
-        "rolling_dd_pct": cap_snap.get("rolling_dd_pct", 0.0),
-        "daily_realized_pnl_usd": cap_snap.get("daily_realized_pnl_usd", 0.0),
-        "daily_realized_pnl_pct": cap_snap.get("daily_realized_pnl_pct", 0.0),
-        # snapshot can hold more granular stuff; keep it compact in text,
-        # but still expose raw in extra for JSON:
+        "limits": limits,
         "risk_snapshot": snap,
-        "risk_capacity_snapshot": cap_snap,
+        "risk_capacity_snapshot": cap,
+        "risk_capacity_score": float(score) if score is not None else None,
+        "allow_new_entry": bool(allow),
+        "high_signal": {
+            "winrate20": winrate20,
+            "rolling_dd_pct": rolling_dd,
+            "daily_realized_pnl_pct": day_pnl_pct,
+            "daily_spend_usd": daily_spend,
+        },
     }
-
-    return CheckResult(True, detail, extra=extra)
-
-
-async def check_router() -> CheckResult:
-    """
-    Router / Jupiter stack health. We keep this light and *never* crash:
-    - Ensure utils_pkg.router is importable.
-    - Optionally call describe_router() or read simple attributes.
-    We intentionally don't fire heavy network requests here.
-    """
-    if _router_mod is None:
-        return CheckResult(
-            False,
-            "utils_pkg.router not importable (router/Jupiter stack missing?).",
-        )
-
-    extra: Dict[str, Any] = {}
-    detail_bits = []
-
-    # Optional describe_router helper
-    try:
-        describe = getattr(_router_mod, "describe_router", None)
-        if callable(describe):
-            if asyncio.iscoroutinefunction(describe):
-                desc = await describe()
-            else:
-                desc = describe()
-            extra["describe_router"] = desc
-            detail_bits.append(_safe_str(desc, max_len=80))
-    except Exception as e:
-        extra["describe_router_error"] = str(e)
-
-    # Basic static fields (if present)
-    try:
-        base = getattr(_router_mod, "JUP_BASE_URL", None) or getattr(
-            _router_mod, "BASE", None
-        )
-        if base:
-            extra["jup_base_url"] = base
-            detail_bits.append(f"JUP_BASE={base}")
-    except Exception:
-        pass
-
-    try:
-        as_legacy = getattr(_router_mod, "AS_LEGACY", None)
-        if as_legacy is not None:
-            extra["as_legacy"] = bool(as_legacy)
-    except Exception:
-        pass
-
-    if not detail_bits:
-        detail = "Router module importable."
-    else:
-        detail = "Router OK: " + " | ".join(detail_bits)
-
-    return CheckResult(True, detail, extra=extra)
+    return CheckResult(ok=True, detail=detail, extra=extra)
 
 
 async def check_entry_ai() -> CheckResult:
-    if ai_entry_logic is None:
+    try:
+        from utils_pkg import ai_entry_logic  # type: ignore
+    except Exception as e:
         return CheckResult(
-            False,
-            "utils_pkg.ai_entry_logic not importable.",
+            ok=False, detail="utils_pkg.ai_entry_logic not importable", error=_safe_str(e)
         )
 
-    extra: Dict[str, Any] = {}
-    detail_parts = []
-
-    # Try to introspect model / config if helpers exist
-    try:
-        describe = getattr(ai_entry_logic, "describe_entry_model", None)
-        if callable(describe):
-            if asyncio.iscoroutinefunction(describe):
-                desc = await describe()
-            else:
-                desc = describe()
-            extra["model_description"] = desc
-            detail_parts.append(_safe_str(desc, max_len=80))
-    except Exception as e:
-        extra["model_description_error"] = str(e)
+    extra: dict[str, Any] = {}
+    # Best-effort diag snapshot
+    for attr in ("diag_snapshot", "gate_snapshot"):
+        try:
+            fn = getattr(ai_entry_logic, attr, None)
+            if callable(fn):
+                out = await _maybe_await(fn())
+                if isinstance(out, dict):
+                    extra[attr] = out
+        except Exception as e:
+            extra[f"{attr}_error"] = _safe_str(e)
 
     try:
-        cfg = getattr(ai_entry_logic, "current_entry_config", None)
-        if callable(cfg):
-            if asyncio.iscoroutinefunction(cfg):
-                cfg_val = await cfg()
-            else:
-                cfg_val = cfg()
-            extra["entry_config"] = cfg_val
-            if isinstance(cfg_val, dict) and "ENTRY_MODEL_NAME" in cfg_val:
-                detail_parts.append(f"model={cfg_val['ENTRY_MODEL_NAME']}")
-    except Exception as e:
-        extra["entry_config_error"] = str(e)
+        cur = getattr(ai_entry_logic, "current_diag", None)
+        if isinstance(cur, dict):
+            extra["current_diag"] = cur
+    except Exception:
+        pass
 
-    if not detail_parts:
-        detail = "AI entry logic present (no describe helpers)."
-    else:
-        detail = "AI entry OK: " + " | ".join(detail_parts)
+    # Compact summary
+    gate = None
+    try:
+        gate = extra.get("diag_snapshot", {}).get("ai_score_gate")  # type: ignore[union-attr]
+    except Exception:
+        gate = None
 
-    return CheckResult(True, detail, extra=extra)
+    detail = "AI entry logic present"
+    if gate is not None:
+        detail = f"AI entry OK (ai_score_gate={_safe_str(gate, 50)})"
+
+    return CheckResult(ok=True, detail=detail, extra=extra)
 
 
 async def check_ai_stack() -> CheckResult:
     """
-    Wider AI stack coverage:
-      - ai_entry_logic
-      - ai_buy_scoring
-      - feature_builder
-      - self_learning_ai_strategy
-      - ai_sell_logic
-    We treat missing entry_logic or feature_builder as more serious than
-    missing self-learning (still reported in extra).
+    Wider AI/quant stack presence (imports only).
+    We treat feature_builder + ai_entry_logic as hard requirements for P0.
     """
-    present = []
-    missing = []
-
-    # Map logical names to modules
-    modules = {
-        "ai_entry_logic": ai_entry_logic,
-        "ai_buy_scoring": _ai_buy_scoring,
-        "feature_builder": _feature_builder,
-        "self_learning_ai_strategy": _self_learning,
-        "ai_sell_logic": _ai_sell_logic,
+    mods = {
+        "feature_builder": "utils_pkg.feature_builder",
+        "ai_entry_logic": "utils_pkg.ai_entry_logic",
+        "ai_buy_scoring": "utils_pkg.ai_buy_scoring",
+        "ai_sell_logic": "utils_pkg.ai_sell_logic",
+        "self_learning_ai_strategy": "utils_pkg.self_learning_ai_strategy",
+        "exit_engine": "utils_pkg.exit_engine",
+        "scanner_registry": "scanner.registry",
     }
 
-    for name, mod in modules.items():
-        if mod is not None:
+    present, missing = [], []
+    for name, path in mods.items():
+        try:
+            __import__(path)
             present.append(name)
-        else:
+        except Exception:
             missing.append(name)
 
-    # Hard requirements for "ok": entry_logic + feature_builder at least
-    ok = ("ai_entry_logic" in present) and ("feature_builder" in present)
-
-    detail = f"AI stack modules: present={present or '[]'}"
+    ok = ("feature_builder" in present) and ("ai_entry_logic" in present)
+    detail = f"present={present}"
     if missing:
         detail += f"; missing={missing}"
-
-    extra = {
-        "present_modules": present,
-        "missing_modules": missing,
-    }
-
-    return CheckResult(ok, detail, extra=extra)
+    return CheckResult(ok=ok, detail=detail, extra={"present": present, "missing": missing})
 
 
-async def check_backtest_sanity(
-    days_back: int,
-    limit_candidates: int,
-) -> CheckResult:
+async def check_backtest(days_back: int, limit_candidates: int, deep: bool) -> CheckResult:
     """
-    Quick, tiny backtest to verify pipeline wiring (DB → feature builder → AI → exits).
-    This is intentionally small, just to see that it runs, not to optimize PnL.
+    Tiny sanity backtest (optional). Never used as “truth” for performance.
+    Only to prove the pipeline can run end-to-end.
     """
-    if run_backtest is None:
-        return CheckResult(False, "utils_pkg.backtest_engine.run_backtest not importable.")
+    try:
+        from utils_pkg.backtest_engine import run_backtest  # type: ignore
+    except Exception as e:
+        return CheckResult(
+            ok=False, detail="utils_pkg.backtest_engine not importable", error=_safe_str(e)
+        )
+
+    # Deep makes it a bit more demanding, but still bounded
+    db = max(2, int(days_back))
+    lim = max(50, int(limit_candidates))
+    if deep:
+        db = max(db, 14)
+        lim = max(lim, 500)
 
     cfg = {
-        "ENTRY_SCORE_MIN": 0.60,
+        "days_back": db,
+        "limit_candidates": lim,
         "max_positions": 1,
-        "days_back": int(days_back),
-        "limit_candidates": int(limit_candidates),
-        # keep everything else default / env-driven
+        "ENTRY_SCORE_MIN": 0.60,
     }
 
     try:
-        stats = await run_backtest(cfg)
+        stats = await _maybe_await(run_backtest(cfg))
+        if not isinstance(stats, dict):
+            return CheckResult(ok=False, detail=f"run_backtest returned {type(stats)}")
     except Exception as e:
-        return CheckResult(False, f"run_backtest failed: {e!r}")
+        return CheckResult(
+            ok=False, detail="run_backtest failed", error=_safe_str(e), extra={"cfg": cfg}
+        )
 
-    n_trades = int(stats.get("n_trades", 0))
-    pnl = float(stats.get("pnl_total_pct", stats.get("net_pnl_pct", 0.0)))
-
-    detail = f"Backtest ran: trades={n_trades}, pnl_total_pct={pnl:.2f}"
-    return CheckResult(True, detail, extra=stats)
-
-
-# =============================================================================
-# Env summary
-# =============================================================================
+    n_trades = int(stats.get("n_trades", stats.get("trades", 0)) or 0)
+    pnl = stats.get("pnl_total_pct", stats.get("net_pnl_pct", None))
+    detail = f"Backtest ran: trades={n_trades}, pnl_total_pct={_safe_str(pnl, 20)}"
+    return CheckResult(ok=True, detail=detail, extra={"cfg": cfg, "stats": stats})
 
 
-def collect_env_summary() -> Dict[str, Any]:
-    """
-    Capture the key knobs that influence behaviour. We strip values and trim
-    secrets so this is safe to print locally.
-    """
-
-    def _clean(key: str, max_len: int = 40) -> Optional[str]:
-        v = os.getenv(key)
-        if not v:
-            return None
-        return _safe_str(v, max_len=max_len)
-
-    env: Dict[str, Any] = {
-        # Network / cluster
-        "NETWORK": _clean("NETWORK") or _clean("SOLANA_CLUSTER"),
-        # Core feature flags
-        "ENTRY_MOMENTUM_ENABLED": _clean("ENTRY_MOMENTUM_ENABLED"),
-        "ENTRY_AI_ENABLED": _clean("ENTRY_AI_ENABLED"),
-        "ENTRY_REQUIRE_RISK_CAPACITY": _clean("ENTRY_REQUIRE_RISK_CAPACITY"),
-        "REGIME_ENABLED": _clean("REGIME_ENABLED"),
-        "RISK_MODE_OVERRIDE": _clean("RISK_MODE_OVERRIDE"),
-        # Risk / capital protection
-        "STOP_AFTER_DAILY_PROFIT_PCT": _clean("STOP_AFTER_DAILY_PROFIT_PCT"),
-        "DAILY_SPEND_CAP_PCT": _clean("DAILY_SPEND_CAP_PCT"),
-        "MAX_CONCURRENT_POS": _clean("MAX_CONCURRENT_POS"),
-        "RISK_PROFILE": _clean("RISK_PROFILE"),
-        # Scanner toggles (if present)
-        "ENABLE_RAYDIUM_SCANNER": _clean("ENABLE_RAYDIUM_SCANNER"),
-        "ENABLE_PUMPFUN_SCANNER": _clean("ENABLE_PUMPFUN_SCANNER"),
-        "ENABLE_DEXSCREENER_SCANNER": _clean("ENABLE_DEXSCREENER_SCANNER"),
-        # Diagnostics / BT
-        "BT_DAYS_BACK": _clean("BT_DAYS_BACK"),
-        "BT_LIMIT_CANDIDATES": _clean("BT_LIMIT_CANDIDATES"),
-    }
-
-    # Remove None entries for cleanliness
-    return {k: v for k, v in env.items() if v is not None}
+# ──────────────────────────────────────────────────────────────
+# Summary logic / pretty printing
+# ──────────────────────────────────────────────────────────────
 
 
-# =============================================================================
-# Pretty printer
-# =============================================================================
+def _traffic(risk_mode: int | None, allow_new_entry: bool | None, halted: bool) -> str:
+    if halted or (risk_mode == 0) or (allow_new_entry is False):
+        return "🔴 BLOCKED"
+    if risk_mode == 3:
+        return "🟠 DEFENSIVE"
+    if risk_mode == 2:
+        return "🟢 AGGRESSIVE"
+    return "🟡 NORMAL"
 
 
-def print_report(report: DiagnosticsReport) -> None:
+def print_report(rep: DiagnosticsReport) -> None:
     print("")
     print("=== Solana Sniper Diagnostics (V3+++) ===")
-    print(f"Generated at: {report.generated_at}")
+    print(f"Generated at: {rep.generated_at}")
     print("")
 
-    print("[ENV]")
-    for k, v in sorted(report.env.items()):
-        print(f"  {k}: {v}")
-    print("")
-
-    def _section(name: str, res: CheckResult):
-        status = "OK" if res.ok else "FAIL"
-        print(f"[{name}]  [{status}]")
-        print(f"  {res.detail}")
-        if res.extra:
-            for ek, ev in sorted(res.extra.items()):
-                print(f"    - {ek}: {_safe_str(ev, 80)}")
+    def sec(title: str, r: CheckResult) -> None:
+        status = "OK" if r.ok else "FAIL"
+        print(f"[{title}] [{status}] ({r.duration_ms} ms)")
+        print(f"  {r.detail}")
+        if r.error:
+            print(f"  error: {r.error}")
+        if r.extra:
+            # keep human output compact
+            for k in sorted(r.extra.keys()):
+                v = r.extra[k]
+                if k in {"raw", "limits", "risk_snapshot", "risk_capacity_snapshot", "stats"}:
+                    continue
+                print(f"  - {k}: {_safe_str(v, 160)}")
         print("")
 
-    _section("DB", report.db)
-    _section("REDIS", report.redis)
-    _section("MARKET_DATA", report.market_data)
-    _section("REGIME", report.regime)
-    _section("RISK", report.risk)
-    _section("ROUTER", report.router)
-    _section("ENTRY_AI", report.entry_ai)
-    _section("AI_STACK", report.ai_stack)
+    # Env
+    print("[ENV (non-secret knobs)]")
+    if rep.env:
+        for k, v in sorted(rep.env.items()):
+            print(f"  {k}: {v}")
+    else:
+        print("  (none)")
+    print("")
 
-    if report.backtest is not None:
-        _section("BACKTEST", report.backtest)
+    # Env presence
+    pres = rep.env_presence.get("groups", {})
+    print("[ENV PRESENCE (names only)]")
+    for g in sorted(pres.keys()):
+        pg = pres[g]
+        print(f"  {g}: present={pg.get('present', [])} missing={pg.get('missing', [])}")
+    crit_missing = rep.env_presence.get("critical_missing", [])
+    if crit_missing:
+        print(f"  CRITICAL MISSING: {crit_missing}")
+    soft_missing = rep.env_presence.get("soft_missing", [])
+    if soft_missing:
+        print(f"  SOFT MISSING: {soft_missing}")
+    print("")
 
-    # Simple overall status
-    all_ok = (
-        report.db.ok
-        and report.redis.ok
-        and report.market_data.ok
-        and report.regime.ok
-        and report.risk.ok
-        and report.router.ok
-        and report.entry_ai.ok
-        and report.ai_stack.ok
-        and (report.backtest.ok if report.backtest else True)
-    )
-    print("Overall:", "ALL GREEN ✅" if all_ok else "Issues detected ⚠️")
+    # Checks
+    sec("INFRA", rep.infra)
+    sec("DB", rep.db)
+    sec("REDIS", rep.redis)
+    sec("MARKET", rep.market_data)
+    sec("REGIME", rep.regime)
+    sec("RISK", rep.risk)
+    sec("ROUTER", rep.router)
+    sec("ENTRY_AI", rep.entry_ai)
+    sec("AI_STACK", rep.ai_stack)
+    if rep.backtest is not None:
+        sec("BACKTEST", rep.backtest)
+
+    # Summary / readiness
+    s = rep.summary or {}
+    print("=== SUMMARY ===")
+    print(f"Readiness: {s.get('readiness', 'unknown')}")
+    if s.get("notes"):
+        for n in s["notes"]:
+            print(f"- {n}")
     print("")
 
 
-# =============================================================================
-# CLI / main
-# =============================================================================
+# ──────────────────────────────────────────────────────────────
+# Main runner
+# ──────────────────────────────────────────────────────────────
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Deep diagnostics for the Solana sniper bot (V3+++ / quant-grade)."
-    )
+    p = argparse.ArgumentParser(description="Deep diagnostics / sanity checker (V3+++).")
+    p.add_argument("--json", action="store_true", help="Emit JSON output.")
+    p.add_argument("--out", type=str, default=None, help="Write output to file (json or text).")
     p.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit JSON instead of human-readable text.",
+        "--timeout",
+        type=int,
+        default=int(os.getenv("DIAG_TIMEOUT_S", "12")),
+        help="Per-check timeout in seconds (default: 12 or DIAG_TIMEOUT_S).",
     )
-    p.add_argument(
-        "--no-backtest",
-        action="store_true",
-        help="Skip the small sanity backtest.",
-    )
+    p.add_argument("--no-backtest", action="store_true", help="Skip mini backtest sanity run.")
     p.add_argument(
         "--days-back",
         type=int,
         default=int(os.getenv("DIAG_BT_DAYS_BACK", "5")),
-        help="Days back for sanity backtest (default from DIAG_BT_DAYS_BACK or 5).",
+        help="Backtest days horizon (default: 5 or DIAG_BT_DAYS_BACK).",
     )
     p.add_argument(
         "--limit-candidates",
         type=int,
         default=int(os.getenv("DIAG_BT_LIMIT_CANDIDATES", "200")),
-        help="Max candidates for sanity backtest (default from env or 200).",
+        help="Backtest candidate cap (default: 200 or DIAG_BT_LIMIT_CANDIDATES).",
     )
-    p.add_argument(
-        "--deep",
-        action="store_true",
-        help="Enable deeper checks (currently: more aggressive BT horizon/cap).",
-    )
+    p.add_argument("--deep", action="store_true", help="Heavier checks (still bounded).")
     return p
 
 
-async def run_diagnostics(args: argparse.Namespace) -> DiagnosticsReport:
-    env_summary = collect_env_summary()
+async def run_all(args: argparse.Namespace) -> DiagnosticsReport:
+    env = collect_env_summary()
+    env_pres = env_presence_summary()
 
-    db_res = await check_db()
-    redis_res = await check_redis()
-    mkt_res = await check_market_data()
-    regime_res = await check_regime()
-    risk_res = await check_risk()
-    router_res = await check_router()
-    entry_ai_res = await check_entry_ai()
-    ai_stack_res = await check_ai_stack()
+    # 1) infra init (first)
+    infra = await run_check("infra", check_infra_init, timeout_s=max(5, args.timeout))
 
-    bt_res: Optional[CheckResult] = None
+    # 2) run checks (some depend on infra)
+    # Keep concurrency, but do not spam too hard.
+    tasks = {
+        "db": asyncio.create_task(run_check("db", check_db, timeout_s=args.timeout)),
+        "redis": asyncio.create_task(run_check("redis", check_redis, timeout_s=args.timeout)),
+        "market": asyncio.create_task(
+            run_check("market", check_market_data, timeout_s=args.timeout)
+        ),
+        "regime": asyncio.create_task(run_check("regime", check_regime, timeout_s=args.timeout)),
+        "risk": asyncio.create_task(run_check("risk", check_risk, timeout_s=args.timeout)),
+        "router": asyncio.create_task(run_check("router", check_router, timeout_s=args.timeout)),
+        "entry_ai": asyncio.create_task(
+            run_check("entry_ai", check_entry_ai, timeout_s=args.timeout)
+        ),
+        "ai_stack": asyncio.create_task(
+            run_check("ai_stack", check_ai_stack, timeout_s=args.timeout)
+        ),
+    }
+
+    db = await tasks["db"]
+    redis = await tasks["redis"]
+    market = await tasks["market"]
+    regime = await tasks["regime"]
+    risk = await tasks["risk"]
+    router = await tasks["router"]
+    entry_ai = await tasks["entry_ai"]
+    ai_stack = await tasks["ai_stack"]
+
+    backtest_res: CheckResult | None = None
     if not args.no_backtest:
-        days_back = int(args.days_back)
-        limit_cand = int(args.limit_candidates)
-        if args.deep:
-            # Deep mode: slightly more demanding sanity BT
-            days_back = max(days_back, 14)
-            limit_cand = max(limit_cand, 500)
-        bt_res = await check_backtest_sanity(
-            days_back=days_back,
-            limit_candidates=limit_cand,
+        backtest_res = await run_check(
+            "backtest",
+            lambda: check_backtest(args.days_back, args.limit_candidates, args.deep),
+            timeout_s=max(args.timeout, 20 if args.deep else 12),
         )
 
-    report = DiagnosticsReport(
-        generated_at=datetime.utcnow().isoformat() + "Z",
-        env=env_summary,
-        db=db_res,
-        redis=redis_res,
-        market_data=mkt_res,
-        regime=regime_res,
-        risk=risk_res,
-        router=router_res,
-        entry_ai=entry_ai_res,
-        ai_stack=ai_stack_res,
-        backtest=bt_res,
+    # Build summary hints
+    notes = []
+    if env_pres.get("critical_missing"):
+        notes.append(f"Critical env missing: {env_pres['critical_missing']}")
+    if infra.ok is False:
+        notes.append("Infra init failed (init_resources). Many checks may be unreliable.")
+
+    halted = False
+    try:
+        halts = (redis.extra or {}).get("halts", {})
+        if isinstance(halts, dict):
+            # any halt "truthy" indicates likely block
+            for v in halts.values():
+                if str(v).strip() in {"1", "true", "True", "YES", "yes", "on"}:
+                    halted = True
+    except Exception:
+        halted = False
+
+    # risk_mode + allow_new_entry best-effort
+    risk_mode = None
+    allow_new_entry = None
+    with contextlib.suppress(Exception):
+        allow_new_entry = (risk.extra or {}).get("allow_new_entry")
+    try:
+        limits = (risk.extra or {}).get("limits", {})
+        if isinstance(limits, dict):
+            risk_mode = int(limits.get("risk_mode") or 1)
+    except Exception:
+        pass
+
+    readiness = _traffic(risk_mode, allow_new_entry, halted)
+
+    # Decide what is "critical"
+    critical_ok = all(
+        [
+            infra.ok,
+            db.ok,  # brain memory
+            redis.ok,  # halt/pnl + infra gating
+            market.ok,  # market data
+            regime.ok,  # regime engine
+            risk.ok,  # risk manager
+            router.ok,  # execution pipe
+            entry_ai.ok,  # entry intelligence
+            ai_stack.ok,  # pipeline wiring
+        ]
     )
-    return report
+
+    if backtest_res is not None and args.deep:
+        # In deep mode, treat BT failure as advisory but mention it
+        if not backtest_res.ok:
+            notes.append("Backtest sanity failed in --deep mode (advisory).")
+
+    if readiness.startswith("🔴"):
+        notes.append("Trading appears BLOCKED (halt key, risk_mode=0, or allow_new_entry=false).")
+    if not critical_ok:
+        notes.append("One or more critical checks failed — do NOT go live until fixed.")
+
+    rep = DiagnosticsReport(
+        generated_at=_utc_now(),
+        args={
+            "json": bool(args.json),
+            "out": args.out,
+            "timeout": int(args.timeout),
+            "no_backtest": bool(args.no_backtest),
+            "days_back": int(args.days_back),
+            "limit_candidates": int(args.limit_candidates),
+            "deep": bool(args.deep),
+        },
+        env=env,
+        env_presence=env_pres,
+        infra=infra,
+        db=db,
+        redis=redis,
+        market_data=market,
+        regime=regime,
+        risk=risk,
+        router=router,
+        entry_ai=entry_ai,
+        ai_stack=ai_stack,
+        backtest=backtest_res,
+        summary={
+            "readiness": readiness,
+            "critical_ok": bool(critical_ok),
+            "risk_mode": risk_mode,
+            "allow_new_entry": allow_new_entry,
+            "halted": halted,
+            "notes": notes,
+        },
+    )
+    return rep
 
 
 def main() -> None:
-    parser = build_arg_parser()
-    args = parser.parse_args()
+    args = build_arg_parser().parse_args()
+
     try:
-        report = asyncio.run(run_diagnostics(args))
+        rep = asyncio.run(run_all(args))
     except KeyboardInterrupt:
-        print("Interrupted by user.", file=sys.stderr)
+        print("Interrupted.", file=sys.stderr)
         sys.exit(130)
     except Exception as e:
-        print(f"Diagnostics crashed unexpectedly: {e!r}", file=sys.stderr)
-        sys.exit(1)
+        print(f"Diagnostics crashed unexpectedly: {_safe_str(e)}", file=sys.stderr)
+        sys.exit(2)
+    finally:
+        # Always try to close shared infra
+        with contextlib.suppress(Exception):
+            asyncio.run(close_infra_best_effort())
 
+    # Output
     if args.json:
-        print(json.dumps(report.to_dict(), indent=2, default=str))
+        payload = json.dumps(rep.to_dict(), indent=2, default=str)
     else:
-        print_report(report)
+        # Build a text payload by printing into a string
+        # (so --out writes exactly what you see)
+        from io import StringIO
 
-    # Exit code non-zero if any critical check failed (for CI / Render checks)
-    crit = [
-        report.db.ok,
-        report.redis.ok,
-        report.market_data.ok,
-        report.regime.ok,
-        report.risk.ok,
-        report.router.ok,
-        report.entry_ai.ok,
-        report.ai_stack.ok,
-    ]
-    if report.backtest is not None:
-        crit.append(report.backtest.ok)
+        buf = StringIO()
+        stdout = sys.stdout
+        try:
+            sys.stdout = buf
+            print_report(rep)
+        finally:
+            sys.stdout = stdout
+        payload = buf.getvalue()
 
-    sys.exit(0 if all(crit) else 1)
+    if args.out:
+        out_path = Path(args.out)
+        if not out_path.is_absolute():
+            out_path = (ROOT / out_path).resolve()
+        _atomic_write(out_path, payload)
+        print(f"✅ Wrote {out_path}")
+    else:
+        print(payload, end="" if payload.endswith("\n") else "\n")
+
+    # Exit code: 0 only if critical_ok
+    sys.exit(0 if rep.summary.get("critical_ok") else 1)
 
 
 if __name__ == "__main__":

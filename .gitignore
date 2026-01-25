@@ -1,5 +1,7 @@
 ###############################################################################
 # God-Tier .gitignore (Render + Python + Windows) — NO SECRETS, NO TRASH
+# - Safe defaults for a production bot repo
+# - Avoids overly-broad globs that would hide real source/config files
 ###############################################################################
 
 # -----------------------------------------------------------------------------
@@ -8,41 +10,38 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
 .pytest_cache/
+.mypy_cache/
 .pyre/
 .pytype/
-.mypy_cache/
 .ruff_cache/
 .cache/
 .ipynb_checkpoints/
-.pytest_cache/
 
 # -----------------------------------------------------------------------------
-# Virtual environments (common names)
+# Virtual environments / Python tooling
 # -----------------------------------------------------------------------------
 .venv/
 venv/
 env/
 ENV/
 .conda/
-conda-env/
-venv*/
-venv311/
 .python-version
 
 # -----------------------------------------------------------------------------
-# Build / packaging
+# Packaging / builds
 # -----------------------------------------------------------------------------
 build/
 dist/
-*.egg-info/
 .eggs/
+*.egg-info/
 pip-wheel-metadata/
 wheelhouse/
 *.whl
 
 # -----------------------------------------------------------------------------
-# Test / coverage
+# Test / coverage artifacts
 # -----------------------------------------------------------------------------
 .coverage
 .coverage.*
@@ -65,24 +64,25 @@ logs/
 # -----------------------------------------------------------------------------
 # Secrets / credentials (ABSOLUTE NO COMMIT)
 # -----------------------------------------------------------------------------
+# Env files
 .env
 .env.*
-.env.local
-.env.*.local
 .envrc
 !.env.example
 !.env.sample
 !.env.template
 
-# Render / local secrets directories
+# Render / local secret mounts (if accidentally created in-repo)
 etc/secrets/
 secrets/
+.secrets/
 .private/
 private/
 
 # Wallet / key material
 id.json
 keypair.json
+wallet.json
 *.key
 *.pem
 *.p12
@@ -91,42 +91,34 @@ keypair.json
 *.seed
 *.mnemonic
 *.wallet
-*.secret*
-*.private*
 
-# API / cloud credentials (common)
-*service_account*.json
-*credentials*.json
-*gcp*.json
-aws-credentials*
+# Cloud credentials (common)
 .aws/
 .gcloud/
-
-# Notion / OAuth / tokens
-.notional*
-notion_token*
-*oauth*
-*token*
-*api_key*
-*apikey*
-*secret*
+*service_account*.json
+*credentials*.json
 
 # -----------------------------------------------------------------------------
-# Local data stores / state (do NOT commit)
+# Local databases / queues / caches (do NOT commit)
 # -----------------------------------------------------------------------------
+# legacy sqlite state (never production)
 state.sqlite3
-*.sqlite
 *.sqlite3
 *.db
-*.rdb
-*.aof
 
-# Local bot state / queues / snapshots / dumps
+# Redis persistence files (if you ever run Redis locally)
+dump.rdb
+appendonly.aof
+
+# -----------------------------------------------------------------------------
+# Local data outputs (keep repo clean; allow .gitkeep placeholders)
+# -----------------------------------------------------------------------------
 state/
 runtime/
 run/
 tmp/
 temp/
+
 data/
 datasets/
 exports/
@@ -134,17 +126,24 @@ backtests/
 reports/
 artifacts/
 snapshots/
+
+# Common large data formats produced by pipelines
 *.jsonl
 *.parquet
 *.feather
-*.csv
 
-# Local backups / audits / scratch
+# Allow placeholders so empty dirs can exist if you want them
+!data/.gitkeep
+!state/.gitkeep
+!exports/.gitkeep
+!backtests/.gitkeep
+!reports/.gitkeep
+
+# -----------------------------------------------------------------------------
+# Local backups / scratch
+# -----------------------------------------------------------------------------
 *.BROKEN_COPY
 *_BROKEN_COPY
-MAIN_WIRING_AUDIT.txt
-*WIRING_AUDIT*
-*LOCAL_NOTES*
 notes.local.*
 scratch/
 scratchpad/
@@ -179,11 +178,18 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-store/
-dist/
 .next/
 out/
 
-# -----------------------------------------------------------------------------
-# Tooling / local scripts (optional)
-# -----------------------------------------------------------------------------
-tools/
+###############################################################################
+# Notes:
+# - We intentionally do NOT ignore *.csv globally (you likely track config/whales.csv)
+# - We intentionally do NOT ignore MAIN_WIRING_AUDIT.txt (roadmap says KEEP as doc)
+###############################################################################
+
+.reports/
+
+ruff.toml
+.ruff.toml
+ruff.toml.bak
+.ruff.toml.bak

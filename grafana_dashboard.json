@@ -1,11 +1,27 @@
 {
   "dashboard": {
     "id": null,
-    "title": "Sol Sniper — Ops, PnL & Routing",
-    "tags": ["solana", "trading", "sniper"],
+    "uid": "sol-sniper-ops-pnl-routing",
+    "title": "Sol Sniper — Ops, PnL & Routing (V3+++)",
+    "tags": ["solana", "trading", "sniper", "ops", "pnl", "routing"],
     "timezone": "utc",
     "refresh": "10s",
+    "schemaVersion": 38,
+    "version": 2,
     "time": { "from": "now-24h", "to": "now" },
+    "annotations": {
+      "list": [
+        {
+          "builtIn": 1,
+          "datasource": "-- Grafana --",
+          "enable": true,
+          "hide": true,
+          "iconColor": "rgba(0, 211, 255, 1)",
+          "name": "Annotations & Alerts",
+          "type": "dashboard"
+        }
+      ]
+    },
     "templating": {
       "list": [
         {
@@ -21,7 +37,18 @@
           "type": "query",
           "datasource": "$datasource",
           "label": "DEX",
-          "query": "label_values(bot_route_used_total, dex)",
+          "query": "label_values({__name__=~\"sniper_route_used_total|bot_route_used_total\"}, dex)",
+          "refresh": 1,
+          "includeAll": true,
+          "allValue": ".*",
+          "multi": true
+        },
+        {
+          "name": "worker",
+          "type": "query",
+          "datasource": "$datasource",
+          "label": "Worker",
+          "query": "label_values({__name__=~\"sniper_worker_state|bot_worker_state\"}, worker)",
           "refresh": 1,
           "includeAll": true,
           "allValue": ".*",
@@ -31,148 +58,462 @@
     },
     "panels": [
       {
+        "type": "row",
+        "title": "PnL & Capital",
+        "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+        "id": 1
+      },
+      {
         "type": "stat",
         "title": "Equity HWM (USD)",
-        "gridPos": {"x":0,"y":0,"w":6,"h":4},
-        "targets": [{"datasource": "$datasource","expr":"bot_equity_hwm_usd"}],
-        "options": {"reduceOptions":{"calcs":["lastNotNull"]},"orientation":"horizontal"}
+        "id": 2,
+        "gridPos": { "x": 0, "y": 1, "w": 6, "h": 4 },
+        "targets": [
+          {
+            "datasource": "$datasource",
+            "expr": "max(sniper_equity_hwm_usd) or max(bot_equity_hwm_usd)",
+            "refId": "A"
+          }
+        ],
+        "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal" }
       },
       {
         "type": "stat",
         "title": "Realized PnL Today (USD)",
-        "gridPos": {"x":6,"y":0,"w":6,"h":4},
-        "targets": [{"datasource": "$datasource","expr":"bot_realized_pnl_today_usd"}],
-        "options": {"reduceOptions":{"calcs":["lastNotNull"]},"orientation":"horizontal"}
+        "id": 3,
+        "gridPos": { "x": 6, "y": 1, "w": 6, "h": 4 },
+        "targets": [
+          {
+            "datasource": "$datasource",
+            "expr": "max(sniper_realized_pnl_today_usd) or max(bot_realized_pnl_today_usd)",
+            "refId": "A"
+          }
+        ],
+        "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal" }
       },
-      {
-        "type": "gauge",
-        "title": "Winrate-20",
-        "gridPos": {"x":12,"y":0,"w":6,"h":4},
-        "targets": [{"datasource": "$datasource","expr":"bot_winrate20"}],
-        "fieldConfig":{"defaults":{"min":0,"max":1,"unit":"percentunit","thresholds":{"mode":"percentage","steps":[{"color":"red","value":null},{"color":"yellow","value":0.45},{"color":"green","value":0.5}]}}}
-      },
-      {
-        "type": "gauge",
-        "title": "Rolling Drawdown",
-        "gridPos": {"x":18,"y":0,"w":6,"h":4},
-        "targets": [{"datasource": "$datasource","expr":"bot_rolling_drawdown"}],
-        "fieldConfig":{"defaults":{"min":0,"max":0.25,"unit":"percentunit","thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"yellow","value":0.08},{"color":"red","value":0.12}]}}}
-      },
-
       {
         "type": "stat",
         "title": "Realized % of Equity (Today)",
-        "gridPos": {"x":0,"y":4,"w":6,"h":4},
+        "id": 4,
+        "gridPos": { "x": 12, "y": 1, "w": 6, "h": 4 },
         "targets": [
-          {"datasource":"$datasource","expr":"bot_realized_pnl_today_usd / clamp_min(bot_equity_hwm_usd, 1)"}
+          {
+            "datasource": "$datasource",
+            "expr": "(max(sniper_realized_pnl_today_usd) or max(bot_realized_pnl_today_usd)) / clamp_min((max(sniper_equity_hwm_usd) or max(bot_equity_hwm_usd)), 1)",
+            "refId": "A"
+          }
         ],
-        "fieldConfig":{"defaults":{"min":0,"max":0.03,"unit":"percentunit","thresholds":{"mode":"percentage","steps":[{"color":"red","value":null},{"color":"yellow","value":0.004},{"color":"green","value":0.006}]}}}
+        "fieldConfig": {
+          "defaults": {
+            "min": 0,
+            "max": 0.05,
+            "unit": "percentunit",
+            "thresholds": {
+              "mode": "percentage",
+              "steps": [
+                { "color": "red", "value": null },
+                { "color": "yellow", "value": 0.004 },
+                { "color": "green", "value": 0.006 }
+              ]
+            }
+          }
+        }
       },
       {
         "type": "stat",
         "title": "Budget Spent (Today, USD)",
-        "gridPos": {"x":6,"y":4,"w":6,"h":4},
-        "targets": [{"datasource":"$datasource","expr":"bot_spend_today_usd"}],
-        "options":{"reduceOptions":{"calcs":["lastNotNull"]}}
+        "id": 5,
+        "gridPos": { "x": 18, "y": 1, "w": 6, "h": 4 },
+        "targets": [
+          { "datasource": "$datasource", "expr": "max(sniper_spend_today_usd) or max(bot_spend_today_usd)", "refId": "A" }
+        ],
+        "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal" }
+      },
+      {
+        "type": "gauge",
+        "title": "Winrate-20",
+        "id": 6,
+        "gridPos": { "x": 0, "y": 5, "w": 6, "h": 4 },
+        "targets": [
+          { "datasource": "$datasource", "expr": "max(sniper_winrate20) or max(bot_winrate20)", "refId": "A" }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "min": 0,
+            "max": 1,
+            "unit": "percentunit",
+            "thresholds": {
+              "mode": "percentage",
+              "steps": [
+                { "color": "red", "value": null },
+                { "color": "yellow", "value": 0.45 },
+                { "color": "green", "value": 0.5 }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "type": "gauge",
+        "title": "Rolling Drawdown",
+        "id": 7,
+        "gridPos": { "x": 6, "y": 5, "w": 6, "h": 4 },
+        "targets": [
+          { "datasource": "$datasource", "expr": "max(sniper_rolling_drawdown) or max(bot_rolling_drawdown)", "refId": "A" }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "min": 0,
+            "max": 0.25,
+            "unit": "percentunit",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "color": "green", "value": null },
+                { "color": "yellow", "value": 0.08 },
+                { "color": "red", "value": 0.12 }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "type": "stat",
+        "title": "Open Positions",
+        "id": 8,
+        "gridPos": { "x": 12, "y": 5, "w": 6, "h": 4 },
+        "targets": [
+          { "datasource": "$datasource", "expr": "max(sniper_open_positions) or max(bot_open_positions)", "refId": "A" }
+        ],
+        "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal" }
       },
       {
         "type": "stat",
         "title": "Infra Halt",
-        "gridPos": {"x":12,"y":4,"w":6,"h":4},
-        "targets": [{"datasource":"$datasource","expr":"bot_infra_halt"}],
-        "fieldConfig":{"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"OK"},"1":{"text":"HALT"}}}],"thresholds":{"mode":"absolute","steps":[{"color":"green","value":0},{"color":"red","value":0.5}]}}}
+        "id": 9,
+        "gridPos": { "x": 18, "y": 5, "w": 6, "h": 4 },
+        "targets": [
+          { "datasource": "$datasource", "expr": "max(sniper_infra_halt) or max(bot_infra_halt)", "refId": "A" }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              { "type": "value", "options": { "0": { "text": "OK" }, "1": { "text": "HALT" } } }
+            ],
+            "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 0.5 } ] }
+          }
+        }
+      },
+
+      {
+        "type": "row",
+        "title": "Why it isn’t trading (Flow: Candidates → Gates → Buys → Exits)",
+        "gridPos": { "x": 0, "y": 9, "w": 24, "h": 1 },
+        "id": 20
+      },
+      {
+        "type": "timeseries",
+        "title": "Candidates Seen (rate)",
+        "id": 21,
+        "gridPos": { "x": 0, "y": 10, "w": 12, "h": 7 },
+        "targets": [
+          {
+            "datasource": "$datasource",
+            "expr": "sum(rate(sniper_candidates_seen_total[5m])) or sum(rate(bot_candidates_seen_total[5m]))",
+            "legendFormat": "candidates/s",
+            "refId": "A"
+          }
+        ]
+      },
+      {
+        "type": "timeseries",
+        "title": "Gate outcomes (rate): pass / reject",
+        "id": 22,
+        "gridPos": { "x": 12, "y": 10, "w": 12, "h": 7 },
+        "targets": [
+          {
+            "datasource": "$datasource",
+            "expr": "sum(rate(sniper_entry_gate_pass_total[5m])) or sum(rate(bot_entry_gate_pass_total[5m]))",
+            "legendFormat": "pass/s",
+            "refId": "A"
+          },
+          {
+            "datasource": "$datasource",
+            "expr": "sum(rate(sniper_entry_gate_reject_total[5m])) or sum(rate(bot_entry_gate_reject_total[5m]))",
+            "legendFormat": "reject/s",
+            "refId": "B"
+          }
+        ]
+      },
+      {
+        "type": "timeseries",
+        "title": "Buys & Sells (rate)",
+        "id": 23,
+        "gridPos": { "x": 0, "y": 17, "w": 12, "h": 7 },
+        "targets": [
+          {
+            "datasource": "$datasource",
+            "expr": "sum(rate(sniper_buys_total[5m])) or sum(rate(bot_buys_total[5m]))",
+            "legendFormat": "buys/s",
+            "refId": "A"
+          },
+          {
+            "datasource": "$datasource",
+            "expr": "sum(rate(sniper_sells_total[5m])) or sum(rate(bot_sells_total[5m]))",
+            "legendFormat": "sells/s",
+            "refId": "B"
+          }
+        ]
+      },
+      {
+        "type": "timeseries",
+        "title": "Reject reasons (top) — if labeled",
+        "id": 24,
+        "gridPos": { "x": 12, "y": 17, "w": 12, "h": 7 },
+        "targets": [
+          {
+            "datasource": "$datasource",
+            "expr": "topk(8, sum by (reason) (rate(sniper_entry_gate_reject_total[15m]))) or topk(8, sum by (reason) (rate(bot_entry_gate_reject_total[15m])))",
+            "legendFormat": "{{reason}}",
+            "refId": "A"
+          }
+        ]
+      },
+
+      {
+        "type": "row",
+        "title": "Routing & Swap Health",
+        "gridPos": { "x": 0, "y": 24, "w": 24, "h": 1 },
+        "id": 30
       },
       {
         "type": "stat",
         "title": "Watchdog Hit Rate (6h, all DEX)",
-        "gridPos": {"x":18,"y":4,"w":6,"h":4},
+        "id": 31,
+        "gridPos": { "x": 0, "y": 25, "w": 6, "h": 4 },
         "targets": [
-          {"datasource":"$datasource","expr":"sum(increase(bot_route_watchdog_hits_total[6h])) / clamp_min(sum(increase(bot_route_used_total[6h])),1)"}
+          {
+            "datasource": "$datasource",
+            "expr": "sum(increase(sniper_route_watchdog_hits_total[6h])) / clamp_min(sum(increase(sniper_route_used_total[6h])),1) or (sum(increase(bot_route_watchdog_hits_total[6h])) / clamp_min(sum(increase(bot_route_used_total[6h])),1))",
+            "refId": "A"
+          }
         ],
-        "fieldConfig":{"defaults":{"min":0,"max":0.1,"unit":"percentunit","thresholds":{"mode":"percentage","steps":[{"color":"green","value":null},{"color":"yellow","value":0.02},{"color":"red","value":0.05}]}}}
+        "fieldConfig": {
+          "defaults": {
+            "min": 0,
+            "max": 0.1,
+            "unit": "percentunit",
+            "thresholds": {
+              "mode": "percentage",
+              "steps": [
+                { "color": "green", "value": null },
+                { "color": "yellow", "value": 0.02 },
+                { "color": "red", "value": 0.05 }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "type": "stat",
+        "title": "Route Success (15m)",
+        "id": 32,
+        "gridPos": { "x": 6, "y": 25, "w": 6, "h": 4 },
+        "targets": [
+          {
+            "datasource": "$datasource",
+            "expr": "(sum(increase(sniper_route_used_total[15m])) - sum(increase(sniper_route_watchdog_hits_total[15m]))) / clamp_min(sum(increase(sniper_route_used_total[15m])),1) or (((sum(increase(bot_route_used_total[15m])) - sum(increase(bot_route_watchdog_hits_total[15m]))) / clamp_min(sum(increase(bot_route_used_total[15m])),1)))",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": { "defaults": { "min": 0, "max": 1, "unit": "percentunit" } }
+      },
+      {
+        "type": "stat",
+        "title": "Router Errors (15m)",
+        "id": 33,
+        "gridPos": { "x": 12, "y": 25, "w": 6, "h": 4 },
+        "targets": [
+          {
+            "datasource": "$datasource",
+            "expr": "sum(increase(sniper_router_errors_total[15m])) or sum(increase(bot_router_errors_total[15m]))",
+            "refId": "A"
+          }
+        ],
+        "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal" }
+      },
+      {
+        "type": "stat",
+        "title": "Swap Failures (15m)",
+        "id": 34,
+        "gridPos": { "x": 18, "y": 25, "w": 6, "h": 4 },
+        "targets": [
+          {
+            "datasource": "$datasource",
+            "expr": "sum(increase(sniper_swap_fail_total[15m])) or sum(increase(bot_swap_fail_total[15m]))",
+            "refId": "A"
+          }
+        ],
+        "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal" }
+      },
+      {
+        "type": "barchart",
+        "title": "Route usage vs watchdog hits (by DEX)",
+        "id": 35,
+        "gridPos": { "x": 0, "y": 29, "w": 12, "h": 8 },
+        "options": { "legend": { "displayMode": "table" }, "orientation": "horizontal" },
+        "targets": [
+          {
+            "datasource": "$datasource",
+            "expr": "(sniper_route_used_total{dex=~\"$dex\"} or bot_route_used_total{dex=~\"$dex\"})",
+            "legendFormat": "used {{dex}}",
+            "refId": "A"
+          },
+          {
+            "datasource": "$datasource",
+            "expr": "(sniper_route_watchdog_hits_total{dex=~\"$dex\"} or bot_route_watchdog_hits_total{dex=~\"$dex\"})",
+            "legendFormat": "watchdog {{dex}}",
+            "refId": "B"
+          }
+        ]
+      },
+      {
+        "type": "timeseries",
+        "title": "Quote / Swap latency (if histograms exist)",
+        "id": 36,
+        "gridPos": { "x": 12, "y": 29, "w": 12, "h": 8 },
+        "targets": [
+          {
+            "datasource": "$datasource",
+            "expr": "histogram_quantile(0.50, sum by (le) (rate(sniper_quote_latency_seconds_bucket[10m]))) or histogram_quantile(0.50, sum by (le) (rate(bot_quote_latency_seconds_bucket[10m])))",
+            "legendFormat": "quote p50 (s)",
+            "refId": "A"
+          },
+          {
+            "datasource": "$datasource",
+            "expr": "histogram_quantile(0.90, sum by (le) (rate(sniper_quote_latency_seconds_bucket[10m]))) or histogram_quantile(0.90, sum by (le) (rate(bot_quote_latency_seconds_bucket[10m])))",
+            "legendFormat": "quote p90 (s)",
+            "refId": "B"
+          },
+          {
+            "datasource": "$datasource",
+            "expr": "histogram_quantile(0.50, sum by (le) (rate(sniper_swap_latency_seconds_bucket[10m]))) or histogram_quantile(0.50, sum by (le) (rate(bot_swap_latency_seconds_bucket[10m])))",
+            "legendFormat": "swap p50 (s)",
+            "refId": "C"
+          },
+          {
+            "datasource": "$datasource",
+            "expr": "histogram_quantile(0.90, sum by (le) (rate(sniper_swap_latency_seconds_bucket[10m]))) or histogram_quantile(0.90, sum by (le) (rate(bot_swap_latency_seconds_bucket[10m])))",
+            "legendFormat": "swap p90 (s)",
+            "refId": "D"
+          }
+        ]
       },
 
       {
-        "type": "timeseries",
-        "title": "Daily Spend vs. Realized",
-        "gridPos": {"x":0,"y":8,"w":12,"h":8},
-        "targets": [
-          {"datasource":"$datasource","expr":"bot_spend_today_usd","legendFormat":"Spend (USD)"},
-          {"datasource":"$datasource","expr":"bot_realized_pnl_today_usd","legendFormat":"Realized (USD)"}
-        ]
+        "type": "row",
+        "title": "Workers & Heartbeats",
+        "gridPos": { "x": 0, "y": 37, "w": 24, "h": 1 },
+        "id": 40
       },
       {
         "type": "state-timeline",
         "title": "Worker States",
-        "gridPos": {"x":12,"y":8,"w":12,"h":8},
+        "id": 41,
+        "gridPos": { "x": 0, "y": 38, "w": 12, "h": 8 },
         "targets": [
-          {"datasource":"$datasource","expr":"bot_worker_state{worker=\"sniper\"}"},
-          {"datasource":"$datasource","expr":"bot_worker_state{worker=\"velocity\"}"},
-          {"datasource":"$datasource","expr":"bot_worker_state{worker=\"hotlist\"}"},
-          {"datasource":"$datasource","expr":"bot_worker_state{worker=\"whales\"}"},
-          {"datasource":"$datasource","expr":"bot_worker_state{worker=\"scalper\"}"}
+          {
+            "datasource": "$datasource",
+            "expr": "(sniper_worker_state{worker=~\"$worker\"} or bot_worker_state{worker=~\"$worker\"})",
+            "refId": "A"
+          }
         ],
-        "options":{"legend":{"show":true}, "rowHeight":24, "mergeValues":true}
+        "options": { "legend": { "show": true }, "rowHeight": 24, "mergeValues": true }
+      },
+      {
+        "type": "timeseries",
+        "title": "Heartbeats / Liveness (rate or last)",
+        "id": 42,
+        "gridPos": { "x": 12, "y": 38, "w": 12, "h": 8 },
+        "targets": [
+          {
+            "datasource": "$datasource",
+            "expr": "sum(rate(sniper_heartbeat_total[5m])) or sum(rate(bot_heartbeat_total[5m]))",
+            "legendFormat": "heartbeat/s",
+            "refId": "A"
+          },
+          {
+            "datasource": "$datasource",
+            "expr": "max(sniper_last_heartbeat_unix) or max(bot_last_heartbeat_unix)",
+            "legendFormat": "last_heartbeat_unix",
+            "refId": "B"
+          }
+        ]
       },
 
       {
-        "type": "barchart",
-        "title": "Route usage vs watchdog hits (by DEX)",
-        "gridPos": {"x":0,"y":16,"w":12,"h":8},
-        "options": {"legend": {"displayMode": "table"}, "orientation":"horizontal"},
-        "targets": [
-          {"datasource":"$datasource","expr":"bot_route_used_total{dex=~\"$dex\"}","legendFormat":"used {{dex}}"},
-          {"datasource":"$datasource","expr":"bot_route_watchdog_hits_total{dex=~\"$dex\"}","legendFormat":"watchdog {{dex}}"}
-        ]
+        "type": "row",
+        "title": "Playbook / Strategy Levers",
+        "gridPos": { "x": 0, "y": 46, "w": 24, "h": 1 },
+        "id": 50
       },
       {
         "type": "table",
         "title": "Playbook — Lever values (current)",
-        "gridPos": {"x":12,"y":16,"w":12,"h":8},
+        "id": 51,
+        "gridPos": { "x": 0, "y": 47, "w": 12, "h": 8 },
         "targets": [
-          {"datasource":"$datasource","expr":"bot_lever_value","instant": true}
+          { "datasource": "$datasource", "expr": "sniper_lever_value or bot_lever_value", "instant": true, "refId": "A" }
         ],
-        "transformations": [
-          {"id":"labelsToFields"}
-        ],
+        "transformations": [ { "id": "labelsToFields" } ],
         "options": { "showHeader": true }
       },
-
       {
         "type": "table",
         "title": "Playbook — Last change & changes total",
-        "gridPos": {"x":0,"y":24,"w":12,"h":8},
+        "id": 52,
+        "gridPos": { "x": 12, "y": 47, "w": 12, "h": 8 },
         "targets": [
-          {"datasource":"$datasource","expr":"bot_lever_last_change","instant": true},
-          {"datasource":"$datasource","expr":"bot_lever_change_total","instant": true}
+          { "datasource": "$datasource", "expr": "sniper_lever_last_change or bot_lever_last_change", "instant": true, "refId": "A" },
+          { "datasource": "$datasource", "expr": "sniper_lever_change_total or bot_lever_change_total", "instant": true, "refId": "B" }
         ],
-        "transformations": [
-          {"id":"labelsToFields"}
-        ],
+        "transformations": [ { "id": "labelsToFields" } ],
         "options": { "showHeader": true },
         "fieldConfig": {
           "defaults": { "unit": "dateTimeAsIso" },
           "overrides": [
-            {
-              "matcher": { "id":"byRegexp","options":"Value" },
-              "properties": [{ "id":"unit","value":"none" }]
-            }
+            { "matcher": { "id": "byRegexp", "options": "Value" }, "properties": [ { "id": "unit", "value": "none" } ] }
           ]
         }
       },
 
       {
+        "type": "row",
+        "title": "Trades & Performance",
+        "gridPos": { "x": 0, "y": 55, "w": 24, "h": 1 },
+        "id": 60
+      },
+      {
+        "type": "timeseries",
+        "title": "Daily Spend vs. Realized",
+        "id": 61,
+        "gridPos": { "x": 0, "y": 56, "w": 12, "h": 7 },
+        "targets": [
+          { "datasource": "$datasource", "expr": "max(sniper_spend_today_usd) or max(bot_spend_today_usd)", "legendFormat": "Spend (USD)", "refId": "A" },
+          { "datasource": "$datasource", "expr": "max(sniper_realized_pnl_today_usd) or max(bot_realized_pnl_today_usd)", "legendFormat": "Realized (USD)", "refId": "B" }
+        ]
+      },
+      {
         "type": "timeseries",
         "title": "Trades / Wins (cumulative)",
-        "gridPos": {"x":12,"y":24,"w":12,"h":8},
+        "id": 62,
+        "gridPos": { "x": 12, "y": 56, "w": 12, "h": 7 },
         "targets": [
-          {"datasource":"$datasource","expr":"bot_trades_total","legendFormat":"Trades"},
-          {"datasource":"$datasource","expr":"bot_wins_total","legendFormat":"Wins"}
+          { "datasource": "$datasource", "expr": "max(sniper_trades_total) or max(bot_trades_total)", "legendFormat": "Trades", "refId": "A" },
+          { "datasource": "$datasource", "expr": "max(sniper_wins_total) or max(bot_wins_total)", "legendFormat": "Wins", "refId": "B" }
         ]
       }
-    ],
-    "schemaVersion": 38,
-    "version": 1
+    ]
   },
   "overwrite": true
 }

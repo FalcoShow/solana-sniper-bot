@@ -6,96 +6,98 @@ utils_pkg/data_logger.py
 God-Tier V3+++ Data Logger (Phase 0–7 LOCK-IN)
 =============================================
 
-Single logging API for the whole stack.
+Canonical persistence + observability layer for:
+  - entry_candidates (every candidate seen, bought or skipped)
+  - entry_outcomes   (labels/outcomes + PnL truth)
+  - trades, positions, exit_state
+  - risk_events, health_heartbeats (regime / equity / risk manager / reinvestor)
 
-Schema targets (aligned to your check_schema / ai_db schema):
-  - candidate_events   (all candidates + features in ui JSONB)
-  - trades             (executions/fills; best-effort idempotent via ON CONFLICT)
-  - positions          (upsert)
-  - exit_state         (upsert)
-  - risk_events        (AI/risk/decision/outcome events)
-  - health_heartbeats  (snapshots: regime/equity/risk/reinvestor/heartbeat)
+Design goals
+------------
+- Never takes the bot down unless AI_LOG_STRICT=1
+- Bounded async writer queue (prevents task storms)
+- Schema self-healing (CREATE TABLE IF NOT EXISTS + additive ALTERs)
+- DSN handling: prefer utils_pkg.ai_db; fallback to asyncpg pool
+- Payload safety: redaction + size caps + feature key caps
+- Sampling + src/regime allow-lists to control volume
 
-Hard rules
-----------
-- Safe by default (sampling, payload caps, redaction).
-- Non-blocking in async loops (fire-and-forget) by default.
-- Deterministic sampling (stable hash).
-- DB failures are swallowed if AI_LOG_STRICT=0.
-- Prefers utils_pkg.ai_db for DB access if available; otherwise uses asyncpg pool.
-
-Recommended usage
------------------
-- In hot loops: use sync wrappers (fire-and-forget).
-- When you NEED an id: call the async variants (a_log_*).
+Important usage contract
+------------------------
+- In async code: prefer the async APIs (a_log_*) to receive candidate_id immediately.
+- Sync wrappers (log_*) are fire-and-forget when called from inside a running loop.
 """
 
 import asyncio
+import contextlib
 import inspect
 import json
 import os
 import socket
 import time
 import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 from logging_setup import get_logger
 
-# Optional imports (soft hooks)
+# Optional imports (must not crash import)
+try:
+    from utils_pkg import ai_db as _ai_db  # type: ignore
+except Exception:  # pragma: no cover
+    _ai_db = None  # type: ignore
+
 try:
     from utils_pkg import feature_builder  # type: ignore
 except Exception:  # pragma: no cover
     feature_builder = None  # type: ignore
 
 try:
-    from utils_pkg import ai_db as _ai_db  # type: ignore
+    from utils_pkg import core_utils as cu  # type: ignore
 except Exception:  # pragma: no cover
-    _ai_db = None  # type: ignore
+    cu = None  # type: ignore
 
 log = get_logger(__name__)
 
-# logging safety shim (so .every always exists)
 if not hasattr(log, "every"):
 
     def _every(_key: str, n: int = 60) -> bool:
         return True
 
-    setattr(log, "every", _every)
+    log.every = _every  # type: ignore[attr-defined]
+
 
 __all__ = [
-    # candidates
-    "log_entry_candidate",
-    "log_buy_candidate",
-    "log_skip_candidate",
-    "log_entry_decision_update",
-    "log_entry_outcome",
-    # async variants (when you need ids)
+    "a_enqueue_paper_label",
     "a_log_entry_candidate",
-    "a_log_trade_execution",
     "a_log_entry_decision_update",
     "a_log_entry_outcome",
-    # per-source wrappers
-    "log_raydium_candidate",
-    "log_pumpfun_candidate",
-    "log_dexscreener_candidate",
-    "log_momo_candidate",
-    # executions + state
-    "log_trade_execution",
-    "log_position_upsert",
-    "log_exit_state_upsert",
+    "a_log_trade_execution",
+    "close_logger",
+    # paper-label queue helpers
+    "enqueue_paper_label",
+    # lifecycle
+    "ensure_schema",
     # events / snapshots
     "log_ai_event",
-    "log_regime_snapshot",
+    "log_buy_candidate",
+    # candidates
+    "log_entry_candidate",
+    "log_entry_decision_update",
+    "log_entry_outcome",
     "log_equity_curve_point",
-    "log_risk_manager_snapshot",
+    "log_exit_state_upsert",
+    "log_position_upsert",
+    "log_regime_snapshot",
     "log_reinvestor_snapshot",
-    # lifecycle
-    "close_logger",
+    "log_risk_manager_snapshot",
+    "log_skip_candidate",
+    # executions + state
+    "log_trade_execution",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Env helpers / flags
+# Env helpers
 # ──────────────────────────────────────────────────────────────────────────────
 _TRUE = {"1", "true", "yes", "y", "on", "t"}
 _FALSE = {"0", "false", "no", "n", "off", "f"}
@@ -134,12 +136,11 @@ def _envf(k: str, d: float) -> float:
 
 # Master toggles
 PG_ENABLED = _envb("PG_ENABLED", True)
-AI_LOG_STRICT = _envb("AI_LOG_STRICT", True)
+AI_LOG_STRICT = _envb("AI_LOG_STRICT", False)
 
 AI_LOG_CANDIDATES = _envb("AI_LOG_CANDIDATES", True)
-AI_LOG_OUTCOMES = _envb("AI_LOG_OUTCOMES", True)
 AI_LOG_SKIPS = _envb("AI_LOG_SKIPS", True)
-
+AI_LOG_OUTCOMES = _envb("AI_LOG_OUTCOMES", True)
 AI_LOG_EXECUTIONS = _envb("AI_LOG_EXECUTIONS", True)
 AI_LOG_EVENTS = _envb("AI_LOG_EVENTS", True)
 AI_LOG_SNAPSHOTS = _envb("AI_LOG_SNAPSHOTS", True)
@@ -156,39 +157,35 @@ AI_LOG_SNAPSHOT_SAMPLE_RATE = _envf("AI_LOG_SNAPSHOT_SAMPLE_RATE", 1.0)
 AI_LOG_SRC_FILTER = _envs("AI_LOG_SRC_FILTER", "")
 AI_LOG_REGIME_FILTER = _envs("AI_LOG_REGIME_FILTER", "")
 
-_SRC_ALLOW: Optional[set[str]] = None
-_REGIME_ALLOW: Optional[set[str]] = None
+_SRC_ALLOW: set[str] | None = None
+_REGIME_ALLOW: set[str] | None = None
 if AI_LOG_SRC_FILTER:
     _SRC_ALLOW = {s.strip() for s in AI_LOG_SRC_FILTER.split(",") if s.strip()}
 if AI_LOG_REGIME_FILTER:
     _REGIME_ALLOW = {s.strip() for s in AI_LOG_REGIME_FILTER.split(",") if s.strip()}
 
-# Payload caps (JSONB size control)
+# Payload caps
 AI_LOG_MAX_UI_BYTES = _envi("AI_LOG_MAX_UI_BYTES", 60_000)
 AI_LOG_MAX_FEATURE_KEYS = _envi("AI_LOG_MAX_FEATURE_KEYS", 450)
-AI_LOG_HISTORY_IN_UI = _envb("AI_LOG_HISTORY_IN_UI", False)
-AI_LOG_HISTORY_MAX_LEN = _envi("AI_LOG_HISTORY_MAX_LEN", 80)
-
-# Basic liquidity/volume hard filters (logger-level)
-AI_LOG_MIN_LIQ_USD = _envf("AI_LOG_MIN_LIQ_USD", 0.0)
-AI_LOG_MIN_VOL5_USD = _envf("AI_LOG_MIN_VOL5_USD", 0.0)
-
-# Metadata tags (helpful for offline analytics)
-AI_POLICY_VERSION = _envs("AI_POLICY_VERSION", "")
-AI_EXPERIMENT_TAG = _envs("AI_EXPERIMENT_TAG", "")
-AI_CODE_VERSION = _envs("AI_CODE_VERSION", "")
-AI_STACK_PROFILE = _envs("AI_STACK_PROFILE", "")
-
-SERVICE_NAME = _envs("SERVICE_NAME", "sniper")
-SERVICE_VERSION = _envs("SERVICE_VERSION", _envs("VERSION", "v1"))
-
-# DB tuning (fallback pool path only)
-AI_PG_POOL_MIN = _envi("AI_PG_POOL_MIN", 1)
-AI_PG_POOL_MAX = _envi("AI_PG_POOL_MAX", 3)
-AI_PG_STATEMENT_TIMEOUT_MS = _envi("AI_PG_STATEMENT_TIMEOUT_MS", 15_000)
 
 # Circuit breaker
 AI_LOG_DISABLE_AFTER_FAILS = _envi("AI_LOG_DISABLE_AFTER_FAILS", 25)
+
+# Async writer queue
+AI_LOG_QUEUE_ENABLED = _envb("AI_LOG_QUEUE_ENABLED", True)
+AI_LOG_QUEUE_MAX = _envi("AI_LOG_QUEUE_MAX", 2500)
+AI_LOG_QUEUE_DROP_NEW = _envb("AI_LOG_QUEUE_DROP_NEW", True)
+
+# Schema ensure
+AI_LOG_ENSURE_SCHEMA = _envb("AI_LOG_ENSURE_SCHEMA", True)
+AI_LOG_SCHEMA_BACKFILL_TS = _envb("AI_LOG_SCHEMA_BACKFILL_TS", True)
+
+# Paper-label enqueue hook
+PAPER_LABEL_ENQUEUE_ON_SKIP = _envb("PAPER_LABEL_ENQUEUE_ON_SKIP", False)
+PAPER_LABEL_INBOX_KEY = _envs("PAPER_LABEL_INBOX_KEY", "paper_label:inbox")
+
+SERVICE_NAME = _envs("SERVICE_NAME", "sniper")
+SERVICE_VERSION = _envs("SERVICE_VERSION", _envs("VERSION", "v1"))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FeatureBuilder (soft hook)
@@ -202,7 +199,7 @@ if feature_builder is not None:
         _FB = None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DB backend (prefer ai_db; fallback asyncpg pool)
+# DB backend (prefer ai_db; fallback asyncpg)
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     import asyncpg  # type: ignore
@@ -211,8 +208,12 @@ except Exception:  # pragma: no cover
 
 _POOL = None
 _POOL_LOCK = asyncio.Lock()
+
 _DB_FAILS = 0
 _DB_DISABLED = False
+
+_SCHEMA_READY = False
+_SCHEMA_LOCK = asyncio.Lock()
 
 
 def _ts() -> str:
@@ -220,6 +221,7 @@ def _ts() -> str:
 
 
 def _stable_hash01(s: str) -> float:
+    # deterministic, stable, fast (no PYTHONHASHSEED dependence)
     h = 0
     for ch in s:
         h = (h * 31 + ord(ch)) & 0xFFFFFFFF
@@ -234,95 +236,24 @@ def _should_sample(key: str, rate: float) -> bool:
     return _stable_hash01(key) < rate
 
 
-def _src_regime_allowed(src: str, regime: Optional[str]) -> bool:
+def _src_regime_allowed(src: str, regime: str | None) -> bool:
     if _SRC_ALLOW is not None and src not in _SRC_ALLOW:
         return False
-    if _REGIME_ALLOW is not None and regime is not None and regime not in _REGIME_ALLOW:
-        return False
-    return True
+    return not (_REGIME_ALLOW is not None and regime is not None and regime not in _REGIME_ALLOW)
 
 
-def _redact_url(dsn: str) -> str:
-    if not dsn:
-        return ""
-    try:
-        import re as _re
-
-        return _re.sub(r"(://)[^/@]+@", r"\1***@", dsn.strip())
-    except Exception:
-        return dsn
+def _db_disabled() -> bool:
+    return (not PG_ENABLED) or _DB_DISABLED
 
 
-def _host_from_dsn(dsn: str) -> str:
-    after_at = dsn.split("@", 1)[-1]
-    hostport = after_at.split("/", 1)[0]
-    return hostport.split(":", 1)[0].strip()
-
-
-def _resolves(host: str) -> bool:
-    try:
-        socket.getaddrinfo(host, None)
-        return True
-    except OSError:
-        return False
-
-
-def _has_param(dsn: str, key: str) -> bool:
-    if "?" not in dsn:
-        return False
-    q = dsn.split("?", 1)[1]
-    for part in q.split("&"):
-        if not part.strip():
-            continue
-        k = part.split("=", 1)[0].strip().lower()
-        if k == key.lower():
-            return True
-    return False
-
-
-def _ensure_sslmode_require(dsn: str) -> str:
-    dsn = dsn.replace("ssl=true", "sslmode=require")
-    if _has_param(dsn, "sslmode"):
-        return dsn
-    return dsn + ("&sslmode=require" if "?" in dsn else "?sslmode=require")
-
-
-def _normalize_asyncpg_dsn(raw: str) -> str:
-    v = (raw or "").strip()
-    if v.startswith("postgresql+asyncpg://"):
-        v = "postgresql://" + v[len("postgresql+asyncpg://") :]
-    if v.startswith("postgres://"):
-        v = "postgresql://" + v[len("postgres://") :]
-    host = _host_from_dsn(v)
-    if host.endswith(".render.com") or "postgres.render.com" in host:
-        v = _ensure_sslmode_require(v)
-    return v
-
-
-def _candidate_dsns() -> list[Tuple[str, str]]:
-    keys = ["PNL_DSN", "PG_DSN", "DATABASE_URL", "PG_DSN_INTERNAL", "PG_DSN_EXTERNAL"]
-    out: list[Tuple[str, str]] = []
-    for k in keys:
-        v = _envs(k, "")
-        if v:
-            out.append((k, v))
-    return out
-
-
-def _pick_best_dsn() -> Tuple[str, str]:
-    cands = _candidate_dsns()
-    if not cands:
-        return "", ""
-    resolved: list[Tuple[str, str]] = []
-    for label, raw in cands:
-        dsn = _normalize_asyncpg_dsn(raw)
-        host = _host_from_dsn(dsn)
-        if host and _resolves(host):
-            resolved.append((label, dsn))
-    if resolved:
-        return resolved[0][0], resolved[0][1]
-    label, raw = cands[0]
-    return label, _normalize_asyncpg_dsn(raw)
+def _bump_db_fail(e: Exception) -> None:
+    global _DB_FAILS, _DB_DISABLED
+    _DB_FAILS += 1
+    if log.every("data_logger_db_fail", 30):  # type: ignore[attr-defined]
+        log.warning("data_logger: db error (fails=%s): %s", _DB_FAILS, repr(e))
+    if max(1, AI_LOG_DISABLE_AFTER_FAILS) <= _DB_FAILS:
+        _DB_DISABLED = True
+        log.error("data_logger: disabling DB logging after too many failures (%s)", _DB_FAILS)
 
 
 def _call_with_accepted_kwargs(fn: Any, **kwargs: Any) -> Any:
@@ -334,31 +265,62 @@ def _call_with_accepted_kwargs(fn: Any, **kwargs: Any) -> Any:
     return fn(**filtered)
 
 
-async def _ai_db_conn() -> Any:
-    """
-    Best-effort adapter to ai_db.
-    We support common helper shapes without assuming an exact signature.
-    """
-    if _ai_db is None:
-        raise RuntimeError("ai_db not available")
+async def _ai_db_execute_raw(sql: str, *args: Any) -> Any:
+    if _ai_db is None or not hasattr(_ai_db, "execute"):
+        raise RuntimeError("ai_db.execute not available")
+    fn = _ai_db.execute
+    try:
+        return await fn(sql, *args)
+    except TypeError:
+        return await _call_with_accepted_kwargs(fn, sql=sql, args=args)
 
-    # pool getter
-    for name in ("get_pool_async", "get_pool", "pool", "get_asyncpg_pool"):
-        if hasattr(_ai_db, name):
-            obj = getattr(_ai_db, name)
-            pool = await obj() if asyncio.iscoroutinefunction(obj) else obj()
-            if pool is not None:
-                return pool.acquire()
 
-    # connection getter
-    for name in ("connect", "get_conn", "acquire", "conn"):
-        if hasattr(_ai_db, name):
-            obj = getattr(_ai_db, name)
-            cm = await obj() if asyncio.iscoroutinefunction(obj) else obj()
-            # if it's already a context manager, return it
-            return cm
+async def _ai_db_fetchrow_raw(sql: str, *args: Any) -> Any:
+    if _ai_db is None or not hasattr(_ai_db, "fetchrow"):
+        raise RuntimeError("ai_db.fetchrow not available")
+    fn = _ai_db.fetchrow
+    try:
+        return await fn(sql, *args)
+    except TypeError:
+        return await _call_with_accepted_kwargs(fn, sql=sql, args=args)
 
-    raise RuntimeError("ai_db present but no usable connection/pool helper found")
+
+def _candidate_dsns() -> list[tuple[str, str]]:
+    keys = [
+        "PNL_DSN",
+        "POSTGRES_DSN",
+        "PG_DSN",
+        "DATABASE_URL",
+        "PG_DSN_INTERNAL",
+        "PG_DSN_EXTERNAL",
+        "PG_DSN_PUBLIC",
+    ]
+    out: list[tuple[str, str]] = []
+    for k in keys:
+        v = _envs(k, "")
+        if v:
+            out.append((k, v))
+    return out
+
+
+def _normalize_asyncpg_dsn(raw: str) -> str:
+    v = (raw or "").strip()
+    if v.startswith("postgresql+asyncpg://"):
+        v = "postgresql://" + v[len("postgresql+asyncpg://") :]
+    if v.startswith("postgres://"):
+        v = "postgresql://" + v[len("postgres://") :]
+    # Render typically requires SSL; safe to append (asyncpg accepts sslmode)
+    if "sslmode=" not in v:
+        v = v + ("&sslmode=require" if "?" in v else "?sslmode=require")
+    return v
+
+
+def _pick_best_dsn() -> tuple[str, str]:
+    cands = _candidate_dsns()
+    if not cands:
+        return "", ""
+    label, raw = cands[0]
+    return label, _normalize_asyncpg_dsn(raw)
 
 
 async def _fallback_get_pool() -> Any:
@@ -370,98 +332,363 @@ async def _fallback_get_pool() -> Any:
     async with _POOL_LOCK:
         if _POOL is not None:
             return _POOL
-
         label, dsn = _pick_best_dsn()
         if not dsn:
-            raise RuntimeError("No DSN found (set PNL_DSN or PG_DSN or DATABASE_URL)")
-
-        log.debug("data_logger: creating asyncpg pool dsn_source=%s dsn=%s", label, _redact_url(dsn))
-
-        async def _init(conn: Any) -> None:
-            try:
-                await conn.execute(f"SET statement_timeout = {int(AI_PG_STATEMENT_TIMEOUT_MS)};")
-            except Exception:
-                pass
-
-        _POOL = await asyncpg.create_pool(
-            dsn=dsn,
-            min_size=max(1, int(AI_PG_POOL_MIN)),
-            max_size=max(1, int(AI_PG_POOL_MAX)),
-            init=_init,
-        )
+            raise RuntimeError("No DSN found (set POSTGRES_DSN/PNL_DSN/PG_DSN/DATABASE_URL)")
+        log.debug("data_logger: creating asyncpg pool dsn_source=%s", label)
+        _POOL = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=3)
         return _POOL
 
 
 @dataclass(frozen=True)
 class _DB:
-    """
-    Internal db executor facade.
-    """
-
     use_ai_db: bool
 
-    async def execute(self, sql: str, *args: Any) -> str:
-        if self.use_ai_db:
-            # Try ai_db helper execute first
-            if hasattr(_ai_db, "execute"):
-                fn = getattr(_ai_db, "execute")
-                return await _call_with_accepted_kwargs(fn, sql=sql, args=args)
-            # Otherwise acquire connection context manager and execute
-            async with (await _ai_db_conn()) as conn:
-                return await conn.execute(sql, *args)
-
+    async def execute_raw(self, sql: str, *args: Any) -> Any:
+        if self.use_ai_db and _ai_db is not None:
+            return await _ai_db_execute_raw(sql, *args)
         p = await _fallback_get_pool()
         async with p.acquire() as conn:
             return await conn.execute(sql, *args)
 
-    async def fetchrow(self, sql: str, *args: Any) -> Any:
-        if self.use_ai_db:
-            if hasattr(_ai_db, "fetchrow"):
-                fn = getattr(_ai_db, "fetchrow")
-                return await _call_with_accepted_kwargs(fn, sql=sql, args=args)
-            async with (await _ai_db_conn()) as conn:
-                return await conn.fetchrow(sql, *args)
-
+    async def fetchrow_raw(self, sql: str, *args: Any) -> Any:
+        if self.use_ai_db and _ai_db is not None:
+            return await _ai_db_fetchrow_raw(sql, *args)
         p = await _fallback_get_pool()
         async with p.acquire() as conn:
             return await conn.fetchrow(sql, *args)
 
+    async def execute(self, sql: str, *args: Any) -> Any:
+        await _ensure_schema_once(self)
+        return await self.execute_raw(sql, *args)
+
+    async def fetchrow(self, sql: str, *args: Any) -> Any:
+        await _ensure_schema_once(self)
+        return await self.fetchrow_raw(sql, *args)
+
 
 _DBX = _DB(use_ai_db=(_ai_db is not None))
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Schema (aligned to psql sanity checks: entry_candidates.ts, entry_outcomes.outcome_label)
+# ──────────────────────────────────────────────────────────────────────────────
+_SCHEMA_SQL = [
+    # entry_candidates
+    """
+    CREATE TABLE IF NOT EXISTS entry_candidates (
+      id BIGSERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      ts TIMESTAMPTZ,
+      mint TEXT NOT NULL,
+      symbol TEXT NOT NULL DEFAULT '',
+      source TEXT NOT NULL,
+      regime TEXT NOT NULL DEFAULT '',
+      pool TEXT NOT NULL DEFAULT '',
+      decision TEXT NOT NULL DEFAULT '',
+      ai_ok BOOLEAN,
+      ai_score DOUBLE PRECISION,
+      outcome_label TEXT,
+      outcome_pnl_pct DOUBLE PRECISION,
+      outcome_ts TIMESTAMPTZ,
+      ui JSONB
+    );
+    """,
+    "ALTER TABLE entry_candidates ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ;",
+    "ALTER TABLE entry_candidates ADD COLUMN IF NOT EXISTS outcome_label TEXT;",
+    "ALTER TABLE entry_candidates ADD COLUMN IF NOT EXISTS outcome_pnl_pct DOUBLE PRECISION;",
+    "ALTER TABLE entry_candidates ADD COLUMN IF NOT EXISTS outcome_ts TIMESTAMPTZ;",
+    "CREATE INDEX IF NOT EXISTS idx_entry_candidates_ts ON entry_candidates (COALESCE(ts, created_at) DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_entry_candidates_mint_ts ON entry_candidates (mint, COALESCE(ts, created_at) DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_entry_candidates_decision_ts ON entry_candidates (decision, COALESCE(ts, created_at) DESC);",
+    # entry_outcomes
+    """
+    CREATE TABLE IF NOT EXISTS entry_outcomes (
+      id BIGSERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      ts TIMESTAMPTZ,
+      candidate_id BIGINT,
+      mint TEXT NOT NULL DEFAULT '',
+      outcome_label TEXT NOT NULL DEFAULT '',
+      pnl_pct DOUBLE PRECISION,
+      hold_sec DOUBLE PRECISION,
+      got_stopped BOOLEAN,
+      notes TEXT NOT NULL DEFAULT '',
+      extra JSONB
+    );
+    """,
+    "ALTER TABLE entry_outcomes ADD COLUMN IF NOT EXISTS outcome_label TEXT;",
+    "ALTER TABLE entry_outcomes ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_entry_outcomes_candidate_id ON entry_outcomes (candidate_id) WHERE candidate_id IS NOT NULL;",
+    "CREATE INDEX IF NOT EXISTS idx_entry_outcomes_label_ts ON entry_outcomes (outcome_label, COALESCE(ts, created_at) DESC);",
+    # trades
+    """
+    CREATE TABLE IF NOT EXISTS trades (
+      id BIGSERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      mint TEXT NOT NULL,
+      side TEXT NOT NULL,
+      sig TEXT NOT NULL DEFAULT '',
+      venue TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'unknown',
+      amount_sol DOUBLE PRECISION,
+      amount_raw BIGINT,
+      out_amount_sol DOUBLE PRECISION,
+      out_amount_raw BIGINT,
+      price_sol DOUBLE PRECISION,
+      fee_sol DOUBLE PRECISION,
+      reason TEXT NOT NULL DEFAULT '',
+      meta JSONB
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_trades_mint_created ON trades (mint, created_at DESC);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_trades_sig_nonempty ON trades(sig) WHERE sig <> '';",
+    # positions
+    """
+    CREATE TABLE IF NOT EXISTS positions (
+      mint TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'open',
+      qty_raw BIGINT,
+      avg_price_sol DOUBLE PRECISION,
+      cost_sol DOUBLE PRECISION,
+      realized_pnl_sol DOUBLE PRECISION,
+      last_price_sol DOUBLE PRECISION,
+      meta JSONB,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    """,
+    # exit_state
+    """
+    CREATE TABLE IF NOT EXISTS exit_state (
+      mint TEXT PRIMARY KEY,
+      state JSONB,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    """,
+    # risk_events
+    """
+    CREATE TABLE IF NOT EXISTS risk_events (
+      id BIGSERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      level TEXT NOT NULL,
+      code TEXT NOT NULL,
+      msg TEXT NOT NULL DEFAULT '',
+      meta JSONB
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_risk_events_code_created ON risk_events (code, created_at DESC);",
+    # heartbeats / snapshots
+    """
+    CREATE TABLE IF NOT EXISTS health_heartbeats (
+      id BIGSERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      component TEXT NOT NULL,
+      payload JSONB
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_health_heartbeats_component_created ON health_heartbeats (component, created_at DESC);",
+]
 
-def _db_disabled() -> bool:
-    return (not PG_ENABLED) or _DB_DISABLED
+
+async def _ensure_schema_once(db: _DB) -> None:
+    global _SCHEMA_READY
+    if _SCHEMA_READY or (not AI_LOG_ENSURE_SCHEMA) or _db_disabled():
+        return
+    async with _SCHEMA_LOCK:
+        if _SCHEMA_READY or (not AI_LOG_ENSURE_SCHEMA) or _db_disabled():
+            return
+        try:
+            for stmt in _SCHEMA_SQL:
+                try:
+                    await db.execute_raw(stmt)
+                except Exception:
+                    # tolerate older schemas / permissions / transient errors
+                    pass
+
+            if AI_LOG_SCHEMA_BACKFILL_TS:
+                try:
+                    await db.execute_raw(
+                        "UPDATE entry_candidates SET ts = COALESCE(ts, created_at) WHERE ts IS NULL;"
+                    )
+                    await db.execute_raw(
+                        "UPDATE entry_outcomes SET ts = COALESCE(ts, created_at) WHERE ts IS NULL;"
+                    )
+                except Exception:
+                    pass
+
+            _SCHEMA_READY = True
+        except Exception as e:
+            _bump_db_fail(e)
+            if log.every("data_logger_schema_fail", 60):  # type: ignore[attr-defined]
+                log.warning("data_logger: schema ensure failed (continuing): %s", repr(e))
 
 
-def _bump_db_fail(e: Exception) -> None:
-    global _DB_FAILS, _DB_DISABLED
-    _DB_FAILS += 1
-    if log.every("data_logger_db_fail", 30):
-        log.warning("data_logger: db error (fails=%s): %s", _DB_FAILS, repr(e))
-    if _DB_FAILS >= max(1, AI_LOG_DISABLE_AFTER_FAILS):
-        _DB_DISABLED = True
-        log.error("data_logger: disabling DB logging after too many failures (%s)", _DB_FAILS)
+async def ensure_schema() -> None:
+    await _ensure_schema_once(_DBX)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Writer queue (bounded)
+# ──────────────────────────────────────────────────────────────────────────────
+_WRITER_Q: asyncio.Queue | None = None
+_WRITER_TASK: asyncio.Task | None = None
+_WRITER_LOCK = asyncio.Lock()
+_WRITER_DROPPED = 0
+_WRITER_CLOSED = False
+
+
+async def _writer_worker() -> None:
+    assert _WRITER_Q is not None
+    while True:
+        item = await _WRITER_Q.get()
+        try:
+            if item is None:
+                return
+            await item
+        except Exception as e:
+            _bump_db_fail(e)
+            if AI_LOG_STRICT:
+                log.exception("data_logger: strict async write failed")
+        finally:
+            _WRITER_Q.task_done()
+
+
+async def _ensure_writer() -> None:
+    global _WRITER_Q, _WRITER_TASK
+    if not AI_LOG_QUEUE_ENABLED:
+        return
+    if _WRITER_Q is not None and _WRITER_TASK is not None and not _WRITER_TASK.done():
+        return
+    async with _WRITER_LOCK:
+        if _WRITER_Q is None:
+            _WRITER_Q = asyncio.Queue(maxsize=max(1, int(AI_LOG_QUEUE_MAX)))
+        if _WRITER_TASK is None or _WRITER_TASK.done():
+            _WRITER_TASK = asyncio.get_running_loop().create_task(_writer_worker())
+
+
+def _close_awaitable_safely(a: Any) -> None:
+    try:
+        if hasattr(a, "close"):
+            a.close()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _submit(coro: Any) -> None:
+    """
+    Fire-and-forget submission with:
+      - circuit breaker
+      - optional bounded queue
+      - safe fallback when no loop is running
+    """
+
+    async def _runner() -> None:
+        if _db_disabled():
+            return
+        try:
+            await coro
+        except Exception as e:
+            _bump_db_fail(e)
+            if AI_LOG_STRICT:
+                raise
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # no loop: run synchronously
+        try:
+            asyncio.run(_runner())
+        except Exception as e:
+            _bump_db_fail(e)
+            if AI_LOG_STRICT:
+                raise
+        return
+
+    if AI_LOG_QUEUE_ENABLED:
+
+        async def _enqueue() -> None:
+            global _WRITER_DROPPED
+            if _WRITER_CLOSED:
+                return
+            await _ensure_writer()
+            assert _WRITER_Q is not None
+            a = _runner()
+            try:
+                _WRITER_Q.put_nowait(a)
+            except asyncio.QueueFull:
+                _WRITER_DROPPED += 1
+                if not AI_LOG_QUEUE_DROP_NEW:
+                    # drop oldest to accept newest
+                    try:
+                        old = _WRITER_Q.get_nowait()
+                        if old is not None:
+                            _close_awaitable_safely(old)
+                        _WRITER_Q.task_done()
+                        _WRITER_Q.put_nowait(a)
+                    except Exception:
+                        _close_awaitable_safely(a)
+                else:
+                    _close_awaitable_safely(a)
+
+                if log.every("data_logger_queue_full", 30):  # type: ignore[attr-defined]
+                    log.warning(
+                        "data_logger: writer queue full (dropped=%s max=%s drop_new=%s)",
+                        _WRITER_DROPPED,
+                        AI_LOG_QUEUE_MAX,
+                        AI_LOG_QUEUE_DROP_NEW,
+                    )
+
+        loop.create_task(_enqueue())
+    else:
+        loop.create_task(_runner())
 
 
 async def close_logger() -> None:
     """
-    Closes fallback asyncpg pool. (ai_db lifecycle is managed by ai_db.)
+    Graceful shutdown:
+      - stop accepting new items
+      - flush queue best-effort
+      - close pool
     """
-    global _POOL
-    p = _POOL
-    _POOL = None
-    if p is not None:
+    global _POOL, _WRITER_CLOSED, _WRITER_TASK, _WRITER_Q
+
+    _WRITER_CLOSED = True
+    q = _WRITER_Q
+    t = _WRITER_TASK
+
+    if q is not None:
+        # sentinel to stop worker
+        with contextlib.suppress(Exception):
+            q.put_nowait(None)
+
+    if t is not None:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(t, timeout=2.0)
+
+    # best-effort drain
+    if q is not None:
         try:
-            await p.close()
+            while not q.empty():
+                item = q.get_nowait()
+                if item is not None:
+                    _close_awaitable_safely(item)
+                q.task_done()
         except Exception:
             pass
 
+    _WRITER_TASK = None
+    _WRITER_Q = None
+
+    p = _POOL
+    _POOL = None
+    if p is not None:
+        with contextlib.suppress(Exception):
+            await p.close()
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Payload safety: redaction + size caps
+# Payload safety: redaction + caps
 # ──────────────────────────────────────────────────────────────────────────────
-_SENSITIVE_KEYS = {
+_SENSITIVE_TOKENS = {
     "WALLET_PRIVATE_KEY",
     "WALLET_JSON",
     "PRIVATE_KEY",
@@ -471,7 +698,6 @@ _SENSITIVE_KEYS = {
     "KEYPAIR",
     "API_KEY",
     "JUP_API_KEY",
-    "JUP_PRO_KEY",
     "OPENAI_API_KEY",
     "DISCORD_TOKEN",
     "TELEGRAM_BOT_TOKEN",
@@ -481,15 +707,15 @@ _SENSITIVE_KEYS = {
 
 def _redact_obj(o: Any) -> Any:
     if isinstance(o, dict):
-        out: Dict[str, Any] = {}
+        out: dict[str, Any] = {}
         for k, v in o.items():
             ks = str(k)
-            if any(tok in ks.upper() for tok in _SENSITIVE_KEYS):
+            if any(tok in ks.upper() for tok in _SENSITIVE_TOKENS):
                 out[ks] = "***REDACTED***"
             else:
                 out[ks] = _redact_obj(v)
         return out
-    if isinstance(o, (list, tuple)):
+    if isinstance(o, list | tuple):
         return [_redact_obj(x) for x in o[:500]]
     return o
 
@@ -501,7 +727,7 @@ def _json_bytes(o: Any) -> int:
         return 10**9
 
 
-def _cap_dict_keys(d: Dict[str, Any], max_keys: int) -> Dict[str, Any]:
+def _cap_dict_keys(d: dict[str, Any], max_keys: int) -> dict[str, Any]:
     if len(d) <= max_keys:
         return d
     keys = sorted(d.keys())
@@ -509,7 +735,7 @@ def _cap_dict_keys(d: Dict[str, Any], max_keys: int) -> Dict[str, Any]:
     return {k: d[k] for k in keep}
 
 
-def _cap_ui(ui: Dict[str, Any]) -> Dict[str, Any]:
+def _cap_ui(ui: dict[str, Any]) -> dict[str, Any]:
     ui = _redact_obj(ui)
 
     feats = ui.get("features")
@@ -519,114 +745,70 @@ def _cap_ui(ui: Dict[str, Any]) -> Dict[str, Any]:
     if _json_bytes(ui) <= AI_LOG_MAX_UI_BYTES:
         return ui
 
-    # Drop heavy optional blocks in a deterministic order
-    for heavy in ("history", "raw", "wallet_signals", "ai_signals", "position_context", "gate_detail", "extra_raw"):
+    # progressively drop heavy sections
+    for heavy in (
+        "history",
+        "raw",
+        "wallet_signals",
+        "ai_signals",
+        "position_context",
+        "gate_detail",
+        "extra_raw",
+        "debug",
+    ):
         if heavy in ui:
             ui.pop(heavy, None)
             if _json_bytes(ui) <= AI_LOG_MAX_UI_BYTES:
                 return ui
 
-    # Final minimal payload
-    if _json_bytes(ui) > AI_LOG_MAX_UI_BYTES:
-        ui = {
-            "ts": ui.get("ts"),
-            "event_uuid": ui.get("event_uuid"),
-            "src": ui.get("src"),
-            "mint": ui.get("mint"),
-            "symbol": ui.get("symbol"),
-            "regime": ui.get("regime"),
-            "decision": ui.get("decision"),
-            "score": ui.get("score"),
-            "reason": ui.get("reason"),
-        }
-    return ui
+    # final minimal shape
+    return {
+        "ts": ui.get("ts"),
+        "event_uuid": ui.get("event_uuid"),
+        "src": ui.get("src"),
+        "mint": ui.get("mint"),
+        "symbol": ui.get("symbol"),
+        "regime": ui.get("regime"),
+        "decision": ui.get("decision"),
+        "score": ui.get("score"),
+        "reason": ui.get("reason"),
+    }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Snapshot normalization (meta -> snapshot)
-# ──────────────────────────────────────────────────────────────────────────────
-def _normalize_rug(raw: Any) -> float:
+def _base_ctx() -> dict[str, Any]:
+    return {
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+    }
+
+
+def _normalize_01(raw: Any) -> float:
     try:
         v = float(raw)
     except Exception:
         return 0.0
+    # accept 0..100 style scores too
     if v > 1.5:
         v = v / 100.0
     return max(0.0, min(1.0, v))
 
 
-def _build_pf_snapshot_from_meta(meta: Mapping[str, Any]) -> Dict[str, Any]:
-    m = meta
-
-    def f_any(keys: Sequence[str], default: float = 0.0) -> float:
-        for k in keys:
-            if k in m:
-                try:
-                    return float(m.get(k, default))
-                except Exception:
-                    return float(default)
-        return float(default)
-
-    def i_any(keys: Sequence[str], default: int = 0) -> int:
-        for k in keys:
-            if k in m:
-                try:
-                    return int(m.get(k, default))
-                except Exception:
-                    return int(default)
-        return int(default)
-
-    liq_usd = f_any(["liq_usd", "liq", "liqUsd", "liquidity_usd"])
-    vol5_usd = f_any(["vol_5m_usd", "vol5", "volume_5m_usd"])
-    buys5 = i_any(["buys_5m", "buys5", "buys_5min"])
-    sells5 = i_any(["sells_5m", "sells5", "sells_5min"])
-    chg5 = f_any(["price_change_5m_pct", "chg5", "change_5m_pct"])
-    age_min = f_any(["token_age_min", "age_min", "age_minutes"])
-    price_usd = f_any(["price_usd", "priceUsd", "price"])
-    ai_rug = f_any(["ai_rug_score", "fraud_score", "ai_rug_score_01"], 0.0)
-
-    snap: Dict[str, Any] = {
-        "liq_usd": liq_usd,
-        "vol_5m_usd": vol5_usd,
-        "buys_5m": buys5,
-        "sells_5m": sells5,
-        "txns_5m": int(buys5 + sells5),
-        "price_change_5m_pct": chg5,
-        "token_age_min": age_min,
-        "price_usd": price_usd,
-        "ai_rug_score": ai_rug,
-        # keep raw for offline debugging (may be dropped by capper)
-        "raw_meta": dict(meta),
-    }
-    if "_filter_debug" in meta:
-        snap["_filter_debug"] = meta.get("_filter_debug")
-    return snap
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FeatureBuilder safe call
-# ──────────────────────────────────────────────────────────────────────────────
-def _call_accepted(fn: Any, **kwargs: Any) -> Any:
-    try:
-        return _call_with_accepted_kwargs(fn, **kwargs)
-    except Exception:
-        return fn(**kwargs)
-
-
 def _build_features_safe(
     *,
     mint: str,
-    symbol: Optional[str],
+    symbol: str | None,
     snapshot: Mapping[str, Any],
-    history: Optional[Sequence[Mapping[str, Any]]],
-    regime: Optional[str],
-    regime_state: Optional[Any],
-    wallet_signals: Optional[Mapping[str, Any]],
-    ai_signals: Optional[Mapping[str, Any]],
-    scanner_source: Optional[str],
-    position_context: Optional[Mapping[str, Any]],
-) -> Dict[str, Any]:
-    feats: Dict[str, Any] = {}
+    history: Sequence[Mapping[str, Any]] | None,
+    regime: str | None,
+    regime_state: Any | None,
+    wallet_signals: Mapping[str, Any] | None,
+    ai_signals: Mapping[str, Any] | None,
+    scanner_source: str | None,
+    position_context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    feats: dict[str, Any] = {}
 
     def f(key: str, default: float = 0.0) -> float:
         try:
@@ -634,6 +816,7 @@ def _build_features_safe(
         except Exception:
             return float(default)
 
+    # minimal canonical fields (fast analytics)
     feats["liq_usd"] = f("liq_usd", f("liq", 0.0))
     feats["vol_5m_usd"] = f("vol_5m_usd", f("vol5", 0.0))
     feats["buys_5m"] = f("buys_5m", f("buys5", 0.0))
@@ -641,14 +824,16 @@ def _build_features_safe(
     feats["chg5_pct"] = f("price_change_5m_pct", f("chg5", 0.0))
     feats["age_min"] = f("token_age_min", f("age_min", 0.0))
     feats["price_usd"] = f("price_usd", 0.0)
-    feats["ai_fraud_score"] = _normalize_rug(snapshot.get("ai_rug_score", 0.0))
+    feats["ai_fraud_score"] = _normalize_01(
+        snapshot.get("ai_rug_score", snapshot.get("fraud_score", 0.0))
+    )
 
     if _FB is None:
         feats["features_mode"] = "minimal"
         return feats
 
     try:
-        built = _call_accepted(
+        built = _call_with_accepted_kwargs(
             _FB.build,
             symbol=symbol,
             mint=mint,
@@ -657,7 +842,7 @@ def _build_features_safe(
             regime=regime_state,
             wallet_signals=dict(wallet_signals) if wallet_signals else None,
             ai_signals=dict(ai_signals) if ai_signals else None,
-            scanner_source=scanner_source,
+            scanner_source=scanner_source or "",
             risk_context=dict(position_context) if position_context else None,
             regime_label=regime,
         )
@@ -667,53 +852,13 @@ def _build_features_safe(
         else:
             feats["features_mode"] = "minimal_fb_non_dict"
     except Exception:
-        if log.every("feature_builder_fail", 60):
+        if log.every("feature_builder_fail", 60):  # type: ignore[attr-defined]
             log.debug("data_logger: FeatureBuilder.build failed (using minimal)", exc_info=True)
         feats["features_mode"] = "minimal_fb_failed"
 
     return feats
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Non-blocking submit (sync callers -> async writes)
-# ──────────────────────────────────────────────────────────────────────────────
-def _submit(coro: Any) -> None:
-    """
-    Fire-and-forget if running inside an event loop; otherwise run once.
-    Ensures task exceptions are consumed (no 'Task exception was never retrieved').
-    """
-
-    async def _runner() -> None:
-        if _db_disabled():
-            return
-        try:
-            await coro
-        except Exception as e:
-            _bump_db_fail(e)
-            if AI_LOG_STRICT:
-                # strict mode: we still can't raise into the caller in async fire-and-forget
-                # but we *do* log loudly.
-                log.exception("data_logger: strict async write failed")
-
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_runner())
-        return
-    except RuntimeError:
-        pass
-
-    # No running loop -> best-effort run
-    try:
-        asyncio.run(_runner())
-    except Exception as e:
-        _bump_db_fail(e)
-        if AI_LOG_STRICT:
-            raise
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Outcome labeling
-# ──────────────────────────────────────────────────────────────────────────────
 def _safe_label_from_pnl(pnl_pct: float, got_stopped: bool) -> str:
     try:
         p = float(pnl_pct)
@@ -736,30 +881,50 @@ def _safe_label_from_pnl(pnl_pct: float, got_stopped: bool) -> str:
     return "loss"
 
 
-def _base_ctx() -> Dict[str, Any]:
-    return {
-        "service": SERVICE_NAME,
-        "version": SERVICE_VERSION,
-        "host": socket.gethostname(),
-        "pid": os.getpid(),
-        "policy": AI_POLICY_VERSION or None,
-        "experiment": AI_EXPERIMENT_TAG or None,
-        "code_version": AI_CODE_VERSION or None,
-        "stack_profile": AI_STACK_PROFILE or None,
-    }
+# ──────────────────────────────────────────────────────────────────────────────
+# Redis enqueue (paper label)
+# ──────────────────────────────────────────────────────────────────────────────
+async def a_enqueue_paper_label(candidate_id: int) -> int:
+    if candidate_id <= 0 or cu is None or not hasattr(cu, "get_redis_async"):
+        return 0
+    try:
+        r = await cu.get_redis_async()
+        await r.lpush(PAPER_LABEL_INBOX_KEY, int(candidate_id))
+        return 1
+    except Exception:
+        if log.every("paper_label_enqueue_fail", 30):  # type: ignore[attr-defined]
+            log.debug("data_logger: failed to enqueue paper label", exc_info=True)
+        return 0
+
+
+def enqueue_paper_label(candidate_id: int) -> int:
+    if candidate_id <= 0:
+        return 0
+    _submit(a_enqueue_paper_label(int(candidate_id)))
+    return 1
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SQL helpers (schema-aligned)
+# SQL helpers
 # ──────────────────────────────────────────────────────────────────────────────
-async def _a_insert_candidate_event(
+class _Now:
+    pass
+
+
+_NOW = _Now()
+
+
+async def _a_insert_entry_candidate(
     *,
     mint: str,
+    symbol: str,
     source: str,
+    regime: str,
     pool: str,
-    ai_ok: Optional[bool],
-    ai_score: Optional[float],
-    ui: Dict[str, Any],
+    decision: str,
+    ai_ok: bool | None,
+    ai_score: float | None,
+    ui: dict[str, Any],
 ) -> int:
     if _db_disabled():
         return 0
@@ -767,13 +932,16 @@ async def _a_insert_candidate_event(
     ui_s = json.dumps(ui, ensure_ascii=False)
     row = await _DBX.fetchrow(
         """
-        INSERT INTO candidate_events (mint, source, pool, ai_ok, ai_score, ui)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+        INSERT INTO entry_candidates (ts, mint, symbol, source, regime, pool, decision, ai_ok, ai_score, ui)
+        VALUES (now(), $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
         RETURNING id
         """,
         mint,
+        symbol or "",
         source,
-        pool,
+        regime or "",
+        pool or "",
+        decision or "",
         ai_ok,
         ai_score,
         ui_s,
@@ -781,45 +949,85 @@ async def _a_insert_candidate_event(
     return int(row["id"]) if row and "id" in row else 0
 
 
-async def _a_patch_candidate_ui(candidate_id: int, patch: Dict[str, Any]) -> int:
+async def _a_patch_candidate(
+    candidate_id: int, patch_cols: dict[str, Any], ui_patch: dict[str, Any] | None = None
+) -> int:
+    if _db_disabled() or candidate_id <= 0:
+        return 0
+
+    sets: list[str] = []
+    args: list[Any] = []
+    i = 1
+
+    for k, v in patch_cols.items():
+        if v is _NOW:
+            sets.append(f"{k} = now()")
+        else:
+            sets.append(f"{k} = ${i}")
+            args.append(v)
+            i += 1
+
+    if ui_patch is not None:
+        ui_patch = _cap_ui(ui_patch)
+        ui_s = json.dumps(ui_patch, ensure_ascii=False)
+        sets.append(f"ui = COALESCE(ui, '{{}}'::jsonb) || ${i}::jsonb")
+        args.append(ui_s)
+        i += 1
+
+    if not sets:
+        return int(candidate_id)
+
+    args.append(int(candidate_id))
+    await _DBX.execute(f"UPDATE entry_candidates SET {', '.join(sets)} WHERE id = ${i}", *args)
+    return int(candidate_id)
+
+
+async def _a_insert_or_upsert_outcome(
+    *,
+    candidate_id: int,
+    mint: str,
+    outcome_label: str,
+    pnl_pct: float,
+    hold_sec: float,
+    got_stopped: bool,
+    notes: str,
+    extra: dict[str, Any],
+) -> int:
     if _db_disabled():
         return 0
-    patch = _cap_ui(patch)
-    patch_s = json.dumps(patch, ensure_ascii=False)
+    extra = _cap_ui(extra)
+    extra_s = json.dumps(extra, ensure_ascii=False)
     await _DBX.execute(
         """
-        UPDATE candidate_events
-        SET ui = COALESCE(ui, '{}'::jsonb) || $1::jsonb
-        WHERE id = $2
+        INSERT INTO entry_outcomes (ts, candidate_id, mint, outcome_label, pnl_pct, hold_sec, got_stopped, notes, extra)
+        VALUES (now(), $1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+        ON CONFLICT (candidate_id) DO UPDATE SET
+          ts = now(),
+          mint = EXCLUDED.mint,
+          outcome_label = EXCLUDED.outcome_label,
+          pnl_pct = EXCLUDED.pnl_pct,
+          hold_sec = EXCLUDED.hold_sec,
+          got_stopped = EXCLUDED.got_stopped,
+          notes = EXCLUDED.notes,
+          extra = COALESCE(entry_outcomes.extra, '{}'::jsonb) || EXCLUDED.extra
         """,
-        patch_s,
         int(candidate_id),
+        mint or "",
+        outcome_label or "",
+        float(pnl_pct),
+        float(hold_sec),
+        bool(got_stopped),
+        notes or "",
+        extra_s,
     )
     return int(candidate_id)
 
 
-async def _a_insert_trade(
-    *,
-    mint: str,
-    side: str,
-    sig: str,
-    venue: str,
-    status: str,
-    amount_sol: Optional[float],
-    amount_raw: Optional[int],
-    out_amount_sol: Optional[float],
-    out_amount_raw: Optional[int],
-    price_sol: Optional[float],
-    fee_sol: Optional[float],
-    reason: str,
-    meta: Dict[str, Any],
-) -> int:
+async def _a_insert_trade(**kwargs: Any) -> int:
     if _db_disabled():
         return 0
-    meta = _cap_ui(meta)
+    meta = _cap_ui(kwargs.get("meta") or {})
     meta_s = json.dumps(meta, ensure_ascii=False)
-
-    # Idempotent if schema defines any unique constraint (commonly sig unique).
     row = await _DBX.fetchrow(
         """
         INSERT INTO trades
@@ -830,37 +1038,27 @@ async def _a_insert_trade(
         ON CONFLICT DO NOTHING
         RETURNING id
         """,
-        mint,
-        side,
-        sig,
-        venue,
-        status,
-        amount_sol,
-        amount_raw,
-        out_amount_sol,
-        out_amount_raw,
-        price_sol,
-        fee_sol,
-        reason,
+        kwargs["mint"],
+        kwargs["side"],
+        kwargs.get("sig", ""),
+        kwargs.get("venue", ""),
+        kwargs.get("status", "unknown"),
+        kwargs.get("amount_sol"),
+        kwargs.get("amount_raw"),
+        kwargs.get("out_amount_sol"),
+        kwargs.get("out_amount_raw"),
+        kwargs.get("price_sol"),
+        kwargs.get("fee_sol"),
+        kwargs.get("reason", ""),
         meta_s,
     )
     return int(row["id"]) if row and "id" in row else 0
 
 
-async def _a_upsert_position(
-    *,
-    mint: str,
-    status: str,
-    qty_raw: Optional[int],
-    avg_price_sol: Optional[float],
-    cost_sol: Optional[float],
-    realized_pnl_sol: Optional[float],
-    last_price_sol: Optional[float],
-    meta: Dict[str, Any],
-) -> int:
+async def _a_upsert_position(**kwargs: Any) -> int:
     if _db_disabled():
         return 0
-    meta = _cap_ui(meta)
+    meta = _cap_ui(kwargs.get("meta") or {})
     meta_s = json.dumps(meta, ensure_ascii=False)
     await _DBX.execute(
         """
@@ -878,19 +1076,19 @@ async def _a_upsert_position(
           meta = COALESCE(positions.meta, '{}'::jsonb) || EXCLUDED.meta,
           updated_at = now()
         """,
-        mint,
-        status,
-        qty_raw,
-        avg_price_sol,
-        cost_sol,
-        realized_pnl_sol,
-        last_price_sol,
+        kwargs["mint"],
+        kwargs.get("status", "open"),
+        kwargs.get("qty_raw"),
+        kwargs.get("avg_price_sol"),
+        kwargs.get("cost_sol"),
+        kwargs.get("realized_pnl_sol"),
+        kwargs.get("last_price_sol"),
         meta_s,
     )
     return 1
 
 
-async def _a_upsert_exit_state(mint: str, state: Dict[str, Any]) -> int:
+async def _a_upsert_exit_state(mint: str, state: dict[str, Any]) -> int:
     if _db_disabled():
         return 0
     state = _cap_ui(state)
@@ -909,78 +1107,66 @@ async def _a_upsert_exit_state(mint: str, state: Dict[str, Any]) -> int:
     return 1
 
 
-async def _a_insert_risk_event(level: str, code: str, msg: str, meta: Dict[str, Any]) -> int:
+async def _a_insert_risk_event(level: str, code: str, msg: str, meta: dict[str, Any]) -> int:
     if _db_disabled():
         return 0
     meta = _cap_ui(meta)
     meta_s = json.dumps(meta, ensure_ascii=False)
-    row = await _DBX.fetchrow(
-        """
-        INSERT INTO risk_events (level, code, msg, meta)
-        VALUES ($1,$2,$3,$4::jsonb)
-        RETURNING id
-        """,
+    await _DBX.execute(
+        "INSERT INTO risk_events (level, code, msg, meta) VALUES ($1,$2,$3,$4::jsonb)",
         level,
         code,
         msg,
         meta_s,
     )
-    return int(row["id"]) if row and "id" in row else 0
+    return 1
 
 
-async def _a_insert_heartbeat(component: str, payload: Dict[str, Any]) -> int:
+async def _a_insert_heartbeat(component: str, payload: dict[str, Any]) -> int:
     if _db_disabled():
         return 0
     payload = _cap_ui(payload)
     payload_s = json.dumps(payload, ensure_ascii=False)
-    row = await _DBX.fetchrow(
-        """
-        INSERT INTO health_heartbeats (component, payload)
-        VALUES ($1,$2::jsonb)
-        RETURNING id
-        """,
+    await _DBX.execute(
+        "INSERT INTO health_heartbeats (component, payload) VALUES ($1,$2::jsonb)",
         component,
         payload_s,
     )
-    return int(row["id"]) if row and "id" in row else 0
+    return 1
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public API: candidates (sync + async)
+# Public API: candidates
 # ──────────────────────────────────────────────────────────────────────────────
 async def a_log_entry_candidate(
     *,
     src: str,
     mint: str,
-    symbol: Optional[str],
+    symbol: str | None,
     snapshot: Mapping[str, Any],
-    regime: Optional[str] = None,
-    wallet_tag: Optional[str] = None,
-    regime_state: Optional[Any] = None,
-    wallet_signals: Optional[Mapping[str, Any]] = None,
-    ai_signals: Optional[Mapping[str, Any]] = None,
-    scanner_source: Optional[str] = None,
-    history: Optional[Sequence[Mapping[str, Any]]] = None,
-    position_context: Optional[Mapping[str, Any]] = None,
-    decision: Optional[str] = None,  # BUY / SKIP / TEST_BUY / etc
-    decision_score: Optional[float] = None,
-    decision_reason: Optional[str] = None,
-    episode_id: Optional[str] = None,
-    step_idx: Optional[int] = None,
-    strategy_profile: Optional[str] = None,
-    trade_id: Optional[str] = None,
-    session_id: Optional[str] = None,
-    candidate_key: Optional[str] = None,
-    gate_detail: Optional[Mapping[str, Any]] = None,
-    ts: Optional[Any] = None,
-    extra_raw: Optional[Mapping[str, Any]] = None,
+    regime: str | None = None,
+    wallet_tag: str | None = None,
+    regime_state: Any | None = None,
+    wallet_signals: Mapping[str, Any] | None = None,
+    ai_signals: Mapping[str, Any] | None = None,
+    scanner_source: str | None = None,
+    history: Sequence[Mapping[str, Any]] | None = None,
+    position_context: Mapping[str, Any] | None = None,
+    decision: str | None = None,
+    decision_score: float | None = None,
+    decision_reason: str | None = None,
+    episode_id: str | None = None,
+    step_idx: int | None = None,
+    strategy_profile: str | None = None,
+    trade_id: str | None = None,
+    session_id: str | None = None,
+    candidate_key: str | None = None,
+    gate_detail: Mapping[str, Any] | None = None,
     pool: str = "",
-    event_uuid: Optional[str] = None,
+    ts: Any | None = None,
+    extra_raw: Mapping[str, Any] | None = None,
+    event_uuid: str | None = None,
 ) -> int:
-    """
-    Async candidate logger (returns the DB id).
-    Use this when you need ids for tight linkage.
-    """
     if _db_disabled() or (not AI_LOG_CANDIDATES):
         return 0
     if not _src_regime_allowed(src, regime):
@@ -998,25 +1184,11 @@ async def a_log_entry_candidate(
         if not _should_sample(ck, AI_LOG_SAMPLE_RATE):
             return 0
 
-    # logger-level hard filters
-    try:
-        liq = float(snapshot.get("liq_usd") or snapshot.get("liq") or 0.0)
-    except Exception:
-        liq = 0.0
-    try:
-        vol5 = float(snapshot.get("vol_5m_usd") or snapshot.get("vol5") or 0.0)
-    except Exception:
-        vol5 = 0.0
-    if AI_LOG_MIN_LIQ_USD > 0.0 and liq < AI_LOG_MIN_LIQ_USD:
-        return 0
-    if AI_LOG_MIN_VOL5_USD > 0.0 and vol5 < AI_LOG_MIN_VOL5_USD:
-        return 0
-
     feats = _build_features_safe(
         mint=mint,
         symbol=symbol,
         snapshot=snapshot,
-        history=history if AI_LOG_HISTORY_IN_UI else None,
+        history=history,
         regime=regime,
         regime_state=regime_state,
         wallet_signals=wallet_signals,
@@ -1025,21 +1197,13 @@ async def a_log_entry_candidate(
         position_context=position_context,
     )
 
-    score: Optional[float] = None
-    if decision_score is not None:
-        score = float(decision_score)
-    elif "ai_entry_score" in feats:
-        try:
-            score = float(feats["ai_entry_score"])
-        except Exception:
-            score = None
-
-    ai_ok: Optional[bool] = None
+    score: float | None = float(decision_score) if decision_score is not None else None
+    ai_ok: bool | None = None
     if decision is not None:
-        ai_ok = (d_upper != "SKIP")
+        ai_ok = d_upper != "SKIP"
 
     e_uuid = event_uuid or str(uuid.uuid4())
-    ui: Dict[str, Any] = {
+    ui: dict[str, Any] = {
         "ts": ts if ts is not None else _ts(),
         "event_uuid": e_uuid,
         "src": src,
@@ -1060,11 +1224,8 @@ async def a_log_entry_candidate(
         "raw": dict(snapshot),
         "ctx": _base_ctx(),
     }
-
     if extra_raw:
         ui["extra_raw"] = dict(extra_raw)
-    if AI_LOG_HISTORY_IN_UI and history:
-        ui["history"] = list(history[-max(0, AI_LOG_HISTORY_MAX_LEN) :])
     if wallet_signals:
         ui["wallet_signals"] = dict(wallet_signals)
     if ai_signals:
@@ -1075,14 +1236,22 @@ async def a_log_entry_candidate(
         ui["gate_detail"] = dict(gate_detail)
 
     try:
-        return await _a_insert_candidate_event(
+        cid = await _a_insert_entry_candidate(
             mint=mint,
+            symbol=symbol or "",
             source=src,
+            regime=regime or "",
             pool=pool or "",
+            decision=d_upper,
             ai_ok=ai_ok,
             ai_score=score,
             ui=ui,
         )
+
+        if PAPER_LABEL_ENQUEUE_ON_SKIP and d_upper == "SKIP" and cid > 0:
+            await a_enqueue_paper_label(cid)
+
+        return cid
     except Exception as e:
         _bump_db_fail(e)
         if AI_LOG_STRICT:
@@ -1092,10 +1261,9 @@ async def a_log_entry_candidate(
 
 def log_entry_candidate(**kwargs: Any) -> int:
     """
-    Sync wrapper (fire-and-forget in a running loop).
-    Returns:
-      - 0 in hot async contexts (scheduled),
-      - best-effort id if executed synchronously (no running loop).
+    Sync wrapper.
+    - If no loop is running: performs the write and returns candidate_id.
+    - If a loop is running: schedules the write and returns 0 (use a_log_* in async paths).
     """
     if _db_disabled() or (not AI_LOG_CANDIDATES):
         return 0
@@ -1122,8 +1290,6 @@ def log_buy_candidate(**kwargs: Any) -> int:
 
 
 def log_skip_candidate(**kwargs: Any) -> int:
-    if not AI_LOG_SKIPS:
-        return 0
     kwargs.setdefault("decision", "SKIP")
     return log_entry_candidate(**kwargs)
 
@@ -1131,25 +1297,33 @@ def log_skip_candidate(**kwargs: Any) -> int:
 async def a_log_entry_decision_update(
     *,
     candidate_id: int,
-    decision: Optional[str] = None,
-    decision_score: Optional[float] = None,
-    decision_reason: Optional[str] = None,
-    extra: Optional[Mapping[str, Any]] = None,
+    decision: str | None = None,
+    decision_score: float | None = None,
+    decision_reason: str | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> int:
     if _db_disabled() or candidate_id <= 0:
         return 0
+    d = (decision or "").upper()
 
-    patch: Dict[str, Any] = {
+    patch_cols: dict[str, Any] = {}
+    if decision is not None:
+        patch_cols["decision"] = d
+        patch_cols["ai_ok"] = d != "SKIP"
+    if decision_score is not None:
+        patch_cols["ai_score"] = float(decision_score)
+
+    ui_patch: dict[str, Any] = {
         "decision": decision,
         "score": float(decision_score) if decision_score is not None else None,
         "reason": decision_reason,
         "decision_updated_at": _ts(),
     }
     if extra:
-        patch["decision_extra"] = dict(extra)
+        ui_patch["decision_extra"] = dict(extra)
 
     try:
-        return await _a_patch_candidate_ui(int(candidate_id), patch)
+        return await _a_patch_candidate(candidate_id, patch_cols, ui_patch)
     except Exception as e:
         _bump_db_fail(e)
         if AI_LOG_STRICT:
@@ -1160,13 +1334,11 @@ async def a_log_entry_decision_update(
 def log_entry_decision_update(
     *,
     candidate_id: int,
-    decision: Optional[str] = None,
-    decision_score: Optional[float] = None,
-    decision_reason: Optional[str] = None,
-    extra: Optional[Mapping[str, Any]] = None,
+    decision: str | None = None,
+    decision_score: float | None = None,
+    decision_reason: str | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> int:
-    if _db_disabled() or candidate_id <= 0:
-        return 0
     _submit(
         a_log_entry_decision_update(
             candidate_id=candidate_id,
@@ -1185,17 +1357,21 @@ async def a_log_entry_outcome(
     pnl_pct: float,
     hold_seconds: float,
     got_stopped: bool,
-    label: Optional[str] = None,
-    notes: Optional[str] = None,
-    extra: Optional[Mapping[str, Any]] = None,
+    label: str | None = None,
+    notes: str | None = None,
+    mint: str | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> int:
     if _db_disabled() or (not AI_LOG_OUTCOMES) or candidate_id <= 0:
         return 0
     if not _should_sample(f"outcome:{candidate_id}", AI_LOG_OUTCOME_SAMPLE_RATE):
         return 0
 
+    outcome_label = label or _safe_label_from_pnl(pnl_pct, got_stopped)
+    mint_final = mint or (str((extra or {}).get("mint", "")) if isinstance(extra, dict) else "")
+
     outcome = {
-        "label": label or _safe_label_from_pnl(pnl_pct, got_stopped),
+        "label": outcome_label,
         "pnl_pct": float(pnl_pct),
         "hold_sec": float(hold_seconds),
         "got_stopped": bool(got_stopped),
@@ -1205,11 +1381,34 @@ async def a_log_entry_outcome(
     }
 
     try:
-        await _a_patch_candidate_ui(int(candidate_id), {"outcome": outcome})
+        # 1) write/upsert into entry_outcomes
+        await _a_insert_or_upsert_outcome(
+            candidate_id=int(candidate_id),
+            mint=mint_final or "",
+            outcome_label=outcome_label,
+            pnl_pct=float(pnl_pct),
+            hold_sec=float(hold_seconds),
+            got_stopped=bool(got_stopped),
+            notes=notes or "",
+            extra={"outcome": outcome, "ctx": _base_ctx()},
+        )
+
+        # 2) patch entry_candidates (fast SQL analytics)
+        await _a_patch_candidate(
+            int(candidate_id),
+            {
+                "outcome_label": outcome_label,
+                "outcome_pnl_pct": float(pnl_pct),
+                "outcome_ts": _NOW,
+            },
+            {"outcome": outcome},
+        )
+
+        # 3) emit risk_event for audit trail
         await _a_insert_risk_event(
             level="info",
             code="outcome",
-            msg=f"candidate_outcome label={outcome['label']} pnl_pct={outcome['pnl_pct']:.2f}",
+            msg=f"entry_outcome label={outcome_label} pnl_pct={float(pnl_pct):.2f}",
             meta={"candidate_id": int(candidate_id), "outcome": outcome, "ctx": _base_ctx()},
         )
         return int(candidate_id)
@@ -1226,12 +1425,11 @@ def log_entry_outcome(
     pnl_pct: float,
     hold_seconds: float,
     got_stopped: bool,
-    label: Optional[str] = None,
-    notes: Optional[str] = None,
-    extra: Optional[Mapping[str, Any]] = None,
+    label: str | None = None,
+    notes: str | None = None,
+    mint: str | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> int:
-    if _db_disabled() or (not AI_LOG_OUTCOMES) or candidate_id <= 0:
-        return 0
     _submit(
         a_log_entry_outcome(
             candidate_id=candidate_id,
@@ -1240,6 +1438,7 @@ def log_entry_outcome(
             got_stopped=got_stopped,
             label=label,
             notes=notes,
+            mint=mint,
             extra=extra,
         )
     )
@@ -1247,7 +1446,7 @@ def log_entry_outcome(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public API: executions / positions / exit_state (sync + async)
+# Executions / positions / exit_state
 # ──────────────────────────────────────────────────────────────────────────────
 async def a_log_trade_execution(
     *,
@@ -1256,16 +1455,14 @@ async def a_log_trade_execution(
     sig: str = "",
     venue: str = "",
     status: str = "ok",
-    amount_sol: Optional[float] = None,
-    amount_raw: Optional[int] = None,
-    out_amount_sol: Optional[float] = None,
-    out_amount_raw: Optional[int] = None,
-    price_sol: Optional[float] = None,
-    fee_sol: Optional[float] = None,
+    amount_sol: float | None = None,
+    amount_raw: int | None = None,
+    out_amount_sol: float | None = None,
+    out_amount_raw: int | None = None,
+    price_sol: float | None = None,
+    fee_sol: float | None = None,
     reason: str = "",
-    meta: Optional[Mapping[str, Any]] = None,
-    candidate_id: Optional[int] = None,
-    session_id: Optional[str] = None,
+    meta: Mapping[str, Any] | None = None,
 ) -> int:
     if _db_disabled() or (not AI_LOG_EXECUTIONS):
         return 0
@@ -1273,20 +1470,14 @@ async def a_log_trade_execution(
         return 0
 
     s = str(side).lower().strip()
-    if s in ("buy", "sell"):
-        pass
-    elif s == "b":
+    if s in ("b", "buy"):
         s = "buy"
-    elif s == "s":
+    elif s in ("s", "sell"):
         s = "sell"
     else:
-        s = (s[:12] or "unknown")
+        s = s[:12] or "unknown"
 
-    meta_d: Dict[str, Any] = dict(meta) if meta else {}
-    if candidate_id is not None:
-        meta_d["candidate_id"] = int(candidate_id)
-    if session_id is not None:
-        meta_d["session_id"] = session_id
+    meta_d: dict[str, Any] = dict(meta) if meta else {}
     meta_d.setdefault("ctx", _base_ctx())
 
     try:
@@ -1313,8 +1504,11 @@ async def a_log_trade_execution(
 
 
 def log_trade_execution(**kwargs: Any) -> int:
-    if _db_disabled() or (not AI_LOG_EXECUTIONS):
-        return 0
+    """
+    Sync wrapper.
+    - If no loop is running: performs the write and returns trade row id.
+    - If a loop is running: schedules the write and returns 0 (use a_log_* in async paths).
+    """
 
     async def _write() -> int:
         return await a_log_trade_execution(**kwargs)
@@ -1336,16 +1530,13 @@ def log_position_upsert(
     *,
     mint: str,
     status: str = "open",
-    qty_raw: Optional[int] = None,
-    avg_price_sol: Optional[float] = None,
-    cost_sol: Optional[float] = None,
-    realized_pnl_sol: Optional[float] = None,
-    last_price_sol: Optional[float] = None,
-    meta: Optional[Mapping[str, Any]] = None,
+    qty_raw: int | None = None,
+    avg_price_sol: float | None = None,
+    cost_sol: float | None = None,
+    realized_pnl_sol: float | None = None,
+    last_price_sol: float | None = None,
+    meta: Mapping[str, Any] | None = None,
 ) -> int:
-    if _db_disabled():
-        return 0
-
     meta_d = dict(meta) if meta else {}
     meta_d.setdefault("ctx", _base_ctx())
 
@@ -1372,9 +1563,6 @@ def log_position_upsert(
 
 
 def log_exit_state_upsert(*, mint: str, state: Mapping[str, Any]) -> int:
-    if _db_disabled():
-        return 0
-
     async def _write() -> int:
         try:
             st = dict(state)
@@ -1391,23 +1579,23 @@ def log_exit_state_upsert(*, mint: str, state: Mapping[str, Any]) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public API: events / snapshots
+# Events / snapshots
 # ──────────────────────────────────────────────────────────────────────────────
 def log_ai_event(
     *,
     event_type: str,
     level: str = "info",
     msg: str = "",
-    src: Optional[str] = None,
-    regime: Optional[str] = None,
-    payload: Optional[Mapping[str, Any]] = None,
+    src: str | None = None,
+    regime: str | None = None,
+    payload: Mapping[str, Any] | None = None,
 ) -> int:
     if _db_disabled() or (not AI_LOG_EVENTS):
         return 0
     if not _should_sample(f"evt:{event_type}:{src or ''}:{regime or ''}", AI_LOG_EVENT_SAMPLE_RATE):
         return 0
 
-    meta: Dict[str, Any] = {
+    meta: dict[str, Any] = {
         "event_type": event_type,
         "src": src,
         "regime": regime,
@@ -1415,36 +1603,48 @@ def log_ai_event(
         "payload": dict(payload) if payload else {},
         "ctx": _base_ctx(),
     }
-
     _submit(_a_insert_risk_event(level=level or "info", code=event_type, msg=msg or "", meta=meta))
     return 1
 
 
-def log_regime_snapshot(*, regime: str, state: Mapping[str, Any], extra: Optional[Mapping[str, Any]] = None) -> int:
+def log_regime_snapshot(
+    *,
+    regime: str,
+    state: Mapping[str, Any],
+    extra: Mapping[str, Any] | None = None,
+) -> int:
     if _db_disabled() or (not AI_LOG_SNAPSHOTS):
         return 0
     if not _should_sample(f"snap:regime:{regime}", AI_LOG_SNAPSHOT_SAMPLE_RATE):
         return 0
-    payload: Dict[str, Any] = {"ts": _ts(), "regime": regime, "state": dict(state), "ctx": _base_ctx()}
+
+    payload: dict[str, Any] = {
+        "ts": _ts(),
+        "regime": regime,
+        "state": dict(state),
+        "ctx": _base_ctx(),
+    }
     if extra:
         payload["extra"] = dict(extra)
+
     _submit(_a_insert_heartbeat("regime", payload))
     return 1
 
 
 def log_equity_curve_point(
     *,
-    equity_usd: Optional[float] = None,
-    balance_sol: Optional[float] = None,
-    pnl_day_pct: Optional[float] = None,
-    pnl_total_pct: Optional[float] = None,
-    extra: Optional[Mapping[str, Any]] = None,
+    equity_usd: float | None = None,
+    balance_sol: float | None = None,
+    pnl_day_pct: float | None = None,
+    pnl_total_pct: float | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> int:
     if _db_disabled() or (not AI_LOG_SNAPSHOTS):
         return 0
     if not _should_sample("snap:equity", AI_LOG_SNAPSHOT_SAMPLE_RATE):
         return 0
-    payload: Dict[str, Any] = {
+
+    payload: dict[str, Any] = {
         "ts": _ts(),
         "equity_usd": float(equity_usd) if equity_usd is not None else None,
         "balance_sol": float(balance_sol) if balance_sol is not None else None,
@@ -1454,6 +1654,7 @@ def log_equity_curve_point(
     }
     if extra:
         payload["extra"] = dict(extra)
+
     _submit(_a_insert_heartbeat("equity", payload))
     return 1
 
@@ -1461,8 +1662,9 @@ def log_equity_curve_point(
 def log_risk_manager_snapshot(*, snapshot: Mapping[str, Any]) -> int:
     if _db_disabled() or (not AI_LOG_SNAPSHOTS):
         return 0
-    if not _should_sample("snap:risk", AI_LOG_SNAPSHOT_SAMPLE_RATE):
+    if not _should_sample("snap:risk_manager", AI_LOG_SNAPSHOT_SAMPLE_RATE):
         return 0
+
     payload = {"ts": _ts(), "snapshot": dict(snapshot), "ctx": _base_ctx()}
     _submit(_a_insert_heartbeat("risk_manager", payload))
     return 1
@@ -1473,57 +1675,7 @@ def log_reinvestor_snapshot(*, snapshot: Mapping[str, Any]) -> int:
         return 0
     if not _should_sample("snap:reinvestor", AI_LOG_SNAPSHOT_SAMPLE_RATE):
         return 0
+
     payload = {"ts": _ts(), "snapshot": dict(snapshot), "ctx": _base_ctx()}
     _submit(_a_insert_heartbeat("reinvestor", payload))
     return 1
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Source-specific convenience wrappers
-# ──────────────────────────────────────────────────────────────────────────────
-def log_raydium_candidate(
-    *,
-    mint: str,
-    symbol: Optional[str],
-    meta: Mapping[str, Any],
-    regime: str = "raydium_live",
-    **kwargs: Any,
-) -> int:
-    snapshot = _build_pf_snapshot_from_meta(meta)
-    return log_entry_candidate(src="raydium", mint=mint, symbol=symbol, snapshot=snapshot, regime=regime, **kwargs)
-
-
-def log_pumpfun_candidate(
-    *,
-    mint: str,
-    symbol: Optional[str],
-    meta: Mapping[str, Any],
-    regime: str = "pumpfun_live",
-    **kwargs: Any,
-) -> int:
-    snapshot = _build_pf_snapshot_from_meta(meta)
-    return log_entry_candidate(src="pumpfun", mint=mint, symbol=symbol, snapshot=snapshot, regime=regime, **kwargs)
-
-
-def log_dexscreener_candidate(
-    *,
-    mint: str,
-    symbol: Optional[str],
-    meta: Mapping[str, Any],
-    regime: str = "dexscreener_live",
-    **kwargs: Any,
-) -> int:
-    snapshot = _build_pf_snapshot_from_meta(meta)
-    return log_entry_candidate(src="dexscreener", mint=mint, symbol=symbol, snapshot=snapshot, regime=regime, **kwargs)
-
-
-def log_momo_candidate(
-    *,
-    mint: str,
-    symbol: Optional[str],
-    meta: Mapping[str, Any],
-    regime: str = "momo_live",
-    **kwargs: Any,
-) -> int:
-    snapshot = _build_pf_snapshot_from_meta(meta)
-    return log_entry_candidate(src="momo", mint=mint, symbol=symbol, snapshot=snapshot, regime=regime, **kwargs)

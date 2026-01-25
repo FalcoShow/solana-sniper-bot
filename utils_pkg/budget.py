@@ -1,44 +1,86 @@
 from __future__ import annotations
 
 """
-utils_pkg/budget.py — God-Tier Budget + Rate Guardrails (V3+++ / quant-grade) — LOCK-IN
-====================================================================================
+utils_pkg/budget.py — God-Tier Budget + Rate Guardrails (V3+++ / quant-grade) — LOCK-IN FINAL
+===========================================================================================
 
 Purpose
 -------
-Non-trading throttle layer that protects:
+Non-trading throttle + credit-accounting layer that protects:
 
   1) Provider “monthly credits” style caps (weighted RPC calls)
-  2) Per-minute RPC pressure (avoid bans / timeouts)
-  3) Per-minute + optional daily Jupiter quote storms (avoid 429 / degraded routes)
+  2) Per-minute RPC pressure (avoid bans/timeouts)
+  3) Per-minute + optional daily Jupiter quote storms (avoid 429 / degraded routing)
   4) Multi-dyno safety via Redis (preferred), with File fallback (best-effort)
 
-Critical constraints
---------------------
+Hard constraints
+----------------
 ✅ NO network at import time
-✅ Safe to call from async code WITHOUT blocking the event loop:
-   - Public sync API stays stable (back-compat)
-   - Inside an event loop, sync calls are non-blocking:
-       * read cached snapshot + local counters
-       * schedule async refresh / async writes best-effort
-✅ Upstash TLS fix: auto-upgrade redis:// → rediss:// when host is Upstash or forced
+✅ Safe to call from async code WITHOUT blocking the event loop
+✅ Sync API stays stable (back-compat)
+✅ When called from inside an event loop, sync calls never block:
+   - returns cached snapshot + local counters immediately
+   - schedules async refresh / async writes best-effort
 
-Public API (stable)
--------------------
-  snapshot()
+Stable public API
+-----------------
+  snapshot() -> BudgetSnapshot
   allow_rpc()/note_rpc()
   allow_quote()/note_quote()
   before_rpc()/after_rpc()
   before_quote()/after_quote()
 
-Optional async API (recommended for new wiring)
-----------------------------------------------
+Optional async API (recommended)
+-------------------------------
   await async_snapshot()
   await async_allow_rpc()/async_note_rpc()
   await async_allow_quote()/async_note_quote()
+
+Environment contract (key knobs)
+--------------------------------
+Enable/namespace:
+  - BUDGET_ENABLED (default 1)
+  - BUDGET_NAMESPACE (default SERVICE_NAME or "sniper")
+
+Monthly credit cap:
+  - QN_MONTHLY_CREDITS or BUDGET_MONTHLY_CREDITS (default 80_000_000)
+  - BUDGET_RESET_DAY or QN_BILLING_RESET_DAY (default 1, 1..28)
+  - BUDGET_SOFT_STOP_FRAC (default 0.95)  -> block new work above this usage
+  - BUDGET_ALERT_FRAC (default 0.90)      -> alert above this usage (and forecast)
+
+Minute rate limits:
+  - BUDGET_RPC_PER_MIN (default 400 weighted credits/min)
+  - BUDGET_JUP_PER_MIN (default 80 quote units/min)
+  - BUDGET_JUP_DAILY_CAP (default 50_000, 0 disables)
+
+Redis / store:
+  - REDIS_URL or REDIS_TLS_URL
+  - REDIS_FORCE_TLS (default 0)
+  - BUDGET_FORCE_FILE (default 0)
+  - PF_BUDGET_STATE (default /var/data/budget_state.json)
+  - BUDGET_REDIS_VALIDATE (default 1)
+  - BUDGET_REDIS_SOCKET_TIMEOUT_SEC (default 1.5)
+  - BUDGET_REDIS_CONNECT_TIMEOUT_SEC (default 1.5)
+
+Cache/behavior:
+  - BUDGET_REFRESH_SEC (default 2.0)         -> config hot-reload TTL
+  - BUDGET_SNAPSHOT_TTL_SEC (default 0.35)   -> snapshot cache TTL
+  - BUDGET_LOCAL_MAX_KEYS (default 2000)     -> local LRU keys
+  - BUDGET_CONSERVATIVE_ON_UNKNOWN (default 0) -> fail-closed snapshot when unknown
+  - BUDGET_FAIL_OPEN (default 1)             -> if store errors, allow instead of block
+
+Weights:
+  - BUDGET_RPC_WEIGHT_getTransaction=7 (per-method override)
+
+Notes
+-----
+- Redis is preferred for multi-dyno correctness.
+- If Redis is missing/unavailable, FileStore is used (best-effort, single-process).
+- No network occurs at import; network happens only on actual store ops.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import ssl
@@ -46,7 +88,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 try:  # pragma: no cover
@@ -61,7 +103,7 @@ except Exception:  # pragma: no cover
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Logging (shim-safe)
+# Logging (shim-safe; logging_setup.get_logger is canonical)
 # ──────────────────────────────────────────────────────────────────────────────
 try:  # pragma: no cover
     from logging_setup import get_logger  # type: ignore
@@ -77,18 +119,18 @@ log = get_logger(__name__)
 if not hasattr(log, "event"):
 
     def _event(name: str, **kw: Any) -> None:  # pragma: no cover
-        try:
+        with contextlib.suppress(Exception):
             log.info("%s %s", name, kw)
-        except Exception:
-            pass
 
-    setattr(log, "event", _event)
+    log.event = _event
 
 if not hasattr(log, "every"):
 
-    def _every(key: str, n: int = 10, msg: str | None = None, **kw: Any) -> None:  # pragma: no cover
+    def _every(
+        key: str, n: int = 10, msg: str | None = None, **kw: Any
+    ) -> None:  # pragma: no cover
         """
-        Throttle by seconds (not by count). n is seconds.
+        Throttle by seconds (not by count). `n` is seconds.
         """
         try:
             now = time.monotonic()
@@ -96,15 +138,15 @@ if not hasattr(log, "every"):
             last = float(store.get(key, 0.0))
             if (now - last) >= float(max(1, int(n))):
                 store[key] = now
-                setattr(_every, "_store", store)  # type: ignore[attr-defined]
-                getattr(log, "event")(msg or key, **kw)
+                _every._store = store  # type: ignore[attr-defined]
+                log.event(msg or key, **kw)
         except Exception:
             return None
 
-    setattr(log, "every", _every)
+    log.every = _every
 
 
-def _short(x: Any, n: int = 220) -> str:
+def _short(x: Any, n: int = 240) -> str:
     try:
         s = str(x)
         return s if len(s) <= n else (s[:n] + "…")
@@ -150,10 +192,13 @@ def _envf(k: str, d: float) -> float:
         return float(d)
 
 
+BUDGET_VERSION = "v3+++_lockin_budget_2026-01-06"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Weights (provider credits)
 # ──────────────────────────────────────────────────────────────────────────────
-_DEFAULT_WEIGHTS: Dict[str, int] = {
+_DEFAULT_WEIGHTS: dict[str, int] = {
     "getBalance": 1,
     "getLatestBlockhash": 1,
     "getSignatureStatuses": 1,
@@ -187,17 +232,17 @@ def _method_weight(method: str) -> int:
 # ──────────────────────────────────────────────────────────────────────────────
 # Time keys (UTC)
 # ──────────────────────────────────────────────────────────────────────────────
-def _minute_key(ts: Optional[float] = None) -> str:
+def _minute_key(ts: float | None = None) -> str:
     t = int(ts or time.time())
     return time.strftime("%Y%m%d%H%M", time.gmtime(t))
 
 
-def _day_key(ts: Optional[float] = None) -> str:
+def _day_key(ts: float | None = None) -> str:
     t = int(ts or time.time())
     return time.strftime("%Y%m%d", time.gmtime(t))
 
 
-def _billing_month_key(ts: Optional[float] = None, reset_day: int = 1) -> Tuple[str, int]:
+def _billing_month_key(ts: float | None = None, reset_day: int = 1) -> tuple[str, int]:
     """
     Returns (month_key, period_start_epoch_utc) using reset_day anchor (1..28).
     If today < anchor, window starts last month at anchor.
@@ -205,20 +250,20 @@ def _billing_month_key(ts: Optional[float] = None, reset_day: int = 1) -> Tuple[
     import datetime as _dt
 
     reset_day = min(28, max(1, int(reset_day)))
-    now = _dt.datetime.fromtimestamp(int(ts or time.time()), tz=_dt.timezone.utc)
+    now = _dt.datetime.fromtimestamp(int(ts or time.time()), tz=_dt.UTC)
 
     year = now.year
     month = now.month
     day = now.day
 
     if day >= reset_day:
-        start = _dt.datetime(year, month, reset_day, tzinfo=_dt.timezone.utc)
+        start = _dt.datetime(year, month, reset_day, tzinfo=_dt.UTC)
     else:
         if month == 1:
             pyear, pmonth = year - 1, 12
         else:
             pyear, pmonth = year, month - 1
-        start = _dt.datetime(pyear, pmonth, reset_day, tzinfo=_dt.timezone.utc)
+        start = _dt.datetime(pyear, pmonth, reset_day, tzinfo=_dt.UTC)
 
     month_key = start.strftime("%Y-%m")
     return month_key, int(start.timestamp())
@@ -263,8 +308,8 @@ def _upgrade_to_tls_if_needed(url: str) -> str:
         return url
 
 
-def _redis_ssl_kwargs_if_needed(url_eff: str) -> Dict[str, Any]:
-    kw: Dict[str, Any] = {}
+def _redis_ssl_kwargs_if_needed(url_eff: str) -> dict[str, Any]:
+    kw: dict[str, Any] = {}
     if url_eff.startswith("rediss://"):
         if certifi is not None:
             kw["ssl_ca_certs"] = certifi.where()
@@ -274,12 +319,107 @@ def _redis_ssl_kwargs_if_needed(url_eff: str) -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Backend stores (async-first; file fallback)
+# Config (hot-reload TTL)
 # ──────────────────────────────────────────────────────────────────────────────
+_CFG_LOCK = threading.Lock()
+_CFG_TTL_SEC = max(0.25, _envf("BUDGET_REFRESH_SEC", 2.0))
+_cfg_at: float = 0.0
+_cfg_cache: dict[str, Any] = {}
+
+
+def _cfg() -> dict[str, Any]:
+    global _cfg_at, _cfg_cache
+    now = time.monotonic()
+
+    with _CFG_LOCK:
+        if _cfg_cache and (now - _cfg_at) < _CFG_TTL_SEC:
+            return _cfg_cache
+
+        enabled = _envb("BUDGET_ENABLED", True)
+
+        monthly_cap = _envi("QN_MONTHLY_CREDITS", _envi("BUDGET_MONTHLY_CREDITS", 80_000_000))
+        soft_stop_frac = max(0.50, min(0.999, _envf("BUDGET_SOFT_STOP_FRAC", 0.95)))
+        alert_frac = max(0.10, min(0.999, _envf("BUDGET_ALERT_FRAC", 0.90)))
+
+        rpc_per_min = max(30, _envi("BUDGET_RPC_PER_MIN", 400))  # weighted credits/min
+        jup_per_min = max(10, _envi("BUDGET_JUP_PER_MIN", 80))  # quote units/min
+        jup_daily_cap = max(0, _envi("BUDGET_JUP_DAILY_CAP", 50_000))
+
+        reset_day = min(28, max(1, _envi("BUDGET_RESET_DAY", _envi("QN_BILLING_RESET_DAY", 1))))
+        state_file = _envs("PF_BUDGET_STATE", "/var/data/budget_state.json")
+
+        conservative_on_unknown = _envb("BUDGET_CONSERVATIVE_ON_UNKNOWN", False)
+        fail_open = _envb("BUDGET_FAIL_OPEN", True)
+
+        # Optionally count quotes into monthly credits too
+        quote_credit_cost = max(0, _envi("BUDGET_QUOTE_CREDIT_COST", 0))  # 0 disables
+
+        namespace = _envs("BUDGET_NAMESPACE", "") or _envs("SERVICE_NAME", "") or "sniper"
+
+        snap_ttl = max(0.10, _envf("BUDGET_SNAPSHOT_TTL_SEC", 0.35))
+        local_max_keys = max(200, _envi("BUDGET_LOCAL_MAX_KEYS", 2000))
+
+        cfg = {
+            "enabled": bool(enabled),
+            "monthly_cap": max(1, int(monthly_cap)),
+            "soft_stop_frac": float(soft_stop_frac),
+            "alert_frac": float(alert_frac),
+            "rpc_per_min": int(rpc_per_min),
+            "jup_per_min": int(jup_per_min),
+            "jup_daily_cap": int(jup_daily_cap),
+            "reset_day": int(reset_day),
+            "state_file": state_file,
+            "conservative_on_unknown": bool(conservative_on_unknown),
+            "fail_open": bool(fail_open),
+            "quote_credit_cost": int(quote_credit_cost),
+            "namespace": str(namespace),
+            "snap_ttl": float(snap_ttl),
+            "local_max_keys": int(local_max_keys),
+        }
+
+        _cfg_cache = cfg
+        _cfg_at = now
+        return cfg
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Keys + namespace
+# ──────────────────────────────────────────────────────────────────────────────
+def _budget_prefix() -> str:
+    ns = _cfg()["namespace"]
+    return f"budget:v3:{ns}"
+
+
+def _keys(prefix: str, minute: str, day: str, month_key: str) -> dict[str, str]:
+    return {
+        "rpc_min": f"{prefix}:minute:{minute}:rpc",
+        "jup_min": f"{prefix}:minute:{minute}:jup",
+        "jup_day": f"{prefix}:day:{day}:jup",
+        "month": f"{prefix}:month:{month_key}:used",
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Store backends (lazy init; no network at import)
+# ──────────────────────────────────────────────────────────────────────────────
+_LUA_INCR_EXPIRE = r"""
+local key = KEYS[1]
+local by = tonumber(ARGV[1]) or 1
+local ttl = tonumber(ARGV[2]) or 0
+local v = redis.call('INCRBY', key, by)
+if ttl and ttl > 0 then
+  redis.call('EXPIRE', key, ttl)
+end
+return v
+"""
+
+
 class _AsyncRedisStore:
     """
     Async Redis backend (preferred).
-    Uses redis.asyncio if available; otherwise uses sync redis via local threads.
+    Uses redis.asyncio if available; otherwise uses sync redis via threads.
+
+    No network at init; connection attempts happen when commands execute.
     """
 
     def __init__(self, url: str):
@@ -323,6 +463,9 @@ class _AsyncRedisStore:
             raise RuntimeError("could not build redis client")
 
     async def validate(self) -> None:
+        """
+        Best-effort ping validation. May do network (runtime only).
+        """
         try:
             if self._async is not None:
                 await self._async.ping()
@@ -343,26 +486,39 @@ class _AsyncRedisStore:
         return [int(v or 0) for v in (vals or [])]
 
     async def incr_with_ttl(self, key: str, n: int, ttl_s: int) -> int:
+        """
+        Atomic-ish INCRBY + EXPIRE:
+        - Prefer Lua (atomic)
+        - Fallback to pipeline if Lua not supported
+        """
         n = int(n)
         ttl_s = int(ttl_s)
 
         if self._async is not None:
-            pipe = self._async.pipeline()
-            pipe.incrby(key, n)
-            if ttl_s > 0:
-                pipe.expire(key, ttl_s)
-            out = await pipe.execute()
-            return int((out or [0])[0] or 0)
+            try:
+                v = await self._async.eval(_LUA_INCR_EXPIRE, 1, key, n, ttl_s)
+                return int(v or 0)
+            except Exception:
+                pipe = self._async.pipeline()
+                pipe.incrby(key, n)
+                if ttl_s > 0:
+                    pipe.expire(key, ttl_s)
+                out = await pipe.execute()
+                return int((out or [0])[0] or 0)
 
         assert self._sync is not None
 
         def _do() -> int:
-            pipe = self._sync.pipeline()
-            pipe.incrby(key, n)
-            if ttl_s > 0:
-                pipe.expire(key, ttl_s)
-            out = pipe.execute()
-            return int((out or [0])[0] or 0)
+            try:
+                v = self._sync.eval(_LUA_INCR_EXPIRE, 1, key, n, ttl_s)
+                return int(v or 0)
+            except Exception:
+                pipe = self._sync.pipeline()
+                pipe.incrby(key, n)
+                if ttl_s > 0:
+                    pipe.expire(key, ttl_s)
+                out = pipe.execute()
+                return int((out or [0])[0] or 0)
 
         return await asyncio.to_thread(_do)
 
@@ -370,20 +526,22 @@ class _AsyncRedisStore:
 class _FileStore:
     """
     JSON file fallback. Not multi-dyno safe; best-effort.
+
+    Suitable for: local dev, single-process, or emergency fallback.
     """
 
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.Lock()
-        self._state: Dict[str, Any] = self._load()
+        self._state: dict[str, Any] = self._load()
 
-    def _load(self) -> Dict[str, Any]:
+    def _load(self) -> dict[str, Any]:
         try:
             d = os.path.dirname(self.path)
             if d and not os.path.exists(d):
                 os.makedirs(d, exist_ok=True)
             if os.path.exists(self.path):
-                with open(self.path, "r", encoding="utf-8") as f:
+                with open(self.path, encoding="utf-8") as f:
                     data = json.load(f)
                     if isinstance(data, dict):
                         data.setdefault("kv", {})
@@ -400,31 +558,34 @@ class _FileStore:
             pass
 
     def _prune(self) -> None:
-        kv: Dict[str, Any] = self._state.get("kv", {})
+        kv: dict[str, Any] = self._state.get("kv", {})
         if not isinstance(kv, dict):
             self._state["kv"] = {}
             return
         now = int(time.time())
 
         def _keep(k: str) -> bool:
+            # prune minute keys older than ~15m
             if ":minute:" in k:
                 try:
                     mk = k.split(":minute:")[1].split(":")[0]
                     import datetime as _dt
 
-                    dt = _dt.datetime.strptime(mk, "%Y%m%d%H%M").replace(tzinfo=_dt.timezone.utc)
-                    return (now - int(dt.timestamp())) <= 8 * 60
+                    dt = _dt.datetime.strptime(mk, "%Y%m%d%H%M").replace(tzinfo=_dt.UTC)
+                    return (now - int(dt.timestamp())) <= 15 * 60
                 except Exception:
                     return True
+            # prune day keys older than ~14d
             if ":day:" in k:
                 try:
                     dk = k.split(":day:")[1].split(":")[0]
                     import datetime as _dt
 
-                    dt = _dt.datetime.strptime(dk, "%Y%m%d").replace(tzinfo=_dt.timezone.utc)
-                    return (now - int(dt.timestamp())) <= 7 * 24 * 3600
+                    dt = _dt.datetime.strptime(dk, "%Y%m%d").replace(tzinfo=_dt.UTC)
+                    return (now - int(dt.timestamp())) <= 14 * 24 * 3600
                 except Exception:
                     return True
+            # month keys are kept (small count)
             return True
 
         for k in list(kv.keys()):
@@ -433,12 +594,12 @@ class _FileStore:
 
     def get_many(self, keys: list[str]) -> list[int]:
         with self._lock:
-            kv: Dict[str, Any] = self._state.get("kv", {})
+            kv: dict[str, Any] = self._state.get("kv", {})
             return [int(kv.get(k, 0) or 0) for k in keys]
 
     def incr(self, key: str, n: int) -> int:
         with self._lock:
-            kv: Dict[str, Any] = self._state.setdefault("kv", {})
+            kv: dict[str, Any] = self._state.setdefault("kv", {})
             cur = int(kv.get(key, 0) or 0) + int(n)
             kv[key] = cur
             self._prune()
@@ -446,73 +607,14 @@ class _FileStore:
             return cur
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config (hot-reload TTL)
-# ──────────────────────────────────────────────────────────────────────────────
-_CFG_TTL_SEC = max(0.25, _envf("BUDGET_REFRESH_SEC", 2.0))
-_cfg_at: float = 0.0
-_cfg_cache: Dict[str, Any] = {}
-
-
-def _cfg() -> Dict[str, Any]:
-    global _cfg_at, _cfg_cache
-    now = time.monotonic()
-    if _cfg_cache and (now - _cfg_at) < _CFG_TTL_SEC:
-        return _cfg_cache
-
-    enabled = _envb("BUDGET_ENABLED", True)
-
-    monthly_cap = _envi("QN_MONTHLY_CREDITS", _envi("BUDGET_MONTHLY_CREDITS", 80_000_000))
-    soft_stop_frac = max(0.50, min(0.999, _envf("BUDGET_SOFT_STOP_FRAC", 0.95)))
-    alert_frac = max(0.10, min(0.999, _envf("BUDGET_ALERT_FRAC", 0.90)))
-
-    rpc_per_min = max(30, _envi("BUDGET_RPC_PER_MIN", 400))   # in weighted credits
-    jup_per_min = max(10, _envi("BUDGET_JUP_PER_MIN", 80))    # in quote units
-    jup_daily_cap = max(0, _envi("BUDGET_JUP_DAILY_CAP", 50_000))
-
-    reset_day = min(28, max(1, _envi("BUDGET_RESET_DAY", _envi("QN_BILLING_RESET_DAY", 1))))
-    state_file = _envs("PF_BUDGET_STATE", "/var/data/budget_state.json")
-
-    conservative_on_unknown = _envb("BUDGET_CONSERVATIVE_ON_UNKNOWN", False)
-
-    # Optional: count quotes into monthly credits too
-    quote_credit_cost = max(0, _envi("BUDGET_QUOTE_CREDIT_COST", 0))  # 0 disables
-
-    namespace = _envs("BUDGET_NAMESPACE", "") or _envs("SERVICE_NAME", "") or "sniper"
-
-    snap_ttl = max(0.10, _envf("BUDGET_SNAPSHOT_TTL_SEC", 0.35))
-    local_max_keys = max(200, _envi("BUDGET_LOCAL_MAX_KEYS", 2000))
-
-    cfg = {
-        "enabled": bool(enabled),
-        "monthly_cap": max(1, int(monthly_cap)),
-        "soft_stop_frac": float(soft_stop_frac),
-        "alert_frac": float(alert_frac),
-        "rpc_per_min": int(rpc_per_min),
-        "jup_per_min": int(jup_per_min),
-        "jup_daily_cap": int(jup_daily_cap),
-        "reset_day": int(reset_day),
-        "state_file": state_file,
-        "conservative_on_unknown": bool(conservative_on_unknown),
-        "quote_credit_cost": int(quote_credit_cost),
-        "namespace": str(namespace),
-        "snap_ttl": float(snap_ttl),
-        "local_max_keys": int(local_max_keys),
-    }
-
-    _cfg_cache = cfg
-    _cfg_at = now
-    return cfg
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Store singleton
-# ──────────────────────────────────────────────────────────────────────────────
 _STORE_LOCK = threading.Lock()
 _STORE: Any = None  # _AsyncRedisStore or _FileStore
 
 
 def _get_store() -> Any:
+    """
+    Lazy store init. No network at import time; store does not connect until ops.
+    """
     global _STORE
     if _STORE is not None:
         return _STORE
@@ -531,14 +633,21 @@ def _get_store() -> Any:
 
         try:
             st = _AsyncRedisStore(url)
+            _STORE = st
+
+            # Best-effort validate; never at import; only on first use
             if _envb("BUDGET_REDIS_VALIDATE", True):
-                # best-effort validate; never block import; may run now if not in loop
                 try:
                     loop = asyncio.get_running_loop()
                     loop.create_task(st.validate())
                 except Exception:
-                    asyncio.run(st.validate())
-            _STORE = st
+                    # No running loop; validate in a background thread (avoid long blocking)
+                    def _bg() -> None:
+                        with contextlib.suppress(Exception):
+                            asyncio.run(st.validate())
+
+                    threading.Thread(target=_bg, daemon=True).start()
+
             log.event("BUDGET_REDIS_OK", url_mask=st.url_mask)
             return _STORE
         except Exception as e:
@@ -561,10 +670,7 @@ def _store_is_redis(st: Any) -> bool:
 async def _store_get_many(keys: list[str]) -> list[int]:
     st = _get_store()
     if _store_is_redis(st):
-        try:
-            return await st.get_many(keys)
-        except Exception as e:
-            log.every("BUDGET_REDIS_RUNTIME_FAIL", n=8, msg="BUDGET_REDIS_RUNTIME_FAIL", err=_short(e))
+        return await st.get_many(keys)
     if isinstance(st, _FileStore):
         return await asyncio.to_thread(st.get_many, keys)
     return [0 for _ in keys]
@@ -573,45 +679,24 @@ async def _store_get_many(keys: list[str]) -> list[int]:
 async def _store_incr(key: str, n: int, *, ttl_s: int) -> int:
     st = _get_store()
     if _store_is_redis(st):
-        try:
-            return await st.incr_with_ttl(key, int(n), int(ttl_s))
-        except Exception as e:
-            log.every("BUDGET_REDIS_RUNTIME_FAIL", n=8, msg="BUDGET_REDIS_RUNTIME_FAIL", err=_short(e))
+        return await st.incr_with_ttl(key, int(n), int(ttl_s))
     if isinstance(st, _FileStore):
         return int(await asyncio.to_thread(st.incr, key, int(n)))
     return 0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Keys + namespace
-# ──────────────────────────────────────────────────────────────────────────────
-def _budget_prefix() -> str:
-    ns = _cfg()["namespace"]
-    return f"budget:v3:{ns}"
-
-
-def _keys(prefix: str, minute: str, day: str, month_key: str) -> Dict[str, str]:
-    return {
-        "rpc_min": f"{prefix}:minute:{minute}:rpc",
-        "jup_min": f"{prefix}:minute:{minute}:jup",
-        "jup_day": f"{prefix}:day:{day}:jup",
-        "month": f"{prefix}:month:{month_key}:used",
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Local counters (for non-blocking sync calls inside event loop)
 # ──────────────────────────────────────────────────────────────────────────────
 _LOCAL_LOCK = threading.Lock()
-_LOCAL: "OrderedDict[str, int]" = OrderedDict()  # key -> count
-_LOCAL_MAX_DEFAULT = 2000
+_LOCAL: OrderedDict[str, int] = OrderedDict()  # key -> count (LRU)
 
 
 def _local_max() -> int:
     try:
-        return max(200, int(_cfg().get("local_max_keys") or _LOCAL_MAX_DEFAULT))
+        return max(200, int(_cfg().get("local_max_keys") or 2000))
     except Exception:
-        return _LOCAL_MAX_DEFAULT
+        return 2000
 
 
 def _local_get(key: str) -> int:
@@ -627,17 +712,20 @@ def _local_incr(key: str, n: int) -> int:
         cur = int(_LOCAL.get(key, 0) or 0) + int(n)
         _LOCAL[key] = cur
         _LOCAL.move_to_end(key, last=True)
-        # prune LRU
-        lim = _local_max()
-        while len(_LOCAL) > lim:
+        while len(_LOCAL) > _local_max():
             _LOCAL.popitem(last=False)
         return cur
+
+
+def _local_clear() -> None:
+    with _LOCAL_LOCK:
+        _LOCAL.clear()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Snapshot caching + coalesced refresh
 # ──────────────────────────────────────────────────────────────────────────────
-@dataclass
+@dataclass(frozen=True)
 class BudgetSnapshot:
     month_key: str
     period_start: int
@@ -650,20 +738,40 @@ class BudgetSnapshot:
     jup_today: int
     forecast_frac: float
     enabled: bool
+    version: str = BUDGET_VERSION
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "month_key": self.month_key,
+            "period_start": self.period_start,
+            "used": self.used,
+            "cap": self.cap,
+            "remaining": self.remaining,
+            "used_frac": self.used_frac,
+            "rpcs_this_min": self.rpcs_this_min,
+            "jup_this_min": self.jup_this_min,
+            "jup_today": self.jup_today,
+            "forecast_frac": self.forecast_frac,
+            "enabled": self.enabled,
+            "version": self.version,
+        }
 
 
 _SNAP_LOCK = threading.Lock()
-_LAST_SNAP: Optional[BudgetSnapshot] = None
+_LAST_SNAP: BudgetSnapshot | None = None
 _LAST_SNAP_AT: float = 0.0
 _SNAP_INFLIGHT: bool = False
 
 
 def _forecast_frac(used: int, period_start: int, cap: int) -> float:
+    """
+    Simple linear usage forecast for the remainder of a ~30-day month window.
+    """
     el = max(1.0, time.time() - float(period_start))
-    per_sec = float(used) / el
-    approx_month_secs = 30 * 24 * 3600
+    per_sec = float(max(0, used)) / el
+    approx_month_secs = 30.0 * 24.0 * 3600.0
     try:
-        return min(3.0, (per_sec * approx_month_secs) / max(1, int(cap)))
+        return min(5.0, (per_sec * approx_month_secs) / float(max(1, int(cap))))
     except Exception:
         return 0.0
 
@@ -675,18 +783,29 @@ def _cache_set(snap: BudgetSnapshot) -> None:
         _LAST_SNAP_AT = time.monotonic()
 
 
-def _cache_get() -> Optional[BudgetSnapshot]:
+def _cache_get() -> BudgetSnapshot | None:
     with _SNAP_LOCK:
         return _LAST_SNAP
 
 
 def _cache_fresh() -> bool:
-    c = _cfg()
-    ttl = float(c.get("snap_ttl") or 0.35)
+    ttl = float(_cfg().get("snap_ttl") or 0.35)
     with _SNAP_LOCK:
         if _LAST_SNAP is None:
             return False
         return (time.monotonic() - float(_LAST_SNAP_AT)) <= ttl
+
+
+def _default_snap() -> BudgetSnapshot:
+    c = _cfg()
+    mk, start = _billing_month_key(reset_day=int(c["reset_day"]))
+    cap = int(c["monthly_cap"])
+    if bool(c.get("conservative_on_unknown")):
+        # fail-closed-ish: pretend we're hot (blocks) if conservative mode enabled
+        return BudgetSnapshot(
+            mk, start, cap, cap, 0, 1.0, 10**9, 10**9, 10**9, 5.0, bool(c["enabled"])
+        )
+    return BudgetSnapshot(mk, start, 0, cap, cap, 0.0, 0, 0, 0, 0.0, bool(c["enabled"]))
 
 
 async def async_snapshot() -> BudgetSnapshot:
@@ -730,9 +849,7 @@ def snapshot() -> BudgetSnapshot:
     Sync snapshot (stable API).
     Never blocks the event loop if called from within it.
     """
-    c = _cfg()
-
-    # If not in a running loop, we can just run the async snapshot.
+    # No loop: allowed to block (runtime), never at import.
     try:
         asyncio.get_running_loop()
         in_loop = True
@@ -744,26 +861,14 @@ def snapshot() -> BudgetSnapshot:
             return asyncio.run(async_snapshot())
         except Exception as e:
             log.every("BUDGET_SNAPSHOT_FAIL", n=10, msg="BUDGET_SNAPSHOT_FAIL", err=_short(e))
-            snap = _cache_get()
-            if snap is not None:
-                return snap
-            mk, start = _billing_month_key(reset_day=int(c["reset_day"]))
-            cap = int(c["monthly_cap"])
-            return BudgetSnapshot(mk, start, 0, cap, cap, 0.0, 0, 0, 0, 0.0, bool(c["enabled"]))
+            return _cache_get() or _default_snap()
 
-    # In loop: return cached immediately; schedule a refresh (coalesced).
-    snap = _cache_get()
-    if snap is None:
-        mk, start = _billing_month_key(reset_day=int(c["reset_day"]))
-        cap = int(c["monthly_cap"])
-        if bool(c.get("conservative_on_unknown")):
-            snap = BudgetSnapshot(mk, start, cap, cap, 0, 1.0, 10**9, 10**9, 10**9, 3.0, bool(c["enabled"]))
-        else:
-            snap = BudgetSnapshot(mk, start, 0, cap, cap, 0.0, 0, 0, 0, 0.0, bool(c["enabled"]))
-        _cache_set(snap)
+    # In loop: return cached immediately; schedule refresh if stale (coalesced).
+    snap = _cache_get() or _default_snap()
+    _cache_set(snap)
 
     global _SNAP_INFLIGHT
-    if not _cache_fresh() and not _SNAP_INFLIGHT:
+    if (not _cache_fresh()) and (not _SNAP_INFLIGHT):
         _SNAP_INFLIGHT = True
 
         async def _refresh() -> None:
@@ -784,9 +889,9 @@ def snapshot() -> BudgetSnapshot:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Global breaker (optional): if store fails repeatedly, we still allow but warn
+# Fail tracking (store issues)
 # ──────────────────────────────────────────────────────────────────────────────
-_FAIL_TIMES: deque[float] = deque(maxlen=50)
+_FAIL_TIMES: deque[float] = deque(maxlen=64)
 
 
 def _note_fail() -> None:
@@ -798,29 +903,50 @@ def _recent_fails(window_sec: float = 30.0) -> int:
     return sum(1 for t in _FAIL_TIMES if (now - t) <= float(window_sec))
 
 
+def _should_fail_open() -> bool:
+    try:
+        return bool(_cfg().get("fail_open", True))
+    except Exception:
+        return True
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # RPC gates
 # ──────────────────────────────────────────────────────────────────────────────
-async def async_allow_rpc(method: str, *, weight: Optional[int] = None) -> bool:
+async def async_allow_rpc(method: str, *, weight: int | None = None) -> bool:
     c = _cfg()
     if not bool(c["enabled"]):
         return True
 
-    s = await async_snapshot()
+    try:
+        s = await async_snapshot()
+    except Exception as e:
+        _note_fail()
+        log.every(
+            "BUDGET_ALLOW_RPC_SNAP_FAIL", n=8, msg="BUDGET_ALLOW_RPC_SNAP_FAIL", err=_short(e)
+        )
+        return bool(_should_fail_open())
 
     # soft stop if too high used
     if s.used_frac >= float(c["soft_stop_frac"]):
         return False
 
-    # warning if forecast is high
+    # forecast warning
     if s.forecast_frac >= float(c["alert_frac"]):
-        log.every("BUDGET_FORECAST_HIGH", n=10, msg="BUDGET_FORECAST_HIGH", used=s.used, cap=s.cap, forecast_frac=round(s.forecast_frac, 3))
+        log.every(
+            "BUDGET_FORECAST_HIGH",
+            n=10,
+            msg="BUDGET_FORECAST_HIGH",
+            used=s.used,
+            cap=s.cap,
+            forecast_frac=round(s.forecast_frac, 3),
+        )
 
     w = int(weight if weight is not None else _method_weight(method))
     return (int(s.rpcs_this_min) + w) <= int(c["rpc_per_min"])
 
 
-def allow_rpc(method: str, *, weight: Optional[int] = None) -> bool:
+def allow_rpc(method: str, *, weight: int | None = None) -> bool:
     """
     Sync allow_rpc (stable API). Non-blocking inside an event loop.
     """
@@ -837,9 +963,10 @@ def allow_rpc(method: str, *, weight: Optional[int] = None) -> bool:
     if not in_loop:
         try:
             return asyncio.run(async_allow_rpc(method, weight=weight))
-        except Exception:
+        except Exception as e:
             _note_fail()
-            return True  # fail-open to avoid killing the bot
+            log.every("BUDGET_ALLOW_RPC_FAIL", n=10, msg="BUDGET_ALLOW_RPC_FAIL", err=_short(e))
+            return bool(_should_fail_open())
 
     # in-loop: cached snap + local counters only (non-blocking)
     s = snapshot()
@@ -856,7 +983,7 @@ def allow_rpc(method: str, *, weight: Optional[int] = None) -> bool:
     return (int(s.rpcs_this_min) + int(local_rpc) + w) <= int(c["rpc_per_min"])
 
 
-async def async_note_rpc(method: str, *, weight: Optional[int] = None) -> None:
+async def async_note_rpc(method: str, *, weight: int | None = None) -> None:
     c = _cfg()
     if not bool(c["enabled"]):
         return
@@ -876,30 +1003,43 @@ async def async_note_rpc(method: str, *, weight: Optional[int] = None) -> None:
         return
 
     cap = max(1, int(c["monthly_cap"]))
-    if float(used) / float(cap) >= float(c["alert_frac"]):
-        log.every("BUDGET_ALERT_USAGE", n=5, msg="BUDGET_ALERT_USAGE", used=used, cap=cap, pct=round(100 * used / cap, 2))
+    used_frac = float(used) / float(cap)
+
+    if used_frac >= float(c["alert_frac"]):
+        log.every(
+            "BUDGET_ALERT_USAGE",
+            n=5,
+            msg="BUDGET_ALERT_USAGE",
+            used=int(used),
+            cap=int(cap),
+            pct=round(100.0 * float(used) / float(cap), 2),
+        )
 
     if int(cur_min) > int(c["rpc_per_min"]):
-        log.every("BUDGET_MINUTE_RPC_HOT", n=5, msg="BUDGET_MINUTE_RPC_HOT", count=cur_min, limit=int(c["rpc_per_min"]))
+        log.every(
+            "BUDGET_MINUTE_RPC_HOT",
+            n=5,
+            msg="BUDGET_MINUTE_RPC_HOT",
+            count=int(cur_min),
+            limit=int(c["rpc_per_min"]),
+        )
 
-    # update cached snap cheaply (best-effort)
+    # Update cached snap cheaply (best-effort)
     try:
         snap = _cache_get()
         if snap is not None and snap.month_key == mk:
-            cap2 = max(1, int(c["monthly_cap"]))
-            used_frac = float(used) / float(cap2)
             _cache_set(
                 BudgetSnapshot(
                     month_key=mk,
                     period_start=int(start),
                     used=int(used),
-                    cap=int(cap2),
-                    remaining=max(0, int(cap2) - int(used)),
+                    cap=int(cap),
+                    remaining=max(0, int(cap) - int(used)),
                     used_frac=float(used_frac),
                     rpcs_this_min=int(cur_min),
                     jup_this_min=int(snap.jup_this_min),
                     jup_today=int(snap.jup_today),
-                    forecast_frac=float(_forecast_frac(int(used), int(start), int(cap2))),
+                    forecast_frac=float(_forecast_frac(int(used), int(start), int(cap))),
                     enabled=bool(c["enabled"]),
                 )
             )
@@ -907,7 +1047,7 @@ async def async_note_rpc(method: str, *, weight: Optional[int] = None) -> None:
         pass
 
 
-def note_rpc(method: str, *, weight: Optional[int] = None) -> None:
+def note_rpc(method: str, *, weight: int | None = None) -> None:
     """
     Sync note_rpc (stable API). Non-blocking inside an event loop:
       - updates local counters immediately
@@ -933,6 +1073,7 @@ def note_rpc(method: str, *, weight: Optional[int] = None) -> None:
     except Exception:
         pass
 
+    # no loop: run now
     try:
         asyncio.run(async_note_rpc(method, weight=weight))
     except Exception as e:
@@ -949,12 +1090,20 @@ async def async_allow_quote(kind: str = "jup_quote", *, units: int = 1) -> bool:
     if not bool(c["enabled"]):
         return True
 
-    s = await async_snapshot()
+    try:
+        s = await async_snapshot()
+    except Exception as e:
+        _note_fail()
+        log.every(
+            "BUDGET_ALLOW_QUOTE_SNAP_FAIL", n=8, msg="BUDGET_ALLOW_QUOTE_SNAP_FAIL", err=_short(e)
+        )
+        return bool(_should_fail_open())
+
     if (int(s.jup_this_min) + int(units)) > int(c["jup_per_min"]):
         return False
-    if int(c["jup_daily_cap"]) > 0 and (int(s.jup_today) + int(units)) > int(c["jup_daily_cap"]):
-        return False
-    return True
+    return not (
+        int(c["jup_daily_cap"]) > 0 and int(s.jup_today) + int(units) > int(c["jup_daily_cap"])
+    )
 
 
 def allow_quote(kind: str = "jup_quote", *, units: int = 1) -> bool:
@@ -972,9 +1121,10 @@ def allow_quote(kind: str = "jup_quote", *, units: int = 1) -> bool:
     if not in_loop:
         try:
             return asyncio.run(async_allow_quote(kind, units=units))
-        except Exception:
+        except Exception as e:
             _note_fail()
-            return True  # fail-open
+            log.every("BUDGET_ALLOW_QUOTE_FAIL", n=10, msg="BUDGET_ALLOW_QUOTE_FAIL", err=_short(e))
+            return bool(_should_fail_open())
 
     s = snapshot()
     prefix = _budget_prefix()
@@ -986,9 +1136,10 @@ def allow_quote(kind: str = "jup_quote", *, units: int = 1) -> bool:
 
     if (int(s.jup_this_min) + int(local_min) + int(units)) > int(c["jup_per_min"]):
         return False
-    if int(c["jup_daily_cap"]) > 0 and (int(s.jup_today) + int(local_day) + int(units)) > int(c["jup_daily_cap"]):
-        return False
-    return True
+    return not (
+        int(c["jup_daily_cap"]) > 0
+        and int(s.jup_today) + int(local_day) + int(units) > int(c["jup_daily_cap"])
+    )
 
 
 async def async_note_quote(kind: str = "jup_quote", *, units: int = 1) -> None:
@@ -1011,33 +1162,43 @@ async def async_note_quote(kind: str = "jup_quote", *, units: int = 1) -> None:
 
     qcost = int(c.get("quote_credit_cost") or 0)
     if qcost > 0:
-        try:
+        with contextlib.suppress(Exception):
             await _store_incr(ks["month"], int(qcost) * int(units), ttl_s=0)
-        except Exception:
-            pass
 
     if int(cur_min) > int(c["jup_per_min"]):
-        log.every("BUDGET_MINUTE_JUP_HOT", n=5, msg="BUDGET_MINUTE_JUP_HOT", count=cur_min, limit=int(c["jup_per_min"]))
+        log.every(
+            "BUDGET_MINUTE_JUP_HOT",
+            n=5,
+            msg="BUDGET_MINUTE_JUP_HOT",
+            count=int(cur_min),
+            limit=int(c["jup_per_min"]),
+        )
     if int(c["jup_daily_cap"]) > 0 and int(cur_day) > int(c["jup_daily_cap"]):
-        log.every("BUDGET_DAILY_JUP_HOT", n=5, msg="BUDGET_DAILY_JUP_HOT", count=cur_day, limit=int(c["jup_daily_cap"]))
+        log.every(
+            "BUDGET_DAILY_JUP_HOT",
+            n=5,
+            msg="BUDGET_DAILY_JUP_HOT",
+            count=int(cur_day),
+            limit=int(c["jup_daily_cap"]),
+        )
 
-    # update cached snap
+    # Update cached snap (best-effort)
     try:
         snap = _cache_get()
         if snap is not None and snap.month_key == mk:
             _cache_set(
                 BudgetSnapshot(
-                    month_key=snap.month_key,
-                    period_start=snap.period_start,
-                    used=snap.used,
-                    cap=snap.cap,
-                    remaining=snap.remaining,
-                    used_frac=snap.used_frac,
-                    rpcs_this_min=snap.rpcs_this_min,
+                    month_key=mk,
+                    period_start=int(start),
+                    used=int(snap.used),
+                    cap=int(snap.cap),
+                    remaining=int(snap.remaining),
+                    used_frac=float(snap.used_frac),
+                    rpcs_this_min=int(snap.rpcs_this_min),
                     jup_this_min=int(cur_min),
                     jup_today=int(cur_day),
-                    forecast_frac=snap.forecast_frac,
-                    enabled=snap.enabled,
+                    forecast_frac=float(snap.forecast_frac),
+                    enabled=bool(snap.enabled),
                 )
             )
     except Exception:
@@ -1078,7 +1239,7 @@ def note_quote(kind: str = "jup_quote", *, units: int = 1) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Convenience wrappers (stable)
 # ──────────────────────────────────────────────────────────────────────────────
-def before_rpc(method: str, *, weight: Optional[int] = None) -> bool:
+def before_rpc(method: str, *, weight: int | None = None) -> bool:
     ok = allow_rpc(method, weight=weight)
     if not ok:
         s = snapshot()
@@ -1095,7 +1256,7 @@ def before_rpc(method: str, *, weight: Optional[int] = None) -> bool:
     return ok
 
 
-def after_rpc(method: str, *, weight: Optional[int] = None) -> None:
+def after_rpc(method: str, *, weight: int | None = None) -> None:
     note_rpc(method, weight=weight)
 
 
@@ -1119,20 +1280,21 @@ def after_quote(units: int = 1) -> None:
 
 
 __all__ = [
+    "BUDGET_VERSION",
     "BudgetSnapshot",
-    "snapshot",
-    "allow_rpc",
-    "note_rpc",
-    "allow_quote",
-    "note_quote",
-    "before_rpc",
-    "after_rpc",
-    "before_quote",
     "after_quote",
+    "after_rpc",
+    "allow_quote",
+    "allow_rpc",
+    "async_allow_quote",
+    "async_allow_rpc",
+    "async_note_quote",
+    "async_note_rpc",
     # optional async API
     "async_snapshot",
-    "async_allow_rpc",
-    "async_note_rpc",
-    "async_allow_quote",
-    "async_note_quote",
+    "before_quote",
+    "before_rpc",
+    "note_quote",
+    "note_rpc",
+    "snapshot",
 ]
