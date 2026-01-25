@@ -1,0 +1,204 @@
+{
+  "schema_version": "1",
+  "source": "pumpfun_snapshot",
+  "captured_at_utc": "2026-01-06T00:00:00Z",
+  "notes": "Static fixture for unit/contract tests. Synthetic Pump.fun-like snapshot. No network.",
+  "coins": [
+    {
+      "mint": "PUMPTESTA11111111111111111111111111111111111",
+      "name": "Pump Test A",
+      "symbol": "PTESTA",
+      "creator": "CreatorA111111111111111111111111111111111111",
+      "image": "ipfs://bafybeigdyrpump-test-a",
+      "description": "Synthetic pumpfun coin for contract tests.",
+      "website": "https://example.com/ptest-a",
+      "twitter": "https://x.com/ptest_a",
+      "telegram": "https://t.me/ptest_a",
+      "created_at_unix": 1767657000,
+      "age_min": 10.0,
+
+      "bonding_curve": {
+        "is_complete": false,
+        "progress_pct": 42.5,
+        "virtual_sol": 36.2,
+        "virtual_tokens": 780000000.0
+      },
+
+      "market": {
+        "price_sol": 0.00000011,
+        "price_usd": 0.000023,
+        "mcap_usd": 920000.0,
+        "fdv_usd": 1200000.0
+      },
+
+      "activity": {
+        "buys_5m": 55,
+        "sells_5m": 39,
+        "vol_5m_usd": 18250.0,
+        "price_change_5m_pct": 9.2
+      },
+
+      "risk": {
+        "is_flagged": false,
+        "flags": [],
+        "holders_est": 4100
+      },
+
+      "sym": "PTESTA",
+      "liq": 120000.0,
+      "vol5": 18250.0,
+      "buys5": 55,
+      "sells5": 39,
+      "chg5": 9.2,
+      "source": "pumpfun",
+      "ts": 1767657600
+    },
+    {
+      "mint": "PUMPTESTB11111111111111111111111111111111111",
+      "name": "Pump Test B",
+      "symbol": "PTESTB",
+      "creator": "CreatorB111111111111111111111111111111111111",
+      "image": "ipfs://bafybeigdyrpump-test-b",
+      "description": "Synthetic pumpfun coin for contract tests (cooling off / weak flow).",
+      "website": "https://example.com/ptest-b",
+      "twitter": "https://x.com/ptest_b",
+      "telegram": "https://t.me/ptest_b",
+      "created_at_unix": 1767652000,
+      "age_min": 93.0,
+
+      "bonding_curve": {
+        "is_complete": false,
+        "progress_pct": 18.0,
+        "virtual_sol": 8.4,
+        "virtual_tokens": 920000000.0
+      },
+
+      "market": {
+        "price_sol": 0.00000006,
+        "price_usd": 0.000012,
+        "mcap_usd": 220000.0,
+        "fdv_usd": 410000.0
+      },
+
+      "activity": {
+        "buys_5m": 7,
+        "sells_5m": 11,
+        "vol_5m_usd": 950.0,
+        "price_change_5m_pct": -3.8
+      },
+
+      "risk": {
+        "is_flagged": false,
+        "flags": [],
+        "holders_est": 980
+      },
+
+      "sym": "PTESTB",
+      "liq": 35000.0,
+      "vol5": 950.0,
+      "buys5": 7,
+      "sells5": 11,
+      "chg5": -3.8,
+      "source": "pumpfun",
+      "ts": 1767657600
+    },
+    {
+      "mint": "PUMPTESTC11111111111111111111111111111111111",
+      "name": "Pump Test C",
+      "symbol": "PTESTC",
+      "creator": "CreatorC111111111111111111111111111111111111",
+      "image": "ipfs://bafybeigdyrpump-test-c",
+      "description": "Synthetic pumpfun coin for contract tests (very early & hot).",
+      "website": "https://example.com/ptest-c",
+      "twitter": "https://x.com/ptest_c",
+      "telegram": "https://t.me/ptest_c",
+      "created_at_unix": 1767657480,
+      "age_min": 2.0,
+
+      "bonding_curve": {
+        "is_complete": false,
+        "progress_pct": 6.5,
+        "virtual_sol": 2.1,
+        "virtual_tokens": 990000000.0
+      },
+
+      "market": {
+        "price_sol": 0.000000035,
+        "price_usd": 0.0000075,
+        "mcap_usd": 110000.0,
+        "fdv_usd": 160000.0
+      },
+
+      "activity": {
+        "buys_5m": 120,
+        "sells_5m": 66,
+        "vol_5m_usd": 40250.0,
+        "price_change_5m_pct": 18.5
+      },
+
+      "risk": {
+        "is_flagged": false,
+        "flags": [],
+        "holders_est": 240
+      },
+
+      "sym": "PTESTC",
+      "liq": 52000.0,
+      "vol5": 40250.0,
+      "buys5": 120,
+      "sells5": 66,
+      "chg5": 18.5,
+      "source": "pumpfun",
+      "ts": 1767657600
+    },
+    {
+      "mint": "PUMPDEAD111111111111111111111111111111111111",
+      "name": "Pump Dead",
+      "symbol": "PDEAD",
+      "creator": "CreatorD111111111111111111111111111111111111",
+      "image": "ipfs://bafybeigdyrpump-dead",
+      "description": "Synthetic pumpfun coin for contract tests (dead/flagged).",
+      "website": "",
+      "twitter": "",
+      "telegram": "",
+      "created_at_unix": 1767640000,
+      "age_min": 293.0,
+
+      "bonding_curve": {
+        "is_complete": false,
+        "progress_pct": 1.2,
+        "virtual_sol": 0.3,
+        "virtual_tokens": 999500000.0
+      },
+
+      "market": {
+        "price_sol": 0.0000000012,
+        "price_usd": 0.00000025,
+        "mcap_usd": 9000.0,
+        "fdv_usd": 15000.0
+      },
+
+      "activity": {
+        "buys_5m": 0,
+        "sells_5m": 2,
+        "vol_5m_usd": 18.0,
+        "price_change_5m_pct": -35.0
+      },
+
+      "risk": {
+        "is_flagged": true,
+        "flags": ["low_liquidity", "dumping", "no_socials"],
+        "holders_est": 41
+      },
+
+      "sym": "PDEAD",
+      "liq": 2500.0,
+      "vol5": 18.0,
+      "buys5": 0,
+      "sells5": 2,
+      "chg5": -35.0,
+      "source": "pumpfun",
+      "ts": 1767657600
+    }
+  ]
+}

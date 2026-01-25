@@ -1,314 +1,649 @@
+# daytrader/data_feed.py
+from __future__ import annotations
+
 """
 daytrader.data_feed
 -------------------
 Async market data helpers for the Solana day-trader stack.
 
-Priorities
-- Minute OHLCV: Birdeye (if BIRDEYE_API_KEY exists), else synthesize from spot.
-- Spot price: Birdeye (if key), else Jupiter v6 price.
-- Safe: never raise to caller; return [] / None on failure.
+Design goals (God-Tier contract)
+--------------------------------
+- Safe: never raise to caller on data failures; return [] / None on failure.
+- Deterministic: stable normalization and caching; no random jitter.
+- Polite: TTL cache + request retries + timeouts.
+- Minimal dependencies: aiohttp only.
 
-Extras
-- TTL caching to avoid hammering APIs.
-- Simple volatility (ATR) and beta vs SOL to aid risk sizing.
+Primary sources
+---------------
+1) Birdeye (minute OHLCV + spot) if BIRDEYE_API_KEY is set
+2) Jupiter v6 price as spot fallback (no OHLCV)
+3) OHLCV fallback: deterministic synthetic bars derived from spot
+   (indicator continuity only; NOT real volume)
 
-Env:
-  BIRDEYE_API_KEY   = <key or empty>
-  DATA_TIMEOUT_SEC  = int (default 12)
-  DATA_RETRIES      = int (default 2)
-  DATA_CACHE_TTL    = int seconds (default 20)
+Public API
+----------
+- MINTS: dict[symbol] -> mint
+- async get_recent_price(mint) -> (price_usd|None, source_str)
+- async get_minute_bars(mint, limit=240) -> list[{t,o,h,l,c,v}] oldest->newest
+- estimate_atr(bars, period=14) -> atr|None
+- estimate_atr_pct(bars, period=14) -> atr_pct|None
+- async estimate_beta_vs_sol(mint, lookback=240) -> beta|None
+- async estimate_corr_vs_sol(mint, lookback=240) -> corr|None
 
-Usage:
-  from daytrader.data_feed import (
-      MINTS, get_minute_bars, get_recent_price, estimate_atr, estimate_beta_vs_sol
-  )
-
-  bars = await get_minute_bars(MINTS["BONK"], limit=240)
-  px, src = await get_recent_price(MINTS["SOL"])
-  atr = estimate_atr(bars)
-  beta = await estimate_beta_vs_sol(MINTS["BONK"])
+Env
+---
+BIRDEYE_API_KEY           = <key or empty>
+DATA_TIMEOUT_SEC          = int seconds (default 12)
+DATA_RETRIES              = int (default 2)
+DATA_CACHE_TTL            = int seconds (default 20)
+DATA_CACHE_MAX_KEYS       = int max cache entries (default 1024)
+DATA_MAX_LIMIT            = int max candles (default 1440)
+DATA_SYNTH_ENABLE         = 0|1 (default 1)
+DATA_SYNTH_VOL_PCT        = float (default 0.0006)  # ~0.06% per bar synthetic range
+DATA_ALLOW_MINTS_JSON     = optional JSON to extend/override MINTS, e.g. {"POP": "...mint..."}
 """
 
-from __future__ import annotations
-
+import asyncio
+import json
+import math
 import os
 import time
-import math
-import asyncio
-from typing import Any, Dict, List, Optional, Tuple
+from collections import OrderedDict
+from typing import Any
 
 import aiohttp
 
-# ----------------------------- Constants / Config -----------------------------
 
-MINTS: Dict[str, str] = {
-    "SOL":  "So11111111111111111111111111111111111111112",
-    "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "JUP":  "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB",
-    "RAY":  "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
-    "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
-    "WIF":  "8V8Nr5az28G8e2x9k3iN3bQJmGm5q9nXYVJHsxgq1D5",
-}
+# =============================================================================
+# Env parsing
+# =============================================================================
+def _env_str(name: str, default: str = "") -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip()
 
-BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
+
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> int:
+    raw = _env_str(name, "")
+    try:
+        val = int(raw) if raw else int(default)
+    except Exception:
+        val = int(default)
+
+    if min_value is not None:
+        val = max(int(min_value), val)
+    if max_value is not None:
+        val = min(int(max_value), val)
+    return val
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> float:
+    raw = _env_str(name, "")
+    try:
+        val = float(raw) if raw else float(default)
+    except Exception:
+        val = float(default)
+
+    if min_value is not None:
+        val = max(float(min_value), val)
+    if max_value is not None:
+        val = min(float(max_value), val)
+    return val
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _env_str(name, "")
+    if not raw:
+        return bool(default)
+    return raw.lower() in ("1", "true", "yes", "y", "on")
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else float(default)
+    except Exception:
+        return float(default)
+
+
+# =============================================================================
+# Config
+# =============================================================================
+BIRDEYE_API_KEY = _env_str("BIRDEYE_API_KEY", "")
 BIRDEYE_BASE = "https://public-api.birdeye.so"
 JUP_PRICE_V6 = "https://price.jup.ag/v6/price"
 
-DATA_TIMEOUT_SEC = int(os.getenv("DATA_TIMEOUT_SEC", "12"))
-DATA_RETRIES     = int(os.getenv("DATA_RETRIES", "2"))
-DATA_CACHE_TTL   = int(os.getenv("DATA_CACHE_TTL", "20"))
+DATA_TIMEOUT_SEC = _env_int("DATA_TIMEOUT_SEC", 12, min_value=3, max_value=60)
+DATA_RETRIES = _env_int("DATA_RETRIES", 2, min_value=0, max_value=8)
+DATA_CACHE_TTL = _env_int("DATA_CACHE_TTL", 20, min_value=0, max_value=600)
+DATA_CACHE_MAX_KEYS = _env_int("DATA_CACHE_MAX_KEYS", 1024, min_value=64, max_value=50_000)
+DATA_MAX_LIMIT = _env_int("DATA_MAX_LIMIT", 1440, min_value=60, max_value=10_000)
 
-# ----------------------------- Lightweight cache -----------------------------
+DATA_SYNTH_ENABLE = _env_bool("DATA_SYNTH_ENABLE", True)
+DATA_SYNTH_VOL_PCT = _env_float("DATA_SYNTH_VOL_PCT", 0.0006, min_value=0.0, max_value=0.05)
 
-# cache: key -> (expires_epoch, value)
-_cache: Dict[str, Tuple[float, Any]] = {}
 
-def _cache_get(key: str) -> Optional[Any]:
-    v = _cache.get(key)
-    if not v:
+# =============================================================================
+# Mints
+# =============================================================================
+MINTS: dict[str, str] = {
+    "SOL": "So11111111111111111111111111111111111111112",
+    "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "JUP": "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB",
+    "RAY": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+    "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "WIF": "8V8Nr5az28G8e2x9k3iN3bQJmGm5q9nXYVJHsxgq1D5",
+}
+
+_raw_mints_json = _env_str("DATA_ALLOW_MINTS_JSON", "")
+if _raw_mints_json:
+    try:
+        extra = json.loads(_raw_mints_json)
+        if isinstance(extra, dict):
+            for sym, mint in extra.items():
+                if isinstance(sym, str) and isinstance(mint, str) and mint.strip():
+                    MINTS[sym.strip().upper()] = mint.strip()
+    except Exception:
+        pass
+
+
+# =============================================================================
+# TTL cache (bounded)
+# =============================================================================
+# cache: key -> (expires_monotonic, value)
+_cache: "OrderedDict[str, tuple[float, Any]]" = OrderedDict()
+_cache_lock = asyncio.Lock()
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+async def _cache_get(key: str) -> Any | None:
+    async with _cache_lock:
+        entry = _cache.get(key)
+        if not entry:
+            return None
+        exp, val = entry
+        if exp >= _now():
+            _cache.move_to_end(key, last=True)
+            return val
+        _cache.pop(key, None)
         return None
-    exp, val = v
-    if exp >= time.time():
-        return val
-    _cache.pop(key, None)
-    return None
 
-def _cache_set(key: str, val: Any, ttl: int = DATA_CACHE_TTL) -> None:
+
+async def _cache_set(key: str, val: Any, ttl: int = DATA_CACHE_TTL) -> None:
     if ttl <= 0:
         return
-    _cache[key] = (time.time() + ttl, val)
+    async with _cache_lock:
+        _cache[key] = (_now() + float(ttl), val)
+        _cache.move_to_end(key, last=True)
 
-# ----------------------------- HTTP helpers ----------------------------------
+        # bound size deterministically
+        while len(_cache) > int(DATA_CACHE_MAX_KEYS):
+            _cache.popitem(last=False)
 
+
+# =============================================================================
+# HTTP helpers
+# =============================================================================
 def _timeout() -> aiohttp.ClientTimeout:
-    return aiohttp.ClientTimeout(total=DATA_TIMEOUT_SEC)
+    return aiohttp.ClientTimeout(total=float(DATA_TIMEOUT_SEC))
 
-def _be_headers() -> Dict[str, str]:
-    h = {"accept": "application/json"}
-    if BIRDEYE_API_KEY:
-        h["x-api-key"] = BIRDEYE_API_KEY
-    return h
 
-async def _with_retries(fn, *args, **kwargs):
+def _headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    out = {
+        "accept": "application/json",
+        "user-agent": "sol-sniper-daytrader/1.0",
+    }
+    if extra:
+        out.update(extra)
+    return out
+
+
+def _birdeye_headers() -> dict[str, str]:
+    return _headers({"x-api-key": BIRDEYE_API_KEY}) if BIRDEYE_API_KEY else _headers()
+
+
+def _should_retry_status(status: int) -> bool:
+    return status == 429 or (500 <= status <= 599)
+
+
+async def _request_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
     """
-    Run an async HTTP call with simple backoff. fn must be an async callable.
+    Safe JSON GET with retries + deterministic exponential backoff.
+    Returns dict or None. (Cancellation propagates.)
     """
-    delay = 0.6
-    for attempt in range(DATA_RETRIES + 1):
+    delay = 0.45
+    attempts = max(0, int(DATA_RETRIES)) + 1
+
+    for attempt in range(attempts):
         try:
-            return await fn(*args, **kwargs)
+            async with session.get(url, headers=headers) as resp:
+                status = int(resp.status)
+                if status != 200:
+                    if attempt < attempts - 1 and _should_retry_status(status):
+                        await asyncio.sleep(delay)
+                        delay = min(6.0, delay * 1.8)
+                        continue
+                    return None
+
+                js = await resp.json(content_type=None)
+                return js if isinstance(js, dict) else None
+
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            if attempt >= DATA_RETRIES:
+            if attempt >= attempts - 1:
                 return None
             await asyncio.sleep(delay)
-            delay *= 1.8
+            delay = min(6.0, delay * 1.8)
 
-# ----------------------------- Birdeye endpoints -----------------------------
+    return None
 
-async def _birdeye_ohlcv(session: aiohttp.ClientSession, mint: str, interval: str = "1m", limit: int = 240) -> Optional[List[Dict[str, Any]]]:
+
+# =============================================================================
+# Normalization
+# =============================================================================
+def _to_epoch_seconds(t: Any) -> int:
+    """Accept seconds or ms epoch; return seconds."""
+    try:
+        ts = int(t)
+    except Exception:
+        return 0
+    if ts > 2_000_000_000_000:  # ms epoch
+        ts //= 1000
+    return ts
+
+
+def _norm_bar(item: dict[str, Any]) -> dict[str, Any] | None:
     """
-    Fetch OHLCV bars newest->oldest from Birdeye; we return oldest->newest normalized.
-    Returns: list[{t,o,h,l,c,v}]
+    Normalize to {t,o,h,l,c,v} with numeric values.
+    NOTE: output key is 'l' (low), but we never use ambiguous local var name `l`.
     """
-    if not BIRDEYE_API_KEY:
-        return None
-    now = int(time.time())
-    time_from = now - limit * 60
-    url = f"{BIRDEYE_BASE}/defi/ohlcv?address={mint}&type={interval}&time_from={time_from}&time_to={now}"
-    async with session.get(url, headers=_be_headers(), timeout=_timeout()) as r:
-        if r.status != 200:
+    try:
+        ts = _to_epoch_seconds(item.get("t", 0))
+        close_px = _safe_float(item.get("c", 0.0), 0.0)
+        if ts <= 0 or close_px <= 0.0:
             return None
-        js = await r.json()
-        items = ((js.get("data") or {}).get("items")) or []
-        # Normalize oldest->newest
-        items.sort(key=lambda x: x.get("t", 0))
-        out: List[Dict[str, Any]] = []
-        for x in items[-limit:]:
-            out.append({
-                "t": int(x.get("t", 0)),
-                "o": float(x.get("o", x.get("c", 0)) or 0.0),
-                "h": float(x.get("h", x.get("c", 0)) or 0.0),
-                "l": float(x.get("l", x.get("c", 0)) or 0.0),
-                "c": float(x.get("c", 0.0) or 0.0),
-                "v": float(x.get("v", 0.0) or 0.0),
-            })
-        return out
 
-async def _birdeye_spot(session: aiohttp.ClientSession, mint: str) -> Optional[float]:
-    """
-    Fetch spot price via Birdeye token price (USD). Returns float or None.
-    """
+        open_px = _safe_float(item.get("o", close_px), close_px)
+        high_px = _safe_float(item.get("h", close_px), close_px)
+        low_px = _safe_float(item.get("l", close_px), close_px)
+        vol_px = _safe_float(item.get("v", 0.0), 0.0)
+
+        high_norm = max(high_px, open_px, close_px)
+        low_norm = min(low_px, open_px, close_px)
+
+        return {
+            "t": int(ts),
+            "o": float(open_px),
+            "h": float(high_norm),
+            "l": float(low_norm),
+            "c": float(close_px),
+            "v": float(vol_px),
+        }
+    except Exception:
+        return None
+
+
+def _dedupe_and_sort(bars: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Oldest->newest, unique by timestamp."""
+    if not bars:
+        return []
+    bars_sorted = sorted(bars, key=lambda b: int(b.get("t", 0)))
+    out: list[dict[str, Any]] = []
+    seen_ts: set[int] = set()
+    for bar in bars_sorted:
+        ts = int(bar.get("t", 0))
+        if ts <= 0 or ts in seen_ts:
+            continue
+        seen_ts.add(ts)
+        out.append(bar)
+    return out
+
+
+# =============================================================================
+# Birdeye
+# =============================================================================
+async def _birdeye_spot(session: aiohttp.ClientSession, mint: str) -> float | None:
     if not BIRDEYE_API_KEY:
         return None
     url = f"{BIRDEYE_BASE}/defi/price?address={mint}"
-    async with session.get(url, headers=_be_headers(), timeout=_timeout()) as r:
-        if r.status != 200:
-            return None
-        js = await r.json()
-        # {"success":true,"data":{"value":1.0012,...}}
-        val = ((js.get("data") or {}).get("value"))
-        try:
-            return float(val)
-        except Exception:
-            return None
+    js = await _request_json(session, url, headers=_birdeye_headers())
+    if not js:
+        return None
+    val = (js.get("data") or {}).get("value")
+    px = _safe_float(val, 0.0)
+    return px if px > 0.0 else None
 
-# ----------------------------- Jupiter endpoints -----------------------------
 
-async def _jup_spot(session: aiohttp.ClientSession, mint: str) -> Optional[float]:
-    """
-    Fetch spot via Jupiter v6 price API.
-    """
+async def _birdeye_ohlcv_1m(
+    session: aiohttp.ClientSession,
+    mint: str,
+    limit: int,
+) -> list[dict[str, Any]] | None:
+    """Return oldest->newest list of normalized bars, or None."""
+    if not BIRDEYE_API_KEY:
+        return None
+
+    limit_i = max(5, min(int(limit), DATA_MAX_LIMIT))
+    now = int(time.time())
+    time_from = now - limit_i * 60
+
+    url = f"{BIRDEYE_BASE}/defi/ohlcv?address={mint}&type=1m&time_from={time_from}&time_to={now}"
+    js = await _request_json(session, url, headers=_birdeye_headers())
+    if not js:
+        return None
+
+    items = ((js.get("data") or {}).get("items")) or []
+    if not isinstance(items, list) or not items:
+        return None
+
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        bar = _norm_bar(item)
+        if bar:
+            out.append(bar)
+
+    out = _dedupe_and_sort(out)
+    return out[-limit_i:] if out else None
+
+
+# =============================================================================
+# Jupiter
+# =============================================================================
+async def _jup_spot(session: aiohttp.ClientSession, mint: str) -> float | None:
     url = f"{JUP_PRICE_V6}?ids={mint}"
-    async with session.get(url, timeout=_timeout()) as r:
-        if r.status != 200:
-            return None
-        js = await r.json()
-        info = ((js or {}).get("data") or {}).get(mint) or {}
-        px = info.get("price")
-        try:
-            return float(px)
-        except Exception:
-            return None
+    js = await _request_json(session, url, headers=_headers())
+    if not js:
+        return None
+    info = (js.get("data") or {}).get(mint) or {}
+    px = _safe_float(info.get("price"), 0.0)
+    return px if px > 0.0 else None
 
-# ----------------------------- Public API ------------------------------------
 
-async def get_recent_price(mint: str) -> Tuple[Optional[float], str]:
+# =============================================================================
+# Synthetic bars
+# =============================================================================
+def _synth_bars_from_spot(spot: float, limit: int) -> list[dict[str, Any]]:
     """
-    Return (price_usd, source). source in {"birdeye","jupiter","none"}.
-    Uses cache by mint for DATA_CACHE_TTL seconds.
+    Deterministic synthetic candles around spot price.
+    ONLY a fallback to keep indicators from breaking when OHLCV source is unavailable.
     """
-    ck = f"px:{mint}"
-    cached = _cache_get(ck)
-    if cached is not None:
-        return cached  # (price, source)
+    if spot <= 0.0:
+        return []
 
-    async with aiohttp.ClientSession(timeout=_timeout()) as s:
-        # Try Birdeye first (if key is set)
-        if BIRDEYE_API_KEY:
-            px = await _with_retries(_birdeye_spot, s, mint)
-            if px is not None and px > 0:
-                _cache_set(ck, (px, "birdeye"))
-                return px, "birdeye"
-        # Fallback to Jupiter
-        px = await _with_retries(_jup_spot, s, mint)
-        if px is not None and px > 0:
-            _cache_set(ck, (px, "jupiter"))
-            return px, "jupiter"
+    limit_i = max(5, min(int(limit), DATA_MAX_LIMIT))
+    now = int(time.time())
 
-    return None, "none"
+    rng = max(spot * max(0.0, float(DATA_SYNTH_VOL_PCT)), 1e-12)
 
-async def get_minute_bars(mint: str, limit: int = 240) -> List[Dict[str, Any]]:
+    bars: list[dict[str, Any]] = []
+    for idx in range(limit_i, 0, -1):
+        ts = now - idx * 60
+
+        w0 = math.sin(idx * 0.7) + 0.35 * math.sin(idx * 0.19)
+        w0 = max(-1.0, min(1.0, w0))
+
+        w1 = math.sin((idx + 1) * 0.7) + 0.35 * math.sin((idx + 1) * 0.19)
+        w1 = max(-1.0, min(1.0, w1))
+
+        close_px = spot + w0 * 0.25 * rng
+        open_px = spot + w1 * 0.25 * rng
+        high_px = max(open_px, close_px) + 0.5 * rng
+        low_px = min(open_px, close_px) - 0.5 * rng
+
+        bars.append(
+            {
+                "t": int(ts),
+                "o": float(open_px),
+                "h": float(high_px),
+                "l": float(low_px),
+                "c": float(close_px),
+                "v": 0.0,
+            }
+        )
+
+    return _dedupe_and_sort(bars)
+
+
+# =============================================================================
+# Public API
+# =============================================================================
+async def get_recent_price(mint: str) -> tuple[float | None, str]:
     """
-    Return minute bars list of dicts: [{t, o, h, l, c, v}, ...] oldest->newest.
-
-    Order of attempts:
-      1) Birdeye 1-minute OHLCV (if key present)
-      2) Synthesize from spot (Jupiter -> flat bars w/ tiny jitter)
-
-    Always returns a list; may be empty on total failure.
-    Cached by (mint, limit).
+    Return (price_usd, source) where source in {"birdeye","jupiter","none"}.
+    Cached by mint for DATA_CACHE_TTL seconds.
     """
-    limit = max(5, min(int(limit or 240), 1440))
-    ck = f"bars:{mint}:{limit}"
-    cached = _cache_get(ck)
+    mint_s = str(mint).strip()
+    if not mint_s:
+        return None, "none"
+
+    cache_key = f"px:{mint_s}"
+    cached = await _cache_get(cache_key)
     if cached is not None:
         return cached
 
     try:
         async with aiohttp.ClientSession(timeout=_timeout()) as session:
-            items: Optional[List[Dict[str, Any]]] = None
             if BIRDEYE_API_KEY:
-                items = await _with_retries(_birdeye_ohlcv, session, mint, "1m", limit)
-            if items:
-                _cache_set(ck, items)
-                return items
+                px = await _birdeye_spot(session, mint_s)
+                if px is not None:
+                    res = (px, "birdeye")
+                    await _cache_set(cache_key, res)
+                    return res
 
-            # Fallback: synthesize bars from current spot
-            spot = await _with_retries(_jup_spot, session, mint)
-            if spot is None or spot <= 0:
-                _cache_set(ck, [])
-                return []
+            px = await _jup_spot(session, mint_s)
+            if px is not None:
+                res = (px, "jupiter")
+                await _cache_set(cache_key, res)
+                return res
 
-            now = int(time.time())
-            bars: List[Dict[str, Any]] = []
-            # Make 'limit' flat bars with tiny jitter to avoid degenerate indicators
-            for i in range(limit, 0, -1):
-                t = now - i * 60
-                jitter = ((i % 7) - 3) * 1e-4 * spot
-                o = spot + 0.5 * jitter
-                c = spot + 1.0 * jitter
-                h = max(o, c) * (1.0 + 6e-5)
-                l = min(o, c) * (1.0 - 6e-5)
-                bars.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": 0.0})
-
-            _cache_set(ck, bars)
-            return bars
+    except asyncio.CancelledError:
+        raise
     except Exception:
-        _cache_set(ck, [])
+        pass
+
+    res = (None, "none")
+    await _cache_set(cache_key, res)
+    return res
+
+
+async def get_minute_bars(mint: str, limit: int = 240) -> list[dict[str, Any]]:
+    """
+    Return minute bars [{t,o,h,l,c,v}, ...] oldest->newest.
+    Cached by (mint, limit).
+
+    Attempts:
+      1) Birdeye OHLCV (if key)
+      2) Synthetic from spot (if DATA_SYNTH_ENABLE=1)
+      3) [] on failure
+    """
+    mint_s = str(mint).strip()
+    if not mint_s:
         return []
 
-# ----------------------------- Analytics helpers -----------------------------
+    limit_i = max(5, min(int(limit or 240), DATA_MAX_LIMIT))
+    cache_key = f"bars:{mint_s}:{limit_i}"
+    cached = await _cache_get(cache_key)
+    if cached is not None:
+        return cached
 
-def _true_range(prev_c: float, h: float, l: float, prev_candle_h: float, prev_candle_l: float) -> float:
-    # Classic TR = max(h-l, abs(h-prev_close), abs(l-prev_close))
-    return max(h - l, abs(h - prev_c), abs(l - prev_c))
+    bars: list[dict[str, Any]] = []
+    try:
+        async with aiohttp.ClientSession(timeout=_timeout()) as session:
+            if BIRDEYE_API_KEY:
+                got = await _birdeye_ohlcv_1m(session, mint_s, limit_i)
+                if got:
+                    bars = got
 
-def estimate_atr(bars: List[Dict[str, Any]], period: int = 14) -> Optional[float]:
-    """
-    Quick ATR estimate from provided bars (oldest->newest).
-    Returns ATR in price units (same units as 'c').
-    """
-    n = len(bars)
-    if n < period + 1:
+            if not bars and DATA_SYNTH_ENABLE:
+                px = await _jup_spot(session, mint_s)
+                if px is not None:
+                    bars = _synth_bars_from_spot(px, limit_i)
+
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        bars = []
+
+    bars = _dedupe_and_sort(bars)
+    if len(bars) > limit_i:
+        bars = bars[-limit_i:]
+
+    await _cache_set(cache_key, bars)
+    return bars
+
+
+# =============================================================================
+# Analytics helpers
+# =============================================================================
+def estimate_atr(bars: list[dict[str, Any]], period: int = 14) -> float | None:
+    """ATR estimate in PRICE units."""
+    try:
+        n = len(bars)
+        p = max(2, int(period))
+        if n < p + 1:
+            return None
+
+        trs: list[float] = []
+        for i in range(1, n):
+            prev_close = float(bars[i - 1]["c"])
+            high_px = float(bars[i]["h"])
+            low_px = float(bars[i]["l"])
+            tr = max(high_px - low_px, abs(high_px - prev_close), abs(low_px - prev_close))
+            trs.append(tr)
+
+        if len(trs) < p:
+            return None
+        return sum(trs[-p:]) / float(p)
+    except Exception:
         return None
-    trs: List[float] = []
-    for i in range(1, n):
-        prev = bars[i - 1]
-        cur  = bars[i]
-        tr = max(cur["h"] - cur["l"], abs(cur["h"] - prev["c"]), abs(cur["l"] - prev["c"]))
-        trs.append(tr)
-    # Simple moving average of TRs over last 'period'
-    if len(trs) < period:
-        return None
-    return sum(trs[-period:]) / period
 
-async def estimate_beta_vs_sol(mint: str, lookback: int = 240) -> Optional[float]:
-    """
-    Estimate beta vs SOL using simple OLS slope on log returns.
-    Returns None if insufficient data or degenerate variance.
-    """
-    if mint == MINTS["SOL"]:
-        return 1.0
-    bars_x = await get_minute_bars(MINTS["SOL"], limit=lookback)
-    bars_y = await get_minute_bars(mint,          limit=lookback)
-    if len(bars_x) < 20 or len(bars_y) < 20:
-        return None
-    # Align by length (oldest->newest already)
-    n = min(len(bars_x), len(bars_y))
-    rx: List[float] = []
-    ry: List[float] = []
-    for i in range(1, n):
-        px0, px1 = bars_x[i - 1]["c"], bars_x[i]["c"]
-        py0, py1 = bars_y[i - 1]["c"], bars_y[i]["c"]
-        if px0 > 0 and py0 > 0 and px1 > 0 and py1 > 0:
-            rx.append(math.log(px1 / px0))
-            ry.append(math.log(py1 / py0))
-    m = min(len(rx), len(ry))
-    if m < 20:
-        return None
-    # OLS slope = cov(rx, ry) / var(rx)
-    mean_x = sum(rx) / m
-    mean_y = sum(ry) / m
-    cov_xy = sum((rx[i] - mean_x) * (ry[i] - mean_y) for i in range(m))
-    var_x  = sum((rx[i] - mean_x) ** 2 for i in range(m))
-    if var_x <= 1e-18:
-        return None
-    return cov_xy / var_x
 
-# ----------------------------- Convenience sync wrappers ---------------------
+def estimate_atr_pct(bars: list[dict[str, Any]], period: int = 14) -> float | None:
+    """ATR as fraction of last close (e.g., 0.02 => ~2%)."""
+    try:
+        atr = estimate_atr(bars, period=period)
+        if atr is None:
+            return None
+        last_close = float(bars[-1]["c"])
+        if last_close <= 0.0:
+            return None
+        return float(atr) / last_close
+    except Exception:
+        return None
 
-def get_recent_price_sync(mint: str) -> Tuple[Optional[float], str]:
-    return asyncio.get_event_loop().run_until_complete(get_recent_price(mint))
 
-def get_minute_bars_sync(mint: str, limit: int = 240) -> List[Dict[str, Any]]:
-    return asyncio.get_event_loop().run_until_complete(get_minute_bars(mint, limit))
+def _log_returns_from_bars(bars: list[dict[str, Any]]) -> list[float]:
+    out: list[float] = []
+    for i in range(1, len(bars)):
+        p0 = float(bars[i - 1]["c"])
+        p1 = float(bars[i]["c"])
+        if p0 > 0.0 and p1 > 0.0:
+            out.append(math.log(p1 / p0))
+    return out
+
+
+async def estimate_beta_vs_sol(mint: str, lookback: int = 240) -> float | None:
+    """Estimate beta vs SOL from minute log returns (OLS slope)."""
+    try:
+        mint_s = str(mint).strip()
+        sol_mint = MINTS.get("SOL")
+        if not mint_s or not sol_mint:
+            return None
+        if mint_s == sol_mint:
+            return 1.0
+
+        lb = max(20, min(int(lookback or 240), DATA_MAX_LIMIT))
+        bars_x = await get_minute_bars(sol_mint, limit=lb)
+        bars_y = await get_minute_bars(mint_s, limit=lb)
+
+        n = min(len(bars_x), len(bars_y))
+        if n < 20:
+            return None
+
+        rx = _log_returns_from_bars(bars_x[-n:])
+        ry = _log_returns_from_bars(bars_y[-n:])
+        m = min(len(rx), len(ry))
+        if m < 20:
+            return None
+
+        mean_x = sum(rx[:m]) / m
+        mean_y = sum(ry[:m]) / m
+        cov = sum((rx[i] - mean_x) * (ry[i] - mean_y) for i in range(m))
+        var_x = sum((rx[i] - mean_x) ** 2 for i in range(m))
+        if var_x <= 1e-18:
+            return None
+        return cov / var_x
+    except Exception:
+        return None
+
+
+async def estimate_corr_vs_sol(mint: str, lookback: int = 240) -> float | None:
+    """Pearson correlation of log returns vs SOL."""
+    try:
+        mint_s = str(mint).strip()
+        sol_mint = MINTS.get("SOL")
+        if not mint_s or not sol_mint:
+            return None
+        if mint_s == sol_mint:
+            return 1.0
+
+        lb = max(20, min(int(lookback or 240), DATA_MAX_LIMIT))
+        bars_x = await get_minute_bars(sol_mint, limit=lb)
+        bars_y = await get_minute_bars(mint_s, limit=lb)
+
+        n = min(len(bars_x), len(bars_y))
+        if n < 20:
+            return None
+
+        rx = _log_returns_from_bars(bars_x[-n:])
+        ry = _log_returns_from_bars(bars_y[-n:])
+        m = min(len(rx), len(ry))
+        if m < 20:
+            return None
+
+        mean_x = sum(rx[:m]) / m
+        mean_y = sum(ry[:m]) / m
+        var_x = sum((rx[i] - mean_x) ** 2 for i in range(m))
+        var_y = sum((ry[i] - mean_y) ** 2 for i in range(m))
+        if var_x <= 1e-18 or var_y <= 1e-18:
+            return None
+
+        cov = sum((rx[i] - mean_x) * (ry[i] - mean_y) for i in range(m))
+        return cov / math.sqrt(var_x * var_y)
+    except Exception:
+        return None
+
+
+__all__ = [
+    "MINTS",
+    "estimate_atr",
+    "estimate_atr_pct",
+    "estimate_beta_vs_sol",
+    "estimate_corr_vs_sol",
+    "get_minute_bars",
+    "get_recent_price",
+]

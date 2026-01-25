@@ -1,94 +1,120 @@
 # fine_tune.py
-# End-to-end helper for creating a parameter-tuning model:
-# - prepare: build chat JSONL from trade history / stats
-# - tune: upload files & start a fine-tune
-# - status: check fine-tune job
-# - set-model: persist chosen model id in Redis (ai:ft_model)
-# - recommend: run one-shot parameter recommendation
-
 from __future__ import annotations
 
 import argparse
 import asyncio
 import csv
+import dataclasses
+import hashlib
 import json
 import logging
 import os
-import sys
-from dataclasses import dataclass, asdict
-from datetime import datetime
+import random
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-# Ensure repo root imports work
-REPO_ROOT = Path(__file__).resolve().parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-# Optional dotenv load (don’t fail if missing)
-try:
-    from dotenv import load_dotenv, find_dotenv
-    load_dotenv(find_dotenv())
-except Exception:
-    pass
-
-from config import (
-    OPENAI_API_KEY,
-    OPENAI_BASE_MODEL,     # e.g. "gpt-4o-mini-2024-07-18" or stable base model name
-    REDIS_URL,
-)
-
-# Our infra helpers
-from utils_pkg.core_utils import init_resources, close_resources, redis  # type: ignore
-
-# OpenAI SDK (support both new and legacy)
-NEW_SDK = False
-try:
-    from openai import OpenAI  # >= v1.x
-    _client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-    NEW_SDK = True
-except Exception:  # legacy
-    _client = None
-
-if not NEW_SDK:
-    try:
-        import openai  # legacy
-        if OPENAI_API_KEY:
-            openai.api_key = OPENAI_API_KEY
-    except Exception:
-        openai = None  # type: ignore
+from typing import Any
 
 log = logging.getLogger("fine_tune")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
+REPO_ROOT = Path(__file__).resolve().parent
 DATA_DIR = REPO_ROOT / "data" / "ai"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_TRAIN = DATA_DIR / "train.jsonl"
 DEFAULT_VAL = DATA_DIR / "val.jsonl"
-DEFAULT_MODEL_PICKLE = DATA_DIR / "last_ft_model.txt"  # fallback cache
+DEFAULT_MODEL_CACHE = DATA_DIR / "last_ft_model.txt"
+
+# ----------------------------
+# Optional dotenv
+# ----------------------------
+try:
+    from dotenv import find_dotenv, load_dotenv  # type: ignore
+
+    load_dotenv(find_dotenv(), override=False)
+except Exception:
+    pass
 
 
-# --------------------------
-# Data schema for features
-# --------------------------
+# ----------------------------
+# Dependencies (checked lazily)
+# ----------------------------
+def _require_asyncpg():
+    try:
+        import asyncpg  # type: ignore
 
+        return asyncpg
+    except Exception as e:
+        raise SystemExit("Missing dependency: asyncpg. Install with: pip install asyncpg") from e
+
+
+def _require_openai():
+    # New SDK (preferred)
+    try:
+        from openai import OpenAI  # type: ignore
+
+        return ("new", OpenAI)
+    except Exception:
+        pass
+
+    # Legacy SDK fallback
+    try:
+        import openai  # type: ignore
+
+        return ("legacy", openai)
+    except Exception as e:
+        raise SystemExit("OpenAI SDK not installed. Install with: pip install openai") from e
+
+
+def _require_redis():
+    try:
+        import redis.asyncio as redis_async  # type: ignore
+
+        return redis_async
+    except Exception:
+        return None
+
+
+# ----------------------------
+# Env helpers
+# ----------------------------
+def env(name: str, default: str | None = None) -> str | None:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    v = v.strip()
+    return v if v else default
+
+
+def env_required(name: str) -> str:
+    v = env(name)
+    if not v:
+        raise SystemExit(f"Missing required env var: {name}")
+    return v
+
+
+def resolve_pg_dsn() -> str:
+    """
+    Prefer your canonical DSN env.
+    Accept common aliases so this tool doesn't break when you rename.
+    """
+    for k in ("POSTGRES_DSN", "PG_DSN", "PG_DSN_INTERNAL", "PG_DSN_EXTERNAL", "DATABASE_URL"):
+        v = env(k)
+        if v:
+            return v
+    raise SystemExit(
+        "Missing Postgres DSN. Set one of: POSTGRES_DSN / PG_DSN / PG_DSN_INTERNAL / PG_DSN_EXTERNAL / DATABASE_URL"
+    )
+
+
+# ----------------------------
+# Training schemas
+# ----------------------------
 @dataclass
 class MarketFeatures:
-    vol_24h_usd: float
-    liquidity_usd: float
-    age_minutes: float
-    whale_buys_1h: int
-    rug_risk: float             # 0..1
-    momentum_5m: float          # % change
-    momentum_15m: float         # % change
-    momentum_1h: float          # % change
-    volatility_1h: float        # stdev %
-    gas_fee_bp: float           # swap fees/slippage proxy bps
-    holding_winrate_7d: float   # your bot winrate last 7d 0..1
-    avg_profit_7d: float        # %
-    avg_loss_7d: float          # %
-    # add new fields over time safely
+    # Keep flexible; DB features are passed through as-is.
+    values: dict[str, Any]
 
 
 @dataclass
@@ -98,50 +124,45 @@ class StrategyParams:
     reinvest_percent: float
     max_hold_time_minutes: int
     partial_take_profits: int
-    hold_if_score_above: float  # 0..1
-    slippage: float             # e.g. 0.005
+    hold_if_score_above: float
+    slippage: float
 
 
-def _example_features() -> MarketFeatures:
-    return MarketFeatures(
-        vol_24h_usd=1_250_000,
-        liquidity_usd=300_000,
-        age_minutes=220,
-        whale_buys_1h=8,
-        rug_risk=0.18,
-        momentum_5m=4.2,
-        momentum_15m=9.1,
-        momentum_1h=15.0,
-        volatility_1h=3.5,
-        gas_fee_bp=12.0,
-        holding_winrate_7d=0.62,
-        avg_profit_7d=27.0,
-        avg_loss_7d=-9.0,
-    )
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
-def _example_params() -> StrategyParams:
-    return StrategyParams(
-        stop_loss_percent=18.0,
-        target_profit_percent=220.0,
-        reinvest_percent=80.0,
-        max_hold_time_minutes=360,
-        partial_take_profits=4,
-        hold_if_score_above=0.80,
-        slippage=0.005,
-    )
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 
-# --------------------------
-# JSONL builders (chat format)
-# --------------------------
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        return int(float(x))
+    except Exception:
+        return default
 
-def _chat_record(features: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
+
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+# ----------------------------
+# JSONL row builder (Chat format)
+# ----------------------------
+def chat_record(features: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
     """
-    Build one chat training row:
-    - system: role description
-    - user: JSON of features
-    - assistant: JSON of target params
+    Chat fine-tune row:
+    - system defines strict output format
+    - user provides features JSON
+    - assistant provides target params JSON
     """
     return {
         "messages": [
@@ -149,353 +170,583 @@ def _chat_record(features: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, 
                 "role": "system",
                 "content": (
                     "You are a trading parameter tuner for a Solana sniper bot. "
-                    "Given recent market features (JSON), respond ONLY with a compact JSON containing the following keys: "
+                    "Given recent market + bot features in JSON, respond ONLY with a single valid JSON object "
+                    "containing exactly these keys:\n"
                     "stop_loss_percent (float), target_profit_percent (float), reinvest_percent (float), "
-                    "max_hold_time_minutes (int), partial_take_profits (int), hold_if_score_above (float 0..1), slippage (float). "
-                    "Keep responses strictly valid JSON without additional text."
+                    "max_hold_time_minutes (int), partial_take_profits (int), hold_if_score_above (float 0..1), slippage (float).\n"
+                    "No extra text. JSON only."
                 ),
             },
-            {"role": "user", "content": json.dumps(features, separators=(",", ":"))},
-            {"role": "assistant", "content": json.dumps(params, separators=(",", ":"))},
+            {
+                "role": "user",
+                "content": json.dumps(features, separators=(",", ":"), ensure_ascii=False),
+            },
+            {
+                "role": "assistant",
+                "content": json.dumps(params, separators=(",", ":"), ensure_ascii=False),
+            },
         ]
     }
 
 
-def write_jsonl(rows: List[Dict[str, Any]], path: Path) -> None:
+def write_jsonl(rows: Iterable[dict[str, Any]], path: Path) -> int:
+    n = 0
     with path.open("w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            n += 1
+    return n
 
 
-# --------------------------
-# Data preparation
-# --------------------------
-
-def prepare_from_csv(csv_path: Path, out_train: Path, out_val: Path, train_split: float = 0.9) -> None:
+# ----------------------------
+# Heuristic labeling (DB row -> params)
+# ----------------------------
+def params_from_row_heuristic(
+    *,
+    features: dict[str, Any],
+    outcome_label: str | None,
+    pnl_pct: float | None,
+    hold_sec: int | None,
+    max_runup_pct: float | None,
+    max_drawdown_pct: float | None,
+) -> StrategyParams:
     """
-    CSV columns expected (example):
-      vol_24h_usd,liquidity_usd,age_minutes,whale_buys_1h,rug_risk,momentum_5m,momentum_15m,momentum_1h,
-      volatility_1h,gas_fee_bp,holding_winrate_7d,avg_profit_7d,avg_loss_7d,
-      stop_loss_percent,target_profit_percent,reinvest_percent,max_hold_time_minutes,partial_take_profits,hold_if_score_above,slippage
+    Create a *supervised target* from your historical outcomes.
+    This isn't "perfect optimal", but it's consistent and gives the model a learnable signal.
+
+    Uses:
+      - drawdown -> stop loss
+      - runup -> profit target and TP count
+      - hold time -> max hold
+      - pnl + label -> reinvest / threshold tweaks
     """
-    rows: List[Dict[str, Any]] = []
-    with csv_path.open("r", encoding="utf-8") as f:
+    dd = abs(_safe_float(max_drawdown_pct, 0.0))
+    ru = max(0.0, _safe_float(max_runup_pct, 0.0))
+    pnl = _safe_float(pnl_pct, 0.0)
+    hold_m = max(1, _safe_int(hold_sec, 0) // 60)
+
+    # Baselines
+    sl = _clamp(2.0 + 1.15 * dd, 6.0, 25.0)  # 6%..25%
+    tp = _clamp(30.0 + 0.70 * ru, 60.0, 500.0)  # 60%..500%
+    max_hold = int(_clamp(float(hold_m), 5.0, 720.0))  # 5m..12h
+
+    # Partial take profits: more runup => more steps
+    if ru >= 250:
+        ptp = 6
+    elif ru >= 160:
+        ptp = 5
+    elif ru >= 90:
+        ptp = 4
+    else:
+        ptp = 3
+
+    # Hold threshold: tighten if rugs / heavy DD, loosen if strong pnl
+    thr = 0.80
+    lbl = (outcome_label or "").lower()
+    if "rug" in lbl or "honeypot" in lbl:
+        thr = 0.88
+        sl = _clamp(sl * 0.85, 6.0, 20.0)  # tighter
+        tp = _clamp(tp * 0.75, 60.0, 250.0)
+    elif pnl < -5.0 or dd > 25.0:
+        thr = 0.86
+    elif pnl > 15.0 and ru > 120:
+        thr = 0.76
+
+    # Slippage: if features include a hint, use it; else safe default
+    # Accept bps or fraction
+    slip = features.get("slippage")
+    slip_bps = features.get("slippage_bps") or features.get("est_slippage_bps")
+    if slip is not None:
+        slippage = float(slip)
+        if slippage > 1.0:  # if user passed bps by mistake
+            slippage = _clamp(slippage / 10_000.0, 0.002, 0.02)
+        else:
+            slippage = _clamp(slippage, 0.002, 0.02)
+    elif slip_bps is not None:
+        slippage = _clamp(_safe_float(slip_bps) / 10_000.0, 0.002, 0.02)
+    else:
+        slippage = 0.005
+
+    # Reinvest: more aggressive if pnl positive and not rug
+    reinvest = 70.0
+    if "rug" in lbl or "honeypot" in lbl:
+        reinvest = 55.0
+    elif pnl > 0.0:
+        reinvest = _clamp(70.0 + min(20.0, pnl), 60.0, 95.0)
+    else:
+        reinvest = 60.0
+
+    return StrategyParams(
+        stop_loss_percent=float(round(sl, 3)),
+        target_profit_percent=float(round(tp, 3)),
+        reinvest_percent=float(round(reinvest, 3)),
+        max_hold_time_minutes=int(max_hold),
+        partial_take_profits=int(ptp),
+        hold_if_score_above=float(round(_clamp(thr, 0.6, 0.95), 3)),
+        slippage=float(round(slippage, 6)),
+    )
+
+
+# ----------------------------
+# DB fetcher
+# ----------------------------
+async def fetch_training_rows(
+    dsn: str,
+    limit: int,
+    schema: str | None,
+    view_name: str,
+    where: str | None,
+) -> list[dict[str, Any]]:
+    asyncpg = _require_asyncpg()
+    view = f"{schema}.{view_name}" if schema else view_name
+    cond = f"WHERE {where}" if where else ""
+    sql = f"""
+        SELECT
+            candidate_id,
+            ts,
+            src,
+            mint,
+            symbol,
+            regime,
+            wallet_tag,
+            feature_version,
+            features,
+            raw,
+            outcome_label,
+            pnl_pct,
+            hold_sec,
+            max_runup_pct,
+            max_drawdown_pct,
+            notes_json
+        FROM {view}
+        {cond}
+        ORDER BY ts DESC
+        LIMIT $1
+    """
+    conn = await asyncpg.connect(dsn)
+    try:
+        rows = await conn.fetch(sql, limit)
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append(dict(r))
+        return out
+    finally:
+        await conn.close()
+
+
+def _jsonify(x: Any) -> Any:
+    if x is None:
+        return None
+    if isinstance(x, dict | list | int | float | bool):
+        return x
+    # asyncpg may return JSON as str sometimes depending on schema
+    if isinstance(x, str):
+        s = x.strip()
+        if s.startswith("{") or s.startswith("["):
+            try:
+                return json.loads(s)
+            except Exception:
+                return x
+    return x
+
+
+def build_feature_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """
+    Compose user-features JSON:
+    - Start from FeatureBuilder features dict
+    - Add a small amount of stable context (src/regime/etc)
+    """
+    feat = _jsonify(row.get("features")) or {}
+    if not isinstance(feat, dict):
+        feat = {"features_raw": feat}
+
+    payload = dict(feat)
+    payload.update(
+        {
+            "src": row.get("src"),
+            "regime": row.get("regime"),
+            "wallet_tag": row.get("wallet_tag"),
+            "symbol": row.get("symbol"),
+            "mint": row.get("mint"),
+            "feature_version": row.get("feature_version"),
+        }
+    )
+    # optional add raw snapshot if you want (kept compact)
+    # payload["raw"] = _jsonify(row.get("raw"))
+    return payload
+
+
+def deterministic_split(
+    rows: list[dict[str, Any]], val_ratio: float, seed: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Stable split so re-runs don't reshuffle labels unpredictably.
+    Uses candidate_id hash.
+    """
+    train: list[dict[str, Any]] = []
+    val: list[dict[str, Any]] = []
+    for r in rows:
+        cid = str(r.get("candidate_id") or "")
+        h = hashlib.sha256((cid + str(seed)).encode("utf-8")).digest()
+        u = int.from_bytes(h[:4], "big") / 2**32
+        (val if u < val_ratio else train).append(r)
+    return train, val
+
+
+# ----------------------------
+# CLI commands
+# ----------------------------
+def cmd_prepare_csv(args: argparse.Namespace) -> None:
+    rows: list[dict[str, Any]] = []
+    path = Path(args.csv).resolve()
+    with path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for line in reader:
-            feat = {k: _safe_cast(line.get(k)) for k in [
-                "vol_24h_usd","liquidity_usd","age_minutes","whale_buys_1h","rug_risk",
-                "momentum_5m","momentum_15m","momentum_1h","volatility_1h","gas_fee_bp",
-                "holding_winrate_7d","avg_profit_7d","avg_loss_7d"
-            ]}
-            params = {k: _safe_cast(line.get(k)) for k in [
-                "stop_loss_percent","target_profit_percent","reinvest_percent","max_hold_time_minutes",
-                "partial_take_profits","hold_if_score_above","slippage"
-            ]}
-            rows.append(_chat_record(feat, params))
+            feat = {}
+            params = {}
+            # everything before params_ is features
+            for k, v in line.items():
+                if k is None:
+                    continue
+                if k.startswith("param_"):
+                    params[k.replace("param_", "", 1)] = _cast(v)
+                else:
+                    feat[k] = _cast(v)
+            rows.append(chat_record(feat, params))
 
     if not rows:
         raise SystemExit("No rows parsed from CSV.")
 
-    split = int(len(rows) * train_split)
-    train, val = rows[:split], rows[split:]
-    write_jsonl(train, out_train)
-    write_jsonl(val or train[:1], out_val)  # ensure non-empty
-    log.info("Prepared JSONL: %s rows -> train=%d, val=%d", len(rows), len(train), len(val or train[:1]))
+    out_train = Path(args.train or DEFAULT_TRAIN)
+    out_val = Path(args.val or DEFAULT_VAL)
+
+    # shuffle, then split
+    rnd = random.Random(args.seed)
+    rnd.shuffle(rows)
+    split = max(1, int(len(rows) * (1.0 - args.val_ratio)))
+    n_train = write_jsonl(rows[:split], out_train)
+    n_val = write_jsonl(rows[split:] or rows[:1], out_val)
+
+    log.info("Prepared CSV JSONL: total=%d train=%d val=%d", len(rows), n_train, n_val)
+    print(str(out_train))
+    print(str(out_val))
 
 
-def prepare_synthetic(n: int, out_train: Path, out_val: Path) -> None:
-    """
-    Use a basic synthetic generator (safe fallback).
-    It anchors around _example_features/_example_params with noise.
-    """
-    import random
-    rows: List[Dict[str, Any]] = []
-    for i in range(n):
-        base_f = _example_features()
-        feat = asdict(base_f)
-        # inject mild randomness
-        feat["vol_24h_usd"] *= random.uniform(0.5, 2.0)
-        feat["liquidity_usd"] *= random.uniform(0.5, 2.0)
-        feat["whale_buys_1h"] = max(0, int(feat["whale_buys_1h"] * random.uniform(0.6, 1.8)))
-        feat["rug_risk"] = min(0.95, max(0.01, feat["rug_risk"] * random.uniform(0.6, 1.6)))
-        feat["momentum_5m"] *= random.uniform(0.4, 1.8)
-        feat["momentum_15m"] *= random.uniform(0.4, 1.8)
-        feat["momentum_1h"] *= random.uniform(0.4, 1.8)
-        feat["volatility_1h"] *= random.uniform(0.6, 1.6)
-        feat["gas_fee_bp"] *= random.uniform(0.8, 1.2)
-        feat["holding_winrate_7d"] = min(0.95, max(0.1, feat["holding_winrate_7d"] * random.uniform(0.8, 1.2)))
-        feat["avg_profit_7d"] *= random.uniform(0.8, 1.2)
-        feat["avg_loss_7d"] *= random.uniform(0.8, 1.2)
+def cmd_prepare_db(args: argparse.Namespace) -> None:
+    dsn = resolve_pg_dsn()
+    limit = int(args.limit)
+    schema = args.schema
+    view = args.view
+    where = args.where
 
-        # rule-of-thumb mapping to targets (seed signal)
-        p = _example_params()
-        params = asdict(p)
-        rr = feat["rug_risk"]
-        wr = feat["holding_winrate_7d"]
-        mom = 0.25*feat["momentum_5m"] + 0.35*feat["momentum_15m"] + 0.40*feat["momentum_1h"]
-        vol = feat["volatility_1h"]
+    rows = asyncio.run(
+        fetch_training_rows(dsn, limit=limit, schema=schema, view_name=view, where=where)
+    )
+    if not rows:
+        raise SystemExit("No rows returned from DB (check DSN/view/where).")
 
-        params["stop_loss_percent"] = max(10.0, min(30.0, 22.0 - 6.0*(wr-0.5) + 4.0*rr + 0.5*vol))
-        params["target_profit_percent"] = max(120.0, min(500.0, 180.0 + 8.0*mom + 2.0*feat["whale_buys_1h"]))
-        params["reinvest_percent"] = max(50.0, min(95.0, 70.0 + 20.0*(wr-0.5) - 10.0*rr))
-        params["max_hold_time_minutes"] = int(max(60, min(720, 360 + 20.0*(wr-0.5) + 10.0*mom - 5.0*vol)))
-        params["partial_take_profits"] = int(max(3, min(6, 4 + (1 if mom > 8 else 0) - (1 if rr > 0.4 else 0))))
-        params["hold_if_score_above"] = float(min(0.95, max(0.6, 0.8 + 0.1*(wr-0.5) - 0.15*(rr-0.2))))
-        params["slippage"] = float(min(0.01, max(0.002, 0.005 + 0.001*(vol/3.0))))
+    train_rows, val_rows = deterministic_split(
+        rows, val_ratio=float(args.val_ratio), seed=int(args.seed)
+    )
 
-        rows.append(_chat_record(feat, params))
+    def gen_jsonl(rws: list[dict[str, Any]]) -> Iterable[dict[str, Any]]:
+        for r in rws:
+            payload = build_feature_payload(r)
+            params = params_from_row_heuristic(
+                features=payload,
+                outcome_label=r.get("outcome_label"),
+                pnl_pct=_safe_float(r.get("pnl_pct"), 0.0),
+                hold_sec=_safe_int(r.get("hold_sec"), 0),
+                max_runup_pct=_safe_float(r.get("max_runup_pct"), 0.0),
+                max_drawdown_pct=_safe_float(r.get("max_drawdown_pct"), 0.0),
+            )
+            yield chat_record(payload, dataclasses.asdict(params))
 
-    # 90/10 split
-    split = max(1, int(n*0.9))
-    write_jsonl(rows[:split], out_train)
-    write_jsonl(rows[split:] or rows[:1], out_val)
-    log.info("Prepared synthetic dataset: %d rows", n)
+    out_train = Path(args.train or DEFAULT_TRAIN)
+    out_val = Path(args.val or DEFAULT_VAL)
+
+    n_train = write_jsonl(gen_jsonl(train_rows), out_train)
+    n_val = write_jsonl(gen_jsonl(val_rows or train_rows[:1]), out_val)
+
+    log.info("Prepared DB JSONL: total=%d train=%d val=%d view=%s", len(rows), n_train, n_val, view)
+    print(str(out_train))
+    print(str(out_val))
 
 
-def _safe_cast(v: Any) -> Any:
+def cmd_tune(args: argparse.Namespace) -> None:
+    mode, sdk = _require_openai()
+    api_key = env_required("OPENAI_API_KEY")
+    base_model = env("OPENAI_BASE_MODEL", args.model) or args.model
+    if not base_model:
+        raise SystemExit("Provide --model or set OPENAI_BASE_MODEL")
+
+    train = Path(args.train or DEFAULT_TRAIN)
+    val = Path(args.val or DEFAULT_VAL)
+    if not train.exists():
+        raise SystemExit(f"Training file missing: {train} (run prepare-db/prepare-csv first)")
+
+    if mode == "new":
+        OpenAI = sdk
+        client = OpenAI(api_key=api_key)
+        with train.open("rb") as f:
+            train_file = client.files.create(file=f, purpose="fine-tune")  #
+        val_file_id = None
+        if val.exists():
+            with val.open("rb") as f:
+                val_file = client.files.create(file=f, purpose="fine-tune")  #
+            val_file_id = val_file.id
+
+        job = client.fine_tuning.jobs.create(  #
+            training_file=train_file.id,
+            validation_file=val_file_id,
+            model=base_model,
+            suffix=args.suffix or "sniper-params",
+        )
+        print(job.id)
+        return
+
+    # legacy fallback
+    openai = sdk
+    openai.api_key = api_key
+    train_id = openai.File.create(file=train.open("rb"), purpose="fine-tune")["id"]
+    val_id = (
+        openai.File.create(file=val.open("rb"), purpose="fine-tune")["id"] if val.exists() else None
+    )
+    job = openai.FineTuningJob.create(
+        training_file=train_id,
+        validation_file=val_id,
+        model=base_model,
+        suffix=args.suffix or "sniper-params",
+    )
+    print(job["id"])
+
+
+async def _store_model_id(model_id: str, redis_url: str | None) -> None:
+    if not model_id:
+        return
+    if redis_url:
+        redis_async = _require_redis()
+        if redis_async:
+            r = redis_async.from_url(redis_url, decode_responses=True)
+            try:
+                await r.set("ai:ft_model", model_id)
+                await r.close()
+                log.info("Stored model id in Redis key ai:ft_model")
+                return
+            except Exception as e:
+                log.warning("Redis store failed: %s", e)
+
+    DEFAULT_MODEL_CACHE.write_text(model_id, encoding="utf-8")
+    log.info("Stored model id in %s", DEFAULT_MODEL_CACHE)
+
+
+def _load_model_id(redis_url: str | None) -> str | None:
+    if redis_url:
+        # best-effort sync load via asyncio
+        redis_async = _require_redis()
+        if redis_async:
+
+            async def _get():
+                r = redis_async.from_url(redis_url, decode_responses=True)
+                try:
+                    return await r.get("ai:ft_model")
+                finally:
+                    await r.close()
+
+            try:
+                return asyncio.run(_get())
+            except Exception:
+                pass
+
+    if DEFAULT_MODEL_CACHE.exists():
+        return DEFAULT_MODEL_CACHE.read_text(encoding="utf-8").strip() or None
+    return None
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    mode, sdk = _require_openai()
+    api_key = env_required("OPENAI_API_KEY")
+    redis_url = env("REDIS_URL") or env("REDIS_TLS_URL") or args.redis_url
+
+    if mode == "new":
+        OpenAI = sdk
+        client = OpenAI(api_key=api_key)
+        job = client.fine_tuning.jobs.retrieve(args.job_id)
+        d = job.to_dict()
+        print(json.dumps(d, indent=2))
+        model_id = d.get("fine_tuned_model")
+        if args.persist and model_id:
+            asyncio.run(_store_model_id(model_id, redis_url))
+        return
+
+    openai = sdk
+    openai.api_key = api_key
+    job = openai.FineTuningJob.retrieve(args.job_id)
+    print(json.dumps(job, indent=2))
+    model_id = job.get("fine_tuned_model")
+    if args.persist and model_id:
+        asyncio.run(_store_model_id(model_id, redis_url))
+
+
+def cmd_set_model(args: argparse.Namespace) -> None:
+    redis_url = env("REDIS_URL") or env("REDIS_TLS_URL") or args.redis_url
+    asyncio.run(_store_model_id(args.model_id.strip(), redis_url))
+    print(f"Stored model id: {args.model_id.strip()}")
+
+
+def cmd_recommend(args: argparse.Namespace) -> None:
+    mode, sdk = _require_openai()
+    api_key = env_required("OPENAI_API_KEY")
+    redis_url = env("REDIS_URL") or env("REDIS_TLS_URL") or args.redis_url
+
+    model = args.model or _load_model_id(redis_url) or env("OPENAI_BASE_MODEL")
+    if not model:
+        raise SystemExit(
+            "No model provided and no stored model found. Use --model or run set-model."
+        )
+
+    # features input
+    if args.features:
+        feats = json.loads(Path(args.features).read_text(encoding="utf-8"))
+    else:
+        feats = {
+            "vol_24h_usd": 1_250_000,
+            "liquidity_usd": 300_000,
+            "age_minutes": 220,
+            "whale_buys_1h": 8,
+            "rug_risk": 0.18,
+            "momentum_5m": 4.2,
+            "momentum_15m": 9.1,
+            "momentum_1h": 15.0,
+            "volatility_1h": 3.5,
+            "slippage_bps": 12.0,
+            "holding_winrate_7d": 0.62,
+            "avg_profit_7d": 27.0,
+            "avg_loss_7d": -9.0,
+        }
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Return ONLY valid JSON keys: "
+                "stop_loss_percent,target_profit_percent,reinvest_percent,max_hold_time_minutes,partial_take_profits,hold_if_score_above,slippage"
+            ),
+        },
+        {"role": "user", "content": json.dumps(feats, separators=(",", ":"), ensure_ascii=False)},
+    ]
+
+    if mode == "new":
+        OpenAI = sdk
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(model=model, messages=messages, temperature=0.2)
+        text = resp.choices[0].message.content.strip()
+    else:
+        openai = sdk
+        openai.api_key = api_key
+        resp = openai.ChatCompletion.create(model=model, messages=messages, temperature=0.2)
+        text = resp["choices"][0]["message"]["content"].strip()
+
+    try:
+        out = json.loads(text)
+    except Exception:
+        # attempt to extract JSON object
+        import re
+
+        m = re.search(r"\{.*\}", text, re.S)
+        if not m:
+            raise
+        out = json.loads(m.group(0))
+
+    print(json.dumps(out, indent=2))
+
+
+def _cast(v: Any) -> Any:
     if v is None:
         return None
     s = str(v).strip()
     if s == "":
         return None
-    # try int, float, bool, else leave string
-    for caster in (int, float):
-        try:
-            return caster(s)
-        except Exception:
-            pass
     ls = s.lower()
     if ls in ("true", "false"):
         return ls == "true"
-    return v
-
-
-# --------------------------
-# OpenAI helpers
-# --------------------------
-
-def _require_openai():
-    if NEW_SDK and _client:
-        return _client
-    if not NEW_SDK and "openai" in globals() and openai:
-        return openai
-    raise SystemExit("OpenAI SDK not available and/or OPENAI_API_KEY missing.")
-
-def upload_file(path: Path) -> str:
-    """Return file id for fine-tune."""
-    client = _require_openai()
-    if NEW_SDK:
-        with path.open("rb") as f:
-            file_obj = client.files.create(file=f, purpose="fine-tune")
-        return file_obj.id
-    else:
-        with path.open("rb") as f:
-            file_obj = client.File.create(file=f, purpose="fine-tune")  # type: ignore[attr-defined]
-        return file_obj["id"]
-
-def start_finetune(training_file_id: str, validation_file_id: Optional[str], base_model: str, suffix: Optional[str]) -> str:
-    """Return fine-tuning job id."""
-    client = _require_openai()
-    if NEW_SDK:
-        job = client.fine_tuning.jobs.create(  # type: ignore[attr-defined]
-            training_file=training_file_id,
-            validation_file=validation_file_id,
-            model=base_model,
-            suffix=suffix or "sniper-params"
-        )
-        return job.id
-    else:
-        job = client.FineTuningJob.create(  # type: ignore[attr-defined]
-            training_file=training_file_id,
-            validation_file=validation_file_id,
-            model=base_model,
-            suffix=suffix or "sniper-params"
-        )
-        return job["id"]
-
-def get_job(job_id: str) -> Dict[str, Any]:
-    client = _require_openai()
-    if NEW_SDK:
-        job = client.fine_tuning.jobs.retrieve(job_id)  # type: ignore[attr-defined]
-        return job.to_dict()
-    else:
-        job = client.FineTuningJob.retrieve(job_id)  # type: ignore[attr-defined]
-        return dict(job)
-
-def last_model_from_job(job: Dict[str, Any]) -> Optional[str]:
-    # both SDKs expose 'fine_tuned_model'
-    return job.get("fine_tuned_model")
-
-def store_model_in_redis(model_id: str) -> None:
-    if not redis:
-        log.warning("Redis not available; writing to %s", DEFAULT_MODEL_PICKLE)
-        DEFAULT_MODEL_PICKLE.write_text(model_id, encoding="utf-8")
-        return
-    # also store under a stable key used by the strategy
-    asyncio.run(redis.set("ai:ft_model", model_id))  # quick set in blocking context
-
-
-def load_model_from_store() -> Optional[str]:
-    if redis:
-        try:
-            val = asyncio.run(redis.get("ai:ft_model"))
-            if val:
-                return str(val)
-        except Exception:
-            pass
-    if DEFAULT_MODEL_PICKLE.exists():
-        return DEFAULT_MODEL_PICKLE.read_text(encoding="utf-8").strip()
-    return None
-
-
-def chat_completion(model: str, features: Dict[str, Any]) -> Dict[str, Any]:
-    """Query the (fine-tuned) model and parse JSON response."""
-    client = _require_openai()
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a trading parameter tuner for a Solana sniper bot. "
-                "Given market features (JSON), respond ONLY with compact JSON keys: "
-                "stop_loss_percent,target_profit_percent,reinvest_percent,max_hold_time_minutes,partial_take_profits,hold_if_score_above,slippage"
-            ),
-        },
-        {"role": "user", "content": json.dumps(features, separators=(",", ":"))},
-    ]
-    if NEW_SDK:
-        resp = client.chat.completions.create(model=model, messages=messages, temperature=0.2)  # type: ignore[attr-defined]
-        text = resp.choices[0].message.content.strip()
-    else:
-        resp = client.ChatCompletion.create(model=model, messages=messages, temperature=0.2)  # type: ignore[attr-defined]
-        text = resp["choices"][0]["message"]["content"].strip()
     try:
-        return json.loads(text)
+        if "." in s:
+            return float(s)
+        return int(s)
     except Exception:
-        # attempt to extract JSON
-        import re
-        m = re.search(r"\{.*\}", text, re.S)
-        if m:
-            return json.loads(m.group(0))
-        raise
+        return s
 
 
-# --------------------------
-# CLI Tasks
-# --------------------------
+def main() -> None:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
 
-def cmd_prepare(args: argparse.Namespace) -> None:
-    out_train = Path(args.train or DEFAULT_TRAIN)
-    out_val = Path(args.val or DEFAULT_VAL)
-
-    if args.csv:
-        prepare_from_csv(Path(args.csv), out_train, out_val, train_split=args.split)
-        return
-
-    # fallback: synthetic dataset if no CSV provided
-    prepare_synthetic(n=args.synthetic_rows, out_train=out_train, out_val=out_val)
-    log.info("Prepared: %s | %s", out_train, out_val)
-
-def cmd_tune(args: argparse.Namespace) -> None:
-    train = Path(args.train or DEFAULT_TRAIN)
-    val = Path(args.val or DEFAULT_VAL)
-    if not train.exists():
-        raise SystemExit(f"Training file missing: {train}. Run 'prepare' first.")
-    if not OPENAI_API_KEY:
-        raise SystemExit("OPENAI_API_KEY not set.")
-
-    train_id = upload_file(train)
-    val_id = upload_file(val) if val.exists() else None
-    base = args.model or OPENAI_BASE_MODEL
-    job_id = start_finetune(train_id, val_id, base, suffix=args.suffix)
-    print(job_id)
-
-def cmd_status(args: argparse.Namespace) -> None:
-    job = get_job(args.job_id)
-    print(json.dumps(job, indent=2))
-    model = last_model_from_job(job)
-    if model:
-        log.info("Fine-tuned model: %s", model)
-        # optionally persist
-        if args.persist:
-            store_model_in_redis(model)
-            log.info("Persisted to Redis (ai:ft_model) / file cache.")
-
-def cmd_set_model(args: argparse.Namespace) -> None:
-    mid = args.model_id.strip()
-    if not mid:
-        raise SystemExit("Provide --model-id")
-    store_model_in_redis(mid)
-    print(f"Stored model id: {mid}")
-
-def cmd_recommend(args: argparse.Namespace) -> None:
-    model = args.model or load_model_from_store() or OPENAI_BASE_MODEL
-    feats = _example_features() if not args.features else json.loads(Path(args.features).read_text(encoding="utf-8"))
-    rec = chat_completion(model, asdict(feats) if isinstance(feats, MarketFeatures) else feats)
-    print(json.dumps(rec, indent=2))
-
-
-# --------------------------
-# Async wrapper to bring up Redis
-# --------------------------
-
-async def _with_resources(coro, *a, **kw):
-    await init_resources()
-    try:
-        return await asyncio.to_thread(coro, *a, **kw)
-    finally:
-        await close_resources()
-
-
-def main():
-    ap = argparse.ArgumentParser(description="Fine-tune a strategy parameter model for the sniper bot.")
+    ap = argparse.ArgumentParser(
+        description="DB->JSONL and fine-tune helper for sniper param tuning."
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    # prepare
-    ap_p = sub.add_parser("prepare", help="Create JSONL training/validation data.")
-    ap_p.add_argument("--csv", help="Path to labeled CSV (optional).")
-    ap_p.add_argument("--train", help=f"Train JSONL (default: {DEFAULT_TRAIN})")
-    ap_p.add_argument("--val", help=f"Val JSONL (default: {DEFAULT_VAL})")
-    ap_p.add_argument("--split", type=float, default=0.9, help="Train split for CSV mode.")
-    ap_p.add_argument("--synthetic-rows", type=int, default=500, help="Rows for synthetic generator if no CSV.")
-    ap_p.set_defaults(func=lambda args: cmd_prepare(args))
+    p_db = sub.add_parser(
+        "prepare-db", help="Export from Postgres view v_training_rows into train/val JSONL."
+    )
+    p_db.add_argument("--limit", type=int, default=20000, help="Rows to pull (default 20000).")
+    p_db.add_argument("--schema", help="Optional schema (default none).")
+    p_db.add_argument(
+        "--view", default="v_training_rows", help="View name (default v_training_rows)."
+    )
+    p_db.add_argument("--where", help="Optional SQL condition (no WHERE keyword).")
+    p_db.add_argument("--train", help=f"Train JSONL (default {DEFAULT_TRAIN})")
+    p_db.add_argument("--val", help=f"Val JSONL (default {DEFAULT_VAL})")
+    p_db.add_argument(
+        "--val-ratio", type=float, default=0.1, help="Validation ratio (default 0.1)."
+    )
+    p_db.add_argument("--seed", type=int, default=1337, help="Split seed (default 1337).")
+    p_db.set_defaults(func=cmd_prepare_db)
 
-    # tune
-    ap_t = sub.add_parser("tune", help="Upload files and start a fine-tune.")
-    ap_t.add_argument("--train", help=f"Train JSONL (default: {DEFAULT_TRAIN})")
-    ap_t.add_argument("--val", help=f"Val JSONL (default: {DEFAULT_VAL})")
-    ap_t.add_argument("--model", help=f"Base model (default: OPENAI_BASE_MODEL)")
-    ap_t.add_argument("--suffix", help="Job suffix", default="sniper-params")
-    ap_t.set_defaults(func=lambda args: cmd_tune(args))
+    p_csv = sub.add_parser(
+        "prepare-csv", help="Prepare JSONL from labeled CSV (features + param_* columns)."
+    )
+    p_csv.add_argument("--csv", required=True, help="Input CSV path.")
+    p_csv.add_argument("--train", help=f"Train JSONL (default {DEFAULT_TRAIN})")
+    p_csv.add_argument("--val", help=f"Val JSONL (default {DEFAULT_VAL})")
+    p_csv.add_argument(
+        "--val-ratio", type=float, default=0.1, help="Validation ratio (default 0.1)."
+    )
+    p_csv.add_argument("--seed", type=int, default=1337, help="Shuffle seed (default 1337).")
+    p_csv.set_defaults(func=cmd_prepare_csv)
 
-    # status
-    ap_s = sub.add_parser("status", help="Check fine-tune job status.")
-    ap_s.add_argument("job_id", help="Fine-tune job id")
-    ap_s.add_argument("--persist", action="store_true", help="Persist resulting model id if available.")
-    ap_s.set_defaults(func=lambda args: cmd_status(args))
+    p_t = sub.add_parser("tune", help="Upload JSONL files and start fine-tune job.")
+    p_t.add_argument("--train", help=f"Train JSONL (default {DEFAULT_TRAIN})")
+    p_t.add_argument("--val", help=f"Val JSONL (default {DEFAULT_VAL})")
+    p_t.add_argument("--model", help="Base model (or set OPENAI_BASE_MODEL).")
+    p_t.add_argument("--suffix", default="sniper-params", help="Job suffix.")
+    p_t.set_defaults(func=cmd_tune)
 
-    # set-model
-    ap_m = sub.add_parser("set-model", help="Persist a chosen fine-tuned model id.")
-    ap_m.add_argument("--model-id", required=True)
-    ap_m.set_defaults(func=lambda args: cmd_set_model(args))
+    p_s = sub.add_parser("status", help="Check fine-tune job status.")
+    p_s.add_argument("job_id", help="Fine-tune job id")
+    p_s.add_argument(
+        "--persist", action="store_true", help="Persist model id to Redis/file if available."
+    )
+    p_s.add_argument("--redis-url", help="Override Redis URL (else uses env).")
+    p_s.set_defaults(func=cmd_status)
 
-    # recommend (inference)
-    ap_r = sub.add_parser("recommend", help="Query tuned/base model with features JSON and print params JSON.")
-    ap_r.add_argument("--model", help="Model id (default: ai:ft_model or OPENAI_BASE_MODEL)")
-    ap_r.add_argument("--features", help="Path to features JSON. If omitted, uses example.")
-    ap_r.set_defaults(func=lambda args: cmd_recommend(args))
+    p_m = sub.add_parser("set-model", help="Persist a model id to Redis/file.")
+    p_m.add_argument("--model-id", required=True)
+    p_m.add_argument("--redis-url", help="Override Redis URL (else uses env).")
+    p_m.set_defaults(func=cmd_set_model)
+
+    p_r = sub.add_parser("recommend", help="Query tuned/base model with features JSON.")
+    p_r.add_argument("--model", help="Model id (default: stored ai:ft_model or OPENAI_BASE_MODEL).")
+    p_r.add_argument("--features", help="Path to features JSON file (optional).")
+    p_r.add_argument("--redis-url", help="Override Redis URL (else uses env).")
+    p_r.set_defaults(func=cmd_recommend)
 
     args = ap.parse_args()
-
-    # Bring up shared resources (Redis) only for commands that need it
-    if args.cmd in ("status", "set-model", "recommend"):
-        asyncio.run(_with_resources(args.func, args))
-    else:
-        # prepare/tune don’t strictly need Redis
-        args.func(args)
+    args.func(args)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
+    main()

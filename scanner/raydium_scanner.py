@@ -1,45 +1,49 @@
-# -*- coding: utf-8 -*-
+# scanner/raydium_scanner.py
 from __future__ import annotations
 
 """
-scanner/raydium_scanner.py — Raydium scanner via Dexscreener (V3+++ / God-Tier LOCK-IN)
-======================================================================================
+scanner/raydium_scanner.py — Raydium discovery scanner (P0 LOCK-IN, V3+++)
+===========================================================================
 
-CONTROL PLANE ONLY (scanner)
-----------------------------
-- Finds Raydium pairs on Solana via Dexscreener search endpoint(s)
-- Normalizes into a single CandidateSnapshot schema (canonical keys + compat aliases)
-- Eliminates “silent no-buy”: every reject increments a reason bucket; summary is logged.
+Role (SCANNER ONLY)
+-------------------
+- Discover Solana Raydium pairs via Dexscreener search endpoint(s)
+- Normalize into *canonical* Candidate objects defined in scanner/registry.py
+- NO trading, NO signing, NO swap/route calls
+- Zero network at import time
+- Cancellation-safe (never swallow asyncio.CancelledError)
+- Orchestrator-friendly call shapes (redis/session/stop_evt/q/emit accepted in any order)
 
-Hard rules
-----------
-- No swap / signing / tx execution here
-- No network at import time
-- Must not crash on missing optional modules unless RAYDIUM_FAST_FAIL=1
-- Must be cancellation-safe (do NOT swallow asyncio.CancelledError)
+Contracts
+---------
+- scan_raydium(...) returns: list[Candidate] (canonical)
+- scan_once(...) alias returns the same
+- run(...) optional loop helper (dev/tools/legacy): emits to queue/callback
 
-Public API
-----------
-async def scan_raydium(*args) -> list[dict]
-async def scan_once(*args) -> list[dict]
-async def run(...)
+Observability
+-------------
+- Every rejection increments a reason bucket (no silent no-buy)
+- Periodic structured reject summaries for "why nothing is passing"
 
-Output
-------
-scan_raydium(...) returns: List[Dict[str, Any]] “runners” sorted best-first.
+Notes
+-----
+- This scanner is designed to degrade gracefully when optional modules are missing,
+  unless FAST_FAIL is enabled.
 """
 
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import random
 import ssl
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
-# Optional deps: scanner should fail-closed if missing
+# Optional HTTP deps (scanner should degrade gracefully unless FAST_FAIL)
 try:
     import aiohttp  # type: ignore
 except Exception:  # pragma: no cover
@@ -51,50 +55,81 @@ except Exception:  # pragma: no cover
     certifi = None  # type: ignore
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Logger (safe)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# Canonical Candidate (scanner/registry.py)
+# =============================================================================
+try:
+    from .registry import Candidate  # type: ignore
+except Exception:  # pragma: no cover
+    Candidate = None  # type: ignore
+
+
+# =============================================================================
+# Logging (supports log.event / log.once / log.every; falls back to stdlib logging)
+# =============================================================================
 try:
     from logging_setup import get_logger  # type: ignore
 
-    log = get_logger("scanner.raydium")
+    try:
+        LOG = get_logger("scanner.raydium")  # type: ignore[arg-type]
+    except TypeError:
+        LOG = get_logger()  # type: ignore[misc]
 except Exception:  # pragma: no cover
     import logging
 
-    log = logging.getLogger("scanner.raydium")
-    if not log.handlers:
+    LOG = logging.getLogger("scanner.raydium")
+    if not LOG.handlers:
         logging.basicConfig(level=logging.INFO)
 
 
-def _ensure_log_shims() -> None:
-    if not hasattr(log, "event"):
+def _ensure_logger_shims() -> None:
+    """Provide LOG.event / LOG.once / LOG.every for stdlib loggers."""
+    if not hasattr(LOG, "event"):
 
-        def _event(name: str, **kw: Any) -> None:  # pragma: no cover
-            try:
-                log.info("%s %s", name, kw)
-            except Exception:
-                pass
+        def _event(name: str, **fields: Any) -> None:  # pragma: no cover
+            with contextlib.suppress(Exception):
+                LOG.info("%s %s", name, fields)
 
-        setattr(log, "event", _event)
+        LOG.event = _event  # type: ignore[attr-defined]
 
-    if not hasattr(log, "every"):
+    if not hasattr(LOG, "once"):
+        _seen: dict[str, float] = {}
 
-        def _every(key: str, n: int = 60, msg: Optional[str] = None, **kw: Any) -> None:  # pragma: no cover
-            now = time.time()
-            store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
-            last = float(store.get(key, 0.0))
-            if (now - last) >= float(n):
-                store[key] = now
-                setattr(_every, "_store", store)  # type: ignore[attr-defined]
-                try:
-                    getattr(log, "event")(msg or key, **kw)
-                except Exception:
-                    pass
+        def _once(
+            key: str,
+            ttl: float = 30.0,
+            level: int = 20,
+            msg: str | None = None,
+            **fields: Any,
+        ) -> bool:  # pragma: no cover
+            now = time.monotonic()
+            last = float(_seen.get(key, 0.0))
+            if now - last < float(ttl):
+                return False
+            _seen[key] = now
+            with contextlib.suppress(Exception):
+                LOG.log(level, "%s %s", (msg or key), fields)
+            return True
 
-        setattr(log, "every", _every)
+        LOG.once = _once  # type: ignore[attr-defined]
+
+    if not hasattr(LOG, "every"):
+
+        def _every(
+            key: str,
+            n: float = 10.0,
+            level: int = 20,
+            msg: str | None = None,
+            **fields: Any,
+        ) -> None:  # pragma: no cover
+            once = getattr(LOG, "once", None)
+            if callable(once):
+                once(key, ttl=float(n), level=level, msg=msg or key, **fields)
+
+        LOG.every = _every  # type: ignore[attr-defined]
 
 
-_ensure_log_shims()
+_ensure_logger_shims()
 
 
 def _short(x: Any, n: int = 240) -> str:
@@ -102,24 +137,26 @@ def _short(x: Any, n: int = 240) -> str:
         s = str(x)
         return s if len(s) <= n else (s[:n] + "…")
     except Exception:
-        return "<?>"
+        return "<unprintable>"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Env/config helpers
-# ──────────────────────────────────────────────────────────────────────────────
+
+# =============================================================================
+# Env / config helpers
+# =============================================================================
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
+_FALSE = {"0", "false", "f", "no", "n", "off"}
 
 
 def _b(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None or str(v).strip() == "":
         return bool(default)
-    return str(v).strip().lower() in _TRUE
-
-
-def _s(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return default if v is None else str(v).strip()
+    s = str(v).strip().lower()
+    if s in _TRUE:
+        return True
+    if s in _FALSE:
+        return False
+    return bool(default)
 
 
 def _i(name: str, default: int) -> int:
@@ -138,10 +175,724 @@ def _f(name: str, default: float) -> float:
         return float(default)
 
 
+def _s(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else str(v).strip()
+
+
 def _clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
 
 
+def _fast_fail() -> bool:
+    return _b("RAYDIUM_FAST_FAIL", _b("MAIN_FAST_FAIL", False))
+
+
+def _disabled() -> bool:
+    return bool(
+        _b("KILL_SWITCH", False)
+        or _b("DISABLE_SCANNERS", False)
+        or _b("RAYDIUM_SCANNER_DISABLED", False)
+    )
+
+
+# config.py is optional; env always wins
+try:
+    import config as C  # type: ignore
+except Exception:  # pragma: no cover
+
+    class _C:
+        pass
+
+    C = _C()  # type: ignore
+
+
+def _cfg(name: str, default: Any) -> Any:
+    """
+    Read env first; fallback to config.py attribute; else default.
+    """
+    if os.getenv(name) not in (None, ""):
+        if isinstance(default, bool):
+            return _b(name, bool(default))
+        if isinstance(default, int) and not isinstance(default, bool):
+            return _i(name, int(default))
+        if isinstance(default, float):
+            return _f(name, float(default))
+        return _s(name, str(default))
+    return getattr(C, name, default)
+
+
+# Optional mint normalizer
+try:
+    from utils_pkg.mints import normalize_mint as _normalize_mint  # type: ignore
+except Exception:  # pragma: no cover
+
+    def _normalize_mint(m: str) -> str:
+        return (m or "").strip()
+
+
+# Optional cheap viability filter (scanner-level sanity, not final gate)
+try:
+    from utils_pkg.pair_filters import is_viable_pair as _is_viable_pair  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from utils_pkg.pump_filters import is_viable_pair as _is_viable_pair  # type: ignore
+    except Exception:  # pragma: no cover
+
+        def _is_viable_pair(_meta: dict[str, Any]) -> bool:  # type: ignore
+            return True
+
+
+# Optional risk/regime snapshot sources (scanner tags only)
+try:
+    from utils_pkg.risk_manager import risk_capacity_snapshot  # type: ignore
+except Exception:  # pragma: no cover
+
+    async def risk_capacity_snapshot(_redis=None) -> dict[str, Any]:
+        return {"risk_capacity": 1.0, "risk_shutdown": False, "risk_mode": "normal"}
+
+
+try:
+    from utils_pkg.regime import regime_state  # type: ignore
+except Exception:  # pragma: no cover
+
+    class _DummyRegime:
+        @staticmethod
+        def get() -> str:
+            return "unknown"
+
+        @staticmethod
+        async def features() -> dict[str, Any]:
+            return {
+                "regime_label": "unknown",
+                "regime_label_numeric": 0.0,
+                "trend_score": 0.0,
+                "volatility_score": 0.0,
+                "liquidity_score": 0.5,
+                "manipulation_risk": 0.0,
+            }
+
+    regime_state = _DummyRegime()  # type: ignore
+
+
+# Optional alerting (best-effort)
+try:
+    from utils_pkg.alert_manager import AlertManager  # type: ignore
+except Exception:  # pragma: no cover
+    AlertManager = None  # type: ignore
+
+
+# Optional structured logging for training/debug
+try:
+    from utils_pkg.data_logger import log_event, log_raydium_candidate  # type: ignore
+except Exception:  # pragma: no cover
+
+    async def log_event(*_: Any, **__: Any) -> None:  # type: ignore
+        return None
+
+    def log_raydium_candidate(*_: Any, **__: Any) -> None:  # type: ignore
+        return None
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+_SOL_MINT = "So11111111111111111111111111111111111111112"
+_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+
+# =============================================================================
+# Settings
+# =============================================================================
+@dataclass(frozen=True)
+class Settings:
+    enabled: bool
+    mode: str  # off/simple/full
+
+    # Dexscreener search
+    base_url: str
+    alt_bases: tuple[str, ...]
+    search_path: str
+    queries: tuple[str, ...]
+    search_limit: int
+    fetch_concurrency: int
+
+    # HTTP
+    ua: str
+    timeout_s: float
+    retries: int
+    backoff_s: float
+    trust_env: bool
+    http_proxy: str
+    conn_limit: int
+    rps_limit: float
+
+    # Selection
+    out_limit: int
+    require_quote: bool
+    allowed_quotes: frozenset[str]
+
+    # Cheap prefilters (scanner sanity only; entry layer still decides)
+    hard_min_liq_usd: float
+    hard_max_age_min: float
+    min_buys_5m: int
+    min_vol5_usd: float
+    max_neg_chg5_pct: float
+
+    # Redis dedupe (optional)
+    seen_ttl_s: int
+
+    # Observability / alerting
+    debug_samples: bool
+    log_rejects: bool
+    reject_log_every_s: float
+    sample_n: int
+
+    momo_alerts: bool
+    max_momo_alerts: int
+    momo_dedup_s: float
+
+
+_SETTINGS_CACHE: tuple[float, Settings | None] = (0.0, None)
+_SETTINGS_TTL_S = 1.0
+
+
+def _compute_settings() -> Settings:
+    phase = int(_i("MASTER_PHASE", int(_cfg("MASTER_PHASE", 7) or 7)))
+    default_mode = "off" if phase <= 0 else ("simple" if phase <= 2 else "full")
+    mode = _s("RAYDIUM_MODE", default_mode).lower().strip()
+    if mode not in {"off", "simple", "full"}:
+        mode = "full"
+
+    enabled = bool(_cfg("ENABLE_RAYDIUM_SCANNER", True)) and _b("RAYDIUM_ENABLED", mode != "off")
+
+    base = _s("DEXSCREENER_BASE_URL", "https://api.dexscreener.com").rstrip("/")
+    alt_raw = [
+        x.strip().rstrip("/") for x in _s("DEXSCREENER_ALT_BASE_URLS", "").split(",") if x.strip()
+    ]
+    alt_bases = tuple([b for b in alt_raw if b and b != base][:5])
+
+    path = _s("RAYDIUM_DEXSEARCH_PATH", "/latest/dex/search").strip() or "/latest/dex/search"
+
+    queries = tuple(
+        [q.strip() for q in _s("RAYDIUM_SEARCH_QUERIES", "raydium,solana").split(",") if q.strip()][
+            :20
+        ]
+        or ["raydium"]
+    )
+    search_limit = max(25, _i("RAYDIUM_SEARCH_LIMIT", 250))
+    fetch_concurrency = max(1, _i("RAYDIUM_FETCH_CONCURRENCY", 3))
+
+    ua = _s("SCANNER_UA", "Mozilla/5.0 SniperBot/1.0 (+raydium)")
+    timeout_s = max(5.0, _f("RAYDIUM_HTTP_TIMEOUT_SEC", 12.0))
+    retries = max(1, _i("RAYDIUM_HTTP_RETRIES", 3))
+    backoff_s = max(0.15, _f("RAYDIUM_HTTP_BACKOFF_SEC", 0.6))
+    trust_env = _b("RAYDIUM_TRUST_ENV", True)
+    http_proxy = _s("RAYDIUM_HTTP_PROXY", "") or _s("SCANNER_HTTP_PROXY", "")
+    conn_limit = max(10, _i("RAYDIUM_HTTP_CONN_LIMIT", 64))
+    rps_limit = max(0.0, _f("RAYDIUM_RPS_LIMIT", 0.0))
+
+    out_limit = max(1, _i("RAYDIUM_LIMIT", 40))
+
+    require_quote = _b("RAYDIUM_REQUIRE_SOL_OR_USDC_QUOTE", True)
+    allowed_quotes = frozenset(
+        {
+            q.strip().upper()
+            for q in _s("RAYDIUM_ALLOWED_QUOTES", "SOL,USDC").split(",")
+            if q.strip()
+        }
+        or {"SOL", "USDC"}
+    )
+
+    hard_min_liq_usd = max(0.0, _f("RAYDIUM_HARD_MIN_LIQ_USD", 0.0))
+    hard_max_age_min = max(0.0, _f("RAYDIUM_HARD_MAX_AGE_MIN", 0.0))
+    min_buys_5m = max(0, _i("RAYDIUM_MIN_BUYS_5M", 0))
+    min_vol5_usd = max(0.0, _f("RAYDIUM_MIN_VOL5_USD", 0.0))
+    max_neg_chg5_pct = _f("RAYDIUM_MAX_NEG_CHG5_PCT", -35.0)
+
+    seen_ttl_s = max(0, _i("RAYDIUM_SEEN_TTL_S", 0))
+
+    debug_samples = _b("RAYDIUM_DEBUG_META_SAMPLE", True)
+    log_rejects = _b("RAYDIUM_LOG_REJECTS", True)
+    reject_log_every_s = max(1.0, float(_f("RAYDIUM_REJECT_LOG_EVERY_SEC", 10.0)))
+    sample_n = max(0, _i("RAYDIUM_REJECT_SAMPLE_N", 2))
+
+    momo_alerts = _b("RAYDIUM_SEND_MOMO_ALERTS", True)
+    max_momo_alerts = max(0, _i("RAYDIUM_MAX_ALERTS_PER_SCAN", 3))
+    momo_dedup_s = max(10.0, _f("RAYDIUM_ALERT_DEDUP_SEC", 180.0))
+
+    return Settings(
+        enabled=enabled,
+        mode=mode,
+        base_url=base,
+        alt_bases=alt_bases,
+        search_path=path,
+        queries=queries,
+        search_limit=search_limit,
+        fetch_concurrency=fetch_concurrency,
+        ua=ua,
+        timeout_s=timeout_s,
+        retries=retries,
+        backoff_s=backoff_s,
+        trust_env=trust_env,
+        http_proxy=http_proxy,
+        conn_limit=conn_limit,
+        rps_limit=rps_limit,
+        out_limit=out_limit,
+        require_quote=require_quote,
+        allowed_quotes=allowed_quotes,
+        hard_min_liq_usd=hard_min_liq_usd,
+        hard_max_age_min=hard_max_age_min,
+        min_buys_5m=min_buys_5m,
+        min_vol5_usd=min_vol5_usd,
+        max_neg_chg5_pct=max_neg_chg5_pct,
+        seen_ttl_s=seen_ttl_s,
+        debug_samples=debug_samples,
+        log_rejects=log_rejects,
+        reject_log_every_s=reject_log_every_s,
+        sample_n=sample_n,
+        momo_alerts=momo_alerts,
+        max_momo_alerts=max_momo_alerts,
+        momo_dedup_s=momo_dedup_s,
+    )
+
+
+def _settings() -> Settings:
+    now = time.time()
+    ts, st = _SETTINGS_CACHE
+    if st is None or (now - ts) >= _SETTINGS_TTL_S:
+        st = _compute_settings()
+        globals()["_SETTINGS_CACHE"] = (now, st)
+    return st
+
+
+# =============================================================================
+# Call context parsing (orchestrator-friendly)
+# =============================================================================
+@dataclass
+class _CallCtx:
+    redis: Any = None
+    session: Any = None
+    stop_evt: asyncio.Event | None = None
+    q: Any = None
+    emit: Callable[[Any], Any] | None = None
+    limit: int | None = None
+
+
+def _looks_like_queue(x: Any) -> bool:
+    return x is not None and (
+        callable(getattr(x, "put", None)) or callable(getattr(x, "put_nowait", None))
+    )
+
+
+def _looks_like_redis(x: Any) -> bool:
+    if x is None or isinstance(x, asyncio.Event) or _looks_like_queue(x):
+        return False
+    return any(callable(getattr(x, nm, None)) for nm in ("get", "set", "setex", "expire", "ping"))
+
+
+def _parse_ctx(*args: Any, **kwargs: Any) -> _CallCtx:
+    ctx = _CallCtx()
+
+    # kwargs first
+    for k in ("stop_evt", "stop_event", "stop"):
+        v = kwargs.get(k)
+        if isinstance(v, asyncio.Event):
+            ctx.stop_evt = v
+            break
+
+    for k in ("session", "sess", "http", "client"):
+        v = kwargs.get(k)
+        if v is not None:
+            ctx.session = v
+            break
+
+    for k in ("redis", "r"):
+        v = kwargs.get(k)
+        if _looks_like_redis(v):
+            ctx.redis = v
+            break
+
+    for k in ("q", "queue", "out_q"):
+        v = kwargs.get(k)
+        if _looks_like_queue(v):
+            ctx.q = v
+            break
+
+    v = kwargs.get("emit")
+    if callable(v):
+        ctx.emit = v
+
+    lim = kwargs.get("limit", None)
+    if isinstance(lim, int):
+        ctx.limit = lim
+
+    # positional: accept any order
+    for a in args:
+        if ctx.stop_evt is None and isinstance(a, asyncio.Event):
+            ctx.stop_evt = a
+            continue
+        if ctx.session is None and a is not None and aiohttp is not None:
+            # best-effort: aiohttp session check without hard dependency
+            cls = getattr(aiohttp, "ClientSession", None)
+            if cls is not None and isinstance(a, cls):  # type: ignore[arg-type]
+                ctx.session = a
+                continue
+        if ctx.q is None and _looks_like_queue(a):
+            ctx.q = a
+            continue
+        if ctx.redis is None and _looks_like_redis(a):
+            ctx.redis = a
+            continue
+        if (
+            ctx.emit is None
+            and callable(a)
+            and not isinstance(a, (str, bytes, dict, list, tuple, set))
+        ):
+            ctx.emit = a  # type: ignore[assignment]
+            continue
+        if ctx.limit is None and isinstance(a, int):
+            ctx.limit = a
+            continue
+
+    return ctx
+
+
+# =============================================================================
+# Redis helpers (optional; safe for sync/async clients)
+# =============================================================================
+def _redis_ok(r: Any) -> bool:
+    return r is not None and any(
+        callable(getattr(r, nm, None)) for nm in ("get", "set", "setex", "expire")
+    )
+
+
+async def _redis_get(r: Any, key: str) -> str | None:
+    if not _redis_ok(r):
+        return None
+    try:
+        out = r.get(key)
+        if asyncio.iscoroutine(out):
+            out = await out
+        if out is None:
+            return None
+        if isinstance(out, (bytes, bytearray)):
+            return out.decode("utf-8", "ignore")
+        return str(out)
+    except Exception:
+        return None
+
+
+async def _redis_setex(r: Any, key: str, ttl_s: int, value: str) -> None:
+    if not _redis_ok(r):
+        return
+    try:
+        if callable(getattr(r, "setex", None)):
+            out = r.setex(key, int(ttl_s), value)
+            if asyncio.iscoroutine(out):
+                await out
+            return
+        out = r.set(key, value)
+        if asyncio.iscoroutine(out):
+            await out
+        if callable(getattr(r, "expire", None)):
+            out2 = r.expire(key, int(ttl_s))
+            if asyncio.iscoroutine(out2):
+                await out2
+    except Exception:
+        return
+
+
+# =============================================================================
+# Stats / rejects (no silent no-buy)
+# =============================================================================
+@dataclass
+class ScanStats:
+    t0: float
+    raw_pairs: int = 0
+    normalized: int = 0
+    passed: int = 0
+    rejects: dict[str, int] = field(default_factory=dict)
+    samples: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    def rej(
+        self, reason: str, sample: dict[str, Any] | None = None, *, st: Settings | None = None
+    ) -> None:
+        r = reason or "reject_unknown"
+        self.rejects[r] = int(self.rejects.get(r, 0)) + 1
+        n = int(getattr(st, "sample_n", 0) or 0) if st else 0
+        if sample is not None and n > 0:
+            arr = self.samples.get(r) or []
+            if len(arr) < n:
+                arr.append(sample)
+                self.samples[r] = arr
+
+
+_REJECT_LAST_TS = 0.0
+
+
+def _maybe_log_rejects(st: Settings, stats: ScanStats, *, force: bool = False) -> None:
+    global _REJECT_LAST_TS
+    if not st.log_rejects or not stats.rejects:
+        return
+    now = time.time()
+    if (not force) and (now - float(_REJECT_LAST_TS)) < float(st.reject_log_every_s):
+        return
+    _REJECT_LAST_TS = now
+    top = sorted(stats.rejects.items(), key=lambda kv: kv[1], reverse=True)[:12]
+    payload: dict[str, Any] = {
+        "raw_pairs": stats.raw_pairs,
+        "normalized": stats.normalized,
+        "passed": stats.passed,
+        "top_rejects": top,
+    }
+    if st.sample_n > 0 and stats.samples:
+        payload["samples"] = stats.samples
+    LOG.event("RAY_REJECT_SUMMARY", **payload)  # type: ignore[attr-defined]
+
+
+# =============================================================================
+# Regime snapshot
+# =============================================================================
+async def _regime_snapshot() -> dict[str, Any]:
+    try:
+        feats = await regime_state.features()
+        return {
+            "regime_label": str(feats.get("regime_label", "")) or "unknown",
+            "regime_label_numeric": float(feats.get("regime_label_numeric", 0.0) or 0.0),
+            "manipulation_risk": float(feats.get("manipulation_risk", 0.0) or 0.0),
+            "trend_score": float(feats.get("trend_score", 0.0) or 0.0),
+            "volatility_score": float(feats.get("volatility_score", 0.0) or 0.0),
+            "liquidity_score": float(feats.get("liquidity_score", 0.5) or 0.5),
+        }
+    except Exception:
+        with contextlib.suppress(Exception):
+            return {
+                "regime_label": str(getattr(regime_state, "get", lambda: "unknown")() or "unknown"),
+                "regime_label_numeric": 0.0,
+                "manipulation_risk": 0.0,
+            }
+        return {"regime_label": "unknown", "regime_label_numeric": 0.0, "manipulation_risk": 0.0}
+
+
+# =============================================================================
+# HTTP helpers
+# =============================================================================
+def _headers(st: Settings) -> dict[str, str]:
+    return {
+        "User-Agent": st.ua,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+
+_SSLCTX: ssl.SSLContext | None = None
+
+
+def _sslctx() -> ssl.SSLContext | None:
+    global _SSLCTX
+    if _SSLCTX is not None:
+        return _SSLCTX
+    with contextlib.suppress(Exception):
+        if certifi is not None:
+            _SSLCTX = ssl.create_default_context(cafile=certifi.where())  # type: ignore[attr-defined]
+            return _SSLCTX
+    _SSLCTX = None
+    return None
+
+
+def _search_url(base: str, path: str) -> str:
+    p = path if path.startswith("/") else ("/" + path)
+    return f"{base}{p}"
+
+
+class _RpsGate:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._last = 0.0
+        self._rps = 0.0
+
+    def set(self, rps: float) -> None:
+        self._rps = float(max(0.0, rps))
+
+    async def wait(self) -> None:
+        rps = float(self._rps)
+        if rps <= 0:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            min_dt = 1.0 / max(0.0001, rps)
+            dt = now - self._last
+            if dt < min_dt:
+                await asyncio.sleep(min_dt - dt)
+            self._last = time.monotonic()
+
+
+_RPS = _RpsGate()
+
+
+async def _fetch_json(
+    session: Any,
+    st: Settings,
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    stop_evt: asyncio.Event | None = None,
+) -> tuple[dict[str, Any] | None, int, str]:
+    status = 0
+    first = ""
+
+    for attempt in range(1, st.retries + 1):
+        if stop_evt is not None and stop_evt.is_set():
+            return None, 0, "stopped"
+
+        await _RPS.wait()
+
+        try:
+            async with session.get(
+                url,
+                params=params,
+                headers=_headers(st),
+                timeout=aiohttp.ClientTimeout(total=st.timeout_s),  # type: ignore[attr-defined]
+                proxy=(st.http_proxy or None),
+                ssl=_sslctx(),
+            ) as r:
+                status = int(getattr(r, "status", 0) or 0)
+                text = (await r.text()) or ""
+                first = text[:140]
+
+                if status == 200:
+                    try:
+                        return await r.json(content_type=None), status, first
+                    except Exception:
+                        with contextlib.suppress(Exception):
+                            return json.loads(text), status, first
+                        return None, status, first
+
+                # Fail-fast on non-rate-limited 4xx
+                if 400 <= status < 500 and status != 429:
+                    return None, status, first
+
+                # 429/5xx backoff
+                if status == 429:
+                    ra = (getattr(r, "headers", {}) or {}).get("Retry-After", "")
+                    ra = (ra or "").strip()
+                    wait = (
+                        float(ra)
+                        if ra.replace(".", "", 1).isdigit()
+                        else (st.backoff_s * attempt * 2.0)
+                    )
+                    wait = _clamp(wait, 0.25, 8.0)
+                    await asyncio.sleep(wait)
+                else:
+                    await asyncio.sleep(st.backoff_s * attempt * (0.85 + 0.3 * random.random()))
+        except asyncio.CancelledError:
+            raise
+        except (TimeoutError, aiohttp.ClientError) as e:  # type: ignore[attr-defined]
+            LOG.every(  # type: ignore[attr-defined]
+                "RAY_HTTP_ERR",
+                n=10,
+                level=20,
+                msg="RAY_HTTP_ERR",
+                err=type(e).__name__,
+                url=url,
+                attempt=attempt,
+                retries=st.retries,
+            )
+            if attempt < st.retries:
+                await asyncio.sleep(st.backoff_s * attempt * (0.85 + 0.3 * random.random()))
+        except Exception as e:
+            LOG.every(  # type: ignore[attr-defined]
+                "RAY_HTTP_UNK",
+                n=10,
+                level=20,
+                msg="RAY_HTTP_UNK",
+                err=_short(e),
+                url=url,
+                attempt=attempt,
+                retries=st.retries,
+            )
+            if attempt < st.retries:
+                await asyncio.sleep(st.backoff_s * attempt * (0.85 + 0.3 * random.random()))
+
+    return None, status, first
+
+
+async def _fetch_pairs(
+    session: Any,
+    st: Settings,
+    stats: ScanStats,
+    *,
+    stop_evt: asyncio.Event | None,
+) -> list[dict[str, Any]]:
+    """
+    Dexscreener search endpoint for multiple queries.
+    Returns list of raw pair dicts (deduped by pairAddress/baseToken.address).
+    """
+    sem = asyncio.Semaphore(max(1, st.fetch_concurrency))
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    bases = (st.base_url,) + tuple([b for b in st.alt_bases if b and b != st.base_url])
+    bases = bases[:5] or (st.base_url,)
+    queries = st.queries[:20] or ("raydium",)
+
+    async def _one_query(q: str) -> None:
+        for base in bases:
+            if stop_evt is not None and stop_evt.is_set():
+                return
+            try:
+                url = _search_url(base, st.search_path)
+                params = {"q": q, "limit": st.search_limit}
+                async with sem:
+                    data, status, _first = await _fetch_json(
+                        session, st, url, params=params, stop_evt=stop_evt
+                    )
+
+                if not data:
+                    stats.rej("fetch_empty", {"q": q, "status": status, "base": base}, st=st)
+                    continue
+
+                pairs = data.get("pairs") or []
+                if not isinstance(pairs, list):
+                    stats.rej("fetch_pairs_nolist", {"q": q, "base": base}, st=st)
+                    continue
+
+                for p in pairs:
+                    if not isinstance(p, dict):
+                        stats.rej("pair_nondict", {"q": q}, st=st)
+                        continue
+                    if (p.get("chainId") or "").lower() != "solana":
+                        continue
+                    if (p.get("dexId") or "").lower() != "raydium":
+                        continue
+
+                    pid = str((p.get("pairAddress") or "")).strip()
+                    if not pid:
+                        pid = str(((p.get("baseToken") or {}).get("address")) or "").strip()
+                    pid_l = pid.lower()
+                    if not pid_l or pid_l in seen:
+                        continue
+                    seen.add(pid_l)
+                    out.append(p)
+
+                return  # success for this query
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                stats.rej("fetch_exc", {"q": q, "base": base, "err": _short(e)}, st=st)
+
+    tasks = [asyncio.create_task(_one_query(q)) for q in queries]
+    if tasks:
+        await asyncio.gather(*tasks)
+    return out
+
+
+# =============================================================================
+# Normalization helpers
+# =============================================================================
 def _nzf(v: Any, d: float = 0.0) -> float:
     try:
         x = float(v)
@@ -157,348 +908,16 @@ def _nzi(v: Any, d: int = 0) -> int:
         return d
 
 
-def _fast_fail() -> bool:
-    return _b("RAYDIUM_FAST_FAIL", _b("MAIN_FAST_FAIL", False))
-
-
-# safe config import (no network)
-try:
-    import config as C  # type: ignore
-except Exception:  # pragma: no cover
-
-    class _C:
-        pass
-
-    C = _C()  # type: ignore
-
-
-def _cfg(name: str, default: Any) -> Any:
-    """Env wins. Then config attr. Then default."""
-    if os.getenv(name) not in (None, ""):
-        if isinstance(default, bool):
-            return _b(name, bool(default))
-        if isinstance(default, int) and not isinstance(default, bool):
-            return _i(name, int(default))
-        if isinstance(default, float):
-            return _f(name, float(default))
-        return _s(name, str(default))
-    return getattr(C, name, default)
-
-
-# Optional mint normalizer (single source of truth if present)
-try:
-    from utils_pkg.mints import normalize_mint as _normalize_mint  # type: ignore
-except Exception:  # pragma: no cover
-
-    def _normalize_mint(m: str) -> str:
-        return (m or "").strip()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Phase / Mode
-# ──────────────────────────────────────────────────────────────────────────────
-MASTER_PHASE = max(
-    0,
-    min(
-        7,
-        _i("MASTER_PHASE", _i("STRATEGY_PHASE", int(_cfg("MASTER_PHASE", 7) or 7))),
-    ),
-)
-
-if MASTER_PHASE == 0:
-    _default_mode = "off"
-elif MASTER_PHASE <= 2:
-    _default_mode = "simple"
-elif MASTER_PHASE <= 4:
-    _default_mode = "alpha"
-else:
-    _default_mode = "full"
-
-RAYDIUM_MODE = _s("RAYDIUM_MODE", _default_mode).lower().strip()
-if RAYDIUM_MODE not in {"off", "simple", "alpha", "full"}:
-    RAYDIUM_MODE = "full"
-
-ENABLE_RAYDIUM_SCANNER = bool(_cfg("ENABLE_RAYDIUM_SCANNER", True))
-RAYDIUM_ENABLED = _b("RAYDIUM_ENABLED", (RAYDIUM_MODE != "off")) and ENABLE_RAYDIUM_SCANNER
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Dexscreener fetch config
-# ──────────────────────────────────────────────────────────────────────────────
-UA = _s("SCANNER_UA", "Mozilla/5.0 SniperBot/1.0 (+raydium)")
-BASE = _s("DEXSCREENER_BASE_URL", "https://api.dexscreener.com").rstrip("/")
-SEARCH_PATH = _s("RAYDIUM_DEXSEARCH_PATH", "/latest/dex/search").strip() or "/latest/dex/search"
-SEARCH_URL = f"{BASE}{SEARCH_PATH if SEARCH_PATH.startswith('/') else '/' + SEARCH_PATH}"
-
-SEARCH_LIMIT = max(25, _i("RAYDIUM_SEARCH_LIMIT", 250))
-SEARCH_QUERIES = [q.strip() for q in _s("RAYDIUM_SEARCH_QUERIES", "raydium,solana").split(",") if q.strip()]
-FETCH_CONCURRENCY = max(1, _i("RAYDIUM_FETCH_CONCURRENCY", 3))
-
-TIMEOUT_S = max(5.0, _f("RAYDIUM_HTTP_TIMEOUT_SEC", 12.0))
-RETRIES = max(1, _i("RAYDIUM_HTTP_RETRIES", 3))
-BACKOFF_S = max(0.1, _f("RAYDIUM_HTTP_BACKOFF_SEC", 0.6))
-TRUST_ENV = _b("RAYDIUM_TRUST_ENV", True)
-HTTP_PROXY = _s("RAYDIUM_HTTP_PROXY", "") or _s("SCANNER_HTTP_PROXY", "")
-
-LIMIT = max(1, _i("RAYDIUM_LIMIT", 40))
-RAYDIUM_MAX_RUNNERS = max(1, _i("RAYDIUM_MAX_RUNNERS", LIMIT))
-
-# Quote constraints
-REQUIRE_SOL_OR_USDC_QUOTE = _b("RAYDIUM_REQUIRE_SOL_OR_USDC_QUOTE", True)
-ALLOWED_QUOTES = {q.strip().upper() for q in _s("RAYDIUM_ALLOWED_QUOTES", "SOL,USDC").split(",") if q.strip()}
-
-# Common quote mints (Solana mainnet)
-_SOL_MINT = "So11111111111111111111111111111111111111112"
-_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-
-# Prefilters (anti-dead / anti-toxic)
-MIN_BUYS_5M = max(0, _i("RAYDIUM_MIN_BUYS_5M", 0))         # 0 disables
-MIN_VOL5_USD = max(0.0, _f("RAYDIUM_MIN_VOL5_USD", 0.0))   # 0 disables
-MAX_NEG_CHG5 = _f("RAYDIUM_MAX_NEG_CHG5_PCT", -35.0)       # reject extreme dumps (<=)
-
-# Liquidity/age soft gates (cheap)
-PF_SCAN_MIN_LIQ_USD = float(_cfg("PF_SCAN_MIN_LIQ_USD", 2500.0) or 2500.0)
-PF_SCAN_MAX_TOKEN_AGE_MIN = float(_cfg("PF_SCAN_MAX_TOKEN_AGE_MIN", 0.0) or 0.0)
-SOFT_MIN_LIQ_USD = _f("RAYDIUM_SOFT_MIN_LIQ_USD", max(0.0, PF_SCAN_MIN_LIQ_USD * 0.25))
-SOFT_MAX_AGE_MIN = _f(
-    "RAYDIUM_SOFT_MAX_AGE_MIN",
-    (PF_SCAN_MAX_TOKEN_AGE_MIN * 1.5 if PF_SCAN_MAX_TOKEN_AGE_MIN > 0 else 0.0),
-)
-RAY_MAX_AGE_MIN = _f("RAY_MAX_AGE_MIN", 0.0)               # hard cap if set (>0)
-HARD_MIN_LIQ_USD = _f("RAYDIUM_HARD_MIN_LIQ_USD", 0.0)     # optional (>0)
-
-# Scoring integration
-SCORING_ENABLED = _b("RAYDIUM_SCORING_ENABLED", True)
-SCORING_MAX_PER_SCAN = max(5, _i("RAYDIUM_SCORING_MAX_PER_SCAN", 80))
-SCORING_CONCURRENCY = max(1, _i("RAYDIUM_SCORING_CONCURRENCY", 6))
-SCORING_MIN_COMBINED = _f("RAYDIUM_SCORING_MIN_COMBINED", 55.0)
-SCORING_MIN_LABEL = _s("RAYDIUM_SCORING_MIN_LABEL", "YELLOW").upper().strip()
-SCORING_USE_PF_GATING = _b("RAYDIUM_SCORING_USE_PF_GATING", True)
-
-# Dynamic threshold tuning
-DYNAMIC_THRESH_ENABLED = _b("RAYDIUM_DYNAMIC_THRESH_ENABLED", True)
-DYNAMIC_THRESH_MAX_DELTA = _f("RAYDIUM_DYNAMIC_THRESH_MAX_DELTA", 8.0)
-
-# Optional enrichment
-AI_RUG_ENABLED = _b("RAYDIUM_AI_RUG_ENABLED", False)
-AI_RUG_MAX_PER_SCAN = max(0, _i("RAYDIUM_AI_RUG_MAX_PER_SCAN", 15))
-RAYDIUM_MAX_AI_RUG = _f("RAYDIUM_MAX_AI_RUG", 0.88)
-
-SMART_WALLETS_ENRICH = _b("RAYDIUM_SMART_WALLETS_ENRICH", True)
-SMART_WALLETS_MAX_PER_SCAN = max(0, _i("RAYDIUM_SMART_WALLETS_MAX_PER_SCAN", 80))
-
-# Alerts / diagnostics
-SEND_MOMO_ALERTS = _b("RAYDIUM_SEND_MOMO_ALERTS", True)
-MAX_ALERTS_PER_SCAN = max(0, _i("RAYDIUM_MAX_ALERTS_PER_SCAN", 3))
-ALERT_DEDUP_SEC = max(10.0, _f("RAYDIUM_ALERT_DEDUP_SEC", 180.0))
-
-DEBUG_META_SAMPLE = _b("RAYDIUM_DEBUG_META_SAMPLE", True)
-DEBUG_SCORE_RESULT = _b("RAYDIUM_DEBUG_SCORE_RESULT", True)
-RAYDIUM_LOG_SCAN_SUMMARY = _b("RAYDIUM_LOG_SCAN_SUMMARY", True)
-RAYDIUM_LOG_CANDIDATES = _b("RAYDIUM_LOG_CANDIDATES", True)
-RAYDIUM_LOG_REJECTS = _b("RAYDIUM_LOG_REJECTS", True)
-RAYDIUM_REJECT_SAMPLE_N = max(0, _i("RAYDIUM_REJECT_SAMPLE_N", 2))
-RAYDIUM_REJECT_LOG_EVERY_SEC = max(1, _i("RAYDIUM_REJECT_LOG_EVERY_SEC", 10))
-
-RAYDIUM_REGIME_TAG = _s("RAYDIUM_REGIME_TAG", "raydium_live")
-RAYDIUM_WALLET_TAG = _s("RAYDIUM_WALLET_TAG", "")
-
-_LABEL_LEVEL = {"RED": 0, "YELLOW": 1, "GREEN": 2}
-_REQUIRED_LABEL_LEVEL = _LABEL_LEVEL.get(SCORING_MIN_LABEL, 0)
-
-# Redis dedup (optional)
-RUNNER_DEDUP_ENABLED = _b("RAYDIUM_RUNNER_DEDUP_ENABLED", True)
-RUNNER_DEDUP_SEC = max(0, _i("RAYDIUM_RUNNER_DEDUP_SEC", 180))
-REDIS_KEY_PREFIX = _s("RAYDIUM_REDIS_PREFIX", "raydium")
-
-# Run-loop knobs (if you use run()/scan_loop())
-SCAN_INTERVAL_SEC = max(0.25, _f("RAYDIUM_SCAN_INTERVAL_SEC", 2.0))
-SCAN_JITTER_SEC = max(0.0, _f("RAYDIUM_SCAN_JITTER_SEC", 0.35))
-
-_recent_alert_ts: Dict[str, float] = {}
-_recent_alert_lock = asyncio.Lock()
-
-_reject_log_last_ts: float = 0.0
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional module hooks (soft imports)
-# ──────────────────────────────────────────────────────────────────────────────
-# PF gating helper (compat)
-try:
-    from utils_pkg.pair_filters import is_viable_pair  # type: ignore
-except Exception:  # pragma: no cover
+def _age_min(created_ms_or_s: Any) -> float | None:
     try:
-        from utils_pkg.pump_filters import is_viable_pair  # type: ignore
-    except Exception:  # pragma: no cover
-
-        def is_viable_pair(_meta: Dict[str, Any]) -> bool:  # type: ignore
-            return True
-
-
-# scoring_service
-try:
-    from utils_pkg.scoring_service import score_candidate  # type: ignore
-except Exception:  # pragma: no cover
-    score_candidate = None  # type: ignore
-
-
-# Alerts
-try:
-    from utils_pkg.alert_manager import AlertManager  # type: ignore
-except Exception:  # pragma: no cover
-    AlertManager = None  # type: ignore
-
-
-# Structured logging (optional)
-try:
-    from utils_pkg.data_logger import log_raydium_candidate, log_scored_token, log_event  # type: ignore
-except Exception:  # pragma: no cover
-
-    def log_raydium_candidate(*_: Any, **__: Any) -> None:  # type: ignore
-        return None
-
-    def log_scored_token(*_: Any, **__: Any) -> None:  # type: ignore
-        return None
-
-    async def log_event(*_: Any, **__: Any) -> None:  # type: ignore
-        return None
-
-
-# Regime (optional)
-try:
-    from utils_pkg.regime import regime_state  # type: ignore
-except Exception:  # pragma: no cover
-
-    class _DummyRegime:
-        @staticmethod
-        def get() -> str:
-            return "unknown"
-
-        @staticmethod
-        async def features() -> Dict[str, Any]:
-            return {
-                "regime_label_numeric": 0.0,
-                "trend_score": 0.0,
-                "volatility_score": 0.0,
-                "liquidity_score": 0.5,
-                "manipulation_risk": 0.0,
-                "regime_label": "unknown",
-            }
-
-    regime_state = _DummyRegime()  # type: ignore
-
-
-# Risk manager snapshot (optional)
-try:
-    from utils_pkg.risk_manager import risk_capacity_snapshot  # type: ignore
-except Exception:  # pragma: no cover
-
-    async def risk_capacity_snapshot(_redis=None) -> Dict[str, Any]:
-        return {"risk_capacity": 1.0, "risk_shutdown": False, "risk_mode": "normal"}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CandidateSnapshot normalization
-# ──────────────────────────────────────────────────────────────────────────────
-def _to_candidate_snapshot(meta: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Canonical schema for scanner -> sniper handoff.
-    Keeps compat aliases used across older codepaths.
-    """
-    m = dict(meta)
-
-    # Canonical fields
-    mint = str(m.get("mint") or "").strip()
-    sym = str(m.get("symbol") or "").strip() or (mint[:6] if mint else "")
-    now = float(m.get("scan_ts") or time.time())
-
-    snap: Dict[str, Any] = {
-        # identity
-        "mint": mint,
-        "symbol": sym,
-        "chain": str(m.get("chain") or "SOL"),
-        "dex": str(m.get("dex") or "raydium"),
-        "source": str(m.get("source") or "raydium"),
-        "scanner": str(m.get("scanner") or "raydium_scanner"),
-        "quote_symbol": str(m.get("quote_symbol") or ""),
-        "quote_mint": str(m.get("quote_mint") or ""),
-        "pair_address": str(m.get("pair_address") or ""),
-        "pair_url": str(m.get("pair_url") or ""),
-        "scan_ts": now,
-
-        # core market stats (canonical names)
-        "liq_usd": float(m.get("liq_usd") or 0.0),
-        "vol_5m_usd": float(m.get("vol_5m_usd") or 0.0),
-        "vol_1h_usd": float(m.get("vol_1h_usd") or 0.0),
-        "vol_24h_usd": float(m.get("vol_24h_usd") or 0.0),
-        "buys_5m": int(m.get("buys_5m") or 0),
-        "sells_5m": int(m.get("sells_5m") or 0),
-        "txns_5m": int(m.get("txns_5m") or (int(m.get("buys_5m") or 0) + int(m.get("sells_5m") or 0))),
-        "price_usd": float(m.get("price_usd") or 0.0),
-        "price_change_5m_pct": float(m.get("price_change_5m_pct") or 0.0),
-        "price_change_15m_pct": float(m.get("price_change_15m_pct") or 0.0),
-        "price_change_1h_pct": float(m.get("price_change_1h_pct") or 0.0),
-        "price_change_24h_pct": float(m.get("price_change_24h_pct") or 0.0),
-        "token_age_min": float(m.get("token_age_min") or 9999.0),
-
-        # derived / hints
-        "buy_ratio_5m": float(m.get("buy_ratio_5m") or 0.0),
-        "vol_to_liq_5m": float(m.get("vol_to_liq_5m") or 0.0),
-        "momo_hint": float(m.get("momo_hint") or 0.0),
-
-        # scoring/enrichment (optional)
-        "ai_rug_score": float(m.get("ai_rug_score") or 0.0),
-        "rank_score": m.get("rank_score", None),
-        "score_combined": m.get("score_combined", None),
-        "score_label": m.get("score_label", None),
-        "score_ai": m.get("score_ai", None),
-        "score_risk": m.get("score_risk", None),
-        "score_quality": m.get("score_quality", None),
-        "score_momentum": m.get("score_momentum", None),
-
-        # risk/regime context (optional)
-        "risk_capacity": m.get("risk_capacity", None),
-        "risk_mode": m.get("risk_mode", None),
-        "regime_label": m.get("regime_label", None),
-        "regime_numeric": m.get("regime_numeric", None),
-        "regime_manipulation": m.get("regime_manipulation", None),
-    }
-
-    # Compatibility aliases expected by legacy filters/scorers
-    snap["liq"] = snap["liq_usd"]
-    snap["vol5"] = snap["vol_5m_usd"]
-    snap["buys5"] = snap["buys_5m"]
-    snap["sells5"] = snap["sells_5m"]
-    snap["chg5"] = snap["price_change_5m_pct"]
-    snap["age_min"] = snap["token_age_min"]
-
-    # Keep original raw meta available for deep debugging/feature builder
-    snap["raw_meta"] = m
-
-    return snap
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def _headers(accept: str = "application/json") -> Dict[str, str]:
-    return {
-        "User-Agent": UA,
-        "Accept": accept,
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-
-
-def _age_min(pair_created_ms: Optional[int]) -> Optional[float]:
-    try:
-        if pair_created_ms is None:
+        if created_ms_or_s in (None, "", 0):
             return None
-        t_ms = int(pair_created_ms)
-        if t_ms <= 0:
+        t = float(created_ms_or_s)
+        if t <= 0:
             return None
-        diff_s = max(0.0, time.time() - (t_ms / 1000.0))
-        return diff_s / 60.0
+        if t > 10_000_000_000:  # ms
+            t = t / 1000.0
+        return max(0.0, (time.time() - t) / 60.0)
     except Exception:
         return None
 
@@ -508,1215 +927,641 @@ def _buy_ratio(buys: int, sells: int) -> float:
     return float(buys) / float(total)
 
 
-def _vol_key(vol: Dict[str, Any], key1: str, alt_key: Optional[str] = None) -> float:
-    raw = vol.get(key1)
+def _quote_allowed(st: Settings, quote_symbol: str, quote_mint: str) -> bool:
+    if not st.require_quote:
+        return True
+    qs = (quote_symbol or "").strip().upper()
+    qm = (quote_mint or "").strip()
+    if qs and qs in st.allowed_quotes:
+        return True
+    return qm in {_SOL_MINT, _USDC_MINT}
+
+
+def _metric_volume(vol: dict[str, Any], key: str, alt: str | None = None) -> float:
+    raw = vol.get(key)
     if isinstance(raw, dict):
         raw = raw.get("usd")
-    if raw is None and alt_key:
-        raw = vol.get(alt_key)
+    if raw is None and alt:
+        raw = vol.get(alt)
         if isinstance(raw, dict):
             raw = raw.get("usd")
     return _nzf(raw, 0.0)
 
 
-def _sol_price_usd_best_effort() -> float:
-    v = _f("SOL_PRICE_USD", 0.0)
-    if v > 0:
-        return v
-    return 150.0
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Redis helpers (optional; supports sync or async redis client)
-# ──────────────────────────────────────────────────────────────────────────────
-async def _maybe_await(x: Any) -> Any:
-    if asyncio.iscoroutine(x):
-        return await x
-    return x
-
-
-async def _redis_get(redis: Any, key: str) -> Optional[str]:
-    if redis is None:
-        return None
+def _normalize_pair(st: Settings, p: dict[str, Any], stats: ScanStats) -> dict[str, Any] | None:
+    """
+    Produces a canonical meta dict that is later converted into Candidate.
+    Emits both modern keys and legacy aliases (liq/vol5/buys5/chg5/age_min) for compatibility.
+    """
     try:
-        v = await _maybe_await(redis.get(key))
-        if v is None:
-            return None
-        if isinstance(v, (bytes, bytearray)):
-            return v.decode("utf-8", "ignore")
-        return str(v)
-    except Exception:
-        return None
+        base = p.get("baseToken") or {}
+        quote = p.get("quoteToken") or {}
 
-
-async def _redis_setex(redis: Any, key: str, ttl: int, value: str) -> None:
-    if redis is None:
-        return
-    try:
-        if hasattr(redis, "setex"):
-            await _maybe_await(redis.setex(key, int(ttl), value))
-            return
-        await _maybe_await(redis.set(key, value))
-        if hasattr(redis, "expire"):
-            await _maybe_await(redis.expire(key, int(ttl)))
-    except Exception:
-        return
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Regime / dynamic thresholds
-# ──────────────────────────────────────────────────────────────────────────────
-async def _regime_snapshot() -> Dict[str, Any]:
-    try:
-        feats = await regime_state.features()
-        return {
-            "label_numeric": float(feats.get("regime_label_numeric", 0.0)),
-            "trend_score": float(feats.get("trend_score", 0.0)),
-            "volatility_score": float(feats.get("volatility_score", 0.0)),
-            "liquidity_score": float(feats.get("liquidity_score", 0.5)),
-            "manipulation_risk": float(feats.get("manipulation_risk", 0.0)),
-            "label": str(feats.get("regime_label", "")) or "unknown",
-        }
-    except Exception:
-        with contextlib.suppress(Exception):
-            return {"label": regime_state.get(), "label_numeric": 0.0, "manipulation_risk": 0.0}  # type: ignore[misc]
-        return {"label": "unknown", "label_numeric": 0.0, "manipulation_risk": 0.0}
-
-
-def _regime_tune_soft(base_soft_liq: float, base_fb_min_vol5: float, regime: Dict[str, Any]) -> Tuple[float, float]:
-    ln = float(regime.get("label_numeric", 0.0))
-    manip = float(regime.get("manipulation_risk", 0.0))
-    soft_liq = float(base_soft_liq)
-    fb_min_vol5 = float(base_fb_min_vol5)
-
-    if ln >= 0.7 and manip < 0.6:
-        soft_liq *= 0.70
-        fb_min_vol5 *= 0.70
-    elif ln <= -0.7 or manip >= 0.8:
-        soft_liq *= 1.40
-        fb_min_vol5 *= 1.30
-
-    return max(0.0, soft_liq), max(0.0, fb_min_vol5)
-
-
-def _dynamic_min_combined(base: float, regime: Dict[str, Any], risk_capacity: float) -> float:
-    if not DYNAMIC_THRESH_ENABLED:
-        return float(base)
-
-    base = float(base)
-    ln = float(regime.get("label_numeric", 0.0))
-    manip = float(regime.get("manipulation_risk", 0.0))
-    cap = _clamp(float(risk_capacity), 0.0, 1.0)
-
-    cap_delta = (1.0 - cap) * float(DYNAMIC_THRESH_MAX_DELTA)
-
-    regime_delta = 0.0
-    if ln >= 0.7:
-        regime_delta -= 0.5 * float(DYNAMIC_THRESH_MAX_DELTA)
-    elif ln <= -0.7:
-        regime_delta += 0.5 * float(DYNAMIC_THRESH_MAX_DELTA)
-
-    manip_delta = _clamp(manip, 0.0, 1.0) * (0.5 * float(DYNAMIC_THRESH_MAX_DELTA))
-
-    delta = _clamp(
-        cap_delta + regime_delta + manip_delta,
-        -float(DYNAMIC_THRESH_MAX_DELTA),
-        float(DYNAMIC_THRESH_MAX_DELTA),
-    )
-    return float(_clamp(base + delta, 0.0, 100.0))
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# HTTP fetch (Dexscreener)
-# ──────────────────────────────────────────────────────────────────────────────
-async def _fetch_json(
-    session: "aiohttp.ClientSession",
-    url: str,
-    *,
-    params: Optional[Dict[str, Any]] = None,
-) -> Tuple[Optional[Dict[str, Any]], int, str]:
-    status = 0
-    first = ""
-    for attempt in range(1, RETRIES + 1):
-        try:
-            async with session.get(
-                url,
-                params=params,
-                headers=_headers("application/json, text/plain, */*"),
-                timeout=aiohttp.ClientTimeout(total=TIMEOUT_S),  # type: ignore[attr-defined]
-                proxy=HTTP_PROXY or None,
-            ) as r:
-                status = int(r.status)
-                text = (await r.text()) or ""
-                first = text[:140]
-
-                if status == 200:
-                    try:
-                        return await r.json(content_type=None), status, first
-                    except Exception:
-                        with contextlib.suppress(Exception):
-                            return json.loads(text), status, first
-                        return None, status, first
-
-                if 400 <= status < 500 and status != 429:
-                    log.every("RAY_HTTP_4XX", n=15, status=status, url=url, first=first)
-                    return None, status, first
-
-                if status == 429:
-                    ra = (r.headers.get("Retry-After") or "").strip()
-                    wait = float(ra) if ra.isdigit() else (BACKOFF_S * attempt * 2.0)
-                    wait = _clamp(wait, 0.25, 8.0)
-                    await asyncio.sleep(wait)
-                else:
-                    await asyncio.sleep(BACKOFF_S * attempt * (0.85 + 0.3 * random.random()))
-
-        except asyncio.CancelledError:
-            raise
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:  # type: ignore[attr-defined]
-            log.every("RAY_HTTP_ERR", n=10, err=type(e).__name__, url=url, attempt=attempt, retries=RETRIES)
-            if attempt < RETRIES:
-                await asyncio.sleep(BACKOFF_S * attempt * (0.85 + 0.3 * random.random()))
-        except Exception as e:
-            log.every("RAY_HTTP_UNK", n=10, err=_short(e), url=url, attempt=attempt, retries=RETRIES)
-            if attempt < RETRIES:
-                await asyncio.sleep(BACKOFF_S * attempt * (0.85 + 0.3 * random.random()))
-
-    return None, status, first
-
-
-async def _fetch_pairs(session: "aiohttp.ClientSession") -> List[Dict[str, Any]]:
-    sem = asyncio.Semaphore(FETCH_CONCURRENCY)
-    out: List[Dict[str, Any]] = []
-    seen_pair_ids: Set[str] = set()
-
-    async def _one(q: str) -> None:
-        try:
-            params = {"q": q, "limit": SEARCH_LIMIT}
-            async with sem:
-                data, status, _first = await _fetch_json(session, SEARCH_URL, params=params)
-            if not data:
-                log.every("RAY_FETCH_EMPTY", n=20, q=q, status=status)
-                return
-
-            pairs = data.get("pairs") or []
-            for p in pairs:
-                if (p.get("chainId") or "").lower() != "solana":
-                    continue
-                if (p.get("dexId") or "").lower() != "raydium":
-                    continue
-
-                pid = (p.get("pairAddress") or "").strip()
-                if not pid:
-                    pid = ((p.get("baseToken") or {}).get("address") or "").strip()
-                if not pid or pid in seen_pair_ids:
-                    continue
-                seen_pair_ids.add(pid)
-                out.append(p)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.every("RAY_FETCH_ONE_FAIL", n=10, q=q, err=_short(e))
-
-    qs = (SEARCH_QUERIES[:20] or ["raydium"])
-    tasks = [asyncio.create_task(_one(q)) for q in qs]
-    if tasks:
-        await asyncio.gather(*tasks)
-
-    log.every("RAY_FETCH_DONE", n=10, raw_pairs=len(out), queries=",".join(qs), limit=SEARCH_LIMIT)
-    return out
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Normalize pair -> meta (+ reject reason)
-# ──────────────────────────────────────────────────────────────────────────────
-def _extract_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
-    liq = pair.get("liquidity") or {}
-    liq_usd = _nzf(liq.get("usd"), 0.0)
-
-    fdv_usd = _nzf(pair.get("fdv"), 0.0)
-    mcap_usd = _nzf(pair.get("marketCap") or pair.get("marketCapUsd") or pair.get("mcap") or fdv_usd, 0.0)
-
-    txs = pair.get("txns") or {}
-    m5_tx = txs.get("m5") or txs.get("5m") or {}
-
-    buys_5m = _nzi(m5_tx.get("buys"), 0)
-    sells_5m = _nzi(m5_tx.get("sells"), 0)
-
-    vol = pair.get("volume") or {}
-    vol_5m_usd = _vol_key(vol, "m5", "5m")
-    vol_1h_usd = _vol_key(vol, "h1", "1h")
-    vol_24h_usd = _vol_key(vol, "h24", "24h")
-
-    if vol_5m_usd <= 0.0 and vol_1h_usd > 0.0:
-        vol_5m_usd = vol_1h_usd / 12.0
-    if vol_1h_usd <= 0.0 and vol_24h_usd > 0.0:
-        vol_1h_usd = vol_24h_usd / 24.0
-    if vol_5m_usd <= 0.0 and vol_24h_usd > 0.0:
-        vol_5m_usd = vol_24h_usd / 288.0
-
-    pc = pair.get("priceChange") or {}
-    chg_5m_pct = _nzf(pc.get("m5") or pc.get("5m"), 0.0)
-    chg_1h_pct = _nzf(pc.get("h1") or pc.get("1h"), 0.0)
-    chg_24h_pct = _nzf(pc.get("h24") or pc.get("24h"), 0.0)
-
-    if chg_5m_pct == 0.0 and chg_1h_pct != 0.0:
-        chg_5m_pct = chg_1h_pct / 12.0
-    if chg_5m_pct == 0.0 and chg_24h_pct != 0.0:
-        chg_5m_pct = chg_24h_pct / 288.0
-    chg_15m_pct = (
-        (chg_1h_pct / 4.0)
-        if chg_1h_pct != 0.0
-        else (chg_24h_pct / 96.0 if chg_24h_pct != 0.0 else chg_5m_pct)
-    )
-
-    price_usd = _nzf(pair.get("priceUsd") or pair.get("price"), 0.0)
-
-    pair_created_ms = pair.get("pairCreatedAt") or pair.get("pairCreatedAtMs") or pair.get("pairCreatedAtTs")
-    age_min = _age_min(pair_created_ms)
-    token_age_min = age_min if age_min is not None else 9999.0
-
-    whales_5m = 0
-    whale_vol_5m_usd = 0.0
-    approx_largest_buy_sol = 0.0
-    if vol_5m_usd > 0:
-        approx_largest_buy_usd = vol_5m_usd * 0.25
-        sol_usd = max(1.0, _sol_price_usd_best_effort())
-        approx_largest_buy_sol = approx_largest_buy_usd / sol_usd
-        whale_vol_5m_usd = approx_largest_buy_usd
-        pf_min_whale_sol = float(_cfg("PF_SCAN_MIN_WHALE_SIZE_SOL", 3.0) or 3.0)
-        if approx_largest_buy_sol >= pf_min_whale_sol:
-            whales_5m = 1
-
-    buy_ratio_5m = _buy_ratio(buys_5m, sells_5m)
-    vol_to_liq = (vol_5m_usd / max(1.0, liq_usd)) if liq_usd > 0 else 0.0
-    momo_hint = (buy_ratio_5m * 100.0) + (min(2.0, vol_to_liq) * 25.0) + (max(-20.0, min(20.0, chg_5m_pct)) * 0.8)
-
-    return {
-        "liq_usd": liq_usd,
-        "mcap_usd": mcap_usd,
-        "fdv_usd": fdv_usd,
-        "token_age_min": token_age_min,
-        "vol_5m_usd": vol_5m_usd,
-        "vol_1h_usd": vol_1h_usd,
-        "vol_24h_usd": vol_24h_usd,
-        "buys_5m": buys_5m,
-        "sells_5m": sells_5m,
-        "txns_5m": buys_5m + sells_5m,
-        "price_usd": price_usd,
-        "price_change_5m_pct": chg_5m_pct,
-        "price_change_15m_pct": chg_15m_pct,
-        "price_change_1h_pct": chg_1h_pct,
-        "price_change_24h_pct": chg_24h_pct,
-        "buy_ratio_5m": buy_ratio_5m,
-        "vol_to_liq_5m": vol_to_liq,
-        "momo_hint": momo_hint,
-        "whales_5m": whales_5m,
-        "whale_vol_5m_usd": whale_vol_5m_usd,
-        "approx_largest_buy_sol": approx_largest_buy_sol,
-    }
-
-
-def _quote_allowed(quote_symbol: str, quote_mint: str) -> bool:
-    qs = (quote_symbol or "").strip().upper()
-    qm = (quote_mint or "").strip()
-    if not REQUIRE_SOL_OR_USDC_QUOTE:
-        return True
-    if qs and (qs in ALLOWED_QUOTES):
-        return True
-    if qm in {_SOL_MINT, _USDC_MINT}:
-        return True
-    return False
-
-
-def _normalize_to_meta(pair: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    try:
-        if (pair.get("chainId") or "").lower() != "solana":
-            return None, "reject_chain"
-        if (pair.get("dexId") or "").lower() != "raydium":
-            return None, "reject_dex"
-
-        base = pair.get("baseToken") or {}
-        quote = pair.get("quoteToken") or {}
-
-        mint = _normalize_mint((base.get("address") or "").strip())
+        mint = _normalize_mint(str((base.get("address") or "")).strip())
         if not mint:
-            return None, "reject_no_mint"
+            stats.rej("reject_no_mint", st=st)
+            return None
 
-        symbol = (base.get("symbol") or "").strip() or mint[:6]
-        quote_symbol = (quote.get("symbol") or "").strip().upper()
-        quote_mint = (quote.get("address") or "").strip()
+        symbol = str((base.get("symbol") or "")).strip() or mint[:6]
+        quote_symbol = str((quote.get("symbol") or "")).strip().upper()
+        quote_mint = str((quote.get("address") or "")).strip()
 
-        if not _quote_allowed(quote_symbol, quote_mint):
-            return None, "reject_quote"
+        if not _quote_allowed(st, quote_symbol, quote_mint):
+            stats.rej("reject_quote", {"mint": mint, "quote": quote_symbol}, st=st)
+            return None
 
-        metrics = _extract_metrics(pair)
-        pair_addr = (pair.get("pairAddress") or "").strip()
+        liq = p.get("liquidity") or {}
+        liq_usd = _nzf((liq.get("usd") if isinstance(liq, dict) else None), 0.0)
 
-        url = pair.get("url") or pair.get("pairUrl")
-        if not url:
-            url = f"https://dexscreener.com/solana/{pair_addr}" if pair_addr else f"https://dexscreener.com/solana/{mint}"
+        txs = p.get("txns") or {}
+        m5 = (txs.get("m5") or txs.get("5m") or {}) if isinstance(txs, dict) else {}
+        buys_5m = _nzi(m5.get("buys"), 0)
+        sells_5m = _nzi(m5.get("sells"), 0)
 
-        ts = time.time()
+        vol = p.get("volume") or {}
+        vol_5m = _metric_volume(vol if isinstance(vol, dict) else {}, "m5", "5m")
+        vol_1h = _metric_volume(vol if isinstance(vol, dict) else {}, "h1", "1h")
+        vol_24h = _metric_volume(vol if isinstance(vol, dict) else {}, "h24", "24h")
 
-        meta = {
-            "dex": "raydium",
-            "chain": "SOL",
-            "source": "raydium",
+        pc = p.get("priceChange") or {}
+        pc = pc if isinstance(pc, dict) else {}
+        chg_5m = _nzf(pc.get("m5") or pc.get("5m"), 0.0)
+        chg_1h = _nzf(pc.get("h1") or pc.get("1h"), 0.0)
+        chg_24h = _nzf(pc.get("h24") or pc.get("24h"), 0.0)
+
+        price_usd = _nzf(p.get("priceUsd") or p.get("price"), 0.0)
+        created = p.get("pairCreatedAt") or p.get("pairCreatedAtMs") or p.get("pairCreatedAtTs")
+        age = _age_min(created)
+        token_age_min = float(age) if age is not None else 9999.0
+
+        pair_address = str((p.get("pairAddress") or "")).strip()
+        pair_url = p.get("url") or p.get("pairUrl")
+        if not pair_url:
+            pair_url = (
+                f"https://dexscreener.com/solana/{pair_address}"
+                if pair_address
+                else f"https://dexscreener.com/solana/{mint}"
+            )
+
+        buy_ratio_5m = _buy_ratio(buys_5m, sells_5m)
+        vol_to_liq_5m = (vol_5m / max(1.0, liq_usd)) if liq_usd > 0 else 0.0
+
+        # Scanner-only "momo hint" (bounded-ish and interpretable)
+        momo_hint = (
+            (buy_ratio_5m * 100.0)
+            + (min(2.0, vol_to_liq_5m) * 25.0)
+            + (max(-20.0, min(20.0, chg_5m)) * 0.8)
+        )
+
+        ts = float(time.time())
+
+        meta: dict[str, Any] = {
+            # identity
             "scanner": "raydium_scanner",
+            "scanner_id": "raydium_scanner",
+            "source": "raydium",
+            "src": "raydium",
+            "dex": "raydium",
+            "dexId": "raydium",
+            "chain": "solana",
             "mint": mint,
             "symbol": symbol,
+            "sym": symbol,
             "quote_symbol": quote_symbol,
             "quote_mint": quote_mint,
-            "pair_address": pair_addr,
-            "pair_url": url,
+            "pair_address": pair_address,
+            "pairAddress": pair_address,
+            "pair_url": pair_url,
+            "url": pair_url,
             "scan_ts": ts,
-            **metrics,
-            # compat placeholders
-            "ai_rug_score": 0.0,
-            "rank_score": None,
-            "is_honeypot": False,
-            "trading_paused": False,
-            "blacklisted": False,
-            "top10_hold_pct": 0.0,
-            "dev_hold_pct": 0.0,
-            "mint_authority_disabled": True,
-            "freeze_authority_disabled": True,
+            "ts": ts,
+            # metrics (modern)
+            "liq_usd": float(liq_usd),
+            "vol_5m_usd": float(vol_5m),
+            "vol_1h_usd": float(vol_1h),
+            "vol_24h_usd": float(vol_24h),
+            "buys_5m": int(buys_5m),
+            "sells_5m": int(sells_5m),
+            "txns_5m": int(buys_5m + sells_5m),
+            "price_usd": float(price_usd),
+            "price_change_5m_pct": float(chg_5m),
+            "price_change_1h_pct": float(chg_1h),
+            "price_change_24h_pct": float(chg_24h),
+            "token_age_min": float(token_age_min),
+            "buy_ratio_5m": float(buy_ratio_5m),
+            "vol_to_liq_5m": float(vol_to_liq_5m),
+            "momo_hint": float(momo_hint),
+            # legacy aliases (for older filters/scorers)
+            "liq": float(liq_usd),
+            "vol5": float(vol_5m),
+            "vol1h": float(vol_1h),
+            "vol24h": float(vol_24h),
+            "buys5": int(buys_5m),
+            "sells5": int(sells_5m),
+            "txns5": int(buys_5m + sells_5m),
+            "chg5": float(chg_5m),
+            "chg1h": float(chg_1h),
+            "chg24h": float(chg_24h),
+            "age_min": float(token_age_min),
+            # keep raw context (debug/training)
+            "raw_pair": p,
         }
-        return meta, None
+
+        # Cheap scanner sanity filters (do NOT replace entry gate!)
+        if st.hard_min_liq_usd > 0 and meta["liq_usd"] < st.hard_min_liq_usd:
+            stats.rej("reject_hard_min_liq", {"mint": mint, "liq": meta["liq_usd"]}, st=st)
+            return None
+        if st.hard_max_age_min > 0 and meta["token_age_min"] > st.hard_max_age_min:
+            stats.rej("reject_hard_max_age", {"mint": mint, "age": meta["token_age_min"]}, st=st)
+            return None
+        if st.min_buys_5m > 0 and meta["buys_5m"] < st.min_buys_5m:
+            stats.rej("reject_min_buys5", {"mint": mint, "buys5": meta["buys_5m"]}, st=st)
+            return None
+        if st.min_vol5_usd > 0 and meta["vol_5m_usd"] < st.min_vol5_usd:
+            stats.rej("reject_min_vol5", {"mint": mint, "vol5": meta["vol_5m_usd"]}, st=st)
+            return None
+        if meta["price_change_5m_pct"] <= st.max_neg_chg5_pct:
+            stats.rej(
+                "reject_dump_chg5", {"mint": mint, "chg5": meta["price_change_5m_pct"]}, st=st
+            )
+            return None
+
+        # Optional ultra-cheap viability sanity (still not final gate)
+        try:
+            if not _is_viable_pair(meta):
+                stats.rej("reject_viable_pair", {"mint": mint}, st=st)
+                return None
+        except Exception:
+            stats.rej("reject_viable_pair_exc", {"mint": mint}, st=st)
+            return None
+
+        return meta
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        log.every("RAY_NORMALIZE_FAIL", n=10, err=_short(e))
-        return None, "reject_normalize_exc"
+        stats.rej("reject_normalize_exc", {"err": _short(e)}, st=st)
+        return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional enrichment (AI rug + smart wallets)
-# ──────────────────────────────────────────────────────────────────────────────
-async def _enrich_optional(metas: List[Dict[str, Any]]) -> None:
-    if not metas:
-        return
-
-    ai_fraud_score = None
-    if AI_RUG_ENABLED:
-        with contextlib.suppress(Exception):
-            from utils_pkg.core_utils import ai_fraud_score as _afs  # type: ignore
-            ai_fraud_score = _afs  # type: ignore
-
-    sw_tracker = None
-    if SMART_WALLETS_ENRICH:
-        with contextlib.suppress(Exception):
-            from utils_pkg.smart_wallets import TRACKER as SW_TRACKER  # type: ignore
-            sw_tracker = SW_TRACKER  # type: ignore
-
-    if (AI_RUG_ENABLED and not ai_fraud_score) and _fast_fail():
-        raise RuntimeError("RAYDIUM_AI_RUG_ENABLED=1 but utils_pkg.core_utils.ai_fraud_score missing")
-
-    ai_targets = metas[:AI_RUG_MAX_PER_SCAN] if (AI_RUG_ENABLED and ai_fraud_score) else []
-    sw_targets = metas[:SMART_WALLETS_MAX_PER_SCAN] if sw_tracker is not None else []
-    if not ai_targets and not sw_targets:
-        return
-
-    ai_set = {id(m) for m in ai_targets}
-    sw_set = {id(m) for m in sw_targets}
-
-    sem = asyncio.Semaphore(max(1, _i("RAYDIUM_ENRICH_CONCURRENCY", 8)))
-
-    async def _one(m: Dict[str, Any]) -> None:
-        mint = m.get("mint")
-        if not isinstance(mint, str) or not mint:
-            return
-        async with sem:
-            if id(m) in ai_set and ai_fraud_score:
-                s01 = await ai_fraud_score(mint)  # type: ignore[misc]
-                if s01 is not None:
-                    m["ai_rug_score"] = _clamp(float(s01), 0.0, 1.0)
-
-            if id(m) in sw_set and sw_tracker is not None:
-                feats = await sw_tracker.build_features(mint)  # type: ignore[misc]
-                if isinstance(feats, dict):
-                    m["smart_wallet_score"] = float(feats.get("smart_wallet_score", 0.5))
-                    m["smart_signal_confidence"] = float(feats.get("smart_signal_confidence", 0.0))
-                    m["smart_signal_quality"] = float(feats.get("smart_signal_quality", 0.0))
-                    m["smart_risk_flag"] = float(feats.get("smart_risk_flag", 0.0))
-                    m["smart_entry_boost_hint"] = float(feats.get("smart_entry_boost_hint", 0.0))
-                    m["smart_exit_pressure_hint"] = float(feats.get("smart_exit_pressure_hint", 0.0))
-                    m["smart_tradeable_flag"] = float(feats.get("smart_tradeable_flag", 0.0))
-
-    tasks = [asyncio.create_task(_one(m)) for m in metas]
-    if tasks:
-        await asyncio.gather(*tasks)
+def _rank_key(meta: dict[str, Any]) -> tuple[float, float, float, float]:
+    """
+    Scanner ranking only: prefer active flow, liquidity, buy-imbalance, modest momentum.
+    """
+    return (
+        float(meta.get("vol_5m_usd") or meta.get("vol5") or 0.0),
+        float(meta.get("liq_usd") or meta.get("liq") or 0.0),
+        float(meta.get("buy_ratio_5m") or 0.0),
+        float(meta.get("momo_hint") or 0.0),
+    )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Scoring
-# ──────────────────────────────────────────────────────────────────────────────
-async def _maybe_await2(x: Any) -> Any:
-    if asyncio.iscoroutine(x):
-        return await x
-    return x
+# =============================================================================
+# Candidate assembly (signature-aware, cached)
+# =============================================================================
+_CAND_FACTORY: Callable[[dict[str, Any]], Any] | None = None
 
 
-async def _score_metas(
-    metas: List[Dict[str, Any]],
-    *,
-    regime: Dict[str, Any],
-    risk_ctx: Optional[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    if not metas or not SCORING_ENABLED or score_candidate is None:
-        return []
-
-    pf: List[Dict[str, Any]] = []
-    for m in metas:
-        try:
-            if SCORING_USE_PF_GATING and not is_viable_pair(m):
-                continue
-            if AI_RUG_ENABLED and float(m.get("ai_rug_score") or 0.0) >= float(RAYDIUM_MAX_AI_RUG):
-                continue
-            pf.append(m)
-        except Exception:
-            continue
-    if not pf:
-        pf = metas
-
-    def _k(x: Dict[str, Any]) -> Tuple[float, float, int]:
-        return (
-            float(x.get("vol_5m_usd") or 0.0),
-            float(x.get("momo_hint") or 0.0),
-            int(x.get("buys_5m") or 0),
+def _build_candidate_factory() -> Callable[[dict[str, Any]], Any]:
+    if Candidate is None:  # pragma: no cover
+        raise RuntimeError(
+            "scanner.registry.Candidate is missing — cannot emit canonical candidates"
         )
 
-    pf.sort(key=_k, reverse=True)
-    targets = pf[:SCORING_MAX_PER_SCAN]
+    # Prefer class factories if present
+    for fn_name in ("from_meta", "from_dict", "from_mapping"):
+        fn = getattr(Candidate, fn_name, None)
+        if callable(fn):
+            return lambda meta: fn(meta)
 
-    sem = asyncio.Semaphore(SCORING_CONCURRENCY)
-    out: List[Dict[str, Any]] = []
-
-    async def _one(meta: Dict[str, Any]) -> None:
-        raw = dict(meta)
-        raw.setdefault("age_min", raw.get("token_age_min"))
-        raw.setdefault("chg5", raw.get("price_change_5m_pct"))
-        raw.setdefault("buys5", raw.get("buys_5m"))
-        raw.setdefault("sells5", raw.get("sells_5m"))
-        raw.setdefault("liq", raw.get("liq_usd"))
-        raw.setdefault("vol5", raw.get("vol_5m_usd"))
-
-        ctx = {
-            "source": "raydium",
-            "scanner": "raydium_scanner",
-            "phase": MASTER_PHASE,
-            "mode": RAYDIUM_MODE,
-            "regime": dict(regime),
-            "risk": dict(risk_ctx or {}),
-        }
-
-        async with sem:
-            st = await _maybe_await2(score_candidate(raw, context=ctx))  # type: ignore[misc]
-
-        m = dict(meta)
-        m["score_combined"] = float(getattr(st, "combined_score", 0.0) or 0.0)
-        m["score_label"] = str(getattr(st, "label", "") or "")
-        m["score_momentum"] = float(getattr(st, "momentum_score", 0.0) or 0.0)
-        m["score_risk"] = float(getattr(st, "risk_score", 0.0) or 0.0)
-        m["score_quality"] = float(getattr(st, "quality_score", 0.0) or 0.0)
-        m["score_ai"] = float(getattr(st, "ai_score", 0.0) or 0.0)
-        m["score_reasons"] = getattr(st, "reasons", None)
-        m["score_is_trade_viable"] = bool(getattr(st, "is_trade_viable", True))
-        m["score_trade_gate_reason"] = getattr(st, "trade_gate_reason", None)
-
-        m["rank_score"] = float(m["score_combined"])
-        m["ai_entry_score"] = float(m["score_ai"])
-        m["ai_entry_reason"] = m.get("score_reasons")
-
-        with contextlib.suppress(Exception):
-            if hasattr(st, "to_dict"):
-                d = st.to_dict()
-                m["scored_token"] = d
-                try:
-                    log_scored_token(d, source="raydium")  # type: ignore[misc]
-                except TypeError:
-                    log_scored_token(d)  # type: ignore[misc]
-
-        out.append(m)
-
-    tasks = [asyncio.create_task(_one(m)) for m in targets]
-    if tasks:
-        await asyncio.gather(*tasks)
-
-    return out
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Fallback pick if scoring yields nothing
-# ──────────────────────────────────────────────────────────────────────────────
-def _fallback_pick(metas: List[Dict[str, Any]], fb_min_vol5: float) -> List[Dict[str, Any]]:
-    if not metas:
-        return []
-
-    fb_min_buys = int(_i("RAYDIUM_FB_MIN_BUYS_5M", 1))
-    fb_min_vol = float(_f("RAYDIUM_FB_MIN_VOL5_USD", fb_min_vol5))
-    fb_max = int(_i("RAYDIUM_FB_MAX_RUNNERS", 3))
-
-    cand: List[Dict[str, Any]] = []
-    for m in metas:
-        try:
-            if fb_min_buys > 0 and int(m.get("buys_5m") or 0) < fb_min_buys:
-                continue
-            if fb_min_vol > 0 and float(m.get("vol_5m_usd") or 0.0) < fb_min_vol:
-                continue
-            if AI_RUG_ENABLED and float(m.get("ai_rug_score") or 0.0) >= float(RAYDIUM_MAX_AI_RUG):
-                continue
-            cand.append(m)
-        except Exception:
-            continue
-
-    if not cand:
-        return []
-
-    def _key(m: Dict[str, Any]) -> Tuple[float, float, float]:
-        return (
-            float(m.get("momo_hint") or 0.0),
-            float(m.get("vol_5m_usd") or 0.0),
-            float(m.get("liq_usd") or 0.0),
-        )
-
-    cand.sort(key=_key, reverse=True)
-    return cand[:fb_max]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MOMO alerts + AI training logs
-# ──────────────────────────────────────────────────────────────────────────────
-async def _send_momo(runners: List[Dict[str, Any]]) -> None:
-    if not SEND_MOMO_ALERTS or not runners or AlertManager is None:
-        return
+    # Signature-aware construction (cached)
     try:
-        am = AlertManager()  # type: ignore[misc]
-    except Exception as e:
-        log.every("RAY_ALERT_INIT_FAIL", n=30, err=_short(e))
-        return
-
-    max_n = max(0, min(MAX_ALERTS_PER_SCAN, len(runners)))
-
-    async with _recent_alert_lock:
-        now = time.time()
-        cutoff = now - max(10.0, float(ALERT_DEDUP_SEC))
-        for k in list(_recent_alert_ts.keys()):
-            if _recent_alert_ts.get(k, 0.0) < cutoff:
-                _recent_alert_ts.pop(k, None)
-
-    for c in runners[:max_n]:
-        try:
-            mint = str(c.get("mint") or "")
-            if not mint:
-                continue
-
-            async with _recent_alert_lock:
-                now = time.time()
-                last = _recent_alert_ts.get(mint, 0.0)
-                if now - last < float(ALERT_DEDUP_SEC):
-                    continue
-                _recent_alert_ts[mint] = now
-
-            age_min = c.get("token_age_min")
-            age_sec = float(age_min) * 60.0 if isinstance(age_min, (int, float)) else None
-
-            ctx: Dict[str, Any] = {
-                "symbol": c.get("symbol") or mint,
-                "mint": mint,
-                "pool": "raydium",
-                "pool_url": c.get("pair_url"),
-                "age_sec": age_sec,
-                "liq_usd": c.get("liq_usd"),
-                "vol_5m": c.get("vol_5m_usd"),
-                "up_pct": c.get("price_change_5m_pct"),
-                "momo_hint": c.get("momo_hint"),
-                "score_combined": c.get("score_combined"),
-                "score_label": c.get("score_label"),
-                "score_ai": c.get("score_ai"),
-                "ai_rug_score": c.get("ai_rug_score"),
-                "risk_capacity": c.get("risk_capacity"),
-                "risk_mode": c.get("risk_mode"),
-            }
-            await am.send_momo_event("MOMO_OK", ctx)  # type: ignore[misc]
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.every("RAY_MOMO_SEND_FAIL", n=10, mint=str(c.get("mint")), err=_short(e))
-
-
-def _log_ai_candidates(runners: List[Dict[str, Any]], *, regime: Dict[str, Any], risk_ctx: Optional[Dict[str, Any]]) -> None:
-    if not RAYDIUM_LOG_CANDIDATES or not runners:
-        return
-
-    try:
-        live_regime = regime.get("label") or regime_state.get()  # type: ignore[misc]
+        sig = inspect.signature(Candidate)  # dataclass/class __call__
+        params = set(sig.parameters.keys())
     except Exception:
-        live_regime = None
+        params = set()
 
-    regime_tag = live_regime or RAYDIUM_REGIME_TAG or "raydium_live"
-    wallet_tag = RAYDIUM_WALLET_TAG or None
+    def _ctor(meta: dict[str, Any]) -> Any:
+        kwargs: dict[str, Any] = {}
 
-    risk_capacity = None
-    risk_mode = None
-    if risk_ctx:
-        with contextlib.suppress(Exception):
-            risk_capacity = float(risk_ctx.get("risk_capacity", 1.0) or 1.0)
-        risk_mode = risk_ctx.get("risk_mode", None)
+        def _set_if(key: str, value: Any) -> None:
+            if key in params:
+                kwargs[key] = value
 
-    for r in runners:
-        try:
-            mint = r.get("mint")
-            if not isinstance(mint, str) or not mint:
-                continue
+        _set_if("scanner", meta.get("scanner"))
+        _set_if("source", meta.get("source"))
+        _set_if("dex", meta.get("dex"))
+        _set_if("chain", meta.get("chain"))
+        _set_if("mint", meta.get("mint"))
+        _set_if("symbol", meta.get("symbol"))
+        _set_if("quote_mint", meta.get("quote_mint"))
+        _set_if("quote_symbol", meta.get("quote_symbol"))
+        _set_if("pair_address", meta.get("pair_address"))
+        _set_if("pair_url", meta.get("pair_url"))
+        _set_if("ts", meta.get("scan_ts"))
+        _set_if("scan_ts", meta.get("scan_ts"))
+        _set_if("meta", meta)
+        _set_if("raw", meta)
+        _set_if("data", meta)
+        _set_if("extra", meta)
 
-            meta: Dict[str, Any] = {
-                "liq": float(r.get("liq_usd") or 0.0),
-                "vol5": float(r.get("vol_5m_usd") or 0.0),
-                "buys5": int(r.get("buys_5m") or 0),
-                "sells5": int(r.get("sells_5m") or 0),
-                "chg5": float(r.get("price_change_5m_pct") or 0.0),
-                "age_min": float(r.get("token_age_min") or 0.0),
-                "scan_ts": float(r.get("scan_ts") or time.time()),
-                "ai_rug_score": float(r.get("ai_rug_score") or 0.0),
-                "pair_url": r.get("pair_url"),
-                "pair_address": r.get("pair_address"),
-                "momo_hint": float(r.get("momo_hint") or 0.0),
-            }
+        if kwargs:
+            try:
+                return Candidate(**kwargs)
+            except TypeError:
+                pass
 
-            for k in ("score_combined", "score_ai", "score_risk", "score_quality", "score_momentum"):
-                if k in r:
-                    with contextlib.suppress(Exception):
-                        meta[k] = float(r.get(k) or 0.0)
-            if "score_label" in r:
-                meta["score_label"] = str(r.get("score_label") or "")
+        # Minimal common layout fallback
+        return Candidate(  # type: ignore[call-arg]
+            mint=meta.get("mint"),
+            symbol=meta.get("symbol"),
+            source=meta.get("source", "raydium"),
+            meta=meta,
+        )
 
-            if risk_capacity is not None:
-                meta["risk_capacity"] = float(risk_capacity)
-            if risk_mode is not None:
-                meta["risk_mode"] = str(risk_mode)
-
-            meta["raw_meta"] = dict(r)
-
-            log_raydium_candidate(mint=mint, symbol=r.get("symbol"), meta=meta, regime=regime_tag, wallet_tag=wallet_tag)  # type: ignore[misc]
-        except Exception:
-            continue
+    return _ctor
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Scan stats + reject tracking
-# ──────────────────────────────────────────────────────────────────────────────
-@dataclass
-class _ScanStats:
-    t0: float
-    raw_pairs: int = 0
-    metas: int = 0
-    soft_metas: int = 0
-    enriched: int = 0
-    scored: int = 0
-    runners: int = 0
-    fb_runners: int = 0
-    risk_capacity: float = 1.0
-    risk_mode: str = "normal"
-    regime_label: str = "unknown"
-    regime_numeric: float = 0.0
-    manip_risk: float = 0.0
-
-    # reject bookkeeping
-    rejects: Dict[str, int] = field(default_factory=dict)
-    reject_samples: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
-
-    def rej(self, reason: str, sample: Optional[Dict[str, Any]] = None) -> None:
-        r = reason or "reject_unknown"
-        self.rejects[r] = int(self.rejects.get(r, 0)) + 1
-        if sample is not None and RAYDIUM_REJECT_SAMPLE_N > 0:
-            arr = self.reject_samples.get(r) or []
-            if len(arr) < RAYDIUM_REJECT_SAMPLE_N:
-                arr.append(sample)
-                self.reject_samples[r] = arr
+def _make_candidate(meta: dict[str, Any]) -> Any:
+    global _CAND_FACTORY
+    if _CAND_FACTORY is None:
+        _CAND_FACTORY = _build_candidate_factory()
+    return _CAND_FACTORY(meta)
 
 
-def _maybe_log_rejects(stats: _ScanStats, *, force: bool = False) -> None:
-    global _reject_log_last_ts
-    if not RAYDIUM_LOG_REJECTS:
-        return
-    if not stats.rejects:
-        return
-    now = time.time()
-    if (not force) and (now - float(_reject_log_last_ts)) < float(RAYDIUM_REJECT_LOG_EVERY_SEC):
-        return
-    _reject_log_last_ts = now
-
-    top = sorted(stats.rejects.items(), key=lambda kv: kv[1], reverse=True)[:12]
-    payload: Dict[str, Any] = {
-        "raw_pairs": stats.raw_pairs,
-        "metas": stats.metas,
-        "soft": stats.soft_metas,
-        "scored": stats.scored,
-        "runners": stats.runners,
-        "fb": stats.fb_runners,
-        "top_rejects": top,
-    }
-    if RAYDIUM_REJECT_SAMPLE_N > 0 and stats.reject_samples:
-        payload["samples"] = stats.reject_samples
-    log.every("RAY_REJECT_SUMMARY", n=5, **payload)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Public: scan_raydium
-# ──────────────────────────────────────────────────────────────────────────────
-async def scan_raydium(*args: Any) -> List[Dict[str, Any]]:
+# =============================================================================
+# Public API
+# =============================================================================
+async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
     """
-    Flexible signatures supported:
-      - scan_raydium()
-      - scan_raydium(redis)
-      - scan_raydium(session)
-      - scan_raydium(redis, session)
+    Canonical scanner entrypoint used by scanner.registry.
+
+    Supported call shapes (orchestrator-friendly):
+      - scan_raydium(redis=..., session=..., stop_evt=..., limit=...)
+      - scan_raydium(redis, session, stop_evt, limit)  (best-effort parsing)
+
+    Returns:
+        list[Candidate]
     """
-    if not RAYDIUM_ENABLED or RAYDIUM_MODE == "off":
+    st = _settings()
+    _RPS.set(st.rps_limit)
+
+    if _disabled() or (not st.enabled) or st.mode == "off":
         return []
+
     if aiohttp is None:
-        log.every("RAY_NO_AIOHTTP", n=60, msg="aiohttp missing; raydium scanner disabled")
+        if _fast_fail():
+            raise RuntimeError("aiohttp is required for raydium_scanner but is not installed")
+        LOG.once("RAY_NO_AIOHTTP", ttl=60, msg="aiohttp missing; raydium scanner disabled")  # type: ignore[attr-defined]
         return []
 
-    redis = None
-    sess: Optional["aiohttp.ClientSession"] = None
+    if Candidate is None:
+        if _fast_fail():
+            raise RuntimeError(
+                "scanner.registry.Candidate missing (cannot emit canonical candidates)"
+            )
+        LOG.once("RAY_NO_CANDIDATE", ttl=60, msg="Candidate missing; raydium scanner disabled")  # type: ignore[attr-defined]
+        return []
 
-    if len(args) == 1:
-        if isinstance(args[0], aiohttp.ClientSession):  # type: ignore[attr-defined]
-            sess = args[0]
-        else:
-            redis = args[0]
-    elif len(args) >= 2:
-        redis = args[0]
-        if isinstance(args[1], aiohttp.ClientSession):  # type: ignore[attr-defined]
-            sess = args[1]
+    ctx = _parse_ctx(*args, **kwargs)
+    stop_evt = ctx.stop_evt
+
+    out_limit = int(
+        ctx.limit
+        if isinstance(ctx.limit, int)
+        else (kwargs.get("limit") if isinstance(kwargs.get("limit"), int) else st.out_limit)
+    )
+    out_limit = max(1, out_limit)
+
+    stats = ScanStats(t0=time.time())
 
     own_session = False
-    if sess is None:
-        sslctx = None
-        with contextlib.suppress(Exception):
-            if certifi is not None:
-                sslctx = ssl.create_default_context(cafile=certifi.where())  # type: ignore[attr-defined]
-        timeout = aiohttp.ClientTimeout(total=TIMEOUT_S + 3.0)  # type: ignore[attr-defined]
-        conn = aiohttp.TCPConnector(ssl=sslctx, limit=60)  # type: ignore[attr-defined]
+    sess: Any = None
+    if ctx.session is not None:
+        sess = ctx.session
+    else:
+        sslctx = _sslctx()
+        timeout = aiohttp.ClientTimeout(total=float(st.timeout_s) + 3.0)  # type: ignore[attr-defined]
+        conn = aiohttp.TCPConnector(ssl=sslctx, limit=int(st.conn_limit))  # type: ignore[attr-defined]
         sess = aiohttp.ClientSession(
-            headers=_headers(),
+            headers=_headers(st),
             connector=conn,
-            trust_env=TRUST_ENV,
+            trust_env=bool(st.trust_env),
             timeout=timeout,
         )  # type: ignore[attr-defined]
         own_session = True
 
-    stats = _ScanStats(t0=time.time())
-
     try:
-        # Risk snapshot
-        risk_ctx = None
-        with contextlib.suppress(Exception):
-            risk_ctx = await risk_capacity_snapshot(redis)
+        if stop_evt is not None and stop_evt.is_set():
+            return []
 
-        risk_capacity = _clamp(float((risk_ctx or {}).get("risk_capacity", 1.0) or 1.0), 0.0, 1.0)
-        risk_shutdown = bool((risk_ctx or {}).get("risk_shutdown", False))
-        risk_mode = str((risk_ctx or {}).get("risk_mode", "normal") or "normal")
-        stats.risk_capacity, stats.risk_mode = risk_capacity, risk_mode
+        # risk capacity (tags only; do NOT trade here)
+        try:
+            risk_ctx = await risk_capacity_snapshot(ctx.redis)
+        except Exception:
+            risk_ctx = {"risk_capacity": 1.0, "risk_shutdown": False, "risk_mode": "normal"}
+            stats.rej("risk_snapshot_exc", st=st)
+
+        risk_capacity = _clamp(float(risk_ctx.get("risk_capacity", 1.0) or 1.0), 0.0, 1.0)
+        risk_shutdown = bool(risk_ctx.get("risk_shutdown", False))
+        risk_mode = str(risk_ctx.get("risk_mode", "normal") or "normal")
 
         if risk_shutdown or risk_capacity <= 0.0:
-            log.every(
+            LOG.every(  # type: ignore[attr-defined]
                 "RAY_RISK_SHUTDOWN",
                 n=10,
+                level=20,
+                msg="RAY_RISK_SHUTDOWN",
                 risk_shutdown=int(risk_shutdown),
                 risk_capacity=round(risk_capacity, 3),
                 risk_mode=risk_mode,
             )
             return []
 
-        # Regime snapshot
         regime = await _regime_snapshot()
-        stats.regime_label = str(regime.get("label", "unknown") or "unknown")
-        stats.regime_numeric = float(regime.get("label_numeric", 0.0))
-        stats.manip_risk = float(regime.get("manipulation_risk", 0.0))
 
-        tuned_soft_liq, tuned_fb_min_vol5 = _regime_tune_soft(
-            SOFT_MIN_LIQ_USD,
-            _f("RAYDIUM_FB_MIN_VOL5_USD", 300.0),
-            regime,
-        )
-        min_combined = _dynamic_min_combined(SCORING_MIN_COMBINED, regime, risk_capacity)
-
-        log.every(
+        LOG.every(  # type: ignore[attr-defined]
             "RAY_SCAN_START",
             n=5,
-            phase=MASTER_PHASE,
-            mode=RAYDIUM_MODE,
-            queries=",".join(SEARCH_QUERIES),
-            tuned_soft_liq=int(tuned_soft_liq),
-            soft_max_age=round(SOFT_MAX_AGE_MIN, 2),
-            hard_min_liq=int(HARD_MIN_LIQ_USD),
-            limit=LIMIT,
-            scoring=int(bool(SCORING_ENABLED and score_candidate)),
-            min_combined=round(min_combined, 2),
-            min_label=SCORING_MIN_LABEL,
-            regime=stats.regime_label,
-            manip=round(stats.manip_risk, 3),
+            level=20,
+            msg="RAY_SCAN_START",
+            mode=st.mode,
+            queries=",".join(st.queries),
+            out_limit=out_limit,
+            hard_min_liq=st.hard_min_liq_usd,
+            hard_max_age=st.hard_max_age_min,
             risk_capacity=round(risk_capacity, 3),
             risk_mode=risk_mode,
+            regime=regime.get("regime_label"),
+            manip=round(float(regime.get("manipulation_risk", 0.0)), 3),
         )
 
-        # Fetch pairs
-        pairs = await _fetch_pairs(sess)
+        pairs = await _fetch_pairs(sess, st, stats, stop_evt=stop_evt)
         stats.raw_pairs = len(pairs)
 
-        # Normalize + dedupe by mint (keep best pool per mint)
-        best_by_mint: Dict[str, Dict[str, Any]] = {}
+        # Normalize + dedupe by mint (keep best per mint)
+        best_by_mint: dict[str, dict[str, Any]] = {}
         for p in pairs:
-            m, reason = _normalize_to_meta(p)
+            if stop_evt is not None and stop_evt.is_set():
+                break
+            m = _normalize_pair(st, p, stats)
             if not m:
-                if reason:
-                    stats.rej(reason)
                 continue
 
-            # hard heuristics (cheap)
-            if HARD_MIN_LIQ_USD > 0 and float(m.get("liq_usd") or 0.0) < float(HARD_MIN_LIQ_USD):
-                stats.rej("reject_hard_min_liq", {"mint": m.get("mint"), "liq": m.get("liq_usd")})
-                continue
-            if MIN_BUYS_5M > 0 and int(m.get("buys_5m") or 0) < MIN_BUYS_5M:
-                stats.rej("reject_min_buys5", {"mint": m.get("mint"), "buys5": m.get("buys_5m")})
-                continue
-            if MIN_VOL5_USD > 0 and float(m.get("vol_5m_usd") or 0.0) < MIN_VOL5_USD:
-                stats.rej("reject_min_vol5", {"mint": m.get("mint"), "vol5": m.get("vol_5m_usd")})
-                continue
-            if float(m.get("price_change_5m_pct") or 0.0) <= float(MAX_NEG_CHG5):
-                stats.rej("reject_dump_chg5", {"mint": m.get("mint"), "chg5": m.get("price_change_5m_pct")})
-                continue
-
-            # attach regime+risk
-            m["regime_label"] = stats.regime_label
-            m["regime_numeric"] = stats.regime_numeric
-            m["regime_manipulation"] = stats.manip_risk
-            m["regime_ctx"] = dict(regime)
+            # attach context tags (cheap)
             m["risk_capacity"] = risk_capacity
             m["risk_mode"] = risk_mode
+            m["regime"] = regime
 
             mint = str(m.get("mint") or "")
             if not mint:
-                stats.rej("reject_no_mint_post")
+                stats.rej("reject_no_mint_post", st=st)
                 continue
 
             cur = best_by_mint.get(mint)
-            if cur is None:
-                best_by_mint[mint] = m
-                continue
-
-            cand_key = (
-                float(m.get("liq_usd") or 0.0),
-                float(m.get("vol_5m_usd") or 0.0),
-                float(m.get("momo_hint") or 0.0),
-            )
-            cur_key = (
-                float(cur.get("liq_usd") or 0.0),
-                float(cur.get("vol_5m_usd") or 0.0),
-                float(cur.get("momo_hint") or 0.0),
-            )
-            if cand_key > cur_key:
+            if cur is None or _rank_key(m) > _rank_key(cur):
                 best_by_mint[mint] = m
 
         metas = list(best_by_mint.values())
-        stats.metas = len(metas)
+        stats.normalized = len(metas)
 
-        # Soft prefilter
-        soft: List[Dict[str, Any]] = []
-        for m in metas:
-            try:
-                liq = float(m.get("liq_usd") or 0.0)
-                age = float(m.get("token_age_min") or 9999.0)
-                if tuned_soft_liq > 0.0 and liq < tuned_soft_liq:
-                    stats.rej("soft_liq", {"mint": m.get("mint"), "liq": liq, "need": tuned_soft_liq})
-                    continue
-                if SOFT_MAX_AGE_MIN > 0.0 and age > SOFT_MAX_AGE_MIN:
-                    stats.rej("soft_age", {"mint": m.get("mint"), "age": age, "max": SOFT_MAX_AGE_MIN})
-                    continue
-                soft.append(m)
-            except Exception:
-                stats.rej("soft_exc")
-                continue
-
-        if not soft and metas:
-            # no silent no-buy: track that soft filter eliminated everything
-            stats.rej("soft_all_filtered")
-            soft = metas
-
-        if RAY_MAX_AGE_MIN > 0.0 and soft:
-            before = len(soft)
-            soft = [m for m in soft if float(m.get("token_age_min") or 9999.0) <= float(RAY_MAX_AGE_MIN)]
-            if before > 0 and not soft:
-                stats.rej("reject_hard_age_cap")
-
-        stats.soft_metas = len(soft)
-
-        if DEBUG_META_SAMPLE:
-            if soft:
-                sample = [
-                    {
-                        "sym": m.get("symbol"),
-                        "liq": m.get("liq_usd"),
-                        "vol5": m.get("vol_5m_usd"),
-                        "buys5": m.get("buys_5m"),
-                        "sells5": m.get("sells_5m"),
-                        "chg5": m.get("price_change_5m_pct"),
-                        "age_min": m.get("token_age_min"),
-                        "momo_hint": round(float(m.get("momo_hint") or 0.0), 2),
-                    }
-                    for m in soft[:5]
-                ]
-                log.every("RAY_META_SAMPLE", n=10, count=len(soft), raw=stats.metas, first=sample)
-            else:
-                log.every("RAY_META_SAMPLE", n=10, count=0, raw=stats.metas)
-
-        # Optional enrichment
-        if soft:
-            await _enrich_optional(soft)
-        stats.enriched = len(soft)
-
-        # Scoring
-        scored = await _score_metas(soft, regime=regime, risk_ctx=risk_ctx)
-        stats.scored = len(scored)
-
-        # Gate to runners
-        runners: List[Dict[str, Any]] = []
-        if scored:
-            for m in scored:
-                try:
-                    label = str(m.get("score_label") or "").upper() or "YELLOW"
-                    combined = float(m.get("score_combined") or 0.0)
-                    trade_ok = bool(m.get("score_is_trade_viable", True))
-
-                    if not trade_ok:
-                        stats.rej("gate_score_not_viable", {"mint": m.get("mint")})
-                        continue
-                    if combined < float(min_combined):
-                        stats.rej("gate_score_low", {"mint": m.get("mint"), "score": combined, "need": min_combined})
-                        continue
-                    if _LABEL_LEVEL.get(label, 0) < _REQUIRED_LABEL_LEVEL:
-                        stats.rej("gate_label_low", {"mint": m.get("mint"), "label": label, "need": SCORING_MIN_LABEL})
-                        continue
-                    if AI_RUG_ENABLED and float(m.get("ai_rug_score") or 0.0) >= float(RAYDIUM_MAX_AI_RUG):
-                        stats.rej("gate_ai_rug", {"mint": m.get("mint"), "ai": m.get("ai_rug_score")})
-                        continue
-
-                    runners.append(m)
-                except Exception:
-                    stats.rej("gate_exc")
-                    continue
-
-        # Fallback
-        if not runners:
-            fb = _fallback_pick(soft, fb_min_vol5=tuned_fb_min_vol5)
-            runners = fb
-            stats.fb_runners = len(fb)
-            if soft and not runners:
-                stats.rej("fallback_empty")
-
-        # Sort + cap + risk shrink
-        if runners:
-
-            def _sort_key(x: Dict[str, Any]) -> Tuple[float, float, float, float]:
-                return (
-                    float(x.get("score_combined", x.get("momo_hint", 0.0)) or 0.0),
-                    float(x.get("vol_5m_usd") or 0.0),
-                    float(x.get("liq_usd") or 0.0),
-                    float(x.get("price_change_5m_pct") or 0.0),
-                )
-
-            runners.sort(key=_sort_key, reverse=True)
-            runners = runners[:max(1, int(RAYDIUM_MAX_RUNNERS))]
-
-            raw_n = len(runners)
-            allowed = int(raw_n * risk_capacity)
-            if risk_capacity > 0.0 and allowed < 1:
-                allowed = 1
-            if allowed < raw_n:
-                runners = runners[:allowed]
-                log.every("RAY_RISK_SHRINK", n=10, before=raw_n, after=allowed, risk_capacity=round(risk_capacity, 3))
-
-        # Redis runner dedup
-        if redis is not None and RUNNER_DEDUP_ENABLED and RUNNER_DEDUP_SEC > 0 and runners:
-            filtered: List[Dict[str, Any]] = []
-            for r in runners:
-                mint = str(r.get("mint") or "")
+        # Optional redis seen-dedupe (default off)
+        if st.seen_ttl_s > 0 and _redis_ok(ctx.redis) and metas:
+            filtered: list[dict[str, Any]] = []
+            for m in metas:
+                mint = str(m.get("mint") or "")
                 if not mint:
                     continue
-                k = f"{REDIS_KEY_PREFIX}:runner:{mint}"
-                seen = await _redis_get(redis, k)
-                if seen:
-                    stats.rej("reject_redis_dedup", {"mint": mint})
+                k = f"ray:seen:{mint}"
+                if await _redis_get(ctx.redis, k):
+                    stats.rej("reject_seen_recent", {"mint": mint}, st=st)
                     continue
-                await _redis_setex(redis, k, int(RUNNER_DEDUP_SEC), "1")
-                filtered.append(r)
-            runners = filtered or runners
+                await _redis_setex(ctx.redis, k, int(st.seen_ttl_s), "1")
+                filtered.append(m)
+            metas = filtered
+            stats.normalized = len(metas)
 
-        stats.runners = len(runners)
-
-        if DEBUG_SCORE_RESULT:
-            log.every(
-                "RAY_SCORE_RESULT",
+        # Debug sample (human-friendly)
+        if st.debug_samples and metas:
+            sample = [
+                {
+                    "sym": m.get("symbol"),
+                    "liq": m.get("liq_usd"),
+                    "vol5": m.get("vol_5m_usd"),
+                    "buys5": m.get("buys_5m"),
+                    "sells5": m.get("sells_5m"),
+                    "chg5": m.get("price_change_5m_pct"),
+                    "age_min": m.get("token_age_min"),
+                    "momo": round(float(m.get("momo_hint") or 0.0), 2),
+                }
+                for m in sorted(metas, key=_rank_key, reverse=True)[:5]
+            ]
+            LOG.every(
+                "RAY_META_SAMPLE",
                 n=10,
-                raw_pairs=stats.raw_pairs,
-                metas=stats.metas,
-                soft=stats.soft_metas,
-                enriched=stats.enriched,
-                scored=stats.scored,
-                fb=stats.fb_runners,
-                runners=stats.runners,
-            )
+                level=20,
+                msg="RAY_META_SAMPLE",
+                count=len(metas),
+                first=sample,
+            )  # type: ignore[attr-defined]
 
-        # If we produced 0 runners, do NOT be silent: emit reject summary
-        if not runners:
-            _maybe_log_rejects(stats, force=True)
-        else:
-            _maybe_log_rejects(stats, force=False)
+        # Sort + cap
+        metas.sort(key=_rank_key, reverse=True)
+        metas = metas[: max(1, out_limit)]
 
-        # AI training logs
-        _log_ai_candidates(runners, regime=regime, risk_ctx=risk_ctx)
+        # Apply risk capacity as a *soft* shrink (still just discovery)
+        if risk_capacity < 1.0 and metas:
+            allowed = max(1, int(len(metas) * risk_capacity))
+            metas = metas[:allowed]
 
-        # MOMO alerts
-        if runners:
-            await _send_momo(runners)
+        # Convert to Candidate
+        candidates: list[Any] = []
+        for m in metas:
+            if stop_evt is not None and stop_evt.is_set():
+                break
+            try:
+                candidates.append(_make_candidate(m))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                stats.rej(
+                    "reject_candidate_build", {"mint": m.get("mint"), "err": _short(e)}, st=st
+                )
+                if _fast_fail():
+                    raise
 
-        # Scan summary
-        if RAYDIUM_LOG_SCAN_SUMMARY:
+        stats.passed = len(candidates)
+
+        # Reject summary if nothing passed
+        _maybe_log_rejects(st, stats, force=(stats.passed == 0))
+
+        # Optional training/debug logging (best-effort)
+        for m in metas[: min(25, len(metas))]:
             with contextlib.suppress(Exception):
-                await log_event(
-                    "raydium_scan_summary",
-                    {
-                        "ts": time.time(),
-                        "phase": MASTER_PHASE,
-                        "mode": RAYDIUM_MODE,
-                        "raw_pairs": stats.raw_pairs,
-                        "metas": stats.metas,
-                        "soft_metas": stats.soft_metas,
-                        "enriched": stats.enriched,
-                        "scored_metas": stats.scored,
-                        "fb_runners": stats.fb_runners,
-                        "runners": stats.runners,
-                        "rejects": dict(stats.rejects),
-                        "regime": dict(regime),
-                        "risk": dict(risk_ctx or {}),
-                        "tuned": {"tuned_soft_liq": tuned_soft_liq, "min_combined_dynamic": min_combined},
-                        "elapsed_ms": int((time.time() - stats.t0) * 1000),
-                    },
+                log_raydium_candidate(
+                    mint=m.get("mint"),
+                    symbol=m.get("symbol"),
+                    meta=m,
+                    regime=str((m.get("regime") or {}).get("regime_label") or "unknown"),
+                    wallet_tag=None,
                 )
 
-        # FINAL: return CandidateSnapshot list (canonical + compat aliases)
-        return [_to_candidate_snapshot(r) for r in runners]
+        with contextlib.suppress(Exception):
+            await log_event(
+                "raydium_scan_summary",
+                {
+                    "ts": time.time(),
+                    "mode": st.mode,
+                    "raw_pairs": stats.raw_pairs,
+                    "normalized": stats.normalized,
+                    "passed": stats.passed,
+                    "rejects": dict(stats.rejects),
+                    "risk": dict(risk_ctx),
+                    "regime": dict(regime),
+                    "elapsed_ms": int((time.time() - stats.t0) * 1000),
+                },
+            )
+
+        # Best-effort MOMO alerts (only top few)
+        if st.momo_alerts and candidates and AlertManager is not None:
+            with contextlib.suppress(Exception):
+                am = AlertManager()  # type: ignore[misc]
+                sent = 0
+                for c in candidates:
+                    if sent >= max(0, st.max_momo_alerts):
+                        break
+                    meta = (
+                        getattr(c, "meta", None)
+                        or getattr(c, "data", None)
+                        or getattr(c, "raw", None)
+                    )
+                    if not isinstance(meta, dict):
+                        continue
+
+                    # dedupe (optional; uses redis if available)
+                    mint = str(meta.get("mint") or "").strip()
+                    if mint and _redis_ok(ctx.redis) and st.momo_dedup_s > 0:
+                        k = f"ray:momo:{mint}"
+                        if await _redis_get(ctx.redis, k):
+                            continue
+                        await _redis_setex(ctx.redis, k, int(st.momo_dedup_s), "1")
+
+                    await am.send_momo_event(  # type: ignore[misc]
+                        "MOMO_OK",
+                        {
+                            "symbol": meta.get("symbol") or meta.get("mint"),
+                            "mint": meta.get("mint"),
+                            "pool": "raydium",
+                            "pool_url": meta.get("pair_url"),
+                            "liq_usd": meta.get("liq_usd"),
+                            "vol_5m": meta.get("vol_5m_usd"),
+                            "up_pct": meta.get("price_change_5m_pct"),
+                            "momo_hint": meta.get("momo_hint"),
+                            "risk_capacity": meta.get("risk_capacity"),
+                            "risk_mode": meta.get("risk_mode"),
+                            "regime": (meta.get("regime") or {}).get("regime_label"),
+                        },
+                    )
+                    sent += 1
+
+        return candidates
 
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        log.every("RAY_SCAN_FAIL", n=5, err=_short(e))
+        LOG.every("RAY_SCAN_FAIL", n=5, level=40, msg="RAY_SCAN_FAIL", err=_short(e))  # type: ignore[attr-defined]
         if _fast_fail():
             raise
         return []
     finally:
-        if own_session and sess:
+        if own_session and sess is not None:
             with contextlib.suppress(Exception):
                 await sess.close()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Compatibility entrypoints for scripts/main.py scanner supervisor
-# ──────────────────────────────────────────────────────────────────────────────
-async def scan_once(*args: Any, **_kw: Any) -> List[Dict[str, Any]]:
-    return await scan_raydium(*args)
-
-
-async def run_scanner(*args: Any, **kwargs: Any) -> None:
-    await run(*args, **kwargs)
-
-
-async def scan_loop(*args: Any, **kwargs: Any) -> None:
-    await run(*args, **kwargs)
+# Backwards-compat alias (some older code calls scan_once)
+async def scan_once(*args: Any, **kwargs: Any) -> list[Any]:
+    return await scan_raydium(*args, **kwargs)
 
 
 async def run(
     *args: Any,
-    q: Optional[Any] = None,
-    emit: Optional[Any] = None,
-    stop_evt: Optional[asyncio.Event] = None,
-    redis: Any = None,
-    session: Any = None,
+    **kwargs: Any,
 ) -> None:
     """
-    Emits runners into q/emit until stop_evt is set.
-
-    - If q is provided: await q.put(dict)
-    - If emit is provided: await emit(dict) or emit(dict)
+    Simple run loop helper (dev/tools/legacy). Registry usually does not need this.
+    - If q is provided: q.put(candidate)
+    - If emit is provided: emit(candidate) (sync or async)
     """
-    stop_evt = stop_evt or asyncio.Event()
+    st = _settings()
+    _RPS.set(st.rps_limit)
 
-    # best-effort parse positional args: (q, stop_evt) or (emit, stop_evt) or (redis, session, ...)
-    if args:
-        for a in args:
-            if isinstance(a, asyncio.Event):
-                stop_evt = a
-            elif aiohttp is not None and isinstance(a, aiohttp.ClientSession):  # type: ignore[attr-defined]
-                session = a
-            elif callable(a) and emit is None:
-                emit = a
-            elif q is None and hasattr(a, "put"):
-                q = a
-            elif redis is None:
-                redis = a
+    ctx = _parse_ctx(*args, **kwargs)
+    stop_evt = ctx.stop_evt or asyncio.Event()
+
+    interval = max(0.25, float(kwargs.get("interval_s") or _f("RAYDIUM_SCAN_INTERVAL_SEC", 2.0)))
+    jitter = max(0.0, float(kwargs.get("jitter_s") or _f("RAYDIUM_SCAN_JITTER_SEC", 0.35)))
 
     while not stop_evt.is_set():
         try:
-            runners = (
-                await scan_raydium(redis, session)
-                if (redis is not None or session is not None)
-                else await scan_raydium()
-            )
-            for r in runners:
+            cands = await scan_raydium(redis=ctx.redis, session=ctx.session, stop_evt=stop_evt)
+            for c in cands:
                 if stop_evt.is_set():
                     break
-                if q is not None:
+                if ctx.q is not None:
                     with contextlib.suppress(Exception):
-                        out = q.put(r)
+                        out = ctx.q.put(c)
                         if asyncio.iscoroutine(out):
                             await out
-                    continue
-                if emit is not None:
+                if ctx.emit is not None:
                     with contextlib.suppress(Exception):
-                        out = emit(r)
+                        out = ctx.emit(c)
                         if asyncio.iscoroutine(out):
                             await out
-
-            wait = SCAN_INTERVAL_SEC + random.uniform(-SCAN_JITTER_SEC, SCAN_JITTER_SEC)
-            await asyncio.sleep(max(0.05, wait))
-
+            await asyncio.sleep(max(0.05, interval + random.uniform(-jitter, jitter)))
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log.every("RAY_RUN_LOOP_ERR", n=10, err=_short(e))
+            LOG.every("RAY_RUN_LOOP_ERR", n=10, level=30, msg="RAY_RUN_LOOP_ERR", err=_short(e))  # type: ignore[attr-defined]
             if _fast_fail():
                 raise
-            await asyncio.sleep(max(0.25, SCAN_INTERVAL_SEC))
+            await asyncio.sleep(max(0.25, interval))
 
 
-__all__ = ["scan_raydium", "scan_once", "run", "run_scanner", "scan_loop"]
+def scanner_health() -> dict[str, Any]:
+    """Non-network health snapshot (safe for /health)."""
+    st = _settings()
+    return {
+        "name": "raydium_scanner",
+        "enabled": bool(st.enabled) and (st.mode != "off") and (not _disabled()),
+        "mode": st.mode,
+        "base_url": st.base_url,
+        "queries": list(st.queries),
+        "search_limit": st.search_limit,
+        "fetch_concurrency": st.fetch_concurrency,
+        "rps_limit": st.rps_limit,
+        "seen_ttl_s": st.seen_ttl_s,
+    }
+
+
+__all__ = ["run", "scan_once", "scan_raydium", "scanner_health"]
+
 
 if __name__ == "__main__":  # pragma: no cover
+
     async def _demo() -> None:
-        res = await scan_raydium()
-        print("runners:", len(res))
-        if res:
-            r = res[0]
-            print(
-                r.get("symbol"),
-                r.get("mint"),
-                r.get("score_combined"),
-                r.get("score_label"),
-                r.get("vol_5m_usd"),
-                r.get("liq_usd"),
+        out = await scan_raydium()
+        print("candidates:", len(out))
+        if out:
+            c0 = out[0]
+            meta = (
+                getattr(c0, "meta", None) or getattr(c0, "data", None) or getattr(c0, "raw", None)
             )
+            if isinstance(meta, dict):
+                print(
+                    meta.get("symbol"),
+                    meta.get("mint"),
+                    meta.get("liq_usd"),
+                    meta.get("vol_5m_usd"),
+                )
 
     asyncio.run(_demo())

@@ -1,172 +1,225 @@
-# _fix_tail.py
+#!/usr/bin/env python3
+"""
+_fix_tail.py  (ARCHIVE / dev-only)
+
+Purpose
+-------
+Safely fix "stray indentation" / tab damage near the bottom ("tail") of a python file
+(typically sniper/sniper.py) without injecting unknown template code.
+
+What it does
+------------
+- Locates a tail anchor (prefers an "Entrypoint" marker, else `if __name__ == ...`,
+  else the last `def main(` / `async def main(`)
+- Converts tabs to spaces
+- Detects global indent offset applied to the tail (e.g., everything shifted by 4 spaces)
+- Dedents the tail by the detected offset while preserving relative indentation
+- Writes a timestamped backup before applying
+
+Usage
+-----
+  py _fix_tail.py --file sniper/sniper.py --dry-run
+  py _fix_tail.py --file sniper/sniper.py --apply
+
+Notes
+-----
+- This is intentionally conservative. It will NOT inject new runtime logic.
+- If no anchor is found, it exits with a clear error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import re
+from collections.abc import Iterable
 from pathlib import Path
 
-p = Path("sniper/sniper.py")
-src = p.read_text(encoding="utf-8")
-
-# Prefer a clear anchor; fall back to the last "Entrypoint" or last "async def main("
-anchors = [
-    "# ==============================================================================\n# Entrypoint",
+ANCHOR_HINTS = (
+    "Entrypoint",
+    "ENTRYPOINT",
     "# Entrypoint",
-]
-pos = -1
-for a in anchors:
-    i = src.rfind(a)
-    if i != -1:
-        pos = i
-        break
-if pos == -1:
-    i = src.rfind("async def main(")
-    if i == -1:
-        raise SystemExit("Entrypoint anchor not found. Open sniper/sniper.py and paste the clean tail manually.")
-    # go a bit above the 'async def main(' line
-    pos = max(0, src.rfind("\n", 0, i))
+    "# ==============================================================================",
+)
 
-clean_tail = """
-# ==============================================================================
-# Entrypoint (clean, no stray indentation)
-# ==============================================================================
-import inspect, importlib, os, asyncio
-log = logging.getLogger("sniper")
+TOPLEVEL_PAT = re.compile(
+    r"""^(?P<indent>[ \t]*)(@|from\s+|import\s+|class\s+|def\s+|async\s+def\s+|if\s+__name__\s*==)""",
+    re.VERBOSE,
+)
 
-async def _maybe_await(x):
-    return await x if inspect.iscoroutine(x) else x
 
-def _resolve_callable(path: str):
-    \"\"\"Resolve 'module.sub:func' or 'func' (from current module) to a callable.\"\"\"
-    if not path:
-        return None
-    if ":" in path:
-        mod_name, fn_name = path.split(":", 1)
-        mod = importlib.import_module(mod_name)
-        return getattr(mod, fn_name, None)
-    return globals().get(path)
+def _ts() -> str:
+    return dt.datetime.now(dt.UTC).strftime("%Y%m%d_%H%M%S")
 
-async def start_scanners():
-    \"\"\"
-    Delegates to your scanner loop.
+
+def _read_text(p: Path) -> str:
+    # Use utf-8 with fallback; keep it simple for a dev script
+    try:
+        return p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return p.read_text(encoding="utf-8", errors="replace")
+
+
+def _write_text(p: Path, s: str) -> None:
+    p.write_text(s, encoding="utf-8")
+
+
+def _make_backup(p: Path, content: str) -> Path:
+    b = p.with_suffix(p.suffix + f".bak.{_ts()}")
+    _write_text(b, content)
+    return b
+
+
+def _find_anchor_line(lines: list[str]) -> int | None:
+    """
+    Return line index (0-based) where tail starts.
     Priority:
-      1) SCANNERS_ENTRY / START_SCANNERS_TARGET -> 'module.path:func'
-      2) Common function names in this module or 'scanners' modules
-      3) Idle keepalive
-    \"\"\"
-    env_target = os.getenv("SCANNERS_ENTRY") or os.getenv("START_SCANNERS_TARGET")
-    if env_target:
-        try:
-            fn = _resolve_callable(env_target)
-            if callable(fn):
-                log.info(f"start_scanners: env target -> {env_target}")
-                return await _maybe_await(fn())
-            else:
-                log.error(f"start_scanners: env target not callable: {env_target}")
-        except Exception as e:
-            log.exception(f"start_scanners: failed to import env target {env_target}: {e}")
+      1) last line containing an Entrypoint marker (string search)
+      2) last `if __name__ == "__main__":`
+      3) last `async def main(` or `def main(`
+    """
+    best = None
 
-    for name in ("run_sniper", "scan_loop", "scan_forever", "scanner_loop", "run_scanners"):
-        fn = globals().get(name)
-        if callable(fn):
-            log.info(f"start_scanners: delegating to local {name}()")
-            return await _maybe_await(fn())
+    # 1) Entrypoint-ish markers
+    for i, ln in enumerate(lines):
+        if any(h in ln for h in ANCHOR_HINTS):
+            best = i
+    if best is not None:
+        return best
 
-    for mod_name, fn_name in (
-        ("scanners", "scan_loop"),
-        ("scanners", "scan_forever"),
-        ("sniper.scanners", "scan_loop"),
-        ("sniper.scanners", "scan_forever"),
-    ):
-        try:
-            mod = importlib.import_module(mod_name)
-            fn = getattr(mod, fn_name, None)
-            if callable(fn):
-                log.info(f"start_scanners: delegating to {mod_name}.{fn_name}()")
-                return await _maybe_await(fn())
-        except Exception:
-            pass
+    # 2) __main__
+    for i, ln in enumerate(lines):
+        if "__name__" in ln and "__main__" in ln and ln.lstrip().startswith("if "):
+            best = i
+    if best is not None:
+        return best
 
-    log.error(
-        "start_scanners: no scan loop found. "
-        "Set SCANNERS_ENTRY='module.path:func' or provide run_sniper()/scan_loop(). "
-        "Idling to keep the container alive."
-    )
-    while True:
-        log.info("scanner: idle heartbeat")
-        await asyncio.sleep(int(os.getenv("SCAN_HEARTBEAT_SEC", "10")))
+    # 3) last main()
+    for i, ln in enumerate(lines):
+        s = ln.lstrip()
+        if s.startswith("async def main(") or s.startswith("def main("):
+            best = i
+    return best
 
-async def scan_loop():
-    \"\"\"Minimal runner: start exits + optional PnL watcher, then idle.\"\"\"
-    try:
-        asyncio.create_task(start_exit_supervisor(get_redis()))
-        log.info("scanner: exit supervisor started")
-    except Exception as e:
-        log.debug("scanner: failed to start exit supervisor: %s", e)
 
-    try:
-        from execution.pnl_watcher import start_pnl_watcher
-        asyncio.create_task(start_pnl_watcher())
-        log.info("scanner: pnl_watcher task started")
-    except Exception:
-        pass
-
-    while True:
-        log.info("scanner: idle heartbeat")
-        await asyncio.sleep(int(os.getenv("SCAN_HEARTBEAT_SEC", "10")))
-
-async def run_sniper():
-    \"\"\"Default scanner entry: exits + watcher + main loop.\"\"\"
-    try:
-        asyncio.create_task(start_exit_supervisor(get_redis()))
-        log.info("exits supervisor started")
-    except Exception as e:
-        log.debug("exit supervisor not started: %s", e)
-
-    try:
-        from execution.pnl_watcher import watch_positions_loop
-        asyncio.create_task(watch_positions_loop())
-    except Exception as e:
-        log.debug("pnl watcher not started: %s", e)
-
-    await Sniper().main_loop()
-
-async def main():
-    await init_resources()
-
-    try:
-        await ensure_schema()
-    except Exception as e:
-        log.warning("ensure_schema failed: %s", e)
-
-    try:
-        if ensure_cookie_refresher:
-            ensure_cookie_refresher()
-        elif cf_refresh_loop:
-            asyncio.create_task(cf_refresh_loop())
+def _count_leading_spaces(s: str) -> int:
+    n = 0
+    for ch in s:
+        if ch == " ":
+            n += 1
         else:
-            log.info("pumpfun CF refresher not available")
-    except Exception as e:
-        log.warning("pumpfun cookie refresher not started: %s", e)
+            break
+    return n
 
-    # refresh session/redis refs via accessors if needed
-    try:
-        global _session_ref, _redis_ref
-        if _session_ref is None or _redis_ref is None:
-            from utils_pkg.core_utils import get_session as _gs, get_redis as _gr
-            _session_ref, _redis_ref = _gs(), _gr()
-    except Exception:
-        pass
 
-    if os.getenv("SCANNERS_ENTRY") or os.getenv("START_SCANNERS_TARGET"):
-        await start_scanners()
-    else:
-        await run_sniper()
+def _compute_tail_shift(tail_lines: Iterable[str]) -> int:
+    """
+    Detect a constant left-shift that appears to be applied to the entire tail.
+    We estimate this by looking at likely top-level lines and taking the minimum indent.
+    If the minimum indent is >= 2, we treat it as a global shift candidate.
+    """
+    indents = []
+    for ln in tail_lines:
+        if not ln.strip():
+            continue
+        m = TOPLEVEL_PAT.match(ln.replace("\t", "    "))
+        if not m:
+            continue
+        indent = m.group("indent").replace("\t", "    ")
+        indents.append(_count_leading_spaces(indent))
 
-    await close_resources()
+    if not indents:
+        return 0
+
+    shift = min(indents)
+    # only shift if it looks like a real global indent (common is 2/4/8)
+    if shift in (2, 4, 8, 12, 16):
+        return shift
+    if shift > 0 and shift <= 16:
+        # tolerate odd-but-small shifts, but don't do anything crazy
+        return shift
+    return 0
+
+
+def _dedent_lines(lines: list[str], shift: int) -> list[str]:
+    if shift <= 0:
+        return lines
+    out: list[str] = []
+    prefix = " " * shift
+    for ln in lines:
+        # only remove if line actually has the prefix
+        if ln.startswith(prefix):
+            out.append(ln[shift:])
+        else:
+            out.append(ln)
+    return out
+
+
+def _ensure_trailing_newline(s: str) -> str:
+    return s if s.endswith("\n") else s + "\n"
+
+
+def process_file(path: Path, apply: bool, dry_run: bool) -> tuple[bool, str]:
+    src = _read_text(path)
+    src = src.replace("\r\n", "\n").replace("\r", "\n")
+
+    lines = src.splitlines(keepends=True)
+    anchor = _find_anchor_line([ln.rstrip("\n") for ln in lines])
+    if anchor is None:
+        return False, "No anchor found (no Entrypoint marker, no __main__, no main())."
+
+    head = lines[:anchor]
+    tail = lines[anchor:]
+
+    # normalize tabs → spaces in tail (common source of weird indentation)
+    tail_norm = [ln.replace("\t", "    ") for ln in tail]
+    shift = _compute_tail_shift(tail_norm)
+
+    # apply dedent
+    tail_fixed = _dedent_lines(tail_norm, shift)
+
+    new = "".join(head + tail_fixed)
+    new = _ensure_trailing_newline(new)
+
+    changed = new != src
+
+    msg = f"anchor_line={anchor + 1} shift={shift} changed={changed} file={path.as_posix()}"
+
+    if dry_run and not apply:
+        return True, "[DRY-RUN] " + msg
+
+    if apply:
+        backup = _make_backup(path, src)
+        _write_text(path, new)
+        return True, msg + f" backup={backup.name}"
+
+    # default: no apply, no dry_run
+    return True, msg + " (no changes written; pass --apply)"
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Fix stray indentation in file tail safely (ARCHIVE/dev-only)."
+    )
+    ap.add_argument(
+        "--file", default="sniper/sniper.py", help="Target python file (default: sniper/sniper.py)"
+    )
+    ap.add_argument("--apply", action="store_true", help="Write changes to disk (creates backup)")
+    ap.add_argument("--dry-run", action="store_true", help="Print what would happen; do not write")
+    return ap.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    p = Path(args.file)
+    if not p.exists():
+        raise SystemExit(f"File not found: {p}")
+
+    ok, msg = process_file(p, apply=bool(args.apply), dry_run=bool(args.dry_run))
+    print(msg)
+    if not ok:
+        raise SystemExit(2)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
-""".lstrip("\n")
-
-# Normalize tabs -> 4 spaces to avoid weird top-level indents
-head = src[:pos].replace("\\t", "    ")
-
-p.write_text(head + clean_tail, encoding="utf-8")
-print("Patched sniper/sniper.py from Entrypoint marker → EOF.")
+    main()

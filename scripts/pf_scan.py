@@ -1,7 +1,9 @@
 # scripts/pf_scan.py
-import asyncio, json, time
-from utils_pkg.pump_client import pump_post
+import asyncio
+
 from utils_pkg.pump_browser_client import pump_post_via_browser
+from utils_pkg.pump_client import pump_post
+
 
 async def once():
     path = "/api/trpc/board.latest?batch=1"
@@ -20,14 +22,16 @@ async def once():
     print("BROWSER OK", len(txt))
     return txt
 
+
 async def main():
     while True:
         try:
-            txt = await once()
+            await once()
             # TODO: parse tRPC batch and process items here
         except Exception as e:
             print("scan error:", e)
         await asyncio.sleep(3)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

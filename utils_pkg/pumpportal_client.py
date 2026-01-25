@@ -1,112 +1,380 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-import os
-import re
-import json
+"""
+utils_pkg/pumpportal_client.py
+
+PumpPortal websocket client — V3+++ (production / Render-safe)
+==============================================================
+
+Role
+----
+A resilient websocket helper for PumpPortal (pumpportal.fun) used by scanners
+and optional standalone tools.
+
+Design constraints (LOCK-IN)
+----------------------------
+- No network work at import time
+- Backwards compatible with current main.py usage:
+    * client = PumpPortalClient(...)
+    * log client.masked_uri()
+    * main.py manages the websocket connection itself
+    * main.py calls: await client._subscribe(ws) after connect
+- ALSO supports self-managed mode via `events()` async generator
+- Robust to wrong `ws_like` passed (string / None / wrong object): no hard crash
+- Exponential backoff with jitter, bounded
+- Chunking subscriptions for large mint lists
+- Defensive JSON parsing & message normalization
+
+Env contract (compatible + extended)
+------------------------------------
+Required:
+- PF_PP_KEY (or PUMPPORTAL_KEY)         : API key
+
+Optional:
+- PF_PP_URI (or PUMPPORTAL_URI)         : base wss uri (default: wss://pumpportal.fun/api/data)
+- PF_PP_ACCOUNT (or PUMPPORTAL_ACCOUNT) : account pubkey to subscribe
+- PF_PP_MINTS (or PUMPPORTAL_MINTS)     : comma-separated mint list
+
+Websocket knobs:
+- PF_PP_WS_PING_INTERVAL   (default 20.0)
+- PF_PP_WS_PING_TIMEOUT    (default 30.0)
+- PF_PP_WS_CLOSE_TIMEOUT   (default 5.0)
+- PF_PP_WS_MAX_SIZE        (default 2**23 ~ 8MB)
+- PF_PP_WS_CONNECT_TIMEOUT (default 15.0)
+- PF_PP_WS_BACKOFF_MAX     (default 30.0)
+- PF_PP_WS_BACKOFF_BASE    (default 0.8)
+- PF_PP_WS_BACKOFF_JITTER  (default 0.25)
+
+Subscription knobs:
+- PF_PP_SUB_CHUNK_SIZE     (default 120)
+- PF_PP_VALIDATE_MINTS     (default 1)
+"""
+
 import asyncio
-from typing import AsyncGenerator, Optional, List, Dict, Any
+import contextlib
+import json
+import logging
+import os
+import random
+import re
+import time
+from collections.abc import AsyncGenerator, Iterable
+from dataclasses import dataclass
+from typing import Any
 
 import websockets
-from websockets.exceptions import (
-    ConnectionClosed,
-    ConnectionClosedError,
-    ConnectionClosedOK,
-)
-from websockets.legacy.client import WebSocketClientProtocol
+from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ENV + small helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _envs(k: str, d: str = "") -> str:
-    return (os.getenv(k) or d).strip()
-
-
-def _envi(k: str, d: int) -> int:
+# Type import drift across websockets versions
+try:  # websockets<=11 legacy path
+    from websockets.legacy.client import WebSocketClientProtocol as WSProto  # type: ignore
+except Exception:  # websockets>=12
     try:
-        return int(os.getenv(k, str(d)))
-    except Exception:
-        return d
+        from websockets.client import ClientConnection as WSProto  # type: ignore
+    except Exception:  # fallback structural
+        WSProto = Any  # type: ignore
 
 
-def _envf(k: str, d: float) -> float:
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+try:
+    from utils_pkg.logging_setup import get_logger as _get_logger  # preferred
+except Exception:  # pragma: no cover
     try:
-        return float(os.getenv(k, str(d)))
+        from logging_setup import get_logger as _get_logger  # root shim
+    except Exception:  # pragma: no cover
+        _get_logger = None  # type: ignore
+
+if _get_logger:
+    try:
+        LOG = _get_logger("utils.pumpportal")  # type: ignore[misc]
+    except TypeError:  # pragma: no cover
+        LOG = _get_logger()  # type: ignore[misc]
+else:
+    LOG = logging.getLogger("utils.pumpportal")
+    if not LOG.handlers:
+        logging.basicConfig(level=logging.INFO)
+
+
+# -----------------------------------------------------------------------------
+# Env helpers
+# -----------------------------------------------------------------------------
+_TRUE = {"1", "true", "t", "yes", "y", "on"}
+_FALSE = {"0", "false", "f", "no", "n", "off"}
+
+
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip()
+
+
+def _env_any(names: list[str], default: str = "") -> str:
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return default
+
+
+def _envi(name: str, default: int) -> int:
+    v = os.getenv(name)
+    try:
+        return int(float(v)) if v not in (None, "") else default
     except Exception:
-        return d
+        return default
 
 
-# connection / ping knobs
-_WS_PING_INTERVAL     = _envf("PF_PP_WS_PING_INTERVAL", 20.0)
-_WS_PING_TIMEOUT      = _envf("PF_PP_WS_PING_TIMEOUT", 30.0)
-_WS_CLOSE_TIMEOUT     = _envf("PF_PP_WS_CLOSE_TIMEOUT", 5.0)
-_WS_MAX_SIZE          = _envi("PF_PP_WS_MAX_SIZE", 2**23)  # ~8MB
-_WS_BACKOFF_MAX       = _envf("PF_PP_WS_BACKOFF_MAX", 30.0)
-_WS_CONNECT_TIMEOUT   = _envf("PF_PP_WS_CONNECT_TIMEOUT", 15.0)
-
-__all__ = ["PumpPortalClient"]
+def _envf(name: str, default: float) -> float:
+    v = os.getenv(name)
+    try:
+        return float(v) if v not in (None, "") else default
+    except Exception:
+        return default
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+def _envb(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in _TRUE:
+        return True
+    if s in _FALSE:
+        return False
+    return default
+
+
+# -----------------------------------------------------------------------------
+# Knobs
+# -----------------------------------------------------------------------------
+_WS_PING_INTERVAL = _envf("PF_PP_WS_PING_INTERVAL", 20.0)
+_WS_PING_TIMEOUT = _envf("PF_PP_WS_PING_TIMEOUT", 30.0)
+_WS_CLOSE_TIMEOUT = _envf("PF_PP_WS_CLOSE_TIMEOUT", 5.0)
+_WS_MAX_SIZE = _envi("PF_PP_WS_MAX_SIZE", 2**23)  # ~8MB
+_WS_CONNECT_TIMEOUT = _envf("PF_PP_WS_CONNECT_TIMEOUT", 15.0)
+
+_WS_BACKOFF_MAX = _envf("PF_PP_WS_BACKOFF_MAX", 30.0)
+_WS_BACKOFF_BASE = _envf("PF_PP_WS_BACKOFF_BASE", 0.8)
+_WS_BACKOFF_JITTER = _envf("PF_PP_WS_BACKOFF_JITTER", 0.25)
+
+_SUB_CHUNK_SIZE = max(10, _envi("PF_PP_SUB_CHUNK_SIZE", 120))
+_VALIDATE_MINTS = _envb("PF_PP_VALIDATE_MINTS", True)
+
+# base58 (Solana mints / accounts)
+_BASE58 = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,64}$")
+
+
+def _valid_base58(x: str) -> bool:
+    return isinstance(x, str) and _BASE58.match(x) is not None
+
+
+def _dedup_keep_order(items: Iterable[str]) -> list[str]:
+    seen = set()
+    out: list[str] = []
+    for x in items:
+        x = (x or "").strip()
+        if not x:
+            continue
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def _chunk(items: list[str], n: int) -> list[list[str]]:
+    if n <= 0:
+        return [items]
+    return [items[i : i + n] for i in range(0, len(items), n)]
+
+
+def _safe_json_loads(raw: str | bytes) -> Any | None:
+    try:
+        s = raw.decode("utf-8", "ignore") if isinstance(raw, bytes | bytearray) else str(raw)
+        s = s.strip()
+        if not s:
+            return None
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+@dataclass(frozen=True)
+class PumpPortalEvent:
+    """
+    Normalized event emitted by `events()`.
+
+    kind:
+      - new_token  (txType=create)
+      - trade      (txType=buy/sell)
+      - info       (message present)
+      - warning    (errors present)
+      - unknown    (fallback)
+    """
+
+    kind: str
+    ts: int
+    raw: dict[str, Any]
+
+
+# -----------------------------------------------------------------------------
 # Client
-# ──────────────────────────────────────────────────────────────────────────────
-
+# -----------------------------------------------------------------------------
 class PumpPortalClient:
     """
-    Minimal PumpPortal websocket helper.
+    PumpPortal websocket helper.
 
-    It is designed to work with the current main.py which:
-      * constructs a PumpPortalClient
-      * logs client.masked_uri()
-      * manages the actual websocket connection itself
-      * calls client._subscribe(ws) once a connection is open
+    Two modes:
+      (A) EXTERNAL WS MODE (used by main.py):
+          - You create client
+          - You connect websocket elsewhere
+          - You call: await client._subscribe(ws)
 
-    Public bits used by the rest of the codebase:
-
-      - masked_uri() -> str
-      - uri          -> str
-      - account      -> str (optional)
-      - tokens       -> list[str] (optional)
-      - async _subscribe(ws_like)  # called by scripts/main.py
-
-    There is also an optional `events()` async generator that manages its own
-    connection for tests or standalone usage, but main.py does not rely on it.
+      (B) SELF-MANAGED MODE (tools/tests):
+          - Iterate: async for ev in client.events(): ...
+          - Client handles reconnect/backoff
     """
 
-    # ------------------------------------------------------------------ #
-    # construction / config
-    # ------------------------------------------------------------------ #
     def __init__(
         self,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         *,
-        account: Optional[str] = None,
-        tokens: Optional[List[str]] = None,
-        uri: Optional[str] = None,
+        account: str | None = None,
+        tokens: list[str] | None = None,
+        uri: str | None = None,
+        logger: logging.Logger | None = None,
     ) -> None:
-        # API key is required
-        self.api_key: str = api_key or _envs("PF_PP_KEY")
+        self._log = logger or LOG
+
+        self.api_key: str = (api_key or _env_any(["PF_PP_KEY", "PUMPPORTAL_KEY"], "")).strip()
         if not self.api_key:
-            raise RuntimeError("PF_PP_KEY not set")
+            raise RuntimeError("PumpPortal API key missing: set PF_PP_KEY (or PUMPPORTAL_KEY)")
 
-        # Optional account + token list (comma-separated env)
-        self.account: str = account or _envs("PF_PP_ACCOUNT") or ""
-        toks_env = [t.strip() for t in _envs("PF_PP_MINTS").split(",") if t.strip()]
-        self.tokens: List[str] = list(tokens) if tokens is not None else toks_env
+        self.account: str = (
+            account or _env_any(["PF_PP_ACCOUNT", "PUMPPORTAL_ACCOUNT"], "")
+        ).strip()
+        mints_env = _env_any(["PF_PP_MINTS", "PUMPPORTAL_MINTS"], "")
+        env_tokens = [t.strip() for t in mints_env.split(",") if t.strip()]
+        toks = list(tokens) if tokens is not None else env_tokens
+        toks = _dedup_keep_order(toks)
 
-        # Base URI + api-key query param
-        base_uri = uri or _envs("PF_PP_URI") or "wss://pumpportal.fun/api/data"
+        if _VALIDATE_MINTS:
+            toks = [t for t in toks if _valid_base58(t)]
+            if self.account and not _valid_base58(self.account):
+                self._log.warning(
+                    "pumpportal: PF_PP_ACCOUNT does not look base58; ignoring account subscription"
+                )
+                self.account = ""
+
+        self.tokens: list[str] = toks
+
+        base_uri = (
+            uri or _env_any(["PF_PP_URI", "PUMPPORTAL_URI"], "")
+        ).strip() or "wss://pumpportal.fun/api/data"
+        # Ensure api-key is present as query param (PumpPortal expects "api-key=")
         sep = "&" if "?" in base_uri else "?"
         self.uri: str = f"{base_uri}{sep}api-key={self.api_key}"
 
-        # internal tracking of last ws if we manage it ourselves
-        self._ws: Optional[WebSocketClientProtocol] = None
+        # self-managed ws state
+        self._ws: WSProto | None = None
         self._closed: bool = False
 
+        # subscription bookkeeping (avoid re-sending identical subs too often)
+        self._last_sub_sig: str = ""
+        self._last_sub_ts: float = 0.0
+        self._sub_lock = asyncio.Lock()
+
     # ------------------------------------------------------------------ #
-    # context manager (used when client manages its own ws)
+    # misc helpers
     # ------------------------------------------------------------------ #
-    async def __aenter__(self) -> "PumpPortalClient":
+    def masked_uri(self) -> str:
+        """URI safe for logs (api key masked)."""
+        key = self.api_key or ""
+        masked = "<hidden>" if len(key) <= 12 else key[:4] + "..." + key[-4:]
+
+        # Replace only the value of api-key=
+        return re.sub(r"(api-key=)[^&]+", r"\1" + masked, self.uri)
+
+    @staticmethod
+    def classify(msg: dict[str, Any]) -> str:
+        tx = msg.get("txType")
+        if tx == "create":
+            return "new_token"
+        if tx in ("buy", "sell"):
+            return "trade"
+        if "errors" in msg:
+            return "warning"
+        if "message" in msg:
+            return "info"
+        return "unknown"
+
+    # ------------------------------------------------------------------ #
+    # ws normalization helper (external mode)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _normalize_ws(ws_like: Any) -> Any | None:
+        """
+        Normalize ws-like objects coming from other modules.
+
+        Returns:
+          - websocket protocol-ish object with `.send` coroutine
+          - or None if unusable
+        """
+        if ws_like is None:
+            return None
+        if isinstance(ws_like, str):
+            # common footgun: passing URI instead of protocol
+            return None
+        if hasattr(ws_like, "send"):
+            return ws_like
+        return None
+
+    # ------------------------------------------------------------------ #
+    # subscription (EXTERNAL WS MODE)
+    # ------------------------------------------------------------------ #
+    async def _subscribe(self, ws_like: Any) -> None:
+        """
+        Subscribe a CONNECTED websocket to PumpPortal channels.
+
+        This method is intentionally forgiving; it will no-op if passed a bad ws.
+        """
+        ws = self._normalize_ws(ws_like)
+        if ws is None:
+            return
+
+        # Create a subscription signature so we don't spam re-sends on reconnect loops
+        sig = f"acct={self.account}|mints={','.join(self.tokens)}"
+        async with self._sub_lock:
+            now = time.time()
+            # allow re-subscribe if signature changed or enough time passed
+            if sig == self._last_sub_sig and (now - self._last_sub_ts) < 5.0:
+                return
+            self._last_sub_sig = sig
+            self._last_sub_ts = now
+
+        # Always subscribe to new token stream
+        await self._safe_send(ws, {"method": "subscribeNewToken"})
+
+        # Token trade stream (chunked)
+        if self.tokens:
+            for batch in _chunk(self.tokens, _SUB_CHUNK_SIZE):
+                await self._safe_send(ws, {"method": "subscribeTokenTrade", "keys": batch})
+
+        # Account trade stream
+        if self.account:
+            await self._safe_send(ws, {"method": "subscribeAccountTrade", "keys": [self.account]})
+
+    async def _safe_send(self, ws: Any, payload: dict[str, Any]) -> None:
+        try:
+            await ws.send(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+        except Exception:
+            # don't crash the outer loop; caller handles reconnect
+            return
+
+    # ------------------------------------------------------------------ #
+    # lifecycle for SELF-MANAGED MODE
+    # ------------------------------------------------------------------ #
+    async def __aenter__(self) -> PumpPortalClient:
         self._closed = False
         return self
 
@@ -114,191 +382,123 @@ class PumpPortalClient:
         await self.close()
 
     async def close(self) -> None:
-        """Gracefully close any internally managed websocket."""
+        """Close any internally managed websocket (best-effort)."""
         self._closed = True
         ws = self._ws
         self._ws = None
         if ws is None:
             return
         try:
-            await asyncio.wait_for(ws.close(code=1000), timeout=_WS_CLOSE_TIMEOUT)
+            await asyncio.wait_for(ws.close(code=1000), timeout=_WS_CLOSE_TIMEOUT)  # type: ignore[attr-defined]
         except Exception:
-            # best-effort cleanup; underlying transport may already be dead
             pass
 
-    # ------------------------------------------------------------------ #
-    # misc helpers
-    # ------------------------------------------------------------------ #
-    def masked_uri(self) -> str:
-        """Return the websocket URI with the api-key masked for logging."""
-        def mask(s: str) -> str:
-            return s[:4] + "..." + s[-4:] if s and len(s) > 12 else "<hidden>"
-
-        # only mask the value part of api-key
-        return re.sub(r"(api-key=)[^&]+", r"\1" + mask(self.api_key), self.uri)
-
-    @staticmethod
-    def _classify(msg: Dict[str, Any]) -> str:
-        """Classify PumpPortal message into a simple kind string."""
-        tx = msg.get("txType")
-        if tx == "create":
-            return "new_token"
-        if tx in ("buy", "sell"):
-            return "trade"
-        if "message" in msg:
-            return "info"
-        if "errors" in msg:
-            return "warning"
-        return "unknown"
-
-    # ------------------------------------------------------------------ #
-    # ws normalization helper
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _normalize_ws(ws_like: Any) -> Optional[WebSocketClientProtocol]:
+    async def _open_ws(self) -> tuple[Any, Any]:
         """
-        Normalize the `ws` object passed in from main.py.
-
-        - If it's already a WebSocketClientProtocol, return it.
-        - If it's None, a string, or anything without `.send`, return None.
-          (This avoids `AttributeError: 'str' object has no attribute 'send'`.)
+        Open websocket using websockets.connect as an async CM, with a connect timeout.
+        Returns (ws, connect_cm) where connect_cm is the context manager to close.
         """
-        if isinstance(ws_like, WebSocketClientProtocol):
-            return ws_like
+        connect_cm = websockets.connect(
+            self.uri,
+            ping_interval=_WS_PING_INTERVAL,
+            ping_timeout=_WS_PING_TIMEOUT,
+            close_timeout=_WS_CLOSE_TIMEOUT,
+            max_size=_WS_MAX_SIZE,
+        )
+        # websockets.connect returns an awaitable/async-cm object; use __aenter__/__aexit__
+        ws = await asyncio.wait_for(connect_cm.__aenter__(), timeout=_WS_CONNECT_TIMEOUT)
+        return ws, connect_cm
 
-        # Common bug: `ws_like` accidentally a URI or sentinel string.
-        if isinstance(ws_like, str):
-            return None
+    async def _close_ws_cm(self, connect_cm: Any) -> None:
+        with contextlib.suppress(Exception):
+            await connect_cm.__aexit__(None, None, None)
 
-        # Generic structural check – if there's no send coroutine, we can't use it.
-        if not hasattr(ws_like, "send"):
-            return None
-
-        # If it looks like a websocket but isn't our type, still try to use it.
-        return ws_like  # type: ignore[return-value]
-
-    # ------------------------------------------------------------------ #
-    # subscription used by scripts/main.py
-    # ------------------------------------------------------------------ #
-    async def _subscribe(self, ws_like: Any) -> None:
-        """
-        Subscribe a *connected* websocket to PumpPortal channels.
-
-        main.py is responsible for:
-          - building the websocket connection
-          - passing the connection object into this method
-
-        This method is robust against being handed a string or other bad type:
-          it will simply no-op instead of raising.
-        """
-        ws = self._normalize_ws(ws_like)
-        if ws is None:
-            # Nothing we can do – caller handed us a bad object.
-            # We intentionally do NOT raise here to keep the main loop alive.
-            return
-
-        # Public new-token stream (free)
-        await ws.send(json.dumps({"method": "subscribeNewToken"}))
-
-        # Token-trade stream (optional)
-        if self.tokens:
-            await ws.send(
-                json.dumps(
-                    {
-                        "method": "subscribeTokenTrade",
-                        "keys": self.tokens,
-                    }
-                )
-            )
-
-        # Account-trade stream (optional)
-        if self.account:
-            await ws.send(
-                json.dumps(
-                    {
-                        "method": "subscribeAccountTrade",
-                        "keys": [self.account],
-                    }
-                )
-            )
+    def _backoff_sleep(self, attempt: int) -> float:
+        base = min(_WS_BACKOFF_MAX, _WS_BACKOFF_BASE * (1.7 ** max(0, attempt - 1)))
+        return min(_WS_BACKOFF_MAX, base + random.uniform(0.0, _WS_BACKOFF_JITTER))
 
     # ------------------------------------------------------------------ #
-    # Optional self-managed event stream (not used by main.py currently)
+    # SELF-MANAGED event stream
     # ------------------------------------------------------------------ #
-    async def events(self) -> AsyncGenerator[Dict[str, Any], None]:
+    async def events(self) -> AsyncGenerator[PumpPortalEvent, None]:
         """
         Async generator that:
           - manages its own websocket connection
-          - auto-reconnects with exponential backoff
-          - yields dicts of the form:
-                {"kind": <str>, "raw": <PumpPortal message dict>}
+          - auto-reconnects with exponential backoff + jitter
+          - yields PumpPortalEvent(kind, ts, raw_dict)
 
-        This is mainly useful for tests or standalone tools.
-        The main sniper loop currently uses its own connection and only calls
-        `_subscribe(ws)` from this class.
+        NOTE: main sniper loop may not use this; it’s great for tests/tools.
         """
-        backoff = 1.0
+        attempt = 0
         while not self._closed:
+            connect_cm = None
+            ws = None
             try:
-                connect_ctx = websockets.connect(
-                    self.uri,
-                    ping_interval=_WS_PING_INTERVAL,
-                    ping_timeout=_WS_PING_TIMEOUT,
-                    close_timeout=_WS_CLOSE_TIMEOUT,
-                    max_size=_WS_MAX_SIZE,
-                )
+                attempt += 1
+                ws, connect_cm = await self._open_ws()
+                self._ws = ws
+                attempt = 0  # reset after successful connect
 
-                # protect connect with timeout
-                async with asyncio.timeout(_WS_CONNECT_TIMEOUT):
-                    ws = await connect_ctx.__aenter__()
+                # Subscribe after connect
+                await self._subscribe(ws)
 
-                try:
-                    self._ws = ws
-                    await self._subscribe(ws)
-                    backoff = 1.0  # reset after successful connect
+                async for raw in ws:
+                    if self._closed:
+                        break
 
-                    async for raw in ws:
-                        if self._closed:
-                            break
+                    msg_any = _safe_json_loads(raw)
+                    if not isinstance(msg_any, dict):
+                        continue
 
-                        try:
-                            msg = json.loads(raw)
-                        except Exception:
-                            continue
-                        if not isinstance(msg, dict):
-                            continue
+                    # Known PumpPortal warning when key invalid for some streams:
+                    # "Invalid API key. PumpSwap data will not be streamed."
+                    # We keep connection alive; new-token is typically still free.
+                    if (
+                        msg_any.get("errors")
+                        == "Invalid API key. PumpSwap data will not be streamed."
+                    ):
+                        continue
 
-                        # Known server text when API key is invalid – keep socket
-                        if msg.get("errors") == "Invalid API key. PumpSwap data will not be streamed.":
-                            # New-token feed is still free; ignore this line.
-                            continue
+                    kind = self.classify(msg_any)
+                    yield PumpPortalEvent(kind=kind, ts=int(time.time()), raw=msg_any)
 
-                        yield {"kind": self._classify(msg), "raw": msg}
-
-                finally:
-                    self._ws = None
-                    try:
-                        await connect_ctx.__aexit__(None, None, None)
-                    except Exception:
-                        pass
-
-            except asyncio.TimeoutError:
-                # connect timeout — fall through to backoff
-                pass
             except asyncio.CancelledError:
-                # caller cancelled iteration
                 break
             except (ConnectionClosedOK, ConnectionClosed, ConnectionClosedError):
-                if self._closed:
-                    break
-                # transient; fall through to backoff
-            except Exception:
-                # Generic transient error — let backoff handle retries.
+                # transient unless we are closing
                 pass
+            except TimeoutError:
+                # connect timeout
+                pass
+            except Exception:
+                # keep resilient; backoff will apply
+                pass
+            finally:
+                self._ws = None
+                if connect_cm is not None:
+                    await self._close_ws_cm(connect_cm)
 
             if self._closed:
                 break
 
-            # exponential backoff with cap
-            await asyncio.sleep(backoff)
-            backoff = min(_WS_BACKOFF_MAX, backoff * 1.7)
+            # backoff
+            sleep_s = self._backoff_sleep(attempt=max(1, attempt))
+            await asyncio.sleep(sleep_s)
+
+    # ------------------------------------------------------------------ #
+    # Mutators (optional)
+    # ------------------------------------------------------------------ #
+    def set_account(self, account: str) -> None:
+        account = (account or "").strip()
+        if _VALIDATE_MINTS and account and not _valid_base58(account):
+            raise ValueError("Account does not look like a base58 Solana pubkey")
+        self.account = account
+
+    def set_tokens(self, tokens: list[str]) -> None:
+        toks = _dedup_keep_order(tokens or [])
+        if _VALIDATE_MINTS:
+            toks = [t for t in toks if _valid_base58(t)]
+        self.tokens = toks
+
+
+__all__ = ["PumpPortalClient", "PumpPortalEvent"]

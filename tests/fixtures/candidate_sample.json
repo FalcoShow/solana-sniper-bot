@@ -1,0 +1,82 @@
+{
+  "schema_version": "1",
+  "source": "candidate_snapshot",
+  "captured_at_utc": "2026-01-06T00:00:00Z",
+  "notes": "Static, synthetic candidate fixture used by contract tests for feature_builder + ai_entry_logic. No network.",
+  "candidate": {
+    "mint": "9xQeWvG816bUx9EPfLk7pQyG2kYQWqY8XJg1p9aVbFhS",
+    "sym": "TESTA",
+    "symbol": "TESTA",
+    "name": "Test A",
+    "source": "fixture",
+    "chain": "solana",
+    "dex": "raydium",
+
+    "base_mint": "So11111111111111111111111111111111111111112",
+    "quote_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "pair_address": "9Qp9w9n9pQp9w9n9pQp9w9n9pQp9w9n9pQp9w9n9pQp9",
+
+    "ts": 1767657600,
+    "age_min": 12.5,
+
+    "price": 0.0042,
+    "price_usd": 0.0042,
+    "price_native": 0.000020,
+
+    "liq": 215000.5,
+    "liq_usd": 215000.5,
+
+    "vol5": 12850.25,
+    "vol5_usd": 12850.25,
+    "buys5": 42,
+    "sells5": 31,
+    "chg5": 6.8,
+
+    "vol15": 39010.75,
+    "buys15": 118,
+    "sells15": 96,
+    "chg15": 11.2,
+
+    "vol60": 142000.0,
+    "buys60": 420,
+    "sells60": 365,
+    "chg60": 18.5,
+
+    "vol300": 410000.0,
+    "buys300": 1180,
+    "sells300": 940,
+    "chg300": 55.0,
+
+    "txns5": 73,
+    "txns15": 214,
+    "txns60": 785,
+
+    "spread_bps": 35.0,
+    "impact_bps_est": 55.0,
+
+    "fdv_usd": 1200000.0,
+    "mcap_usd": 980000.0,
+
+    "holders_est": 4100,
+    "top10_holders_pct_est": 14.5,
+
+    "flags": [],
+    "risk": {
+      "is_flagged": false,
+      "flags": [],
+      "honeypot_suspected": false,
+      "rug_suspected": false
+    },
+
+    "social": {
+      "twitter": "https://x.com/testa_token",
+      "telegram": "https://t.me/testa_token",
+      "website": "https://example.com/testa"
+    },
+
+    "raw": {
+      "hint": "This nested raw block exists to mimic real scanners that keep original payloads.",
+      "origin": "synthetic_fixture"
+    }
+  }
+}

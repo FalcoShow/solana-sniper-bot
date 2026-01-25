@@ -1,23 +1,23 @@
 # scripts/trades_viewer.py
-import asyncio
 import argparse
+import asyncio
 import csv
 import json
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import text
 
 from utils_pkg.core_utils import (
-    init_resources,
+    PG_ENABLED,
     close_resources,
     get_pg_engine,
-    PG_ENABLED,
+    init_resources,
 )
 
 
-def _parse_rel_ts(s: Optional[str]) -> Optional[datetime]:
+def _parse_rel_ts(s: str | None) -> datetime | None:
     """
     Parse relative/absolute timestamps.
       - '24h', '7d', '90m'
@@ -27,7 +27,7 @@ def _parse_rel_ts(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
     s = s.strip()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     try:
         if s.endswith(("h", "H")):
             n = float(s[:-1])
@@ -41,16 +41,13 @@ def _parse_rel_ts(s: Optional[str]) -> Optional[datetime]:
         # Date or datetime
         dt = datetime.fromisoformat(s)
         # If naive, assume UTC
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        else:
-            dt = dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
         return dt
     except Exception:
         return None
 
 
-def _row_to_mapping(row) -> Dict[str, Any]:
+def _row_to_mapping(row) -> dict[str, Any]:
     # SQLAlchemy 2.0: Row has ._mapping
     if hasattr(row, "_mapping"):
         return dict(row._mapping)
@@ -62,7 +59,7 @@ def _row_to_mapping(row) -> Dict[str, Any]:
         return {str(i): v for i, v in enumerate(row)}
 
 
-async def _detect_schema() -> Tuple[str, List[str]]:
+async def _detect_schema() -> tuple[str, list[str]]:
     """
     Detect which trade schema exists:
       - 'new'  -> uses columns: ts, symbol, token, side, sol_amount, price_sol, price_usd, pnl_sol, pnl_usd, reason, signature
@@ -113,20 +110,20 @@ async def _detect_schema() -> Tuple[str, List[str]]:
 
 async def _fetch_rows(
     limit: int,
-    side: Optional[str],
-    symbol: Optional[str],
-    token: Optional[str],
-    since_dt: Optional[datetime],
-    until_dt: Optional[datetime],
-    min_amount: Optional[float],
-    min_pnl_usd: Optional[float],
+    side: str | None,
+    symbol: str | None,
+    token: str | None,
+    since_dt: datetime | None,
+    until_dt: datetime | None,
+    min_amount: float | None,
+    min_pnl_usd: float | None,
     order: str,
-) -> Tuple[str, List[str], List[Dict[str, Any]]]:
+) -> tuple[str, list[str], list[dict[str, Any]]]:
     schema, cols = await _detect_schema()
     eng = get_pg_engine()
 
     where = ["1=1"]
-    params: Dict[str, Any] = {}
+    params: dict[str, Any] = {}
 
     if side:
         where.append("side = :side")
@@ -175,7 +172,7 @@ async def _fetch_rows(
     return schema, cols, mapped
 
 
-def _fmt_table(cols: List[str], rows: List[Dict[str, Any]]) -> str:
+def _fmt_table(cols: list[str], rows: list[dict[str, Any]]) -> str:
     # Make a simple fixed-width table
     # Truncate long signature for readability
     def fmt_val(k: str, v: Any) -> str:
@@ -206,7 +203,7 @@ def _fmt_table(cols: List[str], rows: List[Dict[str, Any]]) -> str:
     return "\n".join(out)
 
 
-def _write_csv(path: str, cols: List[str], rows: List[Dict[str, Any]]) -> str:
+def _write_csv(path: str, cols: list[str], rows: list[dict[str, Any]]) -> str:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -222,10 +219,21 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--side", choices=["buy", "sell"], default=None)
     ap.add_argument("--symbol", type=str, default=None, help="Symbol filter, supports ILIKE")
     ap.add_argument("--token", type=str, default=None, help="Exact token mint")
-    ap.add_argument("--since", type=str, default=None, help="e.g. 24h, 7d, 90m, 2025-08-01, 2025-08-01T12:34:56")
-    ap.add_argument("--until", type=str, default=None, help="same formats as --since (default: now)")
-    ap.add_argument("--min-amount", type=float, default=None, help="Min trade amount (SOL for new schema, token units for legacy)")
-    ap.add_argument("--min-pnl-usd", type=float, default=None, help="Min realized PnL in USD (new schema only)")
+    ap.add_argument(
+        "--since", type=str, default=None, help="e.g. 24h, 7d, 90m, 2025-08-01, 2025-08-01T12:34:56"
+    )
+    ap.add_argument(
+        "--until", type=str, default=None, help="same formats as --since (default: now)"
+    )
+    ap.add_argument(
+        "--min-amount",
+        type=float,
+        default=None,
+        help="Min trade amount (SOL for new schema, token units for legacy)",
+    )
+    ap.add_argument(
+        "--min-pnl-usd", type=float, default=None, help="Min realized PnL in USD (new schema only)"
+    )
     ap.add_argument("--order", choices=["asc", "desc"], default="desc", help="Sort by ts")
     ap.add_argument("--json", action="store_true", help="Emit JSON instead of table")
     ap.add_argument("--csv", type=str, default=None, help="Write CSV to this path")
@@ -240,7 +248,7 @@ async def main_async(args: argparse.Namespace) -> None:
             return
 
         since_dt = _parse_rel_ts(args.since)
-        until_dt = _parse_rel_ts(args.until) or datetime.now(timezone.utc)
+        until_dt = _parse_rel_ts(args.until) or datetime.now(UTC)
 
         schema, cols, rows = await _fetch_rows(
             limit=args.limit,

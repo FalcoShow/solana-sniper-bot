@@ -1,163 +1,432 @@
 #!/usr/bin/env bash
-# go_live.sh — flip DRYRUN off and restart safely (or smoke test only)
+# deploy_tools/go_live.sh — V3+++ GO-LIVE Orchestrator (LOCK-IN)
+# =============================================================================
+# Purpose:
+#   Run preflight + smoke suite, then start the service.
+#   Optionally flip DRYRUN off (locally via .env edit, or process env override).
+#
+# Design rules:
+#   - Deterministic exit codes (0 success, 2 failure)
+#   - No secret leaks (never prints full DSNs / tokens)
+#   - Render-safe: does NOT require .env to exist or be writable
+#   - No "pkill -f start.sh" foot-gun. Optional PIDFILE support only.
+#   - Preflight/smokes MUST pass before starting unless --no-smoke is used.
+#
+# Usage:
+#   bash deploy_tools/go_live.sh
+#   SMOKE_ONLY=1 bash deploy_tools/go_live.sh
+#
+# Flags:
+#   --smoke-only            Run checks only; do not start, do not flip DRYRUN
+#   --no-smoke              Skip preflight/smokes (NOT recommended)
+#   --start-only            Start only (skip flips + smokes)
+#   --set-dryrun=0|1        Desired DRYRUN value (default: 0 if not smoke-only)
+#   --env-file=PATH         .env file to edit (default: repo/.env)
+#   --pidfile=PATH          PID file to stop before starting (default: repo/.run/sniper.pid)
+#   --background            Start in background (local dev); default is exec (Render-friendly)
+#   --log=PATH              Log file path (default: /tmp/go_live.log)
+# =============================================================================
+
 set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# bash niceties
+shopt -s inherit_errexit 2>/dev/null || true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Repo root + defaults
+# ──────────────────────────────────────────────────────────────────────────────
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-ENVFILE="$ROOT/.env"
-BACKUP_TMP="$(mktemp -u "$ROOT/.env.bak.XXXXXXXX")"
-LOG="${LOG:-/tmp/go_live.log}"
+LOG_DEFAULT="/tmp/go_live.log"
+RUN_DIR_DEFAULT="$ROOT/.run"
+PIDFILE_DEFAULT="$RUN_DIR_DEFAULT/sniper.pid"
+ENVFILE_DEFAULT="$ROOT/.env"
 
-# Optional Telegram notify (skip if not configured)
+SMOKE_ONLY="${SMOKE_ONLY:-0}"
+NO_SMOKE="${NO_SMOKE:-0}"
+START_ONLY="${START_ONLY:-0}"
+BACKGROUND="${BACKGROUND:-0}"
+
+# Default target: go-live (DRYRUN=0) unless smoke-only
+SET_DRYRUN_DEFAULT="0"
+[[ "${SMOKE_ONLY}" == "1" ]] && SET_DRYRUN_DEFAULT="1"
+SET_DRYRUN="${SET_DRYRUN:-$SET_DRYRUN_DEFAULT}"
+
+ENVFILE="${ENVFILE:-$ENVFILE_DEFAULT}"
+PIDFILE="${PIDFILE:-$PIDFILE_DEFAULT}"
+LOG="${LOG:-$LOG_DEFAULT}"
+
+# Optional Telegram (SAFE: no chat autodiscovery here)
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
-# SMOKE_ONLY=1 → do NOT flip DRYRUN, just run checks & restart
-SMOKE_ONLY="${SMOKE_ONLY:-0}"
+# Keep track of whether we actually edited ENVFILE (for rollback)
+ENV_EDITED="0"
+BACKUP_PATH=""
 
-send_tg () {
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging + safety helpers
+# ──────────────────────────────────────────────────────────────────────────────
+ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+log() {
   local msg="$1"
-  if [[ -n "$TELEGRAM_BOT_TOKEN" ]]; then
-    # try provided chat id, else attempt to auto-discover the last chat if possible
-    if [[ -z "$TELEGRAM_CHAT_ID" ]]; then
-      local _chat
-      _chat="$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" \
-        | python -c "import sys,json;d=json.load(sys.stdin);r=d.get('result',[]);print(r[-1]['message']['chat']['id'] if r else '')" 2>/dev/null || true)"
-      TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-$_chat}"
-    fi
-    if [[ -n "$TELEGRAM_CHAT_ID" ]]; then
-      curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        -d chat_id="${TELEGRAM_CHAT_ID}" -d text="$msg" >/dev/null || true
-    fi
+  echo "[go_live] $(ts) ${msg}" | tee -a "$LOG" >&2
+}
+
+die() {
+  local msg="$1"
+  log "ERROR: ${msg}"
+  return 2
+}
+
+mask() {
+  # Mask long strings (tokens/keys). Keep first 4 chars only.
+  local s="${1:-}"
+  local n="${#s}"
+  if [[ $n -le 4 ]]; then
+    printf "%s" "****"
+  else
+    printf "%s" "${s:0:4}****"
   fi
 }
 
-# safe snapshot: write a quoted .env when none exists
-snapshot_env_if_missing () {
-  if [[ -f "$ENVFILE" ]]; then return 0; fi
-  echo "[go_live] .env not found; snapshotting current environment -> $ENVFILE" | tee -a "$LOG"
-  python - <<'PY' > "$ENVFILE"
-import os, shlex
-prefixes=("PF_","JUP_","JUPITER_","ROUTER_","ROUTEGUARD_","ENTRY_",
-          "RAYDIUM_","PUMP_","JITO_","TELEGRAM_","PG_","DB_",
-          "BUDGET_","TICKET_","BUY_","SELL_","HEALTH","RELAY_",
-          "START_","DRYRUN")
-def needs_quote(v: str) -> bool:
-    # quote if value contains characters that will break shell parsing, including '=' and ';'
-    return any(c in v for c in '=; #&$`"\\')
-keys=[k for k in os.environ if k.startswith(prefixes) or k in ("DATABASE_URL","PNL_DSN")]
-with open(".env","w") as f:
-  for k in sorted(keys):
-    v=os.environ[k]
-    if needs_quote(v): v = shlex.quote(v)
-    f.write(f"{k}={v}\n")
-print("snapshot complete")
-PY
-  echo "[go_live] snapshot complete" | tee -a "$LOG"
+send_tg() {
+  local msg="$1"
+  [[ -z "$TELEGRAM_BOT_TOKEN" ]] && return 0
+  [[ -z "$TELEGRAM_CHAT_ID" ]] && return 0
+  # best-effort, never fail the pipeline
+  curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${TELEGRAM_CHAT_ID}" -d "text=${msg}" >/dev/null 2>&1 || true
 }
 
-backup_env () {
-  # create timestamped backup; use safe move to avoid partial copies
-  local stamp
-  stamp="$(date +%Y%m%d-%H%M%S)"
-  BACKUP="$ROOT/.env.bak.${stamp}"
-  echo "[go_live] Backing up $ENVFILE -> $BACKUP" | tee -a "$LOG"
-  if ! cp -p "$ENVFILE" "$BACKUP"; then
-    echo "[go_live] Warning: failed to copy $ENVFILE to $BACKUP" | tee -a "$LOG"
+python_bin() {
+  # prefer python3 if available
+  if command -v python3 >/dev/null 2>&1; then echo "python3"; return 0; fi
+  if command -v python  >/dev/null 2>&1; then echo "python";  return 0; fi
+  echo "python"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Locking (avoid concurrent runs)
+# ──────────────────────────────────────────────────────────────────────────────
+LOCKFILE="$RUN_DIR_DEFAULT/go_live.lock"
+
+acquire_lock() {
+  mkdir -p "$RUN_DIR_DEFAULT"
+  exec 9>"$LOCKFILE"
+  if ! flock -n 9; then
+    log "Another go_live is already running (lock: $LOCKFILE)"
+    exit 2
   fi
 }
 
-load_env () {
-  # export everything from .env so Python modules see it; don't fail if file missing
+# ──────────────────────────────────────────────────────────────────────────────
+# Env loading / editing
+# ──────────────────────────────────────────────────────────────────────────────
+load_envfile_if_present() {
   if [[ -f "$ENVFILE" ]]; then
-    # use a subshell to avoid polluting caller env if needed — but we want to export to current shell:
-    set -a
     # shellcheck disable=SC1090
+    set -a
     . "$ENVFILE"
     set +a
+    log "Loaded env file: $(basename "$ENVFILE")"
   else
-    echo "[go_live] load_env: $ENVFILE not present, nothing loaded" | tee -a "$LOG"
+    log "No env file found at $ENVFILE (OK on Render; using process env)"
   fi
 }
 
-flip_dryrun_if_needed () {
+backup_envfile_if_present() {
+  [[ -f "$ENVFILE" ]] || return 0
+  local stamp
+  stamp="$(date -u +"%Y%m%d-%H%M%S")"
+  mkdir -p "$RUN_DIR_DEFAULT/backups"
+  BACKUP_PATH="$RUN_DIR_DEFAULT/backups/.env.bak.${stamp}"
+  cp -p "$ENVFILE" "$BACKUP_PATH" || true
+  log "Backup created: $BACKUP_PATH"
+}
+
+edit_envfile_set_key() {
+  local key="$1"
+  local val="$2"
+
+  [[ -f "$ENVFILE" ]] || return 1
+  [[ -w "$ENVFILE" ]] || return 1
+
+  local tmp="${ENVFILE}.tmp.$$"
+  local found="0"
+
+  # Replace first occurrence; else append
+  awk -v k="$key" -v v="$val" '
+    BEGIN { found=0 }
+    $0 ~ "^"k"=" && found==0 { print k"="v; found=1; next }
+    { print }
+    END { if(found==0) print k"="v }
+  ' "$ENVFILE" > "$tmp"
+
+  mv -f "$tmp" "$ENVFILE"
+  return 0
+}
+
+set_dryrun_mode() {
+  # Desired DRYRUN set via SET_DRYRUN (0/1)
+  local want="${SET_DRYRUN}"
+  if [[ "$want" != "0" && "$want" != "1" ]]; then
+    die "Invalid --set-dryrun value: $want (must be 0 or 1)"
+    return 2
+  fi
+
+  # Smoke-only never edits env or starts
   if [[ "$SMOKE_ONLY" == "1" ]]; then
-    echo "[go_live] SMOKE_ONLY=1 → leaving DRYRUN unchanged" | tee -a "$LOG"
+    log "SMOKE_ONLY=1 -> not flipping DRYRUN"
     return 0
   fi
-  if [[ ! -f "$ENVFILE" ]]; then
-    echo "[go_live] ERROR: cannot flip DRYRUN because $ENVFILE is missing" | tee -a "$LOG"
-    return 1
+
+  # Start-only: don’t change DRYRUN unless user explicitly sets it via env
+  if [[ "$START_ONLY" == "1" ]]; then
+    log "START_ONLY=1 -> not flipping DRYRUN"
+    return 0
   fi
-  if grep -q '^DRYRUN=True' "$ENVFILE"; then
-    # atomic edit: write to tmp and move
-    local tmp="${ENVFILE}.tmp.$$"
-    sed '0,/^DRYRUN=True/{s/^DRYRUN=True/DRYRUN=False/}' "$ENVFILE" > "$tmp"
-    mv -f "$tmp" "$ENVFILE"
-    echo "[go_live] DRYRUN=True → DRYRUN=False" | tee -a "$LOG"
-  elif grep -q '^DRYRUN=False' "$ENVFILE"; then
-    echo "[go_live] DRYRUN already False" | tee -a "$LOG"
+
+  # If ENVFILE is editable, persist change there. Otherwise export for this run.
+  if edit_envfile_set_key "DRYRUN" "$want"; then
+    # Keep IS_DRYRUN aligned too if present/wanted
+    edit_envfile_set_key "IS_DRYRUN" "$want" || true
+    ENV_EDITED="1"
+    log "Persisted DRYRUN=${want} in $(basename "$ENVFILE")"
   else
-    echo "DRYRUN=False" >> "$ENVFILE"
-    echo "[go_live] DRYRUN key not found; appended DRYRUN=False" | tee -a "$LOG"
+    export DRYRUN="$want"
+    export IS_DRYRUN="$want"
+    log "ENVFILE not writable/present; using process env DRYRUN=${want} (Render-safe)"
+  fi
+
+  return 0
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rollback (only if we actually edited ENVFILE)
+# ──────────────────────────────────────────────────────────────────────────────
+rollback_envfile() {
+  local why="$1"
+  log "Rollback requested: $why"
+
+  if [[ "$ENV_EDITED" != "1" ]]; then
+    log "No persisted env edit occurred; skipping rollback."
+    return 0
+  fi
+
+  if [[ -n "$BACKUP_PATH" && -f "$BACKUP_PATH" ]]; then
+    if [[ -x "$ROOT/deploy_tools/rollback.sh" ]]; then
+      bash "$ROOT/deploy_tools/rollback.sh" "$BACKUP_PATH" >>"$LOG" 2>&1 || true
+      log "Rollback attempted via rollback.sh (backup: $BACKUP_PATH)"
+    else
+      # fallback: restore directly
+      cp -f "$BACKUP_PATH" "$ENVFILE" >>"$LOG" 2>&1 || true
+      log "Rollback attempted via direct restore (backup: $BACKUP_PATH)"
+    fi
+    send_tg "[ROLLBACK] ${why} — env restored from backup."
+  else
+    log "No backup available; cannot rollback ENVFILE safely."
+    send_tg "[ROLLBACK-FAILED] ${why} — no backup available."
   fi
 }
 
-rollback_and_exit () {
-  local why="$1"
-  echo "[go_live] ERROR: $why — attempting rollback" | tee -a "$LOG"
-  if [[ -n "${BACKUP:-}" && -f "$BACKUP" ]]; then
-    bash "$ROOT/deploy_tools/rollback.sh" "$BACKUP" 2>&1 | tee -a "$LOG" || true
-    send_tg "[ROLLBACK] $why — env restored from backup."
-  else
-    echo "[go_live] No backup found to rollback to." | tee -a "$LOG"
-    send_tg "[ROLLBACK-FAILED] $why — no backup available."
+# ──────────────────────────────────────────────────────────────────────────────
+# Preflight + Smokes
+# ──────────────────────────────────────────────────────────────────────────────
+run_cmd() {
+  local name="$1"; shift
+  log "RUN: ${name} :: $*"
+  "$@" >>"$LOG" 2>&1
+}
+
+run_python_module() {
+  local mod="$1"
+  local py
+  py="$(python_bin)"
+
+  # If module doesn't exist, fail hard (LOCK-IN) unless NO_SMOKE
+  if ! "$py" -c "import importlib; import sys; sys.exit(0 if importlib.util.find_spec('$mod') else 2)" >>"$LOG" 2>&1; then
+    log "MISSING MODULE: $mod"
+    return 2
   fi
+
+  run_cmd "python -m $mod" "$py" -m "$mod"
+}
+
+run_smoke_suite() {
+  [[ "$NO_SMOKE" == "1" ]] && { log "NO_SMOKE=1 -> skipping preflight/smokes (NOT recommended)"; return 0; }
+  [[ "$START_ONLY" == "1" ]] && { log "START_ONLY=1 -> skipping preflight/smokes"; return 0; }
+
+  log "────────────────────────────────────────────────────────────"
+  log "Preflight + Smoke Suite (LOCK-IN)"
+  log "────────────────────────────────────────────────────────────"
+
+  # Preflight (if present)
+  if ! run_python_module "scripts.preflight"; then
+    log "Preflight module missing; falling back to check_router only"
+    run_python_module "scripts.check_router" || return 2
+  fi
+
+  # Canonical smoke stack
+  run_python_module "scripts.smoke_init"      || return 2
+  run_python_module "scripts.smoke_core"      || return 2
+  run_python_module "scripts.smoke_lightning" || return 2
+  run_python_module "scripts.smoke_pg_only"   || return 2
+
+  # Integration smoke (unit runner)
+  local py
+  py="$(python_bin)"
+  run_cmd "integration smoke" "$py" "tests/integration_smoke.py" || return 2
+
+  log "Smoke suite: OK"
+  return 0
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Start service (Render-friendly default = exec)
+# ──────────────────────────────────────────────────────────────────────────────
+stop_existing_if_pidfile() {
+  [[ -f "$PIDFILE" ]] || return 0
+  local pid
+  pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 0
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    log "Stopping existing process from PIDFILE=$PIDFILE (pid=$pid)"
+    kill "$pid" >/dev/null 2>&1 || true
+    sleep 1
+    kill -9 "$pid" >/dev/null 2>&1 || true
+  fi
+  rm -f "$PIDFILE" >/dev/null 2>&1 || true
+}
+
+start_service() {
+  [[ "$SMOKE_ONLY" == "1" ]] && { log "SMOKE_ONLY=1 -> not starting service"; return 0; }
+
+  local start_cmd=("$ROOT/start.sh")
+
+  if [[ ! -x "${start_cmd[0]}" ]]; then
+    die "Missing or non-executable start.sh at ${start_cmd[0]}"
+    return 2
+  fi
+
+  mkdir -p "$RUN_DIR_DEFAULT"
+
+  stop_existing_if_pidfile
+
+  if [[ "$BACKGROUND" == "1" ]]; then
+    log "Starting in background (local dev mode)"
+    nohup bash "${start_cmd[0]}" >>"$ROOT/.run/sniper.out" 2>&1 &
+    echo $! > "$PIDFILE"
+    log "Started pid=$(cat "$PIDFILE") output=$ROOT/.run/sniper.out"
+    return 0
+  fi
+
+  # Render-friendly: exec so this script becomes the service process
+  log "Starting in foreground (exec start.sh)"
+  exec bash "${start_cmd[0]}"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI parsing
+# ──────────────────────────────────────────────────────────────────────────────
+usage() {
+  cat >&2 <<'USAGE'
+Usage: bash deploy_tools/go_live.sh [flags]
+
+Flags:
+  --smoke-only            Run preflight/smokes only; do not start, do not flip DRYRUN
+  --no-smoke              Skip preflight/smokes (NOT recommended)
+  --start-only            Start only (skip flips + smokes)
+  --set-dryrun=0|1        Desired DRYRUN value (default 0 unless smoke-only)
+  --env-file=PATH         Env file to edit (default repo/.env)
+  --pidfile=PATH          PID file to stop before starting (default repo/.run/sniper.pid)
+  --background            Start in background (local dev); default is exec (Render-friendly)
+  --log=PATH              Log file (default /tmp/go_live.log)
+USAGE
+}
+
+parse_args() {
+  for a in "$@"; do
+    case "$a" in
+      --smoke-only) SMOKE_ONLY="1" ;;
+      --no-smoke) NO_SMOKE="1" ;;
+      --start-only) START_ONLY="1" ;;
+      --background) BACKGROUND="1" ;;
+      --set-dryrun=*) SET_DRYRUN="${a#*=}" ;;
+      --env-file=*) ENVFILE="${a#*=}" ;;
+      --pidfile=*) PIDFILE="${a#*=}" ;;
+      --log=*) LOG="${a#*=}" ;;
+      -h|--help) usage; exit 0 ;;
+      *)
+        log "Unknown arg: $a"
+        usage
+        exit 2
+        ;;
+    esac
+  done
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Trap handlers
+# ──────────────────────────────────────────────────────────────────────────────
+on_err() {
+  local rc=$?
+  log "FAIL (rc=$rc). See log: $LOG"
+  rollback_envfile "go_live failed (rc=$rc)"
   exit 2
 }
 
-preflight_checks () {
-  echo "[go_live] Running pre-live checks…" | tee -a "$LOG"
-  # capture failures and rollback
-  if ! python -m scripts.check_router 2>&1 | tee -a "$LOG"; then
-    rollback_and_exit "check_router failed"
-  fi
-  if ! python -m scripts.canary_trade 2>&1 | tee -a "$LOG"; then
-    rollback_and_exit "canary_trade failed"
-  fi
+on_int() {
+  log "Interrupted (SIGINT)"
+  rollback_envfile "go_live interrupted"
+  exit 2
 }
 
-restart_service () {
-  echo "[go_live] Restarting service via ./start.sh" | tee -a "$LOG"
-  # kill only the start.sh process (pid file could be used instead)
-  pkill -f '[s]tart.sh' || true
-  nohup bash ./start.sh > /tmp/sniper_live.out 2>&1 &
-}
+main() {
+  parse_args "$@"
+  acquire_lock
 
-# trap - if script exits with error, attempt rollback
-trap 'rc=$?; if [[ $rc -ne 0 ]]; then echo "[go_live] EXIT with rc=$rc" | tee -a "$LOG"; rollback_and_exit "script exited (rc=$rc)"; fi' EXIT
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  touch "$LOG" 2>/dev/null || true
 
-main () {
-  snapshot_env_if_missing
-  backup_env
-  load_env
-  flip_dryrun_if_needed
-  load_env                # reload after change
-  preflight_checks
-  restart_service
+  trap on_err ERR
+  trap on_int INT
 
-  # Successful end — cancel trap rollback and send success notice
-  trap - EXIT
+  log "repo_root=$ROOT"
+  log "python=$("$(python_bin)" -V 2>&1 | head -n 1 || true)"
+  log "env_file=$ENVFILE (editable=$( [[ -f "$ENVFILE" && -w "$ENVFILE" ]] && echo yes || echo no ))"
+  log "mode smoke_only=$SMOKE_ONLY start_only=$START_ONLY no_smoke=$NO_SMOKE background=$BACKGROUND"
+  log "target DRYRUN=$SET_DRYRUN"
 
+  backup_envfile_if_present
+  load_envfile_if_present
+  set_dryrun_mode
+  load_envfile_if_present
+
+  # Enforce dryrun contract in process env too (for safety)
+  export DRYRUN="${DRYRUN:-$SET_DRYRUN}"
+  export IS_DRYRUN="${IS_DRYRUN:-$SET_DRYRUN}"
+
+  # Run preflight/smokes
+  run_smoke_suite
+
+  # Notify success of checks (optional)
   if [[ "$SMOKE_ONLY" == "1" ]]; then
-    echo "[SMOKE] Complete. Backup at $BACKUP" | tee -a "$LOG"
-    send_tg "[SMOKE] Pre-live checks passed. Service restarted with DRYRUN unchanged."
-  else
-    echo "[GO-LIVE] Complete. DRYRUN=False. Backup at $BACKUP" | tee -a "$LOG"
-    send_tg "[GO-LIVE] DRYRUN=False applied. Service restarted."
+    log "SMOKE-ONLY SUCCESS"
+    send_tg "[SMOKE] Preflight + smokes PASSED. DRYRUN unchanged."
+    log "Log: $LOG"
+    exit 0
   fi
-  echo "[go_live] Tail: /tmp/sniper_live.out  | Log: $LOG" | tee -a "$LOG"
+
+  send_tg "[GO-LIVE] Preflight + smokes PASSED. Starting service. (DRYRUN=${DRYRUN})"
+  log "GO-LIVE checks OK. Starting…"
+
+  # If background mode, start_service returns. Foreground exec never returns.
+  start_service
+  log "Started (background). Log: $LOG"
+  exit 0
 }
 
 main "$@"

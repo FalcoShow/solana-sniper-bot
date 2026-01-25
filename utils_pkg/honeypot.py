@@ -1,53 +1,118 @@
-# utils_pkg/honeypot.py
-# Comprehensive honeypot / risk checks for Solana tokens.
-# - Dexscreener liquidity & flags
-# - Birdeye price (optional)
-# - Rugcheck.xyz (optional)
-# - On-chain mint/freeze authority flags (optional, via shared RPC)
-# - Jupiter v6 SELL route probe (mint -> WSOL) as pre-trade safety
-#
-# Public API:
-#   ok, report = await honeypot_check(mint)
-#   if not ok:
-#       logger.info(report["reasons"])
-#
-# Also exposes:
-#   - _get_session()               → shared/local aiohttp.ClientSession
-#   - BIRDEYE_API_URL              → for ai_gate
-#   - _headers_birdeye()           → for ai_gate
-#   - JUPITER_QUOTE_URL, WSOL_MINT → for ai_gate + routeguard
-#   - SHARED_SOLANA_CLIENT         → for ai_gate token_decimals
-
 from __future__ import annotations
 
-import os
+"""
+utils_pkg/honeypot.py
+
+Canonical pre-buy safety / honeypot checks (V3+++ / production).
+===============================================================
+
+Role
+----
+This module answers: "Is this mint *likely* sellable / not obviously trapped?"
+
+It provides a single, explainable, cacheable API:
+
+    ok, report = await honeypot_check(mint)
+
+Report is structured for logs, FeatureBuilder enrichment, and AI gates.
+
+Design
+------
+- Fast: concurrent checks + strict timeouts
+- Robust: hard vs soft failures (no dead trading due to rate limits)
+- Deterministic: uses on-chain mint parsing via utils_pkg.liquidity
+- Compatible: keeps exports referenced by older modules (ai_gate, route guards)
+
+Hard vs Soft failures
+---------------------
+Hard failures block entry.
+Soft failures annotate report but do not block entry unless strict mode enabled.
+
+Typical hard failures:
+- Explicit blacklist
+- Dexscreener says trading paused / honeypot flag
+- On-chain freeze authority present (if required)
+- Jupiter sell route definitively absent (if required)
+- Rugcheck signals honeypot/trading disabled (if strict)
+
+Soft failures:
+- External API down / 429 / 5xx
+- Missing optional sources (Birdeye key missing)
+"""
+
 import asyncio
 import atexit
-import base64
-import logging
-from typing import Any, Dict, Optional, Tuple, List
+import os
+import time
+from dataclasses import dataclass
+from typing import Any
 
 import aiohttp
 
-# ---------------------------------------------------------------------------
-# Shared app-wide resources (best-effort, non-fatal if missing)
-# ---------------------------------------------------------------------------
+from logging_setup import get_logger
+
+log = get_logger()
+
+# -----------------------------------------------------------------------------
+# Optional shared app-wide resources (best-effort)
+# -----------------------------------------------------------------------------
 try:
     from utils_pkg.core_utils import (  # type: ignore
-        session as SHARED_SESSION,             # aiohttp.ClientSession | None
-        solana_client as SHARED_SOLANA_CLIENT  # AsyncClient | None
+        session as SHARED_SESSION,  # aiohttp.ClientSession | None
+        solana_client as SHARED_SOLANA_CLIENT,  # AsyncClient | None
     )
-except Exception:
+except Exception:  # pragma: no cover
     SHARED_SESSION = None
     SHARED_SOLANA_CLIENT = None
 
-logger = logging.getLogger("honeypot")
-if not logger.handlers:
-    logging.basicConfig(level=logging.INFO)
+# Canonical mint parsing + probe helpers
+try:
+    from utils_pkg.liquidity import fetch_mint_info  # type: ignore
+except Exception:  # pragma: no cover
+    fetch_mint_info = None  # type: ignore
 
-# ---------------------------------------------------------------------------
+# Router (preferred for route probing)
+try:
+    from utils_pkg import router as _router  # type: ignore
+except Exception:  # pragma: no cover
+    _router = None  # type: ignore
+
+# -----------------------------------------------------------------------------
 # Config / env
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+try:
+    import config as C  # type: ignore
+except Exception:  # pragma: no cover
+
+    class _C:
+        HONEYPOT_CACHE_TTL_S = float(os.getenv("HONEYPOT_CACHE_TTL_S", "180"))
+        HONEYPOT_HTTP_TIMEOUT_S = float(os.getenv("HONEYPOT_HTTP_TIMEOUT", "10"))
+        HONEYPOT_TOTAL_BUDGET_S = float(os.getenv("HONEYPOT_TOTAL_BUDGET_S", "12"))
+
+        HONEYPOT_MIN_LIQUIDITY_USD = float(os.getenv("HONEYPOT_MIN_LIQUIDITY_USD", "3000"))
+        HONEYPOT_REQUIRE_JUP_SELL_ROUTE = int(os.getenv("HONEYPOT_REQUIRE_JUP_SELL_ROUTE", "1"))
+        HONEYPOT_JUP_STRICT = int(os.getenv("HONEYPOT_JUP_STRICT", "0"))
+        HONEYPOT_RUGCHECK_STRICT = int(os.getenv("HONEYPOT_RUGCHECK_STRICT", "0"))
+
+        HONEYPOT_REQUIRE_NO_FREEZE = int(os.getenv("HONEYPOT_REQUIRE_NO_FREEZE", "0"))
+        HONEYPOT_REQUIRE_MINT_AUTH_DISABLED = int(
+            os.getenv("HONEYPOT_REQUIRE_MINT_AUTH_DISABLED", "0")
+        )
+
+        HONEYPOT_ENABLE_DEXSCREENER = int(os.getenv("HONEYPOT_ENABLE_DEXSCREENER", "1"))
+        HONEYPOT_ENABLE_RUGCHECK = int(os.getenv("HONEYPOT_ENABLE_RUGCHECK", "0"))
+        HONEYPOT_ENABLE_BIRDEYE = int(os.getenv("HONEYPOT_ENABLE_BIRDEYE", "0"))
+
+        HONEYPOT_BLACKLIST_CSV = os.getenv("HONEYPOT_BLACKLIST_CSV", "")
+        HONEYPOT_ALLOWLIST_CSV = os.getenv("HONEYPOT_ALLOWLIST_CSV", "")
+
+        # Probe sizing
+        HONEYPOT_SELL_PROBE_SLIPPAGE_BPS = int(os.getenv("HONEYPOT_SELL_PROBE_SLIPPAGE_BPS", "300"))
+        HONEYPOT_SELL_PROBE_MAX_IMPACT_PCT = float(
+            os.getenv("HONEYPOT_SELL_PROBE_MAX_IMPACT_PCT", "90")
+        )
+
+    C = _C()  # type: ignore
 
 DEXSCREENER_TOKEN_URL = os.getenv(
     "DEXSCREENER_TOKEN_URL",
@@ -62,41 +127,18 @@ RUGCHECK_API_URL = os.getenv(
     "https://api.rugcheck.xyz/v1/tokens/{mint}",
 )
 
-# Jupiter v6 base (we append /quote)
 JUPITER_BASE = os.getenv("JUPITER_SWAP_API", "https://quote-api.jup.ag/v6")
 JUPITER_QUOTE_URL = JUPITER_BASE.rstrip("/") + "/quote"
 
-# So111... (wSOL)
 WSOL_MINT = os.getenv(
     "WSOL_MINT",
     "So11111111111111111111111111111111111111112",
 )
 
-# Policy thresholds — tune via env/AI
-MIN_LIQUIDITY_USD = float(os.getenv("HONEYPOT_MIN_LIQUIDITY_USD", "3000"))
-MAX_SELL_TAX_BPS = int(os.getenv("HONEYPOT_MAX_SELL_TAX_BPS", "1500"))  # 15%
-
-REQUIRE_JUP_SELL_ROUTE = (
-    os.getenv("HONEYPOT_REQUIRE_JUP_SELL_ROUTE", "true").strip().lower()
-    in ("1", "true", "yes", "on")
-)
-
-RPC_MINT_CHECK = (
-    os.getenv("HONEYPOT_RPC_MINT_CHECK", "true").strip().lower()
-    in ("1", "true", "yes", "on")
-)
-
-HTTP_TIMEOUT = float(os.getenv("HONEYPOT_HTTP_TIMEOUT", "10"))
-
-# Simple blacklist/allowlist (comma-separated mints)
-BLACKLIST_CSV = os.getenv("HONEYPOT_BLACKLIST_CSV")
-ALLOWLIST_CSV = os.getenv("HONEYPOT_ALLOWLIST_CSV")
-
-# ---------------------------------------------------------------------------
-# Session management (also used by ai_gate + routeguard)
-# ---------------------------------------------------------------------------
-
-_SESSION: Optional[aiohttp.ClientSession] = None
+# -----------------------------------------------------------------------------
+# Session management (compatible with ai_gate expectations)
+# -----------------------------------------------------------------------------
+_SESSION: aiohttp.ClientSession | None = None
 _SESSION_LOCK = asyncio.Lock()
 
 
@@ -105,31 +147,22 @@ async def _get_session() -> aiohttp.ClientSession:
     Return an aiohttp.ClientSession.
 
     Priority:
-      1) Reuse app-wide SHARED_SESSION if present & open
-      2) Reuse module-local _SESSION if present & open
-      3) Create a new local session for this module
+      1) SHARED_SESSION if present & open
+      2) module-local session
     """
     global _SESSION
+    if SHARED_SESSION is not None and not getattr(SHARED_SESSION, "closed", True):
+        return SHARED_SESSION  # type: ignore[return-value]
 
-    # 1) App-wide shared session from core_utils
-    if SHARED_SESSION is not None and not SHARED_SESSION.closed:
-        return SHARED_SESSION
-
-    # 2) Local module session
+    timeout_s = float(getattr(C, "HONEYPOT_HTTP_TIMEOUT_S", 10.0))
     async with _SESSION_LOCK:
         if _SESSION is not None and not _SESSION.closed:
             return _SESSION
-        _SESSION = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
-        )
+        _SESSION = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s))
         return _SESSION
 
 
 async def close_local_session() -> None:
-    """
-    Close only the local session created in this module.
-    Never touches SHARED_SESSION from core_utils.
-    """
     global _SESSION
     async with _SESSION_LOCK:
         if _SESSION is not None and not _SESSION.closed:
@@ -138,273 +171,432 @@ async def close_local_session() -> None:
 
 
 def _atexit_close() -> None:
-    """
-    Close our local session automatically when the interpreter exits.
-
-    This helps `python -m utils_pkg.honeypot` / unit tests avoid
-    "Unclosed client session" warnings. We do NOT close SHARED_SESSION.
-    """
     try:
         if SHARED_SESSION is None:
             asyncio.run(close_local_session())
     except Exception:
-        # At process shutdown, event loop lifecycles are messy; ignore.
         pass
 
 
 atexit.register(_atexit_close)
 
-# ---------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
-
-
-def _headers_birdeye() -> Dict[str, str]:
-    """
-    Shared Birdeye headers (used by this module and ai_gate).
-    """
+# -----------------------------------------------------------------------------
+def _headers_birdeye() -> dict[str, str]:
     h = {"accept": "application/json", "x-chain": "solana"}
     if BIRDEYE_API_KEY:
         h["X-API-KEY"] = BIRDEYE_API_KEY
     return h
 
 
-def _in_csv_list(mint: str, csv_val: Optional[str]) -> bool:
+def _csv_has(mint: str, csv_val: str) -> bool:
     if not csv_val:
         return False
-    return mint in {x.strip() for x in csv_val.split(",") if x.strip()}
+    s = mint.strip()
+    return s in {x.strip() for x in csv_val.split(",") if x.strip()}
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        f = float(x)
+        if f != f or f in (float("inf"), float("-inf")):
+            return default
+        return f
+    except Exception:
+        return default
+
+
+def _normalize_price_impact_pct(raw_pi: Any) -> float:
+    """
+    Jupiter sometimes returns fraction (0.12) or percent (12).
+    Normalize to percent.
+    """
+    pi = _safe_float(raw_pi, 0.0)
+    if pi <= 1.0:
+        pi *= 100.0
+    return max(0.0, pi)
 
 
 async def _fetch_json(
-    url: str,
-    *,
-    headers: Optional[Dict[str, str]] = None,
-    params: Optional[Dict[str, str]] = None,
-) -> Optional[Dict[str, Any]]:
-    """
-    Helper to GET JSON with our session; logs non-200 but never raises.
-    """
+    url: str, *, headers: dict[str, str] | None = None, params: dict[str, str] | None = None
+) -> dict[str, Any] | None:
     sess = await _get_session()
     try:
         async with sess.get(url, headers=headers, params=params) as resp:
             if resp.status == 200:
-                return await resp.json()
-            txt = await resp.text()
-            logger.debug(f"GET {url} -> {resp.status}: {txt}")
+                js = await resp.json()
+                return js if isinstance(js, dict) else None
+            # don’t spam logs at info level
+            try:
+                txt = await resp.text()
+            except Exception:
+                txt = "<no-body>"
+            log.debug(f"honeypot GET {url} -> {resp.status} {txt[:500]}")
             return None
     except Exception as e:
-        logger.debug(f"_fetch_json error for {url}: {e}")
+        log.debug(f"honeypot _fetch_json error {url}: {e}")
         return None
 
 
-# ---------------------------------------------------------------------------
-# Data sources
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Cache (mint -> report)
+# -----------------------------------------------------------------------------
+_HP_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_HP_CACHE_LOCK = asyncio.Lock()
 
-async def _dexscreener_check(mint: str) -> Dict[str, Any]:
-    """
-    Dexscreener: liquidity & simple flags.
 
-    Schema is best-effort and resilient to missing fields.
-    """
-    url = DEXSCREENER_TOKEN_URL.format(mint=mint)
-    data = await _fetch_json(url)
-    result: Dict[str, Any] = {
+async def _cache_get(mint: str) -> dict[str, Any] | None:
+    ttl = float(getattr(C, "HONEYPOT_CACHE_TTL_S", 180.0))
+    if ttl <= 0:
+        return None
+    now = time.time()
+    async with _HP_CACHE_LOCK:
+        row = _HP_CACHE.get(mint)
+        if not row:
+            return None
+        exp, rep = row
+        if now >= exp:
+            _HP_CACHE.pop(mint, None)
+            return None
+        return rep
+
+
+async def _cache_set(mint: str, rep: dict[str, Any]) -> None:
+    ttl = float(getattr(C, "HONEYPOT_CACHE_TTL_S", 180.0))
+    if ttl <= 0:
+        return
+    async with _HP_CACHE_LOCK:
+        _HP_CACHE[mint] = (time.time() + ttl, rep)
+
+
+# -----------------------------------------------------------------------------
+# Source checks
+# -----------------------------------------------------------------------------
+async def _dexscreener_check(mint: str) -> dict[str, Any]:
+    enabled = bool(int(getattr(C, "HONEYPOT_ENABLE_DEXSCREENER", 1)))
+    out: dict[str, Any] = {
         "source": "dexscreener",
-        "liquidity_usd": 0.0,
-        "pair_count": 0,
-        "flags": [],
+        "enabled": enabled,
         "ok": True,
+        "hard_fail": False,
         "reasons": [],
+        "data": {},
     }
-    if not data or "pairs" not in data:
-        result["ok"] = False
-        result["reasons"].append("dexscreener:no_data")
-        return result
-
-    pairs = data.get("pairs") or []
-    result["pair_count"] = len(pairs)
-
-    best_liq = 0.0
-    for p in pairs:
-        # liquidity field can be dict or number; normalize
-        liq_info = p.get("liquidity") or {}
-        if isinstance(liq_info, dict):
-            liq = float(liq_info.get("usd") or 0)
-        else:
-            try:
-                liq = float(liq_info or 0)
-            except Exception:
-                liq = 0.0
-        best_liq = max(best_liq, liq)
-
-        if p.get("priceUsd") in (None, "0", 0):
-            result["flags"].append("no_price")
-        if p.get("isHoneyPot"):
-            result["flags"].append("flag_honeypot")
-        if p.get("tradingPaused"):
-            result["flags"].append("trading_paused")
-        if p.get("pairCreatedAt") is None:
-            result["flags"].append("no_pair_created_at")
-
-    result["liquidity_usd"] = best_liq
-
-    if best_liq < MIN_LIQUIDITY_USD:
-        result["ok"] = False
-        result["reasons"].append(f"dexscreener:low_liquidity<{MIN_LIQUIDITY_USD}")
-
-    if "trading_paused" in result["flags"]:
-        result["ok"] = False
-        result["reasons"].append("dexscreener:trading_paused")
-
-    return result
-
-
-async def _birdeye_check(mint: str) -> Dict[str, Any]:
-    """
-    Birdeye price / basic signal. Non-blocking if disabled or no data.
-    """
-    result: Dict[str, Any] = {
-        "source": "birdeye",
-        "price": None,
-        "liquidity_usd": None,
-        "ok": True,
-        "reasons": [],
-    }
-    if not BIRDEYE_API_URL:
-        result["ok"] = False
-        result["reasons"].append("birdeye:disabled")
-        return result
-
-    url_price = f"{BIRDEYE_API_URL.rstrip('/')}/public/price"
-    price_js = await _fetch_json(
-        url_price,
-        headers=_headers_birdeye(),
-        params={"address": mint},
-    )
-
-    if price_js and price_js.get("success", True):
-        val = price_js.get("data", {}).get("value")
-        try:
-            result["price"] = float(val) if val is not None else None
-        except Exception:
-            result["price"] = None
-    else:
-        result["reasons"].append("birdeye:no_price")
-
-    # You can expand this with liquidity/holders endpoints later.
-    return result
-
-
-async def _rugcheck_check(mint: str) -> Dict[str, Any]:
-    """
-    Rugcheck.xyz: heuristic risk signals.
-
-    If API is down or schema changes, we don't hard-fail; we just mark reasons.
-    """
-    url = RUGCHECK_API_URL.format(mint=mint)
-    data = await _fetch_json(url)
-    res: Dict[str, Any] = {
-        "source": "rugcheck",
-        "score": None,
-        "risks": [],
-        "ok": True,
-        "reasons": [],
-    }
-    if not data:
-        res["reasons"].append("rugcheck:no_data")
-        return res
-
-    res["score"] = data.get("score")
-    risks = data.get("risks") or []
-    res["risks"] = risks
-
-    text_join = " ".join(str(r).lower() for r in risks)
-    if "honeypot" in text_join or "trading disabled" in text_join:
-        res["ok"] = False
-        res["reasons"].append("rugcheck:honeypot_or_trading_blocked")
-
-    return res
-
-
-async def _rpc_mint_flags(mint: str) -> Dict[str, Any]:
-    """
-    Check token mint & freeze authorities from chain (optional).
-
-    Requires shared AsyncClient with get_account_info on mint:
-      SHARED_SOLANA_CLIENT.get_account_info(Pubkey)
-    """
-    out: Dict[str, Any] = {
-        "source": "rpc",
-        "has_freeze_authority": None,
-        "has_mint_authority": None,
-        "ok": True,
-        "reasons": [],
-    }
-
-    if not RPC_MINT_CHECK or SHARED_SOLANA_CLIENT is None:
-        out["reasons"].append("rpc:disabled_or_no_client")
+    if not enabled:
+        out["ok"] = True
+        out["reasons"].append("dexscreener:disabled")
         return out
 
-    try:
-        from solders.pubkey import Pubkey
+    js = await _fetch_json(DEXSCREENER_TOKEN_URL.format(mint=mint))
+    if not js or "pairs" not in js:
+        # external API issue -> soft by default
+        out["ok"] = True
+        out["reasons"].append("dexscreener:no_data:soft")
+        return out
 
-        resp = await SHARED_SOLANA_CLIENT.get_account_info(
-            Pubkey.from_string(mint)
-        )
-        if not resp.value:
-            out["ok"] = False
-            out["reasons"].append("rpc:no_mint_account")
-            return out
+    pairs = js.get("pairs") or []
+    out["data"]["pair_count"] = len(pairs)
 
-        data_b64, _encoding = resp.value.data
-        raw = base64.b64decode(data_b64)
+    best_liq = 0.0
+    any_paused = False
+    any_hp_flag = False
 
-        # SPL Mint (simplified offsets):
-        # mint_authority: [0:32]
-        # freeze_authority: [44:76] (heuristic)
-        mint_auth = raw[0:32]
-        freeze_auth = raw[44:76] if len(raw) >= 76 else b"\x00" * 32
+    for p in pairs:
+        liq = 0.0
+        liq_info = p.get("liquidity") or {}
+        if isinstance(liq_info, dict):
+            liq = _safe_float(liq_info.get("usd"), 0.0)
+        else:
+            liq = _safe_float(liq_info, 0.0)
 
-        out["has_mint_authority"] = (mint_auth != b"\x00" * 32)
-        out["has_freeze_authority"] = (freeze_auth != b"\x00" * 32)
+        best_liq = max(best_liq, liq)
 
-        if out["has_freeze_authority"]:
-            out["reasons"].append("rpc:freeze_authority_present")
+        # Dexscreener flags (best-effort; schema varies)
+        if bool(p.get("tradingPaused")):
+            any_paused = True
+        if bool(p.get("isHoneyPot")):
+            any_hp_flag = True
 
-    except Exception as e:
-        out["reasons"].append(f"rpc:error:{e}")
+    out["data"]["liquidity_usd_best"] = best_liq
+
+    min_liq = float(getattr(C, "HONEYPOT_MIN_LIQUIDITY_USD", 3000.0))
+    if best_liq < min_liq:
+        out["hard_fail"] = True
+        out["ok"] = False
+        out["reasons"].append(f"dexscreener:low_liquidity<{min_liq:.0f}")
+
+    if any_paused:
+        out["hard_fail"] = True
+        out["ok"] = False
+        out["reasons"].append("dexscreener:trading_paused")
+
+    if any_hp_flag:
+        out["hard_fail"] = True
+        out["ok"] = False
+        out["reasons"].append("dexscreener:honeypot_flag")
 
     return out
 
 
-async def _jupiter_sell_route_check(mint: str, test_amount_base_units: int = 1_000_000) -> Dict[str, Any]:
-    """
-    Ask Jupiter for a SELL quote mint -> wSOL for a small test amount.
-
-    * If we get a clean 200 + routePlan + outAmount, we treat that as strong
-      evidence that the token is sellable via Jupiter.
-    * If Jupiter returns a transient HTTP error (401/403/429/5xx) or we hit a
-      network error, we treat it as a **soft** failure by default so it does
-      NOT block entries. You can flip this via HONEYPOT_JUP_STRICT=1.
-    """
-
-    out: Dict[str, Any] = {
-        "source": "jupiter",
-        "route_available": None,
-        "out_amount": None,
+async def _birdeye_price_check(mint: str) -> dict[str, Any]:
+    enabled = bool(int(getattr(C, "HONEYPOT_ENABLE_BIRDEYE", 0)))
+    out: dict[str, Any] = {
+        "source": "birdeye",
+        "enabled": enabled,
         "ok": True,
+        "hard_fail": False,
         "reasons": [],
+        "data": {},
     }
 
-    strict = (os.getenv("HONEYPOT_JUP_STRICT", "0").strip().lower()
-              in {"1", "true", "yes", "on"})
+    if not enabled:
+        out["reasons"].append("birdeye:disabled")
+        return out
 
+    if not BIRDEYE_API_KEY:
+        out["reasons"].append("birdeye:no_api_key:soft")
+        return out
+
+    url = f"{BIRDEYE_API_URL.rstrip('/')}/public/price"
+    js = await _fetch_json(url, headers=_headers_birdeye(), params={"address": mint})
+    if not js:
+        out["reasons"].append("birdeye:no_data:soft")
+        return out
+
+    try:
+        val = js.get("data", {}).get("value")
+        out["data"]["price"] = float(val) if val is not None else None
+    except Exception:
+        out["data"]["price"] = None
+        out["reasons"].append("birdeye:bad_price:soft")
+
+    return out
+
+
+async def _rugcheck_check(mint: str) -> dict[str, Any]:
+    enabled = bool(int(getattr(C, "HONEYPOT_ENABLE_RUGCHECK", 0)))
+    strict = bool(int(getattr(C, "HONEYPOT_RUGCHECK_STRICT", 0)))
+
+    out: dict[str, Any] = {
+        "source": "rugcheck",
+        "enabled": enabled,
+        "ok": True,
+        "hard_fail": False,
+        "reasons": [],
+        "data": {},
+    }
+    if not enabled:
+        out["reasons"].append("rugcheck:disabled")
+        return out
+
+    js = await _fetch_json(RUGCHECK_API_URL.format(mint=mint))
+    if not js:
+        # External API issue: soft unless strict
+        if strict:
+            out["ok"] = False
+            out["hard_fail"] = True
+            out["reasons"].append("rugcheck:no_data:strict")
+        else:
+            out["reasons"].append("rugcheck:no_data:soft")
+        return out
+
+    # Best-effort parse
+    score = js.get("score", None)
+    risks = js.get("risks") or js.get("risk") or []
+    out["data"]["score"] = score
+    out["data"]["risks"] = risks
+
+    risk_text = " ".join(str(r).lower() for r in risks)
+    # Heuristic "bad" indicators
+    bad = any(
+        k in risk_text
+        for k in [
+            "honeypot",
+            "trading disabled",
+            "sell blocked",
+            "cannot sell",
+            "blacklist",
+            "freeze",
+        ]
+    )
+    if bad:
+        out["ok"] = False
+        out["hard_fail"] = True
+        out["reasons"].append("rugcheck:high_risk_flags")
+
+    return out
+
+
+async def _mint_authority_check(mint: str) -> dict[str, Any]:
+    """
+    On-chain mint/freeze authority flags via utils_pkg.liquidity.fetch_mint_info().
+    This is deterministic and does not rely on external APIs.
+    """
+    out: dict[str, Any] = {
+        "source": "mint",
+        "enabled": True,
+        "ok": True,
+        "hard_fail": False,
+        "reasons": [],
+        "data": {},
+    }
+
+    if fetch_mint_info is None:
+        # If liquidity module isn't available, treat as soft by default.
+        out["reasons"].append("mint:fetch_mint_info_unavailable:soft")
+        return out
+
+    info = await fetch_mint_info(mint)
+    if info is None:
+        out["ok"] = False
+        out["hard_fail"] = True
+        out["reasons"].append("mint:no_account_or_parse")
+        return out
+
+    out["data"]["decimals"] = info.decimals
+    out["data"]["mint_authority_present"] = info.mint_authority_present
+    out["data"]["freeze_authority_present"] = info.freeze_authority_present
+    out["data"]["source"] = info.source
+
+    require_no_freeze = bool(int(getattr(C, "HONEYPOT_REQUIRE_NO_FREEZE", 0)))
+    require_mint_disabled = bool(int(getattr(C, "HONEYPOT_REQUIRE_MINT_AUTH_DISABLED", 0)))
+
+    if require_no_freeze and info.freeze_authority_present is True:
+        out["ok"] = False
+        out["hard_fail"] = True
+        out["reasons"].append("mint:freeze_authority_present")
+
+    if require_mint_disabled and info.mint_authority_present is True:
+        out["ok"] = False
+        out["hard_fail"] = True
+        out["reasons"].append("mint:mint_authority_present")
+
+    return out
+
+
+def _pick_sell_probe_amount_raw(decimals: int | None) -> int:
+    """
+    Choose a small-but-not-tiny raw amount for sell-route probing.
+    Goal: trigger route discovery without needing a real balance.
+    """
+    if decimals is None:
+        return 1_000_000  # legacy default (works often for 6-9 dec tokens)
+    d = int(decimals)
+    if d <= 0:
+        return 1
+    # ~0.01 token in raw units
+    amt = int((10**d) * 0.01)
+    # Clamp to a sane range
+    return max(1, min(amt, 50_000_000))
+
+
+async def _router_sell_quote_probe(mint: str, amount_raw: int) -> dict[str, Any] | None:
+    """
+    Prefer router.get_sell_quote() if present; fall back to router.get_quote() shape if needed.
+    Returns quote dict or None.
+    """
+    if _router is None:
+        return None
+
+    # Best guess functions
+    fn = getattr(_router, "get_sell_quote", None)
+    if callable(fn):
+        # Try common signatures
+        for kwargs in (
+            {"mint": mint, "amount_raw": amount_raw},
+            {"mint": mint, "amount": amount_raw},
+            {"mint": mint, "amount_in": amount_raw},
+            {"input_mint": mint, "amount_raw": amount_raw},
+        ):
+            try:
+                q = await fn(**kwargs)  # type: ignore[misc]
+                return q if isinstance(q, dict) else None
+            except TypeError:
+                continue
+            except Exception:
+                return None
+
+    # Generic quote (if router exposes it)
+    fn2 = getattr(_router, "get_quote", None)
+    if callable(fn2):
+        for kwargs in (
+            {"input_mint": mint, "output_mint": WSOL_MINT, "amount_raw": amount_raw},
+            {"inputMint": mint, "outputMint": WSOL_MINT, "amount": amount_raw},
+        ):
+            try:
+                q = await fn2(**kwargs)  # type: ignore[misc]
+                return q if isinstance(q, dict) else None
+            except TypeError:
+                continue
+            except Exception:
+                return None
+
+    return None
+
+
+async def _jupiter_sell_route_check(mint: str, decimals: int | None) -> dict[str, Any]:
+    """
+    Probes for a SELL route mint -> WSOL.
+    Hard-fails only when:
+      - require_jup_sell_route == True AND
+      - we definitively see "no route" (not just HTTP/rate limit)
+      - OR strict mode is enabled and we can't probe reliably
+    """
+    require_route = bool(int(getattr(C, "HONEYPOT_REQUIRE_JUP_SELL_ROUTE", 1)))
+    strict = bool(int(getattr(C, "HONEYPOT_JUP_STRICT", 0)))
+    max_impact_pct = float(getattr(C, "HONEYPOT_SELL_PROBE_MAX_IMPACT_PCT", 90.0))
+    slip_bps = int(getattr(C, "HONEYPOT_SELL_PROBE_SLIPPAGE_BPS", 300))
+
+    out: dict[str, Any] = {
+        "source": "jupiter",
+        "enabled": True,
+        "ok": True,
+        "hard_fail": False,
+        "reasons": [],
+        "data": {},
+    }
+
+    amount_raw = _pick_sell_probe_amount_raw(decimals)
+    out["data"]["amount_raw"] = amount_raw
+
+    # 1) Prefer router probe (keeps your money-pipe deterministic)
+    q = await _router_sell_quote_probe(mint, amount_raw=amount_raw)
+    if isinstance(q, dict) and q:
+        route_plan = q.get("routePlan") or q.get("route_plan") or []
+        out_amt = q.get("outAmount") or q.get("out_amount")
+        pi_pct = _normalize_price_impact_pct(
+            q.get("priceImpactPct", q.get("price_impact_pct", 0.0))
+        )
+
+        out["data"]["via"] = "router"
+        out["data"]["route_len"] = len(route_plan) if isinstance(route_plan, list) else 0
+        out["data"]["outAmount"] = out_amt
+        out["data"]["priceImpactPct"] = pi_pct
+
+        route_ok = bool(route_plan) and _safe_float(out_amt, 0.0) > 0.0
+        if not route_ok:
+            if require_route:
+                out["ok"] = False
+                out["hard_fail"] = True
+                out["reasons"].append("jupiter:no_route(router)")
+            else:
+                out["reasons"].append("jupiter:no_route(router):soft")
+            return out
+
+        if pi_pct > max_impact_pct and strict:
+            out["ok"] = False
+            out["hard_fail"] = True
+            out["reasons"].append(f"jupiter:sell_impact_too_high>{max_impact_pct:.0f}%")
+        return out
+
+    # 2) Fallback to direct HTTP probe (kept for compatibility)
     params = {
         "inputMint": mint,
         "outputMint": WSOL_MINT,
-        "amount": str(test_amount_base_units),
-        "slippageBps": "300",     # 3% probe
+        "amount": str(amount_raw),
+        "slippageBps": str(slip_bps),
         "swapMode": "ExactIn",
         "onlyDirectRoutes": "false",
     }
@@ -414,206 +606,312 @@ async def _jupiter_sell_route_check(mint: str, test_amount_base_units: int = 1_0
         async with sess.get(JUPITER_QUOTE_URL, params=params) as resp:
             status = resp.status
             if status != 200:
-                # Log body at debug level only
-                try:
-                    body = await resp.text()
-                    logger.debug("Jupiter SELL probe %s %s: %s", status, JUPITER_QUOTE_URL, body)
-                except Exception:
-                    body = "<no-body>"
-
-                out["route_available"] = None
-                out["out_amount"] = None
-
                 tag = f"jupiter:http_{status}"
-                if strict:
+                if strict and require_route:
                     out["ok"] = False
+                    out["hard_fail"] = True
                     out["reasons"].append(tag)
                 else:
-                    # Soft-fail: note it, but don't block the token just because
-                    # Jupiter is grumpy / requires auth / rate-limiting.
-                    out["ok"] = True
                     out["reasons"].append(tag + ":soft")
                 return out
-
             js = await resp.json()
     except Exception as e:
         tag = f"jupiter:error:{e}"
-        if strict:
+        if strict and require_route:
             out["ok"] = False
+            out["hard_fail"] = True
             out["reasons"].append(tag)
         else:
-            out["ok"] = True
             out["reasons"].append(tag + ":soft")
         return out
 
-    # v6-style payload: top-level outAmount + routePlan
-    route_plan: List[Any] = js.get("routePlan") or []
+    route_plan = js.get("routePlan") or []
     out_amt = js.get("outAmount")
+    pi_pct = _normalize_price_impact_pct(js.get("priceImpactPct", 0.0))
 
-    if not route_plan:
-        out["route_available"] = False
-        if REQUIRE_JUP_SELL_ROUTE and strict:
+    out["data"]["via"] = "http"
+    out["data"]["route_len"] = len(route_plan) if isinstance(route_plan, list) else 0
+    out["data"]["outAmount"] = out_amt
+    out["data"]["priceImpactPct"] = pi_pct
+
+    route_ok = bool(route_plan) and _safe_float(out_amt, 0.0) > 0.0
+    if not route_ok:
+        if require_route:
             out["ok"] = False
-            out["reasons"].append("jupiter:no_route")
+            out["hard_fail"] = True
+            out["reasons"].append("jupiter:no_route(http)")
+        else:
+            out["reasons"].append("jupiter:no_route(http):soft")
         return out
 
-    try:
-        out["out_amount"] = int(out_amt) if out_amt is not None else None
-    except Exception:
-        out["out_amount"] = None
-
-    out["route_available"] = True
-    if REQUIRE_JUP_SELL_ROUTE and strict and (out["out_amount"] is None or out["out_amount"] <= 0):
+    if pi_pct > max_impact_pct and strict:
         out["ok"] = False
-        out["reasons"].append("jupiter:route_zero_out")
+        out["hard_fail"] = True
+        out["reasons"].append(f"jupiter:sell_impact_too_high>{max_impact_pct:.0f}%")
 
     return out
 
 
-# ---------------------------------------------------------------------------
-# Public main API
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
+@dataclass
+class HoneypotPolicy:
+    min_liquidity_usd: float
+    require_jup_sell_route: bool
+    jup_strict: bool
+    rugcheck_strict: bool
+    require_no_freeze: bool
+    require_mint_auth_disabled: bool
 
-async def honeypot_check(mint: str) -> Tuple[bool, Dict[str, Any]]:
+    @staticmethod
+    def current() -> HoneypotPolicy:
+        return HoneypotPolicy(
+            min_liquidity_usd=float(getattr(C, "HONEYPOT_MIN_LIQUIDITY_USD", 3000.0)),
+            require_jup_sell_route=bool(int(getattr(C, "HONEYPOT_REQUIRE_JUP_SELL_ROUTE", 1))),
+            jup_strict=bool(int(getattr(C, "HONEYPOT_JUP_STRICT", 0))),
+            rugcheck_strict=bool(int(getattr(C, "HONEYPOT_RUGCHECK_STRICT", 0))),
+            require_no_freeze=bool(int(getattr(C, "HONEYPOT_REQUIRE_NO_FREEZE", 0))),
+            require_mint_auth_disabled=bool(
+                int(getattr(C, "HONEYPOT_REQUIRE_MINT_AUTH_DISABLED", 0))
+            ),
+        )
+
+
+async def honeypot_check(mint: str, *, force: bool = False) -> tuple[bool, dict[str, Any]]:
     """
-    Aggregated honeypot / risk decision.
+    Aggregated honeypot / safety decision.
 
-    Returns: (is_safe, report)
+    Returns:
+      (ok, report)
 
     report = {
       "mint": str,
       "ok": bool,
-      "reasons": [str],
-      "sources": {
-        "dexscreener": {...},
-        "birdeye": {...},
-        "jupiter": {...},
-        "rugcheck": {...},
-        "rpc": {...},
-      },
-      "policy": {...},
+      "hard_reasons": [str],
+      "soft_reasons": [str],
+      "reasons": [str],                 # merged
+      "summary": { ...meta-friendly... },
+      "sources": { "dexscreener": {...}, "mint": {...}, "jupiter": {...}, ... },
+      "policy": { ... }
     }
     """
-    # Allowlist short-circuit
-    if _in_csv_list(mint, ALLOWLIST_CSV):
-        return True, {
+    mint = (mint or "").strip()
+    policy = HoneypotPolicy.current()
+
+    # Allowlist / blacklist
+    allow_csv = str(getattr(C, "HONEYPOT_ALLOWLIST_CSV", "") or "")
+    block_csv = str(getattr(C, "HONEYPOT_BLACKLIST_CSV", "") or "")
+
+    if _csv_has(mint, allow_csv):
+        rep = {
             "mint": mint,
             "ok": True,
+            "hard_reasons": [],
+            "soft_reasons": ["allowlist"],
             "reasons": ["allowlist"],
+            "summary": {"is_honeypot": False, "trading_paused": False, "blacklisted": False},
             "sources": {},
-            "policy": {
-                "min_liquidity_usd": MIN_LIQUIDITY_USD,
-                "max_sell_tax_bps": MAX_SELL_TAX_BPS,
-                "require_jup_sell_route": REQUIRE_JUP_SELL_ROUTE,
-            },
+            "policy": policy.__dict__,
         }
+        return True, rep
 
-    # Blacklist short-circuit
-    if _in_csv_list(mint, BLACKLIST_CSV):
-        return False, {
+    if _csv_has(mint, block_csv):
+        rep = {
             "mint": mint,
             "ok": False,
+            "hard_reasons": ["blacklist"],
+            "soft_reasons": [],
             "reasons": ["blacklist"],
+            "summary": {"is_honeypot": True, "trading_paused": False, "blacklisted": True},
             "sources": {},
-            "policy": {
-                "min_liquidity_usd": MIN_LIQUIDITY_USD,
-                "max_sell_tax_bps": MAX_SELL_TAX_BPS,
-                "require_jup_sell_route": REQUIRE_JUP_SELL_ROUTE,
-            },
+            "policy": policy.__dict__,
         }
+        return False, rep
 
-    tasks: List[asyncio.Future] = [
-        _dexscreener_check(mint),
-        _birdeye_check(mint),
-        _jupiter_sell_route_check(mint),
-        _rugcheck_check(mint),
-    ]
-    if RPC_MINT_CHECK:
-        tasks.append(_rpc_mint_flags(mint))
+    if not force:
+        cached = await _cache_get(mint)
+        if cached is not None:
+            return bool(cached.get("ok", False)), cached
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Budget and concurrency
+    total_budget_s = float(getattr(C, "HONEYPOT_TOTAL_BUDGET_S", 12.0))
 
-    combined_ok = True
-    reasons: List[str] = []
-    sources: Dict[str, Any] = {}
+    async def _run_all() -> dict[str, Any]:
+        # We always run mint + jupiter probes, because they’re the most "money-pipe" relevant.
+        # External sources are optional.
+        tasks = []
 
-    for r in results:
-        if isinstance(r, Exception):
-            combined_ok = False
-            reasons.append(f"exception:{r}")
-            continue
+        # mint auth check
+        tasks.append(_mint_authority_check(mint))
 
+        # dexscreener
+        tasks.append(_dexscreener_check(mint))
+
+        # rugcheck
+        tasks.append(_rugcheck_check(mint))
+
+        # birdeye (optional)
+        tasks.append(_birdeye_price_check(mint))
+
+        # jupiter probe needs decimals; we’ll compute after mint check finishes if possible.
+        # But to keep concurrency, we’ll compute decimals from mint result post-gather then rerun probe if needed.
+        # First gather partials (excluding jupiter), then run jupiter with decimals.
+        res = await asyncio.gather(*tasks, return_exceptions=True)
+
+        sources: dict[str, Any] = {}
+        decimals: int | None = None
+
+        for item in res:
+            if isinstance(item, Exception):
+                # treat as soft failure unless strict policy later forces it
+                tag = f"exception:{item}"
+                sources.setdefault(
+                    "exceptions",
+                    {
+                        "source": "exceptions",
+                        "ok": True,
+                        "hard_fail": False,
+                        "reasons": [tag],
+                        "data": {},
+                    },
+                )
+                continue
+            if isinstance(item, dict):
+                src = str(item.get("source", "unknown"))
+                sources[src] = item
+                if src == "mint":
+                    try:
+                        decimals = item.get("data", {}).get("decimals")
+                        decimals = int(decimals) if decimals is not None else None
+                    except Exception:
+                        decimals = None
+
+        # Now run jupiter sell route probe with decimals knowledge
+        jup = await _jupiter_sell_route_check(mint, decimals=decimals)
+        sources["jupiter"] = jup
+
+        return sources
+
+    try:
+        sources = await asyncio.wait_for(_run_all(), timeout=total_budget_s)
+    except Exception as e:
+        # If honeypot pipeline itself fails, default to "soft fail" (do not block)
+        rep = {
+            "mint": mint,
+            "ok": True,
+            "hard_reasons": [],
+            "soft_reasons": [f"honeypot:internal_error:{e}:soft"],
+            "reasons": [f"honeypot:internal_error:{e}:soft"],
+            "summary": {"is_honeypot": False, "trading_paused": False, "blacklisted": False},
+            "sources": {
+                "internal": {
+                    "source": "internal",
+                    "ok": True,
+                    "hard_fail": False,
+                    "reasons": [str(e)],
+                    "data": {},
+                }
+            },
+            "policy": policy.__dict__,
+        }
+        await _cache_set(mint, rep)
+        return True, rep
+
+    hard: list[str] = []
+    soft: list[str] = []
+
+    # Summaries for meta wiring
+    liq_usd = None
+    trading_paused = False
+    is_honeypot = False
+
+    for src, r in sources.items():
         if not isinstance(r, dict):
-            combined_ok = False
-            reasons.append("bad_result_type")
             continue
+        rs = list(r.get("reasons") or [])
+        if not r.get("ok", True) and r.get("hard_fail", False):
+            hard.extend(rs)
+        else:
+            # add reasons as soft unless it's a clean OK/no reasons
+            for x in rs:
+                if (x and x.endswith(":soft")) or (
+                    x and (src in {"birdeye", "rugcheck", "dexscreener"} and "no_data" in x)
+                ):
+                    soft.append(x)
+                elif x:
+                    # non-hard reason from a source
+                    soft.append(x)
 
-        src = r.get("source", "unknown")
-        sources[src] = r
+        # extract some canonical summaries
+        if src == "dexscreener":
+            liq_usd = (r.get("data", {}) or {}).get("liquidity_usd_best")
+            # if hard reason includes paused/honeypot, reflect in summary
+            if any("trading_paused" in s for s in (r.get("reasons") or [])):
+                trading_paused = True
+            if any("honeypot" in s for s in (r.get("reasons") or [])):
+                is_honeypot = True
 
-        if not r.get("ok", True):
-            combined_ok = False
-            reasons.extend(r.get("reasons", []))
+        if src == "mint":
+            if any("freeze_authority_present" in s for s in (r.get("reasons") or [])):
+                is_honeypot = True  # treated as unsafe if required
 
-    # Policy: flag excessive sell tax if Rugcheck hints at it (best-effort)
-    rc = sources.get("rugcheck", {})
-    rc_risks = " ".join(str(x).lower() for x in rc.get("risks", []))
-    if "sell tax" in rc_risks and MAX_SELL_TAX_BPS is not None:
-        combined_ok = False
-        reasons.append(f"tax:high_sell_tax>{MAX_SELL_TAX_BPS}bps")
+        if src == "jupiter" and any("no_route" in s for s in (r.get("reasons") or [])):
+            is_honeypot = True  # sell route missing is effectively a honeypot
 
-    report: Dict[str, Any] = {
+    ok = len(hard) == 0
+
+    # If require_jup_sell_route and we got ONLY soft jupiter errors, keep OK unless strict
+    # (already handled in the jupiter check logic)
+
+    reasons = hard + soft
+
+    rep: dict[str, Any] = {
         "mint": mint,
-        "ok": combined_ok,
+        "ok": ok,
+        "hard_reasons": hard,
+        "soft_reasons": soft,
         "reasons": reasons,
-        "sources": sources,
-        "policy": {
-            "min_liquidity_usd": MIN_LIQUIDITY_USD,
-            "max_sell_tax_bps": MAX_SELL_TAX_BPS,
-            "require_jup_sell_route": REQUIRE_JUP_SELL_ROUTE,
+        "summary": {
+            "is_honeypot": bool(is_honeypot) if not ok else False,
+            "trading_paused": bool(trading_paused),
+            "blacklisted": False,
+            "liq_usd": _safe_float(liq_usd, 0.0) if liq_usd is not None else None,
+            # Convenience fields for downstream:
+            "jup_sell_route_ok": bool(sources.get("jupiter", {}).get("ok", True))
+            if isinstance(sources.get("jupiter"), dict)
+            else None,
+            "sell_price_impact_pct": (sources.get("jupiter", {}).get("data", {}) or {}).get(
+                "priceImpactPct"
+            )
+            if isinstance(sources.get("jupiter"), dict)
+            else None,
         },
+        "sources": sources,
+        "policy": policy.__dict__,
     }
-    return combined_ok, report
+
+    await _cache_set(mint, rep)
+    return ok, rep
 
 
 async def is_token_safe(mint: str) -> bool:
-    """
-    Simple boolean wrapper for honeypot_check.
-    """
     ok, _ = await honeypot_check(mint)
     return ok
 
 
-# ---------------------------------------------------------------------------
-# Self-test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    async def _t() -> None:
-        import sys
-
-        if len(sys.argv) < 2:
-            print("Usage: python -m utils_pkg.honeypot <MINT>")
-            return
-
-        mint = sys.argv[1]
-        ok, rep = await honeypot_check(mint)
-        print("SAFE:", ok)
-        print("REASONS:", rep.get("reasons"))
-        await close_local_session()
-
-    asyncio.run(_t())
-
-
 __all__ = [
+    # compatibility exports
     "BIRDEYE_API_URL",
     "JUPITER_QUOTE_URL",
-    "WSOL_MINT",
     "SHARED_SESSION",
     "SHARED_SOLANA_CLIENT",
+    "WSOL_MINT",
+    "HoneypotPolicy",
     "_get_session",
-    "close_local_session",
     "_headers_birdeye",
+    "close_local_session",
+    # public API
     "honeypot_check",
     "is_token_safe",
 ]

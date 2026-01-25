@@ -1,50 +1,49 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
-scripts/check_schema.py
+scripts/check_schema.py — God-Tier Schema Guard (Phase 0–7 LOCK-IN)
+===================================================================
 
-God-Tier Schema Guard (Phase 0–7 LOCK-IN)
-========================================
-
-Purpose
--------
-Guarantee the Postgres schema your bot expects exists *before* the orchestrator runs.
+Goal
+----
+Guarantee the Postgres schema your bot expects exists *before* anything live runs.
 
 Hard rules
 ----------
-- SAFE / VERIFY mode by default (READ ONLY transaction).
+- VERIFY mode by default (read-only transaction).
 - NEVER drops anything.
-- ONLY creates/upgrades when ALLOW_SCHEMA_CREATE=1 or --allow-create.
-- Only safe, idempotent SQL:
+- Only creates/upgrades when:
+    ALLOW_SCHEMA_CREATE=1  OR  --allow-create
+- DDL is safe/idempotent ONLY:
     CREATE SCHEMA IF NOT EXISTS
-    CREATE TABLE IF NOT EXISTS
-    ALTER TABLE ... ADD COLUMN IF NOT EXISTS
-    CREATE INDEX IF NOT EXISTS
+    CREATE TABLE  IF NOT EXISTS
+    ALTER TABLE   ... ADD COLUMN IF NOT EXISTS
+    CREATE INDEX  IF NOT EXISTS
     CREATE EXTENSION IF NOT EXISTS (optional; best-effort)
+- NEVER prints secrets (DSNs always masked).
 
 DSN brain (single source of truth)
 ----------------------------------
 Uses utils_pkg/db_dsn.py:
 - Picks/normalizes DSN
-- Strips ALL URL query params from SQLAlchemy DSN (prevents asyncpg kwargs crashes)
-- Converts sslmode => real SSLContext via connect_args["ssl"]
+- Strips URL query params from SQLAlchemy DSN (prevents asyncpg kwargs crashes)
+- Converts sslmode into a real SSLContext via connect_args["ssl"] when needed
 - Internal/external preference handled by db_dsn (resolvability-aware)
 
 Output contract (preflight-friendly)
 ------------------------------------
 - Human logs -> STDERR (unless JSON_ONLY).
-- JSON summary -> STDOUT only when:
+- JSON summary -> STDOUT when:
     SCHEMA_JSON=1 or SCHEMA_JSON_ONLY=1 or --json/--json-only
-- NEVER prints secrets (DSNs always masked).
+- JSON schema is stable and tooling-safe.
 
 Exit codes
 ----------
 0   OK (schema ready) / skipped
 2   Missing items (verify-only OR not allowed to create)
 3   Create/upgrade attempted but failed or still missing
-1   Fatal / misconfigured (no DSN, no connection, missing deps, internal error)
-124 Timeout (attempt/all)
+1   Fatal / misconfigured (no DSN, missing deps, connection fatal, internal error)
+124 Timeout (attempt and/or total)
 """
 
 import argparse
@@ -57,9 +56,10 @@ import re
 import socket
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 # Optional dotenv (local dev only)
 try:
@@ -74,15 +74,31 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from sqlalchemy import text  # noqa: E402
-from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
+# Hard dependency: utils_pkg/db_dsn.py is canonical
+try:
+    from utils_pkg import db_dsn as dsnmod  # type: ignore
+except Exception as e:  # pragma: no cover
+    dsnmod = None  # type: ignore[assignment]
+    _DB_DSN_IMPORT_ERR = e
+else:
+    _DB_DSN_IMPORT_ERR = None
 
-from utils_pkg import db_dsn as dsnmod  # noqa: E402
+# Optional dependency: SQLAlchemy async
+try:
+    from sqlalchemy import text  # type: ignore
+    from sqlalchemy.ext.asyncio import create_async_engine  # type: ignore
+except Exception as e:  # pragma: no cover
+    text = None  # type: ignore
+    create_async_engine = None  # type: ignore
+    _SA_IMPORT_ERR = e
+else:
+    _SA_IMPORT_ERR = None
 
 
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
 _FALSE = {"0", "false", "f", "no", "n", "off"}
 
+# DSN env keys we consider when building candidates
 _DSN_KEYS = (
     "POSITIONS_PG_DSN",
     "SNIPER_DB_DSN",
@@ -94,13 +110,14 @@ _DSN_KEYS = (
     "PNL_DSN",
 )
 
+# ---------------------------------------------------------------------
+# env + safe io helpers
+# ---------------------------------------------------------------------
 
-# =============================================================================
-# env helpers
-# =============================================================================
+
 def _envs(k: str, d: str = "") -> str:
     v = os.getenv(k)
-    s = (v if v is not None else d)
+    s = v if v is not None else d
     s = str(s).strip()
     # strip one layer of quotes (Render UI / .env often stores quoted strings)
     if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
@@ -134,13 +151,10 @@ def _envf(k: str, d: float) -> float:
         return d
 
 
-def _split_csv(s: str) -> List[str]:
+def _split_csv(s: str) -> list[str]:
     return [p.strip() for p in (s or "").replace(";", ",").split(",") if p.strip()]
 
 
-# =============================================================================
-# time/log helpers
-# =============================================================================
 def _ts() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -150,14 +164,21 @@ def _safe_print(line: str, *, file) -> None:
     try:
         file.write(line + ("" if line.endswith("\n") else "\n"))
         file.flush()
+        return
     except UnicodeEncodeError:
         enc = getattr(file, "encoding", None) or "utf-8"
         b = line.encode(enc, errors="replace")
-        with contextlib.suppress(Exception):
-            file.buffer.write(b + b"\n")  # type: ignore[attr-defined]
-            file.buffer.flush()  # type: ignore[attr-defined]
+        try:
+            if hasattr(file, "buffer"):
+                file.buffer.write(b + b"\n")  # type: ignore[attr-defined]
+                file.buffer.flush()  # type: ignore[attr-defined]
+            else:
+                file.write(b.decode(enc, errors="replace") + "\n")
+                file.flush()
+        except Exception:
+            return
     except Exception:
-        pass
+        return
 
 
 def _hlog(msg: str, *, json_only: bool) -> None:
@@ -166,9 +187,30 @@ def _hlog(msg: str, *, json_only: bool) -> None:
     _safe_print(f"[schema] {_ts()} {msg}", file=sys.stderr)
 
 
-# =============================================================================
-# diagnostics
-# =============================================================================
+# ---------------------------------------------------------------------
+# diagnostics + masking
+# ---------------------------------------------------------------------
+
+
+def _mask_dsn(raw: str) -> str:
+    raw = str(raw or "")
+    if dsnmod is not None and hasattr(dsnmod, "mask_dsn"):
+        try:
+            return str(dsnmod.mask_dsn(raw))
+        except Exception:
+            pass
+    # fallback: strip creds + query
+    try:
+        u = urlparse(raw)
+        host = u.hostname or ""
+        port = u.port or 0
+        db = (u.path or "").lstrip("/").split("/", 1)[0]
+        scheme = u.scheme or "postgres"
+        return f"{scheme}://***@{host}:{port}/{db}?..."
+    except Exception:
+        return "***"
+
+
 def _resolves(host: str) -> bool:
     if not host:
         return False
@@ -179,10 +221,10 @@ def _resolves(host: str) -> bool:
         return False
 
 
-def _dns_debug(host: str, port: int) -> List[str]:
+def _dns_debug(host: str, port: int) -> list[str]:
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-        ips: List[str] = []
+        ips: list[str] = []
         for _, _, _, _, sockaddr in infos:
             ip = sockaddr[0]
             if ip not in ips:
@@ -192,7 +234,7 @@ def _dns_debug(host: str, port: int) -> List[str]:
         return []
 
 
-def _tcp_probe(host: str, port: int, timeout_s: float) -> Tuple[bool, str]:
+def _tcp_probe(host: str, port: int, timeout_s: float) -> tuple[bool, str]:
     try:
         with socket.create_connection((host, port), timeout=timeout_s):
             return True, "ok"
@@ -200,18 +242,40 @@ def _tcp_probe(host: str, port: int, timeout_s: float) -> Tuple[bool, str]:
         return False, f"{type(e).__name__}: {e}"
 
 
-# =============================================================================
+def _dsn_sslmode(dsn: str) -> str:
+    try:
+        q = parse_qs(urlparse(dsn).query or "")
+        v = (q.get("sslmode") or [""])[0]
+        return (v or "").lower().strip()
+    except Exception:
+        low = (dsn or "").lower()
+        return "require" if "sslmode=require" in low else ""
+
+
+# ---------------------------------------------------------------------
 # error classification + hints
-# =============================================================================
+# ---------------------------------------------------------------------
+
+
 def _classify_error(msg: str) -> str:
     m = (msg or "").lower()
     if not m:
         return "other"
+    if "missing_deps" in m:
+        return "missing_deps"
     if "timed out" in m or "timeout" in m:
         return "timeout"
-    if "getaddrinfo failed" in m or "could not translate host name" in m or "name or service not known" in m:
+    if (
+        "getaddrinfo failed" in m
+        or "could not translate host name" in m
+        or "name or service not known" in m
+    ):
         return "dns"
-    if "password authentication failed" in m or "authentication failed" in m or "no pg_hba.conf entry" in m:
+    if (
+        "password authentication failed" in m
+        or "authentication failed" in m
+        or "no pg_hba.conf entry" in m
+    ):
         return "auth"
     if "ssl" in m and ("handshake" in m or "certificate" in m or "required" in m or "alert" in m):
         return "ssl"
@@ -219,35 +283,55 @@ def _classify_error(msg: str) -> str:
         return "refused"
     if "too many connections" in m:
         return "over_capacity"
-    if "read_only" in m:
+    if "read_only" in m or "read-only" in m:
         return "read_only"
     if "connection was closed in the middle of operation" in m:
         return "server_closed_mid_op"
     return "other"
 
 
-def _fix_hints(results: List[Dict[str, Any]], *, allow_create: bool, schema: str) -> List[str]:
+def _fix_hints(results: list[dict[str, Any]], *, allow_create: bool, schema: str) -> list[str]:
     kinds = [_classify_error(str(r.get("error", ""))) for r in results if not r.get("ok")]
-    hints: List[str] = []
+    hints: list[str] = []
 
+    if "missing_deps" in kinds:
+        hints.append(
+            "Missing deps. Install sqlalchemy[asyncio] and asyncpg, and ensure utils_pkg/db_dsn.py imports."
+        )
     if "dns" in kinds:
-        hints.append("DNS failed for the DB host. Fix DSN host (must include full .render.com host) or check your network/DNS.")
+        hints.append(
+            "DNS failed for the DB host. Fix DSN host (full .render.com) or check your network/DNS."
+        )
     if "timeout" in kinds:
-        hints.append("Timed out. Increase SCHEMA_CONNECT_TIMEOUT_S / SCHEMA_ATTEMPT_TIMEOUT_S or try another network.")
+        hints.append(
+            "Timed out. Increase SCHEMA_CONNECT_TIMEOUT_S / SCHEMA_TIMEOUT_S or try another network."
+        )
     if "ssl" in kinds:
-        hints.append("SSL/TLS issue. Ensure your DSN is external with SSL required locally; internal DSN should be used only on Render.")
+        hints.append(
+            "SSL/TLS issue. Prefer EXTERNAL DSN locally; INTERNAL DSN only on Render. Ensure sslmode is correct."
+        )
     if "auth" in kinds:
-        hints.append("Auth failed. Verify DB username/password and that the DB allows connections from your runtime/IP.")
+        hints.append(
+            "Auth failed. Verify DB username/password and that your runtime/IP is allowed."
+        )
     if "server_closed_mid_op" in kinds:
-        hints.append("Server closed mid-operation. Often SSL mismatch, transient VPN/ISP resets, or DB policy. Prefer EXTERNAL DSN locally.")
+        hints.append(
+            "Server closed mid-operation. Often SSL mismatch or transient network resets; try a different DSN candidate."
+        )
     if "read_only" in kinds and allow_create:
-        hints.append("DB is read-only for this connection/policy. Use a writable endpoint or run schema creation elsewhere.")
+        hints.append(
+            "DB appears read-only. Use a writable endpoint, or run schema create from the correct environment."
+        )
     if any(r.get("missing") for r in results):
-        hints.append(f"Schema items missing in '{schema}'. If you intended a different schema, set SCHEMA_NAME or --schema.")
+        hints.append(
+            f"Schema items missing in '{schema}'. If intended schema differs, set SCHEMA_NAME or --schema."
+        )
     if not hints:
-        hints.append("No candidate connected. Verify DSN values, network egress, and that Postgres is reachable.")
+        hints.append(
+            "No candidate connected. Verify DSNs, network egress, and that Postgres is reachable."
+        )
 
-    out: List[str] = []
+    out: list[str] = []
     seen = set()
     for h in hints:
         if h not in seen:
@@ -256,10 +340,12 @@ def _fix_hints(results: List[Dict[str, Any]], *, allow_create: bool, schema: str
     return out[:10]
 
 
-# =============================================================================
+# ---------------------------------------------------------------------
 # retry policy
-# =============================================================================
-def _retry_cfg() -> Tuple[int, float]:
+# ---------------------------------------------------------------------
+
+
+def _retry_cfg() -> tuple[int, float]:
     retries = max(0, _envi("SCHEMA_RETRIES", 1))
     base = max(0.05, float(_envf("SCHEMA_RETRY_BASE_S", 0.35)))
     return retries, base
@@ -272,22 +358,35 @@ async def _sleep_backoff(attempt: int, base: float) -> None:
     await asyncio.sleep(t)
 
 
-# =============================================================================
-# candidates (same style as test_pg)
-# =============================================================================
-def _candidate_dsns(cli_dsns: Sequence[str]) -> List[Tuple[str, str]]:
-    out: List[Tuple[str, str]] = []
+# ---------------------------------------------------------------------
+# candidates + temporary env override for db_dsn
+# ---------------------------------------------------------------------
+
+
+def _candidate_dsns(cli_dsns: Sequence[str]) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
     for i, d in enumerate(cli_dsns):
         if d and str(d).strip():
-            out.append((f"CLI_{i+1}", str(d).strip()))
+            out.append((f"CLI_{i + 1}", str(d).strip()))
 
-    for k in ("PNL_DSN", "POSTGRES_DSN", "PG_DSN", "DATABASE_URL", "PG_DSN_INTERNAL", "PG_DSN_EXTERNAL", "SNIPER_DB_DSN", "POSITIONS_PG_DSN"):
+    # env candidates (priority-ish)
+    for k in (
+        "PNL_DSN",
+        "POSTGRES_DSN",
+        "PG_DSN",
+        "DATABASE_URL",
+        "PG_DSN_INTERNAL",
+        "PG_DSN_EXTERNAL",
+        "SNIPER_DB_DSN",
+        "POSITIONS_PG_DSN",
+    ):
         v = _envs(k, "")
         if v:
             out.append((k, v))
 
+    # unique by raw string
     seen = set()
-    uniq: List[Tuple[str, str]] = []
+    uniq: list[tuple[str, str]] = []
     for lbl, raw in out:
         key = raw.strip()
         if not key or key in seen:
@@ -298,8 +397,8 @@ def _candidate_dsns(cli_dsns: Sequence[str]) -> List[Tuple[str, str]]:
 
 
 @contextlib.contextmanager
-def _temp_env(overrides: Dict[str, Optional[str]]) -> Any:
-    old: Dict[str, Optional[str]] = {}
+def _temp_env(overrides: dict[str, str | None]) -> Any:
+    old: dict[str, str | None] = {}
     for k, v in overrides.items():
         old[k] = os.getenv(k)
         if v is None:
@@ -321,7 +420,7 @@ class AttemptPlan:
     label: str
     raw: str
     dsn_sa: str
-    connect_args: Dict[str, Any]
+    connect_args: dict[str, Any]
     host: str
     port: int
     db: str
@@ -330,27 +429,32 @@ class AttemptPlan:
     host_resolves: int
 
 
-def _build_plan(label: str, raw: str, *, timeout_s: float, connect_timeout_s: float, app_name: str) -> AttemptPlan:
+def _build_plan(
+    label: str, raw: str, *, timeout_s: float, connect_timeout_s: float, app_name: str
+) -> AttemptPlan:
     """
-    Build a plan for an arbitrary raw DSN WITHOUT calling db_dsn private functions.
-    We do this by temporarily forcing db_dsn's env selection to pick this raw DSN.
+    Build a plan for an arbitrary raw DSN via db_dsn.py, without calling its private internals.
+    We do this by temporarily forcing env selection to pick this raw DSN.
     """
+    if dsnmod is None:
+        raise RuntimeError(f"missing_deps:utils_pkg.db_dsn import failed: {_DB_DSN_IMPORT_ERR}")
+
     overrides = {k: None for k in _DSN_KEYS}
     overrides["POSTGRES_DSN"] = raw  # force selection
 
     with _temp_env(overrides):
         pr = dsnmod.pick_pg_dsn_debug(timeout_s=timeout_s, app_name=app_name)
 
-    if not pr.dsn_sa:
+    if not getattr(pr, "dsn_sa", ""):
         raise RuntimeError("bad_format:empty_sanitized_dsn")
 
     u = urlparse(pr.dsn_sa)
-    host = pr.host or (u.hostname or "")
+    host = getattr(pr, "host", "") or (u.hostname or "")
     port = int(u.port or 5432)
     db = (u.path or "").lstrip("/").split("/", 1)[0] if u.path else ""
 
-    ca = dict(pr.connect_args or {})
-    # Asyncpg connect timeout (dialect forwards connect_args to asyncpg.connect)
+    ca = dict(getattr(pr, "connect_args", {}) or {})
+    # asyncpg connect timeout (sqlalchemy passes connect_args to asyncpg.connect)
     if connect_timeout_s and connect_timeout_s > 0:
         ca.setdefault("timeout", float(connect_timeout_s))
 
@@ -362,23 +466,25 @@ def _build_plan(label: str, raw: str, *, timeout_s: float, connect_timeout_s: fl
         host=host,
         port=port,
         db=db,
-        sslmode=pr.sslmode,
-        ssl_enabled=bool(pr.ssl_enabled),
+        sslmode=str(getattr(pr, "sslmode", "") or ""),
+        ssl_enabled=bool(getattr(pr, "ssl_enabled", False)),
         host_resolves=int(bool(host and _resolves(host))),
     )
 
 
-# =============================================================================
+# ---------------------------------------------------------------------
 # schema plans
-# =============================================================================
+# ---------------------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class TablePlan:
     name: str
-    columns: List[Tuple[str, str]]  # (col, ddl)
-    indexes: List[str]              # CREATE INDEX IF NOT EXISTS ...
+    columns: list[tuple[str, str]]  # (col, ddl)
+    indexes: list[str]  # CREATE INDEX IF NOT EXISTS ...
 
     @property
-    def colmap(self) -> Dict[str, str]:
+    def colmap(self) -> dict[str, str]:
         return {c: ddl for (c, ddl) in self.columns}
 
 
@@ -387,14 +493,22 @@ def _schema_profile() -> str:
     return "full" if p == "full" else "minimal"
 
 
-def _default_required_tables(profile: str) -> List[str]:
+def _default_required_tables(profile: str) -> list[str]:
     if profile == "full":
-        return ["bot_meta", "trades", "positions", "candidate_events", "ai_features", "exit_state", "risk_events", "health_heartbeats"]
-    # minimal default (matches your preflight expectation)
+        return [
+            "bot_meta",
+            "trades",
+            "positions",
+            "candidate_events",
+            "ai_features",
+            "exit_state",
+            "risk_events",
+            "health_heartbeats",
+        ]
     return ["trades", "positions", "ai_features"]
 
 
-def _plans() -> Dict[str, TablePlan]:
+def _plans() -> dict[str, TablePlan]:
     return {
         "bot_meta": TablePlan(
             name="bot_meta",
@@ -525,15 +639,17 @@ def _plans() -> Dict[str, TablePlan]:
     }
 
 
-# =============================================================================
+# ---------------------------------------------------------------------
 # SQL helpers
-# =============================================================================
+# ---------------------------------------------------------------------
+
+
 def _qident(name: str) -> str:
     n = (name or "").strip().replace('"', '""')
     return f'"{n}"'
 
 
-def _index_name_from_sql(sql: str) -> Optional[str]:
+def _index_name_from_sql(sql: str) -> str | None:
     t = " ".join((sql or "").split())
     m = re.search(r"(?i)create\s+index\s+if\s+not\s+exists\s+([a-zA-Z0-9_\".]+)\s+on\s+", t)
     if not m:
@@ -559,28 +675,37 @@ async def _exec(conn: Any, sql: str, *, dryrun: bool) -> None:
     await conn.exec_driver_sql(s)
 
 
-# =============================================================================
+# ---------------------------------------------------------------------
 # introspection
-# =============================================================================
+# ---------------------------------------------------------------------
+
+
 async def _schema_exists(conn: Any, schema: str) -> bool:
-    r = await conn.execute(text("SELECT 1 FROM information_schema.schemata WHERE schema_name=:s"), {"s": schema})
+    r = await conn.execute(
+        text("SELECT 1 FROM information_schema.schemata WHERE schema_name=:s"), {"s": schema}
+    )
     return r.first() is not None
 
 
-async def _tables_in_schema(conn: Any, schema: str) -> List[str]:
-    r = await conn.execute(text("SELECT table_name FROM information_schema.tables WHERE table_schema=:s"), {"s": schema})
+async def _tables_in_schema(conn: Any, schema: str) -> list[str]:
+    r = await conn.execute(
+        text("SELECT table_name FROM information_schema.tables WHERE table_schema=:s"),
+        {"s": schema},
+    )
     return [str(x[0]) for x in r.fetchall()]
 
 
-async def _columns_in_table(conn: Any, schema: str, table: str) -> List[str]:
+async def _columns_in_table(conn: Any, schema: str, table: str) -> list[str]:
     r = await conn.execute(
-        text("SELECT column_name FROM information_schema.columns WHERE table_schema=:s AND table_name=:t"),
+        text(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema=:s AND table_name=:t"
+        ),
         {"s": schema, "t": table},
     )
     return [str(x[0]) for x in r.fetchall()]
 
 
-async def _index_names(conn: Any, schema: str, table: str) -> List[str]:
+async def _index_names(conn: Any, schema: str, table: str) -> list[str]:
     r = await conn.execute(
         text("SELECT indexname FROM pg_indexes WHERE schemaname=:s AND tablename=:t"),
         {"s": schema, "t": table},
@@ -588,9 +713,60 @@ async def _index_names(conn: Any, schema: str, table: str) -> List[str]:
     return [str(x[0]) for x in r.fetchall()]
 
 
-# =============================================================================
+# ---------------------------------------------------------------------
+# advisory lock (prevents concurrent schema DDL fights)
+# ---------------------------------------------------------------------
+
+
+async def _try_schema_lock(conn: Any, *, schema: str, timeout_s: float) -> tuple[bool, str]:
+    """
+    Best-effort advisory lock: pg_try_advisory_lock(hashtext(...)).
+    Not fatal if it fails; but prevents "two deploys racing DDL".
+    """
+    schema = (schema or "public").strip() or "public"
+    key = f"pnlsniper_schema_guard:{schema}"
+    # use two-int key derived from hashtext for portability
+    # (hashtext returns int4; cast to int8 and use (k, 0))
+    try:
+        row = (
+            await conn.execute(
+                text("SELECT pg_try_advisory_lock(hashtext(:k)::bigint, 0)"), {"k": key}
+            )
+        ).first()
+        if row and bool(row[0]):
+            return True, "locked"
+    except Exception as e:
+        return False, f"lock_error:{type(e).__name__}:{e}"
+
+    # wait loop
+    end = time.monotonic() + max(0.0, float(timeout_s))
+    while time.monotonic() < end:
+        await asyncio.sleep(0.20 + random.random() * 0.20)
+        try:
+            row = (
+                await conn.execute(
+                    text("SELECT pg_try_advisory_lock(hashtext(:k)::bigint, 0)"), {"k": key}
+                )
+            ).first()
+            if row and bool(row[0]):
+                return True, "locked_after_wait"
+        except Exception as e:
+            return False, f"lock_error:{type(e).__name__}:{e}"
+    return False, "lock_timeout"
+
+
+async def _unlock_schema(conn: Any, *, schema: str) -> None:
+    schema = (schema or "public").strip() or "public"
+    key = f"pnlsniper_schema_guard:{schema}"
+    with contextlib.suppress(Exception):
+        await conn.execute(text("SELECT pg_advisory_unlock(hashtext(:k)::bigint, 0)"), {"k": key})
+
+
+# ---------------------------------------------------------------------
 # ensure logic
-# =============================================================================
+# ---------------------------------------------------------------------
+
+
 async def _ensure_table(
     conn: Any,
     *,
@@ -599,16 +775,16 @@ async def _ensure_table(
     allow_create: bool,
     dryrun: bool,
     strict_index_verify: bool,
-) -> Tuple[List[str], List[str], List[str], bool]:
+) -> tuple[list[str], list[str], list[str], bool]:
     """
     Returns: (applied, missing, warnings, attempted_ddl)
     """
-    applied: List[str] = []
-    missing: List[str] = []
-    warnings: List[str] = []
+    applied: list[str] = []
+    missing: list[str] = []
+    warnings: list[str] = []
     attempted_ddl = False
 
-    schema = schema or "public"
+    schema = (schema or "public").strip() or "public"
     sch_q = _qident(schema)
 
     tables = set(await _tables_in_schema(conn, schema))
@@ -617,7 +793,6 @@ async def _ensure_table(
             missing.append(f"missing table: {schema}.{plan.name}")
             return applied, missing, warnings, attempted_ddl
         attempted_ddl = True
-        # schema ensure
         if schema != "public":
             await _exec(conn, f"CREATE SCHEMA IF NOT EXISTS {sch_q};", dryrun=dryrun)
             applied.append(f"ensured schema: {schema}")
@@ -639,8 +814,8 @@ async def _ensure_table(
         )
         applied.append(f"added column: {schema}.{plan.name}.{col}")
 
-    # Indexes
-    expected_idx_names: List[str] = []
+    # Indexes: if creating is allowed, ensure them; else optionally verify presence.
+    expected_idx_names: list[str] = []
     for idx_sql in plan.indexes:
         nm = _index_name_from_sql(idx_sql)
         if nm:
@@ -671,19 +846,23 @@ async def _run_one(
     plan: AttemptPlan,
     *,
     schema: str,
-    required_tables: List[str],
+    required_tables: list[str],
     allow_create: bool,
     dryrun: bool,
     strict_index_verify: bool,
     json_only: bool,
     attempt_timeout_s: float,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
+    """
+    Try one DSN candidate. Returns an attempt result dict (stable keys).
+    """
     t0 = time.monotonic()
-    out: Dict[str, Any] = {
+
+    out: dict[str, Any] = {
         "label": plan.label,
         "ok": False,
-        "dsn": dsnmod.mask_dsn(plan.raw),
-        "dsn_sa": dsnmod.mask_dsn(plan.dsn_sa),
+        "dsn": _mask_dsn(plan.raw),
+        "dsn_sa": _mask_dsn(plan.dsn_sa),
         "host": plan.host,
         "host_resolves": plan.host_resolves,
         "port": plan.port,
@@ -706,13 +885,30 @@ async def _run_one(
         "tcp_probe": None,
     }
 
+    # Missing deps
+    if dsnmod is None or _DB_DSN_IMPORT_ERR is not None:
+        out["error"] = (
+            f"missing_deps:utils_pkg.db_dsn:{type(_DB_DSN_IMPORT_ERR).__name__}:{_DB_DSN_IMPORT_ERR}"
+        )
+        out["error_kind"] = "missing_deps"
+        out["sec"] = round(time.monotonic() - t0, 3)
+        return out
+    if create_async_engine is None or text is None:
+        out["error"] = f"missing_deps:sqlalchemy:{type(_SA_IMPORT_ERR).__name__}:{_SA_IMPORT_ERR}"
+        out["error_kind"] = "missing_deps"
+        out["sec"] = round(time.monotonic() - t0, 3)
+        return out
+
     dns_debug = _envb("SCHEMA_DNS_DEBUG", True)
     tcp_probe = _envb("SCHEMA_TCP_PROBE", True)
+    lock_enabled = _envb("SCHEMA_ADVISORY_LOCK", True)
 
     if dns_debug and plan.host:
         out["ips"] = _dns_debug(plan.host, plan.port)
     if tcp_probe and plan.host:
-        okp, msgp = _tcp_probe(plan.host, plan.port, timeout_s=min(6.0, max(2.0, attempt_timeout_s * 0.35)))
+        okp, msgp = _tcp_probe(
+            plan.host, plan.port, timeout_s=min(6.0, max(2.0, attempt_timeout_s * 0.35))
+        )
         out["tcp_probe_ok"] = int(bool(okp))
         out["tcp_probe"] = msgp
 
@@ -727,13 +923,13 @@ async def _run_one(
     )
 
     retries, base = _retry_cfg()
-    last_err: Optional[BaseException] = None
+    last_err: BaseException | None = None
 
     try:
         for attempt in range(retries + 1):
             try:
                 async with eng.connect() as conn:
-                    # Timeouts (safe in both modes)
+                    # Session timeouts (safe in both modes; best-effort)
                     stmt_ms = int(_envi("SCHEMA_STATEMENT_TIMEOUT_MS", 20000))
                     lock_ms = int(_envi("SCHEMA_LOCK_TIMEOUT_MS", 5000))
                     idle_ms = int(_envi("SCHEMA_IDLE_TX_TIMEOUT_MS", 10000))
@@ -743,22 +939,36 @@ async def _run_one(
                     with contextlib.suppress(Exception):
                         await conn.exec_driver_sql(f"SET lock_timeout = {max(500, lock_ms)}")
                     with contextlib.suppress(Exception):
-                        await conn.exec_driver_sql(f"SET idle_in_transaction_session_timeout = {max(1500, idle_ms)}")
+                        await conn.exec_driver_sql(
+                            f"SET idle_in_transaction_session_timeout = {max(1500, idle_ms)}"
+                        )
 
-                    # Basic ping
+                    # Ping
                     row = (await conn.execute(text("SELECT 1"))).first()
                     if not row or row[0] != 1:
                         raise RuntimeError("select1_failed")
 
-                    # Mode-specific transaction
+                    # Begin tx
                     if not allow_create:
                         await conn.exec_driver_sql("BEGIN READ ONLY")
                     else:
                         await conn.exec_driver_sql("BEGIN")
 
                     try:
+                        # advisory lock (only useful in create mode; harmless in verify)
+                        if lock_enabled and allow_create:
+                            ok_lock, why = await _try_schema_lock(
+                                conn,
+                                schema=schema,
+                                timeout_s=float(_envf("SCHEMA_LOCK_WAIT_S", 8.0)),
+                            )
+                            out["details"]["advisory_lock"] = why
+                            if not ok_lock:
+                                # Not fatal, but helps explain drift / DDL races
+                                out["warnings"].append(f"advisory_lock:{why}")
+
                         ro = (await conn.execute(text("SHOW transaction_read_only"))).scalar()
-                        ro_s = (str(ro).strip().lower() if ro is not None else "")
+                        ro_s = str(ro).strip().lower() if ro is not None else ""
                         out["details"]["transaction_read_only"] = ro_s
 
                         if allow_create and ro_s in ("on", "true", "1"):
@@ -771,23 +981,26 @@ async def _run_one(
                         if allow_create and _envb("SCHEMA_PGCRYPTO", False):
                             out["attempted_ddl"] = True
                             try:
-                                await _exec(conn, "CREATE EXTENSION IF NOT EXISTS pgcrypto;", dryrun=dryrun)
+                                await _exec(
+                                    conn, "CREATE EXTENSION IF NOT EXISTS pgcrypto;", dryrun=dryrun
+                                )
                                 out["applied"].append("ensured extension: pgcrypto")
                             except Exception as e:
-                                w = f"pgcrypto_warn:{type(e).__name__}:{e}"
-                                out["warnings"].append(w)
+                                out["warnings"].append(f"pgcrypto_warn:{type(e).__name__}:{e}")
 
-                        # Ensure schema exists if create allowed
+                        # Ensure schema exists if allowed
                         exists = await _schema_exists(conn, sch)
                         if not exists:
                             if not allow_create:
                                 out["missing"].append(f"missing schema: {sch}")
                             else:
                                 out["attempted_ddl"] = True
-                                await _exec(conn, f"CREATE SCHEMA IF NOT EXISTS {sch_q};", dryrun=dryrun)
+                                await _exec(
+                                    conn, f"CREATE SCHEMA IF NOT EXISTS {sch_q};", dryrun=dryrun
+                                )
                                 out["applied"].append(f"ensured schema: {sch}")
 
-                        # search_path
+                        # search_path so unqualified index SQL lands in correct schema
                         with contextlib.suppress(Exception):
                             await conn.exec_driver_sql(f"SET LOCAL search_path TO {sch_q}, public;")
 
@@ -795,10 +1008,12 @@ async def _run_one(
                         for tname in required_tables:
                             plan_tbl = plans.get(tname)
                             if not plan_tbl:
-                                # Unknown plan => verify existence only
+                                # Unknown plan => verify only
                                 tables = set(await _tables_in_schema(conn, sch))
                                 if tname not in tables:
-                                    out["missing"].append(f"missing table (unknown plan): {sch}.{tname}")
+                                    out["missing"].append(
+                                        f"missing table (unknown plan): {sch}.{tname}"
+                                    )
                                 continue
 
                             applied, missing, warnings, attempted = await _ensure_table(
@@ -814,17 +1029,26 @@ async def _run_one(
                             out["warnings"].extend(warnings)
                             out["attempted_ddl"] = bool(out["attempted_ddl"] or attempted)
 
-                        # metadata
+                        # extra metadata
                         with contextlib.suppress(Exception):
-                            r2 = (await conn.execute(text("SELECT current_database(), current_user"))).first()
+                            r2 = (
+                                await conn.execute(text("SELECT current_database(), current_user"))
+                            ).first()
                             if r2:
                                 out["details"]["db"] = str(r2[0])
                                 out["details"]["user"] = str(r2[1])
 
                     finally:
-                        # Always rollback (even create mode); DDL in Postgres is transactional.
-                        # If you want schema to persist, run with ALLOW_SCHEMA_CREATE=1 AND SCHEMA_COMMIT=1.
-                        commit = bool(allow_create and (not dryrun) and _envb("SCHEMA_COMMIT", True))
+                        # Unlock best-effort before finishing tx
+                        if allow_create and lock_enabled:
+                            await _unlock_schema(conn, schema=schema)
+
+                        # Commit policy
+                        # - In create mode, we commit by default (SCHEMA_COMMIT=1).
+                        # - In verify mode, always rollback.
+                        commit = bool(
+                            allow_create and (not dryrun) and _envb("SCHEMA_COMMIT", True)
+                        )
                         if commit:
                             with contextlib.suppress(Exception):
                                 await conn.exec_driver_sql("COMMIT")
@@ -832,7 +1056,7 @@ async def _run_one(
                             with contextlib.suppress(Exception):
                                 await conn.exec_driver_sql("ROLLBACK")
 
-                out["ok"] = (len(out["missing"]) == 0)
+                out["ok"] = len(out["missing"]) == 0
                 return out
 
             except Exception as e:
@@ -842,7 +1066,12 @@ async def _run_one(
                 out["error_kind"] = _classify_error(msg)
 
                 # Retry only for flaky classes
-                if attempt < retries and out["error_kind"] in ("timeout", "server_closed_mid_op", "ssl", "other"):
+                if attempt < retries and out["error_kind"] in (
+                    "timeout",
+                    "server_closed_mid_op",
+                    "ssl",
+                    "other",
+                ):
                     await _sleep_backoff(attempt, base)
                     continue
                 return out
@@ -858,9 +1087,11 @@ async def _run_one(
             await eng.dispose()
 
 
-# =============================================================================
-# main
-# =============================================================================
+# ---------------------------------------------------------------------
+# main runner
+# ---------------------------------------------------------------------
+
+
 async def _amain() -> int:
     RC_OK = 0
     RC_FATAL = 1
@@ -869,19 +1100,48 @@ async def _amain() -> int:
     RC_TIMEOUT = 124
 
     ap = argparse.ArgumentParser(description="God-Tier Schema Guard (LOCK-IN).")
-    ap.add_argument("--dsn", action="append", default=[], help="DSN override (repeatable). If omitted, uses env candidates.")
-    ap.add_argument("--schema", default=_envs("SCHEMA_NAME", _envs("PG_TEST_SCHEMA", "public") or "public") or "public", help="Schema name.")
-    ap.add_argument("--profile", choices=["minimal", "full"], default=_schema_profile(), help="Schema profile.")
-    ap.add_argument("--required-tables", default=_envs("REQUIRED_TABLES", ""), help="CSV override for required tables.")
-    ap.add_argument("--allow-create", action="store_true", help="Enable create/upgrade (or set ALLOW_SCHEMA_CREATE=1).")
+    ap.add_argument(
+        "--dsn",
+        action="append",
+        default=[],
+        help="DSN override (repeatable). If omitted, uses env candidates.",
+    )
+    ap.add_argument(
+        "--schema",
+        default=_envs("SCHEMA_NAME", _envs("PG_TEST_SCHEMA", "public") or "public") or "public",
+        help="Schema name.",
+    )
+    ap.add_argument(
+        "--profile", choices=["minimal", "full"], default=_schema_profile(), help="Schema profile."
+    )
+    ap.add_argument(
+        "--required-tables",
+        default=_envs("REQUIRED_TABLES", ""),
+        help="CSV override for required tables.",
+    )
+    ap.add_argument(
+        "--allow-create",
+        action="store_true",
+        help="Enable create/upgrade (or set ALLOW_SCHEMA_CREATE=1).",
+    )
     ap.add_argument("--dryrun", action="store_true", help="No-op SQL (or set SCHEMA_DRYRUN=1).")
     ap.add_argument("--try-all", action="store_true", help="Try all candidates even if one passes.")
     ap.add_argument("--json", action="store_true", help="Emit JSON summary to STDOUT.")
     ap.add_argument("--json-only", action="store_true", help="Only emit JSON (no STDERR logs).")
+    ap.add_argument(
+        "--strict-index",
+        action="store_true",
+        help="Treat missing indexes as missing (fatal in verify-only).",
+    )
     args = ap.parse_args()
 
     json_only = bool(args.json_only or _envb("SCHEMA_JSON_ONLY", False))
-    emit_json = bool(args.json or args.json_only or _envb("SCHEMA_JSON", False) or _envb("SCHEMA_JSON_ONLY", False))
+    emit_json = bool(
+        args.json
+        or args.json_only
+        or _envb("SCHEMA_JSON", False)
+        or _envb("SCHEMA_JSON_ONLY", False)
+    )
 
     if _envb("SKIP_DSN_REQUIRED", False):
         payload = {"ts": _ts(), "ok": True, "skipped": True, "reason": "SKIP_DSN_REQUIRED=1"}
@@ -897,10 +1157,10 @@ async def _amain() -> int:
 
     allow_create = bool(args.allow_create or _envb("ALLOW_SCHEMA_CREATE", False))
     dryrun = bool(args.dryrun or _envb("SCHEMA_DRYRUN", False))
-    strict_index_verify = bool(_envb("SCHEMA_STRICT_INDEX", False))
+    strict_index_verify = bool(args.strict_index or _envb("SCHEMA_STRICT_INDEX", False))
     try_all = bool(args.try_all or _envb("SCHEMA_TRY_ALL", False))
 
-    # Attempt timeouts
+    # timeouts
     connect_timeout_s = max(2.0, float(_envf("SCHEMA_CONNECT_TIMEOUT_S", 8.0)))
     timeout_s = max(6.0, float(_envf("SCHEMA_TIMEOUT_S", 20.0)))
     attempt_timeout_s = max(timeout_s, connect_timeout_s + 8.0)
@@ -937,8 +1197,8 @@ async def _amain() -> int:
         )
         _hlog(f"candidates={','.join([k for k, _ in cands])}", json_only=False)
 
-    results: List[Dict[str, Any]] = []
-    picked: Optional[Dict[str, Any]] = None
+    results: list[dict[str, Any]] = []
+    picked: dict[str, Any] | None = None
 
     saw_timeout = False
     saw_fatal = False
@@ -950,18 +1210,34 @@ async def _amain() -> int:
     for label, raw in cands:
         if total_timeout_s > 0 and (time.monotonic() - started) > total_timeout_s:
             saw_timeout = True
-            results.append({"label": label, "ok": False, "dsn": dsnmod.mask_dsn(raw), "error": "total_timeout_exceeded", "error_kind": "timeout"})
+            results.append(
+                {
+                    "label": label,
+                    "ok": False,
+                    "dsn": _mask_dsn(raw),
+                    "error": "total_timeout_exceeded",
+                    "error_kind": "timeout",
+                }
+            )
             break
 
+        # Plan build (db_dsn normalization happens here)
         try:
-            plan = _build_plan(label, raw, timeout_s=timeout_s, connect_timeout_s=connect_timeout_s, app_name=app_name)
+            plan = _build_plan(
+                label,
+                raw,
+                timeout_s=timeout_s,
+                connect_timeout_s=connect_timeout_s,
+                app_name=app_name,
+            )
         except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
             r = {
                 "label": label,
                 "ok": False,
-                "dsn": dsnmod.mask_dsn(raw),
-                "error": f"bad_format:{type(e).__name__}: {e}",
-                "error_kind": "bad_format",
+                "dsn": _mask_dsn(raw),
+                "error": f"bad_format:{msg}",
+                "error_kind": _classify_error(msg) if "missing_deps" in str(e) else "bad_format",
                 "sec": 0.0,
             }
             results.append(r)
@@ -972,9 +1248,15 @@ async def _amain() -> int:
 
         if not json_only:
             _hlog(
-                f"TRY {label} host={plan.host or '-'} port={plan.port} db={plan.db or '-'} ssl_enabled={int(plan.ssl_enabled)} sslmode={plan.sslmode or '-'} dsn={dsnmod.mask_dsn(raw)}",
+                f"TRY {label} host={plan.host or '-'} port={plan.port} db={plan.db or '-'} "
+                f"ssl_enabled={int(plan.ssl_enabled)} sslmode={plan.sslmode or '-'} dsn={_mask_dsn(raw)}",
                 json_only=False,
             )
+            if plan.host and plan.host.endswith(".render.com") and _dsn_sslmode(raw) != "require":
+                _hlog(
+                    "  note: DSN appears render-ish; sslmode=require is typical for external DSNs.",
+                    json_only=False,
+                )
 
         try:
             r = await asyncio.wait_for(
@@ -990,13 +1272,13 @@ async def _amain() -> int:
                 ),
                 timeout=attempt_timeout_s + 3.0,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             saw_timeout = True
             r = {
                 "label": label,
                 "ok": False,
-                "dsn": dsnmod.mask_dsn(raw),
-                "dsn_sa": dsnmod.mask_dsn(plan.dsn_sa),
+                "dsn": _mask_dsn(raw),
+                "dsn_sa": _mask_dsn(plan.dsn_sa),
                 "host": plan.host,
                 "host_resolves": plan.host_resolves,
                 "port": plan.port,
@@ -1019,7 +1301,10 @@ async def _amain() -> int:
         results.append(r)
 
         if not json_only:
-            _hlog(f"RES {label} ok={int(bool(r.get('ok')))} sec={r.get('sec')} kind={r.get('error_kind') or '-'}", json_only=False)
+            _hlog(
+                f"RES {label} ok={int(bool(r.get('ok')))} sec={r.get('sec')} kind={r.get('error_kind') or '-'}",
+                json_only=False,
+            )
             if r.get("error"):
                 _hlog(f"  error={r['error']}", json_only=False)
             if r.get("missing"):
@@ -1035,14 +1320,13 @@ async def _amain() -> int:
             saw_timeout = True
         if kind in {"bad_format", "missing_deps"}:
             saw_fatal = True
-
         if r.get("missing"):
             if allow_create:
                 saw_create_failed = True
             else:
                 saw_missing = True
 
-    summary: Dict[str, Any] = {
+    summary: dict[str, Any] = {
         "ts": _ts(),
         "ok": bool(picked is not None),
         "skipped": False,

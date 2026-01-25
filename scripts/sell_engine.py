@@ -1,31 +1,63 @@
 # scripts/sell_engine.py
 from __future__ import annotations
 
+"""
+scripts/sell_engine.py
+
+God-Tier Sell/Exit Harness (V3+++ / quant-grade) — NON-COMPETING
+===============================================================
+
+This script is intentionally *NOT* a second exit engine.
+
+LOCK-IN (P0/P2 dedup rules)
+--------------------------
+- utils_pkg/exit_engine.py is the canonical "exit brain".
+- utils_pkg/auto_exit_worker/exit_engine.py is the canonical "execution worker".
+- This script is a *harness* / *smoke tool* that:
+    1) Reads positions (utils_pkg.positions)
+    2) Gets a current price (utils_pkg.router)
+    3) Asks exit brain for a decision (best-effort compatibility layer)
+    4) Enqueues exit requests into the worker queue
+    5) Optionally drains the queue (local only) via worker.process_one()
+
+Defaults are SAFE:
+- DRY_RUN behavior is default unless you explicitly pass --live
+- If the exit brain surface is unknown/unavailable, we refuse to enqueue.
+
+Usage
+-----
+# report only (default)
+python -m scripts.sell_engine --once
+
+# enqueue exit requests (still dry-run unless --live)
+python -m scripts.sell_engine --once --enqueue
+
+# enqueue + locally process (useful for local smoke)
+python -m scripts.sell_engine --once --enqueue --drain
+
+# continuous monitor (low-frequency)
+python -m scripts.sell_engine --loop --enqueue --interval 10
+
+Notes
+-----
+- This is meant to be used as: "Is the exit path wired? Why isn't it exiting?"
+- Production exit execution should be done by the auto-exit worker service.
+"""
+
+import argparse
 import asyncio
 import importlib
-import math
+import inspect
 import os
-import random
 import time
-from typing import Any, Callable, Dict, Optional, Tuple
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
-from logging_setup import get_logger, bump
-
-# Positions API (required: all(), remove(mint))
-from utils_pkg.positions import all as all_positions  # noqa: N812
-from utils_pkg.positions import remove as remove_position  # noqa: N812
-
-# Router sell executor (Jupiter via Lightning-style router)
-from utils_pkg.router import sell_via_lightning  # returns (ok: bool, sig: Optional[str])
-
-# Guardrails: realized PnL record (buys can be halted upstream; sells always allowed)
-try:
-    from utils_pkg.guardrails import note_close  # type: ignore
-except Exception:  # pragma: no cover
-    def note_close(*_args, **_kwargs):  # type: ignore
-        return None
+from logging_setup import bump, get_logger
 
 log = get_logger()
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Env helpers
@@ -36,11 +68,13 @@ def _envf(k: str, d: float) -> float:
     except Exception:
         return float(d)
 
+
 def _envi(k: str, d: int) -> int:
     try:
         return int(os.getenv(k, str(d)))
     except Exception:
         return int(d)
+
 
 def _envb(k: str, d: bool = False) -> bool:
     v = (os.getenv(k, "") or "").strip().lower()
@@ -48,447 +82,642 @@ def _envb(k: str, d: bool = False) -> bool:
         return d
     return v in {"1", "true", "yes", "y", "on"}
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Tunables
 # ──────────────────────────────────────────────────────────────────────────────
-TP1 = _envf("PF_TP_PCT", 0.0) / 100.0
-TP2 = _envf("PF_TP2_PCT", _envf("EXIT_TP2_PCT", 0.0)) / 100.0
-SL  = _envf("PF_SL_PCT", 0.0) / 100.0
-TSL = _envf("PF_TSL_PCT", 0.0) / 100.0
-TSL_ARM = _envf("PF_TSL_ARM_PCT", max(0.0, TSL * 100)) / 100.0
-HARD_TIMEOUT = _envi("PF_HARD_TIMEOUT_SEC", 0)
-
-# Break-even ratchet (after TP1)
-BE_ENABLED    = _envb("PF_BE_ENABLE", True)
-BE_AFTER_TP1  = _envf("PF_BE_AFTER_TP1_PCT", 0.0) / 100.0
-BE_TRAIL      = _envf("PF_BE_TRAIL_PCT", 0.0) / 100.0
-
-# Fractions per trigger (fallback to PF_SELL_FRAC)
-SELL_FRAC_FALLBACK = max(0.0, min(1.0, _envf("PF_SELL_FRAC", 1.0)))
-SELL_FRAC_TP   = max(0.0, min(1.0, _envf("PF_SELL_FRAC_TP", 0.35)))
-SELL_FRAC_TP2  = max(0.0, min(1.0, _envf("PF_SELL_FRAC_TP2", 0.30)))
-SELL_FRAC_TSL  = max(0.0, min(1.0, _envf("PF_SELL_FRAC_TSL", 1.00)))
-SELL_FRAC_SL   = max(0.0, min(1.0, _envf("PF_SELL_FRAC_SL", 1.00)))
-SELL_FRAC_BE   = max(0.0, min(1.0, _envf("PF_SELL_FRAC_BE", SELL_FRAC_FALLBACK)))
-
-def _frac_for(reason: str) -> float:
-    if reason == "TP1":
-        return SELL_FRAC_TP if "PF_SELL_FRAC_TP" in os.environ else SELL_FRAC_FALLBACK
-    if reason == "TP2":
-        return SELL_FRAC_TP2 if "PF_SELL_FRAC_TP2" in os.environ else SELL_FRAC_FALLBACK
-    if reason == "TSL":
-        return SELL_FRAC_TSL if "PF_SELL_FRAC_TSL" in os.environ else SELL_FRAC_FALLBACK
-    if reason == "SL":
-        return SELL_FRAC_SL if "PF_SELL_FRAC_SL" in os.environ else SELL_FRAC_FALLBACK
-    if reason == "BE":
-        return SELL_FRAC_BE if "PF_SELL_FRAC_BE" in os.environ else SELL_FRAC_FALLBACK
-    if reason == "TIMEOUT":
-        return SELL_FRAC_SL if "PF_SELL_FRAC_SL" in os.environ else SELL_FRAC_FALLBACK
-    return SELL_FRAC_FALLBACK
-
+SLIPPAGE_BPS_DEFAULT = max(1, _envi("PF_SLIPPAGE_BPS", 600))
+PRIORITY_SOL_DEFAULT = max(0.0, _envf("PF_PRIORITY_SOL", 0.002))
 MIN_NOTIONAL_SOL = max(0.0, _envf("PF_MIN_SELL_SOL", 0.0))
-SLIPPAGE_BPS     = _envi("PF_SLIPPAGE_BPS", 600)
-PRIORITY_SOL     = _envf("PF_PRIORITY_SOL", 0.002)
+PRICE_TTL_SEC = max(1, _envi("PF_PRICE_TTL_SEC", 5))
+DRAIN_MAX_STEPS = max(1, _envi("SELL_ENGINE_DRAIN_MAX_STEPS", 200))
+DRAIN_IDLE_BREAK_SEC = max(1, _envi("SELL_ENGINE_DRAIN_IDLE_BREAK_SEC", 2))
 
-LOOP_SEC              = max(2, _envi("PF_SELL_LOOP_SEC", 5))
-RETRY_COOLDOWN_SEC    = max(5, _envi("PF_SELL_RETRY_SEC", 20))
-PER_MINT_COOLDOWN_SEC = max(5, _envi("PF_SELL_MINT_COOLDOWN_SEC", 10))
-PRICE_TTL_SEC         = max(1, _envi("PF_PRICE_TTL_SEC", 5))  # credit-friendly
-
-MAX_CONC = _envi("PF_SELL_MAX_CONCURRENT", _envi("PF_MAX_CONCURRENT", 2))
-DRY_RUN  = _envb("DRY_RUN", False)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Internal state
+# Positions source (LOCK-IN: utils_pkg.positions is canonical)
 # ──────────────────────────────────────────────────────────────────────────────
-_peaks: Dict[str, float] = {}            # % change since entry (for TSL/BE)
-_in_flight: Dict[str, float] = {}        # mint -> started_at_ts
-_last_attempt_at: Dict[str, float] = {}  # mint -> last_attempt_ts
-_tp1_done: Dict[str, bool] = {}
-_tp2_done: Dict[str, bool] = {}
-_be_floor: Dict[str, float] = {}         # SOL per token floor after TP1
-
-# Per-mint price cache to shrink quote/RPC load
-_price_cache: Dict[str, Tuple[float, float]] = {}  # mint -> (ts, priceSOL)
-
-# Optional hooks from utils_pkg.positions (works with positions_pg too)
-_positions_mod = importlib.import_module("utils_pkg.positions")
-_positions_reduce_qty: Optional[Callable[[str, int], None]] = getattr(_positions_mod, "decrement_qty", None)  # type: ignore[attr-defined]
-_positions_update_after_fill: Optional[Callable[..., None]] = getattr(_positions_mod, "update_after_sell", None)  # type: ignore[attr-defined]
-
-# Provide log.every if missing
-if not hasattr(log, "every"):
-    def _every(_key: str, n: int = 10, msg: Optional[str] = None, **kw):
-        return log.event(msg or _key, **kw)
-    setattr(log, "every", _every)  # type: ignore[attr-defined]
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Price discovery (SOL per token) with cache
-# ──────────────────────────────────────────────────────────────────────────────
-async def _fetch_price_ui(mint: str, *, decimals_hint: Optional[int]) -> float:
-    """
-    Try router.get_price_ui / price_of_ui / price_of.
-    Fallback: tiny sell-quote to derive px. Returns 0.0 on failure.
-    """
+def _load_positions_module():
     try:
-        router = importlib.import_module("utils_pkg.router")
+        return importlib.import_module("utils_pkg.positions")
     except Exception:
-        return 0.0
+        return importlib.import_module("positions")
 
-    # 1) direct getters on router
-    for fname in ("get_price_ui", "price_of_ui", "price_of"):
-        fn = getattr(router, fname, None)
-        if callable(fn):
-            try:
-                if asyncio.iscoroutinefunction(fn):
-                    return float(await fn(mint) or 0.0)  # type: ignore
-                return float(fn(mint) or 0.0)           # type: ignore
-            except Exception:
-                pass
 
-    # 2) tiny sell via router quote fallback
-    q_fn = None
-    for fname in ("get_sell_quote", "quote_sell", "sell_quote"):
-        fn = getattr(router, fname, None)
-        if callable(fn):
-            q_fn = fn
-            break
-    if not q_fn:
-        return 0.0
+def _iter_positions(pos_mod: Any) -> list[dict[str, Any]]:
+    """
+    Contract:
+      - preferred: positions.all() -> Iterable[dict]
+      - acceptable: positions.load_positions() -> dict[mint, dict]
+    """
+    if hasattr(pos_mod, "all") and callable(pos_mod.all):
+        try:
+            out = list(pos_mod.all())  # type: ignore[attr-defined]
+            return [p for p in out if isinstance(p, dict)]
+        except Exception:
+            return []
+    if hasattr(pos_mod, "load_positions") and callable(pos_mod.load_positions):
+        try:
+            m = pos_mod.load_positions()  # type: ignore[attr-defined]
+            if isinstance(m, dict):
+                out = []
+                for mint, p in m.items():
+                    if isinstance(p, dict):
+                        p = dict(p)
+                        p.setdefault("mint", mint)
+                        out.append(p)
+                return out
+        except Exception:
+            return []
+    return []
 
-    decimals = int(decimals_hint or 6)
-    decimals = max(0, min(18, decimals))
-    tiny_raw = max(1, 10 ** max(0, decimals - 3))  # ≈0.001 token
-    try:
-        q = await q_fn(mint=mint, amount_raw=int(tiny_raw)) if asyncio.iscoroutinefunction(q_fn) else q_fn(mint=mint, amount_raw=int(tiny_raw))  # type: ignore
-        # Prefer direct SOL field; else compute from lamports_out
-        out_sol = (
-            q.get("out_amount_sol")
-            or q.get("out_sol")
-            or q.get("outSOL")
-            or (q.get("lamports_out", 0) / 1e9 if q.get("lamports_out") else 0.0)
-            or 0.0
-        )
-        if not out_sol:
-            return 0.0
-        return float(out_sol) / (tiny_raw / (10 ** decimals))
-    except Exception:
-        return 0.0
 
-async def _get_price_ui(mint: str, *, decimals_hint: Optional[int]) -> float:
+# ──────────────────────────────────────────────────────────────────────────────
+# Router helpers (price + mint normalization)
+# ──────────────────────────────────────────────────────────────────────────────
+_price_cache: dict[str, tuple[float, float]] = {}
+
+
+async def _router_price_ui(mint: str) -> float:
+    """
+    Canonical price getter:
+      utils_pkg.router.get_price_ui(mint) -> float
+
+    Fallback: best-effort quote-based derivation if router exposes get_sell_quote.
+    Returns 0.0 on failure.
+    """
     now = time.time()
     rec = _price_cache.get(mint)
     if rec and (now - rec[0]) <= PRICE_TTL_SEC:
-        return rec[1]
-    price = await _fetch_price_ui(mint, decimals_hint=decimals_hint)
-    _price_cache[mint] = (now, price)
-    return price
+        return float(rec[1])
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Decision logic
-# ──────────────────────────────────────────────────────────────────────────────
-def _decide_sell(
-    *,
-    mint: str,
-    entry_price_sol: float,
-    now_price_sol: float,
-    opened_at: float,
-) -> Tuple[bool, str, float]:
-    if entry_price_sol <= 0 or now_price_sol <= 0:
-        return False, "", 0.0
-
-    change = (now_price_sol / entry_price_sol) - 1.0
-
-    # Track peak % change for TSL & BE
-    peak = _peaks.get(mint, change)
-    if change > peak:
-        peak = change
-    _peaks[mint] = peak
-
-    # TP2 → once
-    if TP2 > 0 and (not _tp2_done.get(mint)) and change >= TP2:
-        return True, "TP2", change
-
-    # TP1 → once
-    if TP1 > 0 and (not _tp1_done.get(mint)) and change >= TP1:
-        return True, "TP1", change
-
-    # Break-even ratchet (active after TP1)
-    if BE_ENABLED and _tp1_done.get(mint):
-        target_floor = entry_price_sol * (1.0 + max(0.0, BE_AFTER_TP1))
-        if BE_TRAIL > 0.0:
-            peak_px = entry_price_sol * (1.0 + max(0.0, peak))
-            target_floor = max(target_floor, peak_px * (1.0 - BE_TRAIL))
-        prev = _be_floor.get(mint, 0.0)
-        floor_px = _be_floor[mint] = max(prev, target_floor)
-        if now_price_sol <= floor_px:
-            return True, "BE", change
-
-    # TSL
-    if TSL > 0 and peak >= TSL_ARM and (peak - change) >= TSL:
-        return True, "TSL", change
-
-    # SL
-    if SL > 0 and change <= -SL:
-        return True, "SL", change
-
-    # Timeout
-    if HARD_TIMEOUT > 0 and (time.time() - opened_at) >= HARD_TIMEOUT:
-        return True, "TIMEOUT", change
-
-    return False, "", change
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Sell executor
-# ──────────────────────────────────────────────────────────────────────────────
-async def _execute_sell(p: Dict[str, Any], *, reason: str, price_sol: float) -> None:
-    mint = p["mint"]
-    token_program = p.get("token_program")
-    qty_raw = int(p.get("qty_raw", 0))
-    decimals = max(0, min(18, int(p.get("decimals", 0) or 0)))
-    entry = float(p.get("avg_cost_sol", 0.0))
-    qty_ui = float(p.get("qty_ui", 0.0)) or (qty_raw / (10 ** decimals) if decimals else 0.0)
-
-    if qty_raw <= 0 or qty_ui <= 0.0:
-        log.event("SELL_SKIP_EMPTY", mint=mint)
-        return
-
-    sell_frac = _frac_for(reason)
-    if sell_frac <= 0.0:
-        log.event("SELL_SKIP_ZERO_FRAC", mint=mint, reason=reason)
-        return
-
-    sell_raw = min(qty_raw, int(max(1, math.floor(qty_raw * sell_frac))))
-
-    # min notional on selected slice
-    sold_ui = (sell_raw / (10 ** decimals)) if decimals else qty_ui * (sell_raw / max(1, qty_raw))
-    notional_sol = price_sol * sold_ui
-    if notional_sol < MIN_NOTIONAL_SOL:
-        log.event(
-            "SELL_SKIP_SMALL",
-            mint=mint,
-            reason=reason,
-            notional_sol=notional_sol,
-            min_sol=MIN_NOTIONAL_SOL,
-            sell_frac=sell_frac,
-        )
-        return
-
-    # per-mint cooldown
-    now = time.time()
-    last = _last_attempt_at.get(mint, 0.0)
-    if (now - last) < PER_MINT_COOLDOWN_SEC:
-        log.event("SELL_COOLDOWN", mint=mint, secs_left=int(PER_MINT_COOLDOWN_SEC - (now - last)))
-        return
-    _last_attempt_at[mint] = now
-
-    # est realized pnl for this slice
-    est_realized_pnl = (price_sol - entry) * sold_ui
-
-    if DRY_RUN:
-        log.event(
-            "SELL_DRY_RUN",
-            mint=mint,
-            reason=reason,
-            sell_raw=sell_raw,
-            sell_frac=sell_frac,
-            slippage_bps=SLIPPAGE_BPS,
-            priority_sol=PRIORITY_SOL,
-            est_pnl_sol=est_realized_pnl,
-        )
-        return
-
-    ok = False
-    sig: Optional[str] = None
     try:
-        ok, sig = await sell_via_lightning(
-            mint=mint,
-            token_program=token_program,
-            amount_raw=sell_raw,
-            slippage_bps=SLIPPAGE_BPS,
-            priority_sol=PRIORITY_SOL,
-        )
-    except Exception as e:
-        log.event("SELL_SUBMIT_ERROR", mint=mint, reason=reason, error=str(e))
-        bump("sells_fail")
-        return
+        router = importlib.import_module("utils_pkg.router")
+    except Exception:
+        _price_cache[mint] = (now, 0.0)
+        return 0.0
 
-    log.event(
-        "SELL_SUBMIT",
-        mint=mint,
-        reason=reason,
-        ok=ok,
-        sig=sig,
-        sell_raw=sell_raw,
-        sell_frac=sell_frac,
-    )
-
-    if ok:
+    # 1) direct getter
+    fn = getattr(router, "get_price_ui", None)
+    if callable(fn):
         try:
-            note_close(est_realized_pnl)
+            px = float(await fn(mint) or 0.0)  # type: ignore[misc]
+            _price_cache[mint] = (now, px)
+            return px
         except Exception:
             pass
 
-        remaining_raw = qty_raw - sell_raw
-        closed = (remaining_raw <= 0) or (sell_frac >= 0.999)
-
-        if reason == "TP1":
-            _tp1_done[mint] = True
-            if BE_ENABLED:
-                _be_floor[mint] = max(_be_floor.get(mint, 0.0), entry * (1.0 + max(0.0, BE_AFTER_TP1)))
-        elif reason == "TP2":
-            _tp2_done[mint] = True
-
+    # 2) quote fallback
+    q_fn = getattr(router, "get_sell_quote", None)
+    dec_fn = getattr(router, "get_decimals", None)
+    if callable(q_fn) and callable(dec_fn):
         try:
-            if _positions_update_after_fill:
-                _positions_update_after_fill(mint=mint, sold_raw=sell_raw, tx_sig=sig, closed=closed)  # type: ignore
-            elif closed:
-                remove_position(mint)
-            elif _positions_reduce_qty:
-                _positions_reduce_qty(mint, sell_raw)  # type: ignore
+            decimals = int(await dec_fn(mint) or 0)  # type: ignore[misc]
+            decimals = max(0, min(18, decimals))
+            tiny_raw = max(1, 10 ** max(0, decimals - 3))  # ~0.001 token
+            q = await q_fn(mint=mint, amount_raw=int(tiny_raw))  # type: ignore[misc]
+            if not isinstance(q, dict):
+                _price_cache[mint] = (now, 0.0)
+                return 0.0
+            out_sol = (
+                q.get("out_amount_sol")
+                or q.get("out_sol")
+                or q.get("outSOL")
+                or (q.get("lamports_out", 0) / 1e9 if q.get("lamports_out") else 0.0)
+                or 0.0
+            )
+            if not out_sol:
+                _price_cache[mint] = (now, 0.0)
+                return 0.0
+            token_ui = tiny_raw / (10**decimals) if decimals else float(tiny_raw)
+            px = float(out_sol) / float(token_ui) if token_ui else 0.0
+            _price_cache[mint] = (now, px)
+            return px
         except Exception:
-            try:
-                if closed:
-                    remove_position(mint)
-            except Exception:
-                pass
+            pass
 
-        if closed:
-            _tp1_done.pop(mint, None)
-            _tp2_done.pop(mint, None)
-            _peaks.pop(mint, None)
-            _be_floor.pop(mint, None)
-            _price_cache.pop(mint, None)
+    _price_cache[mint] = (now, 0.0)
+    return 0.0
 
-        bump("sells_ok")
-    else:
-        bump("sells_fail")
+
+def _normalize_mint(mint: str) -> str:
+    try:
+        router = importlib.import_module("utils_pkg.router")
+        fn = getattr(router, "normalize_pump_id_to_mint", None)
+        if callable(fn):
+            return str(fn(mint))
+    except Exception:
+        pass
+    return mint
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Worker
+# Exit brain compatibility layer (best-effort but SAFE)
 # ──────────────────────────────────────────────────────────────────────────────
-async def _process_one(p: Dict[str, Any], sem: asyncio.Semaphore):
-    mint = p.get("mint")
-    if not mint or mint in _in_flight:
-        return
+@dataclass
+class ExitDecision:
+    should_exit: bool
+    reason: str
+    sell_pct: float  # 0..1
+    confidence: float = 0.0
+    meta: dict[str, Any] = None  # type: ignore[assignment]
 
-    async with sem:
-        _in_flight[mint] = time.time()
+    def __post_init__(self) -> None:
+        if self.meta is None:
+            self.meta = {}
+        self.sell_pct = float(max(0.0, min(1.0, self.sell_pct)))
+
+
+def _pick_exit_callable(exit_mod: Any) -> Callable[..., Any] | None:
+    """
+    Prefer stable function entrypoints; fall back to common names.
+    """
+    for name in (
+        "decide_exit",
+        "evaluate_position",
+        "compute_exit",
+        "on_position_tick",
+        "get_exit_actions",
+        "maybe_exit",
+        "should_exit",
+        "exit_decision",
+    ):
+        fn = getattr(exit_mod, name, None)
+        if callable(fn):
+            return fn
+
+    # Class-based engine
+    cls = getattr(exit_mod, "ExitEngine", None)
+    if callable(cls):
         try:
-            entry = float(p.get("avg_cost_sol", 0.0))
-            opened_at = float(p.get("opened_at", 0.0))
-            decimals = max(0, min(18, int(p.get("decimals", 0) or 0)))
+            eng = cls()  # type: ignore[call-arg]
+        except Exception:
+            return None
+        for m in ("decide_exit", "evaluate_position", "on_position_tick", "compute_exit"):
+            fn = getattr(eng, m, None)
+            if callable(fn):
+                # bind method with instance already
+                return fn  # type: ignore[return-value]
 
-            price = await _get_price_ui(mint, decimals_hint=decimals)
-            if price <= 0.0 or entry <= 0.0:
-                return
+    return None
 
-            should, reason, change = _decide_sell(
-                mint=mint, entry_price_sol=entry, now_price_sol=price, opened_at=opened_at
+
+def _call_with_accepted_kwargs(fn: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
+    """
+    Only pass kwargs that the function accepts (prevents signature mismatch crashes).
+    If signature can't be inspected, call with the full kwargs best-effort.
+    """
+    try:
+        sig = inspect.signature(fn)
+        accepted = {}
+        for k, v in kwargs.items():
+            if k in sig.parameters:
+                accepted[k] = v
+        return fn(**accepted)
+    except Exception:
+        return fn(**kwargs)
+
+
+async def _exit_decision_for_position(p: dict[str, Any], price_sol: float) -> ExitDecision | None:
+    """
+    Asks utils_pkg.exit_engine for a decision.
+
+    If exit engine interface is unknown or returns an unexpected type,
+    we return None (SAFE: do not enqueue).
+    """
+    try:
+        exit_mod = importlib.import_module("utils_pkg.exit_engine")
+    except Exception:
+        return None
+
+    fn = _pick_exit_callable(exit_mod)
+    if fn is None:
+        return None
+
+    mint = str(p.get("mint") or "")
+    symbol = str(p.get("symbol") or mint[:6] or "UNK")
+    entry = float(p.get("avg_cost_sol", 0.0) or 0.0)
+
+    # Common context payload; we filter by signature.
+    payload: dict[str, Any] = {
+        "mint": mint,
+        "symbol": symbol,
+        "position": p,
+        "pos": p,
+        "price_ui": price_sol,
+        "current_price": price_sol,
+        "current_price_sol": price_sol,
+        "entry_price": entry,
+        "entry_price_sol": entry,
+        "now": None,
+        "redis": None,
+    }
+
+    try:
+        if asyncio.iscoroutinefunction(fn):
+            out = await _call_with_accepted_kwargs(fn, payload)  # type: ignore[misc]
+        else:
+            out = _call_with_accepted_kwargs(fn, payload)
+            if inspect.isawaitable(out):
+                out = await out
+    except Exception as e:
+        log.event("EXIT_BRAIN_ERROR", mint=mint, symbol=symbol, error=str(e))
+        bump("exit_brain_err")
+        return None
+
+    # Normalize output into ExitDecision
+    # Supported patterns:
+    #   - dict with keys: should_exit/exit, reason, sell_pct/pct, confidence, meta
+    #   - tuple: (bool, reason, sell_pct) or (bool, reason)
+    #   - boolean: should_exit (sell_pct=1)
+    try:
+        if isinstance(out, ExitDecision):
+            return out
+        if isinstance(out, dict):
+            should = bool(
+                out.get("should_exit") or out.get("exit") or out.get("should_sell") or False
             )
-
-            log.every(
-                f"sell.check.{mint}",
-                n=12,
-                msg="SELL_CHECK",
-                mint=mint,
-                price_sol=price,
-                entry_sol=entry,
-                change=change,
-                peak=_peaks.get(mint),
-                be_floor=_be_floor.get(mint),
-                tp1_done=int(_tp1_done.get(mint, False)),
-                tp2_done=int(_tp2_done.get(mint, False)),
+            reason = str(out.get("reason") or out.get("why") or "")
+            sell_pct = float(
+                out.get("sell_pct")
+                or out.get("pct")
+                or out.get("sell_fraction")
+                or (1.0 if should else 0.0)
             )
+            conf = float(out.get("confidence") or out.get("conf") or 0.0)
+            meta = dict(out.get("meta") or {})
+            return ExitDecision(
+                should_exit=should,
+                reason=reason or ("EXIT" if should else ""),
+                sell_pct=sell_pct,
+                confidence=conf,
+                meta=meta,
+            )
+        if isinstance(out, tuple) and len(out) >= 2:
+            should = bool(out[0])
+            reason = str(out[1] or "")
+            sell_pct = float(out[2]) if len(out) >= 3 else (1.0 if should else 0.0)
+            return ExitDecision(
+                should_exit=should,
+                reason=reason or ("EXIT" if should else ""),
+                sell_pct=sell_pct,
+                confidence=0.0,
+                meta={},
+            )
+        if isinstance(out, bool):
+            return ExitDecision(
+                should_exit=bool(out),
+                reason="EXIT" if out else "",
+                sell_pct=1.0 if out else 0.0,
+                confidence=0.0,
+                meta={},
+            )
+    except Exception:
+        return None
 
-            if not should:
-                return
+    return None
 
-            qty_raw = int(p.get("qty_raw", 0))
-            qty_ui = float(p.get("qty_ui", 0.0)) or (qty_raw / (10 ** decimals) if decimals else 0.0)
-            sell_frac = _frac_for(reason)
-            est_pnl = (price - entry) * qty_ui * sell_frac
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Worker queue integration (canonical)
+# ──────────────────────────────────────────────────────────────────────────────
+async def _enqueue_exit(
+    *,
+    mint: str,
+    symbol: str,
+    qty_raw: int,
+    sell_pct: float,
+    reason: str,
+    slippage_bps: int,
+    priority_sol: float,
+    meta: dict[str, Any],
+) -> str | None:
+    """
+    Enqueue into utils_pkg.auto_exit_worker.exit_engine queue.
+    Returns request_id or None.
+    """
+    try:
+        worker = importlib.import_module("utils_pkg.auto_exit_worker.exit_engine")
+    except Exception as e:
+        log.event("EXIT_WORKER_IMPORT_ERROR", error=str(e))
+        return None
+
+    mint_n = _normalize_mint(mint)
+
+    # If sell_pct is partial, scale raw.
+    sell_pct = float(max(0.0, min(1.0, sell_pct)))
+    if sell_pct <= 0.0:
+        return None
+    amt_raw = int(max(1, min(qty_raw, int(qty_raw * sell_pct))))
+
+    meta2 = dict(meta or {})
+    meta2.setdefault("slippage_bps", int(slippage_bps))
+    meta2.setdefault("priority_sol", float(priority_sol))
+    meta2.setdefault("apply_sell_pct", False)
+
+    try:
+        rid = await worker.enqueue_exit_request(
+            mint=mint_n,
+            amount_raw=int(amt_raw),
+            reason=str(reason),
+            sell_pct=float(sell_pct),
+            symbol=str(symbol),
+            priority=5,
+            meta=meta2,
+        )
+        return str(rid) if rid else None
+    except Exception as e:
+        log.event("EXIT_ENQUEUE_ERROR", mint=mint_n, symbol=symbol, error=str(e))
+        bump("exit_enqueue_err")
+        return None
+
+
+async def _drain_queue(max_steps: int) -> dict[str, Any]:
+    """
+    Local-only: drain the worker queue by repeatedly calling process_one().
+    This will no-op if the queue is empty.
+    """
+    try:
+        worker = importlib.import_module("utils_pkg.auto_exit_worker.exit_engine")
+    except Exception as e:
+        return {"ok": False, "error": f"worker import failed: {e}"}
+
+    steps = 0
+    did_any = 0
+    last_progress = time.time()
+    while steps < max_steps:
+        steps += 1
+        try:
+            did = await worker.process_one(worker_id="sell_engine")
+        except Exception as e:
+            return {"ok": False, "error": f"process_one error: {e}", "steps": steps, "did": did_any}
+        if did:
+            did_any += 1
+            last_progress = time.time()
+            continue
+        # no work
+        if (time.time() - last_progress) >= DRAIN_IDLE_BREAK_SEC:
+            break
+        await asyncio.sleep(0.05)
+
+    return {"ok": True, "steps": steps, "did": did_any}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main harness loop
+# ──────────────────────────────────────────────────────────────────────────────
+async def _one_pass(*, enqueue: bool, live: bool, max_positions: int) -> dict[str, Any]:
+    pos_mod = _load_positions_module()
+    positions = _iter_positions(pos_mod)
+    if max_positions > 0:
+        positions = positions[:max_positions]
+
+    if not positions:
+        return {"ok": True, "positions": 0, "decisions": 0, "enqueued": 0}
+
+    decisions = 0
+    enqueued = 0
+
+    for p in positions:
+        mint = str(p.get("mint") or "")
+        if not mint:
+            continue
+
+        symbol = str(p.get("symbol") or mint[:6])
+        qty_raw = int(p.get("qty_raw", 0) or 0)
+        decimals = int(p.get("decimals", 0) or 0)
+        entry = float(p.get("avg_cost_sol", 0.0) or 0.0)
+
+        if qty_raw <= 0 or entry <= 0:
             log.event(
-                "SELL_DECISION",
+                "SELL_ENGINE_SKIP_BAD_POS", mint=mint, symbol=symbol, qty_raw=qty_raw, entry=entry
+            )
+            continue
+
+        mint_n = _normalize_mint(mint)
+        price = await _router_price_ui(mint_n)
+        if price <= 0.0:
+            log.every(
+                f"sell_engine.no_price.{mint}",
+                n=12,
+                msg="SELL_ENGINE_NO_PRICE",
                 mint=mint,
-                reason=reason,
+                symbol=symbol,
+            )
+            continue
+
+        notional_sol = price * (qty_raw / (10 ** max(0, min(18, decimals))) if decimals else 0.0)
+        change = (price / entry) - 1.0
+
+        dec = await _exit_decision_for_position(
+            {
+                **p,
+                "mint": mint,
+                "symbol": symbol,
+                "qty_raw": qty_raw,
+                "decimals": decimals,
+                "avg_cost_sol": entry,
+            },
+            price_sol=price,
+        )
+
+        if dec is None:
+            # SAFE: no decision => no enqueue
+            log.every(
+                f"sell_engine.no_decision.{mint}",
+                n=12,
+                msg="SELL_ENGINE_NO_DECISION",
+                mint=mint,
+                symbol=symbol,
                 price_sol=price,
                 entry_sol=entry,
                 change=change,
-                sell_frac=sell_frac,
-                est_pnl_sol=est_pnl,
+                notional_sol=notional_sol,
+            )
+            bump("sell_engine_no_decision")
+            continue
+
+        decisions += 1
+
+        log.event(
+            "SELL_ENGINE_DECISION",
+            mint=mint,
+            mint_norm=mint_n,
+            symbol=symbol,
+            price_sol=price,
+            entry_sol=entry,
+            change=change,
+            notional_sol=notional_sol,
+            should_exit=int(dec.should_exit),
+            reason=dec.reason,
+            sell_pct=dec.sell_pct,
+            confidence=dec.confidence,
+        )
+
+        if not dec.should_exit:
+            continue
+
+        # Optional notional gate (prevents dust spam)
+        if MIN_NOTIONAL_SOL > 0 and notional_sol < MIN_NOTIONAL_SOL:
+            log.event(
+                "SELL_ENGINE_SKIP_DUST",
+                mint=mint,
+                symbol=symbol,
+                notional_sol=notional_sol,
+                min_sol=MIN_NOTIONAL_SOL,
+            )
+            continue
+
+        if not enqueue:
+            continue
+
+        # Live safety: require explicit flag
+        if not live:
+            log.event(
+                "SELL_ENGINE_DRY_ENQUEUE_SKIP",
+                mint=mint,
+                symbol=symbol,
+                reason=dec.reason,
+                sell_pct=dec.sell_pct,
+            )
+            bump("sell_engine_dry")
+            continue
+
+        rid = await _enqueue_exit(
+            mint=mint,
+            symbol=symbol,
+            qty_raw=qty_raw,
+            sell_pct=dec.sell_pct if dec.sell_pct > 0 else 1.0,
+            reason=dec.reason or "EXIT",
+            slippage_bps=int(dec.meta.get("slippage_bps", SLIPPAGE_BPS_DEFAULT)),
+            priority_sol=float(dec.meta.get("priority_sol", PRIORITY_SOL_DEFAULT)),
+            meta=dec.meta or {},
+        )
+        if rid:
+            enqueued += 1
+            bump("exit_enqueued")
+            log.event(
+                "SELL_ENGINE_ENQUEUED",
+                mint=mint,
+                symbol=symbol,
+                rid=rid,
+                reason=dec.reason,
+                sell_pct=dec.sell_pct,
             )
 
-            await _execute_sell(p, reason=reason, price_sol=price)
+    return {"ok": True, "positions": len(positions), "decisions": decisions, "enqueued": enqueued}
 
-        finally:
-            _in_flight.pop(mint, None)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Public loop
-# ──────────────────────────────────────────────────────────────────────────────
-async def run_sell_loop(stop_evt: asyncio.Event):
-    sem = asyncio.Semaphore(max(1, MAX_CONC))
-    cooldown_until = 0.0
+async def main_async(args: argparse.Namespace) -> int:
+    # Best-effort init hooks (some repos expose init_resources; not required here)
+    try:
+        cu = importlib.import_module("utils_pkg.core_utils")
+        init_fn = getattr(cu, "init_resources", None)
+        if callable(init_fn):
+            if asyncio.iscoroutinefunction(init_fn):
+                await init_fn()
+            else:
+                init_fn()
+    except Exception:
+        pass
 
     log.event(
-        "SELL_LOOP_START",
-        tp1_pct=TP1 * 100,
-        tp2_pct=TP2 * 100,
-        sl_pct=SL * 100,
-        tsl_pct=TSL * 100,
-        tsl_arm_pct=TSL_ARM * 100,
-        be_enable=int(BE_ENABLED),
-        be_after_tp1_pct=BE_AFTER_TP1 * 100,
-        be_trail_pct=BE_TRAIL * 100,
-        timeout_sec=HARD_TIMEOUT,
-        sell_frac_default=SELL_FRAC_FALLBACK,
-        sell_frac_tp=SELL_FRAC_TP,
-        sell_frac_tp2=SELL_FRAC_TP2,
-        sell_frac_tsl=SELL_FRAC_TSL,
-        sell_frac_sl=SELL_FRAC_SL,
-        sell_frac_be=SELL_FRAC_BE,
+        "SELL_ENGINE_START",
+        once=int(args.once),
+        loop=int(args.loop),
+        enqueue=int(args.enqueue),
+        drain=int(args.drain),
+        live=int(args.live),
+        interval_sec=args.interval,
+        max_positions=args.max_positions,
         min_notional_sol=MIN_NOTIONAL_SOL,
-        loop_sec=LOOP_SEC,
+        slippage_bps_default=SLIPPAGE_BPS_DEFAULT,
+        priority_sol_default=PRIORITY_SOL_DEFAULT,
         price_ttl_sec=PRICE_TTL_SEC,
-        max_concurrent=MAX_CONC,
-        slippage_bps=SLIPPAGE_BPS,
-        priority_sol=PRIORITY_SOL,
-        dry_run=int(DRY_RUN),
     )
 
-    while not stop_evt.is_set():
-        now = time.time()
-        if now < cooldown_until:
-            await asyncio.sleep(LOOP_SEC)
-            continue
+    try:
+        if args.once:
+            res = await _one_pass(
+                enqueue=args.enqueue, live=args.live, max_positions=args.max_positions
+            )
+            log.event("SELL_ENGINE_PASS", **res)
+            if args.drain:
+                dr = await _drain_queue(max_steps=DRAIN_MAX_STEPS)
+                log.event("SELL_ENGINE_DRAIN", **dr)
+            return 0
 
+        stop_evt = asyncio.Event()
+
+        async def _run_loop():
+            while not stop_evt.is_set():
+                res = await _one_pass(
+                    enqueue=args.enqueue, live=args.live, max_positions=args.max_positions
+                )
+                log.event("SELL_ENGINE_PASS", **res)
+                if args.drain:
+                    dr = await _drain_queue(max_steps=DRAIN_MAX_STEPS)
+                    log.event("SELL_ENGINE_DRAIN", **dr)
+                await asyncio.sleep(max(2.0, float(args.interval)))
+
+        task = asyncio.create_task(_run_loop())
         try:
-            positions = list(all_positions())
-        except Exception as e:
-            log.event("SELL_POSITIONS_ERROR", error=str(e))
-            cooldown_until = time.time() + RETRY_COOLDOWN_SEC
-            await asyncio.sleep(LOOP_SEC)
-            continue
+            await task
+        except asyncio.CancelledError:
+            stop_evt.set()
+            raise
+        return 0
 
-        tasks = []
-        for p in positions:
-            mint = p.get("mint")
-            if not mint:
-                continue
-            last = _last_attempt_at.get(mint, 0.0)
-            if (now - last) < PER_MINT_COOLDOWN_SEC:
-                continue
-            tasks.append(asyncio.create_task(_process_one(p, sem)))
+    finally:
+        try:
+            cu = importlib.import_module("utils_pkg.core_utils")
+            close_fn = getattr(cu, "close_resources", None)
+            if callable(close_fn):
+                if asyncio.iscoroutinefunction(close_fn):
+                    await close_fn()
+                else:
+                    close_fn()
+        except Exception:
+            pass
 
-        if tasks:
-            try:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            except Exception as e:
-                log.event("SELL_GATHER_ERROR", error=str(e))
-                cooldown_until = time.time() + RETRY_COOLDOWN_SEC
 
-        # jitter the loop slightly so many dynos don’t sync up
-        await asyncio.sleep(LOOP_SEC + random.uniform(0, 0.75))
+def _build_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="sell_engine", description="Exit harness (non-competing).")
+    mode = p.add_mutually_exclusive_group(required=False)
+    mode.add_argument("--once", action="store_true", help="Run a single pass (default).")
+    mode.add_argument("--loop", action="store_true", help="Run continuously.")
+    p.add_argument(
+        "--enqueue",
+        action="store_true",
+        help="Enqueue exit requests when the exit brain says to exit.",
+    )
+    p.add_argument(
+        "--drain", action="store_true", help="Drain worker queue locally (process_one loop)."
+    )
+    p.add_argument(
+        "--live",
+        action="store_true",
+        help="ALLOW live enqueue (danger). Without --live, enqueue is skipped (dry).",
+    )
+    p.add_argument(
+        "--interval", type=float, default=10.0, help="Loop interval seconds (when --loop)."
+    )
+    p.add_argument(
+        "--max-positions", type=int, default=0, help="Limit positions processed (0 = all)."
+    )
+    args = p.parse_args()
+    if not args.loop:
+        args.once = True
+    return args
 
-    log.event("SELL_LOOP_STOP")
+
+def main() -> None:
+    args = _build_args()
+    try:
+        asyncio.run(main_async(args))
+    except KeyboardInterrupt:
+        log.event("SELL_ENGINE_STOP", reason="KeyboardInterrupt")
+
+
+if __name__ == "__main__":
+    main()

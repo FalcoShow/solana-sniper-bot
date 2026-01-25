@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
@@ -9,23 +8,19 @@ God-Tier AI DB brain (V3+++ / quant-grade)
 
 Central Postgres utility for ALL persistent AI / quant data.
 
-Production-first guarantees
---------------------------
-- Import-safe: never bricks the bot at import time (no DSN resolution on import).
-- DSN resolution + normalization (Render-friendly + local-friendly).
-- asyncpg SSL handling for Render: explicit SSLContext (asyncpg may not honor libpq sslmode reliably).
-- Safe, idempotent schema creation (never bricks the bot).
-- Narrow, documented read/write helpers (no ad-hoc SQL elsewhere).
-- Quant-grade aggregations that NEVER crash the bot (soft-fail defaults).
-- Async wrappers for sync funcs via asyncio.to_thread (so the asyncio bot won’t block).
+Hard guarantees
+---------------
+- Import-safe: NO network connects on import.
+- Stable DSN resolution + normalization (Render external + internal).
+- Correct TLS behavior for asyncpg via explicit SSLContext when needed.
+- Safe, idempotent migrations (never bricks the bot).
+- Soft-fail reads/writes (configurable) so trading never stops due to DB.
+- Narrow public helpers: no ad-hoc SQL scattered elsewhere.
+- Optional asyncpg pool (off by default).
+- Includes schema tables that support entry/exit training + execution logs.
 
-Fix included
-------------
-- ✅ Avoids f-string backslash SyntaxError pitfalls by never placing backslash escapes inside f-string expressions.
-- ✅ Uses asyncpg server_settings for timeouts and app_name (no unsafe SET string building).
-
-Key env vars (subset)
----------------------
+Env (key)
+---------
 Enable/disable:
   AI_DB_ENABLED=1
   AI_DB_AUTODISABLE_IF_NO_DSN=1
@@ -42,21 +37,21 @@ Connection:
   AI_DB_CONNECT_RETRIES=2
   AI_DB_CONNECT_RETRY_BASE_S=0.35
   AI_DB_CONNECT_RETRY_MAX_S=2.5
+
+Session timeouts:
   AI_DB_STATEMENT_TIMEOUT_MS=0
   AI_DB_IDLE_IN_TX_TIMEOUT_MS=0
   AI_DB_LOCK_TIMEOUT_MS=0
 
-SSL / DSN normalization:
-  AI_DB_FORCE_SSLMODE=require|prefer|disable|allow
+SSL/DSN normalization:
+  AI_DB_FORCE_SSLMODE=require|prefer|disable|allow|verify-ca|verify-full
   AI_DB_RENDER_SSLMODE=require          (default for external Render hosts)
   AI_DB_INTERNAL_SSLMODE=prefer         (default for internal Render dpg-* hosts)
-
-Asyncpg SSL options:
-  AI_DB_SSL_INSECURE=0                  (when 1: disables cert validation; DEBUG ONLY)
+  AI_DB_SSL_INSECURE=0                  (debug only, disables cert validation)
   PG_SSL_INSECURE=0                     (alias)
   AI_DB_SSL_CA_FILE=                    (optional CA bundle path)
 
-DSN resolution priority (includes your script env name PNL_DSN):
+DSN resolution priority:
   SNIPER_DB_DSN (recommended)
   PNL_DSN
   SNIPER_DB_URL
@@ -70,11 +65,24 @@ DSN resolution priority (includes your script env name PNL_DSN):
   RENDER_DATABASE_URL
   SNIPER_DB_DSN_FALLBACK (last resort)
 
-Optional asyncpg pool:
+Migrations:
+  AI_DB_MIGRATIONS_ENABLED=1
+  AI_DB_USE_MIGRATION_LOCK=1
+  AI_DB_MIGRATION_LOCK_ID=907331
+  AI_DB_MIGRATION_LOCK_TIMEOUT_S=20
+
+Async pool:
   AI_DB_USE_ASYNCPG_POOL=0
   AI_DB_ASYNCPG_POOL_MIN_SIZE=1
   AI_DB_ASYNCPG_POOL_MAX_SIZE=4
   AI_DB_ASYNCPG_POOL_MAX_INACTIVE_S=60
+
+Defaults (dashboard scoping):
+  AI_DB_DEFAULT_SRC=
+  AI_DB_DEFAULT_REGIME=
+  AI_DB_DEFAULT_WALLET_TAG=
+  AI_DB_MIN_FEATURE_VERSION=
+  AI_DB_WIN_LABELS=good,win,green,profit
 """
 
 import asyncio
@@ -88,47 +96,362 @@ import re
 import shlex
 import ssl
 import time
-from contextlib import contextmanager
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from functools import wraps
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union, cast
+from typing import Any, cast
 
-from logging_setup import get_logger
+# -----------------------------------------------------------------------------
+# Logging (robust import)
+# -----------------------------------------------------------------------------
+try:
+    from logging_setup import get_logger
+except Exception:  # pragma: no cover
+    try:
+        from utils_pkg.logging_setup import get_logger  # type: ignore
+    except Exception:  # pragma: no cover
+        import logging
+
+        def get_logger() -> Any:  # type: ignore
+            return logging.getLogger("ai_db")
+
 
 log = get_logger()
 
-# ---------------------------------------------------------------------
-# logging safety shim (so log.every always exists)
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Contract DB schema surface (tests look for these)
+# -----------------------------------------------------------------------------
+LEGACY_SCHEMA_VERSION: int = 1
+SCHEMA_VERSION: int = 4  # canonical “current” schema version
+
+
+@dataclass(frozen=True)
+class Migration:
+    from_version: int | None
+    to_version: int
+    name: str
+    sql: str | Sequence[str] = ()
+
+
+def _migration_sql(m: Migration) -> str:
+    if isinstance(m.sql, str):
+        return m.sql
+    return "\n".join([s for s in m.sql if isinstance(s, str) and s.strip()])
+
+
+# Keep rich objects internally
+MIGRATION_PLAN: list[Migration] = [
+    Migration(
+        from_version=None,
+        to_version=LEGACY_SCHEMA_VERSION,
+        name="init_core_tables",
+        sql=(
+            """
+            CREATE TABLE IF NOT EXISTS ai_candidates (
+                id BIGSERIAL PRIMARY KEY,
+                ts BIGINT NOT NULL,
+                src TEXT DEFAULT '',
+                mint TEXT DEFAULT '',
+                sym TEXT DEFAULT '',
+                features JSONB DEFAULT '{}'::jsonb
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS ai_trades (
+                id BIGSERIAL PRIMARY KEY,
+                ts BIGINT NOT NULL,
+                mint TEXT DEFAULT '',
+                side TEXT DEFAULT '',
+                qty_raw NUMERIC DEFAULT 0,
+                price_sol NUMERIC DEFAULT 0,
+                tx TEXT DEFAULT ''
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS ai_positions (
+                id BIGSERIAL PRIMARY KEY,
+                ts BIGINT NOT NULL,
+                mint TEXT DEFAULT '',
+                qty_raw NUMERIC DEFAULT 0,
+                cost_sol NUMERIC DEFAULT 0,
+                extra JSONB DEFAULT '{}'::jsonb
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_ai_candidates_ts ON ai_candidates(ts);
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_ai_trades_ts ON ai_trades(ts);
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_ai_positions_ts ON ai_positions(ts);
+            """,
+        ),
+    ),
+]
+
+(
+    Migration(
+        from_version=LEGACY_SCHEMA_VERSION,
+        to_version=SCHEMA_VERSION,
+        name="init_quant_schema_v4",
+        sql=(
+            r"""
+        CREATE TABLE IF NOT EXISTS ai_schema_meta (
+            k  TEXT PRIMARY KEY,
+            v  TEXT,
+            ts TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
+        INSERT INTO ai_schema_meta (k, v)
+        VALUES ('schema_version', '4')
+        ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, ts = now();
+
+        CREATE TABLE IF NOT EXISTS entry_candidates (
+            id              BIGSERIAL PRIMARY KEY,
+            ts              TIMESTAMPTZ NOT NULL DEFAULT now(),
+            src             TEXT NOT NULL,
+            mint            TEXT NOT NULL,
+            symbol          TEXT,
+            regime          TEXT,
+            wallet_tag      TEXT,
+            session_id      TEXT,
+            feature_version INT NOT NULL,
+            features        JSONB NOT NULL DEFAULT '{}'::jsonb,
+            raw             JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+
+        CREATE TABLE IF NOT EXISTS entry_outcomes (
+            id           BIGSERIAL PRIMARY KEY,
+            candidate_id BIGINT UNIQUE REFERENCES entry_candidates(id) ON DELETE CASCADE,
+            label        TEXT NOT NULL,
+            pnl_pct      DOUBLE PRECISION,
+            hold_sec     INTEGER,
+            notes        TEXT,
+            extra        JSONB NOT NULL DEFAULT '{}'::jsonb,
+            ts           TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
+        CREATE TABLE IF NOT EXISTS trade_executions (
+            id           BIGSERIAL PRIMARY KEY,
+            ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
+            trade_id     TEXT NOT NULL,
+            mint         TEXT NOT NULL,
+            side         TEXT NOT NULL,
+            qty_raw      NUMERIC,
+            price_usd    DOUBLE PRECISION,
+            slippage_bps DOUBLE PRECISION,
+            fees_usd     DOUBLE PRECISION,
+            tx_sig       TEXT,
+            candidate_id BIGINT REFERENCES entry_candidates(id) ON DELETE SET NULL,
+            session_id   TEXT,
+            extra        JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+
+        CREATE TABLE IF NOT EXISTS exit_events (
+            id           BIGSERIAL PRIMARY KEY,
+            ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
+            event_key    TEXT UNIQUE,
+            trade_id     TEXT,
+            mint         TEXT NOT NULL,
+            symbol       TEXT,
+            action       TEXT,
+            reason       TEXT,
+            pnl_pct      DOUBLE PRECISION,
+            pnl_usd      DOUBLE PRECISION,
+            qty_raw      NUMERIC,
+            price_usd    DOUBLE PRECISION,
+            slippage_bps DOUBLE PRECISION,
+            fees_usd     DOUBLE PRECISION,
+            tx_sig       TEXT,
+            candidate_id BIGINT REFERENCES entry_candidates(id) ON DELETE SET NULL,
+            session_id   TEXT,
+            extra        JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+
+        CREATE TABLE IF NOT EXISTS positions (
+            id                 BIGSERIAL PRIMARY KEY,
+            ts                 TIMESTAMPTZ NOT NULL DEFAULT now(),
+            position_id        TEXT,
+            mint               TEXT NOT NULL,
+            symbol             TEXT,
+            status             TEXT NOT NULL DEFAULT 'OPEN',
+            side               TEXT NOT NULL DEFAULT 'LONG',
+            qty_raw            NUMERIC,
+            entry_price_usd    DOUBLE PRECISION,
+            entry_trade_id     TEXT,
+            entry_tx_sig       TEXT,
+            entry_candidate_id BIGINT REFERENCES entry_candidates(id) ON DELETE SET NULL,
+            entry_ts           TIMESTAMPTZ,
+            exit_price_usd     DOUBLE PRECISION,
+            exit_trade_id      TEXT,
+            exit_tx_sig        TEXT,
+            exit_ts            TIMESTAMPTZ,
+            pnl_pct            DOUBLE PRECISION,
+            pnl_usd            DOUBLE PRECISION,
+            session_id         TEXT,
+            wallet_tag         TEXT,
+            extra              JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+
+        CREATE TABLE IF NOT EXISTS position_events (
+            id          BIGSERIAL PRIMARY KEY,
+            ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+            position_id TEXT,
+            mint        TEXT NOT NULL,
+            event_type  TEXT NOT NULL,
+            payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+            session_id  TEXT,
+            extra       JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+
+        CREATE TABLE IF NOT EXISTS regime_snapshots (
+            id         BIGSERIAL PRIMARY KEY,
+            ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
+            regime     TEXT NOT NULL,
+            state      JSONB NOT NULL DEFAULT '{}'::jsonb,
+            session_id TEXT,
+            extra      JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+
+        CREATE TABLE IF NOT EXISTS ai_events (
+            id             BIGSERIAL PRIMARY KEY,
+            ts             TIMESTAMPTZ NOT NULL DEFAULT now(),
+            event_type     TEXT NOT NULL,
+            policy_version TEXT,
+            experiment_tag TEXT,
+            src            TEXT,
+            regime         TEXT,
+            payload        JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+
+        CREATE TABLE IF NOT EXISTS strategy_params (
+            id         BIGSERIAL PRIMARY KEY,
+            ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
+            key        TEXT NOT NULL,
+            value      JSONB NOT NULL DEFAULT '{}'::jsonb,
+            src        TEXT,
+            regime     TEXT,
+            session_id TEXT,
+            extra      JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+
+        CREATE TABLE IF NOT EXISTS risk_assessments (
+            id         BIGSERIAL PRIMARY KEY,
+            ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
+            mint       TEXT NOT NULL,
+            symbol     TEXT,
+            score      DOUBLE PRECISION,
+            verdict    TEXT,
+            details    JSONB NOT NULL DEFAULT '{}'::jsonb,
+            model_tag  TEXT,
+            session_id TEXT,
+            extra      JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_trade_executions_trade_side_mint
+        ON trade_executions (trade_id, side, mint);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_exit_events_event_key
+        ON exit_events (event_key);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_positions_position_id
+        ON positions (position_id);
+
+        CREATE INDEX IF NOT EXISTS idx_entry_candidates_ts ON entry_candidates (ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_entry_candidates_mint_ts ON entry_candidates (mint, ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_entry_outcomes_ts ON entry_outcomes (ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_trade_executions_ts ON trade_executions (ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_exit_events_ts ON exit_events (ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_positions_ts ON positions (ts DESC);
+
+        -- Safe numeric expression indexes (no cast errors)
+        CREATE INDEX IF NOT EXISTS idx_entry_candidates_decision_score_safe
+        ON entry_candidates (
+            (CASE
+                WHEN (raw->'_decision_meta'->>'decision_score') ~ '^-?[0-9]+([.][0-9]+)?$'
+                THEN (raw->'_decision_meta'->>'decision_score')::double precision
+                ELSE NULL
+            END)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_entry_outcomes_max_dd_pct_safe
+        ON entry_outcomes (
+            (CASE
+                WHEN (extra->>'max_dd_pct') ~ '^-?[0-9]+([.][0-9]+)?$'
+                THEN (extra->>'max_dd_pct')::double precision
+                ELSE NULL
+            END)
+        );
+        """,
+        ),
+    ),
+)
+
+# ✅ This is what contract tests typically want: a list[str] of SQL blobs
+MIGRATIONS: list[str] = [_migration_sql(m) for m in MIGRATION_PLAN if _migration_sql(m)]
+
+
+# -----------------------------------------------------------------------------
+# log.every shim (so we can always throttle spam)
+# -----------------------------------------------------------------------------
 if not hasattr(log, "every"):
 
     def _every(_key: str, n: int = 1000) -> bool:  # pragma: no cover
+        _ = n
         return True
 
-    setattr(log, "every", _every)
+    log.every = _every  # type: ignore[attr-defined]
 
-Row = Dict[str, Any]
+
+Row = dict[str, Any]
 
 # =============================================================================
-# Optional imports (graceful)
+# Optional imports (graceful) — psycopg2 OR psycopg3
 # =============================================================================
+_PG_DRIVER: str = "none"
 
-_PSYCOPG2_OK = True
+_PSYCOPG2_OK = False
+_PSYCOPG3_OK = False
+
+psycopg2 = None  # type: ignore
+RealDictCursor = Any  # type: ignore
+_execute_values = None  # type: ignore
+register_default_json = None  # type: ignore
+register_default_jsonb = None  # type: ignore
+
+psycopg = None  # type: ignore
+dict_row = None  # type: ignore
+
+_PGConn = Any  # type: ignore
+_PGCursor = Any  # type: ignore
+
 try:
     import psycopg2  # type: ignore
     from psycopg2.extensions import connection as _PGConn, cursor as _PGCursor  # type: ignore
-    from psycopg2.extras import RealDictCursor, register_default_json, register_default_jsonb  # type: ignore
-    from psycopg2.extras import execute_values as _execute_values  # type: ignore
+    from psycopg2.extras import (  # type: ignore
+        RealDictCursor,
+        execute_values as _execute_values,
+        register_default_json,
+        register_default_jsonb,
+    )
+
+    _PSYCOPG2_OK = True
+    _PG_DRIVER = "psycopg2"
 except Exception:  # pragma: no cover
     _PSYCOPG2_OK = False
-    psycopg2 = None  # type: ignore
-    _PGConn = Any  # type: ignore
-    _PGCursor = Any  # type: ignore
-    RealDictCursor = Any  # type: ignore
-    register_default_json = None  # type: ignore
-    register_default_jsonb = None  # type: ignore
-    _execute_values = None  # type: ignore
+
+try:
+    import psycopg  # type: ignore
+    from psycopg.rows import dict_row  # type: ignore
+
+    _PSYCOPG3_OK = True
+    if _PG_DRIVER == "none":
+        _PG_DRIVER = "psycopg3"
+except Exception:  # pragma: no cover
+    _PSYCOPG3_OK = False
 
 _ASYNCPG_OK = True
 try:
@@ -138,17 +461,20 @@ except Exception:  # pragma: no cover
     asyncpg = None  # type: ignore
 
 
+def _sync_pg_ok() -> bool:
+    return bool(_PSYCOPG2_OK or _PSYCOPG3_OK)
+
+
 # =============================================================================
 # Env helpers
 # =============================================================================
-
 def _env_str(key: str, default: str = "") -> str:
     v = os.getenv(key)
     return default if v is None else str(v)
 
 
 def _env_int(key: str, default: int) -> int:
-    raw = os.getenv(key, "")
+    raw = os.getenv(key)
     if raw is None or not str(raw).strip():
         return int(default)
     try:
@@ -158,7 +484,7 @@ def _env_int(key: str, default: int) -> int:
 
 
 def _env_float(key: str, default: float) -> float:
-    raw = os.getenv(key, "")
+    raw = os.getenv(key)
     if raw is None or not str(raw).strip():
         return float(default)
     try:
@@ -180,7 +506,7 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _json_dumps(o: Any) -> str:
@@ -188,15 +514,12 @@ def _json_dumps(o: Any) -> str:
 
 
 def _ensure_obj(v: Any) -> Any:
-    """
-    psycopg2 may return json/jsonb as dict/list (preferred) or as str/bytes.
-    Normalize to dict/list where possible; otherwise safe defaults.
-    """
+    """Normalize json/jsonb field to dict/list when possible."""
     if v is None:
         return {}
-    if isinstance(v, (dict, list)):
+    if isinstance(v, dict | list):
         return v
-    if isinstance(v, (bytes, bytearray, memoryview)):
+    if isinstance(v, bytes | bytearray | memoryview):
         try:
             v = bytes(v).decode("utf-8", "ignore")
         except Exception:
@@ -215,7 +538,6 @@ def _ensure_obj(v: Any) -> Any:
 # =============================================================================
 # Config
 # =============================================================================
-
 @dataclass(frozen=True)
 class _DBCfg:
     enabled: bool
@@ -237,23 +559,22 @@ class _DBCfg:
 
     render_sslmode: str
     internal_sslmode: str
-    force_sslmode: Optional[str]
+    force_sslmode: str | None
 
     migrations_enabled: bool
     use_migration_lock: bool
     migration_lock_id: int
     migration_lock_timeout_s: int
 
-    default_src: Optional[str]
-    default_regime: Optional[str]
-    default_wallet_tag: Optional[str]
-    min_feature_version: Optional[int]
-    win_labels: List[str]
+    default_src: str | None
+    default_regime: str | None
+    default_wallet_tag: str | None
+    min_feature_version: int | None
+    win_labels: list[str]
 
     ssl_insecure: bool
-    ssl_ca_file: Optional[str]
+    ssl_ca_file: str | None
 
-    # optional asyncpg pool
     use_asyncpg_pool: bool
     asyncpg_pool_min_size: int
     asyncpg_pool_max_size: int
@@ -261,9 +582,9 @@ class _DBCfg:
 
 
 _DSN_ENV_PRIMARY = "SNIPER_DB_DSN"
-_DSN_ENV_CANDIDATES: List[str] = [
+_DSN_ENV_CANDIDATES: list[str] = [
     _DSN_ENV_PRIMARY,
-    "PNL_DSN",  # your scripts/check_schema.py uses this
+    "PNL_DSN",
     "SNIPER_DB_URL",
     "DATABASE_URL",
     "POSTGRES_DSN",
@@ -299,15 +620,17 @@ def _load_cfg() -> _DBCfg:
 
     connect_retries = max(0, min(_env_int("AI_DB_CONNECT_RETRIES", 2), 10))
     connect_retry_base_s = max(0.05, min(_env_float("AI_DB_CONNECT_RETRY_BASE_S", 0.35), 10.0))
-    connect_retry_max_s = max(connect_retry_base_s, min(_env_float("AI_DB_CONNECT_RETRY_MAX_S", 2.5), 30.0))
+    connect_retry_max_s = max(
+        connect_retry_base_s, min(_env_float("AI_DB_CONNECT_RETRY_MAX_S", 2.5), 30.0)
+    )
 
     statement_timeout_ms = _env_int("AI_DB_STATEMENT_TIMEOUT_MS", 0)
     idle_in_tx_timeout_ms = _env_int("AI_DB_IDLE_IN_TX_TIMEOUT_MS", 0)
     lock_timeout_ms = _env_int("AI_DB_LOCK_TIMEOUT_MS", 0)
 
-    render_sslmode = (_env_str("AI_DB_RENDER_SSLMODE", "require").strip().lower() or "require")
-    internal_sslmode = (_env_str("AI_DB_INTERNAL_SSLMODE", "prefer").strip().lower() or "prefer")
-    force_sslmode = (_env_str("AI_DB_FORCE_SSLMODE", "").strip().lower() or None)
+    render_sslmode = _env_str("AI_DB_RENDER_SSLMODE", "require").strip().lower() or "require"
+    internal_sslmode = _env_str("AI_DB_INTERNAL_SSLMODE", "prefer").strip().lower() or "prefer"
+    force_sslmode = _env_str("AI_DB_FORCE_SSLMODE", "").strip().lower() or None
 
     migrations_enabled = _env_bool("AI_DB_MIGRATIONS_ENABLED", True)
     use_migration_lock = _env_bool("AI_DB_USE_MIGRATION_LOCK", True)
@@ -321,9 +644,9 @@ def _load_cfg() -> _DBCfg:
     min_feat_raw = _env_str("AI_DB_MIN_FEATURE_VERSION", "").strip()
     if min_feat_raw:
         try:
-            min_feature_version: Optional[int] = int(min_feat_raw)
+            min_feature_version: int | None = int(min_feat_raw)
         except Exception:
-            log.warning("AI_DB_MIN_FEATURE_VERSION is not a valid int: %r", min_feat_raw)
+            log.warning("AI_DB_MIN_FEATURE_VERSION not valid int: %r", min_feat_raw)
             min_feature_version = None
     else:
         min_feature_version = None
@@ -339,29 +662,37 @@ def _load_cfg() -> _DBCfg:
 
     use_asyncpg_pool = _env_bool("AI_DB_USE_ASYNCPG_POOL", False)
     asyncpg_pool_min_size = max(1, min(_env_int("AI_DB_ASYNCPG_POOL_MIN_SIZE", 1), 32))
-    asyncpg_pool_max_size = max(asyncpg_pool_min_size, min(_env_int("AI_DB_ASYNCPG_POOL_MAX_SIZE", 4), 64))
-    asyncpg_pool_max_inactive_s = max(5, min(_env_int("AI_DB_ASYNCPG_POOL_MAX_INACTIVE_S", 60), 3600))
+    asyncpg_pool_max_size = max(
+        asyncpg_pool_min_size, min(_env_int("AI_DB_ASYNCPG_POOL_MAX_SIZE", 4), 64)
+    )
+    asyncpg_pool_max_inactive_s = max(
+        5, min(_env_int("AI_DB_ASYNCPG_POOL_MAX_INACTIVE_S", 60), 3600)
+    )
 
     # Auto-disable if enabled but no DSN provided
     if enabled and autodisable_if_no_dsn and not _has_any_dsn_env():
-        if getattr(log, "every")("ai_db_no_dsn_autodisable", 1_000_000):
+        if log.every("ai_db_no_dsn_autodisable", 1_000_000):
             log.warning(
                 "ai_db: enabled but no DSN env found; auto-disabling "
                 "(set AI_DB_AUTODISABLE_IF_NO_DSN=0 to override)"
             )
         enabled = False
 
-    # Auto-disable only if BOTH drivers missing
-    if enabled and autodisable_if_no_driver and (not _PSYCOPG2_OK) and (not _ASYNCPG_OK):
-        if getattr(log, "every")("ai_db_no_driver_autodisable", 1_000_000):
+    # Auto-disable if no drivers
+    if enabled and autodisable_if_no_driver and (not _sync_pg_ok()) and (not _ASYNCPG_OK):
+        if log.every("ai_db_no_driver_autodisable", 1_000_000):
             log.warning(
-                "ai_db: enabled but neither psycopg2 nor asyncpg is installed; auto-disabling "
-                "(install psycopg2-binary and/or asyncpg, or set AI_DB_AUTODISABLE_IF_NO_DRIVER=0)"
+                "ai_db: enabled but no sync driver (psycopg2/psycopg) and asyncpg missing; "
+                "auto-disabling (install psycopg[binary] and/or asyncpg, or set "
+                "AI_DB_AUTODISABLE_IF_NO_DRIVER=0)"
             )
         enabled = False
-    elif enabled and autodisable_if_no_driver and (not _PSYCOPG2_OK) and _ASYNCPG_OK:
-        if getattr(log, "every")("ai_db_psycopg2_missing_warn", 1_000_000):
-            log.warning("ai_db: psycopg2 missing; sync DB helpers may soft-fail. Install psycopg2-binary.")
+    elif enabled and autodisable_if_no_driver and (not _sync_pg_ok()) and _ASYNCPG_OK:
+        if log.every("ai_db_no_sync_driver_warn", 1_000_000):
+            log.warning(
+                "ai_db: no sync Postgres driver (psycopg2/psycopg). Sync helpers may soft-fail. "
+                "Install psycopg[binary] or psycopg2-binary."
+            )
 
     return _DBCfg(
         enabled=enabled,
@@ -429,7 +760,7 @@ AI_DB_DEFAULT_SRC = CFG.default_src
 AI_DB_DEFAULT_REGIME = CFG.default_regime
 AI_DB_DEFAULT_WALLET_TAG = CFG.default_wallet_tag
 AI_DB_MIN_FEATURE_VERSION = CFG.min_feature_version
-WIN_LABELS: List[str] = list(CFG.win_labels)
+WIN_LABELS: list[str] = list(CFG.win_labels)
 
 AI_DB_SSL_INSECURE = CFG.ssl_insecure
 AI_DB_SSL_CA_FILE = CFG.ssl_ca_file
@@ -443,7 +774,6 @@ AI_DB_ASYNCPG_POOL_MAX_INACTIVE_S = CFG.asyncpg_pool_max_inactive_s
 # =============================================================================
 # DSN resolution / normalization + SSL inference
 # =============================================================================
-
 @dataclass(frozen=True)
 class DSNInfo:
     source: str
@@ -451,14 +781,14 @@ class DSNInfo:
     normalized_libpq: str
     normalized_asyncpg: str
     normalized_sqlalchemy_async: str
-    host: Optional[str]
-    db: Optional[str]
-    sslmode: Optional[str]
+    host: str | None
+    db: str | None
+    sslmode: str | None
     is_render_external: bool
     is_render_internal: bool
 
 
-_NORMALIZED: Optional[DSNInfo] = None
+_NORMALIZED: DSNInfo | None = None
 
 
 def reset_dsn_cache() -> None:
@@ -466,23 +796,23 @@ def reset_dsn_cache() -> None:
     _NORMALIZED = None
 
 
-def _effective_min_feature_version(explicit: Optional[int]) -> Optional[int]:
+def _effective_min_feature_version(explicit: int | None) -> int | None:
     return explicit if explicit is not None else AI_DB_MIN_FEATURE_VERSION
 
 
-def _looks_like_internal_render_host(host: Optional[str]) -> bool:
+def _looks_like_internal_render_host(host: str | None) -> bool:
     if not host:
         return False
     h = host.lower()
-    # Render internal hosts are often like: dpg-xxxx-a (no dot)
-    return h.startswith("dpg-") and "." not in h
+    # Internal Render often uses short hostnames or ".internal"
+    return (h.startswith("dpg-") and "." not in h) or (".internal" in h) or h.endswith(".internal")
 
 
-def _is_render_external_host(host: Optional[str]) -> bool:
+def _is_render_external_host(host: str | None) -> bool:
     if not host:
         return False
     h = host.lower()
-    return ("postgres.render.com" in h) or (h.endswith(".render.com")) or ("render.com" in h)
+    return ("postgres.render.com" in h) or h.endswith(".render.com") or ("render.com" in h)
 
 
 def _drop_query_key(q: str, key: str) -> str:
@@ -516,12 +846,12 @@ def _mask_dsn(raw: str) -> str:
         return "<dsn>"
 
 
-def _parse_kv_dsn(raw: str) -> Dict[str, str]:
+def _parse_kv_dsn(raw: str) -> dict[str, str]:
     s = (raw or "").strip()
     if not s:
         return {}
     parts = shlex.split(s)
-    out: Dict[str, str] = {}
+    out: dict[str, str] = {}
     for token in parts:
         if "=" not in token:
             continue
@@ -543,7 +873,7 @@ def _kv_to_url(kv: Mapping[str, str]) -> str:
     port = kv.get("port") or ""
 
     if not host or not db:
-        raise RuntimeError("kv DSN missing host/dbname; cannot convert to URL for asyncpg")
+        raise RuntimeError("kv DSN missing host/dbname; cannot convert to URL")
 
     userinfo = ""
     if user:
@@ -556,26 +886,20 @@ def _kv_to_url(kv: Mapping[str, str]) -> str:
     if port:
         netloc += f":{port}"
 
-    q: List[str] = []
-    sslmode = kv.get("sslmode") or ""
-    if sslmode:
-        q.append(f"sslmode={urlparse.quote(sslmode, safe='')}")
-    if kv.get("application_name"):
-        q.append(f"application_name={urlparse.quote(kv['application_name'], safe='')}")
-    if kv.get("connect_timeout"):
-        q.append(f"connect_timeout={urlparse.quote(kv['connect_timeout'], safe='')}")
-
+    q: list[str] = []
+    for k in ("sslmode", "application_name", "connect_timeout"):
+        if kv.get(k):
+            q.append(f"{k}={urlparse.quote(str(kv[k]), safe='')}")
     query = "&".join(q)
     return f"postgresql://{netloc}/{urlparse.quote(db, safe='')}" + (f"?{query}" if query else "")
 
 
-def _normalize_kv_dsn(raw: str) -> Tuple[str, str, Optional[str], Optional[str], Optional[str], bool, bool]:
+def _normalize_kv_dsn(raw: str) -> tuple[str, str, str | None, str | None, str | None, bool, bool]:
     s = (raw or "").strip()
     if not s:
         raise RuntimeError("Empty DB DSN")
 
     kv = _parse_kv_dsn(s)
-
     host = kv.get("host") or kv.get("hostname")
     db = kv.get("dbname") or kv.get("database")
 
@@ -597,10 +921,21 @@ def _normalize_kv_dsn(raw: str) -> Tuple[str, str, Optional[str], Optional[str],
 
     if not kv.get("application_name"):
         kv["application_name"] = AI_DB_APP_NAME
+    if not kv.get("connect_timeout"):
+        kv["connect_timeout"] = str(int(AI_DB_CONNECT_TIMEOUT_S))
 
-    ordered_keys = ["host", "port", "dbname", "user", "password", "sslmode", "application_name"]
+    ordered_keys = [
+        "host",
+        "port",
+        "dbname",
+        "user",
+        "password",
+        "sslmode",
+        "application_name",
+        "connect_timeout",
+    ]
     seen = set(ordered_keys)
-    tail = [k for k in kv.keys() if k not in seen]
+    tail = [k for k in kv if k not in seen]
     keys = ordered_keys + sorted(tail)
 
     def _q(v: str) -> str:
@@ -608,12 +943,12 @@ def _normalize_kv_dsn(raw: str) -> Tuple[str, str, Optional[str], Optional[str],
             return "'" + v.replace("'", "\\'") + "'"
         return v
 
-    libpq = " ".join([f"{k}={_q(kv[k])}" for k in keys if k in kv and str(kv[k]).strip()])
+    libpq = " ".join([f"{k}={_q(str(kv[k]))}" for k in keys if k in kv and str(kv[k]).strip()])
     url = _kv_to_url(kv)
     return libpq, url, host, db, sslmode, is_ext, is_int
 
 
-def _normalize_url_dsn(raw: str) -> Tuple[str, Optional[str], Optional[str], Optional[str], bool, bool]:
+def _normalize_url_dsn(raw: str) -> tuple[str, str | None, str | None, str | None, bool, bool]:
     import urllib.parse as urlparse
 
     raw = (raw or "").strip()
@@ -636,7 +971,7 @@ def _normalize_url_dsn(raw: str) -> Tuple[str, Optional[str], Optional[str], Opt
     is_int = _looks_like_internal_render_host(host)
 
     query = parsed.query or ""
-    sslmode: Optional[str] = None
+    sslmode: str | None = None
     m = re.search(r"(^|&)sslmode=([^&]+)", query)
     if m:
         sslmode = (m.group(2) or "").strip() or None
@@ -656,6 +991,8 @@ def _normalize_url_dsn(raw: str) -> Tuple[str, Optional[str], Optional[str], Opt
 
     if re.search(r"(^|&)application_name=", query) is None:
         query = (query + "&" if query else "") + f"application_name={AI_DB_APP_NAME}"
+    if re.search(r"(^|&)connect_timeout=", query) is None:
+        query = (query + "&" if query else "") + f"connect_timeout={int(AI_DB_CONNECT_TIMEOUT_S)}"
 
     normalized = urlparse.urlunparse((scheme, parsed.netloc, parsed.path, "", query, ""))
     return normalized, host, db, sslmode, is_ext, is_int
@@ -685,7 +1022,6 @@ def _normalize_dsn(raw: str) -> DSNInfo:
     libpq_url, host, db, sslmode, is_ext, is_int = _normalize_url_dsn(raw)
     asyncpg_url = libpq_url
     normalized_sqlalchemy = libpq_url.replace("postgresql://", "postgresql+asyncpg://", 1)
-
     return DSNInfo(
         source="<url>",
         raw=raw,
@@ -700,17 +1036,87 @@ def _normalize_dsn(raw: str) -> DSNInfo:
     )
 
 
-def _resolve_raw_dsn() -> Tuple[str, str]:
+def _is_render_runtime() -> bool:
+    """
+    True when running inside Render.
+    We look for multiple env vars because Render setups vary.
+    """
+    v = os.getenv("RENDER")
+    if v and str(v).strip().lower() in ("1", "true", "yes", "y", "on"):
+        return True
+    for k in (
+        "RENDER_SERVICE_ID",
+        "RENDER_INSTANCE_ID",
+        "RENDER_EXTERNAL_URL",
+        "RENDER_INTERNAL_HOSTNAME",
+        "RENDER_GIT_COMMIT",
+    ):
+        if os.getenv(k):
+            return True
+    return False
+
+
+def _peek_host_from_dsn(raw: str) -> str | None:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if "://" in raw:
+        try:
+            import urllib.parse as urlparse
+
+            return urlparse.urlparse(raw).hostname
+        except Exception:
+            return None
+    try:
+        kv = _parse_kv_dsn(raw)
+        return kv.get("host") or kv.get("hostname")
+    except Exception:
+        return None
+
+
+def _resolve_raw_dsn() -> tuple[str, str]:
+    # Collect all present candidates in declared priority order
+    candidates: list[tuple[str, str]] = []
     for key in _DSN_ENV_CANDIDATES:
         v = os.environ.get(key)
         if v and str(v).strip():
-            return str(v).strip(), key
+            candidates.append((key, str(v).strip()))
     if DB_URL_FALLBACK:
-        return DB_URL_FALLBACK, "SNIPER_DB_DSN_FALLBACK"
-    raise RuntimeError(
-        "No Postgres DSN found. Set SNIPER_DB_DSN (recommended) or one of: "
-        f"{_DSN_ENV_CANDIDATES[1:]} or SNIPER_DB_DSN_FALLBACK."
-    )
+        candidates.append(("SNIPER_DB_DSN_FALLBACK", DB_URL_FALLBACK))
+
+    if not candidates:
+        raise RuntimeError(
+            "No Postgres DSN found. Set SNIPER_DB_DSN (recommended) or one of: "
+            f"{_DSN_ENV_CANDIDATES[1:]} or SNIPER_DB_DSN_FALLBACK."
+        )
+
+    on_render = _is_render_runtime()
+
+    # On Render: prefer an internal DSN if any exists (best latency + routing)
+    if on_render:
+        for key, raw in candidates:
+            host = _peek_host_from_dsn(raw)
+            if _looks_like_internal_render_host(host):
+                return raw, key
+        return candidates[0][1], candidates[0][0]
+
+    # Local (Windows or any non-Render runtime):
+    # Avoid Render *internal* hostnames if any non-internal DSN exists.
+    first_internal: tuple[str, str] | None = None
+    for key, raw in candidates:
+        host = _peek_host_from_dsn(raw)
+        if _looks_like_internal_render_host(host):
+            if first_internal is None:
+                first_internal = (key, raw)
+            continue
+        # Found a non-internal DSN (external Render or any normal hostname)
+        return raw, key
+
+    # Only internal DSNs exist -> return the first internal (will fail locally, but gives a clear hint)
+    if first_internal is not None:
+        return first_internal[1], first_internal[0]
+
+    return candidates[0][1], candidates[0][0]
 
 
 def resolve_dsn_info() -> DSNInfo:
@@ -723,6 +1129,14 @@ def resolve_dsn_info() -> DSNInfo:
     info = dataclasses.replace(info, source=source)
     _NORMALIZED = info
 
+    if (not _is_render_runtime()) and info.is_render_internal:
+        log.warning(
+            "ai_db: selected DSN host looks like Render INTERNAL (%s). "
+            "That hostname will not resolve outside Render. "
+            "Set an EXTERNAL DSN in SNIPER_DB_DSN (preferred) or PG_DSN_EXTERNAL / RENDER_DATABASE_URL.",
+            info.host,
+        )
+
     log.info("ai_db: using DSN from %s (masked): %s", source, _mask_dsn(info.normalized_libpq))
     return info
 
@@ -734,8 +1148,8 @@ def get_normalized_dsn_for_debug() -> str:
         return f"<unresolved: {e}>"
 
 
-def describe_dsn_sources() -> Dict[str, Any]:
-    candidates: Dict[str, str] = {}
+def describe_dsn_sources() -> dict[str, Any]:
+    candidates: dict[str, str] = {}
     for key in _DSN_ENV_CANDIDATES + (["SNIPER_DB_DSN_FALLBACK"] if DB_URL_FALLBACK else []):
         raw = os.environ.get(key) if key != "SNIPER_DB_DSN_FALLBACK" else DB_URL_FALLBACK
         if raw and str(raw).strip():
@@ -764,6 +1178,7 @@ def describe_dsn_sources() -> Dict[str, Any]:
         "candidates": candidates,
         "migrations_enabled": bool(AI_DB_MIGRATIONS_ENABLED),
         "psycopg2_ok": bool(_PSYCOPG2_OK),
+        "psycopg3_ok": bool(_PSYCOPG3_OK),
         "asyncpg_ok": bool(_ASYNCPG_OK),
         "use_asyncpg_pool": bool(AI_DB_USE_ASYNCPG_POOL),
     }
@@ -772,8 +1187,7 @@ def describe_dsn_sources() -> Dict[str, Any]:
 # =============================================================================
 # SSL helpers for asyncpg
 # =============================================================================
-
-def dsn_wants_ssl(dsn: Optional[str] = None) -> bool:
+def dsn_wants_ssl(dsn: str | None = None) -> bool:
     try:
         info = resolve_dsn_info() if not dsn else _normalize_dsn(dsn)
         sm = (info.sslmode or "").lower().strip()
@@ -782,14 +1196,13 @@ def dsn_wants_ssl(dsn: Optional[str] = None) -> bool:
         if sm in {"require", "verify-ca", "verify-full"}:
             return True
         if info.is_render_external or info.is_render_internal:
-            # asyncpg doesn’t “prefer” downgrade in a safe way; prefer TLS by default on Render.
             return True
     except Exception:
         pass
     return False
 
 
-def ssl_context_for_dsn(dsn: Optional[str] = None) -> Optional[ssl.SSLContext]:
+def ssl_context_for_dsn(dsn: str | None = None) -> ssl.SSLContext | None:
     if not dsn_wants_ssl(dsn):
         return None
 
@@ -809,9 +1222,9 @@ def ssl_context_for_dsn(dsn: Optional[str] = None) -> Optional[ssl.SSLContext]:
     return ctx
 
 
-def _asyncpg_server_settings(statement_timeout_ms: Optional[int] = None) -> Dict[str, str]:
+def _asyncpg_server_settings(statement_timeout_ms: int | None = None) -> dict[str, str]:
     stm = statement_timeout_ms if statement_timeout_ms is not None else AI_DB_STATEMENT_TIMEOUT_MS
-    ss: Dict[str, str] = {"application_name": AI_DB_APP_NAME, "timezone": "UTC"}
+    ss: dict[str, str] = {"application_name": AI_DB_APP_NAME, "timezone": "UTC"}
     if stm and int(stm) > 0:
         ss["statement_timeout"] = str(int(stm))
     if AI_DB_IDLE_IN_TX_TIMEOUT_MS and int(AI_DB_IDLE_IN_TX_TIMEOUT_MS) > 0:
@@ -822,17 +1235,12 @@ def _asyncpg_server_settings(statement_timeout_ms: Optional[int] = None) -> Dict
 
 
 async def asyncpg_connect(
-    dsn: Optional[str] = None,
+    dsn: str | None = None,
     *,
-    timeout: Optional[float] = None,
-    statement_timeout_ms: Optional[int] = None,
+    timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
 ) -> Any:
-    """
-    Central asyncpg connector with correct TLS behavior for Render.
-    Returns asyncpg.Connection.
-
-    Use this in scripts/check_schema.py etc.
-    """
+    """Central asyncpg connector with correct TLS behavior for Render."""
     if not _ASYNCPG_OK:
         raise RuntimeError("asyncpg not installed. pip install asyncpg")
     if not AI_DB_ENABLED:
@@ -844,7 +1252,7 @@ async def asyncpg_connect(
     ssl_ctx = ssl_context_for_dsn(info.normalized_asyncpg)
     server_settings = _asyncpg_server_settings(statement_timeout_ms)
 
-    last_err: Optional[BaseException] = None
+    last_err: BaseException | None = None
     attempts = 1 + int(AI_DB_CONNECT_RETRIES)
 
     for i in range(1, attempts + 1):
@@ -855,21 +1263,19 @@ async def asyncpg_connect(
                 ssl=ssl_ctx,
                 server_settings=server_settings,
             )
-            try:
+            with suppress(Exception):
                 await conn.execute("SELECT 1")
-            except Exception:
-                pass
             return conn
         except Exception as e:
             last_err = e
             if i >= attempts:
                 break
-            if getattr(log, "every")("ai_db_asyncpg_connect_retry", 10):
+            if log.every("ai_db_asyncpg_connect_retry", 10):
                 log.warning("ai_db: asyncpg connect failed (attempt %s/%s): %s", i, attempts, e)
             base = float(AI_DB_CONNECT_RETRY_BASE_S)
             cap = float(AI_DB_CONNECT_RETRY_MAX_S)
             delay = min(cap, base * (2.0 ** max(0, i - 1)))
-            delay *= (0.9 + 0.2 * random.random())
+            delay *= 0.9 + 0.2 * random.random()
             await asyncio.sleep(delay)
 
     assert last_err is not None
@@ -880,10 +1286,7 @@ _ASYNCPG_POOL: Any = None
 
 
 async def get_asyncpg_pool() -> Any:
-    """
-    Optional shared asyncpg pool (disabled by default).
-    If enabled, this is the fastest/safest path for high-frequency async writes.
-    """
+    """Optional shared asyncpg pool (disabled by default)."""
     global _ASYNCPG_POOL
     if _ASYNCPG_POOL is not None:
         return _ASYNCPG_POOL
@@ -914,30 +1317,33 @@ async def get_asyncpg_pool() -> Any:
 async def close_asyncpg_pool() -> None:
     global _ASYNCPG_POOL
     if _ASYNCPG_POOL is not None:
-        try:
+        with suppress(Exception):
             await _ASYNCPG_POOL.close()
-        except Exception:
-            pass
         _ASYNCPG_POOL = None
 
 
 # =============================================================================
-# psycopg2 connection helpers
+# Sync driver connect helpers (psycopg2 OR psycopg3)
 # =============================================================================
-
-def _require_psycopg2() -> None:
-    if _PSYCOPG2_OK:
+def _require_sync_pg() -> None:
+    if _sync_pg_ok():
         return
     raise RuntimeError(
-        "psycopg2 is not available. Install psycopg2-binary (or psycopg2) "
-        "or set AI_DB_ENABLED=0 to disable DB features."
+        "No sync Postgres driver is available. Install psycopg[binary] (recommended) "
+        "or psycopg2-binary, or set AI_DB_ENABLED=0 to disable DB features."
     )
 
 
+def _sync_connect(conninfo: str) -> _PGConn:
+    _require_sync_pg()
+    if _PG_DRIVER == "psycopg2":
+        return cast(_PGConn, psycopg2.connect(conninfo))  # type: ignore[union-attr]
+    if _PG_DRIVER == "psycopg3":
+        return cast(_PGConn, psycopg.connect(conninfo))  # type: ignore[union-attr]
+    raise RuntimeError("No sync Postgres driver configured")
+
+
 def _apply_session_settings(conn: _PGConn) -> None:
-    """
-    Apply session-level settings. Best-effort and parameterized (no unsafe SQL building).
-    """
     try:
         with conn.cursor() as cur:
             cur.execute("SET application_name = %s", (AI_DB_APP_NAME,))
@@ -959,34 +1365,34 @@ def _sleep_backoff(attempt: int) -> None:
     base = float(AI_DB_CONNECT_RETRY_BASE_S)
     cap = float(AI_DB_CONNECT_RETRY_MAX_S)
     delay = min(cap, base * (2.0 ** max(0, attempt - 1)))
-    delay *= (0.9 + 0.2 * random.random())
+    delay *= 0.9 + 0.2 * random.random()
     time.sleep(delay)
 
 
 def _connect_once() -> _PGConn:
     if not AI_DB_ENABLED:
         raise RuntimeError("AI DB disabled (AI_DB_ENABLED=0)")
-    _require_psycopg2()
+    _require_sync_pg()
 
     info = resolve_dsn_info()
-    dsn = info.normalized_libpq
+    conn = _sync_connect(info.normalized_libpq)
 
-    conn = cast(_PGConn, psycopg2.connect(dsn, connect_timeout=int(AI_DB_CONNECT_TIMEOUT_S)))  # type: ignore[union-attr]
-
-    try:
-        if register_default_json is not None:
-            register_default_json(conn, loads=json.loads)
-        if register_default_jsonb is not None:
-            register_default_jsonb(conn, loads=json.loads)
-    except Exception:
-        pass
+    # psycopg2: register JSON loaders (optional)
+    if _PG_DRIVER == "psycopg2":
+        try:
+            if register_default_json is not None:
+                register_default_json(conn, loads=json.loads)  # type: ignore[misc]
+            if register_default_jsonb is not None:
+                register_default_jsonb(conn, loads=json.loads)  # type: ignore[misc]
+        except Exception:
+            pass
 
     _apply_session_settings(conn)
     return conn
 
 
 def _connect() -> _PGConn:
-    last_err: Optional[BaseException] = None
+    last_err: BaseException | None = None
     attempts = 1 + int(AI_DB_CONNECT_RETRIES)
     for i in range(1, attempts + 1):
         try:
@@ -995,7 +1401,7 @@ def _connect() -> _PGConn:
             last_err = e
             if i >= attempts:
                 break
-            if getattr(log, "every")("ai_db_connect_retry", 10):
+            if log.every("ai_db_connect_retry", 10):
                 log.warning("ai_db: connect failed (attempt %s/%s): %s", i, attempts, e)
             _sleep_backoff(i)
     assert last_err is not None
@@ -1003,45 +1409,42 @@ def _connect() -> _PGConn:
 
 
 @contextmanager
-def conn_cursor() -> Iterator[Tuple[_PGConn, _PGCursor]]:
+def conn_cursor() -> Iterator[tuple[_PGConn, _PGCursor]]:
     conn = _connect()
     try:
         with conn.cursor() as cur:
             yield conn, cur
         conn.commit()
     except Exception:
-        try:
+        with suppress(Exception):
             conn.rollback()
-        except Exception:
-            pass
         log.exception("ai_db: DB error")
         raise
     finally:
-        try:
+        with suppress(Exception):
             conn.close()
-        except Exception:
-            pass
 
 
 @contextmanager
-def conn_dict_cursor() -> Iterator[Tuple[_PGConn, RealDictCursor]]:
+def conn_dict_cursor() -> Iterator[tuple[_PGConn, Any]]:
     conn = _connect()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:  # type: ignore[arg-type]
-            yield conn, cur
+        if _PG_DRIVER == "psycopg2":
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:  # type: ignore[arg-type]
+                yield conn, cur
+        else:
+            # psycopg3
+            with conn.cursor(row_factory=dict_row) as cur:  # type: ignore[misc]
+                yield conn, cur
         conn.commit()
     except Exception:
-        try:
+        with suppress(Exception):
             conn.rollback()
-        except Exception:
-            pass
         log.exception("ai_db: DB error")
         raise
     finally:
-        try:
+        with suppress(Exception):
             conn.close()
-        except Exception:
-            pass
 
 
 @contextmanager
@@ -1051,15 +1454,14 @@ def cursor_only() -> Iterator[_PGCursor]:
 
 
 @contextmanager
-def dict_cursor_only() -> Iterator[RealDictCursor]:
+def dict_cursor_only() -> Iterator[Any]:
     with conn_dict_cursor() as (_c, cur):
         yield cur
 
 
 # =============================================================================
-# Soft-fail decorators (deep-copy safe)
+# Soft-fail decorators
 # =============================================================================
-
 def _default_copy(v: Any) -> Any:
     try:
         return copy.deepcopy(v)
@@ -1077,7 +1479,7 @@ def _softfail_write(default: Any):
                 return fn(*args, **kwargs)
             except Exception:
                 if AI_DB_SOFT_FAIL_WRITES:
-                    if getattr(log, "every")("ai_db_write_fail", 50):
+                    if log.every("ai_db_write_fail", 50):
                         log.exception("ai_db: write failed in %s (soft-fail)", fn.__name__)
                     return _default_copy(default)
                 raise
@@ -1097,7 +1499,7 @@ def _softfail_read(default: Any):
                 return fn(*args, **kwargs)
             except Exception:
                 if AI_DB_SOFT_FAIL_READS:
-                    if getattr(log, "every")("ai_db_read_fail", 50):
+                    if log.every("ai_db_read_fail", 50):
                         log.exception("ai_db: read failed in %s (soft-fail)", fn.__name__)
                     return _default_copy(default)
                 raise
@@ -1108,15 +1510,11 @@ def _softfail_read(default: Any):
 
 
 # =============================================================================
-# Migration lock
+# Migration lock + safe SQL helpers
 # =============================================================================
-
 @contextmanager
 def _migration_lock(cur: _PGCursor) -> Iterator[None]:
-    """
-    Advisory lock to prevent concurrent schema migrations across multiple instances.
-    Best-effort: if timeout expires, proceed anyway (migrations are idempotent).
-    """
+    """Advisory lock to prevent concurrent migrations (best-effort)."""
     if not AI_DB_USE_MIGRATION_LOCK:
         yield
         return
@@ -1140,18 +1538,23 @@ def _migration_lock(cur: _PGCursor) -> Iterator[None]:
         yield
     finally:
         if got:
-            try:
+            with suppress(Exception):
                 cur.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
-            except Exception:
-                pass
+
+
+_NUMERIC_RE_SQL = r"^-?[0-9]+([.][0-9]+)?$"
+
+
+def _sql_safe_float(text_expr: str) -> str:
+    """Safely cast text -> float only if numeric-looking; otherwise NULL."""
+    return f"(CASE WHEN ({text_expr}) ~ '{_NUMERIC_RE_SQL}' THEN ({text_expr})::double precision ELSE NULL END)"
 
 
 # =============================================================================
 # Phase 0: Health / simple utilities
 # =============================================================================
-
 def ping() -> bool:
-    if not AI_DB_ENABLED or not _PSYCOPG2_OK:
+    if not AI_DB_ENABLED or not _sync_pg_ok():
         return False
     try:
         with cursor_only() as cur:
@@ -1167,9 +1570,8 @@ def describe_backend() -> str:
     dsn_mask = get_normalized_dsn_for_debug()
     if not AI_DB_ENABLED:
         return f"dsn={dsn_mask}, server=<disabled>, ping=False"
-
-    if not _PSYCOPG2_OK:
-        return f"dsn={dsn_mask}, server=<no-psycopg2>, ping=False"
+    if not _sync_pg_ok():
+        return f"dsn={dsn_mask}, server=<no-sync-driver>, ping=False"
 
     version = "unknown"
     ok = False
@@ -1192,28 +1594,29 @@ def describe_backend() -> str:
 # =============================================================================
 # Phase 1: Schema / migrations
 # =============================================================================
-
-_SCHEMA_VERSION = "2"  # v2 adds exit_events + DSN env compat (code-only)
+AI_DB_SCHEMA_VERSION: int = SCHEMA_VERSION
 
 
 def ensure_ai_tables() -> None:
     """
-    Create tables if they don't exist, and add missing columns/indexes safely.
-    Safe to call repeatedly.
-
-    Guardrails:
-      - skips if AI_DB_MIGRATIONS_ENABLED=0
-      - skips if AI_DB_READ_ONLY=1
-      - requires psycopg2 for migration path
+    Create/upgrade schema idempotently.
+    Safe to call repeatedly. Skips when disabled, read-only, or migrations disabled.
     """
     if not AI_DB_ENABLED or AI_DB_READ_ONLY or not AI_DB_MIGRATIONS_ENABLED:
         return
-    if not _PSYCOPG2_OK:
-        log.warning("ai_db.ensure_ai_tables: psycopg2 missing; skipping migrations (install psycopg2-binary).")
+    if not _sync_pg_ok():
+        log.warning(
+            "ai_db.ensure_ai_tables: no sync driver; skipping migrations "
+            "(install psycopg[binary] or psycopg2-binary)."
+        )
         return
+
+    decision_score_expr = _sql_safe_float("(raw->'_decision_meta'->>'decision_score')")
+    max_dd_expr = _sql_safe_float("(extra->>'max_dd_pct')")
 
     with conn_cursor() as (_conn, cur):
         with _migration_lock(cur):
+            # meta (FIXED: columns are k/v, not key/value)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ai_schema_meta (
@@ -1229,9 +1632,10 @@ def ensure_ai_tables() -> None:
                 VALUES ('schema_version', %s)
                 ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, ts = now();
                 """,
-                (_SCHEMA_VERSION,),
+                (str(SCHEMA_VERSION),),
             )
 
+            # training
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS entry_candidates (
@@ -1263,6 +1667,8 @@ def ensure_ai_tables() -> None:
                 );
                 """
             )
+
+            # executions / exits
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS trade_executions (
@@ -1306,6 +1712,55 @@ def ensure_ai_tables() -> None:
                 );
                 """
             )
+
+            # positions
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS positions (
+                    id                 BIGSERIAL PRIMARY KEY,
+                    ts                 TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    position_id        TEXT,
+                    mint               TEXT NOT NULL,
+                    symbol             TEXT,
+                    status             TEXT NOT NULL DEFAULT 'OPEN',
+                    side               TEXT NOT NULL DEFAULT 'LONG',
+                    qty_raw            NUMERIC,
+                    entry_price_usd    DOUBLE PRECISION,
+                    entry_trade_id     TEXT,
+                    entry_tx_sig       TEXT,
+                    entry_candidate_id BIGINT REFERENCES entry_candidates(id) ON DELETE SET NULL,
+                    entry_ts           TIMESTAMPTZ,
+
+                    exit_price_usd     DOUBLE PRECISION,
+                    exit_trade_id      TEXT,
+                    exit_tx_sig        TEXT,
+                    exit_ts            TIMESTAMPTZ,
+
+                    pnl_pct            DOUBLE PRECISION,
+                    pnl_usd            DOUBLE PRECISION,
+
+                    session_id         TEXT,
+                    wallet_tag         TEXT,
+                    extra              JSONB NOT NULL DEFAULT '{}'::jsonb
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS position_events (
+                    id          BIGSERIAL PRIMARY KEY,
+                    ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    position_id TEXT,
+                    mint        TEXT NOT NULL,
+                    event_type  TEXT NOT NULL,
+                    payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    session_id  TEXT,
+                    extra       JSONB NOT NULL DEFAULT '{}'::jsonb
+                );
+                """
+            )
+
+            # regime & AI events
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS regime_snapshots (
@@ -1333,16 +1788,72 @@ def ensure_ai_tables() -> None:
                 """
             )
 
-            # add-if-missing columns (safe idempotent)
+            # future-proof knobs & risk
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_params (
+                    id         BIGSERIAL PRIMARY KEY,
+                    ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    key        TEXT NOT NULL,
+                    value      JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    src        TEXT,
+                    regime     TEXT,
+                    session_id TEXT,
+                    extra      JSONB NOT NULL DEFAULT '{}'::jsonb
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS risk_assessments (
+                    id         BIGSERIAL PRIMARY KEY,
+                    ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    mint       TEXT NOT NULL,
+                    symbol     TEXT,
+                    score      DOUBLE PRECISION,
+                    verdict    TEXT,
+                    details    JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    model_tag  TEXT,
+                    session_id TEXT,
+                    extra      JSONB NOT NULL DEFAULT '{}'::jsonb
+                );
+                """
+            )
+
+            # add-if-missing (defensive; ensure defaults for json columns)
             cur.execute("ALTER TABLE entry_candidates ADD COLUMN IF NOT EXISTS session_id TEXT;")
             cur.execute("ALTER TABLE entry_candidates ADD COLUMN IF NOT EXISTS wallet_tag TEXT;")
+
             cur.execute("ALTER TABLE trade_executions ADD COLUMN IF NOT EXISTS tx_sig TEXT;")
             cur.execute("ALTER TABLE trade_executions ADD COLUMN IF NOT EXISTS session_id TEXT;")
+
             cur.execute("ALTER TABLE exit_events ADD COLUMN IF NOT EXISTS event_key TEXT;")
 
-            # Indexes
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_entry_candidates_ts ON entry_candidates (ts DESC);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_entry_candidates_mint_ts ON entry_candidates (mint, ts DESC);")
+            cur.execute("ALTER TABLE positions ADD COLUMN IF NOT EXISTS position_id TEXT;")
+            cur.execute("ALTER TABLE positions ADD COLUMN IF NOT EXISTS status TEXT;")
+            cur.execute("ALTER TABLE positions ADD COLUMN IF NOT EXISTS side TEXT;")
+            cur.execute("ALTER TABLE positions ADD COLUMN IF NOT EXISTS entry_candidate_id BIGINT;")
+            cur.execute("ALTER TABLE positions ADD COLUMN IF NOT EXISTS session_id TEXT;")
+            cur.execute("ALTER TABLE positions ADD COLUMN IF NOT EXISTS wallet_tag TEXT;")
+            cur.execute(
+                "ALTER TABLE positions ADD COLUMN IF NOT EXISTS extra JSONB NOT NULL DEFAULT '{}'::jsonb;"
+            )
+
+            cur.execute(
+                "ALTER TABLE position_events ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb;"
+            )
+            cur.execute("ALTER TABLE position_events ADD COLUMN IF NOT EXISTS session_id TEXT;")
+            cur.execute(
+                "ALTER TABLE position_events ADD COLUMN IF NOT EXISTS extra JSONB NOT NULL DEFAULT '{}'::jsonb;"
+            )
+
+            # indexes
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_ts ON entry_candidates (ts DESC);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_mint_ts ON entry_candidates (mint, ts DESC);"
+            )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_entry_candidates_src_regime_ts ON entry_candidates (src, regime, ts DESC);"
             )
@@ -1352,15 +1863,29 @@ def ensure_ai_tables() -> None:
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_entry_candidates_session_ts ON entry_candidates (session_id, ts DESC);"
             )
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_entry_candidates_feature_version ON entry_candidates (feature_version);")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_feature_version ON entry_candidates (feature_version);"
+            )
 
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_entry_outcomes_candidate_id ON entry_outcomes (candidate_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_entry_outcomes_label_ts ON entry_outcomes (label, ts DESC);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_entry_outcomes_ts ON entry_outcomes (ts DESC);")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entry_outcomes_candidate_id ON entry_outcomes (candidate_id);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entry_outcomes_label_ts ON entry_outcomes (label, ts DESC);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entry_outcomes_ts ON entry_outcomes (ts DESC);"
+            )
 
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_executions_ts ON trade_executions (ts DESC);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_executions_trade_id ON trade_executions (trade_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_executions_candidate_id ON trade_executions (candidate_id);")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trade_executions_ts ON trade_executions (ts DESC);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trade_executions_trade_id ON trade_executions (trade_id);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trade_executions_candidate_id ON trade_executions (candidate_id);"
+            )
             cur.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_trade_executions_trade_side_mint
@@ -1369,19 +1894,49 @@ def ensure_ai_tables() -> None:
             )
 
             cur.execute("CREATE INDEX IF NOT EXISTS idx_exit_events_ts ON exit_events (ts DESC);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_exit_events_mint_ts ON exit_events (mint, ts DESC);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_exit_events_trade_id ON exit_events (trade_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_exit_events_candidate_id ON exit_events (candidate_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_exit_events_reason_ts ON exit_events (reason, ts DESC);")
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_exit_events_event_key ON exit_events (event_key);")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_exit_events_mint_ts ON exit_events (mint, ts DESC);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_exit_events_trade_id ON exit_events (trade_id);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_exit_events_candidate_id ON exit_events (candidate_id);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_exit_events_reason_ts ON exit_events (reason, ts DESC);"
+            )
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_exit_events_event_key ON exit_events (event_key);"
+            )
 
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_regime_snapshots_ts ON regime_snapshots (ts DESC);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_regime_snapshots_regime_ts ON regime_snapshots (regime, ts DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_positions_ts ON positions (ts DESC);")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_positions_mint_status_ts ON positions (mint, status, ts DESC);"
+            )
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_positions_position_id ON positions (position_id);"
+            )
+
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_position_events_ts ON position_events (ts DESC);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_position_events_mint_ts ON position_events (mint, ts DESC);"
+            )
+
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_regime_snapshots_ts ON regime_snapshots (ts DESC);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_regime_snapshots_regime_ts ON regime_snapshots (regime, ts DESC);"
+            )
 
             cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_events_ts ON ai_events (ts DESC);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_events_type_ts ON ai_events (event_type, ts DESC);")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ai_events_type_ts ON ai_events (event_type, ts DESC);"
+            )
 
-            # JSON decision meta indexes
             cur.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_entry_candidates_policy_version
@@ -1401,16 +1956,29 @@ def ensure_ai_tables() -> None:
                 """
             )
             cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_entry_candidates_decision_score
-                ON entry_candidates (((raw->'_decision_meta'->>'decision_score')::double precision));
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_entry_candidates_decision_score_safe
+                ON entry_candidates (({decision_score_expr}));
                 """
             )
             cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_entry_outcomes_max_dd_pct_safe
+                ON entry_outcomes (({max_dd_expr}));
                 """
-                CREATE INDEX IF NOT EXISTS idx_entry_outcomes_max_dd_pct
-                ON entry_outcomes (((extra->>'max_dd_pct')::double precision));
-                """
+            )
+
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_strategy_params_ts ON strategy_params (ts DESC);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_strategy_params_key_ts ON strategy_params (key, ts DESC);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_risk_assessments_ts ON risk_assessments (ts DESC);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_risk_assessments_mint_ts ON risk_assessments (mint, ts DESC);"
             )
 
     log.info("ai_db.ensure_ai_tables: schema ensured")
@@ -1418,9 +1986,9 @@ def ensure_ai_tables() -> None:
 
 def bootstrap_ai_db() -> bool:
     """
-    One-call bootstrap used by startup:
+    Startup bootstrap:
       - returns False if disabled or not reachable
-      - ensures schema if reachable (unless migrations disabled or read-only)
+      - ensures schema if reachable (unless migrations disabled/read-only)
     """
     if not AI_DB_ENABLED:
         return False
@@ -1430,7 +1998,7 @@ def bootstrap_ai_db() -> bool:
             return True
         return ping()
     except Exception:
-        if getattr(log, "every")("ai_db_bootstrap_fail", 10):
+        if log.every("ai_db_bootstrap_fail", 10):
             log.exception("ai_db.bootstrap_ai_db failed")
         return False
 
@@ -1438,16 +2006,15 @@ def bootstrap_ai_db() -> bool:
 # =============================================================================
 # Phase 2: entry_candidates (training inputs)
 # =============================================================================
-
 @_softfail_write(0)
 def insert_entry_candidate(
     *,
     src: str,
     mint: str,
-    symbol: Optional[str],
-    regime: Optional[str],
-    wallet_tag: Optional[str],
-    session_id: Optional[str] = None,
+    symbol: str | None,
+    regime: str | None,
+    wallet_tag: str | None,
+    session_id: str | None = None,
     feature_version: int,
     features: Mapping[str, Any],
     raw: Mapping[str, Any],
@@ -1482,24 +2049,7 @@ def insert_entry_candidates_bulk(rows: Sequence[Mapping[str, Any]]) -> int:
     if not rows:
         return 0
 
-    if _execute_values is None:
-        n = 0
-        for r in rows:
-            cid = insert_entry_candidate(
-                src=str(r.get("src") or ""),
-                mint=str(r.get("mint") or ""),
-                symbol=cast(Optional[str], r.get("symbol")),
-                regime=cast(Optional[str], r.get("regime")),
-                wallet_tag=cast(Optional[str], r.get("wallet_tag")),
-                session_id=cast(Optional[str], r.get("session_id")),
-                feature_version=int(r.get("feature_version") or 0),
-                features=cast(Mapping[str, Any], r.get("features") or {}),
-                raw=cast(Mapping[str, Any], r.get("raw") or {}),
-            )
-            n += 1 if cid else 0
-        return n
-
-    values = []
+    values: list[tuple[Any, ...]] = []
     for r in rows:
         values.append(
             (
@@ -1515,36 +2065,50 @@ def insert_entry_candidates_bulk(rows: Sequence[Mapping[str, Any]]) -> int:
             )
         )
 
+    if _execute_values is not None:
+        with conn_cursor() as (_conn, cur):
+            _execute_values(
+                cur,
+                """
+                INSERT INTO entry_candidates
+                    (src, mint, symbol, regime, wallet_tag, session_id, feature_version, features, raw)
+                VALUES %s
+                """,
+                values,
+                template="(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)",
+                page_size=500,
+            )
+        return len(values)
+
+    # psycopg3 or no execute_values: executemany
     with conn_cursor() as (_conn, cur):
-        _execute_values(
-            cur,
+        cur.executemany(
             """
             INSERT INTO entry_candidates
                 (src, mint, symbol, regime, wallet_tag, session_id, feature_version, features, raw)
-            VALUES %s
+            VALUES
+                (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)
             """,
             values,
-            template="(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)",
-            page_size=500,
         )
-        return len(values)
+    return len(values)
 
 
 @_softfail_read([])
 def fetch_latest_candidates(
     *,
     limit: int = 50,
-    src: Optional[str] = None,
-    regime: Optional[str] = None,
-    wallet_tag: Optional[str] = None,
-    session_id: Optional[str] = None,
-    min_feature_version: Optional[int] = None,
-) -> List[Row]:
+    src: str | None = None,
+    regime: str | None = None,
+    wallet_tag: str | None = None,
+    session_id: str | None = None,
+    min_feature_version: int | None = None,
+) -> list[Row]:
     limit = max(1, min(int(limit), 500))
     min_feature_version = _effective_min_feature_version(min_feature_version)
 
-    clauses: List[str] = []
-    params: List[Any] = []
+    clauses: list[str] = []
+    params: list[Any] = []
 
     if src:
         clauses.append("src = %s")
@@ -1576,7 +2140,7 @@ def fetch_latest_candidates(
         cur.execute(sql, params)
         rows = cur.fetchall() or []
 
-    out: List[Row] = []
+    out: list[Row] = []
     for r in rows:
         rr = dict(r)
         rr["id"] = int(rr.get("id") or 0)
@@ -1588,7 +2152,7 @@ def fetch_latest_candidates(
 
 
 @_softfail_read(None)
-def fetch_candidate_by_id(candidate_id: int) -> Optional[Row]:
+def fetch_candidate_by_id(candidate_id: int) -> Row | None:
     with dict_cursor_only() as cur:
         cur.execute(
             """
@@ -1613,12 +2177,12 @@ def fetch_candidate_by_id(candidate_id: int) -> Optional[Row]:
 def update_entry_decision(
     *,
     candidate_id: int,
-    decision: Optional[str] = None,
-    decision_score: Optional[float] = None,
-    decision_reason: Optional[str] = None,
+    decision: str | None = None,
+    decision_score: float | None = None,
+    decision_reason: str | None = None,
     **extra_fields: Any,
 ) -> int:
-    patch_meta: Dict[str, Any] = {
+    patch_meta: dict[str, Any] = {
         "decision": decision,
         "decision_score": decision_score,
         "decision_reason": decision_reason,
@@ -1646,16 +2210,15 @@ def update_entry_decision(
 # =============================================================================
 # Phase 3: entry_outcomes (training labels)
 # =============================================================================
-
 @_softfail_write(0)
 def insert_entry_outcome(
     *,
     candidate_id: int,
     label: str,
-    pnl_pct: Optional[float] = None,
-    hold_sec: Optional[int] = None,
-    notes: Optional[str] = None,
-    extra: Optional[Mapping[str, Any]] = None,
+    pnl_pct: float | None = None,
+    hold_sec: int | None = None,
+    notes: str | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> int:
     with conn_cursor() as (_conn, cur):
         cur.execute(
@@ -1666,7 +2229,14 @@ def insert_entry_outcome(
                 (%s,           %s,    %s,       %s,       %s,    %s::jsonb)
             RETURNING id
             """,
-            (int(candidate_id), str(label), pnl_pct, hold_sec, notes, _json_dumps(dict(extra or {}))),
+            (
+                int(candidate_id),
+                str(label),
+                pnl_pct,
+                hold_sec,
+                notes,
+                _json_dumps(dict(extra or {})),
+            ),
         )
         row = cur.fetchone()
         return int(row[0]) if row else 0
@@ -1677,10 +2247,10 @@ def mark_outcome_for_candidate(
     candidate_id: int,
     *,
     label: str,
-    pnl_pct: Optional[float] = None,
-    hold_sec: Optional[int] = None,
-    notes: Optional[str] = None,
-    extra: Optional[Mapping[str, Any]] = None,
+    pnl_pct: float | None = None,
+    hold_sec: int | None = None,
+    notes: str | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> int:
     with conn_cursor() as (_conn, cur):
         cur.execute(
@@ -1699,17 +2269,24 @@ def mark_outcome_for_candidate(
                 ts       = now()
             RETURNING id
             """,
-            (int(candidate_id), str(label), pnl_pct, hold_sec, notes, _json_dumps(dict(extra or {}))),
+            (
+                int(candidate_id),
+                str(label),
+                pnl_pct,
+                hold_sec,
+                notes,
+                _json_dumps(dict(extra or {})),
+            ),
         )
         row = cur.fetchone()
         return int(row[0]) if row else 0
 
 
 @_softfail_read([])
-def fetch_recent_outcomes(*, limit: int = 100, since_candidate_id: Optional[int] = None) -> List[Row]:
+def fetch_recent_outcomes(*, limit: int = 100, since_candidate_id: int | None = None) -> list[Row]:
     limit = max(1, min(int(limit), 1000))
-    clauses: List[str] = []
-    params: List[Any] = []
+    clauses: list[str] = []
+    params: list[Any] = []
     if since_candidate_id is not None:
         clauses.append("candidate_id > %s")
         params.append(int(since_candidate_id))
@@ -1727,7 +2304,7 @@ def fetch_recent_outcomes(*, limit: int = 100, since_candidate_id: Optional[int]
         cur.execute(sql, params)
         rows = cur.fetchall() or []
 
-    out: List[Row] = []
+    out: list[Row] = []
     for r in rows:
         rr = dict(r)
         rr["id"] = int(rr.get("id") or 0)
@@ -1741,18 +2318,18 @@ def fetch_recent_outcomes(*, limit: int = 100, since_candidate_id: Optional[int]
 def fetch_unlabeled_candidates(
     *,
     limit: int = 500,
-    min_feature_version: Optional[int] = None,
-    src: Optional[str] = None,
-    regime: Optional[str] = None,
-    min_age_seconds: Optional[int] = None,
-    wallet_tag: Optional[str] = None,
-    session_id: Optional[str] = None,
-) -> List[Row]:
+    min_feature_version: int | None = None,
+    src: str | None = None,
+    regime: str | None = None,
+    min_age_seconds: int | None = None,
+    wallet_tag: str | None = None,
+    session_id: str | None = None,
+) -> list[Row]:
     limit = max(1, min(int(limit), 5000))
     min_feature_version = _effective_min_feature_version(min_feature_version)
 
-    clauses: List[str] = []
-    params: List[Any] = []
+    clauses: list[str] = []
+    params: list[Any] = []
 
     if src:
         clauses.append("c.src = %s")
@@ -1773,7 +2350,11 @@ def fetch_unlabeled_candidates(
         clauses.append("c.ts <= now() - (%s::interval)")
         params.append(f"{int(min_age_seconds)} seconds")
 
-    where_sql = (("WHERE " + " AND ".join(clauses) + " AND o.candidate_id IS NULL") if clauses else "WHERE o.candidate_id IS NULL")
+    where_sql = (
+        ("WHERE " + " AND ".join(clauses) + " AND o.candidate_id IS NULL")
+        if clauses
+        else "WHERE o.candidate_id IS NULL"
+    )
 
     sql = f"""
         SELECT
@@ -1792,7 +2373,7 @@ def fetch_unlabeled_candidates(
         cur.execute(sql, params)
         rows = cur.fetchall() or []
 
-    out: List[Row] = []
+    out: list[Row] = []
     for r in rows:
         rr = dict(r)
         rr["id"] = int(rr.get("id") or 0)
@@ -1804,9 +2385,8 @@ def fetch_unlabeled_candidates(
 
 
 # =============================================================================
-# Phase 3b: Executions, exit events, regime snapshots
+# Phase 3b: Executions, exit events, regime snapshots, ai events
 # =============================================================================
-
 @_softfail_write(0)
 def insert_trade_execution(
     *,
@@ -1815,13 +2395,13 @@ def insert_trade_execution(
     side: str,  # "BUY" / "SELL"
     qty_raw: int,
     price_usd: float,
-    slippage_bps: Optional[float] = None,
-    fees_usd: Optional[float] = None,
-    tx_sig: Optional[str] = None,
-    candidate_id: Optional[int] = None,
-    session_id: Optional[str] = None,
-    ts: Optional[Any] = None,
-    extra: Optional[Mapping[str, Any]] = None,
+    slippage_bps: float | None = None,
+    fees_usd: float | None = None,
+    tx_sig: str | None = None,
+    candidate_id: int | None = None,
+    session_id: str | None = None,
+    ts: Any | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> int:
     with conn_cursor() as (_conn, cur):
         cur.execute(
@@ -1856,14 +2436,14 @@ def insert_trade_execution(
 
 def _mk_exit_event_key(
     *,
-    trade_id: Optional[str],
+    trade_id: str | None,
     mint: str,
-    action: Optional[str],
-    reason: Optional[str],
-    tx_sig: Optional[str],
-    candidate_id: Optional[int],
-    session_id: Optional[str],
-    ts: Optional[Any],
+    action: str | None,
+    reason: str | None,
+    tx_sig: str | None,
+    candidate_id: int | None,
+    session_id: str | None,
+    ts: Any | None,
 ) -> str:
     base = "|".join(
         [
@@ -1884,22 +2464,22 @@ def _mk_exit_event_key(
 def insert_exit_event(
     *,
     mint: str,
-    symbol: Optional[str] = None,
-    trade_id: Optional[str] = None,
-    action: Optional[str] = None,
-    reason: Optional[str] = None,
-    pnl_pct: Optional[float] = None,
-    pnl_usd: Optional[float] = None,
-    qty_raw: Optional[int] = None,
-    price_usd: Optional[float] = None,
-    slippage_bps: Optional[float] = None,
-    fees_usd: Optional[float] = None,
-    tx_sig: Optional[str] = None,
-    candidate_id: Optional[int] = None,
-    session_id: Optional[str] = None,
-    ts: Optional[Any] = None,
-    extra: Optional[Mapping[str, Any]] = None,
-    event_key: Optional[str] = None,
+    symbol: str | None = None,
+    trade_id: str | None = None,
+    action: str | None = None,
+    reason: str | None = None,
+    pnl_pct: float | None = None,
+    pnl_usd: float | None = None,
+    qty_raw: int | None = None,
+    price_usd: float | None = None,
+    slippage_bps: float | None = None,
+    fees_usd: float | None = None,
+    tx_sig: str | None = None,
+    candidate_id: int | None = None,
+    session_id: str | None = None,
+    ts: Any | None = None,
+    extra: Mapping[str, Any] | None = None,
+    event_key: str | None = None,
 ) -> int:
     ek = event_key or _mk_exit_event_key(
         trade_id=trade_id,
@@ -1954,13 +2534,13 @@ def insert_exit_event(
 def fetch_recent_exit_events(
     *,
     limit: int = 200,
-    mint: Optional[str] = None,
-    trade_id: Optional[str] = None,
-    candidate_id: Optional[int] = None,
-) -> List[Row]:
+    mint: str | None = None,
+    trade_id: str | None = None,
+    candidate_id: int | None = None,
+) -> list[Row]:
     limit = max(1, min(int(limit), 2000))
-    clauses: List[str] = []
-    params: List[Any] = []
+    clauses: list[str] = []
+    params: list[Any] = []
     if mint:
         clauses.append("mint = %s")
         params.append(mint)
@@ -1986,7 +2566,7 @@ def fetch_recent_exit_events(
         cur.execute(sql, params)
         rows = cur.fetchall() or []
 
-    out: List[Row] = []
+    out: list[Row] = []
     for r in rows:
         rr = dict(r)
         rr["id"] = int(rr.get("id") or 0)
@@ -1999,13 +2579,13 @@ def fetch_recent_exit_events(
 def fetch_recent_trade_executions(
     *,
     limit: int = 200,
-    trade_id: Optional[str] = None,
-    candidate_id: Optional[int] = None,
-) -> List[Row]:
+    trade_id: str | None = None,
+    candidate_id: int | None = None,
+) -> list[Row]:
     limit = max(1, min(int(limit), 2000))
 
-    clauses: List[str] = []
-    params: List[Any] = []
+    clauses: list[str] = []
+    params: list[Any] = []
 
     if trade_id:
         clauses.append("trade_id = %s")
@@ -2029,7 +2609,7 @@ def fetch_recent_trade_executions(
         cur.execute(sql, params)
         rows = cur.fetchall() or []
 
-    out: List[Row] = []
+    out: list[Row] = []
     for r in rows:
         rr = dict(r)
         rr["id"] = int(rr.get("id") or 0)
@@ -2043,9 +2623,9 @@ def insert_regime_snapshot(
     *,
     regime: str,
     state: Mapping[str, Any],
-    ts: Optional[Any] = None,
-    session_id: Optional[str] = None,
-    extra: Optional[Mapping[str, Any]] = None,
+    ts: Any | None = None,
+    session_id: str | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> int:
     with conn_cursor() as (_conn, cur):
         cur.execute(
@@ -2056,17 +2636,23 @@ def insert_regime_snapshot(
                 (COALESCE(%s::timestamptz, now()), %s, %s::jsonb, %s, %s::jsonb)
             RETURNING id
             """,
-            (ts, str(regime), _json_dumps(dict(state or {})), session_id, _json_dumps(dict(extra or {}))),
+            (
+                ts,
+                str(regime),
+                _json_dumps(dict(state or {})),
+                session_id,
+                _json_dumps(dict(extra or {})),
+            ),
         )
         row = cur.fetchone()
         return int(row[0]) if row else 0
 
 
 @_softfail_read([])
-def fetch_recent_regime_snapshots(*, limit: int = 200, regime: Optional[str] = None) -> List[Row]:
+def fetch_recent_regime_snapshots(*, limit: int = 200, regime: str | None = None) -> list[Row]:
     limit = max(1, min(int(limit), 2000))
-    clauses: List[str] = []
-    params: List[Any] = []
+    clauses: list[str] = []
+    params: list[Any] = []
     if regime:
         clauses.append("regime = %s")
         params.append(regime)
@@ -2084,7 +2670,7 @@ def fetch_recent_regime_snapshots(*, limit: int = 200, regime: Optional[str] = N
         cur.execute(sql, params)
         rows = cur.fetchall() or []
 
-    out: List[Row] = []
+    out: list[Row] = []
     for r in rows:
         rr = dict(r)
         rr["id"] = int(rr.get("id") or 0)
@@ -2094,10 +2680,209 @@ def fetch_recent_regime_snapshots(*, limit: int = 200, regime: Optional[str] = N
     return out
 
 
-# =============================================================================
-# Phase 3c: Composite helpers (single-call logging)
-# =============================================================================
+@_softfail_write(0)
+def log_ai_event(
+    *,
+    event_type: str,
+    policy_version: str | None = None,
+    experiment_tag: str | None = None,
+    src: str | None = None,
+    regime: str | None = None,
+    payload: Mapping[str, Any] | None = None,
+) -> int:
+    with conn_cursor() as (_conn, cur):
+        cur.execute(
+            """
+            INSERT INTO ai_events
+                (event_type, policy_version, experiment_tag, src, regime, payload)
+            VALUES
+                (%s,         %s,             %s,             %s,  %s,     %s::jsonb)
+            RETURNING id
+            """,
+            (
+                str(event_type),
+                policy_version,
+                experiment_tag,
+                src,
+                regime,
+                _json_dumps(dict(payload or {})),
+            ),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
 
+
+@_softfail_read([])
+def fetch_ai_event_summary(
+    *,
+    days_back: int = 30,
+    event_types: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    days_back = max(1, min(int(days_back), 365))
+
+    clauses: list[str] = ["ts >= now() - (%s::interval)"]
+    params: list[Any] = [f"{days_back} days"]
+    if event_types:
+        clauses.append("event_type = ANY(%s)")
+        params.append(list(event_types))
+
+    where_sql = "WHERE " + " AND ".join(clauses)
+    sql = f"""
+        SELECT event_type, count(*) AS n_events, min(ts) AS first_ts, max(ts) AS last_ts
+        FROM ai_events
+        {where_sql}
+        GROUP BY event_type
+        ORDER BY event_type
+    """
+
+    out: list[dict[str, Any]] = []
+    with cursor_only() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall() or []
+    for event_type, n_events, first_ts, last_ts in rows:
+        out.append(
+            {
+                "event_type": event_type,
+                "n_events": int(n_events or 0),
+                "first_ts": first_ts.isoformat()
+                if isinstance(first_ts, datetime)
+                else str(first_ts),
+                "last_ts": last_ts.isoformat() if isinstance(last_ts, datetime) else str(last_ts),
+            }
+        )
+    return out
+
+
+# =============================================================================
+# Strategy params + risk assessments
+# =============================================================================
+@_softfail_write(0)
+def insert_strategy_param(
+    *,
+    key: str,
+    value: Mapping[str, Any],
+    src: str | None = None,
+    regime: str | None = None,
+    session_id: str | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> int:
+    with conn_cursor() as (_conn, cur):
+        cur.execute(
+            """
+            INSERT INTO strategy_params (key, value, src, regime, session_id, extra)
+            VALUES (%s, %s::jsonb, %s, %s, %s, %s::jsonb)
+            RETURNING id
+            """,
+            (
+                str(key),
+                _json_dumps(dict(value or {})),
+                src,
+                regime,
+                session_id,
+                _json_dumps(dict(extra or {})),
+            ),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+
+@_softfail_read([])
+def fetch_latest_strategy_params(*, key: str | None = None, limit: int = 50) -> list[Row]:
+    limit = max(1, min(int(limit), 500))
+    clauses: list[str] = []
+    params: list[Any] = []
+    if key:
+        clauses.append("key = %s")
+        params.append(str(key))
+    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = f"""
+        SELECT id, ts, key, value, src, regime, session_id, extra
+        FROM strategy_params
+        {where_sql}
+        ORDER BY ts DESC, id DESC
+        LIMIT %s
+    """
+    params.append(limit)
+    with dict_cursor_only() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall() or []
+    out: list[Row] = []
+    for r in rows:
+        rr = dict(r)
+        rr["id"] = int(rr.get("id") or 0)
+        rr["value"] = _ensure_obj(rr.get("value"))
+        rr["extra"] = _ensure_obj(rr.get("extra"))
+        out.append(rr)
+    return out
+
+
+@_softfail_write(0)
+def insert_risk_assessment(
+    *,
+    mint: str,
+    symbol: str | None = None,
+    score: float | None = None,
+    verdict: str | None = None,
+    details: Mapping[str, Any] | None = None,
+    model_tag: str | None = None,
+    session_id: str | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> int:
+    with conn_cursor() as (_conn, cur):
+        cur.execute(
+            """
+            INSERT INTO risk_assessments (mint, symbol, score, verdict, details, model_tag, session_id, extra)
+            VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb)
+            RETURNING id
+            """,
+            (
+                str(mint),
+                symbol,
+                score,
+                verdict,
+                _json_dumps(dict(details or {})),
+                model_tag,
+                session_id,
+                _json_dumps(dict(extra or {})),
+            ),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+
+@_softfail_read([])
+def fetch_latest_risk_assessments(*, mint: str | None = None, limit: int = 100) -> list[Row]:
+    limit = max(1, min(int(limit), 1000))
+    clauses: list[str] = []
+    params: list[Any] = []
+    if mint:
+        clauses.append("mint = %s")
+        params.append(str(mint))
+    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = f"""
+        SELECT id, ts, mint, symbol, score, verdict, details, model_tag, session_id, extra
+        FROM risk_assessments
+        {where_sql}
+        ORDER BY ts DESC, id DESC
+        LIMIT %s
+    """
+    params.append(limit)
+    with dict_cursor_only() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall() or []
+    out: list[Row] = []
+    for r in rows:
+        rr = dict(r)
+        rr["id"] = int(rr.get("id") or 0)
+        rr["details"] = _ensure_obj(rr.get("details"))
+        rr["extra"] = _ensure_obj(rr.get("extra"))
+        out.append(rr)
+    return out
+
+
+# =============================================================================
+# Composite helpers
+# =============================================================================
 @_softfail_write({"execution_id": 0, "outcome_id": 0})
 def record_trade_and_outcome(
     *,
@@ -2106,18 +2891,18 @@ def record_trade_and_outcome(
     side: str,
     qty_raw: int,
     price_usd: float,
-    candidate_id: Optional[int] = None,
-    label: Optional[str] = None,
-    pnl_pct: Optional[float] = None,
-    hold_sec: Optional[int] = None,
-    notes: Optional[str] = None,
-    slippage_bps: Optional[float] = None,
-    fees_usd: Optional[float] = None,
-    tx_sig: Optional[str] = None,
-    session_id: Optional[str] = None,
-    trade_extra: Optional[Mapping[str, Any]] = None,
-    outcome_extra: Optional[Mapping[str, Any]] = None,
-) -> Dict[str, int]:
+    candidate_id: int | None = None,
+    label: str | None = None,
+    pnl_pct: float | None = None,
+    hold_sec: int | None = None,
+    notes: str | None = None,
+    slippage_bps: float | None = None,
+    fees_usd: float | None = None,
+    tx_sig: str | None = None,
+    session_id: str | None = None,
+    trade_extra: Mapping[str, Any] | None = None,
+    outcome_extra: Mapping[str, Any] | None = None,
+) -> dict[str, int]:
     exec_id = insert_trade_execution(
         trade_id=trade_id,
         mint=mint,
@@ -2150,27 +2935,27 @@ def record_trade_and_outcome(
 def record_exit_event_and_outcome(
     *,
     mint: str,
-    symbol: Optional[str] = None,
-    trade_id: Optional[str] = None,
-    action: Optional[str] = None,
-    reason: Optional[str] = None,
-    pnl_pct: Optional[float] = None,
-    pnl_usd: Optional[float] = None,
-    qty_raw: Optional[int] = None,
-    price_usd: Optional[float] = None,
-    slippage_bps: Optional[float] = None,
-    fees_usd: Optional[float] = None,
-    tx_sig: Optional[str] = None,
-    candidate_id: Optional[int] = None,
-    session_id: Optional[str] = None,
-    ts: Optional[Any] = None,
-    exit_extra: Optional[Mapping[str, Any]] = None,
-    label: Optional[str] = None,
-    hold_sec: Optional[int] = None,
-    notes: Optional[str] = None,
-    outcome_extra: Optional[Mapping[str, Any]] = None,
-    event_key: Optional[str] = None,
-) -> Dict[str, int]:
+    symbol: str | None = None,
+    trade_id: str | None = None,
+    action: str | None = None,
+    reason: str | None = None,
+    pnl_pct: float | None = None,
+    pnl_usd: float | None = None,
+    qty_raw: int | None = None,
+    price_usd: float | None = None,
+    slippage_bps: float | None = None,
+    fees_usd: float | None = None,
+    tx_sig: str | None = None,
+    candidate_id: int | None = None,
+    session_id: str | None = None,
+    ts: Any | None = None,
+    exit_extra: Mapping[str, Any] | None = None,
+    label: str | None = None,
+    hold_sec: int | None = None,
+    notes: str | None = None,
+    outcome_extra: Mapping[str, Any] | None = None,
+    event_key: str | None = None,
+) -> dict[str, int]:
     exit_id = insert_exit_event(
         mint=mint,
         symbol=symbol,
@@ -2206,29 +2991,28 @@ def record_exit_event_and_outcome(
 
 
 # =============================================================================
-# Phase 4: Training + Backtest helpers
+# Training export / backtest streaming
 # =============================================================================
-
 @_softfail_read([])
 def fetch_training_rows(
     *,
     limit: int = 2000,
     require_outcome: bool = True,
-    min_feature_version: Optional[int] = None,
-    src: Optional[str] = None,
-    regime: Optional[str] = None,
-    policy_version: Optional[str] = None,
-    experiment_tag: Optional[str] = None,
-    label_in: Optional[Sequence[str]] = None,
-    wallet_tag: Optional[str] = None,
-    session_id: Optional[str] = None,
-) -> List[Row]:
+    min_feature_version: int | None = None,
+    src: str | None = None,
+    regime: str | None = None,
+    policy_version: str | None = None,
+    experiment_tag: str | None = None,
+    label_in: Sequence[str] | None = None,
+    wallet_tag: str | None = None,
+    session_id: str | None = None,
+) -> list[Row]:
     limit = max(1, min(int(limit), 10_000))
     min_feature_version = _effective_min_feature_version(min_feature_version)
 
     join_type = "JOIN" if require_outcome else "LEFT JOIN"
-    clauses: List[str] = []
-    params: List[Any] = []
+    clauses: list[str] = []
+    params: list[Any] = []
 
     if src:
         clauses.append("c.src = %s")
@@ -2256,6 +3040,8 @@ def fetch_training_rows(
         params.append(list(label_in))
 
     where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    max_dd_expr = _sql_safe_float("(o.extra->>'max_dd_pct')")
+
     sql = f"""
         SELECT
             c.id AS id,
@@ -2272,7 +3058,7 @@ def fetch_training_rows(
             o.label AS label,
             o.pnl_pct AS pnl_pct,
             o.hold_sec AS hold_sec,
-            (o.extra->>'max_dd_pct')::double precision AS max_dd_pct
+            {max_dd_expr} AS max_dd_pct
         FROM entry_candidates c
         {join_type} entry_outcomes o
           ON o.candidate_id = c.id
@@ -2286,7 +3072,7 @@ def fetch_training_rows(
         cur.execute(sql, params)
         rows = cur.fetchall() or []
 
-    out: List[Row] = []
+    out: list[Row] = []
     for r in rows:
         rr = dict(r)
         rr["id"] = int(rr.get("id") or 0)
@@ -2298,7 +3084,7 @@ def fetch_training_rows(
     return out
 
 
-def _parse_iso_dt(val: Any) -> Optional[datetime]:
+def _parse_iso_dt(val: Any) -> datetime | None:
     if val is None:
         return None
     if isinstance(val, datetime):
@@ -2311,7 +3097,7 @@ def _parse_iso_dt(val: Any) -> Optional[datetime]:
 
 
 def iter_backtest_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]:
-    if not AI_DB_ENABLED or not _PSYCOPG2_OK:
+    if not AI_DB_ENABLED or not _sync_pg_ok():
         return iter(())
 
     limit = int(config.get("BT_MAX_ROWS") or config.get("limit") or 50_000)
@@ -2339,16 +3125,11 @@ def iter_backtest_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
     min_pnl_pct = config.get("min_pnl_pct")
     max_pnl_pct = config.get("max_pnl_pct")
 
-    require_outcome = True
-    if "BT_REQUIRE_OUTCOME" in config:
-        require_outcome = bool(config.get("BT_REQUIRE_OUTCOME"))
-    elif "require_outcome" in config:
-        require_outcome = bool(config.get("require_outcome"))
-
+    require_outcome = bool(config.get("BT_REQUIRE_OUTCOME", config.get("require_outcome", True)))
     join_type = "JOIN" if require_outcome else "LEFT JOIN"
 
-    clauses: List[str] = []
-    params: List[Any] = []
+    clauses: list[str] = []
+    params: list[Any] = []
 
     if days_back is not None:
         try:
@@ -2412,6 +3193,7 @@ def iter_backtest_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
             pass
 
     where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    max_dd_expr = _sql_safe_float("(o.extra->>'max_dd_pct')")
 
     sql = f"""
         SELECT
@@ -2429,7 +3211,7 @@ def iter_backtest_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
             o.label,
             o.pnl_pct,
             o.hold_sec,
-            (o.extra->>'max_dd_pct')::double precision AS max_dd_pct
+            {max_dd_expr} AS max_dd_pct
         FROM entry_candidates c
         {join_type} entry_outcomes o
           ON o.candidate_id = c.id
@@ -2437,19 +3219,35 @@ def iter_backtest_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
         ORDER BY c.ts ASC, c.id ASC
         LIMIT %s
     """
-    params2 = list(params) + [limit]
+    params2 = [*list(params), limit]
 
     def _gen() -> Iterator[Mapping[str, Any]]:
-        conn: Optional[_PGConn] = None
-        cur: Optional[_PGCursor] = None
+        conn: _PGConn | None = None
+        cur: Any | None = None
         try:
             conn = _connect()
-            cur_name = f"ai_db_backtest_cursor_{os.getpid()}"
-            cur = conn.cursor(name=cur_name)
-            cur.itersize = 2000
-            cur.execute(sql, params2)
 
-            for r in cur:
+            if _PG_DRIVER == "psycopg2":
+                cur_name = f"ai_db_backtest_cursor_{os.getpid()}"
+                cur = conn.cursor(name=cur_name)
+                cur.itersize = 2000
+                cur.execute(sql, params2)
+                iterator = cur
+            else:
+                cur = conn.cursor()
+                cur.execute(sql, params2)
+
+                def _iter_fetchmany() -> Iterator[Any]:
+                    while True:
+                        batch = cur.fetchmany(2000)
+                        if not batch:
+                            break
+                        for item in batch:
+                            yield item
+
+                iterator = _iter_fetchmany()
+
+            for r in iterator:
                 (
                     cid,
                     ts,
@@ -2516,8 +3314,7 @@ def iter_training_rows(config: Mapping[str, Any]) -> Iterator[Row]:
         experiment_tag=config.get("experiment_tag"),
         label_in=config.get("label_in"),
     )
-    for r in rows:
-        yield r
+    yield from rows
 
 
 def iter_training_jsonl(config: Mapping[str, Any]) -> Iterator[str]:
@@ -2543,9 +3340,8 @@ def dump_training_jsonl_to_file(path: str, config: Mapping[str, Any]) -> int:
 
 
 # =============================================================================
-# Phase 5-7: Quant stats & dashboards
+# Quant stats & dashboards
 # =============================================================================
-
 @_softfail_read(
     {
         "n_trades": 0,
@@ -2561,17 +3357,17 @@ def dump_training_jsonl_to_file(path: str, config: Mapping[str, Any]) -> int:
 def fetch_basic_stats(
     *,
     days_back: int = 7,
-    src: Optional[str] = None,
-    regime: Optional[str] = None,
-    min_feature_version: Optional[int] = None,
-    wallet_tag: Optional[str] = None,
-    session_id: Optional[str] = None,
-) -> Dict[str, Any]:
+    src: str | None = None,
+    regime: str | None = None,
+    min_feature_version: int | None = None,
+    wallet_tag: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
     days_back = max(1, min(int(days_back), 365))
     min_feature_version = _effective_min_feature_version(min_feature_version)
 
-    clauses: List[str] = ["o.ts >= now() - (%s::interval)"]
-    params: List[Any] = [f"{days_back} days"]
+    clauses: list[str] = ["o.ts >= now() - (%s::interval)"]
+    params: list[Any] = [f"{days_back} days"]
 
     if src:
         clauses.append("c.src = %s")
@@ -2606,7 +3402,7 @@ def fetch_basic_stats(
     """
 
     with cursor_only() as cur:
-        cur.execute(sql, [win_labels] + params)
+        cur.execute(sql, [win_labels, *params])
         row = cur.fetchone()
 
     if not row:
@@ -2634,17 +3430,17 @@ def fetch_basic_stats(
 def fetch_label_distribution(
     *,
     days_back: int = 30,
-    src: Optional[str] = None,
-    regime: Optional[str] = None,
-    min_feature_version: Optional[int] = None,
-    wallet_tag: Optional[str] = None,
-    session_id: Optional[str] = None,
-) -> Dict[str, int]:
+    src: str | None = None,
+    regime: str | None = None,
+    min_feature_version: int | None = None,
+    wallet_tag: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, int]:
     days_back = max(1, min(int(days_back), 365))
     min_feature_version = _effective_min_feature_version(min_feature_version)
 
-    clauses: List[str] = ["o.ts >= now() - (%s::interval)"]
-    params: List[Any] = [f"{days_back} days"]
+    clauses: list[str] = ["o.ts >= now() - (%s::interval)"]
+    params: list[Any] = [f"{days_back} days"]
 
     if src:
         clauses.append("c.src = %s")
@@ -2671,7 +3467,7 @@ def fetch_label_distribution(
         GROUP BY o.label
     """
 
-    out: Dict[str, int] = {}
+    out: dict[str, int] = {}
     with cursor_only() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall() or []
@@ -2684,17 +3480,17 @@ def fetch_label_distribution(
 def fetch_outcome_coverage(
     *,
     days_back: int = 7,
-    min_feature_version: Optional[int] = None,
-    src: Optional[str] = None,
-    regime: Optional[str] = None,
-    wallet_tag: Optional[str] = None,
-    session_id: Optional[str] = None,
-) -> Dict[str, Any]:
+    min_feature_version: int | None = None,
+    src: str | None = None,
+    regime: str | None = None,
+    wallet_tag: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
     days_back = max(1, min(int(days_back), 365))
     min_feature_version = _effective_min_feature_version(min_feature_version)
 
-    clauses: List[str] = ["c.ts >= now() - (%s::interval)"]
-    params: List[Any] = [f"{days_back} days"]
+    clauses: list[str] = ["c.ts >= now() - (%s::interval)"]
+    params: list[Any] = [f"{days_back} days"]
 
     if src:
         clauses.append("c.src = %s")
@@ -2730,17 +3526,24 @@ def fetch_outcome_coverage(
     n_candidates_i = int(n_candidates or 0)
     n_labeled_i = int(n_labeled or 0)
     coverage = float(n_labeled_i) / float(n_candidates_i) if n_candidates_i else 0.0
-    return {"days_back": days_back, "n_candidates": n_candidates_i, "n_labeled": n_labeled_i, "coverage": coverage}
+    return {
+        "days_back": days_back,
+        "n_candidates": n_candidates_i,
+        "n_labeled": n_labeled_i,
+        "coverage": coverage,
+    }
 
 
 @_softfail_read({"days_back": 30, "n_exit_events": 0, "sell_like": 0, "stop_like": 0})
-def fetch_exit_event_stats(*, days_back: int = 30) -> Dict[str, Any]:
+def fetch_exit_event_stats(*, days_back: int = 30) -> dict[str, Any]:
     days_back = max(1, min(int(days_back), 365))
     sql = """
         SELECT
             count(*) AS n,
             count(*) FILTER (WHERE lower(action) LIKE 'sell%%') AS sell_like,
-            count(*) FILTER (WHERE lower(reason) LIKE 'stop%%' OR lower(reason) LIKE 'sl%%') AS stop_like
+            count(*) FILTER (
+                WHERE lower(reason) LIKE 'stop%%' OR lower(reason) LIKE 'sl%%'
+            ) AS stop_like
         FROM exit_events
         WHERE ts >= now() - (%s::interval)
     """
@@ -2758,83 +3561,19 @@ def fetch_exit_event_stats(*, days_back: int = 30) -> Dict[str, Any]:
     }
 
 
-@_softfail_read([])
-def fetch_ai_event_summary(
-    *,
-    days_back: int = 30,
-    event_types: Optional[Sequence[str]] = None,
-) -> List[Dict[str, Any]]:
-    days_back = max(1, min(int(days_back), 365))
-
-    clauses: List[str] = ["ts >= now() - (%s::interval)"]
-    params: List[Any] = [f"{days_back} days"]
-    if event_types:
-        clauses.append("event_type = ANY(%s)")
-        params.append(list(event_types))
-
-    where_sql = "WHERE " + " AND ".join(clauses)
-    sql = f"""
-        SELECT event_type, count(*) AS n_events, min(ts) AS first_ts, max(ts) AS last_ts
-        FROM ai_events
-        {where_sql}
-        GROUP BY event_type
-        ORDER BY event_type
-    """
-
-    out: List[Dict[str, Any]] = []
-    with cursor_only() as cur:
-        cur.execute(sql, params)
-        rows = cur.fetchall() or []
-    for event_type, n_events, first_ts, last_ts in rows:
-        out.append(
-            {
-                "event_type": event_type,
-                "n_events": int(n_events or 0),
-                "first_ts": first_ts.isoformat() if isinstance(first_ts, datetime) else str(first_ts),
-                "last_ts": last_ts.isoformat() if isinstance(last_ts, datetime) else str(last_ts),
-            }
-        )
-    return out
-
-
-@_softfail_write(0)
-def log_ai_event(
-    *,
-    event_type: str,
-    policy_version: Optional[str] = None,
-    experiment_tag: Optional[str] = None,
-    src: Optional[str] = None,
-    regime: Optional[str] = None,
-    payload: Optional[Mapping[str, Any]] = None,
-) -> int:
-    with conn_cursor() as (_conn, cur):
-        cur.execute(
-            """
-            INSERT INTO ai_events
-                (event_type, policy_version, experiment_tag, src, regime, payload)
-            VALUES
-                (%s,         %s,             %s,             %s,  %s,     %s::jsonb)
-            RETURNING id
-            """,
-            (str(event_type), policy_version, experiment_tag, src, regime, _json_dumps(dict(payload or {}))),
-        )
-        row = cur.fetchone()
-        return int(row[0]) if row else 0
-
-
 def fetch_quant_dashboard(
     *,
-    src: Optional[str] = None,
-    regime: Optional[str] = None,
-    wallet_tag: Optional[str] = None,
-    session_id: Optional[str] = None,
-    min_feature_version: Optional[int] = None,
+    src: str | None = None,
+    regime: str | None = None,
+    wallet_tag: str | None = None,
+    session_id: str | None = None,
+    min_feature_version: int | None = None,
     days_back_core: int = 7,
     days_back_coverage: int = 7,
     days_back_label_dist: int = 30,
     days_back_events: int = 30,
     days_back_exits: int = 30,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     min_feature_version = _effective_min_feature_version(min_feature_version)
     return {
         "core": fetch_basic_stats(
@@ -2866,7 +3605,7 @@ def fetch_quant_dashboard(
     }
 
 
-def get_env_scoped_dashboard() -> Dict[str, Any]:
+def get_env_scoped_dashboard() -> dict[str, Any]:
     return fetch_quant_dashboard(
         src=AI_DB_DEFAULT_SRC or None,
         regime=AI_DB_DEFAULT_REGIME or None,
@@ -2879,7 +3618,6 @@ def get_env_scoped_dashboard() -> Dict[str, Any]:
 # =============================================================================
 # Housekeeping
 # =============================================================================
-
 @_softfail_write(0)
 def prune_old_ai_data(*, max_age_days: int = 365) -> int:
     max_age_days = max(1, int(max_age_days))
@@ -2902,19 +3640,25 @@ def prune_old_events(*, max_age_days: int = 365) -> int:
     max_age_days = max(1, int(max_age_days))
     total = 0
     with conn_cursor() as (_conn, cur):
-        for tbl in ("ai_events", "exit_events", "regime_snapshots", "trade_executions"):
+        for tbl in (
+            "ai_events",
+            "exit_events",
+            "position_events",
+            "regime_snapshots",
+            "trade_executions",
+            "strategy_params",
+            "risk_assessments",
+        ):
             cur.execute(
                 f"DELETE FROM {tbl} WHERE ts < now() - (%s::interval)",
                 (f"{max_age_days} days",),
             )
-            try:
+            with suppress(Exception):
                 total += int(cur.rowcount or 0)
-            except Exception:
-                pass
     return int(total)
 
 
-def ai_db_status() -> Dict[str, Any]:
+def ai_db_status() -> dict[str, Any]:
     return {
         "enabled": bool(AI_DB_ENABLED),
         "read_only": bool(AI_DB_READ_ONLY),
@@ -2926,7 +3670,6 @@ def ai_db_status() -> Dict[str, Any]:
 # =============================================================================
 # Async wrappers (so asyncio bot won't block)
 # =============================================================================
-
 async def abootstrap_ai_db() -> bool:
     return await asyncio.to_thread(bootstrap_ai_db)
 
@@ -2943,7 +3686,7 @@ async def ainsert_trade_execution(**kwargs: Any) -> int:
     return await asyncio.to_thread(insert_trade_execution, **kwargs)
 
 
-async def arecord_trade_and_outcome(**kwargs: Any) -> Dict[str, int]:
+async def arecord_trade_and_outcome(**kwargs: Any) -> dict[str, int]:
     return await asyncio.to_thread(record_trade_and_outcome, **kwargs)
 
 
@@ -2951,7 +3694,7 @@ async def ainsert_exit_event(**kwargs: Any) -> int:
     return await asyncio.to_thread(insert_exit_event, **kwargs)
 
 
-async def arecord_exit_event_and_outcome(**kwargs: Any) -> Dict[str, int]:
+async def arecord_exit_event_and_outcome(**kwargs: Any) -> dict[str, int]:
     return await asyncio.to_thread(record_exit_event_and_outcome, **kwargs)
 
 
@@ -2959,89 +3702,107 @@ async def alog_ai_event(**kwargs: Any) -> int:
     return await asyncio.to_thread(log_ai_event, **kwargs)
 
 
-async def afetch_quant_dashboard(**kwargs: Any) -> Dict[str, Any]:
+async def afetch_quant_dashboard(**kwargs: Any) -> dict[str, Any]:
     return await asyncio.to_thread(fetch_quant_dashboard, **kwargs)
 
 
-async def afetch_training_rows(**kwargs: Any) -> List[Row]:
+async def afetch_training_rows(**kwargs: Any) -> list[Row]:
     return await asyncio.to_thread(fetch_training_rows, **kwargs)
 
 
-async def aget_env_scoped_dashboard() -> Dict[str, Any]:
+async def aget_env_scoped_dashboard() -> dict[str, Any]:
     return await asyncio.to_thread(get_env_scoped_dashboard)
 
 
-async def aai_db_status() -> Dict[str, Any]:
+async def aai_db_status() -> dict[str, Any]:
     return await asyncio.to_thread(ai_db_status)
+
+
+async def ainsert_strategy_param(**kwargs: Any) -> int:
+    return await asyncio.to_thread(insert_strategy_param, **kwargs)
+
+
+async def ainsert_risk_assessment(**kwargs: Any) -> int:
+    return await asyncio.to_thread(insert_risk_assessment, **kwargs)
 
 
 __all__ = [
     # flags
+    "SCHEMA_VERSION",
+    "MIGRATIONS",
+    "MIGRATION_PLAN",
     "AI_DB_ENABLED",
-    "AI_DB_READ_ONLY",
     "AI_DB_MIN_FEATURE_VERSION",
+    "AI_DB_READ_ONLY",
     "WIN_LABELS",
     # dsn / ssl helpers
     "DSNInfo",
-    "reset_dsn_cache",
-    "resolve_dsn_info",
-    "describe_dsn_sources",
-    "get_normalized_dsn_for_debug",
-    "dsn_wants_ssl",
-    "ssl_context_for_dsn",
-    "asyncpg_connect",
-    "get_asyncpg_pool",
-    "close_asyncpg_pool",
-    # health / boot
-    "ping",
-    "describe_backend",
-    "bootstrap_ai_db",
-    "ensure_ai_tables",
-    # writes/reads
-    "insert_entry_candidate",
-    "insert_entry_candidates_bulk",
-    "fetch_latest_candidates",
-    "fetch_candidate_by_id",
-    "update_entry_decision",
-    "insert_entry_outcome",
-    "mark_outcome_for_candidate",
-    "fetch_recent_outcomes",
-    "fetch_unlabeled_candidates",
-    "insert_trade_execution",
-    "fetch_recent_trade_executions",
-    "insert_exit_event",
-    "fetch_recent_exit_events",
-    "insert_regime_snapshot",
-    "fetch_recent_regime_snapshots",
-    "record_trade_and_outcome",
-    "record_exit_event_and_outcome",
-    "fetch_training_rows",
-    "iter_backtest_rows",
-    "iter_training_rows",
-    "iter_training_jsonl",
-    "dump_training_jsonl_to_file",
-    "fetch_basic_stats",
-    "fetch_label_distribution",
-    "fetch_outcome_coverage",
-    "fetch_exit_event_stats",
-    "log_ai_event",
-    "fetch_ai_event_summary",
-    "fetch_quant_dashboard",
-    "get_env_scoped_dashboard",
-    "prune_old_ai_data",
-    "prune_old_events",
-    "ai_db_status",
+    "aai_db_status",
     # async wrappers
     "abootstrap_ai_db",
-    "ainsert_entry_candidate",
-    "amark_outcome_for_candidate",
-    "ainsert_trade_execution",
-    "arecord_trade_and_outcome",
-    "ainsert_exit_event",
-    "arecord_exit_event_and_outcome",
-    "alog_ai_event",
     "afetch_quant_dashboard",
     "afetch_training_rows",
     "aget_env_scoped_dashboard",
-    "aai_db_status",
+    "ai_db_status",
+    "ainsert_entry_candidate",
+    "ainsert_exit_event",
+    "ainsert_risk_assessment",
+    "ainsert_strategy_param",
+    "ainsert_trade_execution",
+    "alog_ai_event",
+    "amark_outcome_for_candidate",
+    "arecord_exit_event_and_outcome",
+    "arecord_trade_and_outcome",
+    "asyncpg_connect",
+    "bootstrap_ai_db",
+    "close_asyncpg_pool",
+    "describe_backend",
+    "describe_dsn_sources",
+    "dsn_wants_ssl",
+    "dump_training_jsonl_to_file",
+    "ensure_ai_tables",
+    "fetch_ai_event_summary",
+    "fetch_basic_stats",
+    "fetch_candidate_by_id",
+    "fetch_exit_event_stats",
+    "fetch_label_distribution",
+    "fetch_latest_candidates",
+    "fetch_latest_risk_assessments",
+    "fetch_latest_strategy_params",
+    "fetch_outcome_coverage",
+    "fetch_quant_dashboard",
+    "fetch_recent_exit_events",
+    "fetch_recent_outcomes",
+    "fetch_recent_regime_snapshots",
+    "fetch_recent_trade_executions",
+    "fetch_training_rows",
+    "fetch_unlabeled_candidates",
+    "get_asyncpg_pool",
+    "get_env_scoped_dashboard",
+    "get_normalized_dsn_for_debug",
+    # writes/reads
+    "insert_entry_candidate",
+    "insert_entry_candidates_bulk",
+    "insert_entry_outcome",
+    "insert_exit_event",
+    "insert_regime_snapshot",
+    "insert_risk_assessment",
+    # strategy/risk
+    "insert_strategy_param",
+    "insert_trade_execution",
+    "iter_backtest_rows",
+    "iter_training_jsonl",
+    "iter_training_rows",
+    "log_ai_event",
+    "mark_outcome_for_candidate",
+    # health / boot
+    "ping",
+    "prune_old_ai_data",
+    "prune_old_events",
+    "record_exit_event_and_outcome",
+    "record_trade_and_outcome",
+    "reset_dsn_cache",
+    "resolve_dsn_info",
+    "ssl_context_for_dsn",
+    "update_entry_decision",
 ]

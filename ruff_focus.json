@@ -1,0 +1,869 @@
+﻿[
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 14,
+      "row": 133
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\daytrader\\alpha.py",
+    "fix": null,
+    "location": {
+      "column": 13,
+      "row": 133
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 133,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 67,
+      "row": 225
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\daytrader\\broker.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 225
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 225,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 10,
+      "row": 204
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\daytrader\\data_feed.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 204
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 204,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 14,
+      "row": 445
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\daytrader\\data_feed.py",
+    "fix": null,
+    "location": {
+      "column": 13,
+      "row": 445
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 445,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 10,
+      "row": 149
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\daytrader\\features.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 149
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 149,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 10,
+      "row": 202
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\daytrader\\features.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 202
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 202,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 10,
+      "row": 239
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\daytrader\\features.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 239
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 239,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 13,
+      "row": 497
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\daytrader\\features.py",
+    "fix": null,
+    "location": {
+      "column": 12,
+      "row": 497
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 497,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 10,
+      "row": 260
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\daytrader\\risk.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 260
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 260,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 10,
+      "row": 298
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\daytrader\\runner.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 298
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 298,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 10,
+      "row": 370
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\daytrader\\runner.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 370
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 370,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 59,
+      "row": 467
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\db\\logger.py",
+    "fix": null,
+    "location": {
+      "column": 17,
+      "row": 467
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 467,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 28,
+      "row": 626
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\deploy_tools\\watchdog.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 626
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 626,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 56,
+      "row": 173
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\route_telemetry.py",
+    "fix": null,
+    "location": {
+      "column": 55,
+      "row": 173
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 173,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 44,
+      "row": 176
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\route_telemetry.py",
+    "fix": null,
+    "location": {
+      "column": 43,
+      "row": 176
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 176,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 75,
+      "row": 357
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\route_telemetry.py",
+    "fix": null,
+    "location": {
+      "column": 74,
+      "row": 357
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 357,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 28,
+      "row": 391
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\alloc_seed.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 391
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 391,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 63,
+      "row": 305
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\build_whales.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 305
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 305,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 28,
+      "row": 865
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\diagnostics_risk.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 865
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 865,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 84,
+      "row": 155
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\dry_run.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 155
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 155,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 99,
+      "row": 238
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\dry_run.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 238
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 238,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 6,
+      "row": 82
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\export_entry_training.py",
+    "fix": null,
+    "location": {
+      "column": 5,
+      "row": 77
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 77,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 52,
+      "row": 707
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\main.py",
+    "fix": null,
+    "location": {
+      "column": 13,
+      "row": 707
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 707,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 14,
+      "row": 143
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\migrate_entry_outcomes.py",
+    "fix": null,
+    "location": {
+      "column": 13,
+      "row": 137
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 137,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 32,
+      "row": 354
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pf_cookie_refresher.py",
+    "fix": null,
+    "location": {
+      "column": 13,
+      "row": 354
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 354,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 28,
+      "row": 356
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pf_cookie_refresher.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 356
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 356,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 28,
+      "row": 359
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pf_cookie_refresher.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 359
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 359,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 28,
+      "row": 362
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pf_cookie_refresher.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 362
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 362,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 62,
+      "row": 218
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pg_export_csv.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 218
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 218,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 28,
+      "row": 565
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pg_export_csv.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 565
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 565,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 28,
+      "row": 568
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pg_export_csv.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 568
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 568,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 28,
+      "row": 529
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pg_maintenance.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 529
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 529,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 62,
+      "row": 247
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pg_tail.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 247
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 247,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 28,
+      "row": 726
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pg_tail.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 726
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 726,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 28,
+      "row": 729
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pg_tail.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 729
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 729,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 49,
+      "row": 405
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pnl_bump.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 405
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 405,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 24,
+      "row": 89
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pumpportal_consumer_demo.py",
+    "fix": null,
+    "location": {
+      "column": 5,
+      "row": 89
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 89,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 24,
+      "row": 92
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\pumpportal_ws_test.py",
+    "fix": null,
+    "location": {
+      "column": 5,
+      "row": 92
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 92,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 99,
+      "row": 239
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\redis_tools.py",
+    "fix": null,
+    "location": {
+      "column": 13,
+      "row": 239
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 239,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 74,
+      "row": 247
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\redis_tools.py",
+    "fix": null,
+    "location": {
+      "column": 13,
+      "row": 247
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 247,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 74,
+      "row": 355
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\scripts\\redis_tools.py",
+    "fix": null,
+    "location": {
+      "column": 13,
+      "row": 355
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 355,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B023",
+    "end_location": {
+      "column": 85,
+      "row": 1727
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\sniper\\sniper.py",
+    "fix": null,
+    "location": {
+      "column": 75,
+      "row": 1727
+    },
+    "message": "Function definition does not bind loop variable `equity_usd`",
+    "noqa_row": 1727,
+    "url": "https://docs.astral.sh/ruff/rules/function-uses-loop-variable"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 52,
+      "row": 113
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\tools\\patch_sniper_tail.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 113
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 113,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 56,
+      "row": 115
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\tools\\patch_sniper_tail.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 115
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 115,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 81,
+      "row": 1780
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\utils_pkg\\pump_trader.py",
+    "fix": null,
+    "location": {
+      "column": 9,
+      "row": 1780
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 1780,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 71,
+      "row": 649
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\utils_pkg\\raydium_impl.py",
+    "fix": null,
+    "location": {
+      "column": 17,
+      "row": 649
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 649,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 75,
+      "row": 98
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\utils_pkg\\risk_manager.py",
+    "fix": null,
+    "location": {
+      "column": 5,
+      "row": 98
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 98,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 84,
+      "row": 103
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\utils_pkg\\risk_manager.py",
+    "fix": null,
+    "location": {
+      "column": 5,
+      "row": 103
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 103,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 62,
+      "row": 569
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\utils_pkg\\routeguard.py",
+    "fix": null,
+    "location": {
+      "column": 61,
+      "row": 569
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 569,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "E741",
+    "end_location": {
+      "column": 14,
+      "row": 576
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\utils_pkg\\routeguard.py",
+    "fix": null,
+    "location": {
+      "column": 13,
+      "row": 576
+    },
+    "message": "Ambiguous variable name: `l`",
+    "noqa_row": 576,
+    "url": "https://docs.astral.sh/ruff/rules/ambiguous-variable-name"
+  },
+  {
+    "cell": null,
+    "code": "B904",
+    "end_location": {
+      "column": 73,
+      "row": 287
+    },
+    "filename": "C:\\Users\\Andrew\\solana-sniper-bot-clean\\utils_pkg\\txlearn.py",
+    "fix": null,
+    "location": {
+      "column": 21,
+      "row": 287
+    },
+    "message": "Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling",
+    "noqa_row": 287,
+    "url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except"
+  }
+]

@@ -1,266 +1,356 @@
 # routeguard.py
-# Minimal-but-robust RouteGuard around Jupiter v6 quotes.
-#
-# Responsibilities:
-#   - Probe BUY route  (WSOL -> token)
-#   - Optionally probe SELL route (token -> WSOL)
-#   - Decide "allow" vs "block" based on:
-#       * presence of routes
-#       * optional max hops
-#       * optional max price impact (bps)
-#
-# Public contract (used by sniper/sniper.py):
-#   async def check_routes(mint: str) -> dict
-#
-# Returned dict shape:
-#   {
-#     "action": "allow" | "block",
-#     "reason": str,
-#     "no_routes": bool,           # True if we saw no usable routes
-#     "hops": int | None,          # BUY-side hop count
-#     "impact_bps": int | None,    # BUY-side price impact in basis points
-#     "buy_quote": dict,           # raw Jupiter BUY quote (or {})
-#     "sell_quote": dict,          # raw Jupiter SELL quote (or {})
-#     "policy": { ... }            # snapshot of env-driven thresholds
-#   }
-#
 from __future__ import annotations
 
+"""
+routeguard.py (ROOT) — V3+++ (God-Tier Overhaul) — WRAPPER / COMPAT LAYER
+========================================================================
+
+This ROOT module is **legacy API compatibility only**.
+
+✅ Canonical guard logic lives in: `utils_pkg/routeguard.py`
+    - preflight(mint, lamports_in) -> (ok, prequote_or_none)
+    - clear_cache(...)
+    - stats()
+
+This wrapper preserves the older public contract used by older wiring:
+    async def check_routes(mint: str) -> dict
+
+Returned dict shape (legacy):
+{
+  "action": "allow" | "block",
+  "reason": str,
+  "no_routes": bool,
+  "hops": int | None,
+  "impact_bps": int | None,
+  "buy_quote": dict,
+  "sell_quote": dict,   # legacy field (canonical guard does not return sell quote)
+  "policy": dict,
+}
+
+Hard requirements
+-----------------
+- NO network at import time.
+- Deterministic behavior: delegates to utils_pkg.routeguard only.
+- Never raises from check_routes(); always returns a decision dict.
+"""
+
+import contextlib
 import os
-import logging
-from typing import Any, Dict, Optional
+import time
+from typing import Any
 
-from utils_pkg.honeypot import _get_session, JUPITER_QUOTE_URL, WSOL_MINT
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging (shim-safe)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from logging_setup import get_logger  # type: ignore
 
-logger = logging.getLogger("routeguard")
-if not logger.handlers:
-    logging.basicConfig(
-        level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
+    log = get_logger(__name__)  # type: ignore
+except Exception:  # pragma: no cover
+    import logging
+
+    log = logging.getLogger(__name__)  # type: ignore[assignment]
+
+
+def _ensure_log_shims() -> None:
+    """Ensure log.event(...) and log.every(...) exist (works with std logging too)."""
+    if not hasattr(log, "event"):
+
+        def _event(name: str, **kw: Any) -> None:  # pragma: no cover
+            with contextlib.suppress(Exception):
+                log.info("%s %s", name, kw)
+
+        log.event = _event  # type: ignore[attr-defined]
+
+    if not hasattr(log, "every"):
+
+        def _every(
+            key: str, n: int = 30, msg: str | None = None, **kw: Any
+        ) -> None:  # pragma: no cover
+            try:
+                now = time.monotonic()
+                store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
+                last = float(store.get(key, 0.0))
+                sec = float(max(1, int(n)))
+                if (now - last) >= sec:
+                    store[key] = now
+                    _every._store = store  # type: ignore[attr-defined]
+                    ev = getattr(log, "event", None)
+                    if callable(ev):
+                        ev(msg or key, **kw)
+                    else:
+                        log.info("%s %s", msg or key, kw)
+            except Exception:
+                return None
+
+        log.every = _every  # type: ignore[attr-defined]
+
+
+_ensure_log_shims()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Env helpers (local-only, safe at import)
+# ──────────────────────────────────────────────────────────────────────────────
+_TRUE = {"1", "true", "yes", "y", "on", "t"}
+_FALSE = {"0", "false", "no", "n", "off", "f"}
+
+
+def _envs(k: str, d: str = "") -> str:
+    v = os.getenv(k)
+    return (v if v is not None else d).strip()
+
+
+def _envb(k: str, d: bool = False) -> bool:
+    v = _envs(k, "")
+    if v == "":
+        return bool(d)
+    s = v.lower().strip()
+    if s in _TRUE:
+        return True
+    if s in _FALSE:
+        return False
+    return bool(d)
+
+
+def _envi(k: str, d: int) -> int:
+    try:
+        return int(float(_envs(k, str(d))))
+    except Exception:
+        return int(d)
+
+
+# Legacy probe input for the guard preflight (lamports-in)
+# NOTE: canonical guard enforces min/max spend; this is just the probe size.
+_BUY_PROBE_LAMPORTS = max(1, _envi("ROUTEGUARD_BUY_PROBE_LAMPORTS", 1_000_000))  # 0.001 SOL
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Canonical guard import (lazy to avoid cycles)
+# ──────────────────────────────────────────────────────────────────────────────
+_rg_mod = None
+
+
+def _get_rg():
+    global _rg_mod
+    if _rg_mod is not None:
+        return _rg_mod
+    try:
+        from utils_pkg import routeguard as rg  # type: ignore
+
+        _rg_mod = rg
+        return _rg_mod
+    except Exception:
+        _rg_mod = None
+        return None
+
+
+def _short(x: Any, n: int = 240) -> str:
+    try:
+        s = str(x)
+        return s if len(s) <= n else (s[:n] + "…")
+    except Exception:
+        return "<?>"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Quote parsing helpers (tolerant)
+# ──────────────────────────────────────────────────────────────────────────────
+def _impact_bps_from_quote(q: dict[str, Any]) -> int | None:
+    if not isinstance(q, dict) or not q:
+        return None
+    with contextlib.suppress(Exception):
+        v = q.get("priceImpactBps")
+        if v is not None:
+            return int(abs(float(v)))
+    with contextlib.suppress(Exception):
+        pip = float(q.get("priceImpactPct") or 0.0)
+        pip = abs(pip)
+        if pip <= 1.0:
+            return int(pip * 10_000)
+        if pip <= 100.0:
+            return int(pip * 100)
+        return int(pip)
+    return None
+
+
+def _hops_from_quote(q: dict[str, Any]) -> int | None:
+    if not isinstance(q, dict) or not q:
+        return None
+    rp = q.get("routePlan")
+    if isinstance(rp, list):
+        return len([x for x in rp if isinstance(x, dict)]) or None
+    data = q.get("data")
+    if isinstance(data, dict) and isinstance(data.get("routePlan"), list):
+        rp2 = data["routePlan"]
+        return len([x for x in rp2 if isinstance(x, dict)]) or None
+    return None
+
+
+def _no_routes_from_quote(q: dict[str, Any]) -> bool:
+    # legacy meaning: "we saw no usable routes"
+    hops = _hops_from_quote(q)
+    if hops is None:
+        return True
+    return hops <= 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public API (LEGACY)
+# ──────────────────────────────────────────────────────────────────────────────
+async def check_routes(mint: str) -> dict[str, Any]:
+    """
+    Legacy compat API. Never raises.
+
+    Delegates decision to utils_pkg.routeguard.preflight().
+
+    Semantics mapping:
+      - (ok=False, _)         -> action=block
+      - (ok=True, quote={})   -> action=allow, but no enforced prequote (guard disabled / optimistic)
+      - (ok=True, quote=None) -> action=allow, BUT fallback-only (router must not try Jupiter)
+      - (ok=True, quote=...)  -> action=allow, with prequote + rg metadata
+    """
+    mint_s = (mint or "").strip()
+
+    # breadcrumb: remind (rarely) that this is a wrapper
+    log.every(
+        "ROOT_ROUTEGUARD_WRAPPER",
+        900,
+        msg="ROOT_ROUTEGUARD_WRAPPER",
+        note="routeguard.py is wrapper; canonical is utils_pkg.routeguard",
     )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _env_true(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return int(default)
-
-
-# Allow trading even when Jupiter reports "no route"
-ROUTEGUARD_ALLOW_NO_ROUTE = _env_true("ROUTEGUARD_ALLOW_NO_ROUTE", False)
-
-# Require SELL route (token -> WSOL) in addition to BUY route?
-ROUTEGUARD_REQUIRE_SELL = _env_true("ROUTEGUARD_REQUIRE_SELL", True)
-
-# Probe sizes
-BUY_PROBE_LAMPORTS = _env_int("ROUTEGUARD_BUY_PROBE_LAMPORTS", 1_000_000)   # 0.001 SOL
-SELL_PROBE_UNITS   = _env_int("ROUTEGUARD_SELL_PROBE_UNITS",   1_000_000)   # 1e6 token base units
-
-# Slippage used when probing routes
-ROUTEGUARD_QUOTE_SLIPPAGE_BPS = _env_int("ROUTEGUARD_QUOTE_SLIPPAGE_BPS", 300)
-
-# Optional caps (0 => disabled)
-ROUTEGUARD_MAX_HOPS = _env_int("ROUTEGUARD_MAX_HOPS", 0)          # e.g. 3 to avoid long paths
-ROUTEGUARD_MAX_IMPACT_BPS = _env_int("ROUTEGUARD_MAX_IMPACT_BPS", 0)  # e.g. 1500 (15%)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-
-def _impact_bps(q: Dict[str, Any] | None) -> Optional[int]:
-    """
-    Convert Jupiter v6 priceImpactPct => basis points.
-    Expecting a fraction (0.0123 ~ 1.23%).
-    """
-    if not q:
-        return None
-    try:
-        v = _safe_float(q.get("priceImpactPct"))
-        if v is None:
-            return None
-        return int(round(v * 10_000))
-    except Exception:
-        return None
-
-
-def _routeplan_and_hops(q: Dict[str, Any] | None) -> tuple[list[dict], Optional[int]]:
-    """
-    Extract routePlan list and hop count from a Jupiter quote.
-    """
-    if not q:
-        return [], None
-    plan = q.get("routePlan") or []
-    if not isinstance(plan, list) or not plan:
-        return [], None
-    return plan, len(plan)
-
-
-async def _jup_quote(params: Dict[str, str]) -> Dict[str, Any] | None:
-    """
-    Thin wrapper to hit the shared Jupiter quote endpoint.
-    Never raises; returns None on error.
-    """
-    try:
-        sess = await _get_session()
-    except Exception as e:
-        logger.debug("_jup_quote: failed to get session: %s", e)
-        return None
-
-    try:
-        async with sess.get(JUPITER_QUOTE_URL, params=params) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                logger.debug("Jupiter quote %s: %s", resp.status, text[:160])
-                return None
-            try:
-                return await resp.json()
-            except Exception as je:
-                logger.debug("Jupiter quote JSON error: %s (text=%r)", je, text[:160])
-                return None
-    except Exception as e:
-        logger.debug("_jup_quote error: %s", e)
-        return None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Public API
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def check_routes(mint: str) -> Dict[str, Any]:
-    """
-    Returns a decision dict, never raises.
-
-    {
-      "action": "allow" | "block",
-      "reason": str,
-      "no_routes": bool,
-      "hops": Optional[int],
-      "impact_bps": Optional[int],
-      "buy_quote": {...},
-      "sell_quote": {...},
-      "policy": {...},
-    }
-    """
-    mint = (mint or "").strip()
-    reason = "unknown"
-    no_routes = False
-    buy_quote: Dict[str, Any] = {}
-    sell_quote: Dict[str, Any] = {}
-    buy_hops: Optional[int] = None
-    buy_impact: Optional[int] = None
-
-    # BUY: WSOL -> token
-    buy_quote = await _jup_quote(
-        {
-            "inputMint": WSOL_MINT,
-            "outputMint": mint,
-            "amount": str(BUY_PROBE_LAMPORTS),
-            "swapMode": "ExactIn",
-            "onlyDirectRoutes": "false",
-            "slippageBps": str(ROUTEGUARD_QUOTE_SLIPPAGE_BPS),
+    rg = _get_rg()
+    if rg is None:
+        # If canonical module missing, we must fail closed (block) rather than silently allow.
+        return {
+            "action": "block",
+            "reason": "routeguard_missing",
+            "no_routes": True,
+            "hops": None,
+            "impact_bps": None,
+            "buy_quote": {},
+            "sell_quote": {},
+            "policy": {
+                "probe_lamports_in": _BUY_PROBE_LAMPORTS,
+                "wrapper_only": True,
+                "canonical_present": False,
+            },
         }
-    ) or {}
 
-    buy_plan, buy_hops = _routeplan_and_hops(buy_quote)
-    buy_impact = _impact_bps(buy_quote)
+    # Call canonical preflight
+    try:
+        ok, preq = await rg.preflight(mint=mint_s, lamports_in=int(_BUY_PROBE_LAMPORTS))  # type: ignore[attr-defined]
+    except Exception as e:
+        log.event("ROOT_ROUTEGUARD_EXCEPTION", mint=mint_s, err=_short(e, 500))
+        return {
+            "action": "block",
+            "reason": "routeguard_error",
+            "no_routes": True,
+            "hops": None,
+            "impact_bps": None,
+            "buy_quote": {},
+            "sell_quote": {},
+            "policy": {
+                "probe_lamports_in": _BUY_PROBE_LAMPORTS,
+                "wrapper_only": True,
+                "canonical_present": True,
+                "error": _short(e, 220),
+            },
+        }
 
-    if not buy_plan:
-        no_routes = True
-        if ROUTEGUARD_ALLOW_NO_ROUTE:
-            reason = "no_routes_allowed"
-            decision = "allow"
-        else:
-            reason = "no_routes"
-            decision = "block"
-    else:
-        # We have at least a BUY route; check optional caps
-        decision = "allow"
-        reason = "routed"
+    # Pull canonical stats snapshot (best-effort)
+    st: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        st = dict(rg.stats())  # type: ignore[attr-defined]
 
-        if ROUTEGUARD_MAX_HOPS > 0 and buy_hops is not None and buy_hops > ROUTEGUARD_MAX_HOPS:
-            reason = f"too_many_hops>{ROUTEGUARD_MAX_HOPS}"
-            decision = "block"
+    # Interpret canonical outputs
+    if not ok:
+        return {
+            "action": "block",
+            "reason": "blocked",
+            "no_routes": True,
+            "hops": None,
+            "impact_bps": None,
+            "buy_quote": {},
+            "sell_quote": {},
+            "policy": {
+                "allow_no_route": bool(st.get("allow_no_buy_route", 0)),
+                "require_sell": bool(st.get("require_sell_route", 0)),
+                "max_hops": int(st.get("max_hops", 0) or 0),
+                "max_impact_bps": int(st.get("max_impact_bps", 0) or 0),
+                "probe_lamports_in": _BUY_PROBE_LAMPORTS,
+                "enabled": bool(st.get("enabled", 1)),
+                "wrapper_only": True,
+                "canonical_present": True,
+            },
+        }
 
-        if (
-            decision == "allow"
-            and ROUTEGUARD_MAX_IMPACT_BPS > 0
-            and buy_impact is not None
-            and buy_impact > ROUTEGUARD_MAX_IMPACT_BPS
-        ):
-            reason = f"impact_bps>{ROUTEGUARD_MAX_IMPACT_BPS}"
-            decision = "block"
+    # ok=True
+    if preq is None:
+        # fallback-only allowed (router MUST NOT attempt Jupiter)
+        return {
+            "action": "allow",
+            "reason": "fallback_only",
+            "no_routes": True,
+            "hops": None,
+            "impact_bps": None,
+            "buy_quote": {},
+            "sell_quote": {},
+            "policy": {
+                "allow_no_route": bool(st.get("allow_no_buy_route", 0)),
+                "require_sell": bool(st.get("require_sell_route", 0)),
+                "max_hops": int(st.get("max_hops", 0) or 0),
+                "max_impact_bps": int(st.get("max_impact_bps", 0) or 0),
+                "probe_lamports_in": _BUY_PROBE_LAMPORTS,
+                "enabled": bool(st.get("enabled", 1)),
+                "wrapper_only": True,
+                "canonical_present": True,
+                "note": "fallback_only means: do NOT call Jupiter; use fallback execution path",
+            },
+        }
 
-    # SELL: token -> WSOL (optional but recommended)
-    if decision == "allow" and ROUTEGUARD_REQUIRE_SELL:
-        sell_quote = await _jup_quote(
-            {
-                "inputMint": mint,
-                "outputMint": WSOL_MINT,
-                "amount": str(SELL_PROBE_UNITS),
-                "swapMode": "ExactIn",
-                "onlyDirectRoutes": "false",
-                "slippageBps": str(ROUTEGUARD_QUOTE_SLIPPAGE_BPS),
-            }
-        ) or {}
-        sell_plan, _sell_hops = _routeplan_and_hops(sell_quote)
-        if not sell_plan:
-            no_routes = True
-            if ROUTEGUARD_ALLOW_NO_ROUTE:
-                reason = "sell_no_routes_allowed"
-                # decision stays "allow"
-            else:
-                reason = "sell_no_routes"
-                decision = "block"
+    # preq is a dict (may be {} meaning allow but no prequote enforced)
+    buy_quote: dict[str, Any] = dict(preq) if isinstance(preq, dict) else {}
+    rg_meta = buy_quote.get("__rg") if isinstance(buy_quote.get("__rg"), dict) else {}
+    hops = None
+    impact = None
 
-    out = {
-        "action": decision,
+    with contextlib.suppress(Exception):
+        hops = int(rg_meta.get("hops")) if rg_meta.get("hops") is not None else None
+    with contextlib.suppress(Exception):
+        impact = int(rg_meta.get("impact_bps")) if rg_meta.get("impact_bps") is not None else None
+
+    if hops is None:
+        hops = _hops_from_quote(buy_quote)
+    if impact is None:
+        impact = _impact_bps_from_quote(buy_quote)
+
+    no_routes = _no_routes_from_quote(buy_quote) if buy_quote else False
+    reason = "routed" if buy_quote else "allow_no_prequote"
+
+    return {
+        "action": "allow",
         "reason": reason,
         "no_routes": bool(no_routes),
-        "hops": buy_hops,
-        "impact_bps": buy_impact,
+        "hops": hops,
+        "impact_bps": impact,
         "buy_quote": buy_quote,
-        "sell_quote": sell_quote,
+        "sell_quote": {},  # canonical guard probes sell internally; it does not return the quote
         "policy": {
-            "allow_no_route": ROUTEGUARD_ALLOW_NO_ROUTE,
-            "require_sell": ROUTEGUARD_REQUIRE_SELL,
-            "buy_probe_lamports": BUY_PROBE_LAMPORTS,
-            "sell_probe_units": SELL_PROBE_UNITS,
-            "quote_slippage_bps": ROUTEGUARD_QUOTE_SLIPPAGE_BPS,
-            "max_hops": ROUTEGUARD_MAX_HOPS,
-            "max_impact_bps": ROUTEGUARD_MAX_IMPACT_BPS,
+            "allow_no_route": bool(st.get("allow_no_buy_route", 0)),
+            "require_sell": bool(st.get("require_sell_route", 0)),
+            "max_hops": int(st.get("max_hops", 0) or 0),
+            "max_impact_bps": int(st.get("max_impact_bps", 0) or 0),
+            "probe_lamports_in": _BUY_PROBE_LAMPORTS,
+            "enabled": bool(st.get("enabled", 1)),
+            "wrapper_only": True,
+            "canonical_present": True,
+            # helpful extras for debugging, without exploding logs:
+            "global_cooldown_active": bool(st.get("global_cooldown_active", 0)),
+            "auth_cooldown_active": bool(st.get("auth_cooldown_active", 0)),
         },
     }
-
-    # Lightweight debug breadcrumb for logs
-    logger.debug(
-        "RouteGuard %s: %s (%s) hops=%s impact_bps=%s no_routes=%s",
-        decision.upper(),
-        mint,
-        reason,
-        buy_hops,
-        buy_impact,
-        no_routes,
-    )
-    return out
 
 
 __all__ = ["check_routes"]

@@ -1,0 +1,46 @@
+version: 2
+
+updates:
+  # 1) Python deps (requirements*.txt)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "06:00"
+    open-pull-requests-limit: 10
+    rebase-strategy: "auto"
+    labels:
+      - "dependencies"
+      - "python"
+    # Group minor/patch together so you don’t get PR spam.
+    groups:
+      python-minor-and-patch:
+        applies-to: "version-updates"
+        update-types:
+          - "minor"
+          - "patch"
+    # Keep majors manual (safer for trading infra)
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+
+  # 2) GitHub Actions (workflow deps)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "06:00"
+    open-pull-requests-limit: 10
+    rebase-strategy: "auto"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    groups:
+      gha-minor-and-patch:
+        applies-to: "version-updates"
+        update-types:
+          - "minor"
+          - "patch"

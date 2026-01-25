@@ -1,6 +1,4 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-
 
 """
 router.py (repo root) — V3+++ TEST-CONTRACT SAFE *HARD SHIM*.
@@ -31,23 +29,23 @@ Import-time constraints:
 
 import asyncio
 import contextlib
-from importlib import import_module
 import json
 import os
 import sys
-from typing import Any, Awaitable, Optional, Tuple
-
+from collections.abc import Awaitable
+from importlib import import_module
+from typing import Any
 
 # --------------------------------------------------------------------------------------
 # 1) HARD SHIM: prefer the real implementation in utils_pkg.router
 # --------------------------------------------------------------------------------------
 
-_IMPL_ERROR: Optional[BaseException] = None
+_IMPL_ERROR: BaseException | None = None
 _IMPL: Any = None
 
 try:
     _IMPL = import_module("utils_pkg.router")
-except BaseException as e:  # noqa: BLE001 (we want to be absolutely bulletproof)
+except BaseException as e:
     _IMPL_ERROR = e
     _IMPL = None
 
@@ -127,14 +125,14 @@ else:
         for attr in ("_payload", "payload", "data", "json_data"):
             if hasattr(resp, attr):
                 v = getattr(resp, attr)
-                if isinstance(v, (dict, list)):
+                if isinstance(v, dict | list):
                     return v
 
         fn = getattr(resp, "json", None)
         if callable(fn):
             v = fn()
             v = await _maybe_await(v)
-            if isinstance(v, (dict, list)):
+            if isinstance(v, dict | list):
                 return v
             if isinstance(v, str):
                 with contextlib.suppress(Exception):
@@ -150,7 +148,7 @@ else:
 
         return None
 
-    async def _http_get(sess: Any, url: str, *, params: dict[str, Any]) -> Tuple[int, Any | None]:
+    async def _http_get(sess: Any, url: str, *, params: dict[str, Any]) -> tuple[int, Any | None]:
         req = sess.get(url, params=params)
         if hasattr(req, "__aenter__"):
             async with req as resp:
@@ -158,7 +156,7 @@ else:
         resp = req
         return _status(resp), await _read_json(resp)
 
-    async def _http_post(sess: Any, url: str, *, payload: dict[str, Any]) -> Tuple[int, Any | None]:
+    async def _http_post(sess: Any, url: str, *, payload: dict[str, Any]) -> tuple[int, Any | None]:
         req = sess.post(url, json=payload)
         if hasattr(req, "__aenter__"):
             async with req as resp:
@@ -343,14 +341,14 @@ else:
         "JUPITER_QUOTE_API",
         "JUPITER_SWAP_API",
         "SOL_MINT",
-        "session",
-        "wallet",
-        "solana_client",
+        "buy_to_token",
         "client",
         "get_buy_quote",
         "get_sell_quote",
-        "swap_from_quote",
-        "buy_to_token",
-        "sell_to_sol",
         "impl_import_error",
+        "sell_to_sol",
+        "session",
+        "solana_client",
+        "swap_from_quote",
+        "wallet",
     ]
