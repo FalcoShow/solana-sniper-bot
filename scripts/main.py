@@ -47,6 +47,8 @@ __all__ = [
     "contracts_surface",
     "get_contracts_surface",
     # module-level helpers (unit_tests)
+    "ensure_event",
+    "install_stdlib_event",
     "get_run_id",
     "set_run_id",
     "get_version",
@@ -260,6 +262,129 @@ def _jitter_disabled() -> bool:
 # =============================================================================
 # Logging (stdlib-only at import time)
 # =============================================================================
+def install_stdlib_event() -> None:
+    """
+    Pure-stdlib compatibility shim:
+    Adds Logger.event / Logger.every / Logger.once so older code & tests can rely on them
+    without importing utils_pkg at module scope.
+    """
+    # Patch only once
+    if (
+        hasattr(logging.Logger, "event")
+        and hasattr(logging.Logger, "every")
+        and hasattr(logging.Logger, "once")
+    ):
+        return
+
+    def _event(self: logging.Logger, name: str, **fields: Any) -> None:
+        # Keep it simple + safe (no secrets handling here; higher layers can redact)
+        with contextlib.suppress(Exception):
+            self.info("%s %s", name, fields)
+
+    def _every(
+        self: logging.Logger,
+        key: str,
+        sec: int = 60,
+        msg: str | None = None,
+        level: int | None = None,
+        **fields: Any,
+    ) -> None:
+        try:
+            now_m = time.monotonic()
+            store = getattr(self, "_pf_every_store", None)
+            if not isinstance(store, dict):
+                store = {}
+            last = float(store.get(key, 0.0))
+            if now_m - last >= float(sec):
+                store[key] = now_m
+                self._pf_every_store = store
+                if level is not None:
+                    self.log(int(level), "%s %s", (msg or key), fields)
+                else:
+                    # type: ignore[attr-defined] - patched below
+                    self.event(msg or key, **fields)  # noqa: B018
+        except Exception:
+            return
+
+    def _once(
+        self: logging.Logger,
+        key: str,
+        ttl: int = 60,
+        msg: str | None = None,
+        level: int | None = None,
+        **fields: Any,
+    ) -> None:
+        # semantic sugar over every()
+        return _every(self, key, sec=ttl, msg=msg, level=level, **fields)
+
+    # Monkeypatch Logger class (stdlib-only)
+    logging.Logger.event = _event  # type: ignore[assignment]
+    logging.Logger.every = _every  # type: ignore[assignment]
+    logging.Logger.once = _once  # type: ignore[assignment]
+
+
+def ensure_event(logger: Any) -> Any:
+    """
+    Ensure a logger object has .event/.every/.once.
+    Works for stdlib Logger and also for custom logger objects.
+    """
+    install_stdlib_event()
+
+    # If it's a stdlib Logger, class patch already covers it
+    if isinstance(logger, logging.Logger):
+        return logger
+
+    # Otherwise, attach per-instance fallbacks
+    if not hasattr(logger, "event"):
+
+        def _event(name: str, **fields: Any) -> None:
+            with contextlib.suppress(Exception):
+                logger.info("%s %s", name, fields)
+
+        logger.event = _event  # type: ignore[attr-defined]
+
+    if not hasattr(logger, "every"):
+
+        def _every(
+            key: str,
+            sec: int = 60,
+            msg: str | None = None,
+            level: int | None = None,
+            **fields: Any,
+        ) -> None:
+            try:
+                now_m = time.monotonic()
+                store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
+                last = float(store.get(key, 0.0))
+                if now_m - last >= float(sec):
+                    store[key] = now_m
+                    _every._store = store  # type: ignore[attr-defined]
+                    with contextlib.suppress(Exception):
+                        if level is not None:
+                            logger.log(int(level), "%s %s", (msg or key), fields)
+                        else:
+                            logger.event(msg or key, **fields)  # type: ignore[attr-defined]
+            except Exception:
+                return
+
+        logger.every = _every  # type: ignore[attr-defined]
+
+    if not hasattr(logger, "once"):
+
+        def _once(
+            key: str,
+            ttl: int = 60,
+            msg: str | None = None,
+            level: int | None = None,
+            **fields: Any,
+        ) -> None:
+            return logger.every(key, sec=ttl, msg=msg, level=level, **fields)  # type: ignore[attr-defined]
+
+        logger.once = _once  # type: ignore[attr-defined]
+
+    return logger
+
+
 _LOG_SHIMS_READY = False
 _LS_CACHE: dict[str, Any] = {}
 
@@ -284,6 +409,8 @@ def _ensure_logger_shims() -> None:
     global _LOG_SHIMS_READY
     if _LOG_SHIMS_READY:
         return
+
+    ensure_event(log)
 
     if not hasattr(log, "event"):
 
@@ -2995,10 +3122,39 @@ def _default_scanner_modules() -> list[str]:
 # Main
 # =============================================================================
 async def main(stop_evt: asyncio.Event | None = None) -> None:
-    global RUN_ID
+    global RUN_ID, log
 
     _refresh_config()
     _maybe_upgrade_logger()
+
+    # ---- log_compat patch (runtime-only; after logger creation) ----
+    with contextlib.suppress(Exception):
+        lc = importlib.import_module("utils_pkg.log_compat")
+        for nm in (
+            "patch_logger",
+            "patch",
+            "install",
+            "apply",
+            "setup",
+            "ensure_compat",
+            "ensure",
+        ):
+            fn = getattr(lc, nm, None)
+            if not callable(fn):
+                continue
+
+            # support a few common signatures: (log=...), (logger=...), (name=...), (log), or ()
+            kw = _filter_kwargs(fn, {"log": log, "logger": log, "name": "sniper.main"})
+            try:
+                out = fn(**kw) if kw else fn(log)  # type: ignore[misc]
+            except TypeError:
+                out = fn()  # type: ignore[misc]
+
+            # if log_compat returns a wrapped logger, adopt it
+            if out is not None:
+                log = out
+            break
+
     _ensure_logger_shims()
     refresh_runtime_constants()
 
