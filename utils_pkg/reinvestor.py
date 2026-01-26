@@ -2,21 +2,20 @@
 from __future__ import annotations
 
 """
-Reinvestor — V3+++ / God-Tier LOCK-IN (Master Roadmap P0→P1)
-============================================================
+Reinvestor — V3+++ / God-Tier LOCK-IN (P0→P1)
+============================================
 
-Role
-----
-Safely turn realized proceeds into a compounding flywheel *without* creating
-a second execution engine.
+Purpose
+-------
+Turn realized proceeds into a compounding flywheel WITHOUT becoming a second execution engine.
 
 This module:
-  1) Builds a decision context (risk/regime/perf/infra/budget)
+  1) Builds decision context (risk/regime/perf/infra/budget)
   2) Applies hard gates (halt, drawdown, infra, budgets, idempotency, locks)
   3) Computes reinvest vs savings split (base_pct × scales, bounded)
   4) Selects a reinvest target (smart_wallets preferred; legacy fallback)
-  5) Executes buy (Jupiter via utils_pkg.core_utils.swap_token_jupiter)
-  6) Persists a position (ONE SoT via positions.save_position if present)
+  5) Executes buy (Jupiter via core_utils.swap_token_jupiter)
+  6) Persists a position (positions.save_position if present; fallback json)
   7) Emits events + Telegram + Notion + Redis introspection
   8) Supports queue worker w/ DLQ + stale job dropping
 
@@ -36,28 +35,13 @@ Public API
     async def get_last_reinvest_decision(redis=None) -> dict|None
     async def get_recent_reinvest_decisions(limit: int = 50, redis=None) -> list[dict]
     def reload_reinvestor_config() -> None
-
-Meta conventions (optional)
---------------------------
-    force_token_mint / target_mint      -> force reinvest into this mint (still allow/deny checked)
-    target_symbol                       -> optional display symbol for alerts
-    dry_run                             -> simulate only; no swap; still decision + health snapshot
-    sandbox / sandbox_mode              -> implies dry_run
-    force_savings_only                  -> do not reinvest (route to savings)
-    force_reinvest_even_if_risk_blocked -> bypass most gates (NOT drawdown hard stop)
-    reinvest_profit_only                -> for sell-fill events: use realized_profit_sol only
-    ignore_*_gate flags                 -> selectively bypass gates (time/infra/health/balance)
-
-Notes
------
-- No profit guarantees. This is infrastructure.
-- Designed to tolerate signature drift across utils_pkg modules.
 """
 
 import asyncio
 import contextlib
 import dataclasses
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -69,7 +53,7 @@ from typing import Any
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Canonical logger (root logging_setup.py is the SoT; utils_pkg wrapper is ok)
+# Logger
 # ──────────────────────────────────────────────────────────────────────────────
 def _get_logger() -> logging.Logger:
     with contextlib.suppress(Exception):
@@ -86,7 +70,7 @@ log = _get_logger()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Small utils
+# Small utilities
 # ──────────────────────────────────────────────────────────────────────────────
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
@@ -157,14 +141,23 @@ def _safe_int(x: Any, d: int = 0) -> int:
 
 
 def _maybe_decode(x: Any) -> Any:
-    if isinstance(x, bytes | bytearray):
+    # NOTE: must NOT use `bytes | bytearray` in isinstance (runtime TypeError).
+    if isinstance(x, (bytes, bytearray)):
         with contextlib.suppress(Exception):
             return x.decode("utf-8", errors="ignore")
     return x
 
 
+def _is_awaitable(x: Any) -> bool:
+    with contextlib.suppress(Exception):
+        return inspect.isawaitable(x)
+    return False
+
+
 async def _maybe_await(x: Any) -> Any:
-    return await x if asyncio.iscoroutine(x) else x
+    if _is_awaitable(x):
+        return await x
+    return x
 
 
 def _phase() -> int:
@@ -207,7 +200,7 @@ def _json_dumps(obj: Any, **kwargs: Any) -> str:
     return json.dumps(obj, default=_default, ensure_ascii=False, **kwargs)
 
 
-# Optional mint normalization (single source if available)
+# Mint normalization (prefer canonical helper if present)
 try:
     from utils_pkg.mints import normalize_mint  # type: ignore
 except Exception:  # pragma: no cover
@@ -216,7 +209,7 @@ except Exception:  # pragma: no cover
         return (x or "").strip()
 
 
-# Optional: mint guard (if you have one)
+# Optional mint guard (if you have one)
 try:
     from utils_pkg.mint_guard import is_mint_allowed as _mint_guard_allowed  # type: ignore
 except Exception:  # pragma: no cover
@@ -244,23 +237,51 @@ async def _redis_call(redis: Any, fn_name: str, *args: Any, **kwargs: Any) -> An
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core helpers (single source of truth) — tolerate sync/async drift
+# core_utils imports (tolerate drift)
 # ──────────────────────────────────────────────────────────────────────────────
-from utils_pkg.core_utils import (  # type: ignore
-    convert_sol_to_usd_amount,
-    get_token_price,
-    log_to_notion,
-    redis as shared_redis,
-    send_telegram,
-    swap_token_jupiter,
-    transfer_to_savings,
-)
+def _missing(name: str):
+    async def _a(*_: Any, **__: Any) -> Any:
+        raise RuntimeError(f"core_utils missing required function: {name}")
+
+    def _s(*_: Any, **__: Any) -> Any:
+        raise RuntimeError(f"core_utils missing required function: {name}")
+
+    return _a, _s
+
 
 try:
-    from utils_pkg.core_utils import get_wallet_balance_sol  # type: ignore
-except Exception:  # pragma: no cover
-    get_wallet_balance_sol = None  # type: ignore[assignment]
+    from utils_pkg import core_utils as _cu  # type: ignore
+except Exception as e:  # pragma: no cover
+    _cu = None  # type: ignore[assignment]
+    _cu_import_err = e
+else:
+    _cu_import_err = None
 
+
+# Required operations (provide hard-fail stubs if missing)
+if _cu is not None:
+    convert_sol_to_usd_amount = getattr(
+        _cu, "convert_sol_to_usd_amount", _missing("convert_sol_to_usd_amount")[0]
+    )
+    get_token_price = getattr(_cu, "get_token_price", _missing("get_token_price")[0])
+    log_to_notion = getattr(_cu, "log_to_notion", _missing("log_to_notion")[0])
+    send_telegram = getattr(_cu, "send_telegram", _missing("send_telegram")[0])
+    swap_token_jupiter = getattr(_cu, "swap_token_jupiter", _missing("swap_token_jupiter")[0])
+    transfer_to_savings = getattr(_cu, "transfer_to_savings", _missing("transfer_to_savings")[0])
+    shared_redis = getattr(_cu, "redis", None)
+    get_wallet_balance_sol = getattr(_cu, "get_wallet_balance_sol", None)
+else:  # pragma: no cover
+    convert_sol_to_usd_amount, _ = _missing("convert_sol_to_usd_amount")
+    get_token_price, _ = _missing("get_token_price")
+    log_to_notion, _ = _missing("log_to_notion")
+    send_telegram, _ = _missing("send_telegram")
+    swap_token_jupiter, _ = _missing("swap_token_jupiter")
+    transfer_to_savings, _ = _missing("transfer_to_savings")
+    shared_redis = None
+    get_wallet_balance_sol = None
+
+
+# Data logger (soft)
 try:
     from utils_pkg.data_logger import log_event  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover
@@ -269,14 +290,12 @@ except Exception:  # pragma: no cover
         return None
 
 
-# Position persistence — prefer SoT position store
+# Position persistence — prefer SoT store if present
 def _load_save_position():
-    # 1) canonical root positions.py
     with contextlib.suppress(Exception):
         from positions import save_position as _sp  # type: ignore
 
         return _sp
-    # 2) optional utils_pkg positions store
     with contextlib.suppress(Exception):
         from utils_pkg.positions import save_position as _sp2  # type: ignore
 
@@ -311,10 +330,10 @@ async def _save_position(mint: str, data: dict[str, Any]) -> None:
 # Optional modules (soft imports)
 # ──────────────────────────────────────────────────────────────────────────────
 try:
-    from utils_pkg.infra_guard import (  # type: ignore
+    from utils_pkg.infra_guard import (
         infra_features,
         should_block_entries as infra_should_block_entries,
-    )
+    )  # type: ignore
 except Exception:  # pragma: no cover
 
     async def infra_features(redis=None) -> dict[str, float]:
@@ -435,7 +454,7 @@ except Exception:  # pragma: no cover
         return None
 
 
-# Optional: post-buy hooks (avoid circular imports)
+# Post-buy hooks (soft)
 try:
     from utils_pkg.ai_sell_logic import (
         schedule_after_buy as _sell_schedule_after_buy,  # type: ignore
@@ -452,14 +471,14 @@ except Exception:  # pragma: no cover
 
 try:
     from utils_pkg.auto_exit_worker.exit_engine import (
-        register_position_after_buy as _autoexit_register_after_buy,  # type: ignore
-    )
+        register_position_after_buy as _autoexit_register_after_buy,
+    )  # type: ignore
 except Exception:  # pragma: no cover
     _autoexit_register_after_buy = None  # type: ignore[assignment]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Redis keys
+# Redis keys (keep existing env keys only)
 # ──────────────────────────────────────────────────────────────────────────────
 REINVEST_QUEUE = _envs("REINVEST_QUEUE_KEY", "reinvest:queue")
 REINVEST_DLQ = _envs("REINVEST_DLQ_KEY", "reinvest:dlq")
@@ -478,7 +497,7 @@ REINVEST_LOCK_PREFIX = _envs("REINVEST_LOCK_PREFIX", "reinvest:lock")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Config
+# Config (keep env key usage stable)
 # ──────────────────────────────────────────────────────────────────────────────
 def _parse_mint_set(val: str) -> set[str]:
     out: set[str] = set()
@@ -494,11 +513,9 @@ class ReinvestCfg:
     enabled: bool
     global_dry_run: bool
 
-    # minimum proceeds to even consider reinvesting
     min_proceeds_sol: float
     min_proceeds_usd: float
 
-    # target selection filters
     vol_min_usd: float
     honeypot_check: bool
     require_price: bool
@@ -506,12 +523,10 @@ class ReinvestCfg:
     allow_mints: set[str]
     deny_mints: set[str]
 
-    # savings split
     savings_wallet: str | None
-    always_savings_pct: float  # subtract from effective reinvest percent
+    always_savings_pct: float
     savings_after_swap: bool
 
-    # time/health/risk gates
     block_weekends: bool
     min_capacity: float
     defensive_capacity: float
@@ -534,30 +549,25 @@ class ReinvestCfg:
     tail_hard: float
     tail_gate: float
 
-    # sizing caps
     min_eff_pct: float
     max_eff_pct: float
     max_single_usd: float
-    max_budget_fraction: float  # fraction of daily remaining spend budget
+    max_budget_fraction: float
 
-    # rate limits / spacing
     max_reinvests_per_day: int
     min_minutes_between: float
     queue_max_age_s: float
     cooldown_on_fail_min: float
 
-    # worker
     worker_batch: int
     queue_maxlen: int
     worker_backoff_s: float
 
-    # idempotency/locks
     idempotency_ttl_h: float
     lock_enabled: bool
     lock_ttl_s: int
-    lock_scope: str  # "job" or "global"
+    lock_scope: str
 
-    # telemetry
     tg_min_seconds: float
     decisions_keep: int
 
@@ -574,6 +584,9 @@ class ReinvestCfg:
         scope = (_envs("REINVEST_LOCK_SCOPE", "job") or "job").strip().lower()
         if scope not in ("job", "global"):
             scope = "job"
+
+        soft = max(0.0, min(1.0, _envf("REINVEST_TAIL_RISK_SOFT", 0.60)))
+        hard = max(soft, min(1.0, _envf("REINVEST_TAIL_RISK_HARD", 0.85)))
 
         return ReinvestCfg(
             enabled=_envb("REINVESTOR_ENABLED", True),
@@ -612,8 +625,8 @@ class ReinvestCfg:
             infra_min_health=max(0.0, _envf("REINVEST_INFRA_MIN_HEALTH", 0.0)),
             block_if_infra_halted=_envb("REINVEST_BLOCK_IF_INFRA_HALTED", True),
             block_if_infra_degraded=_envb("REINVEST_BLOCK_IF_INFRA_DEGRADED", False),
-            tail_soft=max(0.0, min(1.0, _envf("REINVEST_TAIL_RISK_SOFT", 0.60))),
-            tail_hard=max(0.0, min(1.0, _envf("REINVEST_TAIL_RISK_HARD", 0.85))),
+            tail_soft=soft,
+            tail_hard=hard,
             tail_gate=max(0.0, min(1.0, _envf("REINVEST_TAIL_RISK_GATE", 0.0))),
             min_eff_pct=max(0.0, _envf("REINVEST_MIN_EFF_PCT", 0.0)),
             max_eff_pct=max(0.0, min(95.0, _envf("REINVEST_MAX_EFF_PCT", 95.0))),
@@ -836,7 +849,7 @@ async def _token_price_in_sol(mint: str) -> float:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Telegram helpers (rate-limited via redis when available)
+# Telegram (rate-limited)
 # ──────────────────────────────────────────────────────────────────────────────
 async def _safe_tg(msg: str, redis=None) -> None:
     if not msg:
@@ -897,7 +910,7 @@ def _mint_allowed(mint: str) -> bool:
     m = normalize_mint(mint)
     if not m or len(m) <= 30:
         return False
-    if m == SOL_MINT:  # never “reinvest” into SOL; that’s just idle balance
+    if m == SOL_MINT:
         return False
     if m in CFG.deny_mints:
         return False
@@ -922,9 +935,9 @@ async def _pick_target_mint(
             raw={"forced": True},
         )
 
-    # Prefer smart_wallets target picker
+    # Prefer smart_wallets picker
     if pick_reinvestment_target is not None:
-        out = None
+        out: Any = None
         try:
             out = await pick_reinvestment_target(
                 budget_sol=reinvest_sol,
@@ -938,7 +951,6 @@ async def _pick_target_mint(
         except Exception:
             out = None
 
-        # common shapes
         if isinstance(out, str) and _mint_allowed(out):
             return TargetPick(mint=normalize_mint(out), score=1.0, raw=out)
 
@@ -951,7 +963,7 @@ async def _pick_target_mint(
                     mint=normalize_mint(mint), score=sc, symbol=str(sym) if sym else None, raw=out
                 )
 
-        if isinstance(out, list | tuple):
+        if isinstance(out, (list, tuple)):
             best: TargetPick | None = None
             for cand in out:
                 if not isinstance(cand, dict):
@@ -983,7 +995,7 @@ async def _pick_target_mint(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Context + scoring models
+# Context
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ReinvestContext:
@@ -1114,7 +1126,6 @@ async def _build_context(
     proceeds_sol = float(proceeds_sol or 0.0)
     proceeds_usd = await _sol_to_usd(proceeds_sol)
 
-    # risk snapshot (tolerate signature drift)
     try:
         risk_ctx = await risk_capacity_snapshot(redis, source="reinvestor")  # type: ignore[arg-type]
     except TypeError:
@@ -1124,10 +1135,12 @@ async def _build_context(
 
     risk_capacity = float(risk_ctx.get("risk_capacity", 1.0))
     risk_mode = int(risk_ctx.get("risk_mode", 1))
+
     rmo = risk_ctx.get("risk_mode_override")
-    risk_mode_override = (
-        int(rmo) if isinstance(rmo, int | float | str) and str(rmo).strip() != "" else None
-    )
+    risk_mode_override = None
+    if rmo is not None:
+        with contextlib.suppress(Exception):
+            risk_mode_override = int(rmo)
 
     halt_reason = risk_ctx.get("halt_reason")
     halt_reason = str(halt_reason) if halt_reason is not None else None
@@ -1163,12 +1176,11 @@ async def _build_context(
     rt = risk_ctx.get("risk_tags", [])
     if isinstance(rt, str):
         risk_tags = [rt]
-    elif isinstance(rt, list | tuple | set):
+    elif isinstance(rt, (list, tuple, set)):
         risk_tags = [str(x) for x in rt]
     else:
         risk_tags = []
 
-    # equity_sol (derive from equity_usd / sol_usd)
     try:
         sol_usd = await _maybe_await(convert_sol_to_usd_amount(1.0))
         equity_sol = equity_usd / float(sol_usd) if sol_usd and float(sol_usd) > 0 else 0.0
@@ -1188,7 +1200,6 @@ async def _build_context(
     max_risk_per_trade = float(
         params.get("MAX_RISK_PER_TRADE", risk_ctx.get("max_risk_per_trade", 0.05))
     )
-
     strat_mode = int(params.get("STRAT_MODE", risk_ctx.get("strat_mode", 1) or 1))
     hard_halt = bool(params.get("HARD_HALT", False))
 
@@ -1287,12 +1298,11 @@ async def _build_context(
 # Health scoring + persistence
 # ──────────────────────────────────────────────────────────────────────────────
 def _compute_health_score(ctx: ReinvestContext) -> float:
-    # allow upstream risk_manager to provide a precomputed score
     with contextlib.suppress(Exception):
         pre = ctx.risk_ctx_raw.get("reinvest_health_score") or ctx.risk_ctx_raw.get(
             "global_health_score"
         )
-        if isinstance(pre, int | float) and float(pre) >= 0:
+        if isinstance(pre, (int, float)) and float(pre) >= 0:
             return float(pre)
 
     wr = max(0.0, min(1.0, ctx.win_rate))
@@ -1450,7 +1460,7 @@ async def _persist_decision(redis, decision_doc: dict[str, Any]) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Scales / effective % (stable logic)
+# Scales / effective %
 # ──────────────────────────────────────────────────────────────────────────────
 def _kelly_scale(ctx: ReinvestContext) -> float:
     kelly = max(0.0, ctx.kelly_suggestion)
@@ -1708,12 +1718,10 @@ async def _evaluate_gates(ctx: ReinvestContext, redis) -> tuple[bool, str]:
     if CFG.block_weekends and _is_weekend() and not meta.get("ignore_time_gate"):
         return False, "weekend_guard"
 
-    # daily cap
     if redis and CFG.max_reinvests_per_day > 0:
         if (await _get_daily_reinvest_count(redis)) >= CFG.max_reinvests_per_day:
             return False, "daily_cap_reached"
 
-    # propagate sandbox -> dry_run
     if ctx.sandbox_mode and not meta.get("dry_run"):
         meta["dry_run"] = True
 
@@ -1722,13 +1730,11 @@ async def _evaluate_gates(ctx: ReinvestContext, redis) -> tuple[bool, str]:
     if CFG.min_equity_sol > 0 and ctx.equity_sol > 0 and ctx.equity_sol < CFG.min_equity_sol:
         return False, "equity_below_min_env"
 
-    # cooldown on fail
     if redis and CFG.cooldown_on_fail_min > 0 and not meta.get("ignore_time_gate"):
         last_fail = await _get_last_fail_ts(redis)
         if last_fail and (_utc_ts() - float(last_fail)) < float(CFG.cooldown_on_fail_min) * 60.0:
             return False, "cooldown_on_fail"
 
-    # min spacing between reinvests
     if CFG.min_minutes_between > 0 and redis and not meta.get("ignore_time_gate"):
         last_ts = await _get_last_reinvest_ts(redis)
         if last_ts:
@@ -1749,10 +1755,8 @@ async def _evaluate_gates(ctx: ReinvestContext, redis) -> tuple[bool, str]:
             return False, "risk_tag_soft_halt"
 
     if (
-        ctx.daily_trades_cap > 0
-        and ctx.daily_trades_count >= ctx.daily_trades_cap
-        and not force_anyway
-    ):
+        ctx.daily_trades_cap > 0 and ctx.daily_trades_count >= ctx.daily_trades_cap
+    ) and not force_anyway:
         return False, "daily_trades_cap_reached"
 
     if ctx.spend_budget_block and not force_anyway:
@@ -1760,7 +1764,6 @@ async def _evaluate_gates(ctx: ReinvestContext, redis) -> tuple[bool, str]:
     if ctx.spend_remaining_usd is not None and ctx.spend_remaining_usd <= 0.0 and not force_anyway:
         return False, "spend_budget_exhausted"
 
-    # risk manager entry gate
     try:
         allow_entry = await should_allow_new_entry(redis, source="reinvestor")  # type: ignore[arg-type]
     except TypeError:
@@ -1775,11 +1778,9 @@ async def _evaluate_gates(ctx: ReinvestContext, redis) -> tuple[bool, str]:
     if ctx.risk_mode == 3 and ctx.risk_capacity < CFG.defensive_capacity and not force_anyway:
         return False, "defensive_capacity_low"
 
-    # hard stop drawdown always wins
     if CFG.dd_hard_stop_pct > 0 and ctx.daily_dd_pct >= CFG.dd_hard_stop_pct:
         return False, "deep_drawdown"
 
-    # lock profits / chill after strong day
     if CFG.pnl_lock_pct > 0 and ctx.daily_pnl_pct >= CFG.pnl_lock_pct and not force_anyway:
         return False, "pnl_day_high"
 
@@ -1887,10 +1888,6 @@ async def _journal_skip(
 async def _do_swap_buy(
     sol_in: float, out_mint: str, slippage: float
 ) -> tuple[bool, str | None, Any]:
-    """
-    Normalizes multiple possible swap_token_jupiter signatures / return shapes.
-    Returns: (ok, tx_sig, raw_out)
-    """
     out = None
     err: str | None = None
 
@@ -1938,11 +1935,9 @@ async def reinvest(
 ) -> str | None:
     meta = dict(meta or {})
     proceeds_sol = float(proceeds_sol or 0.0)
-
     if proceeds_sol <= 0:
         return None
 
-    # global dry-run switches
     if CFG.global_dry_run:
         meta["dry_run"] = True
     if meta.get("sandbox") or meta.get("sandbox_mode"):
@@ -1956,13 +1951,13 @@ async def reinvest(
 
     t0 = time.monotonic()
 
-    # idempotency
+    # Idempotency
     if redis and not await _idempotency_claim(redis, meta):
         log.info("[REINVEST] Idempotency: already processed. job_id=%s", meta.get("job_id"))
         await _journal_skip("idempotency_already_processed", None, meta, redis=redis)
         return None
 
-    # lock
+    # Lock
     lock_token: str | None = None
     lk = _lock_key(meta)
     if redis and CFG.lock_enabled:
@@ -1980,8 +1975,6 @@ async def reinvest(
             return None
 
         allowed, reason = await _evaluate_gates(ctx, redis)
-
-        # ctx.meta is authoritative (it may have been mutated by gates)
         meta = ctx.meta
 
         eff_pct, scales = _compute_eff_pct(ctx)
@@ -1990,7 +1983,7 @@ async def reinvest(
         reinvest_sol = proceeds_sol * (eff_pct / 100.0)
         savings_sol = max(0.0, proceeds_sol - reinvest_sol)
 
-        # optional budget fraction cap: reinvest <= max_budget_fraction * spend_remaining_usd
+        # Budget fraction cap
         if CFG.max_budget_fraction > 0 and ctx.spend_remaining_usd and ctx.spend_remaining_usd > 0:
             cap_usd = float(CFG.max_budget_fraction) * float(ctx.spend_remaining_usd)
             if cap_usd > 0:
@@ -2002,7 +1995,6 @@ async def reinvest(
 
         health_score = _compute_health_score(ctx)
 
-        # persist last decision (even on skip)
         decision_doc = {
             "ts": _now_utc().isoformat(),
             "job_id": meta.get("job_id"),
@@ -2035,7 +2027,6 @@ async def reinvest(
             )
             return None
 
-        # journal decision upstream
         with contextlib.suppress(Exception):
             await note_reinvest_decision(
                 proceeds_sol=proceeds_sol,
@@ -2070,7 +2061,7 @@ async def reinvest(
                 redis=redis,
             )
 
-        # cap by per-trade risk vs equity
+        # Risk cap by equity
         if ctx.equity_sol > 0 and ctx.max_risk_per_trade > 0:
             cap_sol = float(ctx.max_risk_per_trade) * float(ctx.equity_sol)
             if reinvest_sol > cap_sol:
@@ -2085,7 +2076,6 @@ async def reinvest(
                 reinvest_sol = max(0.0, reinvest_sol * scale_down)
                 savings_sol = max(0.0, proceeds_sol - reinvest_sol)
 
-        # too small reinvest leg -> savings
         if reinvest_sol < CFG.min_proceeds_sol:
             await _journal_skip("reinvest_leg_too_small", ctx, meta, redis=redis)
             await _send_to_savings(proceeds_sol, redis=redis)
@@ -2099,7 +2089,7 @@ async def reinvest(
             )
             return None
 
-        # optional min SOL reserve gate
+        # Optional min SOL reserve gate
         if get_wallet_balance_sol is not None and not meta.get("ignore_balance_gate"):
             with contextlib.suppress(Exception):
                 bal = float(await _maybe_await(get_wallet_balance_sol()))  # type: ignore[misc]
@@ -2116,7 +2106,7 @@ async def reinvest(
                     )
                     return None
 
-        # dry run exits here
+        # Dry run
         if meta.get("dry_run"):
             await _update_reinvest_health(
                 redis,
@@ -2128,7 +2118,7 @@ async def reinvest(
             )
             return None
 
-        # pick target
+        # Pick target
         pick = await _pick_target_mint(reinvest_sol, meta=meta, redis=redis)
         if not pick:
             await _safe_tg(
@@ -2157,7 +2147,7 @@ async def reinvest(
                 )
             return None
 
-        # require price (optional) before swapping (helps avoid junk tokens)
+        # Require price (optional)
         if CFG.require_price and not meta.get("ignore_price_gate"):
             px_sol = await _token_price_in_sol(pick.mint)
             if px_sol <= 0:
@@ -2175,7 +2165,7 @@ async def reinvest(
                 )
                 return None
 
-        # savings before swap if configured
+        # Savings before swap if configured
         if savings_sol > 0 and (not CFG.savings_after_swap):
             await _send_to_savings(savings_sol, redis=redis)
 
@@ -2212,11 +2202,11 @@ async def reinvest(
                 )
             return None
 
-        # savings after swap (default)
+        # Savings after swap (default)
         if savings_sol > 0 and CFG.savings_after_swap:
             await _send_to_savings(savings_sol, redis=redis)
 
-        # persist position (+ optional hooks)
+        # Persist position (+ hooks)
         buy_price_sol = await _token_price_in_sol(pick.mint)
         trailing_stop = (
             (buy_price_sol * (1.0 - (ctx.stop_loss_percent / 100.0))) if buy_price_sol > 0 else 0.0
@@ -2273,12 +2263,11 @@ async def reinvest(
                 "target_score": pick.score,
                 "target_symbol": pick.symbol,
                 "tx_sig": tx_sig,
-                "swap_raw": raw_swap if isinstance(raw_swap, dict | str) else str(raw_swap)[:500],
+                "swap_raw": raw_swap if isinstance(raw_swap, (dict, str)) else str(raw_swap)[:500],
             },
         }
         await _save_position(pick.mint, position_payload)
 
-        # optional: tell exit engine / auto-exit worker / AI sell logic about the new position
         with contextlib.suppress(Exception):
             if callable(_exit_register_after_buy):
                 await _maybe_await(_exit_register_after_buy(position_payload))  # type: ignore[misc]
@@ -2289,7 +2278,6 @@ async def reinvest(
             if callable(_sell_schedule_after_buy):
                 await _maybe_await(_sell_schedule_after_buy(pick.mint, position_payload))  # type: ignore[misc]
 
-        # note spend
         with contextlib.suppress(Exception):
             usd_spent = await _sol_to_usd(reinvest_sol)
             if usd_spent > 0:
@@ -2298,11 +2286,9 @@ async def reinvest(
                 except TypeError:
                     await note_spend(redis, usd_spent)
 
-        # counters
         await _bump_daily_reinvest_counter(redis)
         await _set_last_reinvest_ts(redis)
 
-        # alerts
         usd = await _sol_to_usd(reinvest_sol)
         await _safe_tg(
             "🔁 *Reinvestment executed*\n"
@@ -2320,7 +2306,6 @@ async def reinvest(
             redis=redis,
         )
 
-        # best-effort notion (signature drift tolerant)
         with contextlib.suppress(Exception):
             try:
                 await _maybe_await(
@@ -2432,7 +2417,6 @@ async def queue_reinvest(
     if redis is None:
         redis = await _get_redis()
 
-    # no redis -> run direct
     if not redis:
         await reinvest(proceeds_sol, meta=meta, redis=None)
         return
@@ -2479,7 +2463,6 @@ async def run_reinvest_worker(
         log.warning("[REINVEST] Worker disabled: no Redis client.")
         return
 
-    # phase-based sane polling floors
     if CFG.phase <= 2:
         poll_interval = max(poll_interval, 2.0)
     elif CFG.phase <= 5:
@@ -2509,11 +2492,11 @@ async def run_reinvest_worker(
                 if not raw:
                     break
 
+                payload = None
                 try:
                     _, payload = raw
                 except Exception:
                     payload = raw
-
                 payload = _maybe_decode(payload)
 
                 try:
@@ -2523,7 +2506,6 @@ async def run_reinvest_worker(
                     await _push_dlq(redis, str(payload)[:2000], "invalid_json")
                     continue
 
-                # stale job guard
                 if CFG.queue_max_age_s > 0:
                     enq = _safe_float(job.get("enqueued_ts"), 0.0)
                     if enq and (_utc_ts() - enq) > float(CFG.queue_max_age_s):
@@ -2551,7 +2533,7 @@ async def run_reinvest_worker(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Preview + explain (+ high-level dry-run helper)
+# Preview / explain / dry-run
 # ──────────────────────────────────────────────────────────────────────────────
 async def preview_reinvest_split(
     proceeds_sol: float, meta: dict[str, Any] | None = None, redis=None
@@ -2704,32 +2686,19 @@ async def dry_run_reinvest(
         redis = await _get_redis()
 
     _ensure_job_id(meta, float(proceeds_sol or 0.0))
-    ctx_target_meta = dict(meta)
-    pick = await _pick_target_mint(reinvest_sol, meta=ctx_target_meta, redis=redis)
-    if pick:
-        prev["target"] = {
-            "mint": pick.mint,
-            "symbol": pick.symbol,
-            "score": pick.score,
-            "raw": pick.raw,
-        }
-    else:
-        prev["target"] = None
-
+    pick = await _pick_target_mint(reinvest_sol, meta=dict(meta), redis=redis)
+    prev["target"] = (
+        {"mint": pick.mint, "symbol": pick.symbol, "score": pick.score, "raw": pick.raw}
+        if pick
+        else None
+    )
     return prev
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Wiring helper: consume sell-filled events (fixes "profit vs proceeds")
+# Wiring helper: consume sell-filled events
 # ──────────────────────────────────────────────────────────────────────────────
 async def handle_sell_filled_event(ev: dict[str, Any], redis=None) -> None:
-    """
-    Adapter for exit-engine events.
-
-    Prefers proceeds fields if present; falls back to profit fields.
-    Supports:
-        meta["reinvest_profit_only"]=1 -> use realized_profit_sol
-    """
     if not isinstance(ev, dict):
         return
 

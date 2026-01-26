@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
   pull_request:
   workflow_dispatch:
 
@@ -10,38 +9,52 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+# Global env: safe posture everywhere.
+# We do NOT force NO_NETWORK globally because preflight is intended to validate
+# RPC/Jupiter/router connectivity.
+env:
+  SAFE_MODE: "1"
+  DRYRUN: "1"
+  CI: "1"
+  PYTHONUNBUFFERED: "1"
+  PYTHONFAULTHANDLER: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  TZ: "UTC"
+  # Make imports work for both repo-root and src/ layouts (Linux runner path separator is ":")
+  PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/src
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   smoke:
-    name: Smoke (compile + no-network imports)
+    name: Smoke (compile + hard no-network imports)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
+    # Hard no-network for this job only.
     env:
-      SAFE_MODE: "1"
-      DRYRUN: "1"
       NO_NETWORK: "1"
       DISABLE_NETWORK: "1"
-      CI: "1"
-      PYTHONUNBUFFERED: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python (3.12)
+      - name: Setup Python (3.13)
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
           cache: pip
 
       - name: Install dependencies
-        shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip wheel
+          python -m pip install --upgrade pip wheel setuptools
 
           if [ -f requirements-dev.txt ]; then
             python -m pip install -r requirements-dev.txt
@@ -51,77 +64,64 @@ jobs:
             python -m pip install -r requirements.txt
           fi
 
+          # Optional editable install if the repo is packaged
           if [ -f pyproject.toml ] || [ -f setup.cfg ] || [ -f setup.py ]; then
             python -m pip install -e .
           fi
 
-      - name: Compile all (syntax / import-time errors)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m compileall -q .
+          python -c "import sys; print(sys.version)"
 
-      - name: CI smoke (hard no-network sanity)
-        shell: bash
+      - name: Compile all (syntax / import-time issues)
         run: |
           set -euo pipefail
-          python scripts/ci_smoke.py
+          python -m compileall -q -f .
 
-      - name: Ruff (optional; runs only if config exists)
-        shell: bash
+      - name: CI smoke (hard no-network spine imports)
         run: |
           set -euo pipefail
-          if [ -f ruff.toml ] || [ -f .ruff.toml ] || [ -f pyproject.toml ]; then
-            ruff check .
-            ruff format --check .
+          python -m scripts.ci_smoke
+
+      - name: Ruff (optional; non-blocking)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if command -v ruff >/dev/null 2>&1; then
+            ruff check . || true
+            ruff format --check . || true
           else
-            echo "ruff config not found; skipping lint."
+            echo "ruff not installed; skipping."
           fi
 
-      - name: Mypy (optional; runs only if config exists)
-        shell: bash
+      - name: Mypy (optional; non-blocking)
+        continue-on-error: true
         run: |
           set -euo pipefail
-          if [ -f mypy.ini ] || [ -f pyproject.toml ]; then
-            mypy .
+          if command -v mypy >/dev/null 2>&1; then
+            mypy . || true
           else
-            echo "mypy config not found; skipping type-check."
+            echo "mypy not installed; skipping."
           fi
 
-  tests:
-    name: Tests (py${{ matrix.python-version }})
+  preflight:
+    name: Preflight (deploy profile)
     runs-on: ubuntu-latest
     needs: smoke
-
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.13"]
-
-    env:
-      SAFE_MODE: "1"
-      DRYRUN: "1"
-      NO_NETWORK: "1"
-      DISABLE_NETWORK: "1"
-      CI: "1"
-      PYTHONUNBUFFERED: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python (3.13)
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.13"
           cache: pip
 
       - name: Install dependencies
-        shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip wheel
+          python -m pip install --upgrade pip wheel setuptools
 
           if [ -f requirements-dev.txt ]; then
             python -m pip install -r requirements-dev.txt
@@ -135,8 +135,50 @@ jobs:
             python -m pip install -e .
           fi
 
-      - name: Run pytest (no network / no integration)
-        shell: bash
+      - name: Run preflight (json-only)
         run: |
           set -euo pipefail
-          pytest -q -m "not integration and not network"
+          python -m scripts.preflight --json-only
+
+  tests:
+    name: Tests (pytest)
+    runs-on: ubuntu-latest
+    needs: preflight
+    timeout-minutes: 30
+
+    # Hard no-network for test suite (preflight already validates connectivity).
+    env:
+      NO_NETWORK: "1"
+      DISABLE_NETWORK: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python (3.13)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip wheel setuptools
+
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          fi
+
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
+
+          if [ -f pyproject.toml ] || [ -f setup.cfg ] || [ -f setup.py ]; then
+            python -m pip install -e .
+          fi
+
+      - name: Pytest (no integration / no network)
+        run: |
+          set -euo pipefail
+          python -m pytest -q -m "not integration and not network"

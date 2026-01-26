@@ -2,6 +2,7 @@
 # God-Tier .gitignore (Render + Python + Windows) — NO SECRETS, NO TRASH
 # - Safe defaults for a production bot repo
 # - Avoids overly-broad globs that would hide real source/config files
+# - Keeps lint/config files tracked (ruff/pyproject/etc)
 ###############################################################################
 
 # -----------------------------------------------------------------------------
@@ -18,6 +19,9 @@ __pycache__/
 .ruff_cache/
 .cache/
 .ipynb_checkpoints/
+*.bak
+*.old
+*.orig
 
 # -----------------------------------------------------------------------------
 # Virtual environments / Python tooling
@@ -28,6 +32,10 @@ env/
 ENV/
 .conda/
 .python-version
+__pypackages__/
+.tox/
+.nox/
+.hypothesis/
 
 # -----------------------------------------------------------------------------
 # Packaging / builds
@@ -39,6 +47,7 @@ dist/
 pip-wheel-metadata/
 wheelhouse/
 *.whl
+*.spec
 
 # -----------------------------------------------------------------------------
 # Test / coverage artifacts
@@ -78,11 +87,18 @@ secrets/
 .secrets/
 .private/
 private/
+render_secrets/
+sniper_secrets/
+.render/
+opt/render/
 
 # Wallet / key material
 id.json
 keypair.json
 wallet.json
+**/id.json
+**/keypair.json
+**/wallet.json
 *.key
 *.pem
 *.p12
@@ -101,10 +117,13 @@ wallet.json
 # -----------------------------------------------------------------------------
 # Local databases / queues / caches (do NOT commit)
 # -----------------------------------------------------------------------------
-# legacy sqlite state (never production)
+# Legacy sqlite state (never production)
 state.sqlite3
+state.sqlite3-*
 *.sqlite3
+*.sqlite
 *.db
+*.db-journal
 
 # Redis persistence files (if you ever run Redis locally)
 dump.rdb
@@ -182,14 +201,16 @@ yarn-error.log*
 out/
 
 ###############################################################################
-# Notes:
-# - We intentionally do NOT ignore *.csv globally (you likely track config/whales.csv)
-# - We intentionally do NOT ignore MAIN_WIRING_AUDIT.txt (roadmap says KEEP as doc)
+# Intentional choices:
+# - We do NOT ignore *.csv globally (you may track config/whales.csv, etc.)
+# - We do NOT ignore project wiring/audit docs
 ###############################################################################
 
+# If you specifically want this directory ignored, keep it here.
 .reports/
 
-ruff.toml
-.ruff.toml
-ruff.toml.bak
-.ruff.toml.bak
+###############################################################################
+# IMPORTANT:
+# Do NOT ignore lint/config files. These must remain tracked for CI parity.
+# (Intentionally NOT ignoring ruff.toml / .ruff.toml / pyproject.toml)
+###############################################################################

@@ -7,6 +7,7 @@ import os
 import socket
 import sys
 import traceback
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -15,21 +16,19 @@ from typing import Any
 # -----------------------------------------------------------------------------
 # Path bootstrap (CRITICAL for pre-commit)
 #
-# If this file is executed as:
+# If executed as:
 #   python scripts/ci_smoke.py
-# then sys.path[0] becomes "scripts/" and imports like "utils_pkg" fail.
+# then sys.path[0] becomes "scripts/" and imports like "utils_pkg" can fail.
 # We force repo root (+ optional src/) onto sys.path.
 # -----------------------------------------------------------------------------
 def _bootstrap_sys_path() -> Path:
     here = Path(__file__).resolve()
     repo_root = here.parents[1]  # <repo>/scripts/ci_smoke.py -> <repo>
 
-    # Put repo root first
     root_str = str(repo_root)
     if root_str not in sys.path:
         sys.path.insert(0, root_str)
 
-    # If repo uses src layout, add it too
     src = repo_root / "src"
     if src.is_dir():
         src_str = str(src)
@@ -44,6 +43,8 @@ REPO_ROOT = _bootstrap_sys_path()
 
 # -----------------------------------------------------------------------------
 # Environment: force safe/no-network execution
+#
+# NOTE: Do NOT add new env keys here unless they are already in the contract.
 # -----------------------------------------------------------------------------
 def force_safe_env() -> None:
     """
@@ -74,6 +75,8 @@ def block_network() -> Any:
     """
     Block common outbound network pathways. If anything tries to open a socket / HTTP client,
     it should fail fast with a clear error.
+
+    This is intentionally strict: CI smoke must not touch the network.
     """
     # --- socket guards ---
     orig_socket = socket.socket
@@ -94,6 +97,14 @@ def block_network() -> Any:
         socket.create_connection = guarded_create_connection  # type: ignore[assignment]
     if callable(orig_getaddrinfo):
         socket.getaddrinfo = guarded_getaddrinfo  # type: ignore[assignment]
+
+    # --- urllib guard (stdlib) ---
+    orig_urlopen = urllib.request.urlopen
+
+    def guarded_urlopen(*args: Any, **kwargs: Any) -> Any:
+        raise NetworkBlockedError("Network is blocked in ci_smoke.py (urllib.request.urlopen).")
+
+    urllib.request.urlopen = guarded_urlopen  # type: ignore[assignment]
 
     # --- requests guard (if installed) ---
     requests_mod = None
@@ -176,6 +187,8 @@ def block_network() -> Any:
         if callable(orig_getaddrinfo):
             socket.getaddrinfo = orig_getaddrinfo  # type: ignore[assignment]
 
+        urllib.request.urlopen = orig_urlopen  # type: ignore[assignment]
+
         if requests_mod is not None:
             if callable(orig_requests_request):
                 requests_mod.request = orig_requests_request  # type: ignore[assignment]
@@ -205,12 +218,19 @@ def try_import(name: str) -> tuple[bool, Any | None, str | None, str | None]:
         return False, None, f"{type(e).__name__}: {e}", traceback.format_exc()
 
 
+def _run_maybe_async(result: Any) -> None:
+    """
+    Run coroutine-like return values safely.
+    """
+    if hasattr(result, "__await__"):
+        asyncio.run(result)  # type: ignore[arg-type]
+
+
 def call_env_validator(mod: Any) -> tuple[bool, str]:
     """
     Best-effort env validation call (NON-STRICT).
     Supports common function names used in your overhaul.
-
-    This must never require network; block_network() guarantees that.
+    Must never require network; block_network() guarantees that.
     """
     candidates = (
         "validate_env_contract",
@@ -241,9 +261,7 @@ def call_env_validator(mod: Any) -> tuple[bool, str]:
                 pass
 
             out = fn(**kwargs)
-            if hasattr(out, "__await__"):
-                asyncio.run(out)  # type: ignore[arg-type]
-
+            _run_maybe_async(out)
             return True, f"env validator OK via {mod.__name__}.{fn_name}"
         except Exception as e:
             return (
@@ -254,6 +272,9 @@ def call_env_validator(mod: Any) -> tuple[bool, str]:
     return True, f"no env validator found in {mod.__name__} (skipped)"
 
 
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 def main() -> int:
     force_safe_env()
 
@@ -264,7 +285,8 @@ def main() -> int:
         "utils_pkg.feature_builder",
         "utils_pkg.ai_entry_logic",
         "utils_pkg.exit_engine",
-        "utils_pkg.auto_exit_worker.exit_engine",  # optional path
+        # Optional: only skip if it is truly missing. If it exists but errors, we want to know.
+        "utils_pkg.auto_exit_worker.exit_engine",
     ]
 
     print("[ci_smoke] SAFE_MODE/DRYRUN/NO_NETWORK enabled")
@@ -282,20 +304,24 @@ def main() -> int:
             ok, mod, err, tb = try_import(name)
             if ok and mod is not None:
                 print(f"[ci_smoke] import OK: {name}")
+
+                # Only validate env contract from the canonical spine module
                 if name == "utils_pkg.core_utils":
                     v_ok, msg = call_env_validator(mod)
                     print(f"[ci_smoke] {msg}")
                     if not v_ok:
                         failures.append(msg)
-            else:
-                # tolerate missing optional exit_engine path
-                if name == "utils_pkg.auto_exit_worker.exit_engine":
-                    print(f"[ci_smoke] import SKIP (optional path): {name} ({err})")
+                continue
+
+            # Optional module handling: skip ONLY if module is missing.
+            if name == "utils_pkg.auto_exit_worker.exit_engine" and err:
+                if err.startswith("ModuleNotFoundError") or err.startswith("ImportError"):
+                    print(f"[ci_smoke] import SKIP (optional missing): {name} ({err})")
                     continue
 
-                failures.append(f"import FAILED: {name} ({err})")
-                print(f"[ci_smoke] import FAILED: {name} ({err})")
-                last_tb = tb or last_tb
+            failures.append(f"import FAILED: {name} ({err})")
+            print(f"[ci_smoke] import FAILED: {name} ({err})")
+            last_tb = tb or last_tb
 
     if failures:
         print("\n[ci_smoke] FAILURES:")
