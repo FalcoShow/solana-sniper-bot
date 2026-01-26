@@ -12,8 +12,9 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Global env: safe posture everywhere, but we do NOT force NO_NETWORK globally,
-# because preflight is intended to validate RPC/Jupiter/router connectivity.
+# Global env: safe posture everywhere.
+# We do NOT force NO_NETWORK globally because preflight is intended to validate
+# RPC/Jupiter/router connectivity.
 env:
   SAFE_MODE: "1"
   DRYRUN: "1"
@@ -22,8 +23,8 @@ env:
   PYTHONFAULTHANDLER: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   TZ: "UTC"
-  # Ensure src-layout repos import reliably even without editable installs.
-  PYTHONPATH: ${{ github.workspace }}/src
+  # Make imports work for both repo-root and src/ layouts (Linux runner path separator is ":")
+  PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/src
 
 defaults:
   run:
@@ -70,7 +71,7 @@ jobs:
 
           python -c "import sys; print(sys.version)"
 
-      - name: Compile all (syntax/import-time issues)
+      - name: Compile all (syntax / import-time issues)
         run: |
           set -euo pipefail
           python -m compileall -q -f .
@@ -134,7 +135,6 @@ jobs:
             python -m pip install -e .
           fi
 
-      # Mirrors your proven local command exactly
       - name: Run preflight (json-only)
         run: |
           set -euo pipefail
@@ -145,6 +145,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: preflight
     timeout-minutes: 30
+
+    # Hard no-network for test suite (preflight already validates connectivity).
+    env:
+      NO_NETWORK: "1"
+      DISABLE_NETWORK: "1"
 
     steps:
       - name: Checkout
@@ -173,14 +178,7 @@ jobs:
             python -m pip install -e .
           fi
 
-      # Mirrors your proven local command exactly
-      - name: Pytest (full suite)
-        run: |
-          set -euo pipefail
-          python -m pytest -q
-
-      # Mirrors your proven local command exactly (redundant but intentional)
-      - name: Pytest (exclude integration/network)
+      - name: Pytest (no integration / no network)
         run: |
           set -euo pipefail
           python -m pytest -q -m "not integration and not network"
