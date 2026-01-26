@@ -949,6 +949,18 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
             ],
         ),
+        EnvVar(
+            "TASK_SPAWN_CAPTURE_ORIGIN",
+            default="0",
+            kind="bool",
+            description="Task spawn: capture origin frames for debugging (0/1)",
+        ),
+        EnvVar(
+            "TASK_SPAWN_ORIGIN_FRAMES",
+            default="2",
+            kind="int",
+            description="Task spawn: number of origin frames to record (1..10 recommended)",
+        ),
         # ---------------------------------------------------------------------
         # [A9] ALERTS / NOTIFICATIONS (placeholders)
         # ---------------------------------------------------------------------

@@ -33,13 +33,15 @@ hook_stdio()
 log = get_logger(__name__)
 set_log_context(run_id="...", trade_id="...")
 log.info("boot ok", extra={"event": "BOOT_OK"})
+log.event("WHY_NOT_TRADING", reason="momo_gate", score=0.12)
 event(log, "WHY_NOT_TRADING", reason="momo_gate", score=0.12)
 
 Spam guards
 -----------
 log = get_logger(__name__)
-log.every("CANDIDATE_SKIPPED", every_sec=30, reason="gate", score=0.11)  # at most once per 30s
+log.every("CANDIDATE_SKIPPED", 30, reason="gate", score=0.11)  # at most once per 30s
 log.every("HTTPX_RETRY", every_sec=10, url="...", status=429)
+log.once("BOOT_OK", build="abc123")
 
 Back-compat
 -----------
@@ -87,7 +89,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import TracebackType
-from typing import Any
+from typing import Any, Protocol, cast
 
 UTC = timezone.utc
 
@@ -97,6 +99,40 @@ UTC = timezone.utc
 
 _BASE_STDOUT = getattr(sys, "__stdout__", None) or sys.stdout
 _BASE_STDERR = getattr(sys, "__stderr__", None) or sys.stderr
+
+# =============================================================================
+# Typing: EventLogger protocol (fixes mypy attr errors repo-wide)
+# =============================================================================
+
+
+class EventLogger(Protocol):
+    # Standard logging API (must accept *args and **kwargs like std logging)
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def critical(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def log(self, level: int, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def isEnabledFor(self, level: int) -> bool: ...
+
+    # God-tier extensions
+    def event(
+        self, name: str, /, msg: str | None = None, level: str | int = logging.INFO, **fields: Any
+    ) -> None: ...
+    def every(
+        self,
+        name: str,
+        *args: Any,
+        every_sec: float | None = None,
+        level: str | int = logging.INFO,
+        msg: str | None = None,
+        **fields: Any,
+    ) -> bool: ...
+    def once(
+        self, name: str, /, msg: str | None = None, level: str | int = logging.INFO, **fields: Any
+    ) -> bool: ...
+
 
 # =============================================================================
 # Contextvars (per-task/per-request metadata)
@@ -229,6 +265,7 @@ _DEFAULTS: _LogDefaults = _LogDefaults(
 )
 
 __all__ = [
+    "EventLogger",
     "bind",
     "bump",
     "clear_log_context",
@@ -459,8 +496,8 @@ def _is_sensitive_key_name(k: str) -> bool:
     )
 
 
-def _collect_secret_values() -> list[str]:
-    if not _DEFAULTS.redact_secret_values:
+def _collect_secret_values(redact_secret_values: bool) -> list[str]:
+    if not redact_secret_values:
         return []
     values: set[str] = set()
     try:
@@ -484,7 +521,7 @@ _SECRET_VALUES: list[str] = []
 def _refresh_secret_values() -> None:
     global _SECRET_VALUES
     with _SECRET_VALUES_LOCK:
-        _SECRET_VALUES = _collect_secret_values()
+        _SECRET_VALUES = _collect_secret_values(_DEFAULTS.redact_secret_values)
 
 
 def _mask_tokenish_match(m: re.Match) -> str:
@@ -725,9 +762,7 @@ class ContextFilter(logging.Filter):
         ctx = get_log_context()
         for k, v in ctx.items():
             ks = str(k)
-            if ks in _RESERVED_RECORD_KEYS:
-                continue
-            if ks.startswith("_"):
+            if ks in _RESERVED_RECORD_KEYS or ks.startswith("_"):
                 continue
             try:
                 setattr(record, ks, redact_value(ks, v))
@@ -806,11 +841,7 @@ class JsonFormatter(logging.Formatter):
             )
 
         for k, v in record.__dict__.items():
-            if k in _RESERVED_RECORD_KEYS:
-                continue
-            if k.startswith("_"):
-                continue
-            if k in payload:
+            if k in _RESERVED_RECORD_KEYS or k.startswith("_") or k in payload:
                 continue
             payload[str(k)] = _jsonable(redact_value(str(k), v))
 
@@ -883,7 +914,7 @@ class TextFormatter(logging.Formatter):
 
 
 # =============================================================================
-# Spam guards (log.every-style)
+# Spam guards + extensions: logger.every / logger.event / logger.once
 # =============================================================================
 
 
@@ -896,6 +927,9 @@ class _EveryState:
 _EVERY_LOCK = threading.Lock()
 _EVERY: dict[tuple[str, str], _EveryState] = {}
 _EVERY_MAX_KEYS = 50_000
+
+_ONCE_LOCK = threading.Lock()
+_ONCE: set[tuple[str, str]] = set()
 
 
 def _every_key(logger: logging.Logger, name: str) -> tuple[str, str]:
@@ -964,6 +998,7 @@ def _logger_every(
     msg: str | None = None,
     **fields: Any,
 ) -> bool:
+    # Back-compat: .every("evt", 30) or .every("evt", 30, "WARNING")
     if args:
         if len(args) >= 1 and every_sec is None:
             every_sec = args[0]
@@ -986,11 +1021,46 @@ def _logger_every(
     )
 
 
-def _install_every_on_logger_class() -> None:
-    if callable(getattr(logging.Logger, "every", None)):
-        return
-    with suppress(Exception):
-        logging.Logger.every = _logger_every
+def _logger_event(
+    self: logging.Logger,  # noqa: ANN001
+    name: str,
+    /,
+    msg: str | None = None,
+    level: str | int = logging.INFO,
+    **fields: Any,
+) -> None:
+    extra: dict[str, Any] = {"event": name}
+    extra.update(fields)
+    text = msg if msg is not None else name
+    self.log(_parse_level(level), text, extra=extra)
+
+
+def _logger_once(
+    self: logging.Logger,  # noqa: ANN001
+    name: str,
+    /,
+    msg: str | None = None,
+    level: str | int = logging.INFO,
+    **fields: Any,
+) -> bool:
+    key = (self.name, name)
+    with _ONCE_LOCK:
+        if key in _ONCE:
+            return False
+        _ONCE.add(key)
+    _logger_event(self, name, msg=msg, level=level, **fields)
+    return True
+
+
+def _install_logger_extras() -> None:
+    # mypy-safe monkeypatching
+    lg_cls = cast(Any, logging.Logger)
+    if not callable(getattr(logging.Logger, "every", None)):
+        lg_cls.every = _logger_every
+    if not callable(getattr(logging.Logger, "event", None)):
+        lg_cls.event = _logger_event
+    if not callable(getattr(logging.Logger, "once", None)):
+        lg_cls.once = _logger_once
 
 
 # =============================================================================
@@ -999,12 +1069,12 @@ def _install_every_on_logger_class() -> None:
 
 
 class BoundLogger:
-    def __init__(self, logger: logging.Logger, bound: Mapping[str, Any]) -> None:
+    def __init__(self, logger: EventLogger, bound: Mapping[str, Any]) -> None:
         self._logger = logger
         self._bound = dict(bound)
 
     @property
-    def logger(self) -> logging.Logger:
+    def logger(self) -> EventLogger:
         return self._logger
 
     def _merge_extra(self, extra: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -1056,6 +1126,11 @@ class BoundLogger:
     ) -> None:
         self._logger.critical(msg, *args, extra=self._merge_extra(extra), **kwargs)
 
+    def event(
+        self, name: str, /, msg: str | None = None, level: str | int = logging.INFO, **fields: Any
+    ) -> None:
+        self._logger.event(name, msg=msg, level=level, **fields)
+
     def every(
         self,
         name: str,
@@ -1069,11 +1144,16 @@ class BoundLogger:
             self._logger.every(name, *args, every_sec=every_sec, level=level, msg=msg, **fields)
         )
 
+    def once(
+        self, name: str, /, msg: str | None = None, level: str | int = logging.INFO, **fields: Any
+    ) -> bool:
+        return bool(self._logger.once(name, msg=msg, level=level, **fields))
+
     def __getattr__(self, item: str) -> Any:
         return getattr(self._logger, item)
 
 
-def bind(logger: logging.Logger | str | None = None, **kwargs: Any) -> BoundLogger:
+def bind(logger: EventLogger | str | None = None, **kwargs: Any) -> BoundLogger:
     if logger is None:
         lg = get_logger()
     elif isinstance(logger, str):
@@ -1083,14 +1163,12 @@ def bind(logger: logging.Logger | str | None = None, **kwargs: Any) -> BoundLogg
     return BoundLogger(lg, kwargs)
 
 
-def event(logger: logging.Logger | BoundLogger | None, name: str, **fields: Any) -> None:
+def event(logger: EventLogger | BoundLogger | None, name: str, **fields: Any) -> None:
     lg = logger or get_logger()
-    extra = {"event": name}
-    extra.update(fields)
     if isinstance(lg, BoundLogger):
-        lg.info(name, extra=extra)
+        lg.event(name, **fields)
     else:
-        lg.info(name, extra=extra)
+        lg.event(name, **fields)
 
 
 # =============================================================================
@@ -1212,7 +1290,8 @@ def configure_logging(
 ) -> None:
     global _CONFIGURED, _RUNTIME, _DEFAULTS
 
-    _install_every_on_logger_class()
+    _install_logger_extras()
+
     _DEFAULTS = _read_env_defaults()
     _refresh_secret_values()
 
@@ -1305,7 +1384,10 @@ def get_logger(
     use_utc: bool | None = None,
     include_src: bool | None = None,
     force: bool = False,
-) -> logging.Logger:
+) -> EventLogger:
+    # Ensure extensions exist even if caller never called configure_logging() directly.
+    _install_logger_extras()
+
     needs_config = (not _CONFIGURED) or any(
         x is not None for x in (service, version, env, level, json_logs, use_utc, include_src)
     )
@@ -1325,7 +1407,8 @@ def get_logger(
             logging.basicConfig(level=_parse_level(level))
 
     target = name if name else (service or _DEFAULTS.service or "sniper")
-    return logging.getLogger(target)
+    lg = logging.getLogger(target)
+    return cast(EventLogger, lg)
 
 
 # =============================================================================
@@ -1334,7 +1417,7 @@ def get_logger(
 
 
 class _StreamToLogger(io.TextIOBase):
-    def __init__(self, logger: logging.Logger, level: int, tee: Any) -> None:
+    def __init__(self, logger: EventLogger, level: int, tee: Any) -> None:
         super().__init__()
         self._logger = logger
         self._level = int(level)
@@ -1476,7 +1559,7 @@ _OLD_THREAD_EXCEPTHOOK: Any | None = None
 _EXC_INSTALLED = False
 
 
-def install_excepthook(logger: logging.Logger | None = None) -> None:
+def install_excepthook(logger: EventLogger | None = None) -> None:
     global _OLD_EXCEPTHOOK, _OLD_THREAD_EXCEPTHOOK, _EXC_INSTALLED
 
     with _EXC_LOCK:
@@ -1699,6 +1782,10 @@ def reset_logging_state() -> None:
     with suppress(Exception):
         with _EVERY_LOCK:
             _EVERY.clear()
+
+    with suppress(Exception):
+        with _ONCE_LOCK:
+            _ONCE.clear()
 
     with suppress(Exception):
         reset_metrics()
