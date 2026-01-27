@@ -3,11 +3,12 @@
 # start.sh — Canonical Bootstrap Spine (P0 LOCK-IN / God-Tier)
 #
 # Hard guarantees:
-#   - Render fail-closed: gates MUST pass or we EXIT 1 (no broken boots)
+#   - Render fail-closed: gates MUST pass or EXIT 1 (no broken boots)
 #   - No secret leaks in logs (even on ERR traps)
 #   - Deterministic env + path + DSN normalization + wallet materialization
 #   - Safe dotenv loading (no eval; source only if explicitly allowed)
-#   - One canonical Python module launch + crash supervisor (optional restart)
+#   - One canonical Python module launch + crash supervisor (restart/backoff)
+#   - Optional health gating (readiness) + safe shutdown (signal forwarding)
 #
 # Subcommands:
 #   ./start.sh help
@@ -20,6 +21,7 @@
 #   ./start.sh compileall
 #   ./start.sh check-router [args...]
 #   ./start.sh check-jupiter [args...]
+#   ./start.sh healthcheck   (probe health URL if configured)
 #
 # Default run:
 #   ./start.sh
@@ -56,7 +58,6 @@ _on_err() {
   _log "ERROR rc=${rc} line=${line}"
   exit "${rc}"
 }
-
 trap '_on_err "$?" "$LINENO"' ERR
 trap 'rc=$?; _log "EXIT rc=$rc"' EXIT
 
@@ -68,9 +69,7 @@ _is_true() {
 }
 
 _mask_url() {
-  # Mask creds in URL-like strings:
-  # - Masks ANY userinfo@ portion in scheme://userinfo@host
-  # - Trims query
+  # Masks userinfo in scheme://userinfo@host and strips querystring
   local u="${1:-}"
   [[ -z "$u" ]] && { printf '%s' ""; return 0; }
 
@@ -116,7 +115,6 @@ if [[ -n "${RENDER_SERVICE_ID:-}" || -n "${RENDER_INSTANCE_ID:-}" || -n "${RENDE
 elif _is_true "${RENDER:-}"; then
   IS_RENDER=1
 fi
-# Make render-ness visible to Python too (harmless locally)
 if [[ "$IS_RENDER" == "1" ]]; then
   export RENDER=1
 fi
@@ -137,7 +135,7 @@ fi
 : "${RUN_ARGS:=}"
 : "${RUN_ARGS_FILE:=}"
 
-# Legacy module override knobs (compat; do not remove)
+# Legacy overrides (compat)
 if [[ -z "${RUN_MODULE_OVERRIDE:-}" ]]; then
   [[ -n "${ENTRYPOINT_MODULE:-}" ]] && RUN_MODULE_OVERRIDE="${ENTRYPOINT_MODULE}"
   [[ -n "${APP_ENTRYPOINT_MODULE:-}" ]] && RUN_MODULE_OVERRIDE="${APP_ENTRYPOINT_MODULE}"
@@ -158,45 +156,68 @@ fi
 
 : "${START_RUN_CI_SMOKE:=0}"
 
-: "${START_ALLOW_SOURCE_ENV:=0}"
-: "${START_ENV_OVERRIDE:=0}"
-: "${START_ENV_FILES:=}"
+# dotenv policy
+: "${START_ALLOW_SOURCE_ENV:=0}"   # if 1, source env files (less safe)
+: "${START_ENV_OVERRIDE:=0}"       # if 1, dotenv overrides existing vars
+: "${START_ENV_FILES:=}"           # comma/semicolon list to override search list
 : "${START_NO_DOTENV:=0}"
 
+# wallet policy
 : "${START_SKIP_WALLET:=0}"
 : "${START_WALLET_OVERWRITE:=0}"
 
+# redis policy
 : "${START_REDIS_OVERRIDE:=0}"
 : "${REDIS_DB:=0}"
 : "${REDIS_TLS:=0}"
 
+# DSN policy
 : "${START_NORMALIZE_DSN:=1}"
 : "${START_ADD_SSLMODE:=}"
 if [[ -z "${START_ADD_SSLMODE}" ]]; then
   START_ADD_SSLMODE="$IS_RENDER"
 fi
 
-# Preserve prior behavior: local can skip DSN, Render requires DSN unless overridden
+# Local can skip DSN by default; Render requires unless overridden
 if [[ -z "${SKIP_DSN_REQUIRED:-}" ]]; then
   if [[ "$IS_RENDER" == "1" ]]; then SKIP_DSN_REQUIRED="0"; else SKIP_DSN_REQUIRED="1"; fi
 fi
 
 : "${START_ULIMIT_NOFILE:=0}"
 
+# Supervisor policy
 : "${MAIN_RESTART_ON_CRASH:=1}"
-: "${MAIN_MAX_RESTARTS:=0}"        # 0=infinite
+: "${MAIN_MAX_RESTARTS:=0}"              # 0=infinite
 : "${MAIN_RESTART_BACKOFF_S:=3}"
 : "${MAIN_RESTART_MAX_BACKOFF_S:=30}"
 : "${MAIN_RESTART_JITTER_S:=2}"
 : "${MAIN_NO_RESTART_EXIT_CODES:=130,143}"
 : "${MAIN_USE_SETSID:=1}"
 
+# Crash-loop protection (hard stop if too many crashes in a window)
+: "${MAIN_CRASH_WINDOW_S:=300}"          # 5 minutes
+: "${MAIN_CRASH_MAX_IN_WINDOW:=6}"       # stop if >=6 crashes within window
+
+# Safe shutdown policy
+: "${STOP_GRACE_S:=25}"                  # seconds to wait before SIGKILL
+
 # Preflight behavior (hard gate defaults)
 : "${START_PREFLIGHT_FORCE:=1}"
 : "${START_PREFLIGHT_JSON_ONLY:=1}"
 : "${START_PREFLIGHT_PROFILE:=deploy}"
 
-# IMPORTANT: export contract vars that Python gatekeepers must see
+# Health gating (optional but bulletproof when configured)
+# If enabled and health never becomes OK, we fail the deploy.
+: "${START_HEALTH_GATING:=}"             # set to 1/0 to force
+: "${START_HEALTH_GATING_AUTO:=1}"       # if 1, auto-enable when URL can be inferred on Render
+: "${HEALTHCHECK_URL:=}"                 # override full URL
+: "${HEALTHCHECK_PATH:=/health}"         # used to infer URL if none provided
+: "${START_HEALTH_GATING_TIMEOUT_S:=75}"
+: "${START_HEALTH_GATING_INTERVAL_S:=2}"
+: "${START_HEALTH_GATING_REQUIRE_200:=0}" # if 1 require exact 200; else accept any 2xx
+: "${READY_FILE:=}"                      # if set, touch when healthy
+
+# export contract vars used by Python gatekeepers
 export RUN_MODE RUN_MODULE_OVERRIDE
 export SKIP_DSN_REQUIRED
 export REDIS_DB REDIS_TLS
@@ -260,7 +281,6 @@ PY
 }
 
 _supports_arg() {
-  # Usage: _supports_arg "scripts.preflight" "--strict"
   local mod="${1:-}" arg="${2:-}"
   [[ -z "$mod" || -z "$arg" ]] && return 1
   command -v grep >/dev/null 2>&1 || return 1
@@ -481,6 +501,7 @@ case "${cmd}" in
   ./start.sh bash-syntax
   ./start.sh check-router [args...]
   ./start.sh check-jupiter [args...]
+  ./start.sh healthcheck
 TXT
     exit 0
     ;;
@@ -536,6 +557,10 @@ PY
     ;;
   compileall)
     exec "$PYTHON" -m compileall -q .
+    ;;
+  healthcheck)
+    shift || true
+    # Probe only (does not start child)
     ;;
 esac
 
@@ -636,7 +661,6 @@ PY
 }
 
 if ! _is_true "${START_SKIP_WALLET}"; then
-  # Compat: if KEYPAIR_PATH points to a file, prefer it.
   if [[ -n "${KEYPAIR_PATH:-}" && -f "${KEYPAIR_PATH}" ]]; then
     export WALLET_PRIVATE_KEY="${KEYPAIR_PATH}"
   fi
@@ -644,7 +668,6 @@ if ! _is_true "${START_SKIP_WALLET}"; then
   if [[ -n "${WALLET_PRIVATE_KEY:-}" && -f "${WALLET_PRIVATE_KEY}" ]]; then
     : # already a path
   else
-    # Inline JSON in WALLET_PRIVATE_KEY
     if [[ -n "${WALLET_PRIVATE_KEY:-}" ]]; then
       case "${WALLET_PRIVATE_KEY}" in
         \[*|\{*)
@@ -654,7 +677,6 @@ if ! _is_true "${START_SKIP_WALLET}"; then
       esac
     fi
 
-    # Inline JSON in WALLET_JSON
     if [[ -z "${WALLET_PRIVATE_KEY:-}" || ! -f "${WALLET_PRIVATE_KEY:-}" ]]; then
       if [[ -n "${WALLET_JSON:-}" ]]; then
         _write_wallet_file "${WALLET_JSON}" || true
@@ -662,7 +684,6 @@ if ! _is_true "${START_SKIP_WALLET}"; then
       fi
     fi
 
-    # Base64 wallet JSON
     if [[ -z "${WALLET_PRIVATE_KEY:-}" || ! -f "${WALLET_PRIVATE_KEY:-}" ]]; then
       b64_val="${WALLET_JSON_B64:-${KEYPAIR_B64:-}}"
       if [[ -n "${b64_val:-}" ]]; then
@@ -980,7 +1001,80 @@ PY
 fi
 
 # -----------------------------------------------------------------------------
-# 13) Supervisor launch (signal forwarding + restart policy)
+# 13) Health gating (optional, bulletproof when configured)
+# -----------------------------------------------------------------------------
+_health_infer_url() {
+  local url="${HEALTHCHECK_URL:-}"
+  if [[ -n "$url" ]]; then
+    printf '%s' "$url"
+    return 0
+  fi
+
+  # Prefer explicit external URL when available (Render)
+  if [[ -n "${RENDER_EXTERNAL_URL:-}" ]]; then
+    printf '%s' "${RENDER_EXTERNAL_URL%/}${HEALTHCHECK_PATH}"
+    return 0
+  fi
+
+  # Fall back to localhost:PORT if a web server is expected
+  if [[ -n "${PORT:-}" ]]; then
+    printf '%s' "http://127.0.0.1:${PORT}${HEALTHCHECK_PATH}"
+    return 0
+  fi
+
+  printf '%s' ""
+  return 0
+}
+
+_http_status_python() {
+  local url="${1:-}"
+  "$PYTHON" - "$url" "${START_HEALTH_GATING_INTERVAL_S:-2}" <<'PY'
+import sys, ssl, urllib.request
+url = sys.argv[1]
+timeout = float(sys.argv[2]) if len(sys.argv) > 2 else 2.0
+ctx = ssl.create_default_context()
+try:
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+        code = getattr(r, "status", None) or r.getcode()
+        print(int(code))
+        raise SystemExit(0)
+except Exception:
+    print(0)
+    raise SystemExit(0)
+PY
+}
+
+_health_ok() {
+  local code="${1:-0}"
+  if _is_true "${START_HEALTH_GATING_REQUIRE_200:-0}"; then
+    [[ "$code" == "200" ]] && return 0
+    return 1
+  fi
+  # accept any 2xx
+  [[ "$code" =~ ^2[0-9][0-9]$ ]] && return 0
+  return 1
+}
+
+# Decide whether health gating is on
+if [[ -z "${START_HEALTH_GATING:-}" ]]; then
+  if [[ "$IS_RENDER" == "1" ]] && _is_true "${START_HEALTH_GATING_AUTO:-1}"; then
+    # auto-enable only if we can infer a URL
+    _u="$(_health_infer_url)"
+    if [[ -n "$_u" ]]; then
+      START_HEALTH_GATING="1"
+    else
+      START_HEALTH_GATING="0"
+    fi
+  else
+    START_HEALTH_GATING="0"
+  fi
+fi
+
+HEALTH_URL="$(_health_infer_url)"
+
+# -----------------------------------------------------------------------------
+# 14) Supervisor launch (signal forwarding + safe shutdown + restart policy)
 # -----------------------------------------------------------------------------
 _no_restart_csv="${MAIN_NO_RESTART_EXIT_CODES//;/,}"
 _no_restart_csv="${_no_restart_csv// /,}"
@@ -998,13 +1092,39 @@ _get_pgid() {
   return 1
 }
 
-_forward_signal() {
+_kill_child_group() {
   local sig="${1:-TERM}"
-  _log "Signal ${sig} received; forwarding"
   if [[ -n "${child_pgid:-}" ]]; then
     kill "-${sig}" -- "-${child_pgid}" 2>/dev/null || true
   elif [[ -n "${child_pid:-}" ]]; then
     kill "-${sig}" -- "${child_pid}" 2>/dev/null || true
+  fi
+}
+
+_graceful_stop() {
+  local sig="${1:-TERM}"
+  local grace="${STOP_GRACE_S:-25}"
+
+  _log "Stopping child: signal=${sig} grace=${grace}s"
+  _kill_child_group "$sig"
+
+  local waited=0
+  while [[ -n "${child_pid:-}" ]] && kill -0 "${child_pid}" 2>/dev/null; do
+    if [[ "$waited" -ge "$grace" ]]; then
+      _warn "Child did not stop within grace; SIGKILL"
+      _kill_child_group "KILL"
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
+_forward_signal() {
+  local sig="${1:-TERM}"
+  _log "Signal ${sig} received; forwarding"
+  if [[ -n "${child_pid:-}" ]]; then
+    _graceful_stop "$sig"
   fi
 }
 
@@ -1037,18 +1157,74 @@ _start_child() {
   child_pgid="$(_get_pgid "$child_pid" || true)"
 }
 
-_log "Launch: module=${RUN_MODULE} args=${#run_argv[@]} restart=${MAIN_RESTART_ON_CRASH}"
+_wait_health_or_fail() {
+  # Only used when START_HEALTH_GATING=1 and HEALTH_URL is non-empty.
+  local url="${1:-}"
+  local timeout="${START_HEALTH_GATING_TIMEOUT_S:-75}"
+  local interval="${START_HEALTH_GATING_INTERVAL_S:-2}"
+
+  [[ -z "$url" ]] && return 0
+
+  _log "Health gating: url=$(_mask_url "$url") timeout=${timeout}s interval=${interval}s"
+
+  local start
+  start="$(date +%s 2>/dev/null || echo 0)"
+
+  while true; do
+    # If process died during boot, fail immediately.
+    if [[ -n "${child_pid:-}" ]] && ! kill -0 "${child_pid}" 2>/dev/null; then
+      _warn "Health gating: child exited before ready"
+      return 1
+    fi
+
+    code="$(_http_status_python "$url" 2>/dev/null | tail -n 1 || echo 0)"
+    if _health_ok "$code"; then
+      _log "Health gating: OK (status=${code})"
+      if [[ -n "${READY_FILE:-}" ]]; then
+        mkdir -p "$(dirname "${READY_FILE}")" 2>/dev/null || true
+        printf '%s\n' "ready $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >"${READY_FILE}" 2>/dev/null || true
+      fi
+      return 0
+    fi
+
+    now="$(date +%s 2>/dev/null || echo 0)"
+    if [[ "$start" != "0" && "$now" != "0" ]]; then
+      elapsed=$((now - start))
+      if [[ "$elapsed" -ge "$timeout" ]]; then
+        _warn "Health gating: TIMEOUT (last_status=${code})"
+        return 1
+      fi
+    fi
+
+    sleep "$interval"
+  done
+}
+
+_log "Launch: module=${RUN_MODULE} args=${#run_argv[@]} restart=${MAIN_RESTART_ON_CRASH} health_gate=${START_HEALTH_GATING}"
 
 if ! _is_true "${MAIN_RESTART_ON_CRASH}"; then
+  # no supervisor: exec
   exec "${PYTHON}" -m "${RUN_MODULE}" "${run_argv[@]}"
 fi
 
 restarts=0
 backoff="${MAIN_RESTART_BACKOFF_S}"
+crash_window_start=0
+crashes_in_window=0
 
 while true; do
   rc=0
   _start_child
+
+  # Health gating (only if enabled AND URL available)
+  if _is_true "${START_HEALTH_GATING}" && [[ -n "${HEALTH_URL:-}" ]]; then
+    if ! _wait_health_or_fail "${HEALTH_URL}"; then
+      _warn "Health gating failed; stopping child and failing deploy"
+      _graceful_stop "TERM" || true
+      exit 1
+    fi
+  fi
+
   wait "${child_pid}" || rc=$?
 
   child_pid=""
@@ -1061,6 +1237,24 @@ while true; do
 
   if _should_stop_on_rc "$rc" "$_no_restart_csv"; then
     _log "Process exited rc=${rc} (stop codes=${_no_restart_csv}). Stopping."
+    exit "$rc"
+  fi
+
+  # crash-loop protection window
+  now_epoch="$(date +%s 2>/dev/null || echo 0)"
+  if [[ "$crash_window_start" == "0" || "$now_epoch" == "0" ]]; then
+    crash_window_start="$now_epoch"
+    crashes_in_window=0
+  fi
+  if [[ "$now_epoch" != "0" && "$crash_window_start" != "0" ]]; then
+    if [[ $((now_epoch - crash_window_start)) -gt "${MAIN_CRASH_WINDOW_S}" ]]; then
+      crash_window_start="$now_epoch"
+      crashes_in_window=0
+    fi
+  fi
+  crashes_in_window=$((crashes_in_window + 1))
+  if [[ "$crashes_in_window" -ge "${MAIN_CRASH_MAX_IN_WINDOW}" ]]; then
+    _log "Crash-loop protection tripped: ${crashes_in_window} crashes within ${MAIN_CRASH_WINDOW_S}s"
     exit "$rc"
   fi
 

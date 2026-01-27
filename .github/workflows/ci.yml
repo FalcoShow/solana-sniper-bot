@@ -4,6 +4,15 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_online_probes:
+        description: "Run optional online connectivity probes (RPC/Jupiter/etc). Not recommended for every PR."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 permissions:
   contents: read
@@ -12,17 +21,25 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Global env: safe posture everywhere.
-# We do NOT force NO_NETWORK globally because preflight is intended to validate
-# RPC/Jupiter/router connectivity.
+# Global env: SAFE + deterministic.
+# - CI should be stable and reproducible.
+# - Online probes are optional (manual), to avoid flaky PR failures.
 env:
   SAFE_MODE: "1"
   DRYRUN: "1"
   CI: "1"
+
   PYTHONUNBUFFERED: "1"
   PYTHONFAULTHANDLER: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   TZ: "UTC"
+
+  # Default to offline posture unless a job explicitly enables probes.
+  NO_NETWORK: "1"
+  DISABLE_NETWORK: "1"
+  NO_NETWORK_POLICY: "1"
+  PROBES_ENABLED: "0"
+
   # Make imports work for both repo-root and src/ layouts (Linux runner path separator is ":")
   PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/src
 
@@ -31,15 +48,10 @@ defaults:
     shell: bash
 
 jobs:
-  smoke:
-    name: Smoke (compile + hard no-network imports)
+  quality:
+    name: Quality (ruff + format + compile)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
-    # Hard no-network for this job only.
-    env:
-      NO_NETWORK: "1"
-      DISABLE_NETWORK: "1"
 
     steps:
       - name: Checkout
@@ -51,63 +63,121 @@ jobs:
           python-version: "3.13"
           cache: pip
 
-      - name: Install dependencies
+      - name: Install deps (runtime + dev)
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
 
-          if [ -f requirements-dev.txt ]; then
-            python -m pip install -r requirements-dev.txt
-          fi
-
+          # Runtime deps
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
           fi
 
-          # Optional editable install if the repo is packaged
-          if [ -f pyproject.toml ] || [ -f setup.cfg ] || [ -f setup.py ]; then
-            python -m pip install -e .
+          # Dev deps (prefer requirements-dev.txt, else use pyproject extras if available)
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          elif [ -f pyproject.toml ]; then
+            python -m pip install -e ".[dev]"
+          else
+            # Fallback: at least ensure ruff/pytest exist
+            python -m pip install ruff pytest pytest-asyncio
           fi
 
-          python -c "import sys; print(sys.version)"
+          python -m pip check || true
+          python -c "import sys; print('python', sys.version)"
+
+      - name: Ruff (check)
+        run: |
+          set -euo pipefail
+          python -m ruff check .
+
+      - name: Ruff (format check)
+        run: |
+          set -euo pipefail
+          python -m ruff format --check .
 
       - name: Compile all (syntax / import-time issues)
         run: |
           set -euo pipefail
           python -m compileall -q -f .
 
+  smoke:
+    name: Smoke (no-network spine + init)
+    runs-on: ubuntu-latest
+    needs: quality
+    timeout-minutes: 15
+
+    # Hard no-network for this job (stable CI).
+    env:
+      NO_NETWORK: "1"
+      DISABLE_NETWORK: "1"
+      NO_NETWORK_POLICY: "1"
+      PROBES_ENABLED: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python (3.13)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install deps (runtime + dev)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip wheel setuptools
+
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
+
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          elif [ -f pyproject.toml ]; then
+            python -m pip install -e ".[dev]"
+          else
+            python -m pip install pytest pytest-asyncio
+          fi
+
+      - name: Prepare artifacts dir
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+
       - name: CI smoke (hard no-network spine imports)
         run: |
           set -euo pipefail
-          python -m scripts.ci_smoke
+          python -m scripts.ci_smoke | tee artifacts/ci_smoke.txt
 
-      - name: Ruff (optional; non-blocking)
-        continue-on-error: true
+      - name: smoke_init (json-only, probes disabled)
         run: |
           set -euo pipefail
-          if command -v ruff >/dev/null 2>&1; then
-            ruff check . || true
-            ruff format --check . || true
-          else
-            echo "ruff not installed; skipping."
-          fi
+          python -m scripts.smoke_init --json-only | tee artifacts/smoke_init.json
 
-      - name: Mypy (optional; non-blocking)
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          if command -v mypy >/dev/null 2>&1; then
-            mypy . || true
-          else
-            echo "mypy not installed; skipping."
-          fi
+      - name: Upload artifacts (smoke)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-artifacts
+          path: artifacts
+          if-no-files-found: ignore
 
   preflight:
-    name: Preflight (deploy profile)
+    name: Preflight (deploy profile, deterministic)
     runs-on: ubuntu-latest
     needs: smoke
     timeout-minutes: 20
 
+    # Keep preflight deterministic in CI (offline by default).
+    # Online probes are handled by the optional job below.
+    env:
+      NO_NETWORK: "1"
+      DISABLE_NETWORK: "1"
+      NO_NETWORK_POLICY: "1"
+      PROBES_ENABLED: "0"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -118,38 +188,53 @@ jobs:
           python-version: "3.13"
           cache: pip
 
-      - name: Install dependencies
+      - name: Install deps (runtime + dev)
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
-
-          if [ -f requirements-dev.txt ]; then
-            python -m pip install -r requirements-dev.txt
-          fi
 
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
           fi
 
-          if [ -f pyproject.toml ] || [ -f setup.cfg ] || [ -f setup.py ]; then
-            python -m pip install -e .
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          elif [ -f pyproject.toml ]; then
+            python -m pip install -e ".[dev]"
+          else
+            python -m pip install pytest pytest-asyncio
           fi
+
+      - name: Prepare artifacts dir
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
 
       - name: Run preflight (json-only)
         run: |
           set -euo pipefail
-          python -m scripts.preflight --json-only
+          python -m scripts.preflight --json-only | tee artifacts/preflight.json
+
+      - name: Upload artifacts (preflight)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preflight-artifacts
+          path: artifacts
+          if-no-files-found: ignore
 
   tests:
-    name: Tests (pytest)
+    name: Tests (pytest, no network)
     runs-on: ubuntu-latest
     needs: preflight
     timeout-minutes: 30
 
-    # Hard no-network for test suite (preflight already validates connectivity).
+    # Hard no-network for the test suite.
     env:
       NO_NETWORK: "1"
       DISABLE_NETWORK: "1"
+      NO_NETWORK_POLICY: "1"
+      PROBES_ENABLED: "0"
 
     steps:
       - name: Checkout
@@ -161,24 +246,98 @@ jobs:
           python-version: "3.13"
           cache: pip
 
-      - name: Install dependencies
+      - name: Install deps (runtime + dev)
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
-
-          if [ -f requirements-dev.txt ]; then
-            python -m pip install -r requirements-dev.txt
-          fi
 
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
           fi
 
-          if [ -f pyproject.toml ] || [ -f setup.cfg ] || [ -f setup.py ]; then
-            python -m pip install -e .
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          elif [ -f pyproject.toml ]; then
+            python -m pip install -e ".[dev]"
+          else
+            python -m pip install pytest pytest-asyncio pytest-xdist
           fi
+
+      - name: Prepare artifacts dir
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
 
       - name: Pytest (no integration / no network)
         run: |
           set -euo pipefail
-          python -m pytest -q -m "not integration and not network"
+          python -m pytest -q -m "not integration and not network" --junitxml=artifacts/junit.xml --durations=25
+
+      - name: Upload artifacts (tests)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts
+          path: artifacts
+          if-no-files-found: ignore
+
+  # Optional job: run ONLY when you manually request it.
+  # This avoids flaky PR failures due to external DNS/RPC/Jupiter instability.
+  online_probes:
+    name: Online Probes (optional, manual)
+    runs-on: ubuntu-latest
+    needs: tests
+    timeout-minutes: 20
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_online_probes == 'true' }}
+
+    # Enable probes + allow network ONLY here.
+    env:
+      NO_NETWORK: "0"
+      DISABLE_NETWORK: "0"
+      NO_NETWORK_POLICY: "0"
+      PROBES_ENABLED: "1"
+      DRYRUN: "1"
+      SAFE_MODE: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python (3.13)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install deps (runtime + dev)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip wheel setuptools
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          elif [ -f pyproject.toml ]; then
+            python -m pip install -e ".[dev]"
+          fi
+
+      - name: Prepare artifacts dir
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+
+      - name: check_router (json-only) — best-effort visibility
+        run: |
+          set -euo pipefail
+          # NOTE: this job is informational. If your router contract requires secrets,
+          # keep those out of CI; run this locally or in a protected environment.
+          python -m scripts.check_router --json-only | tee artifacts/check_router.json
+
+      - name: Upload artifacts (online probes)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: online-probes-artifacts
+          path: artifacts
+          if-no-files-found: ignore

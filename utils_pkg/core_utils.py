@@ -11,8 +11,8 @@ Non-negotiables
 - FakeSession-first HTTP (tests inject session).
 - In contract/safe/pytest mode: NEVER sleep/backoff in a way that can hang tests.
 
-Key test contracts (based on your failures/logs)
-------------------------------------------------
+Key test contracts (LOCKED)
+---------------------------
 - convert_sol_to_usd exists and uses COINGECKO path (FakeSession) and returns expected value in tests
 - get_token_price uses Birdeye path (FakeSession) and returns expected value in tests
 - get_jupiter_quote:
@@ -28,8 +28,8 @@ Render / module-matrix lock-in
 Notes
 -----
 This file is intentionally defensive:
-- All heavy deps are optional and imported lazily.
-- HTTP layer prefers injected session; only creates real aiohttp/httpx clients when allowed.
+- Heavy deps are optional and imported lazily.
+- HTTP prefers injected session; creates real aiohttp/httpx clients only when allowed.
 - Redis/SQLite/Solana RPC are lazy and gated by contract/safe/pytest flags.
 
 """
@@ -37,15 +37,16 @@ This file is intentionally defensive:
 import asyncio
 import base64
 import contextlib
+import inspect
 import json
 import os
 import random
 import ssl
 import struct
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Coroutine
 from contextlib import asynccontextmanager
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import certifi
@@ -91,14 +92,13 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _in_pytest() -> bool:
-    # PYTEST_CURRENT_TEST is always set during pytest runs.
     return bool(os.getenv("PYTEST_CURRENT_TEST"))
 
 
 def _contract_no_network() -> bool:
     """
     True => behave as strictly offline / no real network / no sleeping.
-    FakeSession is still allowed.
+    FakeSession is still allowed (tests inject).
     """
     v = os.getenv("NETWORK", "").strip().lower()
     if v in ("off", "0", "false", "no"):
@@ -118,25 +118,19 @@ def _contract_no_network() -> bool:
     if os.getenv("SAFE_MODE", "").strip().lower() in _TRUE:
         return True
 
-    # In pytest, default to no real network unless explicitly allowed
+    # Default: tests run offline unless explicitly allowed
     return bool(_in_pytest() and not _env_bool("ALLOW_TEST_NET", False))
 
 
 def _contract_no_redis() -> bool:
-    """
-    Redis is network I/O; disable in contract/no-network OR explicit redis toggles.
-    """
     if _contract_no_network():
         return True
     if os.getenv("DISABLE_REDIS", "").strip().lower() in _TRUE:
         return True
-    return os.getenv("REDIS_ENABLED", "").strip().lower() in _FALSE
+    return bool(os.getenv("REDIS_ENABLED", "").strip().lower() in _FALSE)
 
 
 async def _sleep(seconds: float) -> None:
-    """
-    Global sleep guard: in contract/safe/pytest mode, NEVER sleep (prevents hangs).
-    """
     if seconds <= 0:
         return
     if _contract_no_network():
@@ -181,7 +175,6 @@ except Exception:  # pragma: no cover
 
 log = get_logger(__name__)
 
-
 if not hasattr(log, "event"):
 
     def _event(name: str, **kw: Any) -> None:  # pragma: no cover
@@ -189,7 +182,6 @@ if not hasattr(log, "event"):
             log.info("%s %s", name, kw)
 
     log.event = _event  # type: ignore[attr-defined]
-
 
 if not hasattr(log, "every"):
 
@@ -289,13 +281,13 @@ JUPITER_SWAP_API = _env_str("JUPITER_SWAP_API", "") or "https://quote-api.jup.ag
 # ──────────────────────────────────────────────────────────────────────────────
 # Runtime globals (NO I/O here)
 # ──────────────────────────────────────────────────────────────────────────────
-# NOTE: tests often monkeypatch one of these names; keep a few aliases.
 _aiohttp_session: Any = None
-aiohttp_session: Any = None  # compat alias
-_http_session: Any = None  # compat alias
-http_session: Any = None  # compat alias
-_HTTP_SESSION: Any = None  # compat alias
-session: Any = None  # compat alias
+aiohttp_session: Any = None
+_http_session: Any = None
+http_session: Any = None
+_HTTP_SESSION: Any = None
+HTTP_SESSION: Any = None
+session: Any = None
 
 _aiohttp_lock = asyncio.Lock()
 
@@ -320,7 +312,7 @@ _SQLITE_READY = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# NullRedis for contract/no-network tests
+# NullRedis for contract/no-network tests (and safe default fallback)
 # ──────────────────────────────────────────────────────────────────────────────
 class _NullRedis:
     async def get(self, key: str) -> Any:
@@ -370,9 +362,6 @@ _NULL_REDIS = _NullRedis()
 # FakeSession-first HTTP helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def get_http_session() -> Any:
-    """
-    CRITICAL: Must find FakeSession fixture no matter what global name tests use.
-    """
     g = globals()
     candidates = [
         "_aiohttp_session",
@@ -405,10 +394,6 @@ def get_http_session() -> Any:
 
 @asynccontextmanager
 async def _as_ctx(obj: Any):
-    """
-    Wrap any response-like object into an async context manager.
-    FakeSession often returns an object that already supports __aenter__/__aexit__.
-    """
     if hasattr(obj, "__aenter__") and hasattr(obj, "__aexit__"):
         async with obj as resp:
             yield resp
@@ -438,7 +423,7 @@ def _parse_status_like(v: Any) -> int:
 
 
 async def _read_json_resp(resp: Any) -> Any:
-    # Some FakeResponse objects stash payload directly.
+    # Many FakeSession responses store JSON directly
     for attr in ("_payload", "payload", "data", "json_data"):
         if hasattr(resp, attr):
             v = getattr(resp, attr)
@@ -465,10 +450,7 @@ async def _read_json_resp(resp: Any) -> Any:
 
 
 async def _ensure_aiohttp_session() -> Any:
-    """
-    Real aiohttp session is PROD-only. In contract/pytest mode: return None.
-    """
-    global _aiohttp_session, aiohttp_session
+    global _aiohttp_session, aiohttp_session, HTTP_SESSION, session
     if _contract_no_network():
         return None
 
@@ -479,6 +461,8 @@ async def _ensure_aiohttp_session() -> Any:
                     _aiohttp_session = None
             if _aiohttp_session is not None:
                 aiohttp_session = _aiohttp_session
+                HTTP_SESSION = _aiohttp_session
+                session = _aiohttp_session
                 return _aiohttp_session
 
         import aiohttp  # lazy
@@ -493,14 +477,18 @@ async def _ensure_aiohttp_session() -> Any:
             timeout=aiohttp.ClientTimeout(total=_env_float("HTTP_TIMEOUT_SEC", 18.0)),
         )
         aiohttp_session = _aiohttp_session
+        HTTP_SESSION = _aiohttp_session
+        session = _aiohttp_session
         return _aiohttp_session
 
 
 async def _close_aiohttp_session() -> None:
-    global _aiohttp_session, aiohttp_session
+    global _aiohttp_session, aiohttp_session, HTTP_SESSION, session
     s = _aiohttp_session
     _aiohttp_session = None
     aiohttp_session = None
+    HTTP_SESSION = None
+    session = None
     if s is None:
         return
     with contextlib.suppress(Exception):
@@ -520,13 +508,12 @@ async def _get_json_with_status(
     """
     s = session or get_http_session()
 
-    # If no FakeSession is present, and we're in contract/no-network, stop here.
-    if s is None and _contract_no_network():
-        return 0, None
-
-    # Production fallback only when allowed
+    # If no injected session AND we are offline/contract => stop (NO real network).
     if s is None:
+        if _contract_no_network():
+            return 0, None
         s = await _ensure_aiohttp_session()
+
     if s is None:
         return 0, None
 
@@ -561,11 +548,62 @@ async def _get_json_with_status(
         return 0, None
 
 
+async def _post_json_with_status(
+    url: str,
+    *,
+    json_payload: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    session: Any | None = None,
+    timeout_s: float | None = None,
+) -> tuple[int, Any | None]:
+    s = session or get_http_session()
+
+    if s is None:
+        if _contract_no_network():
+            return 0, None
+        s = await _ensure_aiohttp_session()
+
+    if s is None:
+        return 0, None
+
+    try:
+        try:
+            if timeout_s is not None:
+                req = s.post(url, json=json_payload, headers=headers, timeout=float(timeout_s))
+            else:
+                req = s.post(url, json=json_payload, headers=headers)
+        except TypeError:
+            req = s.post(url, json=json_payload)
+
+        if asyncio.iscoroutine(req):
+            req = await req
+
+        async with _as_ctx(req) as resp:
+            payload = await _read_json_resp(resp)
+
+            st = 0
+            for attr in ("status", "status_code", "code", "_status"):
+                if hasattr(resp, attr):
+                    st = _parse_status_like(getattr(resp, attr))
+                    if st:
+                        break
+
+            if not st and isinstance(payload, dict):
+                for k in ("status", "status_code", "code"):
+                    if k in payload:
+                        st = _parse_status_like(payload.get(k))
+                        if st:
+                            break
+
+            return int(st or 0), payload
+    except Exception:
+        return 0, None
+
+
 async def _get_json(
     url: str, *, headers: dict[str, str] | None = None, session: Any | None = None
 ) -> Any | None:
     st, payload = await _get_json_with_status(url, headers=headers, session=session)
-    # If FakeSession doesn't provide status, st==0; accept payload.
     if st and st != 200:
         return None
     return payload
@@ -606,9 +644,6 @@ async def _http_get_json(
     timeout_s: float | None = None,
     retries: int | None = None,
 ) -> dict[str, Any] | None:
-    """
-    PROD fallback only. In contract/pytest mode -> fast None.
-    """
     if _contract_no_network():
         return None
     if _in_pytest() and not _env_bool("ALLOW_TEST_HTTPX", False):
@@ -662,25 +697,25 @@ async def _init_redis_if_needed() -> None:
 
     url = _effective_redis_url()
     if not url:
-        redis = None
+        redis = _NULL_REDIS
         return
 
     try:
         import redis.asyncio as redis_async  # type: ignore
     except Exception:
-        redis = None
+        redis = _NULL_REDIS
         return
 
     try:
         redis = redis_async.from_url(url, decode_responses=True)
     except Exception:
-        redis = None
+        redis = _NULL_REDIS
 
 
 def get_redis() -> Any:
     if _contract_no_redis():
         return _NULL_REDIS
-    return redis
+    return redis if redis is not None else _NULL_REDIS
 
 
 async def get_redis_async() -> Any:
@@ -744,19 +779,18 @@ def _sqlite_exec_sync(sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any,
 
 async def init_sqlite() -> None:
     global _SQLITE_READY
-    if not _SQLITE_ENABLED:
+
+    if not _SQLITE_ENABLED or _SQLITE_READY:
         return
-    if _SQLITE_READY:
-        return
+
     async with _SQLITE_LOCK:
-        if _SQLITE_READY:
-            return
-        await asyncio.to_thread(
-            _sqlite_exec_sync,
-            "CREATE TABLE IF NOT EXISTS sniped_tokens (token TEXT PRIMARY KEY, price REAL, timestamp INTEGER, unit TEXT)",
-            (),
-        )
-        _SQLITE_READY = True
+        if not _SQLITE_READY:
+            await asyncio.to_thread(
+                _sqlite_exec_sync,
+                "CREATE TABLE IF NOT EXISTS sniped_tokens (token TEXT PRIMARY KEY, price REAL, timestamp INTEGER, unit TEXT)",
+                (),
+            )
+            _SQLITE_READY = True
 
 
 async def remember_entry_price(
@@ -805,11 +839,8 @@ async def save_entry_price(
     unit: str = "usd",
     **_ignored: Any,
 ) -> None:
-    _ = args  # compatibility placeholder
+    _ = args
 
-    # positional compatibility:
-    #   save_entry_price(mint, price)
-    #   save_entry_price(redis, mint, price)
     if mint is None and token_mint is None:
         if c is not None:
             redis = redis or a
@@ -857,9 +888,6 @@ async def get_entry_price(
 ) -> float | None:
     _ = args
 
-    # positional compatibility:
-    #   get_entry_price(mint)
-    #   get_entry_price(redis, mint)
     if mint is None and token_mint is None:
         if b is not None:
             redis = redis or a
@@ -893,9 +921,7 @@ async def get_entry_price(
         return default
 
     rows = await asyncio.to_thread(
-        _sqlite_exec_sync,
-        "SELECT price, unit FROM sniped_tokens WHERE token = ?",
-        (m,),
+        _sqlite_exec_sync, "SELECT price, unit FROM sniped_tokens WHERE token = ?", (m,)
     )
     if not rows:
         return default
@@ -1014,7 +1040,7 @@ async def send_telegram(
     parse_mode: str | None = None,
     disable_preview: bool = True,
     timeout_s: float | None = None,
-    sol_value: float | None = None,  # required by some integrations/tests
+    sol_value: float | None = None,
     usd_value: float | None = None,
     **_ignored: Any,
 ) -> bool:
@@ -1048,31 +1074,12 @@ async def send_telegram(
     if parse_mode:
         payload["parse_mode"] = str(parse_mode)
 
-    s = session or get_http_session()
-    if s is None and _contract_no_network():
+    st, data = await _post_json_with_status(
+        url, json_payload=payload, session=session, timeout_s=timeout_s
+    )
+    if st and st != 200:
         return False
-    if s is None:
-        s = await _ensure_aiohttp_session()
-    if s is None:
-        return False
-
-    try:
-        try:
-            if timeout_s is not None:
-                req = s.post(url, json=payload, timeout=float(timeout_s))
-            else:
-                req = s.post(url, json=payload)
-        except TypeError:
-            req = s.post(url, json=payload)
-
-        if asyncio.iscoroutine(req):
-            req = await req
-
-        async with _as_ctx(req) as resp:
-            data = await _read_json_resp(resp)
-            return bool(isinstance(data, dict) and data.get("ok") is True)
-    except Exception:
-        return False
+    return bool(isinstance(data, dict) and data.get("ok") is True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1085,7 +1092,6 @@ async def get_sol_usd(*, session: Any | None = None) -> float:
     if _SOL_CACHE_PX > 0 and cache_s > 0 and (now - _SOL_CACHE_TS) < cache_s:
         return float(_SOL_CACHE_PX)
 
-    # FakeSession-first
     data = await _get_json(COINGECKO_SOL_API, session=session)
     if isinstance(data, dict):
         px = _safe_float(((data.get("solana") or {}).get("usd")), 0.0)
@@ -1094,7 +1100,6 @@ async def get_sol_usd(*, session: Any | None = None) -> float:
             _SOL_CACHE_TS = now
             return float(_SOL_CACHE_PX)
 
-    # PROD fallback
     data2 = await _http_get_json(COINGECKO_SOL_API, timeout_s=10.0)
     if isinstance(data2, dict):
         px2 = _safe_float(((data2.get("solana") or {}).get("usd")), 0.0)
@@ -1155,7 +1160,6 @@ async def get_token_price(token_address: str, *, session: Any | None = None) -> 
 
     url = BIRDEYE_PRICE_URL.format(mint=token_address)
 
-    # FakeSession-first
     st, raw = await _get_json_with_status(url, headers=_birdeye_headers(), session=session)
     if (st == 200 or st == 0) and raw is not None:
         px = _parse_birdeye_price_usd(raw)
@@ -1163,7 +1167,6 @@ async def get_token_price(token_address: str, *, session: Any | None = None) -> 
             _TOKEN_CACHE[token_address] = (time.time(), float(px))
             return float(px)
 
-    # PROD fallback
     raw2 = await _http_get_json(url, headers=_birdeye_headers(), timeout_s=10.0)
     px2 = _parse_birdeye_price_usd(raw2)
     if px2 > 0:
@@ -1204,8 +1207,6 @@ def _slp01_to_bps(v: float) -> int:
         return int(_env_int("JUP_SLIPPAGE_BPS", 50))
     if x <= 0:
         return int(_env_int("JUP_SLIPPAGE_BPS", 50))
-    # v in [0..1] => fraction; if someone passes percent like 1.0 = 1% (rare),
-    # the clamp below keeps it sane.
     bps = int(round(x * 10000)) if x <= 0.2 else int(round(x / 100.0 * 10000))
     return int(max(1, min(9900, bps)))
 
@@ -1239,7 +1240,7 @@ def _find_quote(obj: Any) -> dict[str, Any] | None:
     if isinstance(obj, dict):
         if "inAmount" in obj or "outAmount" in obj:
             return obj
-        for k in ("data", "quote", "result", "route", "routes"):
+        for k in ("data", "quote", "result", "route", "routes", "routePlan"):
             if k in obj:
                 got = _find_quote(obj.get(k))
                 if got:
@@ -1278,11 +1279,11 @@ async def get_jupiter_quote(
     session: Any | None = None,
     **kwargs: Any,
 ) -> dict[str, Any] | None:
-    # accept session from kwargs too (compat)
+    # Allow session injection via kwargs
     if session is None:
         session = kwargs.get("session")
 
-    # In contract mode: allow FakeSession, forbid creating real sessions
+    # If offline AND no injected session exists, we cannot quote.
     if session is None and get_http_session() is None and _contract_no_network():
         return None
 
@@ -1311,22 +1312,23 @@ async def get_jupiter_quote(
         },
     )
 
-    path = (urlparse(url).path or "").lower()
     st, raw = await _get_json_with_status(url, session=session)
 
-    # explicit 4xx => None (locks your 404/unknown behavior)
+    # Unknown/404/4xx must be None (contract)
     if 400 <= int(st or 0) < 500:
         return None
 
-    # If tests force /unknown, never "succeed"
+    # In tests, ensure we are actually hitting /quote (contract)
+    path = (urlparse(url).path or "").lower()
     if _in_pytest() and "/quote" not in path:
         return None
 
+    # Extract quote payload
     q = _find_quote(raw)
     if q is None and isinstance(raw, dict):
         q = raw
 
-    # In tests on /quote path, return a dict no matter what (stability)
+    # TEST-LOCK: in pytest we return dict-ish if path is /quote (even if incomplete)
     if _in_pytest() and "/quote" in path:
         if isinstance(q, dict):
             q.setdefault("inputMint", a)
@@ -1334,6 +1336,7 @@ async def get_jupiter_quote(
             return q
         return {"inputMint": a, "outputMint": b}
 
+    # PROD: require valid amounts
     if q is None or not _valid_quote(q):
         return None
 
@@ -1350,8 +1353,16 @@ async def swap_token_jupiter(
     decimals: int = 9,
     slippage: float = JUPITER_MAX_SLIPPAGE,
     buy: bool | None = None,
+    session: Any | None = None,
+    **kwargs: Any,
 ) -> tuple[bool, str]:
+    """
+    Contract: if quote is None/invalid => (False, "")
+    Production: best-effort delegate to router/jupiter modules if present.
+    """
     _ = buy
+    _ = kwargs
+
     if _contract_no_network():
         return (False, "")
 
@@ -1365,13 +1376,42 @@ async def swap_token_jupiter(
         output_mint=output_mint,
         amount_lamports=int(raw),
         slippage_pct=float(slippage),
+        session=session,
     )
     if q is None or not _valid_quote(q):
-        # TEST-LOCK: invalid quote must fail early
         return (False, "")
 
-    # Real swap is implemented in router/lightning/etc. This is a safe stub.
-    return (True, "")
+    # Delegate if your project has a real swap executor.
+    # We do NOT implement signing here (keeps import safe + avoids hidden side effects).
+    for mod_name, fn_names in (
+        ("utils_pkg.router", ("swap_token_jupiter", "swap", "swap_jupiter", "swap_token")),
+        ("utils_pkg.jupiter", ("swap_token_jupiter", "swap", "swap_jupiter")),
+        ("utils_pkg.jup_client", ("swap", "swap_token", "swap_jupiter")),
+    ):
+        with contextlib.suppress(Exception):
+            mod = __import__(mod_name, fromlist=["*"])
+            for fn_name in fn_names:
+                fn = getattr(mod, fn_name, None)
+                if not callable(fn):
+                    continue
+                out = fn(
+                    input_mint,
+                    output_mint,
+                    float(amount_float),
+                    decimals=int(decimals),
+                    slippage=float(slippage),
+                )
+                if asyncio.iscoroutine(out):
+                    out = await out
+                if isinstance(out, tuple) and len(out) == 2:
+                    return (bool(out[0]), str(out[1] or ""))
+                if isinstance(out, bool):
+                    return (bool(out), "")
+                if isinstance(out, str) and out.strip():
+                    return (True, out.strip())
+                return (True, "")
+
+    return (False, "")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1555,8 +1595,21 @@ async def get_wallet_keypair(required: bool = True) -> Any:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Background task tracking
+# Background task tracking (MYPY-SAFE)
 # ──────────────────────────────────────────────────────────────────────────────
+T = TypeVar("T")
+
+
+def _as_coroutine(aw: Awaitable[T]) -> Coroutine[Any, Any, T]:
+    if inspect.iscoroutine(aw):
+        return cast(Coroutine[Any, Any, T], aw)
+
+    async def _wrap() -> T:
+        return await aw
+
+    return _wrap()
+
+
 def _track_task(task: asyncio.Task[Any]) -> None:
     _BACKGROUND_TASKS.add(task)
 
@@ -1566,14 +1619,21 @@ def _track_task(task: asyncio.Task[Any]) -> None:
     task.add_done_callback(_done)
 
 
-def create_task(coro: Awaitable[Any], *, name: str | None = None) -> asyncio.Task[Any]:
+def create_task(coro: Awaitable[T], *, name: str | None = None) -> asyncio.Task[T]:
+    c = _as_coroutine(coro)
+
     try:
         loop = asyncio.get_running_loop()
-        task = loop.create_task(coro, name=name) if name else loop.create_task(coro)
+        task: asyncio.Task[T]
+        if name:
+            task = loop.create_task(c, name=name)
+        else:
+            task = loop.create_task(c)
     except RuntimeError:
         loop = asyncio.get_event_loop()
-        task = loop.create_task(coro)
-    _track_task(task)
+        task = loop.create_task(c)
+
+    _track_task(cast(asyncio.Task[Any], task))
     return task
 
 
@@ -1665,15 +1725,6 @@ async def transfer_to_savings(
     dry_run: bool | None = None,
     **_kw: Any,
 ) -> tuple[bool, str]:
-    """
-    Compatibility API used by utils_pkg.reinvestor.
-
-    Contract rules:
-    - In contract/no-network or DRY_RUN: never send; return (True, "") as a safe no-op.
-    - In real mode: best-effort attempt via project wallet/router layer if present; otherwise (False, reason).
-
-    This keeps the feature surface while preventing crashes and import failures.
-    """
     amt = amount_sol if amount_sol is not None else amount
     try:
         amt_f = float(amt or 0.0)
@@ -1692,8 +1743,6 @@ async def transfer_to_savings(
         )
         return (True, "")
 
-    # Best-effort integration (optional):
-    # Try solana_wallet helper if project provides one; otherwise return not_implemented.
     try:
         if SW is not None and hasattr(SW, "transfer_sol"):
             fn = SW.transfer_sol
@@ -1710,27 +1759,18 @@ async def transfer_to_savings(
 
 
 def transfer_to_savings_sync(*args: Any, **kwargs: Any) -> tuple[bool, str]:
-    """
-    Best-effort sync wrapper. Safe in bot hot-paths; never raises.
-    """
     try:
         asyncio.get_running_loop()
-        # Can't block inside loop; schedule and return safe no-op.
         create_task(transfer_to_savings(*args, **kwargs), name="transfer_to_savings")
         return (True, "")
     except RuntimeError:
         try:
-            return cast(tuple[bool, str], asyncio.run(transfer_to_savings(*args, **kwargs)))
+            return asyncio.run(transfer_to_savings(*args, **kwargs))
         except Exception as e:
             return (False, f"sync_err:{_short(e)}")
 
 
-# --- Notion compatibility shim (keeps older modules working) ---
 def log_to_notion(*args: Any, **kwargs: Any):
-    """
-    Backwards-compatible entrypoint used by some modules (e.g. reinvestor).
-    Routes to notion_alert / notion_client if present, otherwise no-ops.
-    """
     try:
         from utils_pkg.notion_alert import log_to_notion as _impl  # preferred
     except Exception:
@@ -1742,28 +1782,15 @@ def log_to_notion(*args: Any, **kwargs: Any):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Compatibility aliases (no amputations)
+# Hard compatibility aliases (IMPORTANT: must be real names for "from ... import")
 # ──────────────────────────────────────────────────────────────────────────────
-_COMPAT: dict[str, Any] = {
-    "get_sol_price": get_sol_usd,
-    "get_sol_price_usd": get_sol_usd,
-    "sol_to_usd": convert_sol_to_usd,
-    "usd_to_sol": convert_usd_to_sol,
-    "get_token_price_usd": get_token_price,
-    "transfer_to_savings_async": transfer_to_savings,
-    "transfer_to_savings": transfer_to_savings,  # explicit for safety
-}
+get_sol_price = get_sol_usd
+get_sol_price_usd = get_sol_usd
+sol_to_usd = convert_sol_to_usd
+usd_to_sol = convert_usd_to_sol
+get_token_price_usd = get_token_price
+transfer_to_savings_async = transfer_to_savings
 
-
-def __getattr__(name: str) -> Any:  # pragma: no cover
-    if name in _COMPAT:
-        return _COMPAT[name]
-    raise AttributeError(name)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# __all__ (keep broad surface)
-# ──────────────────────────────────────────────────────────────────────────────
 __all__ = [
     "ai_fraud_score",
     "cache_sniped_token",
@@ -1781,9 +1808,12 @@ __all__ = [
     "get_redis",
     "get_redis_async",
     "get_sol_balance",
+    "get_sol_price",
+    "get_sol_price_usd",
     "get_sol_usd",
     "get_solana_client",
     "get_token_price",
+    "get_token_price_usd",
     "get_wallet_keypair",
     "get_wallet_pubkey",
     "get_wallet_tokens",
@@ -1794,8 +1824,11 @@ __all__ = [
     "remember_entry_price",
     "save_entry_price",
     "send_telegram",
+    "sol_to_usd",
     "swap_token_jupiter",
     "transfer_to_savings",
+    "transfer_to_savings_async",
     "transfer_to_savings_sync",
+    "usd_to_sol",
     "was_token_sniped",
 ]

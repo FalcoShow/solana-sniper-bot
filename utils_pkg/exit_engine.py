@@ -79,7 +79,6 @@ _SOL_MINT = "So11111111111111111111111111111111111111112"
 _BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 LAMPORTS_PER_SOL = 1_000_000_000  # kept for downstream compatibility
 
-
 INSTANCE_ID = (
     (os.getenv("INSTANCE_ID") or "").strip()
     or (os.getenv("RENDER_INSTANCE_ID") or "").strip()
@@ -87,10 +86,10 @@ INSTANCE_ID = (
     or "local"
 )
 
-
 # =============================================================================
 # Logger (soft-compatible: .event + .every)
 # =============================================================================
+log: Any
 try:
     from logging_setup import get_logger  # type: ignore
 
@@ -110,7 +109,7 @@ def _install_log_shims() -> None:
             with contextlib.suppress(Exception):
                 log.info("%s %s", name, fields)
 
-        log.event = _event
+        log.event = _event  # type: ignore[attr-defined]
 
     if not hasattr(log, "every"):
 
@@ -122,17 +121,18 @@ def _install_log_shims() -> None:
                 store[key] = now
                 _every._store = store  # type: ignore[attr-defined]
                 with contextlib.suppress(Exception):
-                    log.event(key, **fields)
+                    log.event(key, **fields)  # type: ignore[misc]
 
-        log.every = _every
+        log.every = _every  # type: ignore[attr-defined]
 
 
 _install_log_shims()
 
 
 def _log(name: str, level: str = "info", **fields: Any) -> None:
+    # best-effort structured
     with contextlib.suppress(Exception):
-        log.event(name, **fields)
+        log.event(name, **fields)  # type: ignore[misc]
         return
     with contextlib.suppress(Exception):
         msg = f"{name} {fields}"
@@ -320,10 +320,61 @@ def _pool_normalize(pool: str | None) -> str:
 
 
 # =============================================================================
-# Robust extraction (never throws)
+# Robust parsing helpers (never throws)
 # =============================================================================
 def _as_mapping(x: Any) -> Mapping[str, Any] | None:
     return x if isinstance(x, Mapping) else None
+
+
+def _to_float(v: Any) -> float | None:
+    if v is None:
+        return None
+    try:
+        if isinstance(v, bool):
+            return float(int(v))
+        if isinstance(v, (int, float)):
+            f = float(v)
+            return f
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            s = s.replace(",", "")
+            f2 = float(s)
+            return f2
+    except Exception:
+        return None
+    return None
+
+
+def _to_int(v: Any) -> int | None:
+    if v is None:
+        return None
+    try:
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, int):
+            return int(v)
+        if isinstance(v, float):
+            if v != v or v in (float("inf"), float("-inf")):
+                return None
+            return int(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            s = s.replace(",", "")
+            return int(float(s))  # allow "123.0"
+    except Exception:
+        return None
+    return None
+
+
+def _coerce_int_opt(v: Any) -> int | None:
+    iv = _to_int(v)
+    if iv is None or iv <= 0:
+        return None
+    return int(iv)
 
 
 def _parse_ts_any(v: Any) -> float | None:
@@ -335,30 +386,35 @@ def _parse_ts_any(v: Any) -> float | None:
     """
     if v is None:
         return None
-    if isinstance(v, int | float):
+
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
         fv = float(v)
         return fv if fv > 0 else None
+
     if isinstance(v, str):
         s = v.strip()
         if not s:
             return None
-        with contextlib.suppress(Exception):
-            fv = float(s)
-            if fv > 0:
-                return float(fv)
-        # ISO
+
+        # numeric string path
+        fv_opt = _to_float(s)
+        if fv_opt is not None and fv_opt > 0:
+            return float(fv_opt)
+
+        # ISO8601 path
         with contextlib.suppress(Exception):
             ss = s.replace("Z", "+00:00")
             dt = _dt.datetime.fromisoformat(ss)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=_dt.UTC)
-            return dt.timestamp()
+            return float(dt.timestamp())
+
     return None
 
 
 def _extract_ts(ev: Mapping[str, Any] | None, now: float) -> float:
     if ev:
-        for k in ("ts", "timestamp", "time", "now_ts", "now", "created_ts"):
+        for k in ("ts", "timestamp", "time", "now_ts", "now", "created_ts", "entry_ts"):
             if ev.get(k) is None:
                 continue
             t = _parse_ts_any(ev.get(k))
@@ -376,7 +432,6 @@ def _extract_mint(ev: Mapping[str, Any] | None) -> str | None:
             m = _norm_mint(v)
             return m if m else None
 
-    # nested common shapes
     for k in ("pair", "token", "base", "asset", "meta", "position"):
         o = ev.get(k)
         if isinstance(o, Mapping):
@@ -409,7 +464,7 @@ def _extract_pool(ev: Mapping[str, Any] | None) -> str:
 def _extract_price_any(ev: Mapping[str, Any] | None) -> float | None:
     if not ev:
         return None
-    # prefer SOL/native style first
+
     for key in (
         "price",
         "price_ui",
@@ -426,23 +481,14 @@ def _extract_price_any(ev: Mapping[str, Any] | None) -> float | None:
         "close",
         "p",
     ):
-        v = ev.get(key)
-        if v is None:
-            continue
-        with contextlib.suppress(Exception):
-            f = float(v)
-            if f > 0:
-                return f
+        f = _to_float(ev.get(key))
+        if f is not None and f > 0:
+            return float(f)
 
-    # usd fallback (only for contracts; engine treats as generic "price")
     for key in ("price_usd", "usd_price", "priceUsd", "priceUSD"):
-        v = ev.get(key)
-        if v is None:
-            continue
-        with contextlib.suppress(Exception):
-            f = float(v)
-            if f > 0:
-                return f
+        f = _to_float(ev.get(key))
+        if f is not None and f > 0:
+            return float(f)
 
     return None
 
@@ -454,17 +500,18 @@ def _extract_trades_count(ev: Mapping[str, Any] | None) -> int | None:
         v = ev.get(k)
         if v is None:
             continue
-        # allow nested dict {buys:.., sells:..}
         if isinstance(v, Mapping):
             with contextlib.suppress(Exception):
                 total = 0
                 for kk in ("total", "count", "txns", "trades", "n", "buys", "sells"):
                     if kk in v and v.get(kk) is not None:
-                        total += int(v.get(kk))
+                        iv = _to_int(v.get(kk))
+                        if iv is not None:
+                            total += int(iv)
                 return max(0, int(total))
-        with contextlib.suppress(Exception):
-            iv = int(v)
-            return iv if iv >= 0 else None
+        iv2 = _to_int(v)
+        if iv2 is not None and iv2 >= 0:
+            return int(iv2)
     return None
 
 
@@ -480,11 +527,9 @@ def _extract_spend_sol(ev: Mapping[str, Any] | None) -> float:
         "spent_sol",
         "in_sol",
     ):
-        v = ev.get(key)
-        if v is None:
-            continue
-        with contextlib.suppress(Exception):
-            return float(v)
+        f = _to_float(ev.get(key))
+        if f is not None:
+            return float(f)
     return 0.0
 
 
@@ -499,12 +544,9 @@ def _extract_amount_raw(ev: Mapping[str, Any] | None) -> int | None:
         "size_raw",
         "amountRaw",
     ):
-        v = ev.get(key)
-        if v is None:
-            continue
-        with contextlib.suppress(Exception):
-            iv = int(v)
-            return iv if iv > 0 else None
+        iv = _to_int(ev.get(key))
+        if iv is not None and iv > 0:
+            return int(iv)
     return None
 
 
@@ -512,21 +554,15 @@ def _extract_liq_usd(ev: Mapping[str, Any] | None) -> float | None:
     if not ev:
         return None
     for k in ("liq", "liquidity", "liquidityUsd", "liquidity_usd", "liq_usd", "liquidityUSD"):
-        v = ev.get(k)
-        if v is None:
-            continue
-        with contextlib.suppress(Exception):
-            f = float(v)
-            return f if f > 0 else None
+        f = _to_float(ev.get(k))
+        if f is not None and f > 0:
+            return float(f)
     meta = ev.get("meta")
     if isinstance(meta, Mapping):
         for k in ("liq", "liquidity", "liquidityUsd", "liquidity_usd", "liq_usd"):
-            v = meta.get(k)
-            if v is None:
-                continue
-            with contextlib.suppress(Exception):
-                f = float(v)
-                return f if f > 0 else None
+            f = _to_float(meta.get(k))
+            if f is not None and f > 0:
+                return float(f)
     return None
 
 
@@ -539,7 +575,6 @@ class ExitCfg:
     enabled: bool
     dryrun: bool
 
-    # core rules
     stop_loss_pct: float
     trailing_arm_pct: float
     trailing_stop_pct: float
@@ -548,7 +583,6 @@ class ExitCfg:
     stagnant_max_min: int
     stagnant_min_move_pct: float
 
-    # follow-through
     follow_enabled: bool
     follow_window_sec: int
     follow_grace_sec: int
@@ -559,29 +593,24 @@ class ExitCfg:
     follow_min_pnl_pct: float
     follow_early_catastrophic_dd_pct: float
 
-    # liquidity collapse
     liq_collapse_pct: float
     min_liq_usd: float
 
-    # scope filters (follow/rules only)
     follow_pools: set[str]
     follow_min_spend_sol: float
     follow_mint_whitelist: set[str]
     follow_mint_blacklist: set[str]
 
-    # throttles / housekeeping
     tick_throttle_ms: int
     cleanup_every_sec: int
     track_max_age_sec: int
 
-    # execution controls
     allow_worker_enqueue: bool
     allow_direct_fallback: bool
     fallback_sell_pct: float
     fallback_slippage_bps: int
     fallback_priority: int
 
-    # quote sanity (networked)
     quote_sanity_enabled: bool
     quote_timeout_s: float
     quote_max_price_impact_pct: float
@@ -589,7 +618,6 @@ class ExitCfg:
     quote_reduce_soft_exits: bool
     quote_reduce_floor_sell_pct: float
 
-    # redis (best-effort)
     publish_redis: bool
     redis_ttl_sec: int
     health_redis_key: str
@@ -598,7 +626,6 @@ class ExitCfg:
     publish_open_snapshot: bool
     open_snapshot_every_sec: int
 
-    # anti-spam / caps
     exit_dedupe_sec: int
     burst_cap_per_min: int
     max_daily_exits: int
@@ -615,7 +642,7 @@ def _load_cfg() -> ExitCfg:
     )
     enabled_flag = _env_bool("EXIT_ENGINE_ENABLED", True)
     enabled = bool(
-        master > 0
+        (master > 0 or _is_safe_mode())
         and _env_bool("EXIT_ENGINE", True)
         and enabled_flag
         and (not _env_bool("KILL_SWITCH", False))
@@ -800,12 +827,14 @@ async def _get_redis_async() -> Any:
     gra = getattr(cu, "get_redis_async", None)
     if callable(gra):
         with contextlib.suppress(Exception):
-            return await gra()
+            out = gra()
+            return await _maybe_await(out)
 
     gr = getattr(cu, "get_redis", None)
     if callable(gr):
         with contextlib.suppress(Exception):
-            return await _maybe_await(gr())
+            out2 = gr()
+            return await _maybe_await(out2)
     return None
 
 
@@ -821,9 +850,10 @@ async def _redis_get_int(redis: Any, key: str) -> int:
         raw = await _maybe_await(redis.get(key))
         if raw is None:
             return 0
-        if isinstance(raw, bytes | bytearray):
+        if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode(errors="ignore")
-        return int(str(raw).strip() or "0")
+        iv = _to_int(raw)
+        return int(iv) if iv is not None else 0
     except Exception:
         return 0
 
@@ -887,14 +917,12 @@ class _Pos:
 _OPEN: dict[str, _Pos] = {}
 _OPEN_LOCK = asyncio.Lock()
 
-# snapshots for dashboards/tests (safe & deterministic)
 _LAST_OPEN_SNAPSHOT: dict[str, dict[str, Any]] = {}
 _LAST_OPEN_CACHE_TS = 0.0
 _LAST_OPEN_PUBLISH_TS = 0.0
 _LAST_HEALTH_TS = 0.0
 _LAST_CLEANUP_TS = 0.0
 
-# anti-spam
 _RECENT_EXIT_TS: dict[str, float] = {}
 _BURST_BUCKET: dict[str, int] = {}
 
@@ -974,7 +1002,6 @@ async def _cleanup_if_needed(now: float) -> None:
     if now - _LAST_CLEANUP_TS < float(max(1, CFG.cleanup_every_sec)):
         return
     _LAST_CLEANUP_TS = now
-
     async with _OPEN_LOCK:
         for mint, pos in list(_OPEN.items()):
             if pos.closed or (now - pos.entry_ts) > float(CFG.track_max_age_sec):
@@ -1057,16 +1084,13 @@ def _scope_ok(snapshot: Mapping[str, Any]) -> bool:
     mint = _norm_mint(str(snapshot.get("mint") or ""))
     if not mint:
         return False
-
     if CFG.follow_mint_blacklist and mint in CFG.follow_mint_blacklist:
         return False
     if CFG.follow_mint_whitelist and mint not in CFG.follow_mint_whitelist:
         return False
-
     pool = _pool_normalize(str(snapshot.get("pool") or "unknown"))
     if CFG.follow_pools and pool not in CFG.follow_pools:
         return False
-
     spend = _finite(snapshot.get("spend_sol") or 0.0, 0.0)
     return not (CFG.follow_min_spend_sol > 0.0 and spend < float(CFG.follow_min_spend_sol))
 
@@ -1103,7 +1127,6 @@ def _decision(
     metrics: Mapping[str, Any] | None = None,
     extras: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    # JSON-loggable primitives only
     d: dict[str, Any] = {
         "action": str(action),
         "reason": str(reason or "").strip(),
@@ -1111,7 +1134,7 @@ def _decision(
         "mint": str(mint),
         "symbol": str(symbol),
         "pool": str(pool),
-        "ts": int(now_ts),
+        "ts": int(float(now_ts)),
         "engine_version": EXIT_ENGINE_VERSION,
         "instance": INSTANCE_ID,
         "safe": int(_is_safe_mode()),
@@ -1122,7 +1145,7 @@ def _decision(
     if extras:
         safe_ex: dict[str, Any] = {}
         for k, v in dict(extras).items():
-            if isinstance(v, str | int | float | bool) or v is None:
+            if isinstance(v, (str, int, float, bool)) or v is None:
                 safe_ex[str(k)] = v
             else:
                 safe_ex[str(k)] = str(v)
@@ -1153,19 +1176,14 @@ async def _log_exit_event_safe(event: dict[str, Any]) -> None:
 # Optional position_store reconciliation (best-effort)
 # =============================================================================
 async def _load_position_from_store_best_effort(mint: str) -> Mapping[str, Any] | None:
-    """
-    Only used if we are missing in-memory position and tests/runtime provided none.
-    Must be best-effort and never crash.
-    """
     if not mint:
         return None
     ps = _get_mod("utils_pkg.position_store")
     if not ps:
-        ps = _get_mod("utils_pkg.positions")  # alternate naming
+        ps = _get_mod("utils_pkg.positions")
     if not ps:
         return None
 
-    # Candidate accessors (sync or async)
     candidates = (
         "get_position",
         "get_open_position",
@@ -1228,32 +1246,24 @@ class _QuoteSanity:
 
 
 def _parse_price_impact_pct(v: Any) -> float | None:
-    if v is None:
+    f = _to_float(v)
+    if f is None:
         return None
-    with contextlib.suppress(Exception):
-        f = float(v)
-        if f != f:
-            return None
-        # Heuristic: Jupiter sometimes returns 0.12 meaning 12% or 0.12%?
-        # We treat <=1.0 as fraction (0..1 => 0..100%), unless it's obviously already percent.
-        if 0.0 <= f <= 1.0:
-            return f * 100.0
-        if 0.0 <= f <= 10000.0:
-            return f
+    if f != f:
+        return None
+    if 0.0 <= f <= 1.0:
+        return f * 100.0
+    if 0.0 <= f <= 10000.0:
+        return f
     return None
 
 
 async def _quote_sell_best_effort(
     *, mint: str, amount_raw: int, slippage_bps: int, timeout_s: float
 ) -> _QuoteSanity:
-    """
-    Best-effort quote sanity. Never raises.
-    Returns price impact if obtainable.
-    """
     if not (CFG.quote_sanity_enabled and _allow_network() and _sells_allowed()):
         return _QuoteSanity(ok=True, notes="disabled")
 
-    # Probe likely quote helpers.
     probes: list[tuple[str, tuple[str, ...]]] = [
         ("utils_pkg.router", ("quote_sell", "sell_quote", "quote", "get_quote", "quote_swap")),
         ("utils_pkg.lightning_impl", ("quote_sell", "quote", "get_quote")),
@@ -1262,7 +1272,6 @@ async def _quote_sell_best_effort(
     ]
 
     async def _call(fn: Callable[..., Any]) -> Any:
-        # Try a few common signatures.
         with contextlib.suppress(TypeError):
             return await _maybe_await(
                 fn(mint=mint, amount_raw=int(amount_raw), slippage_bps=int(slippage_bps))
@@ -1270,7 +1279,6 @@ async def _quote_sell_best_effort(
         with contextlib.suppress(TypeError):
             return await _maybe_await(fn(mint, int(amount_raw), int(slippage_bps)))
         with contextlib.suppress(TypeError):
-            # Some routers want input_mint/output_mint; assume SOL out on sell.
             return await _maybe_await(
                 fn(
                     input_mint=mint,
@@ -1283,7 +1291,6 @@ async def _quote_sell_best_effort(
             return await _maybe_await(
                 fn(mint=mint, amount=int(amount_raw), slippage_bps=int(slippage_bps))
             )
-        # last attempt
         return await _maybe_await(fn(mint, int(amount_raw)))
 
     try:
@@ -1297,13 +1304,12 @@ async def _quote_sell_best_effort(
                     continue
                 try:
                     out = await asyncio.wait_for(_call(fn), timeout=float(timeout_s))
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     return _QuoteSanity(ok=False, notes=f"timeout:{mod_name}.{nm}")
                 except Exception:
                     continue
 
                 if isinstance(out, Mapping):
-                    # Common keys
                     pi = None
                     for k in (
                         "priceImpactPct",
@@ -1317,20 +1323,19 @@ async def _quote_sell_best_effort(
                             if pi is not None:
                                 break
                     return _QuoteSanity(ok=True, price_impact_pct=pi, notes=f"{mod_name}.{nm}")
-                # If it's a simple float -> treat as pi pct
+
                 pi2 = _parse_price_impact_pct(out)
                 if pi2 is not None:
                     return _QuoteSanity(
                         ok=True, price_impact_pct=pi2, notes=f"{mod_name}.{nm}:scalar"
                     )
-        # No quote capability found
+
         return _QuoteSanity(ok=False, notes="no_quote_fn")
     except Exception as e:
         return _QuoteSanity(ok=False, notes=_short_exc(e))
 
 
 async def _direct_sell_best_effort(*, mint: str, amount_raw: int, slippage_bps: int) -> str | None:
-    # last resort, best-effort; MUST NOT run in SAFE_MODE
     if not _sells_allowed():
         return None
 
@@ -1370,25 +1375,17 @@ async def _direct_sell_best_effort(*, mint: str, amount_raw: int, slippage_bps: 
 
 
 async def _delegate_exit(
-    *,
-    decision: dict[str, Any],
-    snapshot: Mapping[str, Any],
-    amount_raw: int | None,
+    *, decision: dict[str, Any], snapshot: Mapping[str, Any], amount_raw: int | None
 ) -> bool:
-    """
-    Executes an exit best-effort.
-    In SAFE_MODE/DRYRUN: does NOT execute (returns False), but still loggable.
-    """
     mint = _norm_mint(str(decision.get("mint") or ""))
     if not mint or mint == _SOL_MINT:
         return False
 
-    now = float(decision.get("ts") or time.time())
+    now = float(_to_float(decision.get("ts")) or time.time())
 
     if not _exit_dedupe_ok(mint, now) or not _burst_cap_ok(now):
         return False
 
-    # Daily cap (Redis)
     r = await _get_redis_async()
     if r and int(CFG.max_daily_exits) > 0:
         day_key = _today_key(CFG.daily_key_prefix)
@@ -1403,26 +1400,23 @@ async def _delegate_exit(
             )
             return False
 
-    # never execute in safe mode/dryrun
     if not _sells_allowed() or bool(CFG.dryrun):
         return False
 
     amt_full = int(amount_raw) if isinstance(amount_raw, int) and amount_raw > 0 else 0
     if amt_full <= 0:
-        # we refuse to guess balances in exit_engine; execution path needs amount
         return False
 
-    sell_pct = float(snapshot.get("sell_pct") or CFG.fallback_sell_pct)
+    sell_pct_val = _to_float(snapshot.get("sell_pct"))
+    sell_pct = float(sell_pct_val) if sell_pct_val is not None else float(CFG.fallback_sell_pct)
     sell_pct = _clamp(sell_pct, 0.01, 1.0)
 
     slippage_bps = int(CFG.fallback_slippage_bps)
     priority = int(CFG.fallback_priority)
 
-    # Compute scaled amount
     scaled_amt = _scale_amount(int(amt_full), sell_pct)
     hard = bool(decision.get("hard") or False)
 
-    # Quote sanity (optional): can reduce soft exits if PI too high
     quote_info: _QuoteSanity | None = None
     if CFG.quote_sanity_enabled and _allow_network():
         quote_info = await _quote_sell_best_effort(
@@ -1434,13 +1428,11 @@ async def _delegate_exit(
 
         pi = quote_info.price_impact_pct if quote_info else None
         if quote_info and not quote_info.ok:
-            # Hard stops may be allowed to proceed even if quoting fails
             if hard and not bool(CFG.quote_allow_fail_on_hard_stop):
                 _log(
                     "EXIT_QUOTE_FAIL_BLOCK_HARD", level="warning", mint=mint, note=quote_info.notes
                 )
                 return False
-            # Soft exits: fail-open (do not block)
             _log(
                 "EXIT_QUOTE_FAIL_SOFT",
                 level="warning",
@@ -1455,12 +1447,10 @@ async def _delegate_exit(
             and (not hard)
             and bool(CFG.quote_reduce_soft_exits)
         ):
-            # Reduce sell size progressively for soft exits
             floor_pct = float(CFG.quote_reduce_floor_sell_pct)
             cur_pct = float(sell_pct)
             cur_amt = int(scaled_amt)
-            max_iter = 6
-            for _ in range(max_iter):
+            for _ in range(6):
                 if cur_pct <= floor_pct or cur_amt <= 1:
                     break
                 cur_pct = max(floor_pct, cur_pct * 0.5)
@@ -1471,14 +1461,13 @@ async def _delegate_exit(
                     slippage_bps=int(slippage_bps),
                     timeout_s=float(CFG.quote_timeout_s),
                 )
-                pi2 = qi2.price_impact_pct if qi2 else None
                 quote_info = qi2
+                pi2 = qi2.price_impact_pct
                 if pi2 is None or pi2 <= float(CFG.quote_max_price_impact_pct):
                     sell_pct = cur_pct
                     scaled_amt = cur_amt
                     break
 
-            # After reductions, if still too high and quote gave a PI, we can block the soft exit
             if (
                 quote_info
                 and quote_info.price_impact_pct is not None
@@ -1494,7 +1483,6 @@ async def _delegate_exit(
                 )
                 return False
 
-    # AI hook first (best-effort)
     for hook_name in ("schedule_force_exit", "force_exit", "request_exit", "exit_now"):
         hook = _sell_hook(hook_name)
         if hook is None:
@@ -1525,14 +1513,13 @@ async def _delegate_exit(
         except Exception as e:
             _log("EXIT_AI_HOOK_FAIL", level="warning", mint=mint, hook=hook_name, err=_short_exc(e))
 
-    # Worker enqueue
     if CFG.allow_worker_enqueue:
         ok = await _enqueue_exit_request_best_effort(
             mint=mint,
             amount_raw=int(scaled_amt),
             reason=str(decision.get("reason") or "exit"),
             sell_pct=float(sell_pct),
-            entry_spend_sol=float(snapshot.get("spend_sol") or 0.0),
+            entry_spend_sol=float(_to_float(snapshot.get("spend_sol")) or 0.0),
             symbol=str(snapshot.get("symbol") or ""),
             pool=str(snapshot.get("pool") or ""),
             slippage_bps=int(slippage_bps),
@@ -1551,7 +1538,6 @@ async def _delegate_exit(
                 await _redis_incr_with_ttl(r, _today_key(CFG.daily_key_prefix), 60 * 60 * 36)
             return True
 
-    # Direct fallback
     if not CFG.allow_direct_fallback:
         return False
 
@@ -1613,13 +1599,10 @@ async def on_buy_filled(ev: dict[str, Any]) -> None:
     entry_ts = _extract_ts(ev, time.time())
     entry_price = None
     for k in ("entry_price", "price_entry", "price_entry_ui", "avg_entry_price", "entryPrice"):
-        if ev.get(k) is None:
-            continue
-        with contextlib.suppress(Exception):
-            f = float(ev.get(k))
-            if f > 0:
-                entry_price = f
-                break
+        f = _to_float(ev.get(k))
+        if f is not None and f > 0:
+            entry_price = float(f)
+            break
 
     liq_usd = _extract_liq_usd(ev)
     cand = ev.get("candidate_id") or ev.get("entry_candidate_id") or ev.get("cand_id")
@@ -1631,7 +1614,7 @@ async def on_buy_filled(ev: dict[str, Any]) -> None:
         pool=pool,
         entry_sig=entry_sig,
         spend_sol=float(spend_sol),
-        amount_raw=int(amount_raw) if isinstance(amount_raw, int) and amount_raw > 0 else None,
+        amount_raw=_coerce_int_opt(amount_raw),
         candidate_id=cand,
         entry_ts=float(entry_ts),
         opened_from="on_buy_filled",
@@ -1649,7 +1632,6 @@ async def on_buy_filled(ev: dict[str, Any]) -> None:
 
     await _refresh_snapshot_cache(time.time())
 
-    # AI schedule hook (best-effort, but skip in SAFE_MODE to avoid accidental network)
     if not _is_safe_mode():
         fn = _sell_hook("schedule_after_buy")
         if fn is not None:
@@ -1718,7 +1700,6 @@ async def on_sell_filled(ev: dict[str, Any]) -> None:
 # The DECIDER (contract tests call this)
 # =============================================================================
 def _map_position_fields(pos: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize a position payload into the keys this engine understands."""
     mint = _extract_mint(pos) or _norm_mint(str(pos.get("mint") or ""))
     entry_ts = _extract_ts(pos, time.time())
     spend_sol = float(_extract_spend_sol(pos) or 0.0)
@@ -1726,13 +1707,10 @@ def _map_position_fields(pos: Mapping[str, Any]) -> dict[str, Any]:
 
     entry_price = None
     for k in ("entry_price", "avg_entry_price", "price_entry", "price_entry_ui", "entryPrice"):
-        if pos.get(k) is None:
-            continue
-        with contextlib.suppress(Exception):
-            f = float(pos.get(k))
-            if f > 0:
-                entry_price = f
-                break
+        f = _to_float(pos.get(k))
+        if f is not None and f > 0:
+            entry_price = float(f)
+            break
 
     return {
         "mint": mint,
@@ -1740,7 +1718,7 @@ def _map_position_fields(pos: Mapping[str, Any]) -> dict[str, Any]:
         "pool": _pool_normalize(str(pos.get("pool") or pos.get("source") or "unknown")),
         "entry_ts": float(entry_ts),
         "spend_sol": float(spend_sol),
-        "amount_raw": int(amount_raw) if isinstance(amount_raw, int) and amount_raw > 0 else None,
+        "amount_raw": _coerce_int_opt(amount_raw),
         "candidate_id": pos.get("candidate_id"),
         "entry_price": entry_price,
         "entry_liq_usd": _extract_liq_usd(pos),
@@ -1764,9 +1742,10 @@ def _deterministic_now(
     now_ts: int | float | None, tick_in: Mapping[str, Any] | None, pos_in: Mapping[str, Any] | None
 ) -> float:
     if now_ts is not None:
-        with contextlib.suppress(Exception):
-            return float(now_ts)
-    # In SAFE_MODE, try to anchor "now" to inputs for deterministic behavior.
+        f = _to_float(now_ts)
+        if f is not None:
+            return float(f)
+
     if _is_safe_mode():
         if tick_in:
             t = _parse_ts_any(tick_in.get("ts") or tick_in.get("time") or tick_in.get("timestamp"))
@@ -1776,13 +1755,13 @@ def _deterministic_now(
             t2 = _parse_ts_any(pos_in.get("now_ts") or pos_in.get("ts") or pos_in.get("entry_ts"))
             if t2 is not None:
                 return float(t2)
+
     return float(time.time())
 
 
 async def on_trade_tick(
     raw_event: dict[str, Any] | None = None,
     *,
-    # contract-required "position-ish" names:
     position: Mapping[str, Any] | None = None,
     pos: Mapping[str, Any] | None = None,
     payload: Mapping[str, Any] | None = None,
@@ -1790,26 +1769,14 @@ async def on_trade_tick(
     state: Mapping[str, Any] | None = None,
     position_state: Mapping[str, Any] | None = None,
     trade: Mapping[str, Any] | None = None,
-    # common additional inputs:
     tick: Mapping[str, Any] | None = None,
     meta: Mapping[str, Any] | None = None,
     now_ts: int | float | None = None,
     **kwargs: Any,
 ) -> dict[str, Any] | None:
-    """
-    Contract + runtime entrypoint.
-
-    Accepts:
-      - raw_event dict (runtime tick)
-      - OR explicit {position, tick, meta} payloads (contract tests)
-
-    Returns:
-      - decision dict (JSON-loggable) OR None (treated as HOLD)
-    """
     if not CFG.enabled:
         return None
 
-    # Normalize inputs
     pos_in = (
         _as_mapping(position)
         or _as_mapping(pos)
@@ -1824,7 +1791,6 @@ async def on_trade_tick(
 
     now = _deterministic_now(now_ts, tick_in, pos_in)
 
-    # housekeeping is safe and must never throw
     with contextlib.suppress(Exception):
         await _housekeeping(now)
 
@@ -1838,11 +1804,6 @@ async def on_trade_tick(
         if tick_in
         else {"mint": mint, "ts": now, "price": None, "trades": None, "liq_usd": None}
     )
-
-    # Position snapshot preference:
-    #   1) explicit position payload (tests)
-    #   2) in-memory position
-    #   3) optional position_store (best-effort)
     pos_norm: dict[str, Any] | None = _map_position_fields(pos_in) if pos_in else None
 
     if pos_norm is None or not pos_norm.get("mint"):
@@ -1882,17 +1843,16 @@ async def on_trade_tick(
 
     symbol = str(pos_norm.get("symbol") or _extract_symbol(tick_in, mint) or mint[:4])
     pool = str(pos_norm.get("pool") or _extract_pool(tick_in) or "unknown")
-    entry_ts = float(pos_norm.get("entry_ts") or now)
-    spend_sol = float(pos_norm.get("spend_sol") or 0.0)
-    amount_raw = pos_norm.get("amount_raw")
-    entry_price = pos_norm.get("entry_price")
-    entry_liq = pos_norm.get("entry_liq_usd")
-    last_liq = tick_norm.get("liq_usd") or _extract_liq_usd(meta_in) or None
+    entry_ts = float(_to_float(pos_norm.get("entry_ts")) or now)
+    spend_sol = float(_to_float(pos_norm.get("spend_sol")) or 0.0)
 
-    last_price = tick_norm.get("price")
-    trades = tick_norm.get("trades")
+    entry_price = _to_float(pos_norm.get("entry_price"))
+    entry_liq = _to_float(pos_norm.get("entry_liq_usd"))
+    last_liq = _to_float(tick_norm.get("liq_usd")) or _to_float(_extract_liq_usd(meta_in))
 
-    # Update in-memory tracking if present
+    last_price = _to_float(tick_norm.get("price"))
+    trades = _to_int(tick_norm.get("trades"))
+
     trades_after: int
     max_price: float | None
     min_price: float | None
@@ -1900,7 +1860,6 @@ async def on_trade_tick(
     async with _OPEN_LOCK:
         p = _OPEN.get(mint)
         if p and not p.closed:
-            # throttle eval in runtime; tests call once so fine
             if CFG.tick_throttle_ms > 0 and (now - p.last_eval_ts) * 1000.0 < float(
                 CFG.tick_throttle_ms
             ):
@@ -1912,6 +1871,7 @@ async def on_trade_tick(
                     pool=pool,
                     now_ts=now,
                 )
+
             p.last_eval_ts = now
             p.last_tick_ts = now
 
@@ -1945,35 +1905,35 @@ async def on_trade_tick(
             max_price = p.max_price
             min_price = p.min_price
             trades_after = int(p.trades_after_entry)
+            amount_raw_opt = p.amount_raw
         else:
             max_price = last_price
             min_price = last_price
             trades_after = int(trades or 0)
+            amount_raw_opt = _coerce_int_opt(pos_norm.get("amount_raw"))
 
     if max_price is None:
-        with contextlib.suppress(Exception):
-            mp = meta_in.get("max_price") or meta_in.get("high") or meta_in.get("ath")
-            if mp is not None:
-                max_price = float(mp)
+        mp = _to_float(meta_in.get("max_price") or meta_in.get("high") or meta_in.get("ath"))
+        if mp is not None:
+            max_price = float(mp)
     if min_price is None:
-        with contextlib.suppress(Exception):
-            mn = meta_in.get("min_price") or meta_in.get("low")
-            if mn is not None:
-                min_price = float(mn)
+        mn = _to_float(meta_in.get("min_price") or meta_in.get("low"))
+        if mn is not None:
+            min_price = float(mn)
 
     age_sec = max(0.0, float(now - float(entry_ts)))
     age_min = age_sec / 60.0
 
     metrics = _compute_metrics(entry_price, max_price, min_price, last_price)
 
-    snapshot = {
+    snapshot: dict[str, Any] = {
         "mint": mint,
         "symbol": symbol,
         "pool": pool,
         "entry_ts": float(entry_ts),
         "age_sec": float(age_sec),
         "spend_sol": float(spend_sol),
-        "amount_raw": int(amount_raw) if isinstance(amount_raw, int) and amount_raw > 0 else None,
+        "amount_raw": amount_raw_opt,  # int|None
         "candidate_id": pos_norm.get("candidate_id"),
         "entry_price": entry_price,
         "last_price": last_price,
@@ -1984,6 +1944,7 @@ async def on_trade_tick(
         "trades_after_entry": int(trades_after),
         "sell_pct": float(CFG.fallback_sell_pct),
     }
+    amt_for_exit: int | None = amount_raw_opt  # <-- typed, fixes mypy arg-type errors
 
     if not _scope_ok(snapshot):
         return _decision(
@@ -2015,7 +1976,6 @@ async def on_trade_tick(
     # -----------------------------
     # RULES (deterministic)
     # -----------------------------
-    # 1) HARD stop-loss
     if float(metrics["pnl_pct"]) <= -float(CFG.stop_loss_pct):
         dec = _decision(
             action="EXIT",
@@ -2029,14 +1989,11 @@ async def on_trade_tick(
             extras={"age_sec": age_sec},
         )
         await _log_exit_event_safe({**dec, "label": "exit_signal"})
-        _ = await _delegate_exit(
-            decision=dec, snapshot=snapshot, amount_raw=snapshot.get("amount_raw")
-        )
+        _ = await _delegate_exit(decision=dec, snapshot=snapshot, amount_raw=amt_for_exit)
         return dec
 
-    # 2) Liquidity collapse hard floor
     if float(CFG.min_liq_usd) > 0.0 and snapshot.get("last_liq_usd") is not None:
-        if float(snapshot["last_liq_usd"]) < float(CFG.min_liq_usd):
+        if float(_to_float(snapshot["last_liq_usd"]) or 0.0) < float(CFG.min_liq_usd):
             dec = _decision(
                 action="EXIT",
                 reason="liq_collapse_hard",
@@ -2049,19 +2006,16 @@ async def on_trade_tick(
                 extras={"liq_usd": snapshot.get("last_liq_usd")},
             )
             await _log_exit_event_safe({**dec, "label": "exit_signal"})
-            _ = await _delegate_exit(
-                decision=dec, snapshot=snapshot, amount_raw=snapshot.get("amount_raw")
-            )
+            _ = await _delegate_exit(decision=dec, snapshot=snapshot, amount_raw=amt_for_exit)
             return dec
 
-    # 3) Liquidity collapse relative drop
     if (
         float(CFG.liq_collapse_pct) > 0.0
         and snapshot.get("entry_liq_usd")
         and snapshot.get("last_liq_usd")
     ):
-        e = float(snapshot["entry_liq_usd"])
-        c = float(snapshot["last_liq_usd"])
+        e = float(_to_float(snapshot["entry_liq_usd"]) or 0.0)
+        c = float(_to_float(snapshot["last_liq_usd"]) or 0.0)
         if e > 0 and c > 0:
             drop_pct = (c / e - 1.0) * 100.0
             if drop_pct <= -float(CFG.liq_collapse_pct):
@@ -2077,12 +2031,9 @@ async def on_trade_tick(
                     extras={"age_sec": age_sec},
                 )
                 await _log_exit_event_safe({**dec, "label": "exit_signal"})
-                _ = await _delegate_exit(
-                    decision=dec, snapshot=snapshot, amount_raw=snapshot.get("amount_raw")
-                )
+                _ = await _delegate_exit(decision=dec, snapshot=snapshot, amount_raw=amt_for_exit)
                 return dec
 
-    # 4) Trailing stop: arm then trail off peak drawdown
     if float(CFG.trailing_arm_pct) > 0.0:
         if float(metrics["up_pct"]) >= float(CFG.trailing_arm_pct) and float(
             metrics["peak_dd_pct"]
@@ -2099,12 +2050,9 @@ async def on_trade_tick(
                 extras={"age_sec": age_sec},
             )
             await _log_exit_event_safe({**dec, "label": "exit_signal"})
-            _ = await _delegate_exit(
-                decision=dec, snapshot=snapshot, amount_raw=snapshot.get("amount_raw")
-            )
+            _ = await _delegate_exit(decision=dec, snapshot=snapshot, amount_raw=amt_for_exit)
             return dec
 
-    # 5) Time stop
     if int(CFG.time_stop_min) > 0 and age_min >= float(CFG.time_stop_min):
         if float(metrics["pnl_pct"]) < float(CFG.time_stop_min_profit_pct):
             dec = _decision(
@@ -2119,12 +2067,9 @@ async def on_trade_tick(
                 extras={"age_min": age_min},
             )
             await _log_exit_event_safe({**dec, "label": "exit_signal"})
-            _ = await _delegate_exit(
-                decision=dec, snapshot=snapshot, amount_raw=snapshot.get("amount_raw")
-            )
+            _ = await _delegate_exit(decision=dec, snapshot=snapshot, amount_raw=amt_for_exit)
             return dec
 
-    # 6) Stagnant exit (range too small)
     if int(CFG.stagnant_max_min) > 0 and age_min >= float(CFG.stagnant_max_min):
         if float(metrics["range_pct"]) < float(CFG.stagnant_min_move_pct):
             dec = _decision(
@@ -2139,14 +2084,10 @@ async def on_trade_tick(
                 extras={"age_min": age_min},
             )
             await _log_exit_event_safe({**dec, "label": "exit_signal"})
-            _ = await _delegate_exit(
-                decision=dec, snapshot=snapshot, amount_raw=snapshot.get("amount_raw")
-            )
+            _ = await _delegate_exit(decision=dec, snapshot=snapshot, amount_raw=amt_for_exit)
             return dec
 
-    # 7) Follow-through (early protection) - one-time latch if tracked
     if CFG.follow_enabled:
-        # If latched as passed, skip; if latched as failed we likely already exited.
         follow_done = bool(pos_norm.get("follow_done") or False)
         follow_pass_prev = bool(pos_norm.get("follow_pass") or False)
         async with _OPEN_LOCK:
@@ -2158,7 +2099,6 @@ async def on_trade_tick(
         if not (follow_done and follow_pass_prev):
             warmup_end = float(CFG.follow_window_sec + max(0, CFG.follow_grace_sec))
             if age_sec >= warmup_end:
-                # catastrophic DD early
                 if float(CFG.follow_early_catastrophic_dd_pct) > 0.0 and float(
                     metrics["dd_pct"]
                 ) <= -float(CFG.follow_early_catastrophic_dd_pct):
@@ -2175,9 +2115,8 @@ async def on_trade_tick(
                     )
                     await _log_exit_event_safe({**dec, "label": "exit_signal"})
                     _ = await _delegate_exit(
-                        decision=dec, snapshot=snapshot, amount_raw=snapshot.get("amount_raw")
+                        decision=dec, snapshot=snapshot, amount_raw=amt_for_exit
                     )
-                    # latch fail if tracked
                     async with _OPEN_LOCK:
                         p3 = _OPEN.get(mint)
                         if p3 and not p3.closed:
@@ -2206,10 +2145,8 @@ async def on_trade_tick(
                     if float(CFG.follow_min_pnl_pct) <= 0.0
                     else (float(metrics["pnl_pct"]) >= float(CFG.follow_min_pnl_pct))
                 )
-
                 follow_pass = bool(trades_ok and up_ok and dd_ok and pnl_ok)
 
-                # latch in memory if tracked
                 async with _OPEN_LOCK:
                     p4 = _OPEN.get(mint)
                     if p4 and not p4.closed:
@@ -2230,11 +2167,10 @@ async def on_trade_tick(
                     )
                     await _log_exit_event_safe({**dec, "label": "exit_signal"})
                     _ = await _delegate_exit(
-                        decision=dec, snapshot=snapshot, amount_raw=snapshot.get("amount_raw")
+                        decision=dec, snapshot=snapshot, amount_raw=amt_for_exit
                     )
                     return dec
 
-    # Forward tick to AI (best-effort) ONLY if network is allowed and not safe
     if not _is_safe_mode():
         fn_ai = _sell_hook("on_trade_tick")
         if fn_ai is not None:
@@ -2254,58 +2190,41 @@ async def on_trade_tick(
 
 
 # =============================================================================
-# Contract surface aliases (tests/test_exit_pipeline.py expects at least one)
+# Contract surface aliases
 # =============================================================================
-
-
 async def decide_exit_async(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
-    """Async alias (preferred in new code)."""
     return await on_trade_tick(*args, **kwargs)
 
 
 async def evaluate_position_async(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
-    """Async alias (preferred in new code)."""
     return await on_trade_tick(*args, **kwargs)
 
 
 async def on_position_tick_async(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
-    """Async alias (preferred in new code)."""
     return await on_trade_tick(*args, **kwargs)
 
 
 async def should_exit_async(*args: Any, **kwargs: Any) -> bool:
-    """Async convenience: returns True iff decision.action == 'EXIT'."""
     d = await on_trade_tick(*args, **kwargs)
     return bool(d and str(d.get("action")) == "EXIT")
 
 
 class ExitPolicy:
-    """Lightweight policy wrapper (optional surface)."""
-
     async def decide(self, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
         return await on_trade_tick(*args, **kwargs)
 
 
 class ExitEngine(ExitPolicy):
-    """Alias for policy; kept for compatibility."""
-
     pass
 
 
 def _run_or_schedule(coro: Any) -> Any:
-    """
-    If we're in a running event loop, schedule a Task (safe if caller doesn't await).
-    If we're in sync land, run to completion and return the result (no warnings).
-    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
     else:
         return loop.create_task(coro)
-
-
-# ---- Back-compat dual-mode wrappers (sync-safe + awaitable in async contexts) ----
 
 
 def decide_exit(*args: Any, **kwargs: Any) -> Any:
@@ -2324,7 +2243,6 @@ def should_exit(*args: Any, **kwargs: Any) -> Any:
     return _run_or_schedule(should_exit_async(*args, **kwargs))
 
 
-# Friendly aliases older code/tests may reference
 compute_exit = decide_exit
 get_exit_actions = decide_exit
 maybe_exit = decide_exit
@@ -2366,7 +2284,6 @@ async def run_worker(stop_evt: asyncio.Event) -> None:
             with contextlib.suppress(Exception):
                 await _housekeeping(now)
 
-            # heartbeat
             with contextlib.suppress(Exception):
                 log.every(  # type: ignore[misc]
                     "EXIT_ENGINE_HEARTBEAT",

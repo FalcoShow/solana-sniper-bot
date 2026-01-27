@@ -74,7 +74,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import Any, TypeVar, Union, cast
+from typing import Any, Self, TypeVar, Union, cast, overload
 
 # =============================================================================
 # EXCEPTIONS (must exist before helpers that may raise them)
@@ -157,6 +157,7 @@ class EnvVar:
                 description = str(args[4])
             if len(args) >= 6 and aliases is None:
                 aliases = cast(Any, args[5])
+
         k = (key or name or "").strip()
         if not k:
             raise TypeError("EnvVar requires 'key' (or alias 'name')")
@@ -173,10 +174,7 @@ class EnvVar:
             dv = str(value)
 
         kd = (kind or "str").strip().lower()
-
-        # secret default: if unspecified, default False (caller can infer separately)
         sec = bool(secret) if secret is not None else False
-
         als: tuple[str, ...] = tuple(str(a).strip() for a in (aliases or []) if str(a).strip())
 
         object.__setattr__(self, "key", k)
@@ -187,7 +185,6 @@ class EnvVar:
         object.__setattr__(self, "description", d)
         object.__setattr__(self, "aliases", als)
 
-    # Back-compat attributes some older code uses
     @property
     def name(self) -> str:  # legacy alias
         return self.key
@@ -251,7 +248,7 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return float(xf)
 
 
-def looks_like_base58(s: str, *, min_len: int = 20, max_len: int = 90) -> bool:
+def looks_like_base58(s: Any, *, min_len: int = 20, max_len: int = 90) -> bool:
     if not isinstance(s, str):
         return False
     ss = s.strip()
@@ -273,6 +270,11 @@ def stable_id(*parts: Any, prefix: str = "") -> str:
     return f"{prefix}{digest}" if prefix else digest
 
 
+def _dc_asdict(obj: Any) -> dict[str, Any]:
+    """Typed wrapper around dataclasses.asdict for mypy friendliness."""
+    return dataclasses.asdict(cast(Any, obj))
+
+
 def _to_primitive(x: Any) -> Any:
     """Convert dataclasses/enums/collections into JSON-friendly primitives."""
     if x is None:
@@ -288,7 +290,7 @@ def _to_primitive(x: Any) -> Any:
     if dataclasses.is_dataclass(x):
         if hasattr(x, "to_dict") and callable(x.to_dict):
             return cast(Any, x).to_dict()
-        return dataclasses.asdict(x)
+        return _dc_asdict(x)
     if isinstance(x, Mapping):
         return {str(k): _to_primitive(v) for k, v in x.items()}
     if isinstance(x, Sequence) and not isinstance(x, (str, bytes, bytearray, memoryview)):
@@ -437,7 +439,6 @@ def redact_mapping(
 ENV_EXAMPLE_FILENAME = ".env.example"
 
 EXTERNAL_ENV_ALLOWLIST: set[str] = {
-    # common OS
     "PATH",
     "HOME",
     "SHELL",
@@ -457,7 +458,6 @@ EXTERNAL_ENV_ALLOWLIST: set[str] = {
     "TERM",
     "LANG",
     "LC_ALL",
-    # python/tooling
     "PYTHONPATH",
     "PYTHONUTF8",
     "PYTHONDONTWRITEBYTECODE",
@@ -465,7 +465,6 @@ EXTERNAL_ENV_ALLOWLIST: set[str] = {
     "VIRTUAL_ENV",
     "PIP_DISABLE_PIP_VERSION_CHECK",
     "PIP_NO_CACHE_DIR",
-    # CI-ish / system-ish
     "CI",
     "TZ",
     "SSL_CERT_FILE",
@@ -518,7 +517,6 @@ def _is_secret_key(k: str) -> bool:
 
 
 def _env_section(_title: str, vars_: list[EnvVar]) -> list[EnvVar]:
-    # organizational only (kept for readability)
     return vars_
 
 
@@ -539,7 +537,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
                 EnvVar("ENV", default="development", description="Legacy alias for APP_ENV"),
                 EnvVar("TZ", default="UTC", description="Timezone label"),
-                # platform metadata (optional; CI/Render may populate)
                 EnvVar("RUN_ID", default="", description="Run identifier (CI/Render optional)"),
                 EnvVar("INSTANCE_ID", default="local", description="Instance identifier"),
                 EnvVar("GIT_COMMIT", default="", description="Git commit (optional)"),
@@ -562,9 +559,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 EnvVar("HOSTNAME", default="", description="Hostname (optional)"),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [B] ENV VALIDATION / FAIL-FAST
-        # ---------------------------------------------------------------------
         *_env_section(
             "ENV VALIDATION / FAIL-FAST",
             [
@@ -590,9 +584,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 EnvVar("RUNTIME_PROFILE", default="safe", description="safe|paper|live"),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [A0] GLOBAL MODES / SAFETY
-        # ---------------------------------------------------------------------
         *_env_section(
             "GLOBAL MODES / SAFETY",
             [
@@ -659,9 +650,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [A1] SOLANA / NETWORK
-        # ---------------------------------------------------------------------
         *_env_section(
             "SOLANA / NETWORK",
             [
@@ -673,9 +661,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 EnvVar("RPC_COMMITMENT", default="confirmed", description="RPC commitment"),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [A2] WALLET (secrets)
-        # ---------------------------------------------------------------------
         *_env_section(
             "WALLET",
             [
@@ -692,9 +677,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [A3] REDIS / CACHE
-        # ---------------------------------------------------------------------
         *_env_section(
             "REDIS / CACHE",
             [
@@ -718,9 +700,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [AI] INTERNAL REDIS KEYS / STREAMS
-        # ---------------------------------------------------------------------
         *_env_section(
             "INTERNAL REDIS KEYS / STREAMS",
             [
@@ -752,9 +731,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [A4] POSTGRES / AI DB
-        # ---------------------------------------------------------------------
         *_env_section(
             "POSTGRES / AI DB",
             [
@@ -775,9 +751,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [A5] ROUTER / JUPITER
-        # ---------------------------------------------------------------------
         *_env_section(
             "ROUTER / JUPITER",
             [
@@ -815,9 +788,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [A6] SCANNERS (high-level gates)
-        # ---------------------------------------------------------------------
         *_env_section(
             "SCANNERS",
             [
@@ -879,9 +849,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [A7] ENTRY / RISK / EXECUTION (minimal stable knobs)
-        # ---------------------------------------------------------------------
         *_env_section(
             "ENTRY / RISK / EXECUTION",
             [
@@ -927,9 +894,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 EnvVar("TRAILING_PCT", default="18", kind="float", description="Trailing percent"),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [A8] LOGGING
-        # ---------------------------------------------------------------------
         *_env_section(
             "LOGGING",
             [
@@ -961,9 +925,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
             kind="int",
             description="Task spawn: number of origin frames to record (1..10 recommended)",
         ),
-        # ---------------------------------------------------------------------
-        # [A9] ALERTS / NOTIFICATIONS (placeholders)
-        # ---------------------------------------------------------------------
         *_env_section(
             "ALERTS / NOTIFICATIONS",
             [
@@ -993,9 +954,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 EnvVar("NOTION_DATABASE_ID", default="", secret=True, description="Notion DB"),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [AI] PLAYBOOK (Notion + stream)
-        # ---------------------------------------------------------------------
         *_env_section(
             "PLAYBOOK (Notion + stream)",
             [
@@ -1055,9 +1013,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [AJ] CI / DIAGNOSTICS (scripts)
-        # ---------------------------------------------------------------------
         *_env_section(
             "CI / DIAGNOSTICS (scripts)",
             [
@@ -1115,7 +1070,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                     kind="bool",
                     description="Project-level switch for pytest plugin autoload handling",
                 ),
-                # --- FIXED: support old constructor style, but we now use canonical fields ---
                 EnvVar(
                     "CHECK_ENV_SKIP_CONFIG",
                     kind="bool",
@@ -1136,9 +1090,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [AJ2] SMOKE INIT (scripts/smoke_init.py)
-        # ---------------------------------------------------------------------
         *_env_section(
             "SMOKE INIT (scripts/smoke_init.py)",
             [
@@ -1186,9 +1137,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [AJ3] PREFLIGHT DNS (scripts/preflight.py)
-        # ---------------------------------------------------------------------
         *_env_section(
             "PREFLIGHT DNS (scripts/preflight.py)",
             [
@@ -1234,9 +1182,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [C] CI / Contract / Smoke toggles
-        # ---------------------------------------------------------------------
         *_env_section(
             "CI / Contract / Smoke toggles",
             [
@@ -1263,9 +1208,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 ),
             ],
         ),
-        # ---------------------------------------------------------------------
-        # [AK] PATHS
-        # ---------------------------------------------------------------------
         *_env_section(
             "PATHS",
             [
@@ -1428,13 +1370,10 @@ def _augment_canonical_with_env_example(
 # Apply augmentation at import-time (local file read only; safe)
 CANONICAL_ENV_VARS = _augment_canonical_with_env_example(CANONICAL_ENV_VARS)
 
-# Final canonical sets
 ENV_VARS: list[EnvVar] = list(CANONICAL_ENV_VARS)
 ENV_KEYS: set[str] = {v.key for v in ENV_VARS}
 REQUIRED_KEYS: set[str] = {v.key for v in ENV_VARS if v.required}
 SAFE_MODE_KEYS: set[str] = {v.key for v in ENV_VARS if _SAFE_TOGGLE_KEY_RE.search(v.key or "")}
-
-# Helpful schema maps (no side effects)
 ENV_SCHEMA: dict[str, EnvVar] = {v.key: v for v in ENV_VARS}
 
 
@@ -1462,10 +1401,7 @@ def env_example_diff(repo_root: Path | None = None) -> dict[str, list[str]]:
     root = repo_root or _repo_root_from_here()
     path = root / ENV_EXAMPLE_FILENAME
     if not path.exists():
-        return {
-            "missing_in_env_example": sorted(ENV_KEYS),
-            "extra_in_env_example": [],
-        }
+        return {"missing_in_env_example": sorted(ENV_KEYS), "extra_in_env_example": []}
 
     keys_in_order, _, _ = _parse_env_example(path)
     file_keys = set(keys_in_order)
@@ -1473,10 +1409,7 @@ def env_example_diff(repo_root: Path | None = None) -> dict[str, list[str]]:
     missing = sorted(k for k in ENV_KEYS if k not in file_keys)
     extra = sorted(k for k in file_keys if k not in ENV_KEYS)
 
-    return {
-        "missing_in_env_example": missing,
-        "extra_in_env_example": extra,
-    }
+    return {"missing_in_env_example": missing, "extra_in_env_example": extra}
 
 
 def env_example_required_hint_diff(repo_root: Path | None = None) -> dict[str, list[str]]:
@@ -1548,7 +1481,6 @@ def _env_example_lines() -> list[str]:
     """
     Deterministic `.env.example` generator from canonical vars.
     Emits inline `# required ...` hints ONLY for EnvVar.required=True keys.
-    This ensures strict required-hint tests do not skip and remain consistent.
     """
     lines: list[str] = []
     lines.append("# ===================================================================")
@@ -1570,7 +1502,6 @@ def _env_example_lines() -> list[str]:
 
         line = f"{ev.key}={default}"
 
-        # Inline required hint (ONLY for required keys)
         if ev.required:
             hint = "required"
             if desc:
@@ -1587,10 +1518,7 @@ def _env_example_lines() -> list[str]:
 
 
 def write_env_example(repo_root: Path | None = None) -> Path:
-    """
-    Deterministically regenerate `.env.example` from CANONICAL_ENV_VARS.
-    Intended for dev workflow and CI repair steps, not runtime.
-    """
+    """Deterministically regenerate `.env.example` from CANONICAL_ENV_VARS."""
     root = repo_root or _repo_root_from_here()
     path = root / ENV_EXAMPLE_FILENAME
     txt = "\n".join(_env_example_lines()).rstrip() + "\n"
@@ -1672,7 +1600,6 @@ def _split_known_extra(cls: type[T], d: Mapping[str, Any]) -> tuple[dict[str, An
         raise ValidationError(f"{cls.__name__}.from_dict expects mapping")
 
     known_names = {f.name for f in dataclasses.fields(cls)}
-
     raw_extra = d.get("extra")
     extra: dict[str, Any] = dict(raw_extra) if isinstance(raw_extra, Mapping) else {}
 
@@ -1743,14 +1670,19 @@ class ContractBase:
         return json_dumps(self.to_dict())
 
     @classmethod
-    def from_json(cls: type[T], s: str) -> T:
+    def from_dict(cls: type[Self], d: Mapping[str, Any]) -> Self:
+        """Typed contract for subclasses. Subclasses MUST override."""
+        raise NotImplementedError(f"{cls.__name__}.from_dict not implemented")
+
+    @classmethod
+    def from_json(cls: type[Self], s: str) -> Self:
         try:
             d = json.loads(s)
         except Exception as e:
             raise ValidationError(f"{cls.__name__}.from_json invalid JSON: {e}") from e
         if not isinstance(d, Mapping):
             raise ValidationError(f"{cls.__name__}.from_json expected object")
-        return cast(T, cls.from_dict(d))  # subclasses implement from_dict
+        return cls.from_dict(cast(Mapping[str, Any], d))
 
     def redacted(self) -> dict[str, Any]:
         d = self.to_dict()
@@ -1760,7 +1692,7 @@ class ContractBase:
     def get(self, key: str, default: Any = None) -> Any:
         return (self.extra or {}).get(key, default)
 
-    def with_extra(self: T, **updates: Any) -> T:
+    def with_extra(self: Self, **updates: Any) -> Self:
         e = dict(self.extra or {})
         for k, v in updates.items():
             if k:
@@ -1781,11 +1713,13 @@ class ContractBase:
 # CORE CONTRACTS
 # =============================================================================
 
+# ---- (Everything below stays feature-identical to your current schemas) ----
+# NOTE: the following classes are copied from your file with only minimal typing-safe
+# adjustments (no feature removals). Keep them as-is unless tests demand new shims.
+
 
 @dataclass(slots=True)
 class Candidate(ContractBase):
-    """Scanner output: a tradable opportunity snapshot. Minimal requirement: mint"""
-
     source: Source = Source.MANUAL
     chain: Chain = Chain.SOLANA
 
@@ -1909,8 +1843,6 @@ class Candidate(ContractBase):
 
 @dataclass(slots=True)
 class Tick(ContractBase):
-    """Tick stream update used by exit engine / trailing logic."""
-
     chain: Chain = Chain.SOLANA
     mint: str = ""
     price_usd: float = 0.0
@@ -1942,8 +1874,6 @@ class Tick(ContractBase):
 
 @dataclass(slots=True)
 class EntrySignal(ContractBase):
-    """Result from entry logic (ai_entry_logic / ai_buy_scoring)."""
-
     ok: bool = False
     score: float = 0.0
     reasons: list[str] = field(default_factory=list)
@@ -1975,8 +1905,6 @@ class EntrySignal(ContractBase):
 
 @dataclass(slots=True)
 class RouteQuote(ContractBase):
-    """Router quote (Jupiter/Lightning wrapper)."""
-
     in_mint: str = ""
     out_mint: str = ""
     in_amount_raw: int = 0
@@ -2033,8 +1961,6 @@ class RouteQuote(ContractBase):
 
 @dataclass(slots=True)
 class OrderIntent(ContractBase):
-    """What we intend to do (before sending tx)."""
-
     side: Side = Side.BUY
     order_type: OrderType = OrderType.MARKET
 
@@ -2081,8 +2007,6 @@ class OrderIntent(ContractBase):
 
 @dataclass(slots=True)
 class Fill(ContractBase):
-    """Execution result from router/trader."""
-
     side: Side = Side.BUY
     mint: str = ""
 
@@ -2135,8 +2059,6 @@ class Fill(ContractBase):
 
 @dataclass(slots=True)
 class Position(ContractBase):
-    """Canonical position state tracked by exit engine + position_store."""
-
     mint: str = ""
     symbol: str = ""
 
@@ -2224,8 +2146,6 @@ class Position(ContractBase):
 
 @dataclass(slots=True)
 class ExitSignal(ContractBase):
-    """Decision from exit engine / ai_sell_logic."""
-
     should_exit: bool = False
     reason: str = ""
     strength: float = 0.0  # 0..1
@@ -2261,8 +2181,6 @@ class ExitSignal(ContractBase):
 
 @dataclass(slots=True)
 class RiskSnapshot(ContractBase):
-    """Snapshot from risk_manager (permissive)."""
-
     ok_to_trade: bool = True
     reason: str = ""
 
@@ -2302,14 +2220,20 @@ class EventEnvelope(ContractBase):
     """Generic envelope for logging/streams."""
 
     type: EventType = EventType.ERROR
-    data: dict[str, Any] = field(default_factory=dict)
-    meta: dict[str, Any] = field(default_factory=dict)
+    data: Any = field(default_factory=dict)
+    meta: Any = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.type = as_enum(EventType, self.type, EventType.ERROR)
-        if not isinstance(self.data, dict):
+
+        if isinstance(self.data, Mapping):
+            self.data = dict(self.data)
+        else:
             self.data = {"value": _to_primitive(self.data)}
-        if not isinstance(self.meta, dict):
+
+        if isinstance(self.meta, Mapping):
+            self.meta = dict(self.meta)
+        else:
             self.meta = {"value": _to_primitive(self.meta)}
 
     def key(self) -> str:
@@ -2341,8 +2265,27 @@ class EventEnvelope(ContractBase):
 # =============================================================================
 
 
-def _json_safe(v: Any) -> Any:
-    return _to_primitive(v)
+def _coerce_to_dict(position: Any, *, kwargs_fallback: dict[str, Any]) -> dict[str, Any]:
+    """
+    Coerce arbitrary input into a dict[str, Any] without creating mypy "unreachable"
+    branches or ambiguous asdict typing.
+    """
+    if position is None:
+        return dict(kwargs_fallback) if kwargs_fallback else {}
+
+    if isinstance(position, Position):
+        return position.to_dict()
+
+    if dataclasses.is_dataclass(position):
+        return _dc_asdict(position)
+
+    if isinstance(position, Mapping):
+        return dict(position)
+
+    try:
+        return dict(cast(Any, position))  # e.g., list of pairs
+    except Exception:
+        return {"value": position}
 
 
 def normalize_position(
@@ -2357,7 +2300,7 @@ def normalize_position(
     Canonical position normalizer for contract tests + persistence.
     MUST return a JSON-safe dict.
 
-    Supports flexible calling patterns (contract tests try many):
+    Supports flexible calling patterns:
       normalize_position(pos, ctx)
       normalize_position(pos, ctx=ctx)
       normalize_position(position=pos, ctx=ctx)
@@ -2373,32 +2316,7 @@ def normalize_position(
     if position is None:
         position = pos if pos is not None else d
 
-    if position is None:
-        # Allow kwargs-only calls from tests/harnesses, e.g. normalize_position(mint=..., size_raw=..., ctx=...)
-        out = dict(kwargs) if kwargs else {}
-    elif isinstance(position, Position):
-        out = position.to_dict()
-    elif dataclasses.is_dataclass(position):
-        out = dataclasses.asdict(position)
-    elif isinstance(position, Mapping):
-        out = dict(position)
-    else:
-        try:
-            out = dict(position)  # type: ignore[arg-type]
-        except Exception:
-            out = {"value": position}
-
-    if isinstance(position, Position):
-        out = position.to_dict()
-    elif dataclasses.is_dataclass(position):
-        out = dataclasses.asdict(position)
-    elif isinstance(position, Mapping):
-        out = dict(position)
-    else:
-        try:
-            out = dict(position)  # type: ignore[arg-type]
-        except Exception:
-            out = {"value": position}
+    out = _coerce_to_dict(position, kwargs_fallback=dict(kwargs))
 
     # ensure required schema keys exist
     out.setdefault("schema_version", CONTRACTS_VERSION)
@@ -2416,7 +2334,6 @@ def normalize_position(
         out.setdefault("ts", now_ts_val)
         out.setdefault("ts_ms", int(now_ts_val * 1000))
 
-    # hard default ts/ts_ms if absent/invalid
     out["ts"] = safe_int(out.get("ts", now_ts()), now_ts())
     out["ts_ms"] = safe_int(out.get("ts_ms", now_ms()), now_ms())
 
@@ -2432,16 +2349,22 @@ def normalize_position(
         elif "amount_raw" in out:
             out["size_raw"] = out.get("amount_raw")
 
-    return cast(dict[str, Any], _json_safe(out))
+    return cast(dict[str, Any], _to_primitive(out))
 
 
-def ensure_position(x: Any = None, ctx: Any = None, /, **kwargs: Any) -> Position:
+@overload
+def ensure_position(
+    x: Any = None, ctx: Mapping[str, Any] = ..., /, **kwargs: Any
+) -> dict[str, Any]: ...
+@overload
+def ensure_position(x: Any = None, ctx: None = ..., /, **kwargs: Any) -> Position: ...
+
+
+def ensure_position(x: Any = None, ctx: Any = None, /, **kwargs: Any) -> Any:
     """
     Dual-mode helper used by legacy callers + tests:
     - object mode: ensure_position(obj_or_dict) -> Position
     - dict/normalizer mode: ensure_position(obj_or_dict, ctx) -> dict (via ensure_position_dict)
-
-    NOTE: This preserves existing behavior relied on by some harness paths.
     """
     if x is None:
         for k in ("position", "pos", "d"):
@@ -2450,17 +2373,14 @@ def ensure_position(x: Any = None, ctx: Any = None, /, **kwargs: Any) -> Positio
                 break
 
     if ctx is not None:
-        kwargs.setdefault("ctx", ctx)
-        return ensure_position_dict(x, **kwargs)  # type: ignore[return-value]
+        kwargs.setdefault("ctx", cast(Mapping[str, Any], ctx))
+        return ensure_position_dict(x, **kwargs)
 
     if kwargs.get("ctx") is not None:
-        return ensure_position_dict(x, **kwargs)  # type: ignore[return-value]
+        return ensure_position_dict(x, **kwargs)
 
-    dct = normalize_position(x, **kwargs) if x is not None else normalize_position(**kwargs)
-
-    if isinstance(dct, Position):
-        return dct
-    return Position.from_dict(dict(dct))
+    dct = ensure_position_dict(x, **kwargs)
+    return Position.from_dict(dct)
 
 
 def ensure_position_dict(x: Any = None, /, **kwargs: Any) -> dict[str, Any]:
@@ -2476,7 +2396,7 @@ def ensure_position_obj(x: Any = None, /, **kwargs: Any) -> Position:
             if k in kwargs:
                 x = kwargs.pop(k)
                 break
-    return ensure_position(x, **kwargs)
+    return ensure_position(x, None, **kwargs)
 
 
 # =============================================================================
@@ -2532,10 +2452,7 @@ def ensure_event_envelope(x: EventEnvelopeLike) -> EventEnvelope:
 
 
 def build_contracts_surface() -> dict[str, Any]:
-    """
-    Builder-style surface for contract/startup discovery tests.
-    Returns a stable map of key contract symbols.
-    """
+    """Builder-style surface for contract/startup discovery tests."""
     return {
         "schema_version": CONTRACTS_VERSION,
         "Position": Position,
@@ -2590,7 +2507,6 @@ def schema_names() -> list[str]:
 
 
 __all__ = [
-    # DATA/OBJECT CONTRACTS
     "CONTRACTS_VERSION",
     "ENV_KEYS",
     "ENV_VARS",
@@ -2606,7 +2522,6 @@ __all__ = [
     "ContractError",
     "EntrySignal",
     "EntrySignalLike",
-    # ENV CONTRACT
     "EnvVar",
     "EventEnvelope",
     "EventEnvelopeLike",

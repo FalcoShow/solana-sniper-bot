@@ -114,12 +114,13 @@ class EventLogger(Protocol):
     def exception(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
     def critical(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
     def log(self, level: int, msg: str, *args: Any, **kwargs: Any) -> None: ...
-    def isEnabledFor(self, level: int) -> bool: ...
+    def isEnabledFor(self, level: int) -> bool: ...  # noqa: N802
 
     # God-tier extensions
     def event(
         self, name: str, /, msg: str | None = None, level: str | int = logging.INFO, **fields: Any
     ) -> None: ...
+
     def every(
         self,
         name: str,
@@ -129,6 +130,7 @@ class EventLogger(Protocol):
         msg: str | None = None,
         **fields: Any,
     ) -> bool: ...
+
     def once(
         self, name: str, /, msg: str | None = None, level: str | int = logging.INFO, **fields: Any
     ) -> bool: ...
@@ -172,7 +174,7 @@ class _LogDefaults:
     force_reset: bool
 
 
-_RESERVED_RECORD_KEYS = {
+_RESERVED_RECORD_KEYS: set[str] = {
     # Standard LogRecord fields
     "name",
     "msg",
@@ -214,7 +216,7 @@ _RESERVED_RECORD_KEYS = {
     "ts_ms",
 }
 
-_DEFAULT_REDACT_KEYS = {
+_DEFAULT_REDACT_KEYS: set[str] = {
     "password",
     "pass",
     "passwd",
@@ -327,11 +329,12 @@ def _infer_env_name() -> str:
     if env:
         return env
 
-    for k in ("ENV", "APP_ENV", "ENVIRONMENT", "RUNTIME_ENV"):
-        v = (os.getenv(k, "") or "").strip()
-        if v:
-            return v
+    for key in ("ENV", "APP_ENV", "ENVIRONMENT", "RUNTIME_ENV"):
+        val = (os.getenv(key, "") or "").strip()
+        if val:
+            return val
 
+    # Render hints
     if (os.getenv("RENDER", "") or "").strip():
         return "prod"
     if (os.getenv("RENDER_SERVICE_ID", "") or "").strip():
@@ -524,7 +527,7 @@ def _refresh_secret_values() -> None:
         _SECRET_VALUES = _collect_secret_values(_DEFAULTS.redact_secret_values)
 
 
-def _mask_tokenish_match(m: re.Match) -> str:
+def _mask_tokenish_match(m: re.Match[str]) -> str:
     tok = m.group(0)
     if _looks_like_solana_mint(tok):
         return tok
@@ -536,6 +539,7 @@ def _sanitize_text(text: Any) -> str:
         return ""
     s = str(text)
 
+    # obvious patterns
     s = _URL_CRED_RE.sub(r"\1***@", s)
     s = _APIKEY_HDR_RE.sub(r"\1***", s)
     s = _BEARER_HDR_RE.sub(r"\1***", s)
@@ -543,6 +547,7 @@ def _sanitize_text(text: Any) -> str:
     s = _KV_SECRET_RE.sub(r"\1\2***", s)
     s = _QP_SECRET_RE.sub(r"\1=***", s)
 
+    # exact secret values (env) redaction
     if _DEFAULTS.redact_secret_values:
         with _SECRET_VALUES_LOCK:
             sv = list(_SECRET_VALUES)
@@ -553,6 +558,7 @@ def _sanitize_text(text: Any) -> str:
             except Exception:
                 continue
 
+    # token-ish strings (but keep Solana mints visible)
     if _DEFAULTS.mask_long_tokens:
         s = _LONG_TOKENISH_RE.sub(_mask_tokenish_match, s)
 
@@ -565,7 +571,6 @@ def _truncate_str(s: str) -> str:
         return s
     if len(s) <= vmax:
         return s
-
     head = max(0, (vmax // 2) - 32)
     tail = max(0, vmax - head - 64)
     if tail > 0:
@@ -873,6 +878,7 @@ class TextFormatter(logging.Formatter):
         self.use_utc = bool(use_utc)
 
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:  # noqa: N802
+        _ = datefmt
         if self.use_utc:
             dt = datetime.fromtimestamp(record.created, tz=UTC)
             return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -998,7 +1004,9 @@ def _logger_every(
     msg: str | None = None,
     **fields: Any,
 ) -> bool:
-    # Back-compat: .every("evt", 30) or .every("evt", 30, "WARNING")
+    # Back-compat:
+    #   .every("evt", 30)
+    #   .every("evt", 30, "WARNING")  or  .every("evt", 30, logging.WARNING)
     if args:
         if len(args) >= 1 and every_sec is None:
             every_sec = args[0]
@@ -1443,6 +1451,7 @@ class _StreamToLogger(io.TextIOBase):
         if not s:
             return 0
 
+        # If logging writes to our tee, avoid recursion.
         if getattr(self._local, "in_write", False):
             try:
                 return int(self._tee.write(s))

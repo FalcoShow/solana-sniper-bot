@@ -242,11 +242,20 @@ _LAST_HTTP_SESSION: Any | None = None
 _LAST_HTTP_SESSION_TESTID: str | None = None
 
 
+def _pytest_runtime() -> bool:
+    # single source of truth
+    return _is_pytest_runtime()
+
+
 def _pytest_test_id() -> str | None:
+    """
+    Stable id unique per-test:
+      "path/to/test.py::test_name"
+    (PYTEST_CURRENT_TEST also includes " (call)" etc — we strip that.)
+    """
     t = os.getenv("PYTEST_CURRENT_TEST")
     if not t:
         return None
-    # stable id: "file.py::test_name"
     return t.split(" ")[0].strip()
 
 
@@ -260,11 +269,14 @@ def _looks_like_capturing_session(o: Any) -> bool:
             return False
         if hasattr(o, "get_calls") or hasattr(o, "post_calls"):
             return True
-        # some harnesses wrap objects; fall back to class name
         name = type(o).__name__.lower()
         return ("capturing" in name) or ("fake" in name)
     except Exception:
         return False
+
+
+def _is_capturing_session(o: Any) -> bool:
+    return _looks_like_capturing_session(o)
 
 
 def _looks_like_http_session(o: Any) -> bool:
@@ -272,7 +284,6 @@ def _looks_like_http_session(o: Any) -> bool:
         return False
     if _looks_like_capturing_session(o):
         return True
-    # common http client shapes (aiohttp/httpx-style)
     for m in ("request", "get", "post"):
         try:
             if hasattr(o, m) and callable(getattr(o, m)):
@@ -282,24 +293,17 @@ def _looks_like_http_session(o: Any) -> bool:
     return False
 
 
-def _pytest_test_id() -> str | None:
-    """
-    Must be unique per-test (not just per-file), otherwise pinned sessions can bleed.
-    """
-    t = os.getenv("PYTEST_CURRENT_TEST")
-    if not t:
-        return None
-    return t.strip()
+# -------------------------------------------------------------------------
+# Test session discovery (MUST exist for contract tests)
+# -------------------------------------------------------------------------
 
 
 def _find_patched_capturing_session(*, needs_post: bool) -> Any | None:
     """
     Find the CapturingSession that tests monkeypatch into this module.
-    Prefer likely names, then scan 'session-ish' globals.
-    Never return our pinned _LAST_HTTP_SESSION (we want the CURRENT test's patch).
+    Works even when SAFE_MODE/DRYRUN/NO_NETWORK is enabled.
     """
     preferred_names = (
-        # common test patch targets
         "_http_client",
         "http_client",
         "_http_session",
@@ -311,66 +315,73 @@ def _find_patched_capturing_session(*, needs_post: bool) -> Any | None:
         "_aiohttp_client",
         "_httpx_client",
         "router_session",
+        "HTTP_CLIENT",
+        "SESSION",
+        "client",
     )
 
-    # 1) try the obvious names first
-    for name in preferred_names:
-        if name.startswith("_LAST_"):
-            continue
-        s = globals().get(name)
-        if _looks_like_capturing_session(s):
-            if (not needs_post) or hasattr(s, "post") or hasattr(s, "request"):
-                return s
+    def _post_ok(o: Any) -> bool:
+        if not needs_post:
+            return True
+        return callable(getattr(o, "post", None)) or callable(getattr(o, "request", None))
 
-    # 2) scan "session-ish" globals (but skip pinned/internal)
+    # 1) obvious names first
+    for name in preferred_names:
+        o = globals().get(name)
+        if _looks_like_capturing_session(o) and _post_ok(o):
+            return o
+
+    # 2) scan "session-ish" globals
     for k, v in globals().items():
         if k.startswith("__") or k.startswith("_LAST_"):
             continue
         lk = k.lower()
         if ("session" not in lk) and ("http" not in lk) and ("client" not in lk):
             continue
-        if _looks_like_capturing_session(v):
-            if (not needs_post) or hasattr(v, "post") or hasattr(v, "request"):
-                return v
+        if _looks_like_capturing_session(v) and _post_ok(v):
+            return v
 
     return None
 
 
 async def _get_http_test_double(*, needs_post: bool) -> Any | None:
     """
-    If tests monkeypatched _get_http to return a CapturingSession (or set it to one),
-    fetch it safely WITHOUT requiring pytest-runtime gating.
+    If tests monkeypatch `_get_http` to a session object OR a sync/async function returning one,
+    fetch it safely. This is the critical bridge for contract tests.
     """
     obj = globals().get("_get_http")
     if obj is None:
         return None
 
-    # If it's our original factory, don't call it under tests/offline
-    if callable(obj) and _is_original_get_http_bound(obj):
+    # Patched to an object directly
+    if not callable(obj):
+        return obj if _looks_like_capturing_session(obj) else None
+
+    # If it's the router's own factory, do NOT call it in pytest/hermetic.
+    if (_is_pytest_runtime() or _hermetic_mode()) and _is_original_get_http_bound(obj):
         return None
 
     try:
-        out = obj(needs_post=needs_post) if callable(obj) else obj  # type: ignore[misc]
+        out = obj(needs_post=needs_post)  # type: ignore[misc]
     except TypeError:
-        out = obj() if callable(obj) else obj  # type: ignore[misc]
+        out = obj()  # type: ignore[misc]
 
-    return await _maybe_await(out)
+    out = await _maybe_await(out)
+    return out if _looks_like_capturing_session(out) else None
 
 
 def _set_last_http_session(s: Any | None) -> None:
     """
-    Store the last session; in pytest tie it to the current test id to prevent bleed.
+    Store last session; under pytest tie it to current test id to prevent bleed.
     Never overwrite a capturing session with a non-capturing one.
     """
     global _LAST_HTTP_SESSION, _LAST_HTTP_SESSION_TESTID
 
-    # allow clearing
     if s is None:
         _LAST_HTTP_SESSION = None
         _LAST_HTTP_SESSION_TESTID = _pytest_test_id()
         return
 
-    # don't overwrite capturing with non-capturing
     if _looks_like_capturing_session(_LAST_HTTP_SESSION) and (not _looks_like_capturing_session(s)):
         return
 
@@ -380,8 +391,9 @@ def _set_last_http_session(s: Any | None) -> None:
 
 def _get_last_http_session() -> Any | None:
     """
-    Return the pinned session only if not in pytest,
-    OR if in pytest and pinned during the SAME test.
+    Return pinned session only if:
+      - not pytest, OR
+      - pytest AND pinned during SAME test
     """
     if _pytest_runtime():
         cur = _pytest_test_id()
@@ -1117,10 +1129,6 @@ async def _session_request_json(
     return _resp_status(raw), await _resp_json(raw)
 
 
-def _is_capturing_session(o: Any) -> bool:
-    return _looks_like_capturing_session(o)
-
-
 # -------------------------------------------------------------------------
 # httpx client lifecycle (no import-time network)
 # -------------------------------------------------------------------------
@@ -1164,21 +1172,33 @@ async def _get_http(needs_post: bool = False) -> Any:
     if not _net_allowed():
         raise NetworkDisabled("network_disabled_by_env")
 
-    if _http_client is not None:
-        with contextlib.suppress(Exception):
-            if isinstance(_http_client, httpx.AsyncClient) and not _http_client.is_closed:
-                return _http_client
-        return _http_client
+    # IMPORTANT: read global into a local so mypy doesn't "prove" the global is None later
+    client = _http_client
+    if client is not None:
+        if isinstance(client, httpx.AsyncClient):
+            with contextlib.suppress(Exception):
+                if not client.is_closed:
+                    return client
+            # closed client -> drop and recreate
+            _http_client = None
+        else:
+            return client
 
     async with _http_lock:
-        if _http_client is not None:
-            with contextlib.suppress(Exception):
-                if isinstance(_http_client, httpx.AsyncClient) and not _http_client.is_closed:
-                    return _http_client
-            return _http_client
+        # re-read AFTER awaiting the lock (real concurrency can change it)
+        client = _http_client
+        if client is not None:
+            if isinstance(client, httpx.AsyncClient):
+                with contextlib.suppress(Exception):
+                    if not client.is_closed:
+                        return client
+                _http_client = None
+            else:
+                return client
 
         limits = httpx.Limits(
-            max_keepalive_connections=int(HTTP_MAX_KEEPALIVE), max_connections=int(HTTP_MAX_CONN)
+            max_keepalive_connections=int(HTTP_MAX_KEEPALIVE),
+            max_connections=int(HTTP_MAX_CONN),
         )
         kwargs: dict[str, Any] = dict(
             timeout=_http_timeout_obj(),
@@ -1197,8 +1217,7 @@ async def _get_http(needs_post: bool = False) -> Any:
                 kwargs["proxies"] = {"all://": px}
 
         _http_client = httpx.AsyncClient(**kwargs)
-
-    return _http_client
+        return _http_client
 
 
 async def _close_http_local() -> None:
@@ -1485,7 +1504,8 @@ async def _singleflight(key: str, maker: Callable[[], Awaitable[Any]]) -> Any:
     async with _quote_lock:
         fut = _QUOTE_FLIGHT.get(key)
         if fut is None or fut.done():
-            fut = asyncio.create_task(maker())
+            # ensure_future accepts Awaitable (Task requires Coroutine)
+            fut = asyncio.ensure_future(maker())
             _QUOTE_FLIGHT[key] = fut
     try:
         return await fut
@@ -2024,94 +2044,47 @@ async def _with_retries(fetcher: Callable[[], Awaitable[dict[str, Any]]]) -> dic
 # -------------------------------------------------------------------------
 
 
-def _pytest_runtime() -> bool:
-    fn = globals().get("_is_pytest_runtime") or globals().get("_is_test_runtime")
-    try:
-        return bool(fn()) if callable(fn) else False
-    except Exception:
-        return False
-
-
-def _looks_like_capturing_session(s: Any) -> bool:
-    """
-    Heuristic: tests use CapturingSession with get_calls/post_calls.
-    We must allow it even when _net_allowed() is False.
-    """
-    if s is None:
-        return False
-    if hasattr(s, "get_calls") or hasattr(s, "post_calls"):
-        return True
-    # Some harnesses store wrapped objects
-    name = type(s).__name__.lower()
-    if "capturing" in name or "fake" in name:
-        return True
-    return False
-
-
 async def _resolve_quote_session(session: Any | None) -> Any | None:
     """
     Quote session resolution:
-      - If caller passed a session, use it.
-      - In pytest/hermetic: prefer the CURRENT test’s patched CapturingSession.
-      - Fall back to pinned session only within the SAME test (via _get_last_http_session()).
-      - Never create a real network client in pytest/hermetic.
+      - If caller passed a usable HTTP session, use it.
+      - Prefer CURRENT test’s patched CapturingSession.
+      - Else pinned session (same-test only).
+      - In pytest/hermetic: NEVER create real network clients.
+      - In production: create httpx client if network allowed.
     """
-    # ✅ Always prefer the CURRENT test's patched CapturingSession if present
+    if session is not None and _looks_like_http_session(session):
+        return session
+
+    # 1) current test patched CapturingSession (strongest signal)
     with contextlib.suppress(Exception):
         s = _find_patched_capturing_session(needs_post=False)
         if _looks_like_capturing_session(s):
             _set_last_http_session(s)
             return s
 
-    # ✅ If tests patched _get_http, use that too (even if pytest detection is flaky)
+    # 2) tests may monkeypatch _get_http to return a CapturingSession
     with contextlib.suppress(Exception):
         s = await _get_http_test_double(needs_post=False)
         if _looks_like_capturing_session(s):
             _set_last_http_session(s)
             return s
 
-    if session is not None:
-        # Only accept real HTTP-ish sessions here; otherwise ignore and keep resolving
-        if _looks_like_http_session(session):
-            return session
-        session = None
-
-    # pytest/hermetic: must use test doubles if present
-    if _pytest_runtime() or _hermetic_mode():
-        # 1) direct globals scan (router._http_client, router.session, etc.)
-        with contextlib.suppress(Exception):
-            s = _find_patched_session(needs_post=False)
-            if _looks_like_capturing_session(s):
-                _set_last_http_session(s)
-                return s
-
-        # 2) tests sometimes monkeypatch _get_http itself (sync/async/object)
-        with contextlib.suppress(Exception):
-            s = await _get_http_from_tests(needs_post=False)
-            if _looks_like_capturing_session(s):
-                _set_last_http_session(s)
-                return s
-
-        # 3) pinned session (ONLY if same test; your _get_last_http_session enforces this)
-        with contextlib.suppress(Exception):
-            s = _get_last_http_session()
-            if _looks_like_capturing_session(s):
-                return s
-
-        return None
-
-    # non-pytest: prefer pinned; else create only if network allowed
+    # 3) pinned (same-test only)
     with contextlib.suppress(Exception):
         s = _get_last_http_session()
         if s is not None:
             return s
 
+    # 4) hermetic/pytest: do not create real clients
+    if _pytest_runtime() or _hermetic_mode():
+        return None
+
+    # 5) production: create real client if allowed
     if _net_allowed():
-        with contextlib.suppress(Exception):
-            s = await _maybe_await(_get_http(needs_post=False))
-            if s is not None:
-                _set_last_http_session(s)
-                return s
+        s2 = await _get_http(needs_post=False)
+        _set_last_http_session(s2)
+        return s2
 
     return None
 

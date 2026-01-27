@@ -214,3 +214,6 @@ out/
 # Do NOT ignore lint/config files. These must remain tracked for CI parity.
 # (Intentionally NOT ignoring ruff.toml / .ruff.toml / pyproject.toml)
 ###############################################################################
+
+# local render export
+render.env

@@ -12,23 +12,19 @@ license = { text = "Proprietary" }
 authors = [{ name = "Andrew" }]
 keywords = ["solana", "trading", "asyncio", "jupiter", "quant", "bot"]
 
-# Keep runtime deps tight + real.
-# NOTE: asyncpg is Linux-friendly for Render; Windows often runs psycopg instead.
+# Runtime deps: keep real + lean.
+# NOTE: asyncpg is Linux-friendly (Render). Windows typically uses psycopg.
 dependencies = [
   "aiohttp>=3.9.0",
   "httpx>=0.27.0",
   "aiosqlite>=0.20.0",
-
   "SQLAlchemy>=2.0.0",
   "asyncpg>=0.29.0; platform_system != 'Windows'",
   "psycopg[binary]>=3.1",
-
   "redis>=5.0.0",
   "certifi>=2024.2.2",
   "python-dotenv>=1.0.1",
   "requests>=2.31.0",
-
-  # Solana stack
   "solders>=0.20.0",
   "solana>=0.35.0",
 ]
@@ -39,7 +35,6 @@ dev = [
   "pytest-asyncio>=0.23.0",
   "pytest-cov>=4.1.0",
   "pytest-xdist>=3.5.0",
-
   "ruff>=0.6.0",
   "mypy>=1.8.0",
   "types-redis>=4.6.0.20241004",
@@ -56,15 +51,15 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["utils_pkg*", "scanner*", "sniper*", "scripts*", "daytrader*", "db*"]
+include = ["utils_pkg*", "scanner*", "sniper*", "scripts*", "daytrader*", "db*", "config*"]
 exclude = ["tests*", "data*", "logs*", "tmp*", "node_modules*", "dist*", "build*"]
 
 # -------------------
-# Ruff (lint + import sorting)
+# Ruff (lint + formatting)
 # -------------------
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py313"
 extend-exclude = [
   ".venv",
   "venv",
@@ -81,19 +76,14 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-# "No-drama" gate: correctness + imports only.
-# We intentionally DO NOT gate on style churn right now.
+# Gate only correctness + imports (no style churn).
 select = ["E", "F", "I"]
 
 ignore = [
   "E203", # whitespace before ':'
-
-  # ✅ Critical: stop repo-wide lint avalanches that are NOT runtime bugs.
-  "E402", # module import not at top of file (common in CLIs / scripts / late imports)
-  "E501", # line too long (SQL strings, long f-strings, URLs)
-
-  # Project convention: OHLC / low = l patterns (do not block builds)
-  "E741",
+  "E402", # import not at top of file (common in CLIs / scripts)
+  "E501", # long lines (SQL/URLs/long f-strings)
+  "E741", # ambiguous variable name (project convention; do not block builds)
 ]
 
 [tool.ruff.lint.isort]
@@ -101,8 +91,6 @@ known-first-party = ["utils_pkg", "scanner", "sniper", "scripts", "daytrader", "
 combine-as-imports = true
 
 [tool.ruff.lint.per-file-ignores]
-# Scripts frequently have CLI patterns that aren’t worth blocking on.
-# (Kept for clarity; E402 is already ignored repo-wide.)
 "scripts/*.py" = ["E402"]
 
 # -------------------
@@ -112,22 +100,6 @@ combine-as-imports = true
 testpaths = ["tests"]
 addopts = "-q"
 asyncio_mode = "auto"
-
-# -------------------
-# MyPy
-# -------------------
-[tool.mypy]
-python_version = "3.11"
-warn_unused_configs = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-no_implicit_optional = true
-check_untyped_defs = true
-disallow_any_generics = false
-disallow_untyped_defs = false
-strict_equality = true
-pretty = true
-ignore_missing_imports = true
 
 # -------------------
 # Coverage
