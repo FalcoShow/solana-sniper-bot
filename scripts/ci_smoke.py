@@ -8,9 +8,11 @@ import socket
 import sys
 import traceback
 import urllib.request
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import Any, Callable
 
 
 # -----------------------------------------------------------------------------
@@ -70,8 +72,28 @@ class NetworkBlockedError(RuntimeError):
     pass
 
 
+def _setattr_if_present(obj: Any, name: str, value: Any) -> None:
+    """
+    setattr wrapper used to avoid mypy 'Cannot assign to a type' / attr-defined errors
+    while keeping behavior identical.
+    """
+    try:
+        setattr(obj, name, value)
+    except Exception:
+        # If an attribute is readonly or missing on some platforms, ignore;
+        # the smoke still blocks the primary channels.
+        pass
+
+
+def _wrap_blocked(msg: str) -> Callable[..., Any]:
+    def _blocked(*_args: Any, **_kwargs: Any) -> Any:
+        raise NetworkBlockedError(msg)
+
+    return _blocked
+
+
 @contextmanager
-def block_network() -> Any:
+def block_network() -> Iterator[None]:
     """
     Block common outbound network pathways. If anything tries to open a socket / HTTP client,
     it should fail fast with a clear error.
@@ -79,24 +101,33 @@ def block_network() -> Any:
     This is intentionally strict: CI smoke must not touch the network.
     """
     # --- socket guards ---
-    orig_socket = socket.socket
+    orig_socket = getattr(socket, "socket", None)
     orig_create_conn = getattr(socket, "create_connection", None)
     orig_getaddrinfo = getattr(socket, "getaddrinfo", None)
 
-    def guarded_socket(*args: Any, **kwargs: Any) -> Any:
-        raise NetworkBlockedError("Network is blocked in ci_smoke.py (socket.socket).")
-
-    def guarded_create_connection(*args: Any, **kwargs: Any) -> Any:
-        raise NetworkBlockedError("Network is blocked in ci_smoke.py (socket.create_connection).")
-
-    def guarded_getaddrinfo(*args: Any, **kwargs: Any) -> Any:
-        raise NetworkBlockedError("Network is blocked in ci_smoke.py (socket.getaddrinfo).")
-
-    socket.socket = guarded_socket  # type: ignore[assignment]
+    _setattr_if_present(
+        socket, "socket", _wrap_blocked("Network is blocked in ci_smoke.py (socket.socket).")
+    )
     if callable(orig_create_conn):
-        socket.create_connection = guarded_create_connection  # type: ignore[assignment]
+        _setattr_if_present(
+            socket,
+            "create_connection",
+            _wrap_blocked("Network is blocked in ci_smoke.py (socket.create_connection)."),
+        )
     if callable(orig_getaddrinfo):
-        socket.getaddrinfo = guarded_getaddrinfo  # type: ignore[assignment]
+        _setattr_if_present(
+            socket,
+            "getaddrinfo",
+            _wrap_blocked("Network is blocked in ci_smoke.py (socket.getaddrinfo)."),
+        )
+
+    # --- urllib guard (stdlib) ---
+    orig_urlopen = getattr(urllib.request, "urlopen", None)
+    _setattr_if_present(
+        urllib.request,
+        "urlopen",
+        _wrap_blocked("Network is blocked in ci_smoke.py (urllib.request.urlopen)."),
+    )
 
     # --- urllib guard (stdlib) ---
     orig_urlopen = urllib.request.urlopen
@@ -107,56 +138,59 @@ def block_network() -> Any:
     urllib.request.urlopen = guarded_urlopen  # type: ignore[assignment]
 
     # --- requests guard (if installed) ---
-    requests_mod = None
-    orig_requests_request = None
-    orig_requests_get = None
-    orig_requests_post = None
+    requests_mod: Any | None = None
+    orig_requests_request: Any = None
+    orig_requests_get: Any = None
+    orig_requests_post: Any = None
     try:
-        import requests as _requests  # type: ignore
+        import requests as _requests  # type: ignore[import-not-found]
 
         requests_mod = _requests
         orig_requests_request = getattr(_requests, "request", None)
         orig_requests_get = getattr(_requests, "get", None)
         orig_requests_post = getattr(_requests, "post", None)
 
-        def _blocked(*args: Any, **kwargs: Any) -> Any:
-            raise NetworkBlockedError("Network is blocked in ci_smoke.py (requests).")
-
         if callable(orig_requests_request):
-            _requests.request = _blocked  # type: ignore[assignment]
+            _setattr_if_present(
+                _requests, "request", _wrap_blocked("Network is blocked (requests.request).")
+            )
         if callable(orig_requests_get):
-            _requests.get = _blocked  # type: ignore[assignment]
+            _setattr_if_present(
+                _requests, "get", _wrap_blocked("Network is blocked (requests.get).")
+            )
         if callable(orig_requests_post):
-            _requests.post = _blocked  # type: ignore[assignment]
+            _setattr_if_present(
+                _requests, "post", _wrap_blocked("Network is blocked (requests.post).")
+            )
     except Exception:
         pass
 
     # --- aiohttp guard (if installed) ---
-    aiohttp_mod = None
-    orig_aiohttp_session = None
+    aiohttp_mod: Any | None = None
+    orig_aiohttp_session: Any = None
     try:
-        import aiohttp as _aiohttp  # type: ignore
+        import aiohttp as _aiohttp  # type: ignore[import-not-found]
 
         aiohttp_mod = _aiohttp
         orig_aiohttp_session = getattr(_aiohttp, "ClientSession", None)
 
-        class _BlockedSession:
+        class _BlockedClientSession:
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 raise NetworkBlockedError(
                     "Network is blocked in ci_smoke.py (aiohttp.ClientSession)."
                 )
 
         if orig_aiohttp_session is not None:
-            _aiohttp.ClientSession = _BlockedSession  # type: ignore[assignment]
+            _setattr_if_present(_aiohttp, "ClientSession", _BlockedClientSession)
     except Exception:
         pass
 
     # --- httpx guard (if installed) ---
-    httpx_mod = None
-    orig_httpx_client = None
-    orig_httpx_async_client = None
+    httpx_mod: Any | None = None
+    orig_httpx_client: Any = None
+    orig_httpx_async_client: Any = None
     try:
-        import httpx as _httpx  # type: ignore
+        import httpx as _httpx  # type: ignore[import-not-found]
 
         httpx_mod = _httpx
         orig_httpx_client = getattr(_httpx, "Client", None)
@@ -171,46 +205,50 @@ def block_network() -> Any:
                 raise NetworkBlockedError("Network is blocked in ci_smoke.py (httpx.AsyncClient).")
 
         if orig_httpx_client is not None:
-            _httpx.Client = _BlockedClient  # type: ignore[assignment]
+            _setattr_if_present(_httpx, "Client", _BlockedClient)
         if orig_httpx_async_client is not None:
-            _httpx.AsyncClient = _BlockedAsyncClient  # type: ignore[assignment]
+            _setattr_if_present(_httpx, "AsyncClient", _BlockedAsyncClient)
     except Exception:
         pass
 
     try:
         yield
     finally:
-        # Restore everything we changed
-        socket.socket = orig_socket  # type: ignore[assignment]
+        # Restore everything we changed (best-effort; do not fail on restore)
+        if orig_socket is not None:
+            _setattr_if_present(socket, "socket", orig_socket)
         if callable(orig_create_conn):
-            socket.create_connection = orig_create_conn  # type: ignore[assignment]
+            _setattr_if_present(socket, "create_connection", orig_create_conn)
         if callable(orig_getaddrinfo):
-            socket.getaddrinfo = orig_getaddrinfo  # type: ignore[assignment]
+            _setattr_if_present(socket, "getaddrinfo", orig_getaddrinfo)
+
+        if orig_urlopen is not None:
+            _setattr_if_present(urllib.request, "urlopen", orig_urlopen)
 
         urllib.request.urlopen = orig_urlopen  # type: ignore[assignment]
 
         if requests_mod is not None:
             if callable(orig_requests_request):
-                requests_mod.request = orig_requests_request  # type: ignore[assignment]
+                _setattr_if_present(requests_mod, "request", orig_requests_request)
             if callable(orig_requests_get):
-                requests_mod.get = orig_requests_get  # type: ignore[assignment]
+                _setattr_if_present(requests_mod, "get", orig_requests_get)
             if callable(orig_requests_post):
-                requests_mod.post = orig_requests_post  # type: ignore[assignment]
+                _setattr_if_present(requests_mod, "post", orig_requests_post)
 
         if aiohttp_mod is not None and orig_aiohttp_session is not None:
-            aiohttp_mod.ClientSession = orig_aiohttp_session  # type: ignore[assignment]
+            _setattr_if_present(aiohttp_mod, "ClientSession", orig_aiohttp_session)
 
         if httpx_mod is not None:
             if orig_httpx_client is not None:
-                httpx_mod.Client = orig_httpx_client  # type: ignore[assignment]
+                _setattr_if_present(httpx_mod, "Client", orig_httpx_client)
             if orig_httpx_async_client is not None:
-                httpx_mod.AsyncClient = orig_httpx_async_client  # type: ignore[assignment]
+                _setattr_if_present(httpx_mod, "AsyncClient", orig_httpx_async_client)
 
 
 # -----------------------------------------------------------------------------
 # Import + env contract probing
 # -----------------------------------------------------------------------------
-def try_import(name: str) -> tuple[bool, Any | None, str | None, str | None]:
+def try_import(name: str) -> tuple[bool, ModuleType | None, str | None, str | None]:
     try:
         mod = importlib.import_module(name)
         return True, mod, None, None
@@ -221,6 +259,24 @@ def try_import(name: str) -> tuple[bool, Any | None, str | None, str | None]:
 def _run_maybe_async(result: Any) -> None:
     """
     Run coroutine-like return values safely.
+    Supports coroutines and generic awaitables by wrapping them.
+    """
+    import inspect
+
+    if inspect.iscoroutine(result):
+        asyncio.run(result)
+        return
+
+    if inspect.isawaitable(result):
+        aw = result
+
+        async def _wrap() -> Any:
+            return await aw
+
+        asyncio.run(_wrap())
+
+
+def call_env_validator(mod: ModuleType) -> tuple[bool, str]:
     """
     if hasattr(result, "__await__"):
         asyncio.run(result)  # type: ignore[arg-type]
@@ -240,6 +296,7 @@ def call_env_validator(mod: Any) -> tuple[bool, str]:
         "ensure_env",
         "assert_env",
     )
+
     for fn_name in candidates:
         fn = getattr(mod, fn_name, None)
         if not callable(fn):

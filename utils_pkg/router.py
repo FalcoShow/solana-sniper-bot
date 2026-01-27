@@ -28,6 +28,11 @@ Production features preserved:
   - budget hooks + routeguard hook
   - lightning-first trade path with optional direct Jupiter swap fallback
   - strict auth handling, safe/dryrun modes, proxy controls
+
+LOCK-IN CHANGE (this rewrite):
+  - Prefer explicit env endpoints:
+      JUPITER_QUOTE_API / JUPITER_SWAP_API
+    and when set, DO NOT try quote-api.jup.ag unless explicitly allowed.
 """
 
 import asyncio
@@ -242,11 +247,20 @@ _LAST_HTTP_SESSION: Any | None = None
 _LAST_HTTP_SESSION_TESTID: str | None = None
 
 
+def _pytest_runtime() -> bool:
+    # single source of truth
+    return _is_pytest_runtime()
+
+
 def _pytest_test_id() -> str | None:
+    """
+    Stable id unique per-test:
+      "path/to/test.py::test_name"
+    (PYTEST_CURRENT_TEST also includes " (call)" etc — we strip that.)
+    """
     t = os.getenv("PYTEST_CURRENT_TEST")
     if not t:
         return None
-    # stable id: "file.py::test_name"
     return t.split(" ")[0].strip()
 
 
@@ -260,11 +274,14 @@ def _looks_like_capturing_session(o: Any) -> bool:
             return False
         if hasattr(o, "get_calls") or hasattr(o, "post_calls"):
             return True
-        # some harnesses wrap objects; fall back to class name
         name = type(o).__name__.lower()
         return ("capturing" in name) or ("fake" in name)
     except Exception:
         return False
+
+
+def _is_capturing_session(o: Any) -> bool:
+    return _looks_like_capturing_session(o)
 
 
 def _looks_like_http_session(o: Any) -> bool:
@@ -272,7 +289,6 @@ def _looks_like_http_session(o: Any) -> bool:
         return False
     if _looks_like_capturing_session(o):
         return True
-    # common http client shapes (aiohttp/httpx-style)
     for m in ("request", "get", "post"):
         try:
             if hasattr(o, m) and callable(getattr(o, m)):
@@ -282,24 +298,15 @@ def _looks_like_http_session(o: Any) -> bool:
     return False
 
 
-def _pytest_test_id() -> str | None:
-    """
-    Must be unique per-test (not just per-file), otherwise pinned sessions can bleed.
-    """
-    t = os.getenv("PYTEST_CURRENT_TEST")
-    if not t:
-        return None
-    return t.strip()
-
-
+# -------------------------------------------------------------------------
+# Test session discovery (MUST exist for contract tests)
+# -------------------------------------------------------------------------
 def _find_patched_capturing_session(*, needs_post: bool) -> Any | None:
     """
     Find the CapturingSession that tests monkeypatch into this module.
-    Prefer likely names, then scan 'session-ish' globals.
-    Never return our pinned _LAST_HTTP_SESSION (we want the CURRENT test's patch).
+    Works even when SAFE_MODE/DRYRUN/NO_NETWORK is enabled.
     """
     preferred_names = (
-        # common test patch targets
         "_http_client",
         "http_client",
         "_http_session",
@@ -311,66 +318,73 @@ def _find_patched_capturing_session(*, needs_post: bool) -> Any | None:
         "_aiohttp_client",
         "_httpx_client",
         "router_session",
+        "HTTP_CLIENT",
+        "SESSION",
+        "client",
     )
 
-    # 1) try the obvious names first
-    for name in preferred_names:
-        if name.startswith("_LAST_"):
-            continue
-        s = globals().get(name)
-        if _looks_like_capturing_session(s):
-            if (not needs_post) or hasattr(s, "post") or hasattr(s, "request"):
-                return s
+    def _post_ok(o: Any) -> bool:
+        if not needs_post:
+            return True
+        return callable(getattr(o, "post", None)) or callable(getattr(o, "request", None))
 
-    # 2) scan "session-ish" globals (but skip pinned/internal)
+    # 1) obvious names first
+    for name in preferred_names:
+        o = globals().get(name)
+        if _looks_like_capturing_session(o) and _post_ok(o):
+            return o
+
+    # 2) scan "session-ish" globals
     for k, v in globals().items():
         if k.startswith("__") or k.startswith("_LAST_"):
             continue
         lk = k.lower()
         if ("session" not in lk) and ("http" not in lk) and ("client" not in lk):
             continue
-        if _looks_like_capturing_session(v):
-            if (not needs_post) or hasattr(v, "post") or hasattr(v, "request"):
-                return v
+        if _looks_like_capturing_session(v) and _post_ok(v):
+            return v
 
     return None
 
 
 async def _get_http_test_double(*, needs_post: bool) -> Any | None:
     """
-    If tests monkeypatched _get_http to return a CapturingSession (or set it to one),
-    fetch it safely WITHOUT requiring pytest-runtime gating.
+    If tests monkeypatch `_get_http` to a session object OR a sync/async function returning one,
+    fetch it safely. This is the critical bridge for contract tests.
     """
     obj = globals().get("_get_http")
     if obj is None:
         return None
 
-    # If it's our original factory, don't call it under tests/offline
-    if callable(obj) and _is_original_get_http_bound(obj):
+    # Patched to an object directly
+    if not callable(obj):
+        return obj if _looks_like_capturing_session(obj) else None
+
+    # If it's the router's own factory, do NOT call it in pytest/hermetic.
+    if (_is_pytest_runtime() or _hermetic_mode()) and _is_original_get_http_bound(obj):
         return None
 
     try:
-        out = obj(needs_post=needs_post) if callable(obj) else obj  # type: ignore[misc]
+        out = obj(needs_post=needs_post)  # type: ignore[misc]
     except TypeError:
-        out = obj() if callable(obj) else obj  # type: ignore[misc]
+        out = obj()  # type: ignore[misc]
 
-    return await _maybe_await(out)
+    out = await _maybe_await(out)
+    return out if _looks_like_capturing_session(out) else None
 
 
 def _set_last_http_session(s: Any | None) -> None:
     """
-    Store the last session; in pytest tie it to the current test id to prevent bleed.
+    Store last session; under pytest tie it to current test id to prevent bleed.
     Never overwrite a capturing session with a non-capturing one.
     """
     global _LAST_HTTP_SESSION, _LAST_HTTP_SESSION_TESTID
 
-    # allow clearing
     if s is None:
         _LAST_HTTP_SESSION = None
         _LAST_HTTP_SESSION_TESTID = _pytest_test_id()
         return
 
-    # don't overwrite capturing with non-capturing
     if _looks_like_capturing_session(_LAST_HTTP_SESSION) and (not _looks_like_capturing_session(s)):
         return
 
@@ -380,8 +394,9 @@ def _set_last_http_session(s: Any | None) -> None:
 
 def _get_last_http_session() -> Any | None:
     """
-    Return the pinned session only if not in pytest,
-    OR if in pytest and pinned during the SAME test.
+    Return pinned session only if:
+      - not pytest, OR
+      - pytest AND pinned during SAME test
     """
     if _pytest_runtime():
         cur = _pytest_test_id()
@@ -546,7 +561,7 @@ def _sanitize_mint(m: Any) -> str:
 # -------------------------------------------------------------------------
 # Constants / identity
 # -------------------------------------------------------------------------
-ROUTER_VERSION = "v3+++_router_probe_safe_LOCKIN_2026-01-18"
+ROUTER_VERSION = "v3+++_router_probe_safe_LOCKIN_2026-01-27"
 
 LAMPORTS_PER_SOL = 1_000_000_000
 LAMPORTS_PER_SOL_F = float(LAMPORTS_PER_SOL)
@@ -806,19 +821,81 @@ def _migrate_legacy_url(u: str, kind: Literal["quote", "swap"]) -> str:
     return raw
 
 
+# --- LOCK-IN: explicit endpoint keys (your Render env uses these) ---
+_QUOTE_ENV_KEYS = (
+    "JUPITER_QUOTE_API",  # ✅ your key
+    "JUPITER_QUOTE_URL",
+    "ROUTER_QUOTE_URL",
+    "ROUTER_QUOTE_API",
+    "JUP_QUOTE_URL",
+    "JUPITER_QUOTE_ENDPOINT",
+)
+_SWAP_ENV_KEYS = (
+    "JUPITER_SWAP_API",  # ✅ your key
+    "JUPITER_SWAP_URL",
+    "ROUTER_SWAP_URL",
+    "ROUTER_SWAP_API",
+    "JUP_SWAP_URL",
+    "JUPITER_SWAP_ENDPOINT",
+)
+
+
+def _explicit_quote_url() -> str:
+    u = _env_first(*_QUOTE_ENV_KEYS)
+    return _migrate_legacy_url(u, "quote") if u else ""
+
+
+def _explicit_swap_url() -> str:
+    u = _env_first(*_SWAP_ENV_KEYS)
+    return _migrate_legacy_url(u, "swap") if u else ""
+
+
+def _allow_quote_api_fallback() -> bool:
+    """
+    If user explicitly pins Jupiter endpoints (especially api.jup.ag),
+    we MUST NOT attempt quote-api.jup.ag unless they explicitly opt-in.
+    """
+    return bool(_envb("ROUTER_ALLOW_QUOTE_API_FALLBACK", False))
+
+
 def _quote_urls() -> list[str]:
-    u = _env_first("ROUTER_QUOTE_URL", "JUP_QUOTE_URL", "JUPITER_QUOTE_URL")
-    if u:
-        return [_migrate_legacy_url(u, "quote")]
+    # 1) Explicit override wins (and becomes exclusive unless fallback allowed)
+    explicit = _explicit_quote_url()
+    if explicit:
+        if (not _allow_quote_api_fallback()) and ("quote-api.jup.ag" in explicit.lower()):
+            # if they explicitly set quote-api, respect it (they asked for it)
+            return [explicit]
+        if not _allow_quote_api_fallback():
+            # ✅ exclusive: do NOT include quote-api fallback
+            return [explicit]
+        # fallback allowed: keep explicit first, then safe backups
+        return [explicit, DEFAULT_QUOTE_URL_V1, DEFAULT_QUOTE_URL_V6]
+
+    # 2) If swap endpoint is explicitly set to api.jup.ag and fallback not allowed,
+    #    keep quote on api.jup.ag too (no quote-api attempts).
+    if _explicit_swap_url() and not _allow_quote_api_fallback():
+        return [DEFAULT_QUOTE_URL_V1]
+
+    # 3) Default behavior (unchanged): v6 then v1 unless JUP_PREFER_V1
     if _envb("JUP_PREFER_V1", False):
         return [DEFAULT_QUOTE_URL_V1, DEFAULT_QUOTE_URL_V6]
     return [DEFAULT_QUOTE_URL_V6, DEFAULT_QUOTE_URL_V1]
 
 
 def _swap_urls() -> list[str]:
-    u = _env_first("ROUTER_SWAP_URL", "JUP_SWAP_URL", "JUPITER_SWAP_URL")
-    if u:
-        return [_migrate_legacy_url(u, "swap")]
+    explicit = _explicit_swap_url()
+    if explicit:
+        if (not _allow_quote_api_fallback()) and ("quote-api.jup.ag" in explicit.lower()):
+            return [explicit]
+        if not _allow_quote_api_fallback():
+            # ✅ exclusive: do NOT include quote-api fallback
+            return [explicit]
+        return [explicit, DEFAULT_SWAP_URL_V1, DEFAULT_SWAP_URL_V6]
+
+    # If quote endpoint explicitly set and fallback not allowed, keep swap on api.jup.ag
+    if _explicit_quote_url() and not _allow_quote_api_fallback():
+        return [DEFAULT_SWAP_URL_V1]
+
     if _envb("JUP_PREFER_V1", False):
         return [DEFAULT_SWAP_URL_V1, DEFAULT_SWAP_URL_V6]
     return [DEFAULT_SWAP_URL_V6, DEFAULT_SWAP_URL_V1]
@@ -1117,10 +1194,6 @@ async def _session_request_json(
     return _resp_status(raw), await _resp_json(raw)
 
 
-def _is_capturing_session(o: Any) -> bool:
-    return _looks_like_capturing_session(o)
-
-
 # -------------------------------------------------------------------------
 # httpx client lifecycle (no import-time network)
 # -------------------------------------------------------------------------
@@ -1164,21 +1237,30 @@ async def _get_http(needs_post: bool = False) -> Any:
     if not _net_allowed():
         raise NetworkDisabled("network_disabled_by_env")
 
-    if _http_client is not None:
-        with contextlib.suppress(Exception):
-            if isinstance(_http_client, httpx.AsyncClient) and not _http_client.is_closed:
-                return _http_client
-        return _http_client
+    client = _http_client
+    if client is not None:
+        if isinstance(client, httpx.AsyncClient):
+            with contextlib.suppress(Exception):
+                if not client.is_closed:
+                    return client
+            _http_client = None
+        else:
+            return client
 
     async with _http_lock:
-        if _http_client is not None:
-            with contextlib.suppress(Exception):
-                if isinstance(_http_client, httpx.AsyncClient) and not _http_client.is_closed:
-                    return _http_client
-            return _http_client
+        client = _http_client
+        if client is not None:
+            if isinstance(client, httpx.AsyncClient):
+                with contextlib.suppress(Exception):
+                    if not client.is_closed:
+                        return client
+                _http_client = None
+            else:
+                return client
 
         limits = httpx.Limits(
-            max_keepalive_connections=int(HTTP_MAX_KEEPALIVE), max_connections=int(HTTP_MAX_CONN)
+            max_keepalive_connections=int(HTTP_MAX_KEEPALIVE),
+            max_connections=int(HTTP_MAX_CONN),
         )
         kwargs: dict[str, Any] = dict(
             timeout=_http_timeout_obj(),
@@ -1197,8 +1279,7 @@ async def _get_http(needs_post: bool = False) -> Any:
                 kwargs["proxies"] = {"all://": px}
 
         _http_client = httpx.AsyncClient(**kwargs)
-
-    return _http_client
+        return _http_client
 
 
 async def _close_http_local() -> None:
@@ -1211,10 +1292,6 @@ async def _close_http_local() -> None:
 
 
 def _is_original_get_http_bound(obj: Any) -> bool:
-    """
-    True if `obj` is the router's own real _get_http factory (the one in THIS module).
-    In pytest/hermetic we must NOT call it, because it may create a real httpx client.
-    """
     try:
         return (
             callable(obj)
@@ -1226,27 +1303,16 @@ def _is_original_get_http_bound(obj: Any) -> bool:
 
 
 async def _get_http_from_tests(*, needs_post: bool) -> Any | None:
-    """
-    Normalize common test monkeypatch styles:
-      - _get_http monkeypatched to a SESSION OBJECT
-      - _get_http monkeypatched to a SYNC function returning session
-      - _get_http monkeypatched to an ASYNC function returning session
-
-    In pytest/hermetic, we DO NOT call our original _get_http.
-    """
     obj = globals().get("_get_http")
     if obj is None:
         return None
 
-    # If tests monkeypatched _get_http to be a session object directly
     if not callable(obj):
         return obj
 
-    # In pytest/hermetic, don't call our own real-client factory
     if (_pytest_runtime() or _hermetic_mode()) and _is_original_get_http_bound(obj):
         return None
 
-    # Call with needs_post if supported; else call without args
     try:
         out = obj(needs_post=needs_post)  # type: ignore[misc]
     except TypeError:
@@ -1255,48 +1321,30 @@ async def _get_http_from_tests(*, needs_post: bool) -> Any | None:
     return await _maybe_await(out)
 
 
-def _is_test_runtime() -> bool:
-    # keep whatever you already use; this is a safe default
-    return ("PYTEST_CURRENT_TEST" in os.environ) or ("pytest" in sys.modules)
-
-
 async def _resolve_patched_or_pinned_session(*, needs_post: bool) -> Any | None:
-    """
-    Prefer:
-      1) pinned last session (test-scoped)
-      2) patched globals session
-      3) pytest/hermetic: patched _get_http (sync/async/object)
-      4) pytest: monkeypatched aiohttp ClientSession ONLY if it's a test double
-    Never creates a real network session under pytest/hermetic.
-    """
-    # ✅ Always prefer the CURRENT test's patched CapturingSession if present
     with contextlib.suppress(Exception):
         s = _find_patched_capturing_session(needs_post=needs_post)
         if _looks_like_capturing_session(s):
             _set_last_http_session(s)
             return s
 
-    # ✅ If tests patched _get_http, use that too
     with contextlib.suppress(Exception):
         s = await _get_http_test_double(needs_post=needs_post)
         if _looks_like_capturing_session(s):
             _set_last_http_session(s)
             return s
 
-    # 1) pinned last session
     with contextlib.suppress(Exception):
         s = _get_last_http_session()
         if s is not None and (not needs_post or hasattr(s, "post") or hasattr(s, "request")):
             return s
 
-    # 2) patched globals
     with contextlib.suppress(Exception):
         s = _find_patched_session(needs_post=needs_post)
         if s is not None:
             _set_last_http_session(s)
             return s
 
-    # 3) pytest/hermetic: patched _get_http (handles sync/async/object)
     if _pytest_runtime() or _hermetic_mode():
         with contextlib.suppress(Exception):
             s = await _get_http_from_tests(needs_post=needs_post)
@@ -1308,7 +1356,6 @@ async def _resolve_patched_or_pinned_session(*, needs_post: bool) -> Any | None:
                 _set_last_http_session(s)
                 return s
 
-        # 4) pytest: aiohttp ClientSession only if test monkeypatched
         with contextlib.suppress(Exception):
             s = await _aiohttp_client_session_for_tests()
             if (
@@ -1321,7 +1368,6 @@ async def _resolve_patched_or_pinned_session(*, needs_post: bool) -> Any | None:
 
         return None
 
-    # production: create only if network allowed
     if _net_allowed():
         with contextlib.suppress(Exception):
             return await _maybe_await(_get_http(needs_post=needs_post))
@@ -1485,7 +1531,7 @@ async def _singleflight(key: str, maker: Callable[[], Awaitable[Any]]) -> Any:
     async with _quote_lock:
         fut = _QUOTE_FLIGHT.get(key)
         if fut is None or fut.done():
-            fut = asyncio.create_task(maker())
+            fut = asyncio.ensure_future(maker())
             _QUOTE_FLIGHT[key] = fut
     try:
         return await fut
@@ -1816,6 +1862,9 @@ def stats() -> dict[str, Any]:
         "proxy_set": int(bool(_router_proxy_effective())),
         "quote_urls": _quote_urls(),
         "swap_urls": _swap_urls(),
+        "explicit_quote_url": _explicit_quote_url() or None,
+        "explicit_swap_url": _explicit_swap_url() or None,
+        "allow_quote_api_fallback": int(_allow_quote_api_fallback()),
     }
 
 
@@ -2022,96 +2071,34 @@ async def _with_retries(fetcher: Callable[[], Awaitable[dict[str, Any]]]) -> dic
 # -------------------------------------------------------------------------
 # Public quote API (probe-safe, test-session-first)
 # -------------------------------------------------------------------------
-
-
-def _pytest_runtime() -> bool:
-    fn = globals().get("_is_pytest_runtime") or globals().get("_is_test_runtime")
-    try:
-        return bool(fn()) if callable(fn) else False
-    except Exception:
-        return False
-
-
-def _looks_like_capturing_session(s: Any) -> bool:
-    """
-    Heuristic: tests use CapturingSession with get_calls/post_calls.
-    We must allow it even when _net_allowed() is False.
-    """
-    if s is None:
-        return False
-    if hasattr(s, "get_calls") or hasattr(s, "post_calls"):
-        return True
-    # Some harnesses store wrapped objects
-    name = type(s).__name__.lower()
-    if "capturing" in name or "fake" in name:
-        return True
-    return False
-
-
 async def _resolve_quote_session(session: Any | None) -> Any | None:
-    """
-    Quote session resolution:
-      - If caller passed a session, use it.
-      - In pytest/hermetic: prefer the CURRENT test’s patched CapturingSession.
-      - Fall back to pinned session only within the SAME test (via _get_last_http_session()).
-      - Never create a real network client in pytest/hermetic.
-    """
-    # ✅ Always prefer the CURRENT test's patched CapturingSession if present
+    if session is not None and _looks_like_http_session(session):
+        return session
+
     with contextlib.suppress(Exception):
         s = _find_patched_capturing_session(needs_post=False)
         if _looks_like_capturing_session(s):
             _set_last_http_session(s)
             return s
 
-    # ✅ If tests patched _get_http, use that too (even if pytest detection is flaky)
     with contextlib.suppress(Exception):
         s = await _get_http_test_double(needs_post=False)
         if _looks_like_capturing_session(s):
             _set_last_http_session(s)
             return s
 
-    if session is not None:
-        # Only accept real HTTP-ish sessions here; otherwise ignore and keep resolving
-        if _looks_like_http_session(session):
-            return session
-        session = None
-
-    # pytest/hermetic: must use test doubles if present
-    if _pytest_runtime() or _hermetic_mode():
-        # 1) direct globals scan (router._http_client, router.session, etc.)
-        with contextlib.suppress(Exception):
-            s = _find_patched_session(needs_post=False)
-            if _looks_like_capturing_session(s):
-                _set_last_http_session(s)
-                return s
-
-        # 2) tests sometimes monkeypatch _get_http itself (sync/async/object)
-        with contextlib.suppress(Exception):
-            s = await _get_http_from_tests(needs_post=False)
-            if _looks_like_capturing_session(s):
-                _set_last_http_session(s)
-                return s
-
-        # 3) pinned session (ONLY if same test; your _get_last_http_session enforces this)
-        with contextlib.suppress(Exception):
-            s = _get_last_http_session()
-            if _looks_like_capturing_session(s):
-                return s
-
-        return None
-
-    # non-pytest: prefer pinned; else create only if network allowed
     with contextlib.suppress(Exception):
         s = _get_last_http_session()
         if s is not None:
             return s
 
+    if _pytest_runtime() or _hermetic_mode():
+        return None
+
     if _net_allowed():
-        with contextlib.suppress(Exception):
-            s = await _maybe_await(_get_http(needs_post=False))
-            if s is not None:
-                _set_last_http_session(s)
-                return s
+        s2 = await _get_http(needs_post=False)
+        _set_last_http_session(s2)
+        return s2
 
     return None
 
@@ -2122,23 +2109,19 @@ async def _resolve_quote_session(session: Any | None) -> Any | None:
 async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
     _inc("quotes", 1)
 
-    # Extract session aliases (track whether caller explicitly supplied one)
     caller_provided_session = False
     session: Any | None = None
 
     for k in ("session", "sess", "http", "http_session", "http_client", "client", "transport"):
         if k in kwargs:
             cand = kwargs.get(k)
-            # Only treat it as an HTTP session if it actually looks like one
             if _looks_like_http_session(cand):
                 caller_provided_session = True
                 session = kwargs.pop(k)
             else:
-                # Drop it (prevents FakeClient / Solana RPC client from being mistaken as HTTP)
                 kwargs.pop(k, None)
             break
 
-    # positional contract: (inputMint, outputMint, amount[, slippageBps])
     if args:
         has_structured = any(
             k in kwargs for k in ("inputMint", "outputMint", "amount", "input_mint", "output_mint")
@@ -2176,7 +2159,6 @@ async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
     od = kwargs.get("onlyDirectRoutes") or kwargs.get("only_direct") or kwargs.get("onlyDirect")
     only_direct = _to_bool(od)
 
-    # user pubkey: if not explicitly passed, prefer wallet pubkey if available
     user_pk = kwargs.get("userPublicKey") or kwargs.get("user_public_key") or kwargs.get("pubkey")
     user_pk_s = str(user_pk).strip() if user_pk is not None else None
     if not user_pk_s:
@@ -2199,7 +2181,6 @@ async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
         amount_sol=amount_sol,
     )
 
-    # Safe mode: allow deterministic shape even if amt <= 0
     if amt <= 0 and _safe_mode_env():
         _inc("dryrun_quotes", 1)
         out0 = _dry_mock_quote(
@@ -2217,7 +2198,6 @@ async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
     if amt <= 0:
         raise ValueError("amount must be a positive integer")
 
-    # same-mint shortcut
     if input_mint == output_mint:
         return {
             "inputMint": input_mint,
@@ -2232,18 +2212,13 @@ async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
             "router_dryrun": bool(_hermetic_mode()),
         }
 
-    # ---------------------------------------------------------------------
-    # CRITICAL: resolve pytest/hermetic patched session BEFORE any early-return
-    # ---------------------------------------------------------------------
     with contextlib.suppress(Exception):
         session = await _resolve_quote_session(session)
 
-    # If we got a capturing-like session, pin it for swap_from_quote reuse
     if _looks_like_capturing_session(session):
         with contextlib.suppress(Exception):
             _set_last_http_session(session)
 
-    # If network is disallowed AND we do not have a CapturingSession, return deterministic quote
     if (not _net_allowed()) and (not _looks_like_capturing_session(session)):
         _inc("dryrun_quotes", 1)
         out1 = _dry_mock_quote(
@@ -2258,11 +2233,6 @@ async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
         out1["router_dryrun"] = True
         return out1
 
-    # Cache only when:
-    # - network allowed
-    # - not pytest
-    # - caller did not provide a session
-    # - and we are not forcing a resolved session object
     use_cache = (
         bool(_net_allowed())
         and (not _pytest_runtime())
@@ -2278,7 +2248,6 @@ async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
 
     async def _fetch() -> dict[str, Any]:
         async with _quote_sema:
-            # In pytest we should not budget-block deterministic contract tests.
             ok_budget = True if _pytest_runtime() else await _budget_before_quote(units=1)
             if not ok_budget:
                 _inc("quote_budget_blocks", 1)
@@ -2293,7 +2262,7 @@ async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
                         slippage_bps=int(slippage_bps),
                         only_direct=only_direct,
                         user_public_key=user_pk_s,
-                        session=session,  # ✅ USE THE RESOLVED SESSION HERE
+                        session=session,
                     )
                 )
 
@@ -2322,7 +2291,6 @@ async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
     return await _fetch()
 
 
-# Back-compat aliases
 quote = get_quote
 swap_quote = get_quote
 get_swap_quote = get_quote
@@ -2330,9 +2298,6 @@ jup_quote = get_quote
 jupiter_quote = get_quote
 
 
-# -------------------------------------------------------------------------
-# P0 Contract: get_buy_quote / get_sell_quote / swap_from_quote
-# -------------------------------------------------------------------------
 def _positional_amount_to_amount_sol(amount_raw: Any) -> float | None:
     if amount_raw is None:
         return None
@@ -2383,7 +2348,6 @@ async def get_buy_quote(
         upk = _wallet_pubkey_str()
     upk_s = str(upk).strip() if upk else None
 
-    # positional drift: get_buy_quote(mint, 0.01, 200)
     if amount_sol is None and lamports_in is None and amount_in is None and amount is None:
         f = _positional_amount_to_amount_sol(amount_raw)
         if f is not None:
@@ -2441,16 +2405,6 @@ async def get_sell_quote(
     sess: Any | None = None,
     only_direct: bool | None = None,
 ) -> dict[str, Any]:
-    """
-    SELL quote (TOKEN -> SOL)
-
-    Contract (tests/test_swap.py + sell_path_test.py):
-      - MUST call /quote
-      - MUST set inputMint=mint, outputMint=SOL
-      - MUST set amount == amount_raw
-      - MUST set slippageBps == slippage_bps
-      - MUST set userPublicKey to wallet pubkey (if wallet available)
-    """
     _inc("sell_quotes", 1)
     m = _sanitize_mint(mint)
 
@@ -2469,7 +2423,7 @@ async def get_sell_quote(
         raise ValueError("missing userPublicKey")
 
     amt = await _normalize_amount_raw(
-        input_mint=m,  # IMPORTANT: token input, so amount_sol is ignored here
+        input_mint=m,
         amount=amount,
         amount_raw=amount_raw,
         lamports_in=lamports_in,
@@ -2507,9 +2461,6 @@ quote_buy = get_buy_quote
 quote_sell = get_sell_quote
 
 
-# -------------------------------------------------------------------------
-# Swap execution
-# -------------------------------------------------------------------------
 def _pick_swap_tx_b64(swap_response: dict[str, Any]) -> str:
     b64 = (
         swap_response.get("swapTransaction")
@@ -2621,13 +2572,6 @@ async def swap_from_quote(
     sign_send: bool | None = None,
     **kwargs: Any,
 ) -> tuple[bool, str]:
-    """
-    Test-contract swap:
-      - MUST call /swap with JSON containing {quoteResponse, userPublicKey, wrapAndUnwrapSol=True}
-      - MUST NOT skip /swap in DRYRUN/SAFE_MODE (DRYRUN only skips broadcast)
-      - MUST refuse when wallet/client absent: return (False, "")
-      - MUST hit CapturingSession.post() via patched session
-    """
     w = globals().get("wallet", None)
     c = globals().get("solana_client", None)
     if w is None or c is None:
@@ -2637,7 +2581,6 @@ async def swap_from_quote(
     if not isinstance(q, dict) or not q:
         return (False, "")
 
-    # unwrap if caller passed {"quoteResponse": {...}} wrapper
     if isinstance(q.get("quoteResponse"), dict) and not q.get("routePlan"):
         q = q["quoteResponse"]
 
@@ -2653,16 +2596,13 @@ async def swap_from_quote(
     if not upk_s:
         return (False, "")
 
-    # caller-provided session?
     caller_session = session if session is not None else sess
 
-    # ✅ Resolve a POST-capable session safely
     s = caller_session
     if s is None:
         with contextlib.suppress(Exception):
             s = await _resolve_patched_or_pinned_session(needs_post=True)
 
-    # pytest fallback: try _get_http only if it returns CapturingSession
     if s is None and _pytest_runtime():
         with contextlib.suppress(Exception):
             maybe = await _get_http_from_tests(needs_post=True)
@@ -2671,7 +2611,6 @@ async def swap_from_quote(
                 with contextlib.suppress(Exception):
                     _set_last_http_session(s)
 
-    # production: only create a real client if network allowed
     if s is None and _net_allowed():
         with contextlib.suppress(Exception):
             s = await _get_http(needs_post=True)
@@ -2679,14 +2618,12 @@ async def swap_from_quote(
     if s is None:
         return (False, "")
 
-    # If network disallowed and not a capturing session, refuse (don’t hit network)
     if (not _net_allowed()) and (not _looks_like_capturing_session(s)):
         return (False, "")
 
     with contextlib.suppress(Exception):
         _set_last_http_session(s)
 
-    # Budget gate (tests typically bypass through _net_allowed() == False logic)
     ok_budget = True if _pytest_runtime() else await _budget_before_swap(units=1)
     if not ok_budget:
         _inc("swap_budget_blocks", 1)
@@ -2695,7 +2632,6 @@ async def swap_from_quote(
     try:
         swap_url = _resolve_swap_url() or DEFAULT_SWAP_URL_V6
 
-        # build payload (contract requires these keys)
         body = dict(build_swap_payload(q, upk_s, **kwargs))
         body["userPublicKey"] = upk_s
         body["wrapAndUnwrapSol"] = True
@@ -2704,7 +2640,6 @@ async def swap_from_quote(
         headers = dict(_jup_headers())
         timeout_s = float(_envf("JUP_HTTP_TIMEOUT_S", JUP_HTTP_TIMEOUT_S_DEFAULT))
 
-        # ✅ CRITICAL: do the POST even in DRYRUN if we have a session
         sc, swap = await _session_request_json(
             s,
             "POST",
@@ -2718,7 +2653,6 @@ async def swap_from_quote(
         if not isinstance(swap, dict):
             return (False, "")
 
-        # DRYRUN only skips broadcast AFTER /swap
         if _safe_mode_env():
             return (True, "DRYRUN")
 
@@ -2741,15 +2675,7 @@ async def swap_from_quote(
                 await _budget_after_swap(units=1)
 
 
-# -------------------------------------------------------------------------
-# Offline pipeline helper (tests/sell_path_test.py expects _sell_pipeline)
-# -------------------------------------------------------------------------
 async def _sell_pipeline(*, mint: str, amount_raw: int, slippage_bps: int) -> tuple[bool, str]:
-    """
-    Must orchestrate primitives:
-      - call get_sell_quote(...)
-      - then call swap_from_quote(...) using pinned session
-    """
     q = await get_sell_quote(mint=mint, amount_raw=int(amount_raw), slippage_bps=int(slippage_bps))
     return await swap_from_quote(q)
 
@@ -2887,9 +2813,6 @@ async def sell_via_lightning(
         return None
 
 
-# -------------------------------------------------------------------------
-# Dispatch API (compat)
-# -------------------------------------------------------------------------
 BUY_IMPLS: dict[str, Callable[..., Any]] = {}
 SELL_IMPLS: dict[str, Callable[..., Any]] = {}
 
@@ -2939,9 +2862,6 @@ async def sell(
     )  # type: ignore[misc]
 
 
-# -------------------------------------------------------------------------
-# Router object + lifecycle
-# -------------------------------------------------------------------------
 class Router:
     async def start(self) -> None:
         return None
