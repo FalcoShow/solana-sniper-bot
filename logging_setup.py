@@ -115,6 +115,7 @@ class EventLogger(Protocol):
     def critical(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
     def log(self, level: int, msg: str, *args: Any, **kwargs: Any) -> None: ...
     def isEnabledFor(self, level: int) -> bool: ...  # noqa: N802
+    def isEnabledFor(self, level: int) -> bool: ...
 
     # God-tier extensions
     def event(
@@ -1007,6 +1008,7 @@ def _logger_every(
     # Back-compat:
     #   .every("evt", 30)
     #   .every("evt", 30, "WARNING")  or  .every("evt", 30, logging.WARNING)
+    # Back-compat: .every("evt", 30) or .every("evt", 30, "WARNING")
     if args:
         if len(args) >= 1 and every_sec is None:
             every_sec = args[0]

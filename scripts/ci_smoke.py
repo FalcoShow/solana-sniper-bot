@@ -129,6 +129,14 @@ def block_network() -> Iterator[None]:
         _wrap_blocked("Network is blocked in ci_smoke.py (urllib.request.urlopen)."),
     )
 
+    # --- urllib guard (stdlib) ---
+    orig_urlopen = urllib.request.urlopen
+
+    def guarded_urlopen(*args: Any, **kwargs: Any) -> Any:
+        raise NetworkBlockedError("Network is blocked in ci_smoke.py (urllib.request.urlopen).")
+
+    urllib.request.urlopen = guarded_urlopen  # type: ignore[assignment]
+
     # --- requests guard (if installed) ---
     requests_mod: Any | None = None
     orig_requests_request: Any = None
@@ -217,6 +225,8 @@ def block_network() -> Iterator[None]:
         if orig_urlopen is not None:
             _setattr_if_present(urllib.request, "urlopen", orig_urlopen)
 
+        urllib.request.urlopen = orig_urlopen  # type: ignore[assignment]
+
         if requests_mod is not None:
             if callable(orig_requests_request):
                 _setattr_if_present(requests_mod, "request", orig_requests_request)
@@ -267,6 +277,12 @@ def _run_maybe_async(result: Any) -> None:
 
 
 def call_env_validator(mod: ModuleType) -> tuple[bool, str]:
+    """
+    if hasattr(result, "__await__"):
+        asyncio.run(result)  # type: ignore[arg-type]
+
+
+def call_env_validator(mod: Any) -> tuple[bool, str]:
     """
     Best-effort env validation call (NON-STRICT).
     Supports common function names used in your overhaul.

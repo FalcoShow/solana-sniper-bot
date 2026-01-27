@@ -925,6 +925,9 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
             kind="int",
             description="Task spawn: number of origin frames to record (1..10 recommended)",
         ),
+        # ---------------------------------------------------------------------
+        # [A9] ALERTS / NOTIFICATIONS (placeholders)
+        # ---------------------------------------------------------------------
         *_env_section(
             "ALERTS / NOTIFICATIONS",
             [

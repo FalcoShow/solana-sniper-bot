@@ -24,6 +24,9 @@ concurrency:
 # Global env: SAFE + deterministic.
 # - CI should be stable and reproducible.
 # - Online probes are optional (manual), to avoid flaky PR failures.
+# Global env: safe posture everywhere.
+# We do NOT force NO_NETWORK globally because preflight is intended to validate
+# RPC/Jupiter/router connectivity.
 env:
   SAFE_MODE: "1"
   DRYRUN: "1"
@@ -52,6 +55,27 @@ jobs:
     name: Quality (ruff + format + compile)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+  PYTHONUNBUFFERED: "1"
+  PYTHONFAULTHANDLER: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  TZ: "UTC"
+  # Make imports work for both repo-root and src/ layouts (Linux runner path separator is ":")
+  PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/src
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  smoke:
+    name: Smoke (compile + hard no-network imports)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Hard no-network for this job only.
+    env:
+      NO_NETWORK: "1"
+      DISABLE_NETWORK: "1"
 
     steps:
       - name: Checkout
@@ -64,6 +88,7 @@ jobs:
           cache: pip
 
       - name: Install deps (runtime + dev)
+      - name: Install dependencies
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
@@ -178,6 +203,50 @@ jobs:
       NO_NETWORK_POLICY: "1"
       PROBES_ENABLED: "0"
 
+          # Optional editable install if the repo is packaged
+          if [ -f pyproject.toml ] || [ -f setup.cfg ] || [ -f setup.py ]; then
+            python -m pip install -e .
+          fi
+
+          python -c "import sys; print(sys.version)"
+
+      - name: Compile all (syntax / import-time issues)
+        run: |
+          set -euo pipefail
+          python -m compileall -q -f .
+
+      - name: CI smoke (hard no-network spine imports)
+        run: |
+          set -euo pipefail
+          python -m scripts.ci_smoke
+
+      - name: Ruff (optional; non-blocking)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if command -v ruff >/dev/null 2>&1; then
+            ruff check . || true
+            ruff format --check . || true
+          else
+            echo "ruff not installed; skipping."
+          fi
+
+      - name: Mypy (optional; non-blocking)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if command -v mypy >/dev/null 2>&1; then
+            mypy . || true
+          else
+            echo "mypy not installed; skipping."
+          fi
+
+  preflight:
+    name: Preflight (deploy profile)
+    runs-on: ubuntu-latest
+    needs: smoke
+    timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -192,6 +261,15 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip wheel setuptools
+
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          fi
 
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
@@ -225,6 +303,13 @@ jobs:
 
   tests:
     name: Tests (pytest, no network)
+      - name: Run preflight (json-only)
+        run: |
+          set -euo pipefail
+          python -m scripts.preflight --json-only
+
+  tests:
+    name: Tests (pytest)
     runs-on: ubuntu-latest
     needs: preflight
     timeout-minutes: 30
@@ -235,6 +320,10 @@ jobs:
       DISABLE_NETWORK: "1"
       NO_NETWORK_POLICY: "1"
       PROBES_ENABLED: "0"
+    # Hard no-network for test suite (preflight already validates connectivity).
+    env:
+      NO_NETWORK: "1"
+      DISABLE_NETWORK: "1"
 
     steps:
       - name: Checkout
@@ -247,9 +336,14 @@ jobs:
           cache: pip
 
       - name: Install deps (runtime + dev)
+      - name: Install dependencies
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
+
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          fi
 
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
@@ -341,3 +435,11 @@ jobs:
           name: online-probes-artifacts
           path: artifacts
           if-no-files-found: ignore
+          if [ -f pyproject.toml ] || [ -f setup.cfg ] || [ -f setup.py ]; then
+            python -m pip install -e .
+          fi
+
+      - name: Pytest (no integration / no network)
+        run: |
+          set -euo pipefail
+          python -m pytest -q -m "not integration and not network"
