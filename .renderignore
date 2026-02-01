@@ -12,35 +12,64 @@
 #
 # IMPORTANT:
 # - Do NOT exclude source code needed at runtime.
-# - Do NOT exclude requirements.txt / start.sh / render.yaml / Procfile if used.
+# - Do NOT exclude requirements / pyproject / start scripts / render.yaml / Procfile.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# Python caches / local venvs
+# VCS + repo tooling noise
+# ------------------------------------------------------------------------------
+.git/
+.gitignore
+.gitattributes
+
+# ------------------------------------------------------------------------------
+# Python: virtualenvs + caches
 # ------------------------------------------------------------------------------
 .venv/
 venv/
 venv*/
 __pycache__/
-*.pyc
+**/__pycache__/
+*.py[cod]
+*.pyd
 *.pyo
+*.so
+*.dll
+
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pytype/
+.pyre/
+.pyright/
 .ipynb_checkpoints/
 
+# Coverage / test artifacts (safe to exclude from deploy context)
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+test-results/
+junit*.xml
+
 # ------------------------------------------------------------------------------
-# Local env/secrets (never upload)
+# Local env / secrets (NEVER upload)
 # ------------------------------------------------------------------------------
 .env
 .env.*
 .envrc
-etc/secrets/
+*.local
+
+# Common secret folders
 secrets/
+etc/secrets/
 .private/
 private/
+credentials/
+creds/
+keys/
 
-# Key material
+# Key material / wallets / certs
 id.json
 keypair.json
 *.pem
@@ -48,50 +77,88 @@ keypair.json
 *.pfx
 *.key
 *.keystore
+*.jks
 *.seed
 *.mnemonic
 *.wallet
+*.crt
+*.cer
 
 # ------------------------------------------------------------------------------
-# Local data / artifacts (big + not needed in deploy)
+# Logs + temp outputs (your recent run artifacts included)
 # ------------------------------------------------------------------------------
-exports/
+*.log
+logs/
+err.log
+out.json
+
+# Common temp / scratch
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+
+# ------------------------------------------------------------------------------
+# Local data / large artifacts (keep deploy lean)
+# ------------------------------------------------------------------------------
 artifacts/
+exports/
 snapshots/
 reports/
 backtests/
 datasets/
 data/
+downloads/
+uploads/
 
-# Database / state files
+# Database / state files (should NOT be shipped)
 state.sqlite3
 database.sqlite
 *.sqlite
 *.sqlite3
 *.db
+*.duckdb
 
-# Logs
-*.log
-logs/
-
+# ------------------------------------------------------------------------------
 # OS / editor junk
+# ------------------------------------------------------------------------------
 .DS_Store
 Thumbs.db
+desktop.ini
 .vscode/
 .idea/
+*.code-workspace
 
-# Node junk (if present)
+# ------------------------------------------------------------------------------
+# Node / frontend junk (if present)
+# ------------------------------------------------------------------------------
 node_modules/
 .pnpm-store/
+.yarn/
 .next/
 out/
 dist/
+build/
+.cache/
 
 # ------------------------------------------------------------------------------
-# Keep: do NOT exclude these (examples)
+# Keep (explicit allowlist — prevents accidental exclusions)
 # ------------------------------------------------------------------------------
-# !requirements.txt
-# !start.sh
-# !render.yaml
-# !Procfile
-# !src/**
+!requirements.txt
+!pyproject.toml
+!poetry.lock
+!uv.lock
+!Pipfile
+!Pipfile.lock
+!runtime.txt
+!.python-version
+
+!render.yaml
+!Procfile
+!start.sh
+!scripts/**
+!utils_pkg/**
+!daytrader/**
+!sniper/**
+!tests/**
