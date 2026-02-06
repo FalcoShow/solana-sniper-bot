@@ -48,6 +48,7 @@ Websocket knobs:
 Subscription knobs:
 - PF_PP_SUB_CHUNK_SIZE     (default 120)
 - PF_PP_VALIDATE_MINTS     (default 1)
+- PF_PP_RESUB_COOLDOWN_SEC (default 5.0)
 """
 
 import asyncio
@@ -58,43 +59,126 @@ import os
 import random
 import re
 import time
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, cast
+from urllib.parse import quote_plus
 
 import websockets
-from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
-
-# Type import drift across websockets versions
-try:  # websockets<=11 legacy path
-    from websockets.legacy.client import WebSocketClientProtocol as WSProto  # type: ignore
-except Exception:  # websockets>=12
-    try:
-        from websockets.client import ClientConnection as WSProto  # type: ignore
-    except Exception:  # fallback structural
-        WSProto = Any  # type: ignore
 
 
 # -----------------------------------------------------------------------------
-# Logging
+# Logging (NO monkeypatching; safe shim)
 # -----------------------------------------------------------------------------
-try:
-    from utils_pkg.logging_setup import get_logger as _get_logger  # preferred
-except Exception:  # pragma: no cover
-    try:
-        from logging_setup import get_logger as _get_logger  # root shim
-    except Exception:  # pragma: no cover
-        _get_logger = None  # type: ignore
+class _LogShim:
+    __slots__ = ("_supplier", "_store")
 
-if _get_logger:
-    try:
-        LOG = _get_logger("utils.pumpportal")  # type: ignore[misc]
-    except TypeError:  # pragma: no cover
-        LOG = _get_logger()  # type: ignore[misc]
-else:
-    LOG = logging.getLogger("utils.pumpportal")
-    if not LOG.handlers:
+    def __init__(self, supplier) -> None:
+        self._supplier = supplier
+        self._store: dict[str, float] = {}
+
+    def _log(self) -> Any:
+        with contextlib.suppress(Exception):
+            return self._supplier()
+        return None
+
+    def _emit_fallback(self, level: str, msg: str) -> None:
+        lg = self._log()
+        if lg is None:
+            return
+        fn = getattr(lg, level, None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(msg)
+                return
+
+    def event(self, name: str, **fields: Any) -> None:
+        lg = self._log()
+        if lg is None:
+            return
+
+        fn = getattr(lg, "event", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(name, **fields)
+                return
+
+        # fallback to stdlib logging-style info
+        info = getattr(lg, "info", None)
+        if callable(info):
+            with contextlib.suppress(Exception):
+                info("%s %s", name, fields)
+                return
+
+        self._emit_fallback("info", f"{name} {fields}")
+
+    def every(self, key: str, n: int = 30, msg: str | None = None, **fields: Any) -> None:
+        try:
+            now = time.monotonic()
+            sec = float(max(1, int(n)))
+            last = float(self._store.get(key, 0.0))
+            if (now - last) >= sec:
+                self._store[key] = now
+                self.event(msg or key, **fields)
+        except Exception:
+            return
+
+    def info(self, msg: str) -> None:
+        self._emit_fallback("info", msg)
+
+    def warning(self, msg: str) -> None:
+        self._emit_fallback("warning", msg)
+
+    def error(self, msg: str) -> None:
+        self._emit_fallback("error", msg)
+
+
+_DEFAULT_LOGGER: Any | None = None
+
+
+def _default_logger_supplier() -> Any:
+    global _DEFAULT_LOGGER
+    if _DEFAULT_LOGGER is not None:
+        return _DEFAULT_LOGGER
+
+    # Prefer repo log_compat
+    with contextlib.suppress(Exception):
+        from utils_pkg.log_compat import get_logger as gl  # type: ignore
+
+        _DEFAULT_LOGGER = gl(__name__)
+        return _DEFAULT_LOGGER
+
+    # fallback to logging_setup
+    with contextlib.suppress(Exception):
+        from utils_pkg.logging_setup import get_logger as gl2  # type: ignore
+
+        _DEFAULT_LOGGER = gl2(__name__)
+        return _DEFAULT_LOGGER
+
+    lg = logging.getLogger(__name__)
+    if not lg.handlers:
         logging.basicConfig(level=logging.INFO)
+    _DEFAULT_LOGGER = lg
+    return _DEFAULT_LOGGER
+
+
+LOG = _LogShim(_default_logger_supplier)
+
+
+# -----------------------------------------------------------------------------
+# Minimal websocket-like protocol (avoids websockets version/type drift)
+# -----------------------------------------------------------------------------
+class _WsSendOnly(Protocol):
+    async def send(self, data: str) -> Any:  # pragma: no cover
+        ...
+
+
+class _WsIterable(_WsSendOnly, Protocol):
+    def __aiter__(self) -> AsyncIterator[Any]:  # pragma: no cover
+        ...
+
+    async def close(self, code: int = 1000) -> Any:  # pragma: no cover
+        ...
 
 
 # -----------------------------------------------------------------------------
@@ -104,39 +188,45 @@ _TRUE = {"1", "true", "t", "yes", "y", "on"}
 _FALSE = {"0", "false", "f", "no", "n", "off"}
 
 
-def _env(name: str, default: str = "") -> str:
-    return (os.getenv(name) or default).strip()
-
-
 def _env_any(names: list[str], default: str = "") -> str:
     for n in names:
         v = os.getenv(n)
-        if v is not None and str(v).strip() != "":
-            return str(v).strip()
+        if v is not None and v.strip():
+            return v.strip()
     return default
 
 
 def _envi(name: str, default: int) -> int:
-    v = os.getenv(name)
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    s = raw.strip()
+    if not s:
+        return default
     try:
-        return int(float(v)) if v not in (None, "") else default
+        return int(float(s))
     except Exception:
         return default
 
 
 def _envf(name: str, default: float) -> float:
-    v = os.getenv(name)
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    s = raw.strip()
+    if not s:
+        return default
     try:
-        return float(v) if v not in (None, "") else default
+        return float(s)
     except Exception:
         return default
 
 
 def _envb(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
+    raw = os.getenv(name)
+    if raw is None:
         return default
-    s = str(v).strip().lower()
+    s = raw.strip().lower()
     if s in _TRUE:
         return True
     if s in _FALSE:
@@ -159,8 +249,9 @@ _WS_BACKOFF_JITTER = _envf("PF_PP_WS_BACKOFF_JITTER", 0.25)
 
 _SUB_CHUNK_SIZE = max(10, _envi("PF_PP_SUB_CHUNK_SIZE", 120))
 _VALIDATE_MINTS = _envb("PF_PP_VALIDATE_MINTS", True)
+_RESUB_COOLDOWN_SEC = max(0.5, _envf("PF_PP_RESUB_COOLDOWN_SEC", 5.0))
 
-# base58 (Solana mints / accounts)
+# base58 (Solana mints/accounts)
 _BASE58 = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,64}$")
 
 
@@ -169,16 +260,14 @@ def _valid_base58(x: str) -> bool:
 
 
 def _dedup_keep_order(items: Iterable[str]) -> list[str]:
-    seen = set()
+    seen: set[str] = set()
     out: list[str] = []
     for x in items:
-        x = (x or "").strip()
-        if not x:
+        s = (x or "").strip()
+        if not s or s in seen:
             continue
-        if x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
+        seen.add(s)
+        out.append(s)
     return out
 
 
@@ -188,18 +277,26 @@ def _chunk(items: list[str], n: int) -> list[list[str]]:
     return [items[i : i + n] for i in range(0, len(items), n)]
 
 
-def _safe_json_loads(raw: str | bytes) -> Any | None:
+def _safe_json_loads(raw: str | bytes | bytearray) -> dict[str, Any] | None:
     try:
-        s = raw.decode("utf-8", "ignore") if isinstance(raw, bytes | bytearray) else str(raw)
+        if isinstance(raw, (bytes, bytearray)):
+            s = raw.decode("utf-8", "ignore")
+        else:
+            s = str(raw)
         s = s.strip()
         if not s:
             return None
-        return json.loads(s)
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
     except Exception:
         return None
 
 
-@dataclass(frozen=True)
+def _now_ts() -> int:
+    return int(time.time())
+
+
+@dataclass(frozen=True, slots=True)
 class PumpPortalEvent:
     """
     Normalized event emitted by `events()`.
@@ -217,9 +314,6 @@ class PumpPortalEvent:
     raw: dict[str, Any]
 
 
-# -----------------------------------------------------------------------------
-# Client
-# -----------------------------------------------------------------------------
 class PumpPortalClient:
     """
     PumpPortal websocket helper.
@@ -242,9 +336,13 @@ class PumpPortalClient:
         account: str | None = None,
         tokens: list[str] | None = None,
         uri: str | None = None,
-        logger: logging.Logger | None = None,
+        logger: Any | None = None,
     ) -> None:
-        self._log = logger or LOG
+        # Wrap any provided logger (duck-typed) in a shim; no monkeypatching.
+        if logger is not None:
+            self._log = _LogShim(lambda: logger)
+        else:
+            self._log = LOG
 
         self.api_key: str = (api_key or _env_any(["PF_PP_KEY", "PUMPPORTAL_KEY"], "")).strip()
         if not self.api_key:
@@ -253,6 +351,7 @@ class PumpPortalClient:
         self.account: str = (
             account or _env_any(["PF_PP_ACCOUNT", "PUMPPORTAL_ACCOUNT"], "")
         ).strip()
+
         mints_env = _env_any(["PF_PP_MINTS", "PUMPPORTAL_MINTS"], "")
         env_tokens = [t.strip() for t in mints_env.split(",") if t.strip()]
         toks = list(tokens) if tokens is not None else env_tokens
@@ -271,12 +370,11 @@ class PumpPortalClient:
         base_uri = (
             uri or _env_any(["PF_PP_URI", "PUMPPORTAL_URI"], "")
         ).strip() or "wss://pumpportal.fun/api/data"
-        # Ensure api-key is present as query param (PumpPortal expects "api-key=")
         sep = "&" if "?" in base_uri else "?"
-        self.uri: str = f"{base_uri}{sep}api-key={self.api_key}"
+        self.uri: str = f"{base_uri}{sep}api-key={quote_plus(self.api_key)}"
 
         # self-managed ws state
-        self._ws: WSProto | None = None
+        self._ws: _WsIterable | None = None
         self._closed: bool = False
 
         # subscription bookkeeping (avoid re-sending identical subs too often)
@@ -285,14 +383,19 @@ class PumpPortalClient:
         self._sub_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ #
+    # closed-state helper
+    # ------------------------------------------------------------------ #
+    def is_closed(self) -> bool:
+        # getattr avoids mypy "unreachable" when code evolves.
+        return bool(getattr(self, "_closed", False))
+
+    # ------------------------------------------------------------------ #
     # misc helpers
     # ------------------------------------------------------------------ #
     def masked_uri(self) -> str:
         """URI safe for logs (api key masked)."""
         key = self.api_key or ""
-        masked = "<hidden>" if len(key) <= 12 else key[:4] + "..." + key[-4:]
-
-        # Replace only the value of api-key=
+        masked = "<hidden>" if len(key) <= 12 else (key[:4] + "..." + key[-4:])
         return re.sub(r"(api-key=)[^&]+", r"\1" + masked, self.uri)
 
     @staticmethod
@@ -308,46 +411,55 @@ class PumpPortalClient:
             return "info"
         return "unknown"
 
+    @staticmethod
+    def normalize_message(msg: dict[str, Any]) -> dict[str, Any]:
+        """
+        Normalize a raw PumpPortal payload into a stable dict shape.
+        Keep it conservative: do not drop fields.
+        """
+        out = dict(msg)
+        data = out.get("data")
+        if isinstance(data, dict):
+            for k, v in data.items():
+                out.setdefault(k, v)
+        if "mint" not in out and isinstance(out.get("token"), str):
+            out["mint"] = out["token"]
+        return out
+
     # ------------------------------------------------------------------ #
     # ws normalization helper (external mode)
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _normalize_ws(ws_like: Any) -> Any | None:
-        """
-        Normalize ws-like objects coming from other modules.
-
-        Returns:
-          - websocket protocol-ish object with `.send` coroutine
-          - or None if unusable
-        """
+    def _normalize_ws(ws_like: Any) -> _WsSendOnly | None:
         if ws_like is None:
             return None
         if isinstance(ws_like, str):
-            # common footgun: passing URI instead of protocol
             return None
-        if hasattr(ws_like, "send"):
-            return ws_like
+        send_fn = getattr(ws_like, "send", None)
+        if callable(send_fn):
+            return cast(_WsSendOnly, ws_like)
         return None
+
+    async def _safe_send(self, ws: _WsSendOnly, payload: dict[str, Any]) -> None:
+        try:
+            data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+            await ws.send(data)
+        except Exception:
+            return
 
     # ------------------------------------------------------------------ #
     # subscription (EXTERNAL WS MODE)
     # ------------------------------------------------------------------ #
     async def _subscribe(self, ws_like: Any) -> None:
-        """
-        Subscribe a CONNECTED websocket to PumpPortal channels.
-
-        This method is intentionally forgiving; it will no-op if passed a bad ws.
-        """
         ws = self._normalize_ws(ws_like)
         if ws is None:
             return
 
-        # Create a subscription signature so we don't spam re-sends on reconnect loops
         sig = f"acct={self.account}|mints={','.join(self.tokens)}"
+
         async with self._sub_lock:
             now = time.time()
-            # allow re-subscribe if signature changed or enough time passed
-            if sig == self._last_sub_sig and (now - self._last_sub_ts) < 5.0:
+            if sig == self._last_sub_sig and (now - self._last_sub_ts) < _RESUB_COOLDOWN_SEC:
                 return
             self._last_sub_sig = sig
             self._last_sub_ts = now
@@ -355,21 +467,14 @@ class PumpPortalClient:
         # Always subscribe to new token stream
         await self._safe_send(ws, {"method": "subscribeNewToken"})
 
-        # Token trade stream (chunked)
+        # token trade streams (chunked)
         if self.tokens:
             for batch in _chunk(self.tokens, _SUB_CHUNK_SIZE):
                 await self._safe_send(ws, {"method": "subscribeTokenTrade", "keys": batch})
 
-        # Account trade stream
+        # account trade stream
         if self.account:
             await self._safe_send(ws, {"method": "subscribeAccountTrade", "keys": [self.account]})
-
-    async def _safe_send(self, ws: Any, payload: dict[str, Any]) -> None:
-        try:
-            await ws.send(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
-        except Exception:
-            # don't crash the outer loop; caller handles reconnect
-            return
 
     # ------------------------------------------------------------------ #
     # lifecycle for SELF-MANAGED MODE
@@ -378,112 +483,123 @@ class PumpPortalClient:
         self._closed = False
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: Any,
+    ) -> None:
         await self.close()
 
     async def close(self) -> None:
-        """Close any internally managed websocket (best-effort)."""
         self._closed = True
         ws = self._ws
         self._ws = None
         if ws is None:
             return
-        try:
-            await asyncio.wait_for(ws.close(code=1000), timeout=_WS_CLOSE_TIMEOUT)  # type: ignore[attr-defined]
-        except Exception:
-            pass
 
-    async def _open_ws(self) -> tuple[Any, Any]:
+        close_fn = getattr(ws, "close", None)
+        if not callable(close_fn):
+            return
+
+        try:
+            try:
+                await asyncio.wait_for(close_fn(code=1000), timeout=_WS_CLOSE_TIMEOUT)  # type: ignore[misc]
+            except TypeError:
+                await asyncio.wait_for(close_fn(1000), timeout=_WS_CLOSE_TIMEOUT)  # type: ignore[misc]
+        except Exception:
+            return
+
+    # ------------------------------------------------------------------ #
+    # connect/backoff helpers
+    # ------------------------------------------------------------------ #
+    def _backoff_sleep(self, attempt: int) -> float:
+        exp = _WS_BACKOFF_BASE * (1.7 ** max(0, attempt - 1))
+        base = min(_WS_BACKOFF_MAX, exp)
+        return min(_WS_BACKOFF_MAX, base + random.uniform(0.0, _WS_BACKOFF_JITTER))
+
+    def _connect_cm(self) -> Any:
         """
-        Open websocket using websockets.connect as an async CM, with a connect timeout.
-        Returns (ws, connect_cm) where connect_cm is the context manager to close.
+        Build a websockets.connect(...) context manager across websockets versions.
+
+        Some versions support open_timeout; some don't. We try with it first,
+        then retry without if TypeError.
         """
-        connect_cm = websockets.connect(
-            self.uri,
+        connect_fn = cast(Any, websockets.connect)
+        kwargs: dict[str, Any] = dict(
             ping_interval=_WS_PING_INTERVAL,
             ping_timeout=_WS_PING_TIMEOUT,
             close_timeout=_WS_CLOSE_TIMEOUT,
             max_size=_WS_MAX_SIZE,
+            open_timeout=_WS_CONNECT_TIMEOUT,
         )
-        # websockets.connect returns an awaitable/async-cm object; use __aenter__/__aexit__
-        ws = await asyncio.wait_for(connect_cm.__aenter__(), timeout=_WS_CONNECT_TIMEOUT)
-        return ws, connect_cm
-
-    async def _close_ws_cm(self, connect_cm: Any) -> None:
-        with contextlib.suppress(Exception):
-            await connect_cm.__aexit__(None, None, None)
-
-    def _backoff_sleep(self, attempt: int) -> float:
-        base = min(_WS_BACKOFF_MAX, _WS_BACKOFF_BASE * (1.7 ** max(0, attempt - 1)))
-        return min(_WS_BACKOFF_MAX, base + random.uniform(0.0, _WS_BACKOFF_JITTER))
+        try:
+            return connect_fn(self.uri, **kwargs)
+        except TypeError:
+            kwargs.pop("open_timeout", None)
+            return connect_fn(self.uri, **kwargs)
 
     # ------------------------------------------------------------------ #
     # SELF-MANAGED event stream
     # ------------------------------------------------------------------ #
     async def events(self) -> AsyncGenerator[PumpPortalEvent, None]:
-        """
-        Async generator that:
-          - manages its own websocket connection
-          - auto-reconnects with exponential backoff + jitter
-          - yields PumpPortalEvent(kind, ts, raw_dict)
-
-        NOTE: main sniper loop may not use this; it’s great for tests/tools.
-        """
         attempt = 0
-        while not self._closed:
-            connect_cm = None
-            ws = None
+
+        while True:
+            if self.is_closed():
+                return
+
+            cm = self._connect_cm()
             try:
-                attempt += 1
-                ws, connect_cm = await self._open_ws()
-                self._ws = ws
-                attempt = 0  # reset after successful connect
+                async with cm as ws_any:
+                    if self.is_closed():
+                        return
 
-                # Subscribe after connect
-                await self._subscribe(ws)
+                    ws = cast(_WsIterable, ws_any)
+                    self._ws = ws
+                    attempt = 0  # reset after successful connect
 
-                async for raw in ws:
-                    if self._closed:
-                        break
+                    self._log.event("PUMPPORTAL_WS_CONNECTED", uri=self.masked_uri())
+                    await self._subscribe(ws)
 
-                    msg_any = _safe_json_loads(raw)
-                    if not isinstance(msg_any, dict):
-                        continue
+                    async for raw in ws:
+                        if self.is_closed():
+                            return
 
-                    # Known PumpPortal warning when key invalid for some streams:
-                    # "Invalid API key. PumpSwap data will not be streamed."
-                    # We keep connection alive; new-token is typically still free.
-                    if (
-                        msg_any.get("errors")
-                        == "Invalid API key. PumpSwap data will not be streamed."
-                    ):
-                        continue
+                        msg = _safe_json_loads(raw)
+                        if msg is None:
+                            continue
 
-                    kind = self.classify(msg_any)
-                    yield PumpPortalEvent(kind=kind, ts=int(time.time()), raw=msg_any)
+                        # Known API-key warning noise sometimes present; ignore but log occasionally.
+                        if (
+                            msg.get("errors")
+                            == "Invalid API key. PumpSwap data will not be streamed."
+                        ):
+                            self._log.every(
+                                "PUMPPORTAL_INVALID_KEY", n=60, msg="PUMPPORTAL_INVALID_KEY"
+                            )
+                            continue
+
+                        norm = self.normalize_message(msg)
+                        yield PumpPortalEvent(kind=self.classify(norm), ts=_now_ts(), raw=norm)
 
             except asyncio.CancelledError:
-                break
-            except (ConnectionClosedOK, ConnectionClosed, ConnectionClosedError):
-                # transient unless we are closing
-                pass
-            except TimeoutError:
-                # connect timeout
-                pass
-            except Exception:
-                # keep resilient; backoff will apply
-                pass
+                return
+            except Exception as e:
+                self._log.every(
+                    "PUMPPORTAL_WS_ERR",
+                    n=10,
+                    msg="PUMPPORTAL_WS_ERR",
+                    err=type(e).__name__,
+                )
             finally:
                 self._ws = None
-                if connect_cm is not None:
-                    await self._close_ws_cm(connect_cm)
 
-            if self._closed:
-                break
+            if self.is_closed():
+                return
 
-            # backoff
-            sleep_s = self._backoff_sleep(attempt=max(1, attempt))
-            await asyncio.sleep(sleep_s)
+            attempt = max(1, attempt + 1)
+            await asyncio.sleep(self._backoff_sleep(attempt))
 
     # ------------------------------------------------------------------ #
     # Mutators (optional)

@@ -24,7 +24,7 @@ Optional:
     <name>_scanner_health() -> dict
     async shutdown_<name>_scanner() -> None
 
-Registry will also fall back to: scan, scan_<name>, scan_once
+Registry also falls back to: scan, scan_<name>, scan_once
 
 Environment controls
 --------------------
@@ -33,7 +33,7 @@ SCANNERS_DISABLED="dexscreener"             (optional)
 SCANNER_<NAME>_ENABLED=0/1                  (overrides lists)
 
 SCANNER_CONCURRENCY=3                       (default: 3)
-SCANNER_TIMEOUT_SEC=10                      (default: 10)
+SCANNER_TIMEOUT_SEC=10                      (default: 10; float ok)
 
 SCANNER_FAIL_OPEN=1                         (default: 1) if 0, scan errors raise
 SCANNER_CANDIDATE_LIMIT=0                   (0 = no limit; else cap per scanner)
@@ -43,18 +43,21 @@ SCANNER_STRICT_CANDIDATES=0                 (if 1, invalid candidates raise cont
 SCANNER_DROP_INVALID=1                      (default: 1) if 0, keep invalid but mark extra["invalid"]=True
 SCANNER_WARNINGS_MAX=20                     (default: 20) cap warnings list stored in extra
 SCANNER_LOG_EVERY_SEC=8                     (default: 8) throttle "SCAN_OK" logs
+
+Hard rule: this registry performs NO network calls. Scanner modules may, but are imported lazily.
 """
 
 import asyncio
 import contextlib
 import dataclasses
 import importlib
+import inspect
 import logging
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeAlias
 
 from utils_pkg import mint_guard as mg
 from utils_pkg.contracts import Candidate, Source, ensure_candidate, looks_like_base58
@@ -62,6 +65,7 @@ from utils_pkg.contracts import Candidate, Source, ensure_candidate, looks_like_
 # ──────────────────────────────────────────────────────────────────────────────
 # Logger (safe, no hard dependency)
 # ──────────────────────────────────────────────────────────────────────────────
+log: Any
 try:
     from logging_setup import get_logger  # type: ignore
 
@@ -69,26 +73,23 @@ try:
 except Exception:  # pragma: no cover
     log = logging.getLogger("scanner.registry")
     if not log.handlers:
-        logging.basicConfig(level=logging.INFO)
+        log.addHandler(logging.NullHandler())
 
 
 def _ensure_log_helpers() -> None:
-    """
-    Guarantee log.event + log.every exist with safe fallbacks.
-    """
+    """Guarantee log.event + log.every exist with safe fallbacks."""
+
     if not hasattr(log, "event"):
 
         def _event(name: str, **kw: Any) -> None:  # pragma: no cover
             with contextlib.suppress(Exception):
                 log.info("%s %s", name, kw)
 
-        log.event = _event
+        log.event = _event  # type: ignore[attr-defined]
 
     if not hasattr(log, "every"):
 
-        def _every(
-            key: str, n: int = 60, msg: str | None = None, **kw: Any
-        ) -> bool:  # pragma: no cover
+        def _every(key: str, n: float = 60.0, msg: str | None = None, **kw: Any) -> bool:
             now = time.time()
             store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
             last = float(store.get(key, 0.0))
@@ -100,11 +101,10 @@ def _ensure_log_helpers() -> None:
                 return True
             return False
 
-        log.every = _every
+        log.every = _every  # type: ignore[attr-defined]
 
 
 _ensure_log_helpers()
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Env helpers
@@ -114,22 +114,40 @@ _TRUE = {"1", "true", "t", "yes", "y", "on"}
 
 def _b(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
-    if v is None or str(v).strip() == "":
+    if v is None or v.strip() == "":
         return bool(default)
-    return str(v).strip().lower() in _TRUE
+    return v.strip().lower() in _TRUE
 
 
 def _s(name: str, default: str = "") -> str:
     v = os.getenv(name)
-    return default if v is None else str(v).strip()
+    return default if v is None else v.strip()
 
 
 def _i(name: str, default: int) -> int:
     v = os.getenv(name)
+    if v is None:
+        return int(default)
+    s = v.strip()
+    if s == "":
+        return int(default)
     try:
-        return int(float(v)) if v not in (None, "") else int(default)
+        return int(float(s))
     except Exception:
         return int(default)
+
+
+def _f(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None:
+        return float(default)
+    s = v.strip()
+    if s == "":
+        return float(default)
+    try:
+        return float(s)
+    except Exception:
+        return float(default)
 
 
 def _csv_list(val: str) -> list[str]:
@@ -156,19 +174,19 @@ def _short(x: Any, n: int = 240) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 # Types
 # ──────────────────────────────────────────────────────────────────────────────
-RawCandidate = Candidate | Mapping[str, Any]
-ScanFn = Callable[..., Awaitable[list[RawCandidate]]]
+RawCandidate: TypeAlias = Candidate | Mapping[str, Any]
+ScanFn: TypeAlias = Callable[..., Awaitable[list[RawCandidate]]]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Exceptions
 # ──────────────────────────────────────────────────────────────────────────────
 class ScannerError(RuntimeError):
-    pass
+    """Base error for scanner registry failures."""
 
 
 class ScannerContractError(ScannerError):
-    pass
+    """Raised when a scanner violates the registry contract in strict modes."""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -193,15 +211,17 @@ _SETTINGS_TTL_S = 1.0
 
 
 def _settings() -> RegistrySettings:
+    global _SETTINGS_CACHE
+
     now = time.time()
-    ts, st = _SETTINGS_CACHE
-    if st is not None and (now - ts) < _SETTINGS_TTL_S:
-        return st
+    ts, cached = _SETTINGS_CACHE
+    if cached is not None and (now - ts) < _SETTINGS_TTL_S:
+        return cached
 
     enabled = _csv_list(_s("SCANNERS_ENABLED", ""))
     disabled = _csv_set(_s("SCANNERS_DISABLED", ""))
     concurrency = max(1, _i("SCANNER_CONCURRENCY", 3))
-    timeout_s = max(1.0, float(_i("SCANNER_TIMEOUT_SEC", 10)))
+    timeout_s = max(1.0, _f("SCANNER_TIMEOUT_SEC", 10.0))
     fail_open = _b("SCANNER_FAIL_OPEN", True)
     candidate_limit = max(0, _i("SCANNER_CANDIDATE_LIMIT", 0))
     strict_candidates = _b("SCANNER_STRICT_CANDIDATES", False)
@@ -221,7 +241,7 @@ def _settings() -> RegistrySettings:
         warnings_max=warnings_max,
         log_every_sec=log_every_sec,
     )
-    globals()["_SETTINGS_CACHE"] = (now, st)
+    _SETTINGS_CACHE = (now, st)
     return st
 
 
@@ -260,13 +280,14 @@ class ScannerSpec:
         sa = (self.scan_attr or "").strip()
         if not sa:
             raise ValueError("ScannerSpec.scan_attr required")
+
         return ScannerSpec(
             name=n,
             module=m,
             scan_attr=sa,
-            health_attr=(self.health_attr or f"{n}_scanner_health"),
-            shutdown_attr=(self.shutdown_attr or f"shutdown_{n}_scanner"),
-            enabled_env=(self.enabled_env or f"SCANNER_{n.upper()}_ENABLED"),
+            health_attr=self.health_attr or f"{n}_scanner_health",
+            shutdown_attr=self.shutdown_attr or f"shutdown_{n}_scanner",
+            enabled_env=self.enabled_env or f"SCANNER_{n.upper()}_ENABLED",
             tags=dict(self.tags or {}),
         )
 
@@ -275,9 +296,7 @@ class ScannerSpec:
 # Candidate canonicalization + validation
 # ──────────────────────────────────────────────────────────────────────────────
 def _with_extra(c: Candidate, **kw: Any) -> Candidate:
-    """
-    Prefer Candidate.with_extra, fallback to dataclasses.replace.
-    """
+    """Prefer Candidate.with_extra, fallback to dataclasses.replace."""
     fn = getattr(c, "with_extra", None)
     if callable(fn):
         with contextlib.suppress(Exception):
@@ -301,13 +320,12 @@ def _add_scanner_meta(c: Candidate, *, spec: ScannerSpec) -> Candidate:
         scanner=spec.name,
         scanner_module=spec.module,
         scanner_tags=dict(spec.tags or {}),
+        scanned_at_ts=time.time(),
     )
 
 
 def _is_non_mint(mint: str) -> bool:
-    """
-    Guard known non-mint program IDs.
-    """
+    """Guard known non-mint program IDs."""
     fn = getattr(mg, "is_non_mint_address", None)
     if callable(fn):
         with contextlib.suppress(Exception):
@@ -317,7 +335,7 @@ def _is_non_mint(mint: str) -> bool:
 
 def _validate_candidate(c: Candidate) -> tuple[bool, list[str]]:
     """
-    Lightweight validation. Not an entry gate, just a schema sanity check.
+    Lightweight validation. Not an entry gate, just schema sanity.
     Returns (ok, warnings).
     """
     warns: list[str] = []
@@ -331,7 +349,6 @@ def _validate_candidate(c: Candidate) -> tuple[bool, list[str]]:
     if not looks_like_base58(mint, min_len=20, max_len=60):
         warns.append("mint_not_base58ish")
 
-    # Price can be 0 for brand new pools; warn only.
     price_usd = float(getattr(c, "price_usd", 0.0) or 0.0)
     price_sol = float(getattr(c, "price_sol", 0.0) or 0.0)
     if price_usd <= 0.0 and price_sol <= 0.0:
@@ -345,21 +362,15 @@ def _validate_candidate(c: Candidate) -> tuple[bool, list[str]]:
 
 
 def canonicalize_candidate(raw: RawCandidate, *, spec: ScannerSpec) -> Candidate:
-    """
-    Convert Candidate|Mapping -> Candidate and stamp Source + registry metadata.
-    """
+    """Convert Candidate|Mapping -> Candidate and stamp Source + registry metadata."""
     c = raw if isinstance(raw, Candidate) else ensure_candidate(raw)
 
-    # If scanner didn't set Source meaningfully, stamp it.
-    try:
+    with contextlib.suppress(Exception):
         src = getattr(c, "source", None)
         if not isinstance(src, Source) or src == Source.MANUAL:
             c = dataclasses.replace(c, source=_coerce_source(spec.name))
-    except Exception:
-        pass
 
-    c = _add_scanner_meta(c, spec=spec)
-    return c
+    return _add_scanner_meta(c, spec=spec)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -383,7 +394,7 @@ class ScannerRegistry:
         self._module_cache: dict[str, Any] = {}
         self._scan_fn_cache: dict[str, ScanFn] = {}
 
-    # ----- registration -----
+    # ── registration ──────────────────────────────────────────────────────────
     def register(self, spec: ScannerSpec) -> None:
         s = spec.normalized()
         self._specs[s.name] = s
@@ -395,7 +406,7 @@ class ScannerRegistry:
     def specs(self) -> dict[str, ScannerSpec]:
         return dict(self._specs)
 
-    # ----- enable/disable/order -----
+    # ── enablement logic ──────────────────────────────────────────────────────
     def _enabled_by_env(self, name: str, spec: ScannerSpec) -> bool:
         """
         Precedence:
@@ -421,7 +432,6 @@ class ScannerRegistry:
         st = _settings()
         names = [n for n, s in self._specs.items() if self._enabled_by_env(n, s)]
 
-        # stable ordering: respect SCANNERS_ENABLED order if provided
         if st.enabled:
             idx = {n: i for i, n in enumerate(st.enabled)}
             names.sort(key=lambda n: idx.get(n, 10_000))
@@ -429,7 +439,7 @@ class ScannerRegistry:
             names.sort()
         return names
 
-    # ----- lazy load -----
+    # ── module + fn resolution ────────────────────────────────────────────────
     def _load_module(self, module_path: str) -> Any:
         m = self._module_cache.get(module_path)
         if m is not None:
@@ -439,19 +449,17 @@ class ScannerRegistry:
         return m
 
     def _resolve_scan_fn(self, spec: ScannerSpec) -> ScanFn:
-        """
-        Resolve and cache scanner scan callable.
-        """
-        if spec.name in self._scan_fn_cache:
-            return self._scan_fn_cache[spec.name]
+        cached = self._scan_fn_cache.get(spec.name)
+        if cached is not None:
+            return cached
 
         mod = self._load_module(spec.module)
+
         fn = getattr(mod, spec.scan_attr, None)
         if callable(fn):
             self._scan_fn_cache[spec.name] = fn  # type: ignore[assignment]
             return fn  # type: ignore[return-value]
 
-        # compatibility fallbacks (common in older modules)
         for cand in ("scan", f"scan_{spec.name}", "scan_once"):
             fn2 = getattr(mod, cand, None)
             if callable(fn2):
@@ -462,7 +470,73 @@ class ScannerRegistry:
             f"Scanner '{spec.name}' missing scan function '{spec.scan_attr}' in {spec.module}"
         )
 
-    # ----- scanning -----
+    async def _call_maybe_await(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        """
+        Call fn and await if it returns an awaitable.
+        Cancellation-safe: CancelledError always propagates.
+        """
+        try:
+            res = fn(*args, **kwargs)
+            if inspect.isawaitable(res):
+                return await res
+            return res
+        except asyncio.CancelledError:
+            raise
+
+    async def _invoke_scan_fn(
+        self,
+        fn: ScanFn,
+        *,
+        redis: Any,
+        session: Any,
+        kw: dict[str, Any],
+    ) -> list[RawCandidate]:
+        """
+        Call a scanner function with deterministic signature compatibility.
+
+        We avoid using "catch TypeError to guess signature", because a TypeError
+        inside the scanner body would be incorrectly treated as a mismatch.
+        """
+        try:
+            sig = inspect.signature(fn)
+            params = sig.parameters
+        except Exception:
+            # Fallback: best-effort common contract call
+            out = await self._call_maybe_await(fn, redis=redis, session=session, **kw)
+            return out if isinstance(out, list) else (list(out) if out is not None else [])
+
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        accepts = set(params.keys())
+
+        call_kwargs: dict[str, Any] = {}
+        # only pass redis/session if the function can accept them
+        if has_var_kw or "redis" in accepts:
+            call_kwargs["redis"] = redis
+        if has_var_kw or "session" in accepts:
+            call_kwargs["session"] = session
+
+        # merge user kw
+        call_kwargs.update(dict(kw or {}))
+
+        # if no **kwargs, filter unknown keys to avoid unexpected-keyword TypeError
+        if not has_var_kw:
+            call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepts}
+
+        # If scanner takes no kwargs at all, call without kwargs.
+        if not call_kwargs:
+            out = await self._call_maybe_await(fn)
+            return out if isinstance(out, list) else (list(out) if out is not None else [])
+
+        out = await self._call_maybe_await(fn, **call_kwargs)
+        if out is None:
+            return []
+        if isinstance(out, list):
+            return out
+        if isinstance(out, Sequence) and not isinstance(out, (str, bytes, bytearray)):
+            return list(out)
+        return []
+
+    # ── scan APIs ─────────────────────────────────────────────────────────────
     async def scan_one(
         self,
         name: str,
@@ -475,7 +549,7 @@ class ScannerRegistry:
         """
         Run one scanner and return canonical Candidates.
 
-        Never raises unless:
+        Raises only when:
           - SCANNER_FAIL_OPEN=0 and scanner call fails, or
           - SCANNER_STRICT_CANDIDATES=1 and candidate contract violations occur.
         """
@@ -498,42 +572,28 @@ class ScannerRegistry:
         t0 = time.time()
 
         async def _call() -> list[RawCandidate]:
-            # Most scanners accept kw; fall back to positional if needed.
-            try:
-                return await fn(redis=redis, session=session, **kw)
-            except TypeError:
-                try:
-                    return await fn(redis, session, **kw)  # type: ignore[misc]
-                except TypeError:
-                    return await fn(redis)  # type: ignore[misc]
+            return await self._invoke_scan_fn(fn, redis=redis, session=session, kw=dict(kw))
 
         try:
-            raw = await asyncio.wait_for(_call(), timeout=timeout)
+            raw_list = await asyncio.wait_for(_call(), timeout=timeout)
 
-            if not isinstance(raw, list):
-                msg = f"Scanner '{n}' returned {type(raw).__name__}, expected list"
-                if strict:
-                    raise ScannerContractError(msg)
-                log.every(
-                    "SCAN_BAD_SHAPE", n=15, msg="SCAN_BAD_SHAPE", scanner=n, got=type(raw).__name__
-                )
-                return []
+            if not raw_list:
+                raw_list = []
 
-            if limit and len(raw) > limit:
-                raw = raw[:limit]
+            if limit and len(raw_list) > limit:
+                raw_list = raw_list[:limit]
 
             out: list[Candidate] = []
             dropped = 0
             warned = 0
 
-            for item in raw:
+            for item in raw_list:
                 try:
                     c = canonicalize_candidate(item, spec=spec)
                     ok, warns = _validate_candidate(c)
 
                     if warns:
                         warned += 1
-                        # preserve warnings but cap growth
                         cur = (c.extra or {}).get("warnings")
                         w_list: list[str] = list(cur) if isinstance(cur, list) else []
                         w_list.extend(warns)
@@ -568,7 +628,7 @@ class ScannerRegistry:
             ms = int((time.time() - t0) * 1000)
             log.every(
                 f"SCAN_OK:{n}",
-                n=st.log_every_sec,
+                n=float(st.log_every_sec),
                 msg="SCAN_OK",
                 scanner=n,
                 count=len(out),
@@ -606,9 +666,7 @@ class ScannerRegistry:
         timeout_s: float | None = None,
         **kw: Any,
     ) -> dict[str, list[Candidate]]:
-        """
-        Run enabled scanners concurrently and return {scanner_name: [Candidate, ...]}.
-        """
+        """Run enabled scanners concurrently and return {scanner_name: [Candidate, ...]}."""
         st = _settings()
         enabled = [n.strip().lower() for n in (names or self.enabled_names()) if str(n).strip()]
         if not enabled:
@@ -617,23 +675,43 @@ class ScannerRegistry:
         conc = max(1, int(concurrency if concurrency is not None else st.concurrency))
         sem = asyncio.Semaphore(conc)
 
-        out: dict[str, list[Candidate]] = {}
-
-        async def _one(n: str) -> None:
+        async def _one(n: str) -> tuple[str, list[Candidate]]:
             async with sem:
-                out[n] = await self.scan_one(
+                res = await self.scan_one(
                     n, redis=redis, session=session, timeout_s=timeout_s, **kw
                 )
+                return n, res
 
         tasks = [asyncio.create_task(_one(n), name=f"scan:{n}") for n in enabled]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # scan_one already absorbs errors when fail_open=1, but log unexpected task exceptions
-        for n, r in zip(enabled, results, strict=False):
-            if isinstance(r, Exception):
+        out: dict[str, list[Candidate]] = {}
+        first_err: BaseException | None = None
+
+        for n, r in zip(enabled, results, strict=True):
+            if isinstance(r, asyncio.CancelledError):
+                raise r
+            if isinstance(r, BaseException):
+                # Should only happen if scan_one was configured to raise (fail_open=0 / strict)
                 log.every(
-                    "SCAN_TASK_EXCEPTION", n=10, msg="SCAN_TASK_EXCEPTION", scanner=n, err=_short(r)
+                    "SCAN_FAIL_ALL",
+                    n=3,
+                    msg="SCAN_FAIL_ALL",
+                    scanner=n,
+                    err=_short(type(r).__name__),
+                    detail=_short(r),
                 )
+                out[n] = []
+                if first_err is None:
+                    first_err = r
+            else:
+                out[n] = r[1] if isinstance(r, tuple) and len(r) == 2 else []  # defensive
+                # With our _one() contract, r should be (name, list)
+                if isinstance(r, tuple) and len(r) == 2 and isinstance(r[1], list):
+                    out[r[0]] = r[1]
+
+        if first_err is not None and not st.fail_open:
+            raise first_err
 
         return out
 
@@ -647,9 +725,7 @@ class ScannerRegistry:
         timeout_s: float | None = None,
         **kw: Any,
     ) -> list[Candidate]:
-        """
-        Convenience: run scan_all and flatten into a single list of Candidates.
-        """
+        """Convenience: run scan_all and flatten into a single list of Candidates."""
         by = await self.scan_all(
             redis=redis,
             session=session,
@@ -665,11 +741,9 @@ class ScannerRegistry:
             flat.extend(by.get(n, []))
         return flat
 
-    # ----- health/shutdown -----
+    # ── health + shutdown ─────────────────────────────────────────────────────
     def health(self, *, names: Sequence[str] | None = None) -> dict[str, Any]:
-        """
-        Best-effort: may import scanner modules to access health functions.
-        """
+        """Best-effort: may import scanner modules to access health functions."""
         enabled = [n.strip().lower() for n in (names or self.enabled_names()) if str(n).strip()]
         out: dict[str, Any] = {"enabled": enabled, "scanners": {}}
 
@@ -689,9 +763,7 @@ class ScannerRegistry:
         return out
 
     async def shutdown_all(self, *, names: Sequence[str] | None = None) -> None:
-        """
-        Best-effort: call shutdown hooks if present.
-        """
+        """Best-effort: call shutdown hooks if present."""
         target = [n.strip().lower() for n in (names or list(self._specs.keys())) if str(n).strip()]
         for n in target:
             spec = self._specs.get(n)
@@ -764,9 +836,6 @@ REGISTRY.register_many(
 )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Convenience module-level wrappers (keeps rest of codebase simple)
-# ──────────────────────────────────────────────────────────────────────────────
 def enabled_scanners() -> list[str]:
     return REGISTRY.enabled_names()
 
@@ -795,16 +864,18 @@ __all__ = [
     "Candidate",
     "Source",
     "REGISTRY",
+    "RawCandidate",
+    "RegistrySettings",
+    "ScanFn",
     "ScannerContractError",
     "ScannerError",
     "ScannerRegistry",
     "ScannerSpec",
-    "RegistrySettings",
     "canonicalize_candidate",
     "enabled_scanners",
-    "scan_one",
+    "health",
     "scan_all",
     "scan_flat",
-    "health",
+    "scan_one",
     "shutdown_all",
 ]

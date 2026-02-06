@@ -1,39 +1,35 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
 utils_pkg/logging_setup.py (COMPAT WRAPPER — NO DRIFT)
 ======================================================
 
-LOCK-IN:
-- Root logging_setup.py is the canonical logging system.
+LOCK-IN
+-------
+- Root `logging_setup.py` (repo root) is canonical logging configuration (handlers/formatters).
+- `utils_pkg.log_compat` is the canonical *logger contract* (EventLogger + get_logger signature).
 - This module exists ONLY to preserve backwards compatibility for legacy imports:
     from utils_pkg.logging_setup import get_logger, Heartbeat, hook_stdio, ...
 
-What this wrapper provides
---------------------------
-1) Calls root.configure_logging(...) as the single source of truth.
-2) Installs optional global filters on the ROOT handler(s):
-   - SecretRedactionFilter (best-effort DSN/token masking)
-   - DedupFilter (drops repeated spam bursts, emits suppressed count)
-   - BurstLimitFilter (caps logs/sec)
-3) Exposes legacy helper ergonomics:
-   - logger.event(name, **fields)
-   - logger.bind(**ctx) -> bound logger
-   - logger.once(key, ttl=...)
-   - logger.every(key, n=...)
-   - logger.sample(key, rate=...)
-   - Heartbeat (threaded) + bump()
-   - hook_stdio/restore_stdio (routes print() into structured logs)
-   - install_excepthook / install_asyncio_exception_hook
-
-IMPORTANT:
-- This module does NOT add competing handlers.
-- All output flows through root logging_setup.py.
+Design goals
+------------
+1) Side-effect free import: no logging configuration at import time.
+2) No competing logger types: EventLogger is re-exported from utils_pkg.log_compat.
+3) Delegate handler setup to root logging_setup (drift-safe signature forwarding).
+4) Keep hardening features:
+   - secret/DSN redaction filter
+   - burst limiting filter
+   - dedupe filter
+   - heartbeat counter + stdio hooks + exception hooks
+   - context passthrough to root if present
 """
 
+import asyncio
 import collections
 import contextlib
-import hashlib
+import importlib
+import inspect
 import logging
 import os
 import re
@@ -41,16 +37,73 @@ import sys
 import threading
 import time
 from io import TextIOBase
-from typing import Any
+from types import TracebackType
+from typing import TYPE_CHECKING, Any
 
-# Canonical root logging system (single source of truth)
-import logging_setup as _root
+if TYPE_CHECKING:
+    # Canonical contract lives here (single surface across repo).
+    from utils_pkg.log_compat import EventLogger as EventLogger  # noqa: F401
+else:
+    # Runtime import is safe in-repo; if something truly exotic happens, fall back to Any.
+    try:
+        from utils_pkg.log_compat import EventLogger as EventLogger  # type: ignore
+    except Exception:  # pragma: no cover
+        EventLogger = Any  # type: ignore[assignment,misc]
+
+
+# =============================================================================
+# Lazy root module access (avoids import-time side effects)
+# =============================================================================
+
+
+def _root_module() -> Any:
+    """Import root logging_setup lazily to avoid import-time config side effects."""
+    mod = sys.modules.get("logging_setup")
+    if mod is not None:
+        return mod
+    return importlib.import_module("logging_setup")
+
+
+def _call_root(fn_name: str, **kwargs: Any) -> Any:
+    """
+    Call a function from root logging_setup, safely.
+
+    - If the target doesn't exist, returns None.
+    - Filters kwargs to match the root function signature (drift-safe).
+    """
+    root = _root_module()
+    fn = getattr(root, fn_name, None)
+    if not callable(fn):
+        return None
+
+    try:
+        params = set(inspect.signature(fn).parameters.keys())
+        safe = {k: v for k, v in kwargs.items() if k in params}
+    except Exception:
+        safe = dict(kwargs)
+
+    try:
+        return fn(**safe)
+    except TypeError:
+        # Best-effort fallback for older "get_logger(name)" style signatures.
+        if fn_name == "get_logger" and "name" in kwargs:
+            try:
+                return fn(kwargs["name"])
+            except Exception:
+                return None
+        return None
+    except Exception:
+        return None
+
 
 # =============================================================================
 # Env helpers (support both LOG_* and legacy PF_* knobs)
 # =============================================================================
 
-_LEVEL_MAP = {
+_TRUE = {"1", "true", "t", "yes", "y", "on"}
+_FALSE = {"0", "false", "f", "no", "n", "off"}
+
+_LEVEL_MAP: dict[str, int] = {
     "CRITICAL": logging.CRITICAL,
     "FATAL": logging.CRITICAL,
     "ERROR": logging.ERROR,
@@ -58,29 +111,33 @@ _LEVEL_MAP = {
     "WARNING": logging.WARNING,
     "INFO": logging.INFO,
     "DEBUG": logging.DEBUG,
-    "TRACE": logging.DEBUG,  # no TRACE in stdlib; map to DEBUG
+    "TRACE": logging.DEBUG,  # stdlib has no TRACE
 }
 
 
 def _env_str(*names: str, default: str = "") -> str:
     for n in names:
         v = os.getenv(n)
-        if v is not None and str(v).strip() != "":
+        if v is not None and str(v).strip():
             return str(v).strip()
     return default
 
 
 def _env_bool(*names: str, default: bool = False) -> bool:
     v = _env_str(*names, default="")
-    if v == "":
+    if not v:
         return default
     s = v.strip().lower()
-    return s in {"1", "true", "yes", "y", "on", "t"}
+    if s in _TRUE:
+        return True
+    if s in _FALSE:
+        return False
+    return default
 
 
 def _env_int(*names: str, default: int = 0) -> int:
     v = _env_str(*names, default="")
-    if v == "":
+    if not v:
         return default
     try:
         return int(float(v.replace("_", "")))
@@ -90,7 +147,7 @@ def _env_int(*names: str, default: int = 0) -> int:
 
 def _env_float(*names: str, default: float = 0.0) -> float:
     v = _env_str(*names, default="")
-    if v == "":
+    if not v:
         return default
     try:
         return float(v.replace("_", ""))
@@ -99,7 +156,6 @@ def _env_float(*names: str, default: float = 0.0) -> float:
 
 
 def _env_level() -> str | int:
-    # Keep as str for root parser compatibility, but allow int too
     s = _env_str("PF_LOG_LEVEL", "LOG_LEVEL", default="INFO").upper()
     return s if s in _LEVEL_MAP else "INFO"
 
@@ -124,12 +180,19 @@ def _env_include_src() -> bool:
     return _env_bool("PF_LOG_INCLUDE_SRC", "LOG_INCLUDE_SRC", default=False)
 
 
+def _env_stream() -> str | None:
+    s = _env_str("PF_LOG_STREAM", "LOG_STREAM", default="")
+    return s or None
+
+
 # =============================================================================
 # Extra sanitization (prevents LogRecord collisions on extra=)
 # =============================================================================
 
-_RESERVED_LOGRECORD_KEYS = set(logging.makeLogRecord({}).__dict__.keys())
-_RESERVED_LOGRECORD_KEYS |= {"message", "asctime"}
+_RESERVED_LOGRECORD_KEYS: set[str] = set(logging.makeLogRecord({}).__dict__.keys()) | {
+    "message",
+    "asctime",
+}
 
 
 def _sanitize_extra(extra: dict[str, Any] | None) -> dict[str, Any]:
@@ -150,7 +213,7 @@ def _sanitize_extra(extra: dict[str, Any] | None) -> dict[str, Any]:
 
 
 # =============================================================================
-# Global handler filters (applied ONCE to the root handler(s))
+# Global handler filters (applied ONCE to root handler(s))
 # =============================================================================
 
 _SENSITIVE_KEY_RE = re.compile(
@@ -168,23 +231,18 @@ def _redact_dsn(s: str) -> str:
 
 
 def _looks_secretish(val: str) -> bool:
-    if not val:
-        return False
     v = val.strip()
-    # Heuristic: long-ish mixed alpha+digit strings (base58/hex tokens)
     return len(v) >= 40 and any(c.isdigit() for c in v) and any(c.isalpha() for c in v)
 
 
 def _redact_value(key: str, value: Any) -> Any:
     k = (key or "").strip()
+
     if isinstance(value, str):
-        # URLs with creds
         if "://" in value and "@" in value and ":" in value:
             return _redact_dsn(value)
-        # key indicates secret
         if _SENSITIVE_KEY_RE.search(k) and _looks_secretish(value):
             return value[:4] + "…" + "*" * 6
-        # bearer inside strings
         low = value.lower()
         if "bearer " in low and len(value) > 20:
             parts = value.split()
@@ -195,16 +253,13 @@ def _redact_value(key: str, value: Any) -> Any:
 
     if isinstance(value, dict):
         return {str(kk): _redact_value(str(kk), vv) for kk, vv in value.items()}
-    if isinstance(value, list | tuple):
+    if isinstance(value, (list, tuple)):
         return [_redact_value(k, x) for x in value]
     return value
 
 
 class SecretRedactionFilter(logging.Filter):
-    """
-    Best-effort redaction. Root logging_setup.py already redacts by key,
-    but this also scrubs DSN-like patterns and obvious secret blobs.
-    """
+    """Best-effort redaction for extras + DSN-like patterns."""
 
     def __init__(self, enabled: bool = True) -> None:
         super().__init__()
@@ -214,23 +269,28 @@ class SecretRedactionFilter(logging.Filter):
         if not self.enabled:
             return True
 
-        # Redact extras best-effort. Avoid touching exc_info tuple.
+        # Avoid breaking %-formatting: never mutate record.args shape unsafely.
+        try:
+            args = getattr(record, "args", None)
+            if isinstance(args, dict):
+                record.args = {k: _redact_value(str(k), v) for k, v in args.items()}
+            elif isinstance(args, tuple):
+                record.args = tuple(_redact_value("", v) for v in args)
+        except Exception:
+            pass
+
+        # Redact extra fields attached to the record.
         for k, v in list(record.__dict__.items()):
-            if k in ("exc_info", "stack_info"):
+            if k in ("exc_info", "stack_info", "args", "msg"):
                 continue
             if k.startswith("_"):
                 continue
-            try:
+            with contextlib.suppress(Exception):
                 record.__dict__[k] = _redact_value(k, v)
-            except Exception:
-                continue
 
-        # Redact DSN-like patterns inside the message template too
-        try:
-            if isinstance(record.msg, str):
-                record.msg = _redact_dsn(record.msg)
-        except Exception:
-            pass
+        # Redact DSN-like patterns in message template itself.
+        if isinstance(record.msg, str):
+            record.msg = _redact_dsn(record.msg)
 
         return True
 
@@ -248,7 +308,6 @@ class DedupFilter(logging.Filter):
         self.max_keys = int(max(1000, max_keys))
         self._lock = threading.Lock()
         self._state: dict[tuple[Any, ...], tuple[float, int]] = {}
-        self._lru: collections.deque[tuple[Any, ...]] = collections.deque()
 
     def filter(self, record: logging.LogRecord) -> bool:
         if self.window <= 0:
@@ -265,32 +324,23 @@ class DedupFilter(logging.Filter):
 
         with self._lock:
             next_ok, suppressed = self._state.get(key, (0.0, 0))
-
             if now >= next_ok:
                 if suppressed:
                     record.suppressed = suppressed
                 self._state[key] = (now + self.window, 0)
-                self._lru.append(key)
-            else:
-                self._state[key] = (next_ok, suppressed + 1)
-                self._lru.append(key)
-                return False
 
-            # Trim memory
-            while len(self._state) > self.max_keys and self._lru:
-                k = self._lru.popleft()
-                # only delete if still present (LRU may contain duplicates)
-                if k in self._state:
-                    del self._state[k]
-                    break
+                if len(self._state) > self.max_keys:
+                    with contextlib.suppress(Exception):
+                        self._state.pop(next(iter(self._state)))
 
-        return True
+                return True
+
+            self._state[key] = (next_ok, suppressed + 1)
+            return False
 
 
 class BurstLimitFilter(logging.Filter):
-    """
-    Caps logs per second per key bucket (global/logger/level/event/logger+level).
-    """
+    """Caps logs per second per key bucket."""
 
     def __init__(self, max_per_sec: int = 200, key_mode: str = "logger+level") -> None:
         super().__init__()
@@ -325,52 +375,62 @@ class BurstLimitFilter(logging.Filter):
             return c <= self.max_per_sec
 
 
-# =============================================================================
-# One-time installation on root handler(s)
-# =============================================================================
-
 _WRAPPER_SETUP_LOCK = threading.Lock()
 _WRAPPER_SETUP_DONE = False
 
 
 def _iter_root_handlers() -> list[logging.Handler]:
-    """
-    Root logging may have 1+ handlers. We attach filters to all StreamHandlers.
-    """
-    root_logger = logging.getLogger()
-    if not root_logger.handlers:
-        return []
-    return list(root_logger.handlers)
+    return list(logging.getLogger().handlers)
 
 
-def _install_root_filters_once() -> None:
-    """
-    Attach filters to the root handler(s) created by root.configure_logging.
-    No parallel handlers, no competing pipelines.
-    """
+def _install_root_filters_once(force: bool = False) -> None:
+    """Adds redaction/dedup/burst filters to root handlers once (if handlers exist)."""
+    global _WRAPPER_SETUP_DONE
     handlers = _iter_root_handlers()
     if not handlers:
         return
 
-    redact_enabled = _env_bool("PF_LOG_REDACT", "LOG_REDACT", default=True)
+    with _WRAPPER_SETUP_LOCK:
+        if _WRAPPER_SETUP_DONE and not force:
+            return
 
-    burst_max = _env_int("PF_LOG_BURST_MAX_PER_SEC", "LOG_BURST_MAX_PER_SEC", default=200)
-    burst_key = _env_str("PF_LOG_BURST_KEY", "LOG_BURST_KEY", default="logger+level")
+        redact_enabled = _env_bool("PF_LOG_REDACT", "LOG_REDACT", default=True)
+        burst_max = _env_int("PF_LOG_BURST_MAX_PER_SEC", "LOG_BURST_MAX_PER_SEC", default=200)
+        burst_key = _env_str("PF_LOG_BURST_KEY", "LOG_BURST_KEY", default="logger+level")
+        dedup_window = _env_float("PF_LOG_DEDUP_WINDOW_SEC", "LOG_DEDUP_WINDOW_SEC", default=20.0)
+        dedup_max_keys = _env_int("PF_LOG_DEDUP_MAX_KEYS", "LOG_DEDUP_MAX_KEYS", default=20_000)
 
-    dedup_window = _env_float("PF_LOG_DEDUP_WINDOW_SEC", "LOG_DEDUP_WINDOW_SEC", default=20.0)
-    dedup_max_keys = _env_int("PF_LOG_DEDUP_MAX_KEYS", "LOG_DEDUP_MAX_KEYS", default=20_000)
+        for h in handlers:
+            existing = list(getattr(h, "filters", []) or [])
 
-    for h in handlers:
-        existing = {type(f) for f in getattr(h, "filters", [])}
+            red = next((f for f in existing if isinstance(f, SecretRedactionFilter)), None)
+            if red is None:
+                h.addFilter(SecretRedactionFilter(enabled=redact_enabled))
+            else:
+                red.enabled = bool(redact_enabled)
 
-        if SecretRedactionFilter not in existing:
-            h.addFilter(SecretRedactionFilter(enabled=redact_enabled))
+            burst = next((f for f in existing if isinstance(f, BurstLimitFilter)), None)
+            if burst_max > 0:
+                if burst is None:
+                    h.addFilter(BurstLimitFilter(max_per_sec=burst_max, key_mode=burst_key))
+                else:
+                    burst.max_per_sec = int(burst_max)
+                    burst.key_mode = str(burst_key or "logger+level").strip().lower()
 
-        if burst_max > 0 and BurstLimitFilter not in existing:
-            h.addFilter(BurstLimitFilter(max_per_sec=burst_max, key_mode=burst_key))
+            dedup = next((f for f in existing if isinstance(f, DedupFilter)), None)
+            if dedup_window > 0:
+                if dedup is None:
+                    h.addFilter(DedupFilter(window_sec=dedup_window, max_keys=dedup_max_keys))
+                else:
+                    dedup.window = float(max(0.0, dedup_window))
+                    dedup.max_keys = int(max(1000, dedup_max_keys))
 
-        if dedup_window > 0 and DedupFilter not in existing:
-            h.addFilter(DedupFilter(window_sec=dedup_window, max_keys=dedup_max_keys))
+        _WRAPPER_SETUP_DONE = True
+
+
+# =============================================================================
+# Public logging configuration (delegates to root)
+# =============================================================================
 
 
 def configure_logging(
@@ -382,19 +442,20 @@ def configure_logging(
     service: str | None = None,
     version: str | None = None,
     env: str | None = None,
+    stream: str | None = None,
     force: bool = False,
 ) -> None:
-    """
-    Compatibility configure. Delegates to root, then installs global filters.
-    """
+    """Compatibility configure (no import-time side effects)."""
     lvl = level if level is not None else _env_level()
-    jl = json_logs if json_logs is not None else _env_json_logs()
-    utc = use_utc if use_utc is not None else _env_use_utc()
-    src = include_src if include_src is not None else _env_include_src()
+    jl = _env_json_logs() if json_logs is None else bool(json_logs)
+    utc = _env_use_utc() if use_utc is None else bool(use_utc)
+    src = _env_include_src() if include_src is None else bool(include_src)
     svc = service if service is not None else _env_service()
     ver = version if version is not None else _env_version()
+    stm = stream if stream is not None else _env_stream()
 
-    _root.configure_logging(
+    out = _call_root(
+        "configure_logging",
         level=lvl,
         json_logs=jl,
         use_utc=utc,
@@ -402,205 +463,90 @@ def configure_logging(
         service=svc,
         version=ver,
         env=env,
+        stream=stm,
+        force=force,
+    )
+    if out is None:
+        _call_root(
+            "setup_logging",
+            level=lvl,
+            json_logs=jl,
+            use_utc=utc,
+            include_src=src,
+            service=svc,
+            version=ver,
+            env=env,
+            stream=stm,
+            force=force,
+        )
+
+    _install_root_filters_once(force=force)
+
+
+def setup_logging(**kwargs: Any) -> None:
+    """Legacy alias used across older modules."""
+    configure_logging(**kwargs)
+
+
+# =============================================================================
+# Canonical get_logger (EventLogger contract is utils_pkg.log_compat)
+# =============================================================================
+
+
+def get_logger(
+    name: str | None = None,
+    *,
+    service: str | None = None,
+    version: str | None = None,
+    env: str | None = None,
+    level: str | int | None = None,
+    json_logs: bool | None = None,
+    use_utc: bool | None = None,
+    include_src: bool | None = None,
+    stream: str | None = None,
+    force: bool = False,
+) -> EventLogger:
+    """Returns canonical EventLogger from utils_pkg.log_compat (single repo-wide surface)."""
+    configure_logging(
+        level=level,
+        json_logs=json_logs,
+        use_utc=use_utc,
+        include_src=include_src,
+        service=service,
+        version=version,
+        env=env,
+        stream=stream,
         force=force,
     )
 
-    global _WRAPPER_SETUP_DONE
-    with _WRAPPER_SETUP_LOCK:
-        if not _WRAPPER_SETUP_DONE or force:
-            _install_root_filters_once()
-            _WRAPPER_SETUP_DONE = True
+    from utils_pkg import log_compat as _lc  # type: ignore
+
+    lg = _lc.get_logger(
+        name=name,
+        service=service,
+        version=version,
+        env=env,
+        level=level,
+        json_logs=json_logs,
+        use_utc=use_utc,
+        include_src=include_src,
+        stream=stream,
+        force=force,
+    )
+
+    _install_root_filters_once(force=False)
+    return lg
 
 
-# =============================================================================
-# Logger adapters (event/once/every/sample/bind ergonomics)
-# =============================================================================
-
-_ONCE_LOCK = threading.Lock()
-_ONCE_SEEN: dict[str, float] = {}
-
-_EVERY_LOCK = threading.Lock()
-_EVERY_CTR: collections.Counter[str] = collections.Counter()
-
-_SAMPLE_LOCK = threading.Lock()
-_SAMPLE_CTR: collections.Counter[str] = collections.Counter()
-
-
-class EventLogger:
-    """
-    Thin wrapper around stdlib logging.Logger that:
-    - Sanitizes extra keys to avoid LogRecord collisions
-    - Provides convenience helpers used across the repo
-    """
-
-    def __init__(self, logger: logging.Logger):
-        self._log = logger
-
-    @property
-    def raw(self) -> logging.Logger:
-        return self._log
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._log, name)
-
-    def _safe_log(
-        self,
-        level: int,
-        msg: str,
-        *,
-        extra: dict[str, Any] | None = None,
-        exc_info: Any = None,
-    ) -> None:
-        ex = _sanitize_extra(extra)
-        # stacklevel makes caller location correct (py3.8+; best on 3.11+)
-        try:
-            self._log.log(level, msg, extra=ex, exc_info=exc_info, stacklevel=3)
-        except TypeError:
-            # older python might not support stacklevel here
-            self._log.log(level, msg, extra=ex, exc_info=exc_info)
-
-    def bind(self, **ctx: Any) -> BoundLogger:
-        return BoundLogger(self, ctx)
-
-    def event(self, name: str, level: int = logging.INFO, **fields: Any) -> None:
-        fields.setdefault("event", name)
-        self._safe_log(level, name, extra=fields)
-
-    def once(
-        self,
-        key: str,
-        ttl: float = 30.0,
-        level: int = logging.INFO,
-        msg: str | None = None,
-        **fields: Any,
-    ) -> bool:
-        now = time.monotonic()
-        with _ONCE_LOCK:
-            last = _ONCE_SEEN.get(key, 0.0)
-            if now - last < float(ttl):
-                return False
-            _ONCE_SEEN[key] = now
-        self._safe_log(level, msg or key, extra=fields)
-        return True
-
-    def every(
-        self,
-        key: str,
-        n: int = 10,
-        level: int = logging.DEBUG,
-        msg: str | None = None,
-        **fields: Any,
-    ) -> None:
-        n = max(1, int(n))
-        with _EVERY_LOCK:
-            _EVERY_CTR[key] += 1
-            i = _EVERY_CTR[key]
-        if i % n == 0:
-            self._safe_log(level, msg or key, extra=fields)
-
-    def sample(
-        self,
-        key: str,
-        rate: float = 0.1,
-        level: int = logging.DEBUG,
-        msg: str | None = None,
-        **fields: Any,
-    ) -> None:
-        r = max(0.0, min(1.0, float(rate)))
-        with _SAMPLE_LOCK:
-            _SAMPLE_CTR[key] += 1
-            i = _SAMPLE_CTR[key]
-
-        if i == 1:
-            self._safe_log(level, msg or key, extra=fields)
-            return
-
-        h = hashlib.md5(f"{key}:{i}".encode()).digest()
-        bucket = int.from_bytes(h[:2], "big") / 65535.0
-        if bucket < r:
-            self._safe_log(level, msg or key, extra=fields)
-
-    # Convenience: legacy style logger.info("msg", foo=1)
-    def debug(self, msg: str, **fields: Any) -> None:
-        self._safe_log(logging.DEBUG, msg, extra=fields)
-
-    def info(self, msg: str, **fields: Any) -> None:
-        self._safe_log(logging.INFO, msg, extra=fields)
-
-    def warning(self, msg: str, **fields: Any) -> None:
-        self._safe_log(logging.WARNING, msg, extra=fields)
-
-    def error(self, msg: str, **fields: Any) -> None:
-        self._safe_log(logging.ERROR, msg, extra=fields)
-
-    def exception(self, msg: str, **fields: Any) -> None:
-        self._safe_log(logging.ERROR, msg, extra=fields, exc_info=True)
-
-
-class BoundLogger:
-    __slots__ = ("_base", "_ctx")
-
-    def __init__(self, base: EventLogger, ctx: dict[str, Any]):
-        self._base = base
-        self._ctx = dict(ctx or {})
-
-    def bind(self, **more: Any) -> BoundLogger:
-        nxt = dict(self._ctx)
-        nxt.update(more)
-        return BoundLogger(self._base, nxt)
-
-    def _merged(self, fields: dict[str, Any]) -> dict[str, Any]:
-        out = dict(self._ctx)
-        out.update(fields)
-        return out
-
-    def event(self, name: str, level: int = logging.INFO, **fields: Any) -> None:
-        self._base.event(name, level=level, **self._merged(fields))
-
-    def once(
-        self,
-        key: str,
-        ttl: float = 30.0,
-        level: int = logging.INFO,
-        msg: str | None = None,
-        **fields: Any,
-    ) -> bool:
-        return self._base.once(key, ttl=ttl, level=level, msg=msg, **self._merged(fields))
-
-    def every(
-        self,
-        key: str,
-        n: int = 10,
-        level: int = logging.DEBUG,
-        msg: str | None = None,
-        **fields: Any,
-    ) -> None:
-        self._base.every(key, n=n, level=level, msg=msg, **self._merged(fields))
-
-    def sample(
-        self,
-        key: str,
-        rate: float = 0.1,
-        level: int = logging.DEBUG,
-        msg: str | None = None,
-        **fields: Any,
-    ) -> None:
-        self._base.sample(key, rate=rate, level=level, msg=msg, **self._merged(fields))
-
-    def debug(self, msg: str, **fields: Any) -> None:
-        self._base.debug(msg, **self._merged(fields))
-
-    def info(self, msg: str, **fields: Any) -> None:
-        self._base.info(msg, **self._merged(fields))
-
-    def warning(self, msg: str, **fields: Any) -> None:
-        self._base.warning(msg, **self._merged(fields))
-
-    def error(self, msg: str, **fields: Any) -> None:
-        self._base.error(msg, **self._merged(fields))
-
-    def exception(self, msg: str, **fields: Any) -> None:
-        self._base.exception(msg, **self._merged(fields))
+def set_level(logger: logging.Logger, level_str: str) -> None:
+    """Legacy helper: set global level quickly (best-effort)."""
+    s = (level_str or "INFO").upper()
+    os.environ["PF_LOG_LEVEL"] = s
+    os.environ["LOG_LEVEL"] = s
+    lvl = _LEVEL_MAP.get(s, logging.INFO)
+    logging.getLogger().setLevel(lvl)
+    with contextlib.suppress(Exception):
+        logger.setLevel(lvl)
 
 
 # =============================================================================
@@ -609,16 +555,18 @@ class BoundLogger:
 
 
 class Heartbeat:
-    def __init__(self, logger: EventLogger, interval: float = 30.0, name: str = "HEARTBEAT"):
+    def __init__(
+        self, logger: EventLogger, interval: float = 30.0, name: str = "HEARTBEAT"
+    ) -> None:
         self.log = logger
         self.interval = float(interval)
         self.name = str(name)
-        self._ctr = collections.Counter()
+        self._ctr: collections.Counter[str] = collections.Counter()
         self._lock = threading.Lock()
         self._t = threading.Thread(target=self._run, daemon=True)
         self._running = False
 
-    def start(self) -> Heartbeat:
+    def start(self) -> "Heartbeat":
         if not self._running:
             self._running = True
             self._t.start()
@@ -640,7 +588,7 @@ class Heartbeat:
                     snap = dict(self._ctr)
                     self._ctr.clear()
             if snap:
-                self.log.event(self.name, **snap)
+                self.log.event(self.name, msg=self.name, counters=snap)
 
 
 _global_hb: Heartbeat | None = None
@@ -660,176 +608,190 @@ def bump(key: str, n: int = 1) -> None:
 
 
 # =============================================================================
-# Stdout/stderr capture (route print() to JSON logs)
+# Stdout/stderr capture
 # =============================================================================
 
-_stdout_original = sys.stdout
-_stderr_original = sys.stderr
+_STDIO_LOCK = threading.Lock()
+_STDIO_STACK: list[tuple[Any, Any]] = []
 
 
 class _PrintToLogger(TextIOBase):
-    def __init__(self, logger: EventLogger, level: int):
+    def __init__(self, logger: EventLogger, level: int) -> None:
+        super().__init__()
         self.logger = logger
-        self.level = level
+        self.level = int(level)
         self._buf = ""
 
-    def writable(self) -> bool:
+    def writable(self) -> bool:  # pragma: no cover
         return True
 
-    def write(self, s: str) -> int:
-        if not isinstance(s, str):
-            try:
-                s = s.decode("utf-8", "replace")  # type: ignore[attr-defined]
-            except Exception:
+    def write(self, s: Any) -> int:
+        if isinstance(s, (bytes, bytearray, memoryview)):
+            with contextlib.suppress(Exception):
+                s = bytes(s).decode("utf-8", "replace")
+            if not isinstance(s, str):
                 s = str(s)
+        elif not isinstance(s, str):
+            with contextlib.suppress(Exception):
+                s = str(s)
+            if not isinstance(s, str):
+                s = "<unprintable>"
+
         self._buf += s
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
             line = line.strip()
             if line:
-                self.logger._safe_log(self.level, "STDIO", extra={"event": "STDIO", "line": line})
+                self.logger.event("STDIO", msg="STDIO", level=self.level, line=line)
         return len(s)
 
     def flush(self) -> None:
-        if self._buf.strip():
-            self.logger._safe_log(
-                self.level, "STDIO", extra={"event": "STDIO", "line": self._buf.strip()}
-            )
+        b = self._buf.strip()
+        if b:
+            self.logger.event("STDIO", msg="STDIO", level=self.level, line=b)
             self._buf = ""
 
 
 def hook_stdio(
     logger: EventLogger, stdout_level: int = logging.INFO, stderr_level: int = logging.ERROR
 ) -> None:
-    global _stdout_original, _stderr_original
-    _stdout_original = sys.stdout
-    _stderr_original = sys.stderr
-    sys.stdout = _PrintToLogger(logger, stdout_level)  # type: ignore[assignment]
-    sys.stderr = _PrintToLogger(logger, stderr_level)  # type: ignore[assignment]
+    with _STDIO_LOCK:
+        _STDIO_STACK.append((sys.stdout, sys.stderr))
+        sys.stdout = _PrintToLogger(logger, stdout_level)  # type: ignore[assignment]
+        sys.stderr = _PrintToLogger(logger, stderr_level)  # type: ignore[assignment]
 
 
 def restore_stdio() -> None:
-    global _stdout_original, _stderr_original
-    sys.stdout = _stdout_original  # type: ignore[assignment]
-    sys.stderr = _stderr_original  # type: ignore[assignment]
+    with _STDIO_LOCK:
+        if not _STDIO_STACK:
+            return
+        out, err = _STDIO_STACK.pop()
+        sys.stdout = out  # type: ignore[assignment]
+        sys.stderr = err  # type: ignore[assignment]
+
+
+unhook_stdio = restore_stdio
 
 
 # =============================================================================
 # Exception hooks
 # =============================================================================
 
+_ExcTuple = tuple[type[BaseException], BaseException, TracebackType | None]
+_ExcInfo = _ExcTuple | tuple[None, None, None]
+ExcInfoArg = _ExcInfo | BaseException | bool | None
+
+
+def _log_exc(logger: EventLogger, title: str, exc_info: ExcInfoArg, **fields: Any) -> None:
+    """Best-effort exception emission that NEVER raises."""
+    merged_extra = _sanitize_extra(dict(fields or {}))
+
+    raw = getattr(logger, "raw", None)
+    if isinstance(raw, logging.Logger):
+        with contextlib.suppress(Exception):
+            raw.error(title, exc_info=exc_info, extra=merged_extra, stacklevel=2)
+            return
+
+    with contextlib.suppress(Exception):
+        logger.error(title, exc_info=exc_info, **merged_extra)  # type: ignore[misc]
+        return
+
+    with contextlib.suppress(Exception):
+        logger.event("EXCEPTION", msg=title, level="ERROR", **merged_extra)
+
 
 def install_excepthook(logger: EventLogger) -> None:
-    def _hook(exc_type, exc, tb):
-        logger._safe_log(
-            logging.ERROR, "UNCAUGHT", extra={"event": "UNCAUGHT"}, exc_info=(exc_type, exc, tb)
-        )
-        sys.__excepthook__(exc_type, exc, tb)
+    def _hook(exc_type: type[BaseException], exc: BaseException, tb: Any) -> None:
+        try:
+            _log_exc(
+                logger, "UNCAUGHT", (exc_type, exc, tb), event="UNCAUGHT", exc_type=str(exc_type)
+            )
+        finally:
+            sys.__excepthook__(exc_type, exc, tb)
 
     sys.excepthook = _hook
 
 
-def install_asyncio_exception_hook(logger: EventLogger, loop=None) -> None:
-    """
-    Logs asyncio loop exceptions as structured events.
-    """
-    try:
-        import asyncio
-
-        lp = loop or asyncio.get_event_loop()
-    except Exception:
+def install_asyncio_exception_hook(logger: EventLogger, loop: Any = None) -> None:
+    lp: Any = loop
+    if lp is None:
+        with contextlib.suppress(Exception):
+            lp = asyncio.get_running_loop()
+    if lp is None:
+        with contextlib.suppress(Exception):
+            lp = asyncio.get_event_loop()
+    if lp is None:
         return
 
-    def _handler(_lp, context: dict[str, Any]) -> None:
-        fields = dict(context or {})
-        fields.setdefault("event", "ASYNCIO_EXCEPTION")
+    def _handler(_lp: Any, context: dict[str, Any]) -> None:
+        fields2 = dict(context or {})
+        fields2.setdefault("event", "ASYNCIO_EXCEPTION")
+        if "message" in fields2:
+            fields2["asyncio_message"] = fields2.pop("message")
 
-        # asyncio gives "exception": Exception and "message": str
-        exc = fields.get("exception")
-        # avoid reserved collisions: move common keys
-        if "message" in fields:
-            fields["asyncio_message"] = fields.pop("message")
-
+        exc = fields2.get("exception")
         if isinstance(exc, BaseException):
-            logger._safe_log(logging.ERROR, "ASYNCIO_EXCEPTION", extra=fields, exc_info=True)
-        else:
-            logger._safe_log(logging.ERROR, "ASYNCIO_EXCEPTION", extra=fields)
+            exc_info2: _ExcTuple = (type(exc), exc, getattr(exc, "__traceback__", None))
+            _log_exc(logger, "ASYNCIO_EXCEPTION", exc_info2, **fields2)
+            return
+
+        with contextlib.suppress(Exception):
+            logger.error("ASYNCIO_EXCEPTION", **fields2)
+            return
+
+        with contextlib.suppress(Exception):
+            logger.event("ASYNCIO_EXCEPTION", msg="ASYNCIO_EXCEPTION", level="ERROR", **fields2)
 
     with contextlib.suppress(Exception):
         lp.set_exception_handler(_handler)
 
 
 # =============================================================================
-# Public: get_logger + set_level + context passthrough
+# Context passthrough to canonical root (lazy)
 # =============================================================================
 
 
-def get_logger(
-    name: str = "sniper",
-    level: str | int | None = None,
-    service: str | None = None,
-    version: str | None = None,
-    dedup_window_sec: float | None = None,  # legacy signature: optional override
-) -> EventLogger:
-    """
-    Legacy entrypoint. Ensures root logging is configured and returns an EventLogger adapter.
-    """
-    configure_logging(
-        level=level if level is not None else _env_level(),
-        service=service if service is not None else _env_service(),
-        version=version if version is not None else _env_version(),
-        json_logs=_env_json_logs(),
-        use_utc=_env_use_utc(),
-        include_src=_env_include_src(),
-        force=False,
-    )
-
-    # Optional per-process override
-    if dedup_window_sec is not None:
-        os.environ["LOG_DEDUP_WINDOW_SEC"] = str(float(dedup_window_sec))
-        os.environ["PF_LOG_DEDUP_WINDOW_SEC"] = str(float(dedup_window_sec))
-        _install_root_filters_once()
-
-    lg = _root.get_logger(name)  # stdlib logger configured by root
-    return EventLogger(lg)
+def set_log_context(**kwargs: Any) -> None:
+    fn = getattr(_root_module(), "set_log_context", None)
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            fn(**kwargs)
 
 
-def set_level(logger: logging.Logger, level_str: str) -> None:
-    s = (level_str or "INFO").upper()
-    os.environ["PF_LOG_LEVEL"] = s
-    os.environ["LOG_LEVEL"] = s
-    lvl = _LEVEL_MAP.get(s, logging.INFO)
-    logging.getLogger().setLevel(lvl)
-    with contextlib.suppress(Exception):
-        logger.setLevel(lvl)
+def clear_log_context(*keys: str) -> None:
+    fn = getattr(_root_module(), "clear_log_context", None)
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            fn(*keys)
 
 
-# contextvars passthrough to root canonical
-set_log_context = _root.set_log_context
-clear_log_context = _root.clear_log_context
-get_log_context = _root.get_log_context
+def get_log_context() -> dict[str, Any]:
+    fn = getattr(_root_module(), "get_log_context", None)
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            out = fn()
+            return dict(out) if isinstance(out, dict) else {}
+    return {}
 
 
 __all__ = [
-    "BoundLogger",
-    "BurstLimitFilter",
-    "DedupFilter",
-    # compat surface
     "EventLogger",
-    "Heartbeat",
-    # filters
-    "SecretRedactionFilter",
-    "bump",
-    "clear_log_context",
-    # canonical passthrough (root)
     "configure_logging",
-    "get_log_context",
+    "setup_logging",
     "get_logger",
-    "hook_stdio",
-    "install_asyncio_exception_hook",
-    "install_excepthook",
-    "restore_stdio",
     "set_level",
-    "set_log_context",
+    "SecretRedactionFilter",
+    "DedupFilter",
+    "BurstLimitFilter",
+    "Heartbeat",
     "start_global_heartbeat",
+    "bump",
+    "hook_stdio",
+    "restore_stdio",
+    "unhook_stdio",
+    "install_excepthook",
+    "install_asyncio_exception_hook",
+    "set_log_context",
+    "clear_log_context",
+    "get_log_context",
 ]

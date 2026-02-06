@@ -7,7 +7,7 @@ God-Tier Quant Backtest Engine (V3+++ / Phase 0–7, Final Overhaul)
 
 Single public entrypoint:
 
-    async run_backtest(config: Mapping[str, Any]) -> dict
+    async run_backtest(config: Mapping[str, Any]) -> dict[str, Any]
 
 Design goals
 ------------
@@ -28,20 +28,18 @@ Optional:
 """
 
 import asyncio
-import contextlib
 import heapq
 import json
 import math
-import random
 import statistics
 import threading
 from collections.abc import AsyncIterator, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from functools import lru_cache
+from typing import Any, Callable
 
 from logging_setup import get_logger
-from utils_pkg import ai_db, ai_entry_logic as _entry
 
 ENGINE_NAME = "backtest_engine"
 ENGINE_VERSION = "V3+++_Phase0_7_GodTier"
@@ -51,64 +49,107 @@ __all__ = ["run_backtest"]
 # -----------------------------------------------------------------------------
 # Logger (robust to get_logger signature differences)
 # -----------------------------------------------------------------------------
-try:
-    log = get_logger(__name__)
-except TypeError:  # pragma: no cover
-    log = get_logger()
+def _get_log() -> Any:
+    try:
+        return get_logger(__name__)
+    except TypeError:  # pragma: no cover
+        return get_logger()
 
-if not hasattr(log, "every"):
 
-    def _every(_key: str, n: int = 60) -> bool:  # pragma: no cover
-        return True
+log = _get_log()
 
-    log.every = _every
+
+def _log_every(key: str, n: int = 60) -> bool:
+    """
+    Some of your loggers support log.every(key, n). This wrapper keeps behavior
+    compatible without monkey-patching the logger instance (mypy/ruff-friendly).
+    """
+    fn = getattr(log, "every", None)
+    if callable(fn):
+        try:
+            return bool(fn(key, n))
+        except TypeError:  # pragma: no cover
+            # Some implementations accept only (key)
+            try:
+                return bool(fn(key))
+            except Exception:
+                return True
+        except Exception:
+            return True
+    return True
 
 
 # -----------------------------------------------------------------------------
-# Optional modules (guarded; engine still works if missing)
+# Lazy imports (avoid heavy imports/side-effects at module import-time)
 # -----------------------------------------------------------------------------
-try:
-    from utils_pkg import ai_risk_model as _ai_risk_model  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-    _ai_risk_model = None  # type: ignore[assignment]
+@lru_cache(maxsize=1)
+def _ai_db_mod() -> Any:
+    from utils_pkg import ai_db  # local import by design
 
-try:
-    from utils_pkg import self_learning_ai_strategy as _sl_mod  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-    _sl_mod = None  # type: ignore[assignment]
+    return ai_db
 
-try:
-    from utils_pkg import regime as _regime_mod  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-    _regime_mod = None  # type: ignore[assignment]
 
-try:
-    from utils_pkg import data_logger as _data_logger  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-    _data_logger = None  # type: ignore[assignment]
+@lru_cache(maxsize=1)
+def _entry_mod() -> Any:
+    from utils_pkg import ai_entry_logic as entry  # local import by design
 
-try:
-    from utils_pkg import risk_manager as _rm  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-    _rm = None  # type: ignore[assignment]
+    return entry
 
-try:
-    from utils_pkg import ai_buy_scoring as _buy_scorer  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-    _buy_scorer = None  # type: ignore[assignment]
 
-try:
-    from utils_pkg import reinvestor as _reinv  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-    _reinv = None  # type: ignore[assignment]
+def _try_import(module_attr: str) -> Any | None:
+    """
+    module_attr: "utils_pkg.some_module"
+    Returns module or None.
+    """
+    try:
+        mod_name = module_attr.strip()
+        if not mod_name:
+            return None
+        __import__(mod_name)
+        return __import__(mod_name, fromlist=["*"])
+    except Exception:  # pragma: no cover
+        return None
+
+
+@lru_cache(maxsize=1)
+def _ai_risk_model_mod() -> Any | None:
+    return _try_import("utils_pkg.ai_risk_model")
+
+
+@lru_cache(maxsize=1)
+def _self_learning_mod() -> Any | None:
+    return _try_import("utils_pkg.self_learning_ai_strategy")
+
+
+@lru_cache(maxsize=1)
+def _regime_mod() -> Any | None:
+    return _try_import("utils_pkg.regime")
+
+
+@lru_cache(maxsize=1)
+def _data_logger_mod() -> Any | None:
+    return _try_import("utils_pkg.data_logger")
+
+
+@lru_cache(maxsize=1)
+def _risk_manager_mod() -> Any | None:
+    return _try_import("utils_pkg.risk_manager")
+
+
+@lru_cache(maxsize=1)
+def _ai_buy_scoring_mod() -> Any | None:
+    return _try_import("utils_pkg.ai_buy_scoring")
+
+
+@lru_cache(maxsize=1)
+def _reinvestor_mod() -> Any | None:
+    return _try_import("utils_pkg.reinvestor")
 
 
 # =============================================================================
 # Datamodels
 # =============================================================================
-
-
-@dataclass
+@dataclass(frozen=True)
 class BacktestRow:
     features: dict[str, Any]
     pnl_pct: float
@@ -121,7 +162,7 @@ class BacktestRow:
     raw: Mapping[str, Any] | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class ScoreTriple:
     heur: float
     ai: float | None
@@ -168,14 +209,12 @@ class BacktestTrade:
 # =============================================================================
 # Small helpers
 # =============================================================================
-
-
 def _clip01(x: float) -> float:
     try:
-        x = float(x)
+        xf = float(x)
     except Exception:
         return 0.0
-    return max(0.0, min(1.0, x))
+    return max(0.0, min(1.0, xf))
 
 
 def _maybe_float(v: Any) -> float | None:
@@ -195,20 +234,24 @@ def _ensure_dict(obj: Any) -> dict[str, Any]:
         return {}
     if isinstance(obj, dict):
         return dict(obj)
-    if isinstance(obj, bytes | bytearray):
+
+    # IMPORTANT: isinstance(..., A | B) is a runtime TypeError.
+    if isinstance(obj, (bytes, bytearray)):
         try:
             obj = obj.decode("utf-8", errors="ignore")
         except Exception:
             return {}
+
     if isinstance(obj, str):
         s = obj.strip()
         if not s:
             return {}
         try:
-            v = json.loads(s)
-            return dict(v) if isinstance(v, dict) else {}
+            parsed = json.loads(s)
+            return dict(parsed) if isinstance(parsed, dict) else {}
         except Exception:
             return {}
+
     try:
         return dict(obj)
     except Exception:
@@ -234,7 +277,7 @@ def _parse_ts_val(val: Any) -> datetime | None:
     if not s:
         return None
 
-    # epoch seconds/ms
+    # epoch seconds/ms (best-effort)
     try:
         num = float(s)
         if math.isfinite(num) and num > 10_000_000:
@@ -258,7 +301,7 @@ def _get_cfg_float(cfg: Mapping[str, Any], *keys: str, default: float) -> float:
             try:
                 return float(cfg[k])
             except Exception:
-                pass
+                continue
     return float(default)
 
 
@@ -268,7 +311,7 @@ def _get_cfg_int(cfg: Mapping[str, Any], *keys: str, default: int) -> int:
             try:
                 return int(cfg[k])
             except Exception:
-                pass
+                continue
     return int(default)
 
 
@@ -295,10 +338,10 @@ def _risk_profile_scale(profile: str | None) -> float:
 
 
 def _regime_mult_from_features(features: Mapping[str, Any], regime_mode_lock: int | None) -> float:
-    # Preferred: delegate to utils_pkg.regime
-    if _regime_mod is not None and hasattr(_regime_mod, "risk_mult_from_features"):
+    regime = _regime_mod()
+    if regime is not None and hasattr(regime, "risk_mult_from_features"):
         try:
-            v = float(_regime_mod.risk_mult_from_features(features, regime_mode_lock))  # type: ignore[attr-defined]
+            v = float(regime.risk_mult_from_features(features, regime_mode_lock))  # type: ignore[attr-defined]
             return v if math.isfinite(v) and v > 0 else 1.0
         except Exception:  # pragma: no cover
             log.debug("regime.risk_mult_from_features failed; fallback.", exc_info=True)
@@ -350,8 +393,6 @@ def _calc_effective_cost_pct(
 # =============================================================================
 # Row normalization
 # =============================================================================
-
-
 def _normalize_row(row: Mapping[str, Any]) -> BacktestRow | None:
     feats_raw = (
         row.get("features")
@@ -439,28 +480,31 @@ def _extract_mint(row: BacktestRow) -> str | None:
 # =============================================================================
 # Data source adapter (sync + async streaming)
 # =============================================================================
-
-
 async def _aiter_from_sync_iter(
     it: Iterable[Mapping[str, Any]], max_queue: int = 2048
 ) -> AsyncIterator[Mapping[str, Any]]:
     loop = asyncio.get_running_loop()
-    q: asyncio.Queue[Any] = asyncio.Queue(maxsize=max_queue)
+    q: asyncio.Queue[object] = asyncio.Queue(maxsize=max_queue)
     stop = threading.Event()
     sentinel = object()
+
+    def _put_threadsafe(obj: object) -> None:
+        try:
+            asyncio.run_coroutine_threadsafe(q.put(obj), loop).result()
+        except Exception:
+            # If the loop is shutting down, just drop.
+            pass
 
     def _worker() -> None:
         try:
             for item in it:
                 if stop.is_set():
                     break
-                asyncio.run_coroutine_threadsafe(q.put(item), loop).result()
-        except Exception as e:
-            with contextlib.suppress(Exception):
-                asyncio.run_coroutine_threadsafe(q.put(e), loop).result()
+                _put_threadsafe(item)
+        except BaseException as e:  # pragma: no cover
+            _put_threadsafe(e)
         finally:
-            with contextlib.suppress(Exception):
-                asyncio.run_coroutine_threadsafe(q.put(sentinel), loop).result()
+            _put_threadsafe(sentinel)
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
@@ -470,14 +514,16 @@ async def _aiter_from_sync_iter(
             item = await q.get()
             if item is sentinel:
                 break
-            if isinstance(item, Exception):
+            if isinstance(item, BaseException):
                 raise item
-            yield item
+            yield item  # type: ignore[misc]
     finally:
         stop.set()
 
 
 async def _iter_rows_from_ai_db(config: Mapping[str, Any]) -> AsyncIterator[BacktestRow]:
+    ai_db = _ai_db_mod()
+
     if hasattr(ai_db, "iter_backtest_rows"):
         it = ai_db.iter_backtest_rows(config)  # type: ignore[attr-defined]
     elif hasattr(ai_db, "iter_training_rows"):
@@ -492,7 +538,7 @@ async def _iter_rows_from_ai_db(config: Mapping[str, Any]) -> AsyncIterator[Back
         async for row in it:  # type: ignore[operator]
             br = _normalize_row(row)
             if br is None:
-                if log.every("bt_skip_row_no_pnl_async", 2500):
+                if _log_every("bt_skip_row_no_pnl_async", 2500):
                     log.debug("backtest_engine: skipping row without pnl_pct")
                 continue
             yield br
@@ -501,7 +547,7 @@ async def _iter_rows_from_ai_db(config: Mapping[str, Any]) -> AsyncIterator[Back
     async for row in _aiter_from_sync_iter(it):  # type: ignore[arg-type]
         br = _normalize_row(row)
         if br is None:
-            if log.every("bt_skip_row_no_pnl_sync", 2500):
+            if _log_every("bt_skip_row_no_pnl_sync", 2500):
                 log.debug("backtest_engine: skipping row without pnl_pct")
             continue
         yield br
@@ -510,17 +556,17 @@ async def _iter_rows_from_ai_db(config: Mapping[str, Any]) -> AsyncIterator[Back
 # =============================================================================
 # Scoring: live stack router (ai_entry_logic + optional ai_buy_scoring)
 # =============================================================================
-
-
 async def _compute_scores_entry_logic(
     features: dict[str, Any], cfg: Mapping[str, Any]
 ) -> ScoreTriple:
+    entry = _entry_mod()
+
     # Preferred: score_entry (sync or async)
-    if hasattr(_entry, "score_entry"):
+    if hasattr(entry, "score_entry"):
         try:
-            res = _entry.score_entry(features, ctx={"mode": "backtest", "config": cfg})  # type: ignore[attr-defined]
+            res = entry.score_entry(features, ctx={"mode": "backtest", "config": cfg})  # type: ignore[attr-defined]
         except TypeError:
-            res = _entry.score_entry(features)  # type: ignore[attr-defined]
+            res = entry.score_entry(features)  # type: ignore[attr-defined]
         if asyncio.iscoroutine(res):
             res = await res  # type: ignore[assignment]
 
@@ -542,9 +588,9 @@ async def _compute_scores_entry_logic(
     # Fallback heuristic
     heur_score = None
     for name in ("_heuristic_score", "heuristic_score", "score_heuristic"):
-        if hasattr(_entry, name):
+        if hasattr(entry, name):
             try:
-                heur_score = float(getattr(_entry, name)(features))  # type: ignore[misc]
+                heur_score = float(getattr(entry, name)(features))  # type: ignore[misc]
                 break
             except Exception:
                 pass
@@ -559,15 +605,15 @@ async def _compute_scores_entry_logic(
         cfg,
         "ENTRY_AI_WEIGHT",
         "entry_ai_weight",
-        default=float(getattr(_entry, "ENTRY_AI_WEIGHT", 0.7)),
+        default=float(getattr(entry, "ENTRY_AI_WEIGHT", 0.7)),
     )
     w = _clip01(w)
 
     ai_score = None
     for name in ("_ai_score", "ai_score", "score_ai"):
-        if hasattr(_entry, name):
+        if hasattr(entry, name):
             try:
-                r = getattr(_entry, name)(features)  # type: ignore[misc]
+                r = getattr(entry, name)(features)  # type: ignore[misc]
                 if asyncio.iscoroutine(r):
                     r = await r
                 ai_score = _maybe_float(r)
@@ -585,12 +631,14 @@ async def _compute_scores_entry_logic(
 async def _compute_scores_ai_buy_scoring(
     features: dict[str, Any], cfg: Mapping[str, Any]
 ) -> ScoreTriple | None:
-    if _buy_scorer is None or not hasattr(_buy_scorer, "score_only"):
+    buy = _ai_buy_scoring_mod()
+    if buy is None or not hasattr(buy, "score_only"):
         return None
+
     try:
         candidate: Any
-        if hasattr(_buy_scorer, "Candidate"):
-            Cand = _buy_scorer.Candidate
+        if hasattr(buy, "Candidate"):
+            Cand = buy.Candidate
             try:
                 candidate = Cand(features=features, ctx={"mode": "backtest", "config": cfg})
             except TypeError:
@@ -601,7 +649,7 @@ async def _compute_scores_ai_buy_scoring(
         else:
             candidate = features
 
-        res = _buy_scorer.score_only(candidate)  # type: ignore[misc]
+        res = buy.score_only(candidate)  # type: ignore[misc]
         if asyncio.iscoroutine(res):
             res = await res  # type: ignore[assignment]
 
@@ -614,7 +662,7 @@ async def _compute_scores_ai_buy_scoring(
             ai = res.get("ai_score", ai)
             blended = res.get("blended_score", blended)
 
-        if blended is None and isinstance(res, tuple | list) and len(res) >= 1:
+        if blended is None and isinstance(res, (tuple, list)) and len(res) >= 1:
             blended = float(res[0])
             if heur is None:
                 heur = blended
@@ -648,8 +696,6 @@ async def _compute_scores(features: dict[str, Any], cfg: Mapping[str, Any]) -> S
 # =============================================================================
 # Self-learning (backtest-only adaptive tuning)
 # =============================================================================
-
-
 @dataclass
 class _SelfLearningState:
     enabled: bool
@@ -660,12 +706,8 @@ class _SelfLearningState:
 
     tune_count: int = 0
     last_tune_ts: datetime | None = None
-    window_pnls: list[float] = None  # type: ignore[assignment]
-    window_ts: list[datetime | None] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        self.window_pnls = [] if self.window_pnls is None else self.window_pnls
-        self.window_ts = [] if self.window_ts is None else self.window_ts
+    window_pnls: list[float] = field(default_factory=list)
+    window_ts: list[datetime | None] = field(default_factory=list)
 
     def maybe_tune(
         self,
@@ -692,7 +734,6 @@ class _SelfLearningState:
                 return score_min, blended_gate, risk_mult_override
 
         if self.max_tunes_per_day and self.max_tunes_per_day > 0:
-            # crude limiter: tunes per span-days
             anchor = next((t for t in self.window_ts if t is not None), None)
             if anchor and created_at:
                 days = max(1.0, (created_at - anchor).total_seconds() / 86400.0)
@@ -743,9 +784,10 @@ class _SelfLearningState:
             equity,
         )
 
-        if _sl_mod is not None and hasattr(_sl_mod, "record_backtest_tune"):
+        sl = _self_learning_mod()
+        if sl is not None and hasattr(sl, "record_backtest_tune"):
             try:
-                _sl_mod.record_backtest_tune(  # type: ignore[attr-defined]
+                sl.record_backtest_tune(  # type: ignore[attr-defined]
                     win_rate=win_rate,
                     window_pnl_pct=window_pnl,
                     new_score_min=new_score_min,
@@ -803,8 +845,6 @@ def _build_self_learning_state(cfg: Mapping[str, Any]) -> _SelfLearningState:
 # =============================================================================
 # AI risk overlay
 # =============================================================================
-
-
 async def _maybe_ai_risk_score(
     *,
     row: BacktestRow,
@@ -827,23 +867,26 @@ async def _maybe_ai_risk_score(
             or features.get("fraud_conf")
         )
 
-    if score is None and _ai_risk_model is not None:
+    risk_mod = _ai_risk_model_mod()
+    if score is None and risk_mod is not None:
         try:
-            fn = None
+            fn: Callable[..., Any] | None = None
             for name in ("score_entry", "score_candidate", "score", "evaluate"):
-                if hasattr(_ai_risk_model, name):
-                    fn = getattr(_ai_risk_model, name)
+                if hasattr(risk_mod, name):
+                    fn = getattr(risk_mod, name)
                     break
+
             if fn is not None:
                 res = fn(features, cfg)  # type: ignore[misc]
                 if asyncio.iscoroutine(res):
                     res = await res  # type: ignore[assignment]
-                if isinstance(res, int | float):
+
+                if isinstance(res, (int, float)):
                     score = float(res)
                 elif isinstance(res, dict):
                     score = _maybe_float(res.get("score"))
                     conf = _maybe_float(res.get("conf") or res.get("confidence"))
-                elif isinstance(res, tuple | list) and len(res) >= 1:
+                elif isinstance(res, (tuple, list)) and len(res) >= 1:
                     score = _maybe_float(res[0])
                     if len(res) >= 2:
                         conf = _maybe_float(res[1])
@@ -856,16 +899,14 @@ async def _maybe_ai_risk_score(
 # =============================================================================
 # Quant metrics
 # =============================================================================
-
-
 def _safe_quantile(values: list[float], q: float) -> float:
     if not values:
         return 0.0
     if len(values) == 1:
         return float(values[0])
     v = sorted(values)
-    q = max(0.0, min(1.0, float(q)))
-    idx = int(q * (len(v) - 1))
+    qf = max(0.0, min(1.0, float(q)))
+    idx = int(qf * (len(v) - 1))
     return float(v[idx])
 
 
@@ -943,8 +984,6 @@ def _omega_ratio(returns_pct: list[float], threshold_pct: float = 0.0) -> float:
 # =============================================================================
 # Main backtest engine
 # =============================================================================
-
-
 async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
     tag = str(config.get("config_tag") or config.get("BT_TAG_PREFIX") or "")
 
@@ -1029,10 +1068,10 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
         limit_candidates = None
 
     # smart-wallet gates
-    min_sw_score = _get_cfg_float(
+    min_sw_score_val = _get_cfg_float(
         config, "BT_MIN_SMART_WALLET_SCORE", "min_smart_wallet_score", default=-1.0
     )
-    min_sw_score = None if min_sw_score < 0.0 else float(min_sw_score)
+    min_sw_score: float | None = None if min_sw_score_val < 0.0 else float(min_sw_score_val)
     require_sw_flag = _get_cfg_bool(
         config, "BT_REQUIRE_SMART_WALLET_FLAG", "require_smart_wallet_flag", default=False
     )
@@ -1054,10 +1093,10 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
     label_include = config.get("label_include")
     label_exclude = config.get("label_exclude")
     label_include = (
-        [str(x) for x in label_include] if isinstance(label_include, list | tuple) else None
+        [str(x) for x in label_include] if isinstance(label_include, (list, tuple)) else None
     )
     label_exclude = (
-        [str(x) for x in label_exclude] if isinstance(label_exclude, list | tuple) else None
+        [str(x) for x in label_exclude] if isinstance(label_exclude, (list, tuple)) else None
     )
 
     # segment filter
@@ -1088,12 +1127,14 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
     log_equity_series = _get_cfg_bool(
         config, "BT_LOG_EQUITY_SERIES", "log_equity_series", default=False
     )
+
     max_log_trades = max(
         0, _get_cfg_int(config, "BT_MAX_LOG_TRADES", "max_log_trades", default=25000)
     )
     max_log_equity = max(
         0, _get_cfg_int(config, "BT_MAX_LOG_EQUITY_POINTS", "max_log_equity_points", default=25000)
     )
+
     trades_for_log: list[dict[str, Any]] = []
     equity_series: list[dict[str, Any]] = []
 
@@ -1224,7 +1265,6 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
     equity_returns: list[float] = []  # r_alloc (decimal)
     eq_drawdowns_pct: list[float] = []
 
-    # diagnostics
     blended_scores: list[float] = []
     heur_scores: list[float] = []
     ai_scores: list[float] = []
@@ -1249,7 +1289,6 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
     risk_mult_effective_sum = 0.0
     cost_sum_pct = 0.0
 
-    # buckets
     rc_bucket_defs: list[tuple[float, float, str]] = [
         (0.0, 0.25, "0.00-0.25"),
         (0.25, 0.50, "0.25-0.50"),
@@ -1276,9 +1315,10 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
 
     open_pos_ends: list[datetime] = []
 
-    # deterministic-ish sampling for any future approximations
-    seed = _get_cfg_int(config, "BT_RANDOM_SEED", "seed", default=1337)
-    _rng = random.Random(seed)
+    rm = _risk_manager_mod()
+    reinv = _reinvestor_mod()
+    data_logger = _data_logger_mod()
+    sl_mod = _self_learning_mod()
 
     async for row in _iter_rows_from_ai_db(config):
         if limit_candidates is not None and n_candidates >= limit_candidates:
@@ -1454,14 +1494,14 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
             rc_val = float(rc)
             for lo, hi, name in rc_bucket_defs:
                 if (rc_val >= lo and rc_val < hi) or (name.endswith("1.00") and rc_val <= hi):
-                    b = rc_bucket_acc.setdefault(
+                    bucket = rc_bucket_acc.setdefault(
                         name, {"count": 0, "pnl_sum": 0.0, "win_count": 0, "rc_sum": 0.0}
                     )
-                    b["count"] += 1
-                    b["pnl_sum"] += pnl_pct
-                    b["rc_sum"] += rc_val
+                    bucket["count"] += 1
+                    bucket["pnl_sum"] += pnl_pct
+                    bucket["rc_sum"] += rc_val
                     if pnl_pct > 0:
-                        b["win_count"] += 1
+                        bucket["win_count"] += 1
                     break
 
         # buckets: score
@@ -1486,14 +1526,12 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
                 label_loss_counts[row.label] = label_loss_counts.get(row.label, 0) + 1
 
         # regime stats
-        regime_key = None
         if feats.get("regime_label"):
             regime_key = str(feats["regime_label"]).strip().lower()
         elif feats.get("regime_label_numeric") is not None:
             rn = _maybe_float(feats.get("regime_label_numeric"))
-            if rn is not None:
-                regime_key = f"num_{rn:+.1f}"
-        if not regime_key:
+            regime_key = f"num_{rn:+.1f}" if rn is not None else "unknown"
+        else:
             regime_key = "unknown"
 
         reg = regime_bucket_acc.setdefault(
@@ -1530,10 +1568,10 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
         )
 
         # allocation factor
-        if use_live_rm and _rm is not None and hasattr(_rm, "backtest_allocation_factor"):
+        if use_live_rm and rm is not None and hasattr(rm, "backtest_allocation_factor"):
             try:
                 alloc_factor = float(
-                    _rm.backtest_allocation_factor(  # type: ignore[attr-defined]
+                    rm.backtest_allocation_factor(  # type: ignore[attr-defined]
                         equity=equity,
                         risk_capacity_score=float(rc) if rc is not None else None,
                         config=config,
@@ -1591,9 +1629,9 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
             break
 
         # optional RM hook
-        if use_live_rm and _rm is not None and hasattr(_rm, "backtest_on_trade"):
+        if use_live_rm and rm is not None and hasattr(rm, "backtest_on_trade"):
             try:
-                _rm.backtest_on_trade(  # type: ignore[attr-defined]
+                rm.backtest_on_trade(  # type: ignore[attr-defined]
                     pnl_pct=pnl_pct,
                     equity=equity,
                     drawdown_pct=drawdown * 100.0,
@@ -1616,9 +1654,9 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
 
             if qualifies:
                 reinvest_count += 1
-                if _reinv is not None and hasattr(_reinv, "backtest_on_win"):
+                if reinv is not None and hasattr(reinv, "backtest_on_win"):
                     try:
-                        extra = _reinv.backtest_on_win(  # type: ignore[attr-defined]
+                        extra = reinv.backtest_on_win(  # type: ignore[attr-defined]
                             pnl_pct=pnl_pct,
                             equity=equity,
                             config=config,
@@ -1686,15 +1724,15 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
             td["created_at"] = trade.created_at.isoformat() if trade.created_at else None
             trades_for_log.append(td)
 
-            if _data_logger is not None and hasattr(_data_logger, "record_backtest_trade"):
+            if data_logger is not None and hasattr(data_logger, "record_backtest_trade"):
                 try:
-                    _data_logger.record_backtest_trade(config=dict(config), trade=td)  # type: ignore[attr-defined]
+                    data_logger.record_backtest_trade(config=dict(config), trade=td)  # type: ignore[attr-defined]
                 except Exception:  # pragma: no cover
                     log.debug("data_logger.record_backtest_trade failed", exc_info=True)
 
-            if _sl_mod is not None and hasattr(_sl_mod, "record_backtest_trade"):
+            if sl_mod is not None and hasattr(sl_mod, "record_backtest_trade"):
                 try:
-                    _sl_mod.record_backtest_trade(config=dict(config), trade=td)  # type: ignore[attr-defined]
+                    sl_mod.record_backtest_trade(config=dict(config), trade=td)  # type: ignore[attr-defined]
                 except Exception:  # pragma: no cover
                     log.debug(
                         "self_learning_ai_strategy.record_backtest_trade failed", exc_info=True
@@ -1728,7 +1766,6 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
         "win_rate": (n_wins / n_trades) if n_trades > 0 else 0.0,
     }
 
-    # PnL stats
     if pnl_list:
         stats["avg_pnl_pct"] = statistics.mean(pnl_list)
         stats["median_pnl_pct"] = statistics.median(pnl_list)
@@ -1752,7 +1789,6 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
             }
         )
 
-    # Equity / drawdown
     stats["equity_final"] = equity
     stats["equity_init"] = float(equity_init)
     stats["equity_max"] = hwm
@@ -1762,7 +1798,6 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
     stats["max_drawdown_pct"] = max_dd * 100.0
     stats["max_runup_pct"] = max_runup * 100.0
 
-    # Equity-return metrics
     stats["sharpe"] = _compute_sharpe(equity_returns)
     stats["avg_equity_return_per_trade_pct"] = (
         (statistics.mean(equity_returns) * 100.0) if equity_returns else 0.0
@@ -1771,7 +1806,6 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
         (statistics.pstdev(equity_returns) * 100.0) if len(equity_returns) > 1 else 0.0
     )
 
-    # Ulcer + time in DD
     if eq_drawdowns_pct:
         ulcer = math.sqrt(statistics.mean([d * d for d in eq_drawdowns_pct]))
         stats["ulcer_index_pct"] = ulcer
@@ -1781,34 +1815,31 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
     else:
         stats["ulcer_index_pct"] = 0.0
         stats["time_in_drawdown_frac"] = 0.0
+
     stats["ulcer_perf_ratio"] = (
         (float(stats["net_pnl_pct"]) / float(stats["ulcer_index_pct"]))
         if stats["ulcer_index_pct"] > 0
         else 0.0
     )
 
-    # Profit factor / gain-to-pain / omega
     stats["win_sum_pct"] = win_sum
     stats["loss_sum_pct"] = loss_sum
     stats["profit_factor"] = (win_sum / abs(loss_sum)) if loss_sum < 0 else 0.0
     stats["gain_to_pain"] = _gain_to_pain(pnl_list)
     stats["omega_0"] = _omega_ratio(pnl_list, threshold_pct=0.0)
 
-    # Per-trade DD + holds
     stats["avg_dd_trade_pct"] = statistics.mean(dd_list) if dd_list else 0.0
     stats["p95_drawdown_trade_pct"] = _safe_quantile(dd_list, 0.95) if dd_list else 0.0
     stats["avg_hold_sec"] = statistics.mean(hold_list) if hold_list else 0.0
     stats["median_hold_sec"] = statistics.median(hold_list) if hold_list else 0.0
     stats["p95_hold_sec"] = _safe_quantile(hold_list, 0.95) if hold_list else 0.0
 
-    # Exposure / risk mult
     stats["avg_exposure"] = statistics.mean(exposure_list) if exposure_list else 0.0
     stats["p95_exposure"] = _safe_quantile(exposure_list, 0.95) if exposure_list else 0.0
     stats["avg_risk_mult_effective"] = (
         (risk_mult_effective_sum / float(n_trades)) if n_trades > 0 else 1.0
     )
 
-    # Costs
     stats["trade_cost_total_pct"] = cost_sum_pct
     stats["trade_cost_avg_pct"] = (cost_sum_pct / float(n_trades)) if n_trades > 0 else 0.0
     stats["trade_cost_bps_cfg"] = float(trade_cost_bps)
@@ -1817,18 +1848,15 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
     stats["spread_bps_cfg"] = float(spread_bps)
     stats["trade_cost_mode_cfg"] = trade_cost_mode
 
-    # Weighted research metric
     stats["weighted_avg_pnl_pct"] = (
         (weighted_return_sum / weight_sum) if weight_sum > 0 else float(stats["avg_pnl_pct"])
     )
 
-    # Score diagnostics
     stats["avg_entry_score"] = statistics.mean(blended_scores) if blended_scores else 0.0
     stats["median_entry_score"] = statistics.median(blended_scores) if blended_scores else 0.0
     stats["avg_heur_score"] = statistics.mean(heur_scores) if heur_scores else 0.0
     stats["avg_ai_score"] = statistics.mean(ai_scores) if ai_scores else 0.0
 
-    # Win/loss averages + expectancy
     pos = [p for p in pnl_list if p > 0]
     neg = [p for p in pnl_list if p < 0]
     stats["avg_win_pct"] = statistics.mean(pos) if pos else 0.0
@@ -1841,7 +1869,6 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
         (wr * stats["avg_win_pct"] + (1.0 - wr) * stats["avg_loss_pct"]) if n_trades > 0 else 0.0
     )
 
-    # Span / density
     if first_ts is not None and last_ts is not None and last_ts > first_ts:
         span_days = (last_ts - first_ts).total_seconds() / 86400.0
         stats["days_span"] = max(span_days, 1e-6)
@@ -1855,7 +1882,6 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
         stats["daily_pnl_pct"] = 0.0
         stats["trade_density_per_day"] = 0.0
 
-    # Geometric growth (time-aware if span exists)
     if stats["days_span"] > 0 and equity_init > 0 and equity > 0:
         growth = equity / equity_init
         daily_geo = growth ** (1.0 / float(stats["days_span"]))
@@ -1869,7 +1895,6 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
         stats["monthly_pnl_geo_pct"] = 0.0
         stats["annual_pnl_geo_pct"] = 0.0
 
-    # Tail metrics
     if pnl_list:
         sorted_pnl = sorted(pnl_list)
         stats["pnl_p05_pct"] = _safe_quantile(sorted_pnl, 0.05)
@@ -1903,9 +1928,9 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
     avg_win = float(stats["avg_win_pct"])
     avg_loss = float(stats["avg_loss_pct"])
     if 0.0 < wr < 1.0 and avg_win > 0 and avg_loss < 0:
-        b = avg_win / abs(avg_loss)
+        payoff_ratio = avg_win / abs(avg_loss)
         q = 1.0 - wr
-        kelly = (b * wr - q) / b
+        kelly = (payoff_ratio * wr - q) / payoff_ratio
         kelly = max(0.0, kelly)
         stats["kelly_fraction_est"] = kelly
         stats["kelly_fraction_capped"] = min(kelly, 0.5)
@@ -1920,7 +1945,6 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
         _compute_sharpe(equity_returns[-100:]) if len(equity_returns) >= 2 else 0.0
     )
 
-    # label stats
     stats["label_counts"] = dict(label_counts)
     stats["label_pnl_sum"] = dict(label_pnl_sum)
     label_avg: dict[str, float] = {}
@@ -1978,7 +2002,6 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
         if agg.get("count", 0) > 0
     }
 
-    # self-learning + reinvestor + AI risk overlay diagnostics
     stats["self_learning_tune_count"] = int(sl_state.tune_count)
     stats["self_learning_use_llm"] = bool(sl_state.use_llm)
 
@@ -2007,13 +2030,11 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
     )
     stats["ai_risk_scores_used_count"] = len(ai_risk_scores_used)
 
-    # final gates after tuning
     stats["score_min_initial"] = float(score_min_initial)
     stats["score_min_final"] = float(score_min)
     stats["entry_min_score_initial"] = float(blended_gate_initial)
     stats["entry_min_score_final"] = float(blended_gate)
 
-    # echo config essentials
     stats["risk_profile"] = risk_profile
     stats["risk_profile_mult"] = float(risk_profile_mult)
     stats["risk_mult_override_final"] = float(risk_mult_override)
@@ -2026,12 +2047,11 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
     stats["dedup_mode"] = dedup_mode
     stats["dedup_window_sec"] = dedup_window_sec
 
-    # target metric helper
     target_metric_key_raw = config.get("BT_TARGET_METRIC") or config.get("target_metric") or ""
     target_metric_key = str(target_metric_key_raw).strip() or None
     if not target_metric_key:
         for cand in ("annual_pnl_geo_pct", "net_pnl_with_reinvest_pct", "net_pnl_pct", "sharpe"):
-            if isinstance(stats.get(cand), int | float):
+            if isinstance(stats.get(cand), (int, float)):
                 target_metric_key = cand
                 break
     stats["target_metric_key"] = target_metric_key
@@ -2054,30 +2074,30 @@ async def run_backtest(config: Mapping[str, Any]) -> dict[str, Any]:
         )
 
     # optional logging hooks
-    if _data_logger is not None:
+    if data_logger is not None:
         try:
-            if hasattr(_data_logger, "record_backtest_run"):
-                _data_logger.record_backtest_run(config=dict(config), stats=stats)  # type: ignore[attr-defined]
-            elif hasattr(_data_logger, "log_backtest_run"):
-                _data_logger.log_backtest_run(config=dict(config), stats=stats)  # type: ignore[attr-defined]
+            if hasattr(data_logger, "record_backtest_run"):
+                data_logger.record_backtest_run(config=dict(config), stats=stats)  # type: ignore[attr-defined]
+            elif hasattr(data_logger, "log_backtest_run"):
+                data_logger.log_backtest_run(config=dict(config), stats=stats)  # type: ignore[attr-defined]
         except Exception:  # pragma: no cover
             log.debug("data_logger backtest hook failed", exc_info=True)
 
-    if _sl_mod is not None and hasattr(_sl_mod, "record_backtest_summary"):
+    if sl_mod is not None and hasattr(sl_mod, "record_backtest_summary"):
         try:
-            _sl_mod.record_backtest_summary(config=dict(config), stats=stats)  # type: ignore[attr-defined]
+            sl_mod.record_backtest_summary(config=dict(config), stats=stats)  # type: ignore[attr-defined]
         except Exception:  # pragma: no cover
             log.debug("self_learning_ai_strategy.record_backtest_summary failed", exc_info=True)
 
-    if _rm is not None and hasattr(_rm, "backtest_on_summary"):
+    if rm is not None and hasattr(rm, "backtest_on_summary"):
         try:
-            _rm.backtest_on_summary(config=dict(config), stats=stats)  # type: ignore[attr-defined]
+            rm.backtest_on_summary(config=dict(config), stats=stats)  # type: ignore[attr-defined]
         except Exception:  # pragma: no cover
             log.debug("risk_manager.backtest_on_summary failed", exc_info=True)
 
-    if _reinv is not None and hasattr(_reinv, "backtest_on_summary"):
+    if reinv is not None and hasattr(reinv, "backtest_on_summary"):
         try:
-            _reinv.backtest_on_summary(config=dict(config), stats=stats)  # type: ignore[attr-defined]
+            reinv.backtest_on_summary(config=dict(config), stats=stats)  # type: ignore[attr-defined]
         except Exception:  # pragma: no cover
             log.debug("reinvestor.backtest_on_summary failed", exc_info=True)
 

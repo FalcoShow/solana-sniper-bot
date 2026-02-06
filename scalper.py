@@ -1,9 +1,8 @@
-# scalper.py
 from __future__ import annotations
 
 """
-scalper.py — P1/P2 (isolated, production-safe)
-==============================================
+scalper.py — P1/P2/P3 hardened isolated scalper (production-safe)
+=================================================================
 
 Role
 ----
@@ -40,104 +39,284 @@ We prefer utils_pkg.core_utils hooks if present:
 - send_telegram
 - convert_sol_to_usd
 - swap_token_jupiter
-- get_wallet_tokens (optional; we can run without it but balances become unknown)
-
+- get_wallet_tokens (optional)
 """
 
 import asyncio
 import contextlib
+import inspect
 import json
-import logging
 import os
 import random
 import signal
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
-from typing import Any
-
-
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-def _setup_logging() -> logging.Logger:
-    # Prefer canonical logging_setup if present
-    try:
-        from logging_setup import get_logger  # type: ignore
-
-        return get_logger("scalper")
-    except Exception:
-        pass
-
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s | %(levelname)s | %(name)s: %(message)s",
-    )
-    return logging.getLogger("scalper")
-
-
-log = _setup_logging()
-
+from datetime import datetime, timezone
+from functools import lru_cache
+from typing import Any, cast
 
 # -----------------------------------------------------------------------------
-# Optional core hooks (must not crash if absent)
+# Optional core hooks (best-effort; must never crash if absent)
+# NOTE: Keep as Any so mypy doesn't lock us into one signature and then fail on
+#       "optional-callable set to None" or "missing arg" patterns.
 # -----------------------------------------------------------------------------
+init_resources: Any = None
+close_resources: Any = None
+get_redis_async: Any = None
+send_telegram: Any = None
+convert_sol_to_usd: Any = None
+swap_token_jupiter: Any = None
+get_wallet_tokens: Any = None
+
 try:
     from utils_pkg.core_utils import (  # type: ignore
-        close_resources,
-        convert_sol_to_usd,
-        get_redis_async,
-        get_wallet_tokens,
-        init_resources,
-        send_telegram,
-        swap_token_jupiter,
+        close_resources as _close_resources,
+        convert_sol_to_usd as _convert_sol_to_usd,
+        get_redis_async as _get_redis_async,
+        get_wallet_tokens as _get_wallet_tokens,
+        init_resources as _init_resources,
+        send_telegram as _send_telegram,
+        swap_token_jupiter as _swap_token_jupiter,
     )
+
+    init_resources = _init_resources
+    close_resources = _close_resources
+    get_redis_async = _get_redis_async
+    send_telegram = _send_telegram
+    convert_sol_to_usd = _convert_sol_to_usd
+    swap_token_jupiter = _swap_token_jupiter
+    get_wallet_tokens = _get_wallet_tokens
 except Exception:  # pragma: no cover
-    init_resources = None
-    close_resources = None
-    get_redis_async = None
-    send_telegram = None
-    convert_sol_to_usd = None
-    swap_token_jupiter = None
-    get_wallet_tokens = None
+    # Keep Nones. This module must still import safely.
+    pass
 
 
 # -----------------------------------------------------------------------------
-# Constants
+# Small async helpers (mypy-safe)
+# -----------------------------------------------------------------------------
+async def _maybe_await(x: Any) -> Any:
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+
+async def _call_maybe_async(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """
+    Call fn(*args, **kwargs) and await it if it returns an awaitable.
+
+    IMPORTANT: fn is Any on purpose (compat across multiple implementations).
+    """
+    out = fn(*args, **kwargs)
+    return await _maybe_await(out)
+
+
+def _short(x: Any, n: int = 320) -> str:
+    try:
+        s = str(x)
+        return s if len(s) <= n else (s[:n] + "…")
+    except Exception:
+        return "<?>"
+
+
+# -----------------------------------------------------------------------------
+# Logging: no global side-effects at import (no setup_logging at import)
+# -----------------------------------------------------------------------------
+class _LogShim:
+    """
+    Adapter supporting .event() and .every() without mutating any logger object.
+    If the underlying logger exposes .event, call it; else fall back to .info.
+    """
+
+    __slots__ = ("_supplier", "_every_store")
+
+    def __init__(self, supplier: Any) -> None:
+        self._supplier = supplier
+        self._every_store: dict[str, float] = {}
+
+    def _log(self) -> Any:
+        with contextlib.suppress(Exception):
+            return self._supplier()
+        return None
+
+    def event(self, name: str, **fields: Any) -> None:
+        lg = self._log()
+        if lg is None:
+            return
+        fn = getattr(lg, "event", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(name, **fields)
+            return
+        info = getattr(lg, "info", None)
+        if callable(info):
+            with contextlib.suppress(Exception):
+                info("%s %s", name, fields)
+
+    def every(self, key: str, n: int = 30, msg: str | None = None, **fields: Any) -> None:
+        try:
+            now = time.monotonic()
+            sec = float(max(1, int(n)))
+            last = float(self._every_store.get(key, 0.0))
+            if (now - last) >= sec:
+                self._every_store[key] = now
+                self.event(msg or key, **fields)
+        except Exception:
+            return
+
+    def info(self, msg: str, *a: Any) -> None:
+        lg = self._log()
+        if lg is None:
+            return
+        fn = getattr(lg, "info", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(msg, *a)
+
+    def warning(self, msg: str, *a: Any) -> None:
+        lg = self._log()
+        if lg is None:
+            return
+        fn = getattr(lg, "warning", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(msg, *a)
+
+    def error(self, msg: str, *a: Any) -> None:
+        lg = self._log()
+        if lg is None:
+            return
+        fn = getattr(lg, "error", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(msg, *a)
+
+    def debug(self, msg: str, *a: Any) -> None:
+        lg = self._log()
+        if lg is None:
+            return
+        fn = getattr(lg, "debug", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(msg, *a)
+
+
+@lru_cache(maxsize=1)
+def _resolve_logger() -> Any:
+    # Prefer repo compat first
+    with contextlib.suppress(Exception):
+        from utils_pkg.log_compat import get_logger as gl  # type: ignore
+
+        return gl(__name__)
+
+    with contextlib.suppress(Exception):
+        from utils_pkg.logging_setup import get_logger as gl2  # type: ignore
+
+        try:
+            return gl2(__name__)
+        except TypeError:
+            return gl2()
+
+    # Root-level compatibility
+    with contextlib.suppress(Exception):
+        from logging_setup import get_logger as gl3  # type: ignore
+
+        try:
+            return gl3(__name__)
+        except TypeError:
+            return gl3("scalper")
+
+    import logging
+
+    lg = logging.getLogger("scalper")
+    if not lg.handlers:
+        logging.basicConfig(level=logging.INFO)
+    return lg
+
+
+log = _LogShim(_resolve_logger)
+
+# -----------------------------------------------------------------------------
+# Constants / truth tables
 # -----------------------------------------------------------------------------
 SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
-
-def _env_bool(name: str, default: str = "0") -> bool:
-    v = os.getenv(name, default).strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
+_TRUE = {"1", "true", "t", "yes", "y", "on"}
+_FALSE = {"0", "false", "f", "no", "n", "off"}
 
 
-def _env_float(name: str, default: str) -> float:
-    try:
-        return float(os.getenv(name, default))
-    except Exception:
-        return float(default)
+# -----------------------------------------------------------------------------
+# Env helpers (stable + typed)
+# -----------------------------------------------------------------------------
+def _env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else str(v).strip()
 
 
-def _env_int(name: str, default: str) -> int:
-    try:
-        return int(os.getenv(name, default))
-    except Exception:
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return bool(default)
+    s = str(v).strip().lower()
+    if s in _TRUE:
+        return True
+    if s in _FALSE:
+        return False
+    return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
         return int(default)
+    with contextlib.suppress(Exception):
+        return int(str(v).strip())
+    with contextlib.suppress(Exception):
+        return int(float(str(v).strip()))
+    return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return float(default)
+    with contextlib.suppress(Exception):
+        return float(str(v).strip())
+    return float(default)
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
 def _utc_day() -> str:
-    return datetime.now(UTC).strftime("%Y%m%d")
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+
+# -----------------------------------------------------------------------------
+# Sleep helper (mypy-safe, avoids "unreachable" propagation)
+# -----------------------------------------------------------------------------
+async def _sleep_or_stop(stop_event: asyncio.Event, seconds: float) -> bool:
+    timeout = float(max(0.0, seconds))
+    if timeout <= 0.0:
+        return bool(stop_event.is_set())
+
+    if stop_event.is_set():
+        return True
+
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=timeout)
+    except (asyncio.TimeoutError, TimeoutError):
+        pass
+
+    return bool(stop_event.is_set())
 
 
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ScalperConfig:
     enabled: bool
     mode: str  # OFF | PAPER | TRADE
@@ -174,105 +353,106 @@ class ScalperConfig:
 
     # Redis keys
     state_key: str
-    pnl_key: str
-    dd_key: str
-    trades_key: str
     cooldown_key: str
+    pnl_key_prefix: str
+    dd_key_prefix: str
+    trades_key_prefix: str
 
     @staticmethod
-    def from_env() -> ScalperConfig:
-        # New toggles
-        scalper_enabled = _env_bool("SCALPER_ENABLED", "0")
-        scalper_mode_env = os.getenv("SCALPER_MODE", "").strip()
+    def from_env() -> "ScalperConfig":
+        scalper_enabled = _env_bool("SCALPER_ENABLED", False)
+        scalper_mode_env = _env_str("SCALPER_MODE", "")
 
-        # Legacy toggle (your current file uses DAYTRADER_ENABLED)
-        legacy_enabled = os.getenv("DAYTRADER_ENABLED", "false").strip().lower() == "true"
-
+        legacy_enabled = _env_bool("DAYTRADER_ENABLED", False)
         enabled = bool(scalper_enabled or legacy_enabled)
 
         if scalper_mode_env:
             mode = scalper_mode_env.strip().upper()
         else:
-            # Backcompat: legacy enabled implies TRADE unless user specifies otherwise
             mode = "TRADE" if legacy_enabled else ("PAPER" if enabled else "OFF")
 
         if mode not in ("OFF", "PAPER", "TRADE"):
             mode = "PAPER" if enabled else "OFF"
 
-        timeframe_sec = _env_int("SCALPER_TIMEFRAME_SEC", os.getenv("TIMEFRAME_SEC", "60"))
-        lookback = _env_int("SCALPER_LOOKBACK", os.getenv("DAYTRADER_LOOKBACK", "600"))
+        timeframe_sec = _env_int("SCALPER_TIMEFRAME_SEC", _env_int("TIMEFRAME_SEC", 60))
+        lookback = _env_int("SCALPER_LOOKBACK", _env_int("DAYTRADER_LOOKBACK", 600))
 
-        alpha_min = _env_float("SCALPER_ALPHA_MIN", os.getenv("DAYTRADER_ALPHA_SCORE_MIN", "0.60"))
-        rsi_bull = _env_float(
-            "SCALPER_RSI_BULL", os.getenv("DAYTRADER_ALPHA_CONFIRM_RSIBULL", "55")
-        )
+        alpha_min = _env_float("SCALPER_ALPHA_MIN", _env_float("DAYTRADER_ALPHA_SCORE_MIN", 0.60))
+        rsi_bull = _env_float("SCALPER_RSI_BULL", _env_float("DAYTRADER_ALPHA_CONFIRM_RSIBULL", 55))
+
         stop_atr_mult = _env_float(
-            "SCALPER_STOP_ATR_MULT", os.getenv("DAYTRADER_STOP_ATR_MULT", "1.5")
+            "SCALPER_STOP_ATR_MULT", _env_float("DAYTRADER_STOP_ATR_MULT", 1.5)
         )
-        tp_atr_mult = _env_float("SCALPER_TP_ATR_MULT", os.getenv("DAYTRADER_TP_ATR_MULT", "3.0"))
+        tp_atr_mult = _env_float("SCALPER_TP_ATR_MULT", _env_float("DAYTRADER_TP_ATR_MULT", 3.0))
 
-        use_trailing = _env_bool("SCALPER_USE_TRAIL", "1")
-        trail_atr_mult = _env_float("SCALPER_TRAIL_ATR_MULT", "1.25")
-        max_hold_min = _env_int("SCALPER_MAX_HOLD_MIN", "180")
+        use_trailing = _env_bool("SCALPER_USE_TRAIL", True)
+        trail_atr_mult = _env_float("SCALPER_TRAIL_ATR_MULT", 1.25)
+        max_hold_min = _env_int("SCALPER_MAX_HOLD_MIN", 180)
 
         risk_per_trade = _env_float(
-            "SCALPER_RISK_PER_TRADE", os.getenv("DAYTRADER_RISK_PER_TRADE", "0.005")
+            "SCALPER_RISK_PER_TRADE", _env_float("DAYTRADER_RISK_PER_TRADE", 0.005)
         )
-        min_trade_usd = _env_float("SCALPER_MIN_TRADE_USD", "10")
-        max_trade_usd = _env_float("SCALPER_MAX_TRADE_USD", "250")
-        min_sol_fee_reserve = _env_float("SCALPER_MIN_SOL_FEE_RESERVE", "0.03")
+        min_trade_usd = _env_float("SCALPER_MIN_TRADE_USD", 10.0)
+        max_trade_usd = _env_float("SCALPER_MAX_TRADE_USD", 250.0)
+        min_sol_fee_reserve = _env_float("SCALPER_MIN_SOL_FEE_RESERVE", 0.03)
 
-        max_trades_per_day = _env_int("SCALPER_MAX_TRADES_PER_DAY", "8")
-        cooldown_sec = _env_int("SCALPER_COOLDOWN_SEC", os.getenv("DAYTRADER_COOLDOWN_SEC", "60"))
+        max_trades_per_day = _env_int("SCALPER_MAX_TRADES_PER_DAY", 8)
+        cooldown_sec = _env_int("SCALPER_COOLDOWN_SEC", _env_int("DAYTRADER_COOLDOWN_SEC", 60))
 
         max_daily_loss_pct = _env_float(
-            "SCALPER_MAX_DAILY_LOSS_PCT", os.getenv("DAYTRADER_MAX_DRAWDOWN_PCT", "0.07")
+            "SCALPER_MAX_DAILY_LOSS_PCT", _env_float("DAYTRADER_MAX_DRAWDOWN_PCT", 0.07)
         )
-        max_daily_dd_pct = _env_float("SCALPER_MAX_DAILY_DD_PCT", "0.10")
+        max_daily_dd_pct = _env_float("SCALPER_MAX_DAILY_DD_PCT", 0.10)
 
-        slippage = _env_float("JUPITER_MAX_SLIPPAGE", os.getenv("JUPITER_SLIPPAGE", "0.005"))
+        slippage = _env_float("JUPITER_MAX_SLIPPAGE", _env_float("JUPITER_SLIPPAGE", 0.005))
 
-        telegram_on_start = _env_bool("SCALPER_TELEGRAM_ON_START", "1")
-        telegram_on_trade = _env_bool("SCALPER_TELEGRAM_ON_TRADE", "1")
-        telegram_on_paper = _env_bool("SCALPER_TELEGRAM_ON_PAPER", "0")
+        telegram_on_start = _env_bool("SCALPER_TELEGRAM_ON_START", True)
+        telegram_on_trade = _env_bool("SCALPER_TELEGRAM_ON_TRADE", True)
+        telegram_on_paper = _env_bool("SCALPER_TELEGRAM_ON_PAPER", False)
 
-        day = _utc_day()
-        state_key = os.getenv("SCALPER_STATE_KEY", "scalper:state")
-        pnl_key = os.getenv("SCALPER_PNL_KEY", f"scalper:pnl_usd:{day}")
-        dd_key = os.getenv("SCALPER_DD_KEY", f"scalper:dd_pct:{day}")
-        trades_key = os.getenv("SCALPER_TRADES_KEY", f"scalper:trades:{day}")
-        cooldown_key = os.getenv("SCALPER_COOLDOWN_KEY", "scalper:cooldown_until")
+        state_key = _env_str("SCALPER_STATE_KEY", "scalper:state")
+        cooldown_key = _env_str("SCALPER_COOLDOWN_KEY", "scalper:cooldown_until")
+
+        pnl_key_prefix = _env_str("SCALPER_PNL_KEY_PREFIX", "scalper:pnl_usd")
+        dd_key_prefix = _env_str("SCALPER_DD_KEY_PREFIX", "scalper:dd_pct")
+        trades_key_prefix = _env_str("SCALPER_TRADES_KEY_PREFIX", "scalper:trades")
 
         return ScalperConfig(
-            enabled=enabled,
+            enabled=bool(enabled),
             mode=mode,
-            timeframe_sec=max(5, timeframe_sec),
-            lookback=max(60, lookback),
-            alpha_min=float(alpha_min),
-            rsi_bull=float(rsi_bull),
-            stop_atr_mult=float(stop_atr_mult),
-            tp_atr_mult=float(tp_atr_mult),
+            timeframe_sec=max(5, int(timeframe_sec)),
+            lookback=max(60, int(lookback)),
+            alpha_min=float(_clamp(float(alpha_min), 0.0, 1.0)),
+            rsi_bull=float(_clamp(float(rsi_bull), 1.0, 99.0)),
+            stop_atr_mult=float(_clamp(float(stop_atr_mult), 0.1, 25.0)),
+            tp_atr_mult=float(_clamp(float(tp_atr_mult), 0.1, 50.0)),
             use_trailing=bool(use_trailing),
-            trail_atr_mult=float(trail_atr_mult),
+            trail_atr_mult=float(_clamp(float(trail_atr_mult), 0.1, 25.0)),
             max_hold_min=max(5, int(max_hold_min)),
-            risk_per_trade=max(0.0005, float(risk_per_trade)),
+            risk_per_trade=float(_clamp(float(risk_per_trade), 0.0001, 0.25)),
             min_trade_usd=max(1.0, float(min_trade_usd)),
             max_trade_usd=max(1.0, float(max_trade_usd)),
             min_sol_fee_reserve=max(0.0, float(min_sol_fee_reserve)),
             max_trades_per_day=max(1, int(max_trades_per_day)),
             cooldown_sec=max(0, int(cooldown_sec)),
-            max_daily_loss_pct=max(0.0, float(max_daily_loss_pct)),
-            max_daily_dd_pct=max(0.0, float(max_daily_dd_pct)),
-            slippage=max(0.0001, float(slippage)),
+            max_daily_loss_pct=float(_clamp(float(max_daily_loss_pct), 0.0, 1.0)),
+            max_daily_dd_pct=float(_clamp(float(max_daily_dd_pct), 0.0, 1.0)),
+            slippage=float(_clamp(float(slippage), 0.0001, 0.50)),
             telegram_on_start=bool(telegram_on_start),
             telegram_on_trade=bool(telegram_on_trade),
             telegram_on_paper=bool(telegram_on_paper),
             state_key=state_key,
-            pnl_key=pnl_key,
-            dd_key=dd_key,
-            trades_key=trades_key,
             cooldown_key=cooldown_key,
+            pnl_key_prefix=pnl_key_prefix,
+            dd_key_prefix=dd_key_prefix,
+            trades_key_prefix=trades_key_prefix,
         )
+
+    def daily_keys(self, day: str) -> tuple[str, str, str]:
+        pnl_key = f"{self.pnl_key_prefix}:{day}"
+        dd_key = f"{self.dd_key_prefix}:{day}"
+        trades_key = f"{self.trades_key_prefix}:{day}"
+        return pnl_key, dd_key, trades_key
 
 
 # -----------------------------------------------------------------------------
@@ -280,104 +460,200 @@ class ScalperConfig:
 # -----------------------------------------------------------------------------
 def ema(prev: float, price: float, period: int) -> float:
     k = 2.0 / (period + 1.0)
-    return price * k + prev * (1.0 - k) if prev else price
+    return (price * k + prev * (1.0 - k)) if prev else price
 
 
 def compute_rsi(prices: deque[float], period: int = 14) -> float:
     if len(prices) < period + 1:
         return 50.0
+    arr = list(prices)
     gains = 0.0
     losses = 0.0
-    # iterate over last `period` diffs
-    for i in range(len(prices) - period, len(prices)):
-        diff = prices[i] - prices[i - 1]  # type: ignore[index]
+    start = len(arr) - period
+    for idx in range(start, len(arr)):
+        diff = arr[idx] - arr[idx - 1]
         if diff > 0:
             gains += diff
         else:
             losses -= diff
-    rs = (gains / period) / max(1e-9, (losses / period))
+    avg_gain = gains / period
+    avg_loss = losses / period
+    rs = avg_gain / max(1e-9, avg_loss)
     return 100.0 - (100.0 / (1.0 + rs))
 
 
 def compute_atr_close_to_close(prices: deque[float], period: int = 14) -> float:
     if len(prices) < period + 1:
         return 0.0
-    trs = []
-    for i in range(len(prices) - period + 1, len(prices)):
-        trs.append(abs(prices[i] - prices[i - 1]))  # type: ignore[index]
-    return float(sum(trs) / max(1, len(trs)))
-
-
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+    arr = list(prices)
+    start = len(arr) - period
+    tr_sum = 0.0
+    count = 0
+    for idx in range(start, len(arr)):
+        tr_sum += abs(arr[idx] - arr[idx - 1])
+        count += 1
+    return float(tr_sum / max(1, count))
 
 
 # -----------------------------------------------------------------------------
-# Redis + telemetry
+# Redis + telemetry wrappers (async/sync compatible)
 # -----------------------------------------------------------------------------
-async def _redis() -> Any:
-    if get_redis_async is None:
+class _RedisCompat:
+    def __init__(self, client: Any):
+        self._r = client
+
+    async def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        if self._r is None:
+            return None
+        fn = getattr(self._r, method, None)
+        if fn is None:
+            return None
+        try:
+            return await _maybe_await(fn(*args, **kwargs))
+        except Exception:
+            return None
+
+    async def get(self, key: str) -> Any:
+        return await self.call("get", key)
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> Any:
+        if ex is None:
+            return await self.call("set", key, value)
+        return await self.call("set", key, value, ex=int(ex))
+
+    async def incr(self, key: str) -> int:
+        out = await self.call("incr", key)
+        with contextlib.suppress(Exception):
+            return int(out)
+        return 0
+
+    async def incrbyfloat(self, key: str, delta: float) -> float:
+        out = await self.call("incrbyfloat", key, float(delta))
+        with contextlib.suppress(Exception):
+            return float(out)
+        return 0.0
+
+    async def expire(self, key: str, seconds: int) -> None:
+        await self.call("expire", key, int(seconds))
+
+
+async def _redis() -> _RedisCompat | None:
+    fn = get_redis_async
+    if not callable(fn):
         return None
     try:
-        return await get_redis_async()
-    except Exception:
-        log.debug("get_redis_async failed", exc_info=True)
+        r = await _call_maybe_async(fn)
+        return _RedisCompat(r)
+    except Exception as e:
+        log.every("REDIS_GET_FAIL", n=30, msg="REDIS_GET_FAIL", err=_short(e))
         return None
+
+
+def _decode_if_bytes(v: Any) -> str:
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8", "ignore")
+    return str(v)
 
 
 async def _tg(msg: str) -> None:
-    if send_telegram is None:
-        log.info(f"[telegram disabled] {msg}")
+    fn = send_telegram
+    if not callable(fn):
+        log.info("[telegram disabled] %s", msg)
         return
-    try:
-        await send_telegram(msg)
-    except Exception:
-        log.debug("send_telegram failed", exc_info=True)
+    with contextlib.suppress(Exception):
+        await _call_maybe_async(fn, msg)
 
 
-async def _get_float(r: Any, key: str, default: float = 0.0) -> float:
+async def _get_float(r: _RedisCompat | None, key: str, default: float = 0.0) -> float:
     if r is None:
         return default
-    try:
-        v = await r.get(key)
-        return float(v) if v is not None else default
-    except Exception:
+    v = await r.get(key)
+    if v is None or v == "":
         return default
+    s = _decode_if_bytes(v).strip()
+    with contextlib.suppress(Exception):
+        return float(s)
+    return default
 
 
-async def _set_float(r: Any, key: str, value: float, ex_sec: int | None = None) -> None:
+async def _set_float(
+    r: _RedisCompat | None, key: str, value: float, ex_sec: int | None = None
+) -> None:
     if r is None:
         return
-    try:
-        if ex_sec is not None:
-            await r.set(key, str(float(value)), ex=ex_sec)
-        else:
-            await r.set(key, str(float(value)))
-    except Exception:
-        pass
+    await r.set(key, str(float(value)), ex=ex_sec)
 
 
-async def _incr_float(r: Any, key: str, delta: float) -> float:
+async def _incr_float(r: _RedisCompat | None, key: str, delta: float) -> float:
     if r is None:
         return 0.0
-    try:
-        v = await r.incrbyfloat(key, float(delta))
-        return float(v)
-    except Exception:
-        return 0.0
+    out = await r.incrbyfloat(key, float(delta))
+    return float(out)
 
 
 # -----------------------------------------------------------------------------
 # Wallet / balances (SOL + USDC)
 # -----------------------------------------------------------------------------
+def _wallet_pubkey() -> str:
+    return _env_str("WALLET_PUBKEY", "") or _env_str("WALLET_ADDRESS", "")
+
+
 async def _sol_usd() -> float:
-    if convert_sol_to_usd is None:
+    """
+    Best-effort SOL->USD price for 1 SOL.
+
+    We intentionally treat convert_sol_to_usd as a flex-signature function:
+    - Some implementations want convert_sol_to_usd(1.0)
+    - Others accept no args and return the spot price
+    """
+    fn = convert_sol_to_usd
+    if not callable(fn):
         return 0.0
+
+    # Try preferred (amount=1.0) first
     try:
-        v = await convert_sol_to_usd(1.0)
-        return float(v or 0.0)
+        out = await _call_maybe_async(fn, 1.0)
+        return float(out or 0.0)
+    except TypeError:
+        pass
     except Exception:
         return 0.0
+
+    # Try no-arg variant
+    try:
+        out2 = await _call_maybe_async(fn)
+        return float(out2 or 0.0)
+    except Exception:
+        return 0.0
+
+
+async def _get_wallet_tokens_safe(wallet: str) -> list[dict[str, Any]]:
+    fn = get_wallet_tokens
+    if not callable(fn):
+        return []
+
+    def _only_dicts(raw: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for item in raw:
+            if isinstance(item, dict):
+                out.append(cast(dict[str, Any], item))
+        return out
+
+    try:
+        raw = await _call_maybe_async(fn, wallet)
+        return _only_dicts(raw)
+    except TypeError:
+        pass
+    except Exception:
+        return []
+
+    try:
+        raw2 = await _call_maybe_async(fn)
+        return _only_dicts(raw2)
+    except Exception:
+        return []
 
 
 async def _balances() -> tuple[float, float]:
@@ -385,28 +661,28 @@ async def _balances() -> tuple[float, float]:
     Returns (sol_balance, usdc_balance).
     Uses get_wallet_tokens if available; otherwise returns (0,0).
     """
-    if get_wallet_tokens is None:
-        return 0.0, 0.0
-    wallet = os.getenv("WALLET_PUBKEY", "").strip() or os.getenv("WALLET_ADDRESS", "").strip()
+    wallet = _wallet_pubkey()
     if not wallet:
         return 0.0, 0.0
-    try:
-        toks = await get_wallet_tokens(wallet)
-    except Exception:
-        return 0.0, 0.0
+
+    toks = await _get_wallet_tokens_safe(wallet)
 
     sol_bal = 0.0
     usdc_bal = 0.0
-    for t in toks or []:
-        mint = (t.get("mint") or "").strip()
-        bal = float(t.get("balance", 0.0) or 0.0)
-        if bal <= 0:
+    for t in toks:
+        mint = str(t.get("mint") or "").strip()
+        try:
+            bal = float(t.get("balance") or 0.0)
+        except Exception:
+            bal = 0.0
+        if bal <= 0.0:
             continue
         if mint == SOL_MINT:
             sol_bal += bal
         elif mint == USDC_MINT:
             usdc_bal += bal
-    return sol_bal, usdc_bal
+
+    return float(sol_bal), float(usdc_bal)
 
 
 async def _equity_usd(sol_usd: float) -> float:
@@ -415,63 +691,84 @@ async def _equity_usd(sol_usd: float) -> float:
 
 
 # -----------------------------------------------------------------------------
-# Trade execution (USDC <-> SOL)
+# Trade execution (USDC <-> SOL) (compat signatures)
 # -----------------------------------------------------------------------------
 async def _buy_sol(usdc_to_spend: float, cfg: ScalperConfig) -> tuple[bool, str]:
-    if swap_token_jupiter is None:
+    fn = swap_token_jupiter
+    if not callable(fn) or usdc_to_spend <= 0.0:
         return False, ""
-    if usdc_to_spend <= 0:
-        return False, ""
+
+    # Preferred keyword form first (Jupiter v6-like)
     try:
-        # Support multiple historical signatures
-        try:
-            ok, sig = await swap_token_jupiter(
-                USDC_MINT,
-                SOL_MINT,
-                amount_float=float(usdc_to_spend),
-                buy=True,
-                slippage=float(cfg.slippage),
-            )
-            return bool(ok), str(sig or "")
-        except TypeError:
-            ok, sig = await swap_token_jupiter(
-                USDC_MINT, SOL_MINT, float(usdc_to_spend), True, float(cfg.slippage)
-            )
-            return bool(ok), str(sig or "")
-    except Exception:
-        log.exception("swap buy failed")
+        out = await _call_maybe_async(
+            fn,
+            USDC_MINT,
+            SOL_MINT,
+            amount_float=float(usdc_to_spend),
+            buy=True,
+            slippage=float(cfg.slippage),
+        )
+        if isinstance(out, tuple) and len(out) >= 2:
+            return bool(out[0]), str(out[1] or "")
+        return bool(out), ""
+    except TypeError:
+        pass
+    except Exception as e:
+        log.every("SWAP_BUY_FAIL", n=10, msg="SWAP_BUY_FAIL", err=_short(e))
+        return False, ""
+
+    # Positional fallback
+    try:
+        out2 = await _call_maybe_async(
+            fn, USDC_MINT, SOL_MINT, float(usdc_to_spend), True, float(cfg.slippage)
+        )
+        if isinstance(out2, tuple) and len(out2) >= 2:
+            return bool(out2[0]), str(out2[1] or "")
+        return bool(out2), ""
+    except Exception as e:
+        log.every("SWAP_BUY_FAIL_2", n=10, msg="SWAP_BUY_FAIL_2", err=_short(e))
         return False, ""
 
 
 async def _sell_sol(sol_to_sell: float, cfg: ScalperConfig) -> tuple[bool, str]:
-    if swap_token_jupiter is None:
+    fn = swap_token_jupiter
+    if not callable(fn) or sol_to_sell <= 0.0:
         return False, ""
-    if sol_to_sell <= 0:
-        return False, ""
+
     try:
-        try:
-            ok, sig = await swap_token_jupiter(
-                SOL_MINT,
-                USDC_MINT,
-                amount_float=float(sol_to_sell),
-                buy=False,
-                slippage=float(cfg.slippage),
-            )
-            return bool(ok), str(sig or "")
-        except TypeError:
-            ok, sig = await swap_token_jupiter(
-                SOL_MINT, USDC_MINT, float(sol_to_sell), False, float(cfg.slippage)
-            )
-            return bool(ok), str(sig or "")
-    except Exception:
-        log.exception("swap sell failed")
+        out = await _call_maybe_async(
+            fn,
+            SOL_MINT,
+            USDC_MINT,
+            amount_float=float(sol_to_sell),
+            buy=False,
+            slippage=float(cfg.slippage),
+        )
+        if isinstance(out, tuple) and len(out) >= 2:
+            return bool(out[0]), str(out[1] or "")
+        return bool(out), ""
+    except TypeError:
+        pass
+    except Exception as e:
+        log.every("SWAP_SELL_FAIL", n=10, msg="SWAP_SELL_FAIL", err=_short(e))
+        return False, ""
+
+    try:
+        out2 = await _call_maybe_async(
+            fn, SOL_MINT, USDC_MINT, float(sol_to_sell), False, float(cfg.slippage)
+        )
+        if isinstance(out2, tuple) and len(out2) >= 2:
+            return bool(out2[0]), str(out2[1] or "")
+        return bool(out2), ""
+    except Exception as e:
+        log.every("SWAP_SELL_FAIL_2", n=10, msg="SWAP_SELL_FAIL_2", err=_short(e))
         return False, ""
 
 
 # -----------------------------------------------------------------------------
 # State model
 # -----------------------------------------------------------------------------
-@dataclass
+@dataclass(frozen=True, slots=True)
 class PositionState:
     pos: str  # "FLAT" | "LONG"
     entry_ts: float
@@ -480,124 +777,131 @@ class PositionState:
     entry_usd: float
     stop_px: float
     take_px: float
-    trail_px: float  # trailing stop level if enabled (0 if none)
+    trail_px: float
 
     @staticmethod
-    def flat() -> PositionState:
+    def flat() -> "PositionState":
         return PositionState("FLAT", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
-async def _load_state(r: Any, key: str) -> PositionState:
+def _pos_norm(p: str) -> str:
+    p2 = (p or "FLAT").strip().upper()
+    return p2 if p2 in ("FLAT", "LONG") else "FLAT"
+
+
+async def _load_state(r: _RedisCompat | None, key: str) -> PositionState:
     if r is None:
         return PositionState.flat()
+    raw = await r.get(key)
+    if not raw:
+        return PositionState.flat()
     try:
-        raw = await r.get(key)
-        if not raw:
+        s = _decode_if_bytes(raw)
+        obj = json.loads(s)
+        if not isinstance(obj, dict):
             return PositionState.flat()
-        obj = json.loads(raw)
         return PositionState(
-            pos=str(obj.get("pos", "FLAT")).upper(),
-            entry_ts=float(obj.get("entry_ts", 0.0)),
-            entry_px=float(obj.get("entry_px", 0.0)),
-            size_sol=float(obj.get("size_sol", 0.0)),
-            entry_usd=float(obj.get("entry_usd", 0.0)),
-            stop_px=float(obj.get("stop_px", 0.0)),
-            take_px=float(obj.get("take_px", 0.0)),
-            trail_px=float(obj.get("trail_px", 0.0)),
+            pos=_pos_norm(str(obj.get("pos", "FLAT"))),
+            entry_ts=float(obj.get("entry_ts", 0.0) or 0.0),
+            entry_px=float(obj.get("entry_px", 0.0) or 0.0),
+            size_sol=float(obj.get("size_sol", 0.0) or 0.0),
+            entry_usd=float(obj.get("entry_usd", 0.0) or 0.0),
+            stop_px=float(obj.get("stop_px", 0.0) or 0.0),
+            take_px=float(obj.get("take_px", 0.0) or 0.0),
+            trail_px=float(obj.get("trail_px", 0.0) or 0.0),
         )
     except Exception:
         return PositionState.flat()
 
 
-async def _save_state(r: Any, key: str, st: PositionState) -> None:
+async def _save_state(r: _RedisCompat | None, key: str, st: PositionState) -> None:
     if r is None:
         return
-    with contextlib.suppress(Exception):
-        await r.set(key, json.dumps(asdict(st), separators=(",", ":")))
+    payload = json.dumps(asdict(st), separators=(",", ":"), ensure_ascii=False)
+    await r.set(key, payload)
 
 
 # -----------------------------------------------------------------------------
 # Risk / breakers
 # -----------------------------------------------------------------------------
-async def _cooldown_active(r: Any, cfg: ScalperConfig) -> bool:
+async def _cooldown_active(r: _RedisCompat | None, cooldown_key: str) -> bool:
     if r is None:
         return False
+    until = await r.get(cooldown_key)
+    if not until:
+        return False
     try:
-        until = await r.get(cfg.cooldown_key)
-        if not until:
-            return False
-        return time.time() < float(until)
+        return time.time() < float(_decode_if_bytes(until))
     except Exception:
         return False
 
 
-async def _set_cooldown(r: Any, cfg: ScalperConfig) -> None:
-    if r is None or cfg.cooldown_sec <= 0:
+async def _set_cooldown(r: _RedisCompat | None, cooldown_key: str, cooldown_sec: int) -> None:
+    if r is None or cooldown_sec <= 0:
         return
+    until = time.time() + float(cooldown_sec)
+    await r.set(cooldown_key, str(until), ex=max(cooldown_sec + 10, 20))
+
+
+async def _trade_count(r: _RedisCompat | None, trades_key: str) -> int:
+    if r is None:
+        return 0
+    v = await r.get(trades_key)
+    if v is None:
+        return 0
+    s = _decode_if_bytes(v).strip()
     with contextlib.suppress(Exception):
-        await r.set(
-            cfg.cooldown_key, str(time.time() + cfg.cooldown_sec), ex=max(cfg.cooldown_sec + 5, 10)
-        )
+        return int(s)
+    return 0
 
 
-async def _trade_count(r: Any, cfg: ScalperConfig) -> int:
+async def _inc_trade_count(r: _RedisCompat | None, trades_key: str) -> int:
     if r is None:
         return 0
-    try:
-        v = await r.get(cfg.trades_key)
-        return int(v) if v is not None else 0
-    except Exception:
-        return 0
+    v = await r.incr(trades_key)
+    await r.expire(trades_key, 172800)
+    return int(v)
 
 
-async def _inc_trade_count(r: Any, cfg: ScalperConfig) -> int:
-    if r is None:
-        return 0
-    try:
-        v = await r.incr(cfg.trades_key)
-        # expire daily keys after ~2 days
-        await r.expire(cfg.trades_key, 172800)
-        return int(v)
-    except Exception:
-        return 0
+async def _update_dd(r: _RedisCompat | None, dd_key: str, pnl_key: str, equity_usd: float) -> None:
+    if r is None or equity_usd <= 0.0:
+        return
+    pnl = await _get_float(r, pnl_key, 0.0)
+    dd = abs(min(0.0, pnl)) / max(1e-9, equity_usd)
+    dd = float(_clamp(dd, 0.0, 1.0))
+    await _set_float(r, dd_key, dd, ex_sec=172800)
 
 
-async def _breaker_ok(r: Any, cfg: ScalperConfig, equity_usd: float) -> bool:
-    """
-    Breakers use realized pnl approximations (USDC delta from trades is not directly tracked),
-    so we track pnl from price * size using entry/exit prices.
-    """
-    pnl = await _get_float(r, cfg.pnl_key, 0.0)
-    dd = await _get_float(r, cfg.dd_key, 0.0)
+async def _breaker_ok(
+    r: _RedisCompat | None,
+    cfg: ScalperConfig,
+    equity_usd: float,
+    pnl_key: str,
+    dd_key: str,
+    trades_key: str,
+) -> bool:
+    pnl = await _get_float(r, pnl_key, 0.0)
+    dd = await _get_float(r, dd_key, 0.0)
 
-    # Daily loss breaker (pnl below -loss% of equity)
-    if cfg.max_daily_loss_pct > 0 and equity_usd > 0:
+    if cfg.max_daily_loss_pct > 0.0 and equity_usd > 0.0:
         if pnl <= -abs(cfg.max_daily_loss_pct) * equity_usd:
             return False
 
-    # DD breaker (max_dd_pct stored)
-    if cfg.max_daily_dd_pct > 0 and dd >= abs(cfg.max_daily_dd_pct):
+    if cfg.max_daily_dd_pct > 0.0:
+        if dd >= abs(cfg.max_daily_dd_pct):
+            return False
+
+    trades = await _trade_count(r, trades_key)
+    if trades >= cfg.max_trades_per_day:
         return False
 
-    # Trade count breaker
-    trades = await _trade_count(r, cfg)
-    return not trades >= cfg.max_trades_per_day
-
-
-async def _update_dd(r: Any, cfg: ScalperConfig, equity_usd: float) -> None:
-    if r is None or equity_usd <= 0:
-        return
-    pnl = await _get_float(r, cfg.pnl_key, 0.0)
-    # DD approximation: if pnl negative, dd = |pnl|/equity (bounded)
-    dd = abs(min(0.0, pnl)) / max(1e-9, equity_usd)
-    dd = float(_clamp(dd, 0.0, 1.0))
-    await _set_float(r, cfg.dd_key, dd, ex_sec=172800)
+    return True
 
 
 # -----------------------------------------------------------------------------
 # Alpha / signals
 # -----------------------------------------------------------------------------
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Signals:
     alpha: float
     ema12: float
@@ -608,19 +912,11 @@ class Signals:
 
 
 def _compute_alpha(
-    sol_usd: float, ema12_v: float, ema26_v: float, ema200_v: float, rsi_v: float
+    px: float, ema12_v: float, ema26_v: float, ema200_v: float, rsi_v: float
 ) -> float:
-    """
-    Bounded [0..1] alpha composite:
-      - trend: ema12 > ema26
-      - regime: price > ema200
-      - confirmation: rsi >= threshold (bullish)
-    """
     a = 0.0
-    if ema26_v:
-        a += 0.42 * (1.0 if ema12_v > ema26_v else 0.0)
-    if ema200_v:
-        a += 0.33 * (1.0 if sol_usd > ema200_v else 0.0)
+    a += 0.42 * (1.0 if ema12_v > ema26_v else 0.0)
+    a += 0.33 * (1.0 if (ema200_v > 0.0 and px > ema200_v) else 0.0)
     a += 0.25 * (1.0 if rsi_v >= 50.0 else 0.0)
     return float(_clamp(a, 0.0, 1.0))
 
@@ -630,10 +926,12 @@ def _compute_alpha(
 # -----------------------------------------------------------------------------
 async def run_scalper(stop_event: asyncio.Event) -> None:
     cfg = ScalperConfig.from_env()
-
-    if not cfg.enabled or cfg.mode == "OFF":
+    if (not cfg.enabled) or cfg.mode == "OFF":
         log.info("scalper disabled (SCALPER_ENABLED=0 or mode=OFF).")
         return
+
+    day = _utc_day()
+    pnl_key, dd_key, trades_key = cfg.daily_keys(day)
 
     if cfg.telegram_on_start:
         await _tg(
@@ -654,53 +952,64 @@ async def run_scalper(stop_event: asyncio.Event) -> None:
     ema26_v = 0.0
     ema200_v = 0.0
 
-    # If we restart with an open position, we keep managing it.
     if st.pos == "LONG":
         log.warning(
-            "Recovered LONG position from Redis: size_sol=%.6f entry_px=%.4f stop=%.4f take=%.4f",
+            "Recovered LONG from state: size_sol=%.6f entry_px=%.4f stop=%.4f take=%.4f trail=%.4f",
             st.size_sol,
             st.entry_px,
             st.stop_px,
             st.take_px,
+            st.trail_px,
         )
 
     last_heartbeat = 0.0
 
     while not stop_event.is_set():
-        time.time()
         try:
-            sol_usd = await _sol_usd()
-            if sol_usd <= 0:
-                await asyncio.sleep(cfg.timeframe_sec)
+            new_day = _utc_day()
+            if new_day != day:
+                day = new_day
+                pnl_key, dd_key, trades_key = cfg.daily_keys(day)
+                log.event("SCALPER_DAY_ROLLOVER", day=day, pnl_key=pnl_key, trades_key=trades_key)
+
+            px = await _sol_usd()
+            if px <= 0.0:
+                if await _sleep_or_stop(stop_event, float(cfg.timeframe_sec)):
+                    break
                 continue
 
-            prices.append(sol_usd)
-            ema12_v = ema(ema12_v, sol_usd, 12)
-            ema26_v = ema(ema26_v, sol_usd, 26)
+            prices.append(px)
+            ema12_v = ema(ema12_v, px, 12)
+            ema26_v = ema(ema26_v, px, 26)
             if len(prices) >= 200:
-                ema200_v = ema(ema200_v, sol_usd, 200)
+                ema200_v = ema(ema200_v, px, 200)
+
             rsi_v = compute_rsi(prices, 14)
             atr_v = compute_atr_close_to_close(prices, 14)
+            alpha = _compute_alpha(px, ema12_v, ema26_v, ema200_v, rsi_v)
 
-            alpha = _compute_alpha(sol_usd, ema12_v, ema26_v, ema200_v, rsi_v)
             sigs = Signals(
                 alpha=alpha, ema12=ema12_v, ema26=ema26_v, ema200=ema200_v, rsi=rsi_v, atr=atr_v
             )
 
-            # Heartbeat every ~5 minutes
+            equity = await _equity_usd(px)
+            await _update_dd(r, dd_key, pnl_key, equity)
+
+            breakers_ok = await _breaker_ok(r, cfg, equity, pnl_key, dd_key, trades_key)
+            cooldown_on = await _cooldown_active(r, cfg.cooldown_key)
+
             if time.time() - last_heartbeat >= 300:
-                eq = await _equity_usd(sol_usd)
-                pnl = await _get_float(r, cfg.pnl_key, 0.0)
-                dd = await _get_float(r, cfg.dd_key, 0.0)
-                trades = await _trade_count(r, cfg)
+                pnl = await _get_float(r, pnl_key, 0.0)
+                dd = await _get_float(r, dd_key, 0.0)
+                trades = await _trade_count(r, trades_key)
                 log.info(
                     "[hb] px=%.2f alpha=%.2f rsi=%.1f atr=%.4f pos=%s eq=$%.2f pnl=$%.2f dd=%.3f trades=%d mode=%s",
-                    sol_usd,
+                    px,
                     sigs.alpha,
                     sigs.rsi,
                     sigs.atr,
                     st.pos,
-                    eq,
+                    equity,
                     pnl,
                     dd,
                     trades,
@@ -708,239 +1017,202 @@ async def run_scalper(stop_event: asyncio.Event) -> None:
                 )
                 last_heartbeat = time.time()
 
-            # Breakers check (only impacts NEW entries)
-            equity = await _equity_usd(sol_usd)
-            await _update_dd(r, cfg, equity)
-
-            breakers_ok = await _breaker_ok(r, cfg, equity)
-            cooldown_on = await _cooldown_active(r, cfg)
-
             # --------------------
             # Position management
             # --------------------
             if st.pos == "LONG":
-                # Update trailing stop if enabled
-                if cfg.use_trailing and sigs.atr > 0:
-                    new_trail = sol_usd - cfg.trail_atr_mult * sigs.atr
-                    if st.trail_px <= 0:
-                        st = PositionState(
-                            pos="LONG",
-                            entry_ts=st.entry_ts,
-                            entry_px=st.entry_px,
-                            size_sol=st.size_sol,
-                            entry_usd=st.entry_usd,
-                            stop_px=st.stop_px,
-                            take_px=st.take_px,
-                            trail_px=new_trail,
-                        )
-                    else:
-                        st = PositionState(
-                            pos="LONG",
-                            entry_ts=st.entry_ts,
-                            entry_px=st.entry_px,
-                            size_sol=st.size_sol,
-                            entry_usd=st.entry_usd,
-                            stop_px=st.stop_px,
-                            take_px=st.take_px,
-                            trail_px=max(st.trail_px, new_trail),
-                        )
+                trail_px = st.trail_px
+                if cfg.use_trailing and sigs.atr > 0.0:
+                    new_trail = px - (cfg.trail_atr_mult * sigs.atr)
+                    trail_px = max(trail_px, new_trail) if trail_px > 0.0 else new_trail
 
-                # Effective stop is max(original_stop, trailing_stop)
-                eff_stop = max(st.stop_px, st.trail_px) if st.trail_px > 0 else st.stop_px
-                eff_take = st.take_px
-
-                held_min = (time.time() - st.entry_ts) / 60.0 if st.entry_ts > 0 else 0.0
+                eff_stop = max(st.stop_px, trail_px) if trail_px > 0.0 else st.stop_px
+                held_min = (time.time() - st.entry_ts) / 60.0 if st.entry_ts > 0.0 else 0.0
 
                 exit_reason = ""
-                if eff_stop > 0 and sol_usd <= eff_stop:
+                if eff_stop > 0.0 and px <= eff_stop:
                     exit_reason = "STOP"
-                elif eff_take > 0 and sol_usd >= eff_take:
+                elif st.take_px > 0.0 and px >= st.take_px:
                     exit_reason = "TAKE"
-                elif cfg.max_hold_min > 0 and held_min >= cfg.max_hold_min:
+                elif cfg.max_hold_min > 0 and held_min >= float(cfg.max_hold_min):
                     exit_reason = "TIME"
-                # Optional: alpha flips bearish while in position (soft exit)
                 elif sigs.alpha < 0.25 and sigs.rsi < 45.0:
                     exit_reason = "ALPHA_FLIP"
 
                 if exit_reason:
-                    # Execute exit
+                    pnl_usd = (px - st.entry_px) * st.size_sol
+
                     if cfg.mode == "PAPER":
-                        pnl_usd = (sol_usd - st.entry_px) * st.size_sol
-                        await _incr_float(r, cfg.pnl_key, pnl_usd)
-                        await _update_dd(r, cfg, equity)
+                        await _incr_float(r, pnl_key, pnl_usd)
+                        await _update_dd(r, dd_key, pnl_key, equity)
                         if cfg.telegram_on_paper:
                             await _tg(
                                 f"🧾 PAPER EXIT ({exit_reason})\n"
-                                f"• px={sol_usd:.2f} entry={st.entry_px:.2f} size={st.size_sol:.6f} pnl=${pnl_usd:+.2f}"
+                                f"• px={px:.2f} entry={st.entry_px:.2f} size={st.size_sol:.6f} pnl=${pnl_usd:+.2f}"
                             )
                         log.info("[PAPER EXIT] %s pnl=$%.2f", exit_reason, pnl_usd)
                         st = PositionState.flat()
                         await _save_state(r, cfg.state_key, st)
-                        await _set_cooldown(r, cfg)
+                        await _set_cooldown(r, cfg.cooldown_key, cfg.cooldown_sec)
                     else:
                         ok, sig = await _sell_sol(st.size_sol, cfg)
                         if ok:
-                            pnl_usd = (sol_usd - st.entry_px) * st.size_sol
-                            await _incr_float(r, cfg.pnl_key, pnl_usd)
-                            await _update_dd(r, cfg, equity)
+                            await _incr_float(r, pnl_key, pnl_usd)
+                            await _update_dd(r, dd_key, pnl_key, equity)
                             if cfg.telegram_on_trade:
                                 await _tg(
                                     f"✅ EXIT ({exit_reason})\n"
-                                    f"• px={sol_usd:.2f} entry={st.entry_px:.2f} size={st.size_sol:.6f}\n"
+                                    f"• px={px:.2f} entry={st.entry_px:.2f} size={st.size_sol:.6f}\n"
                                     f"• pnl=${pnl_usd:+.2f} • tx={sig}"
                                 )
                             log.info("[EXIT] %s pnl=$%.2f tx=%s", exit_reason, pnl_usd, sig)
                             st = PositionState.flat()
                             await _save_state(r, cfg.state_key, st)
-                            await _set_cooldown(r, cfg)
+                            await _set_cooldown(r, cfg.cooldown_key, cfg.cooldown_sec)
                         else:
-                            # Don’t flip state; retry next bar.
                             log.warning(
                                 "Exit attempt failed (%s). Will retry next bar.", exit_reason
                             )
                             if cfg.telegram_on_trade:
                                 await _tg(f"⚠️ EXIT failed ({exit_reason}) — will retry next bar.")
+                else:
+                    if trail_px != st.trail_px:
+                        st = PositionState(
+                            pos="LONG",
+                            entry_ts=st.entry_ts,
+                            entry_px=st.entry_px,
+                            size_sol=st.size_sol,
+                            entry_usd=st.entry_usd,
+                            stop_px=st.stop_px,
+                            take_px=st.take_px,
+                            trail_px=float(trail_px),
+                        )
+                        await _save_state(r, cfg.state_key, st)
 
             # --------------------
             # Entry logic
             # --------------------
             if st.pos == "FLAT":
-                if not breakers_ok:
-                    await asyncio.sleep(cfg.timeframe_sec)
-                    continue
-                if cooldown_on:
-                    await asyncio.sleep(cfg.timeframe_sec)
-                    continue
-                if len(prices) < 200:
-                    await asyncio.sleep(cfg.timeframe_sec)
+                if (not breakers_ok) or cooldown_on or (len(prices) < 200) or (sigs.atr <= 0.0):
+                    sleep_for = float(cfg.timeframe_sec) + random.uniform(0.0, 0.7)
+                    if await _sleep_or_stop(stop_event, sleep_for):
+                        break
                     continue
 
-                # Strong trend filter
-                trend_ok = (ema12_v > ema26_v) and (sol_usd > ema200_v)
+                trend_ok = (ema12_v > ema26_v) and (ema200_v > 0.0 and px > ema200_v)
                 confirm_ok = sigs.rsi >= cfg.rsi_bull
                 score_ok = sigs.alpha >= cfg.alpha_min
 
                 if trend_ok and confirm_ok and score_ok:
-                    # Risk sizing using ATR stop distance (USD)
-                    if sigs.atr <= 0:
-                        await asyncio.sleep(cfg.timeframe_sec)
-                        continue
+                    stop_px = px - (cfg.stop_atr_mult * sigs.atr)
+                    take_px = px + (cfg.tp_atr_mult * sigs.atr)
 
-                    stop_dist = cfg.stop_atr_mult * sigs.atr
-                    stop_px = sol_usd - stop_dist
-                    take_px = sol_usd + cfg.tp_atr_mult * sigs.atr
-
-                    # Determine allowed USD spend
                     sol_bal, usdc_bal = await _balances()
-                    # keep SOL reserve for fees
-                    # (if we hold SOL already, we still keep reserve)
+
                     if sol_bal < cfg.min_sol_fee_reserve:
-                        # If you have insufficient SOL for fees, scalper trading is risky.
                         log.warning(
                             "SOL fee reserve low (sol=%.4f < %.4f). Skipping entry.",
                             sol_bal,
                             cfg.min_sol_fee_reserve,
                         )
-                        await asyncio.sleep(cfg.timeframe_sec)
-                        continue
-
-                    if usdc_bal < cfg.min_trade_usd:
-                        await asyncio.sleep(cfg.timeframe_sec)
-                        continue
-
-                    # USD risk budget
-                    usd_risk = max(cfg.min_trade_usd, equity * cfg.risk_per_trade)
-                    usd_to_use = _clamp(usd_risk, cfg.min_trade_usd, cfg.max_trade_usd)
-                    usd_to_use = min(usd_to_use, usdc_bal)
-
-                    if usd_to_use < cfg.min_trade_usd:
-                        await asyncio.sleep(cfg.timeframe_sec)
-                        continue
-
-                    # Convert size from USD to SOL (approx)
-                    size_sol = float(usd_to_use / max(1e-9, sol_usd))
-
-                    # Book trade
-                    if cfg.mode == "PAPER":
-                        st = PositionState(
-                            pos="LONG",
-                            entry_ts=time.time(),
-                            entry_px=float(sol_usd),
-                            size_sol=float(size_sol),
-                            entry_usd=float(usd_to_use),
-                            stop_px=float(stop_px),
-                            take_px=float(take_px),
-                            trail_px=0.0,
-                        )
-                        await _save_state(r, cfg.state_key, st)
-                        await _inc_trade_count(r, cfg)
-                        if cfg.telegram_on_paper:
-                            await _tg(
-                                "🧾 PAPER ENTRY\n"
-                                f"• px={sol_usd:.2f} size≈{size_sol:.6f} SOL spend≈${usd_to_use:.2f}\n"
-                                f"• stop={stop_px:.2f} take={take_px:.2f} alpha={sigs.alpha:.2f} rsi={sigs.rsi:.1f}"
-                            )
-                        log.info(
-                            "[PAPER ENTRY] px=%.2f size=%.6f stop=%.2f take=%.2f",
-                            sol_usd,
-                            size_sol,
-                            stop_px,
-                            take_px,
-                        )
-                        await _set_cooldown(r, cfg)
-
                     else:
-                        ok, sig = await _buy_sol(usd_to_use, cfg)
-                        if ok:
-                            st = PositionState(
-                                pos="LONG",
-                                entry_ts=time.time(),
-                                entry_px=float(sol_usd),
-                                size_sol=float(size_sol),
-                                entry_usd=float(usd_to_use),
-                                stop_px=float(stop_px),
-                                take_px=float(take_px),
-                                trail_px=0.0,
-                            )
-                            await _save_state(r, cfg.state_key, st)
-                            await _inc_trade_count(r, cfg)
-                            if cfg.telegram_on_trade:
-                                await _tg(
-                                    "🟢 ENTRY (scalper)\n"
-                                    f"• px={sol_usd:.2f} spend=${usd_to_use:.2f} size≈{size_sol:.6f} SOL\n"
-                                    f"• stop={stop_px:.2f} take={take_px:.2f} alpha={sigs.alpha:.2f} rsi={sigs.rsi:.1f}\n"
-                                    f"• tx={sig}"
-                                )
-                            log.info("[ENTRY] px=%.2f spend=$%.2f tx=%s", sol_usd, usd_to_use, sig)
-                            await _set_cooldown(r, cfg)
-                        else:
-                            log.warning("Entry swap failed; will retry if setup persists.")
-                            if cfg.telegram_on_trade:
-                                await _tg("⚠️ ENTRY failed (swap) — will retry if setup persists.")
+                        if usdc_bal >= cfg.min_trade_usd:
+                            usd_risk = max(cfg.min_trade_usd, equity * cfg.risk_per_trade)
+                            usd_to_use = _clamp(usd_risk, cfg.min_trade_usd, cfg.max_trade_usd)
+                            usd_to_use = min(usd_to_use, usdc_bal)
 
-            # sleep with small jitter to avoid sync
-            sleep_for = float(cfg.timeframe_sec) + random.uniform(0.0, 0.7)
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
+                            if usd_to_use >= cfg.min_trade_usd:
+                                size_sol = float(usd_to_use / max(1e-9, px))
+
+                                if cfg.mode == "PAPER":
+                                    st = PositionState(
+                                        pos="LONG",
+                                        entry_ts=time.time(),
+                                        entry_px=float(px),
+                                        size_sol=float(size_sol),
+                                        entry_usd=float(usd_to_use),
+                                        stop_px=float(stop_px),
+                                        take_px=float(take_px),
+                                        trail_px=0.0,
+                                    )
+                                    await _save_state(r, cfg.state_key, st)
+                                    await _inc_trade_count(r, trades_key)
+                                    if cfg.telegram_on_paper:
+                                        await _tg(
+                                            "🧾 PAPER ENTRY\n"
+                                            f"• px={px:.2f} size≈{size_sol:.6f} SOL spend≈${usd_to_use:.2f}\n"
+                                            f"• stop={stop_px:.2f} take={take_px:.2f} alpha={sigs.alpha:.2f} rsi={sigs.rsi:.1f}"
+                                        )
+                                    log.info(
+                                        "[PAPER ENTRY] px=%.2f size=%.6f stop=%.2f take=%.2f",
+                                        px,
+                                        size_sol,
+                                        stop_px,
+                                        take_px,
+                                    )
+                                    await _set_cooldown(r, cfg.cooldown_key, cfg.cooldown_sec)
+                                else:
+                                    ok, sig = await _buy_sol(usd_to_use, cfg)
+                                    if ok:
+                                        st = PositionState(
+                                            pos="LONG",
+                                            entry_ts=time.time(),
+                                            entry_px=float(px),
+                                            size_sol=float(size_sol),
+                                            entry_usd=float(usd_to_use),
+                                            stop_px=float(stop_px),
+                                            take_px=float(take_px),
+                                            trail_px=0.0,
+                                        )
+                                        await _save_state(r, cfg.state_key, st)
+                                        await _inc_trade_count(r, trades_key)
+                                        if cfg.telegram_on_trade:
+                                            await _tg(
+                                                "🟢 ENTRY (scalper)\n"
+                                                f"• px={px:.2f} spend=${usd_to_use:.2f} size≈{size_sol:.6f} SOL\n"
+                                                f"• stop={stop_px:.2f} take={take_px:.2f} alpha={sigs.alpha:.2f} rsi={sigs.rsi:.1f}\n"
+                                                f"• tx={sig}"
+                                            )
+                                        log.info(
+                                            "[ENTRY] px=%.2f spend=$%.2f tx=%s", px, usd_to_use, sig
+                                        )
+                                        await _set_cooldown(r, cfg.cooldown_key, cfg.cooldown_sec)
+                                    else:
+                                        log.warning(
+                                            "Entry swap failed; will retry if setup persists."
+                                        )
+                                        if cfg.telegram_on_trade:
+                                            await _tg(
+                                                "⚠️ ENTRY failed (swap) — will retry if setup persists."
+                                            )
+
+            sleep_for2 = float(cfg.timeframe_sec) + random.uniform(0.0, 0.7)
+            if await _sleep_or_stop(stop_event, sleep_for2):
+                break
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log.exception("[scalper] loop error: %s", e)
-            # small backoff
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(
-                    stop_event.wait(),
-                    timeout=max(3.0, float(ScalperConfig.from_env().cooldown_sec)),
-                )
+            log.every("SCALPER_LOOP_ERR", n=5, msg="SCALPER_LOOP_ERR", err=_short(e))
+            if await _sleep_or_stop(stop_event, 3.0):
+                break
 
 
 async def main() -> None:
-    if init_resources is not None:
-        try:
-            await init_resources()
-        except Exception:
-            log.debug("init_resources failed (continuing)", exc_info=True)
+    # Configure logging for standalone runs only (no import-time side effects)
+    with contextlib.suppress(Exception):
+        from utils_pkg.logging_setup import setup_logging as _s1  # type: ignore
+
+        await _call_maybe_async(_s1, service="scalper")
+
+    with contextlib.suppress(Exception):
+        from logging_setup import setup_logging as _s2  # type: ignore
+
+        await _call_maybe_async(_s2, service="scalper")
+
+    if callable(init_resources):
+        with contextlib.suppress(Exception):
+            await _call_maybe_async(init_resources)
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -949,20 +1221,18 @@ async def main() -> None:
         stop_event.set()
 
     for sig_name in ("SIGINT", "SIGTERM"):
-        sig = getattr(signal, sig_name, None)
-        if sig is None:
+        sig_obj = getattr(signal, sig_name, None)
+        if sig_obj is None:
             continue
         with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, _stop)
+            loop.add_signal_handler(sig_obj, _stop)
 
     try:
         await run_scalper(stop_event)
     finally:
-        if close_resources is not None:
-            try:
-                await close_resources()
-            except Exception:
-                log.debug("close_resources failed", exc_info=True)
+        if callable(close_resources):
+            with contextlib.suppress(Exception):
+                await _call_maybe_async(close_resources)
 
 
 if __name__ == "__main__":

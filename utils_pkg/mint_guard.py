@@ -7,16 +7,17 @@ utils_pkg/mint_guard.py — God-Tier Mint Guardrails (V3+++ / P0 LOCK-IN)
 
 CRITICAL TEST CONTRACT
 ----------------------
-- This module MUST be import-safe (tests may swallow import errors and then mg is undefined).
+- MUST be import-safe (tests may swallow import errors and then mg is undefined).
 - ZERO network at import time.
 - Avoid importing heavy / network deps at import time (optional deps must be lazy).
 
-Features preserved:
-✅ Canonical mint normalization (symbols/urls/blobs → base58 pubkey)
+LOCK-IN FEATURES PRESERVED
+--------------------------
+✅ Canonical mint normalization (symbols/urls/blobs → pubkey string)
 ✅ Allowlist / denylist (env + runtime); deny overrides allow
 ✅ Blocks obvious non-mint program IDs (system/token/ATA/memo/etc.)
 ✅ Cooldowns (local + optional Redis shared cooldown across workers)
-✅ Dedupe reservation (optional Redis SET NX) to prevent two workers entering same mint
+✅ Dedupe reservation (optional Redis SET NX) to prevent concurrent entries
 ✅ Rate limiting (local): per-mint + global + unique-mints-per-window caps
 ✅ Optional on-chain validation (async, timed) to ensure the address is a real SPL mint
 
@@ -62,30 +63,36 @@ _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58_INDEX = {c: i for i, c in enumerate(_B58_ALPHABET)}
 _B58_SET = set(_B58_ALPHABET)
 
+_PUBKEYISH_CHARS = set(string.ascii_letters + string.digits)
+
 
 def _b58decode(s: str) -> bytes | None:
     s = (s or "").strip()
     if not s:
         return None
+
     num = 0
     for ch in s:
         v = _B58_INDEX.get(ch)
         if v is None:
             return None
         num = num * 58 + v
+
     b = num.to_bytes((num.bit_length() + 7) // 8, "big") if num else b""
+
     pad = 0
     for ch in s:
         if ch == "1":
             pad += 1
         else:
             break
+
     return (b"\x00" * pad) + b
 
 
 def is_canonical_pubkey(s: str) -> bool:
     b = _b58decode((s or "").strip())
-    return bool(b) and len(b) == 32
+    return b is not None and len(b) == 32
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -116,24 +123,26 @@ _DEFAULT_NON_MINT_PUBKEYS: set[str] = {
     "AddressLookupTab1e1111111111111111111111111",  # ALT program
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Pubkey-ish normalization (THIS is what fixes your "normalize_failed" -> "no_anchor")
-# ──────────────────────────────────────────────────────────────────────────────
-_PUBKEYISH_CHARS = set(string.ascii_letters + string.digits)
 
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Normalization helpers (NO heavy imports)
+# ──────────────────────────────────────────────────────────────────────────────
 def _coerce_mint_str(x: Any) -> str:
     """
-    Convert common mint representations into a clean string without breaking
-    Pubkey objects/bytes.
+    Convert common mint representations into a clean string.
 
+    Supports:
     - bytes/bytearray -> utf-8 decode
     - "Pubkey(....)" / "pubkey(....)" -> extract inner
     - otherwise -> str(x)
     """
     if x is None:
         return ""
-    s = x.decode("utf-8", "ignore").strip() if isinstance(x, bytes | bytearray) else str(x).strip()
+
+    if isinstance(x, (bytes, bytearray)):
+        s = x.decode("utf-8", "ignore").strip()
+    else:
+        s = str(x).strip()
 
     if not s:
         return ""
@@ -145,8 +154,7 @@ def _coerce_mint_str(x: Any) -> str:
             inner.startswith("'") and inner.endswith("'")
         ):
             inner = inner[1:-1].strip()
-        if inner:
-            return inner
+        return inner.strip()
 
     return s
 
@@ -239,9 +247,11 @@ def _pubkey_ok(s: str) -> bool:
     s = (s or "").strip()
     if not s:
         return False
+
     strict = _env_bool("MINT_GUARD_STRICT_PUBKEY", False)
     if strict:
         return is_canonical_pubkey(s)
+
     return is_canonical_pubkey(s) or _is_base58_pubkeyish(s) or _is_pubkeyish_lenient(s)
 
 
@@ -267,7 +277,6 @@ def _extract_canonical_pubkey_from_blob(s: str) -> str | None:
     if len(run) >= 32:
         runs.append("".join(run))
 
-    # Prefer canonical decode matches
     for cand in runs:
         if 32 <= len(cand) <= 64 and is_canonical_pubkey(cand):
             return cand
@@ -276,8 +285,16 @@ def _extract_canonical_pubkey_from_blob(s: str) -> str | None:
 
 
 def _normalize_symbol_or_pubkey(x: Any) -> str | None:
+    """
+    Normalize:
+    - symbol like "SOL" -> known mint
+    - "Pubkey(...)" -> inner
+    - direct pubkey-ish string -> itself
+    - blob/url -> attempt extract canonical pubkey
+    """
     if x is None:
         return None
+
     s = _coerce_mint_str(x)
     if not s:
         return None
@@ -289,7 +306,6 @@ def _normalize_symbol_or_pubkey(x: Any) -> str | None:
     if _pubkey_ok(s):
         return s
 
-    # Try extracting canonical pubkey from blob/url
     ext = _extract_canonical_pubkey_from_blob(s)
     if ext and _pubkey_ok(ext):
         return ext
@@ -514,7 +530,7 @@ def _get_cfg() -> MintGuardConfig:
 # ──────────────────────────────────────────────────────────────────────────────
 # Redis (optional) — lazy import; no hard dependency
 # ──────────────────────────────────────────────────────────────────────────────
-async def _get_redis():
+async def _get_redis() -> Any:
     try:
         from utils_pkg.core_utils import get_redis_async  # type: ignore
     except Exception:
@@ -643,28 +659,24 @@ def _classify_mint_allowed(
     mint: str, *, allow_sol: bool, allow_stables: bool, allow_memes: bool
 ) -> MintGuardDecision | None:
     if not allow_sol and mint == SOL_MINT:
-        return MintGuardDecision(
-            ok=False, mint=mint, code="sol_blocked", detail="SOL mint blocked by policy"
-        )
+        return MintGuardDecision(ok=False, mint=mint, code="sol_blocked", detail="SOL blocked")
     if not allow_stables and mint in (USDC_MINT, USDT_MINT):
         return MintGuardDecision(
-            ok=False, mint=mint, code="stable_blocked", detail="stable mint blocked by policy"
+            ok=False, mint=mint, code="stable_blocked", detail="stable blocked"
         )
     if not allow_memes and mint == BONK_MINT:
-        return MintGuardDecision(
-            ok=False, mint=mint, code="meme_blocked", detail="meme mint blocked by policy"
-        )
+        return MintGuardDecision(ok=False, mint=mint, code="meme_blocked", detail="meme blocked")
     return None
 
 
 def _normalize_and_basic_validate(x: Any, cfg: MintGuardConfig) -> MintGuardDecision:
     if not cfg.enabled:
-        m = _normalize_symbol_or_pubkey(x)
-        if not m:
+        m0 = _normalize_symbol_or_pubkey(x)
+        if not m0:
             return MintGuardDecision(
                 ok=False, mint=None, code="normalize_failed", detail="normalize_failed"
             )
-        return MintGuardDecision(ok=True, mint=m, code="ok_disabled", detail="mint guard disabled")
+        return MintGuardDecision(ok=True, mint=m0, code="ok_disabled", detail="mint guard disabled")
 
     mint = _normalize_symbol_or_pubkey(x)
     if not mint:
@@ -682,7 +694,10 @@ def _normalize_and_basic_validate(x: Any, cfg: MintGuardConfig) -> MintGuardDeci
 
     if mint in cfg.non_mint:
         return MintGuardDecision(
-            ok=False, mint=mint, code="non_mint_program_id", detail="known program id / non-mint"
+            ok=False,
+            mint=mint,
+            code="non_mint_program_id",
+            detail="known program id / non-mint",
         )
 
     # deny overrides allow
@@ -718,6 +733,7 @@ def check_mint(
 
     deny = set(cfg0.deny)
     allow = set(cfg0.allow)
+
     if extra_deny:
         deny |= _resolve_list_items(extra_deny)
     if extra_allow:
@@ -845,7 +861,7 @@ async def acheck_mint(
                         code="not_a_real_mint",
                         detail="on-chain validation failed (not an SPL mint)",
                     )
-            except TimeoutError:
+            except (asyncio.TimeoutError, TimeoutError):
                 return MintGuardDecision(
                     ok=False,
                     mint=mint,
@@ -867,10 +883,7 @@ async def acheck_mint(
             ok = await r.set(key_res, "1", nx=True, ex=cfg.reserve_sec)
             if not ok:
                 return MintGuardDecision(
-                    ok=False,
-                    mint=mint,
-                    code="reserved",
-                    detail="mint already reserved by another worker",
+                    ok=False, mint=mint, code="reserved", detail="mint already reserved"
                 )
         except Exception:
             pass
@@ -1169,7 +1182,6 @@ __all__ = [
     "_ALLOW_CACHE",
     "_CACHE",
     "_DENY_CACHE",
-    # test-visible caches
     "_ENV_CACHE",
     "_NON_MINT_CACHE",
     "_PARSED_ENV",

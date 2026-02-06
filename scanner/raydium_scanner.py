@@ -1,4 +1,3 @@
-# scanner/raydium_scanner.py
 from __future__ import annotations
 
 """
@@ -27,109 +26,190 @@ Observability
 
 Notes
 -----
-- This scanner is designed to degrade gracefully when optional modules are missing,
-  unless FAST_FAIL is enabled.
+- Degrades gracefully when optional modules are missing, unless FAST_FAIL is enabled.
 """
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
+import logging
 import os
 import random
 import ssl
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+# =============================================================================
 # Optional HTTP deps (scanner should degrade gracefully unless FAST_FAIL)
+# =============================================================================
 try:
-    import aiohttp  # type: ignore
+    import aiohttp as _aiohttp  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover
-    aiohttp = None  # type: ignore
+    _aiohttp = None
+aiohttp: Any | None = _aiohttp
 
 try:
-    import certifi  # type: ignore
+    import certifi as _certifi  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover
-    certifi = None  # type: ignore
-
+    _certifi = None
+certifi: Any | None = _certifi
 
 # =============================================================================
-# Canonical Candidate (scanner/registry.py)
+# Canonical Candidate/Source (scanner/registry.py) — runtime optional
 # =============================================================================
+if TYPE_CHECKING:
+    from .registry import Candidate as CandidateT, Source as SourceT
+else:  # pragma: no cover
+    CandidateT = Any  # type: ignore[assignment]
+    SourceT = Any  # type: ignore[assignment]
+
+CandidateClass: type[CandidateT] | None
 try:
-    from .registry import Candidate  # type: ignore
+    from .registry import Candidate as _Candidate  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover
-    Candidate = None  # type: ignore
+    CandidateClass = None
+else:
+    CandidateClass = _Candidate
 
-
-# =============================================================================
-# Logging (supports log.event / log.once / log.every; falls back to stdlib logging)
-# =============================================================================
+_SourceEnum: Any | None
 try:
-    from logging_setup import get_logger  # type: ignore
+    from .registry import Source as _Source  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    _SourceEnum = None
+else:
+    _SourceEnum = _Source
 
+
+def _coerce_source(x: Any) -> SourceT:
+    """
+    Coerce 'source' into scanner.registry.Source when available; fallback to str.
+    """
+    if _SourceEnum is None:
+        return str(x or "raydium")  # type: ignore[return-value]
+
+    src = _SourceEnum
+    if isinstance(x, src):
+        return x  # type: ignore[return-value]
+
+    s = str(x or "raydium").strip() or "raydium"
+
+    # Enum name lookup: Source.RAYDIUM etc.
+    with contextlib.suppress(Exception):
+        return src[s.upper()]  # type: ignore[index,return-value]
+
+    # Value ctor: Source("raydium") etc.
+    with contextlib.suppress(Exception):
+        return src(s)  # type: ignore[call-arg,return-value]
+
+    # Attribute fallback
+    with contextlib.suppress(Exception):
+        return src.RAYDIUM  # type: ignore[return-value]
+
+    # last resort: first enum member
+    with contextlib.suppress(Exception):
+        return list(src)[0]  # type: ignore[return-value]
+
+    return str(s)  # type: ignore[return-value]
+
+
+# =============================================================================
+# Logging (Phase A compliant: canonical logger contract; no monkey patching)
+# =============================================================================
+def _fallback_setup_logging(*_: Any, **__: Any) -> None:
+    return None
+
+
+def _resolve_logger_base(name: str) -> Any:
+    """
+    Return a logger-like object.
+    Prefer utils_pkg.log_compat.get_logger() if present; else stdlib logging.Logger.
+    """
     try:
-        LOG = get_logger("scanner.raydium")  # type: ignore[arg-type]
-    except TypeError:
-        LOG = get_logger()  # type: ignore[misc]
-except Exception:  # pragma: no cover
-    import logging
+        from utils_pkg.log_compat import get_logger as canon_get_logger  # type: ignore
 
-    LOG = logging.getLogger("scanner.raydium")
-    if not LOG.handlers:
-        logging.basicConfig(level=logging.INFO)
+        return canon_get_logger(name)
+    except Exception:
+        return logging.getLogger(name)
 
 
-def _ensure_logger_shims() -> None:
-    """Provide LOG.event / LOG.once / LOG.every for stdlib loggers."""
-    if not hasattr(LOG, "event"):
+def _resolve_setup_logging() -> Callable[..., None]:
+    try:
+        from utils_pkg.log_compat import setup_logging as canon_setup_logging  # type: ignore
 
-        def _event(name: str, **fields: Any) -> None:  # pragma: no cover
+        return canon_setup_logging
+    except Exception:
+        return _fallback_setup_logging
+
+
+_SETUP_LOGGING = _resolve_setup_logging()
+
+
+class _LogProxy:
+    """
+    Wraps a logger-like object and provides .event/.once/.every WITHOUT mutating it.
+    If the base already provides event/once/every (canonical EventLogger), we defer to it.
+    """
+
+    def __init__(self, base: Any) -> None:
+        self._base = base
+        self._seen: dict[str, float] = {}
+
+    def event(self, name: str, **fields: Any) -> None:
+        fn = getattr(self._base, "event", None)
+        if callable(fn):
             with contextlib.suppress(Exception):
-                LOG.info("%s %s", name, fields)
+                fn(name, **fields)
+            return
+        with contextlib.suppress(Exception):
+            self._base.info("%s %s", name, fields)
 
-        LOG.event = _event  # type: ignore[attr-defined]
-
-    if not hasattr(LOG, "once"):
-        _seen: dict[str, float] = {}
-
-        def _once(
-            key: str,
-            ttl: float = 30.0,
-            level: int = 20,
-            msg: str | None = None,
-            **fields: Any,
-        ) -> bool:  # pragma: no cover
-            now = time.monotonic()
-            last = float(_seen.get(key, 0.0))
-            if now - last < float(ttl):
-                return False
-            _seen[key] = now
+    def once(
+        self,
+        key: str,
+        ttl: float = 30.0,
+        level: int = logging.INFO,
+        msg: str | None = None,
+        **fields: Any,
+    ) -> bool:
+        fn = getattr(self._base, "once", None)
+        if callable(fn):
             with contextlib.suppress(Exception):
-                LOG.log(level, "%s %s", (msg or key), fields)
-            return True
+                return bool(fn(key, ttl=ttl, level=level, msg=msg, **fields))
+            return False
 
-        LOG.once = _once  # type: ignore[attr-defined]
+        now = time.monotonic()
+        last = float(self._seen.get(key, 0.0))
+        if (now - last) < float(ttl):
+            return False
+        self._seen[key] = now
+        with contextlib.suppress(Exception):
+            self._base.log(level, "%s %s", (msg or key), fields)
+        return True
 
-    if not hasattr(LOG, "every"):
+    def every(
+        self,
+        key: str,
+        n: float = 10.0,
+        level: int = logging.INFO,
+        msg: str | None = None,
+        **fields: Any,
+    ) -> None:
+        fn = getattr(self._base, "every", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(key, n=n, level=level, msg=msg, **fields)
+            return
+        self.once(key, ttl=float(n), level=level, msg=(msg or key), **fields)
 
-        def _every(
-            key: str,
-            n: float = 10.0,
-            level: int = 20,
-            msg: str | None = None,
-            **fields: Any,
-        ) -> None:  # pragma: no cover
-            once = getattr(LOG, "once", None)
-            if callable(once):
-                once(key, ttl=float(n), level=level, msg=msg or key, **fields)
-
-        LOG.every = _every  # type: ignore[attr-defined]
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
 
 
-_ensure_logger_shims()
+LOG = _LogProxy(_resolve_logger_base("scanner.raydium_scanner"))
 
 
 def _short(x: Any, n: int = 240) -> str:
@@ -141,7 +221,7 @@ def _short(x: Any, n: int = 240) -> str:
 
 
 # =============================================================================
-# Env / config helpers
+# Env / config helpers (NO NEW ENV KEYS HERE)
 # =============================================================================
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
 _FALSE = {"0", "false", "f", "no", "n", "off"}
@@ -160,17 +240,27 @@ def _b(name: str, default: bool = False) -> bool:
 
 
 def _i(name: str, default: int) -> int:
-    v = os.getenv(name)
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    s = raw.strip()
+    if s == "":
+        return int(default)
     try:
-        return int(float(v)) if v not in (None, "") else int(default)
+        return int(float(s))
     except Exception:
         return int(default)
 
 
 def _f(name: str, default: float) -> float:
-    v = os.getenv(name)
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    s = raw.strip()
+    if s == "":
+        return float(default)
     try:
-        return float(v) if v not in (None, "") else float(default)
+        return float(s)
     except Exception:
         return float(default)
 
@@ -196,6 +286,29 @@ def _disabled() -> bool:
     )
 
 
+def _coerce_int(value: Any, default: int) -> int:
+    if value is None:
+        return int(default)
+    if isinstance(value, bool):
+        return int(default)
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        with contextlib.suppress(Exception):
+            return int(value)
+        return int(default)
+    if isinstance(value, str):
+        s = value.strip()
+        if s == "":
+            return int(default)
+        with contextlib.suppress(Exception):
+            return int(float(s))
+        return int(default)
+    with contextlib.suppress(Exception):
+        return int(value)  # type: ignore[arg-type]
+    return int(default)
+
+
 # config.py is optional; env always wins
 try:
     import config as C  # type: ignore
@@ -208,9 +321,6 @@ except Exception:  # pragma: no cover
 
 
 def _cfg(name: str, default: Any) -> Any:
-    """
-    Read env first; fallback to config.py attribute; else default.
-    """
     if os.getenv(name) not in (None, ""):
         if isinstance(default, bool):
             return _b(name, bool(default))
@@ -222,36 +332,57 @@ def _cfg(name: str, default: Any) -> Any:
     return getattr(C, name, default)
 
 
-# Optional mint normalizer
-try:
-    from utils_pkg.mints import normalize_mint as _normalize_mint  # type: ignore
-except Exception:  # pragma: no cover
+# Optional mint normalizer (must be Any->str to avoid conditional signature mismatch)
+def _normalize_mint_fallback(x: Any) -> str:
+    return str(x or "").strip()
 
-    def _normalize_mint(m: str) -> str:
-        return (m or "").strip()
+
+_normalize_mint: Callable[[Any], str] = _normalize_mint_fallback
+try:
+    from utils_pkg.mints import normalize_mint as _nm  # type: ignore
+
+    _normalize_mint = _nm  # type: ignore[assignment]
+except Exception:  # pragma: no cover
+    _normalize_mint = _normalize_mint_fallback
 
 
 # Optional cheap viability filter (scanner-level sanity, not final gate)
+def _is_viable_pair_fallback(_: dict[str, Any]) -> bool:
+    return True
+
+
+_is_viable_pair: Callable[[dict[str, Any]], bool] = _is_viable_pair_fallback
 try:
-    from utils_pkg.pair_filters import is_viable_pair as _is_viable_pair  # type: ignore
+    from utils_pkg.pair_filters import is_viable_pair as _ivp  # type: ignore
+
+    _is_viable_pair = _ivp  # type: ignore[assignment]
 except Exception:  # pragma: no cover
     try:
-        from utils_pkg.pump_filters import is_viable_pair as _is_viable_pair  # type: ignore
+        from utils_pkg.pump_filters import is_viable_pair as _ivp2  # type: ignore
+
+        _is_viable_pair = _ivp2  # type: ignore[assignment]
     except Exception:  # pragma: no cover
-
-        def _is_viable_pair(_meta: dict[str, Any]) -> bool:  # type: ignore
-            return True
+        _is_viable_pair = _is_viable_pair_fallback
 
 
-# Optional risk/regime snapshot sources (scanner tags only)
+# Optional risk snapshot (signature must stay stable across variants)
+async def _risk_capacity_snapshot_fallback(redis: Any | None = None) -> dict[str, Any]:
+    _ = redis
+    return {"risk_capacity": 1.0, "risk_shutdown": False, "risk_mode": "normal"}
+
+
+_risk_capacity_snapshot: Callable[[Any | None], Awaitable[dict[str, Any]]] = (
+    _risk_capacity_snapshot_fallback
+)
 try:
-    from utils_pkg.risk_manager import risk_capacity_snapshot  # type: ignore
+    from utils_pkg.risk_manager import risk_capacity_snapshot as _rcs  # type: ignore
+
+    _risk_capacity_snapshot = _rcs  # type: ignore[assignment]
 except Exception:  # pragma: no cover
-
-    async def risk_capacity_snapshot(_redis=None) -> dict[str, Any]:
-        return {"risk_capacity": 1.0, "risk_shutdown": False, "risk_mode": "normal"}
+    _risk_capacity_snapshot = _risk_capacity_snapshot_fallback
 
 
+# Optional regime snapshot source (tags only)
 try:
     from utils_pkg.regime import regime_state  # type: ignore
 except Exception:  # pragma: no cover
@@ -276,10 +407,13 @@ except Exception:  # pragma: no cover
 
 
 # Optional alerting (best-effort)
+AlertManagerClass: type[Any] | None
 try:
-    from utils_pkg.alert_manager import AlertManager  # type: ignore
+    from utils_pkg.alert_manager import AlertManager as _AM  # type: ignore
+
+    AlertManagerClass = _AM  # type: ignore[assignment]
 except Exception:  # pragma: no cover
-    AlertManager = None  # type: ignore
+    AlertManagerClass = None
 
 
 # Optional structured logging for training/debug
@@ -494,7 +628,6 @@ def _looks_like_redis(x: Any) -> bool:
 def _parse_ctx(*args: Any, **kwargs: Any) -> _CallCtx:
     ctx = _CallCtx()
 
-    # kwargs first
     for k in ("stop_evt", "stop_event", "stop"):
         v = kwargs.get(k)
         if isinstance(v, asyncio.Event):
@@ -519,12 +652,12 @@ def _parse_ctx(*args: Any, **kwargs: Any) -> _CallCtx:
             ctx.q = v
             break
 
-    v = kwargs.get("emit")
-    if callable(v):
-        ctx.emit = v
+    v_emit = kwargs.get("emit")
+    if callable(v_emit):
+        ctx.emit = v_emit
 
     lim = kwargs.get("limit", None)
-    if isinstance(lim, int):
+    if isinstance(lim, int) and not isinstance(lim, bool):
         ctx.limit = lim
 
     # positional: accept any order
@@ -532,12 +665,6 @@ def _parse_ctx(*args: Any, **kwargs: Any) -> _CallCtx:
         if ctx.stop_evt is None and isinstance(a, asyncio.Event):
             ctx.stop_evt = a
             continue
-        if ctx.session is None and a is not None and aiohttp is not None:
-            # best-effort: aiohttp session check without hard dependency
-            cls = getattr(aiohttp, "ClientSession", None)
-            if cls is not None and isinstance(a, cls):  # type: ignore[arg-type]
-                ctx.session = a
-                continue
         if ctx.q is None and _looks_like_queue(a):
             ctx.q = a
             continue
@@ -551,7 +678,7 @@ def _parse_ctx(*args: Any, **kwargs: Any) -> _CallCtx:
         ):
             ctx.emit = a  # type: ignore[assignment]
             continue
-        if ctx.limit is None and isinstance(a, int):
+        if ctx.limit is None and isinstance(a, int) and not isinstance(a, bool):
             ctx.limit = a
             continue
 
@@ -639,6 +766,7 @@ def _maybe_log_rejects(st: Settings, stats: ScanStats, *, force: bool = False) -
     if (not force) and (now - float(_REJECT_LAST_TS)) < float(st.reject_log_every_s):
         return
     _REJECT_LAST_TS = now
+
     top = sorted(stats.rejects.items(), key=lambda kv: kv[1], reverse=True)[:12]
     payload: dict[str, Any] = {
         "raw_pairs": stats.raw_pairs,
@@ -648,11 +776,118 @@ def _maybe_log_rejects(st: Settings, stats: ScanStats, *, force: bool = False) -
     }
     if st.sample_n > 0 and stats.samples:
         payload["samples"] = stats.samples
-    LOG.event("RAY_REJECT_SUMMARY", **payload)  # type: ignore[attr-defined]
+
+    LOG.event("RAY_REJECT_SUMMARY", **payload)
 
 
 # =============================================================================
-# Regime snapshot
+# OFFLINE candidates (no env keys; purely signature flag)
+# =============================================================================
+_B58_ALPH = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_OFFLINE_TS = 1_700_000_000  # fixed deterministic timestamp
+
+
+def _b58encode(data: bytes) -> str:
+    if not data:
+        return ""
+    n = int.from_bytes(data, "big")
+    out: list[str] = []
+    while n > 0:
+        n, r = divmod(n, 58)
+        out.append(_B58_ALPH[r])
+    pad = 0
+    for b in data:
+        if b == 0:
+            pad += 1
+        else:
+            break
+    return ("1" * pad) + "".join(reversed(out or ["1"]))
+
+
+def _stable_pubkey(tag: str) -> str:
+    h = hashlib.sha256(tag.encode("utf-8")).digest()
+    return _b58encode(h)
+
+
+def _offline_meta(limit: int) -> list[dict[str, Any]]:
+    mint0 = _stable_pubkey("raydium-offline-mint-0")
+    mint1 = _stable_pubkey("raydium-offline-mint-1")
+    pair0 = _stable_pubkey("raydium-offline-pair-0")
+    pair1 = _stable_pubkey("raydium-offline-pair-1")
+
+    def _one(
+        mint: str,
+        pair: str,
+        sym: str,
+        liq: float,
+        vol5: float,
+        buys: int,
+        sells: int,
+        chg5: float,
+        age: float,
+    ) -> dict[str, Any]:
+        ts = float(_OFFLINE_TS)
+        buy_ratio = float(buys) / float(max(1, buys + sells))
+        vol_to_liq = (float(vol5) / max(1.0, float(liq))) if liq > 0 else 0.0
+        momo = (
+            (buy_ratio * 100.0)
+            + (min(2.0, vol_to_liq) * 25.0)
+            + (max(-20.0, min(20.0, chg5)) * 0.8)
+        )
+        url = f"https://dexscreener.com/solana/{pair}"
+        return {
+            "scanner": "raydium_scanner",
+            "scanner_id": "raydium_scanner",
+            "source": "raydium",
+            "src": "raydium",
+            "dex": "raydium",
+            "dexId": "raydium",
+            "chain": "solana",
+            "mint": mint,
+            "symbol": sym,
+            "sym": sym,
+            "quote_symbol": "SOL",
+            "quote_mint": _SOL_MINT,
+            "pair_address": pair,
+            "pairAddress": pair,
+            "pair_url": url,
+            "url": url,
+            "scan_ts": ts,
+            "ts": ts,
+            "liq_usd": float(liq),
+            "vol_5m_usd": float(vol5),
+            "vol_1h_usd": float(vol5) * 6.0,
+            "vol_24h_usd": float(vol5) * 288.0,
+            "buys_5m": int(buys),
+            "sells_5m": int(sells),
+            "txns_5m": int(buys + sells),
+            "price_usd": 0.000042,
+            "price_change_5m_pct": float(chg5),
+            "price_change_1h_pct": float(chg5) * 1.8,
+            "price_change_24h_pct": float(chg5) * 4.0,
+            "token_age_min": float(age),
+            "buy_ratio_5m": float(buy_ratio),
+            "vol_to_liq_5m": float(vol_to_liq),
+            "momo_hint": float(momo),
+            "offline": True,
+            "raw_pair": {},
+        }
+
+    metas = [
+        _one(mint0, pair0, "RAY_OFFLINE_A", 125_000.0, 8_400.0, 22, 12, 2.9, 7.0),
+        _one(mint1, pair1, "RAY_OFFLINE_B", 310_000.0, 19_500.0, 44, 18, 5.8, 3.5),
+    ]
+    return metas[: max(1, int(limit))]
+
+
+def _offline_enabled(
+    offline: bool, dry: bool | None, no_network: bool | None, test_mode: bool | None
+) -> bool:
+    return bool(offline) or bool(dry) or bool(no_network) or bool(test_mode)
+
+
+# =============================================================================
+# Regime snapshot (tags only)
 # =============================================================================
 async def _regime_snapshot() -> dict[str, Any]:
     try:
@@ -744,6 +979,9 @@ async def _fetch_json(
     status = 0
     first = ""
 
+    if aiohttp is None:
+        return None, 0, "aiohttp_missing"
+
     for attempt in range(1, st.retries + 1):
         if stop_evt is not None and stop_evt.is_set():
             return None, 0, "stopped"
@@ -771,11 +1009,9 @@ async def _fetch_json(
                             return json.loads(text), status, first
                         return None, status, first
 
-                # Fail-fast on non-rate-limited 4xx
                 if 400 <= status < 500 and status != 429:
                     return None, status, first
 
-                # 429/5xx backoff
                 if status == 429:
                     ra = (getattr(r, "headers", {}) or {}).get("Retry-After", "")
                     ra = (ra or "").strip()
@@ -790,26 +1026,13 @@ async def _fetch_json(
                     await asyncio.sleep(st.backoff_s * attempt * (0.85 + 0.3 * random.random()))
         except asyncio.CancelledError:
             raise
-        except (TimeoutError, aiohttp.ClientError) as e:  # type: ignore[attr-defined]
-            LOG.every(  # type: ignore[attr-defined]
+        except (TimeoutError, Exception) as e:
+            LOG.every(
                 "RAY_HTTP_ERR",
                 n=10,
-                level=20,
+                level=logging.INFO,
                 msg="RAY_HTTP_ERR",
                 err=type(e).__name__,
-                url=url,
-                attempt=attempt,
-                retries=st.retries,
-            )
-            if attempt < st.retries:
-                await asyncio.sleep(st.backoff_s * attempt * (0.85 + 0.3 * random.random()))
-        except Exception as e:
-            LOG.every(  # type: ignore[attr-defined]
-                "RAY_HTTP_UNK",
-                n=10,
-                level=20,
-                msg="RAY_HTTP_UNK",
-                err=_short(e),
                 url=url,
                 attempt=attempt,
                 retries=st.retries,
@@ -827,10 +1050,6 @@ async def _fetch_pairs(
     *,
     stop_evt: asyncio.Event | None,
 ) -> list[dict[str, Any]]:
-    """
-    Dexscreener search endpoint for multiple queries.
-    Returns list of raw pair dicts (deduped by pairAddress/baseToken.address).
-    """
     sem = asyncio.Semaphore(max(1, st.fetch_concurrency))
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -878,7 +1097,7 @@ async def _fetch_pairs(
                     seen.add(pid_l)
                     out.append(p)
 
-                return  # success for this query
+                return
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -896,7 +1115,7 @@ async def _fetch_pairs(
 def _nzf(v: Any, d: float = 0.0) -> float:
     try:
         x = float(v)
-        return d if x != x else x  # NaN guard
+        return d if x != x else x
     except Exception:
         return d
 
@@ -915,7 +1134,7 @@ def _age_min(created_ms_or_s: Any) -> float | None:
         t = float(created_ms_or_s)
         if t <= 0:
             return None
-        if t > 10_000_000_000:  # ms
+        if t > 10_000_000_000:
             t = t / 1000.0
         return max(0.0, (time.time() - t) / 60.0)
     except Exception:
@@ -949,15 +1168,11 @@ def _metric_volume(vol: dict[str, Any], key: str, alt: str | None = None) -> flo
 
 
 def _normalize_pair(st: Settings, p: dict[str, Any], stats: ScanStats) -> dict[str, Any] | None:
-    """
-    Produces a canonical meta dict that is later converted into Candidate.
-    Emits both modern keys and legacy aliases (liq/vol5/buys5/chg5/age_min) for compatibility.
-    """
     try:
         base = p.get("baseToken") or {}
         quote = p.get("quoteToken") or {}
 
-        mint = _normalize_mint(str((base.get("address") or "")).strip())
+        mint = _normalize_mint((base.get("address") or ""))
         if not mint:
             stats.rej("reject_no_mint", st=st)
             return None
@@ -979,15 +1194,16 @@ def _normalize_pair(st: Settings, p: dict[str, Any], stats: ScanStats) -> dict[s
         sells_5m = _nzi(m5.get("sells"), 0)
 
         vol = p.get("volume") or {}
-        vol_5m = _metric_volume(vol if isinstance(vol, dict) else {}, "m5", "5m")
-        vol_1h = _metric_volume(vol if isinstance(vol, dict) else {}, "h1", "1h")
-        vol_24h = _metric_volume(vol if isinstance(vol, dict) else {}, "h24", "24h")
+        vol_d = vol if isinstance(vol, dict) else {}
+        vol_5m = _metric_volume(vol_d, "m5", "5m")
+        vol_1h = _metric_volume(vol_d, "h1", "1h")
+        vol_24h = _metric_volume(vol_d, "h24", "24h")
 
         pc = p.get("priceChange") or {}
-        pc = pc if isinstance(pc, dict) else {}
-        chg_5m = _nzf(pc.get("m5") or pc.get("5m"), 0.0)
-        chg_1h = _nzf(pc.get("h1") or pc.get("1h"), 0.0)
-        chg_24h = _nzf(pc.get("h24") or pc.get("24h"), 0.0)
+        pc_d = pc if isinstance(pc, dict) else {}
+        chg_5m = _nzf(pc_d.get("m5") or pc_d.get("5m"), 0.0)
+        chg_1h = _nzf(pc_d.get("h1") or pc_d.get("1h"), 0.0)
+        chg_24h = _nzf(pc_d.get("h24") or pc_d.get("24h"), 0.0)
 
         price_usd = _nzf(p.get("priceUsd") or p.get("price"), 0.0)
         created = p.get("pairCreatedAt") or p.get("pairCreatedAtMs") or p.get("pairCreatedAtTs")
@@ -1006,7 +1222,6 @@ def _normalize_pair(st: Settings, p: dict[str, Any], stats: ScanStats) -> dict[s
         buy_ratio_5m = _buy_ratio(buys_5m, sells_5m)
         vol_to_liq_5m = (vol_5m / max(1.0, liq_usd)) if liq_usd > 0 else 0.0
 
-        # Scanner-only "momo hint" (bounded-ish and interpretable)
         momo_hint = (
             (buy_ratio_5m * 100.0)
             + (min(2.0, vol_to_liq_5m) * 25.0)
@@ -1016,7 +1231,6 @@ def _normalize_pair(st: Settings, p: dict[str, Any], stats: ScanStats) -> dict[s
         ts = float(time.time())
 
         meta: dict[str, Any] = {
-            # identity
             "scanner": "raydium_scanner",
             "scanner_id": "raydium_scanner",
             "source": "raydium",
@@ -1035,7 +1249,6 @@ def _normalize_pair(st: Settings, p: dict[str, Any], stats: ScanStats) -> dict[s
             "url": pair_url,
             "scan_ts": ts,
             "ts": ts,
-            # metrics (modern)
             "liq_usd": float(liq_usd),
             "vol_5m_usd": float(vol_5m),
             "vol_1h_usd": float(vol_1h),
@@ -1051,23 +1264,9 @@ def _normalize_pair(st: Settings, p: dict[str, Any], stats: ScanStats) -> dict[s
             "buy_ratio_5m": float(buy_ratio_5m),
             "vol_to_liq_5m": float(vol_to_liq_5m),
             "momo_hint": float(momo_hint),
-            # legacy aliases (for older filters/scorers)
-            "liq": float(liq_usd),
-            "vol5": float(vol_5m),
-            "vol1h": float(vol_1h),
-            "vol24h": float(vol_24h),
-            "buys5": int(buys_5m),
-            "sells5": int(sells_5m),
-            "txns5": int(buys_5m + sells_5m),
-            "chg5": float(chg_5m),
-            "chg1h": float(chg_1h),
-            "chg24h": float(chg_24h),
-            "age_min": float(token_age_min),
-            # keep raw context (debug/training)
             "raw_pair": p,
         }
 
-        # Cheap scanner sanity filters (do NOT replace entry gate!)
         if st.hard_min_liq_usd > 0 and meta["liq_usd"] < st.hard_min_liq_usd:
             stats.rej("reject_hard_min_liq", {"mint": mint, "liq": meta["liq_usd"]}, st=st)
             return None
@@ -1086,7 +1285,6 @@ def _normalize_pair(st: Settings, p: dict[str, Any], stats: ScanStats) -> dict[s
             )
             return None
 
-        # Optional ultra-cheap viability sanity (still not final gate)
         try:
             if not _is_viable_pair(meta):
                 stats.rej("reject_viable_pair", {"mint": mint}, st=st)
@@ -1104,12 +1302,9 @@ def _normalize_pair(st: Settings, p: dict[str, Any], stats: ScanStats) -> dict[s
 
 
 def _rank_key(meta: dict[str, Any]) -> tuple[float, float, float, float]:
-    """
-    Scanner ranking only: prefer active flow, liquidity, buy-imbalance, modest momentum.
-    """
     return (
-        float(meta.get("vol_5m_usd") or meta.get("vol5") or 0.0),
-        float(meta.get("liq_usd") or meta.get("liq") or 0.0),
+        float(meta.get("vol_5m_usd") or 0.0),
+        float(meta.get("liq_usd") or 0.0),
         float(meta.get("buy_ratio_5m") or 0.0),
         float(meta.get("momo_hint") or 0.0),
     )
@@ -1118,29 +1313,34 @@ def _rank_key(meta: dict[str, Any]) -> tuple[float, float, float, float]:
 # =============================================================================
 # Candidate assembly (signature-aware, cached)
 # =============================================================================
-_CAND_FACTORY: Callable[[dict[str, Any]], Any] | None = None
+_CAND_FACTORY: Callable[[dict[str, Any]], CandidateT] | None = None
 
 
-def _build_candidate_factory() -> Callable[[dict[str, Any]], Any]:
-    if Candidate is None:  # pragma: no cover
-        raise RuntimeError(
-            "scanner.registry.Candidate is missing — cannot emit canonical candidates"
-        )
+def _build_candidate_factory() -> Callable[[dict[str, Any]], CandidateT]:
+    if CandidateClass is None:  # pragma: no cover
+        raise RuntimeError("scanner.registry.Candidate missing — cannot emit candidates")
 
-    # Prefer class factories if present
+    # Prefer classmethods if present
     for fn_name in ("from_meta", "from_dict", "from_mapping"):
-        fn = getattr(Candidate, fn_name, None)
+        fn = getattr(CandidateClass, fn_name, None)
         if callable(fn):
-            return lambda meta: fn(meta)
 
-    # Signature-aware construction (cached)
+            def _wrap(meta: dict[str, Any], _fn: Any = fn) -> CandidateT:
+                return _fn(meta)
+
+            return _wrap
+
+    # Signature-aware ctor mapping
     try:
-        sig = inspect.signature(Candidate)  # dataclass/class __call__
+        sig = inspect.signature(CandidateClass)
         params = set(sig.parameters.keys())
     except Exception:
         params = set()
 
-    def _ctor(meta: dict[str, Any]) -> Any:
+    def _ctor(meta: dict[str, Any]) -> CandidateT:
+        if CandidateClass is None:  # pragma: no cover
+            raise RuntimeError("CandidateClass missing")
+
         kwargs: dict[str, Any] = {}
 
         def _set_if(key: str, value: Any) -> None:
@@ -1148,7 +1348,7 @@ def _build_candidate_factory() -> Callable[[dict[str, Any]], Any]:
                 kwargs[key] = value
 
         _set_if("scanner", meta.get("scanner"))
-        _set_if("source", meta.get("source"))
+        _set_if("source", _coerce_source(meta.get("source") or "raydium"))
         _set_if("dex", meta.get("dex"))
         _set_if("chain", meta.get("chain"))
         _set_if("mint", meta.get("mint"))
@@ -1164,24 +1364,38 @@ def _build_candidate_factory() -> Callable[[dict[str, Any]], Any]:
         _set_if("data", meta)
         _set_if("extra", meta)
 
+        # If we can match any parameters, try that first.
         if kwargs:
-            try:
-                return Candidate(**kwargs)
-            except TypeError:
-                pass
+            with contextlib.suppress(TypeError):
+                return CandidateClass(**kwargs)  # type: ignore[misc]
 
-        # Minimal common layout fallback
-        return Candidate(  # type: ignore[call-arg]
-            mint=meta.get("mint"),
-            symbol=meta.get("symbol"),
-            source=meta.get("source", "raydium"),
-            meta=meta,
-        )
+        # Fallback: Any-safe progressive ctor attempts (keeps mypy happy and runtime resilient)
+        mint = str(meta.get("mint") or "").strip()
+        symbol = str(meta.get("symbol") or "").strip() or (mint[:6] if mint else "UNKNOWN")
+        src = _coerce_source(meta.get("source") or "raydium")
+
+        cls_any: Any = CandidateClass
+        variants: list[dict[str, Any]] = [
+            {"mint": mint, "symbol": symbol, "source": src, "meta": meta},
+            {"mint": mint, "symbol": symbol, "meta": meta},
+            {"mint": mint, "symbol": symbol, "source": src},
+            {"mint": mint, "symbol": symbol},
+            {"mint": mint},
+            {"meta": meta},
+        ]
+        for kw in variants:
+            try:
+                return cls_any(**kw)
+            except TypeError:
+                continue
+
+        # Final fallback (should basically never happen)
+        return cls_any(meta)
 
     return _ctor
 
 
-def _make_candidate(meta: dict[str, Any]) -> Any:
+def _make_candidate(meta: dict[str, Any]) -> CandidateT:
     global _CAND_FACTORY
     if _CAND_FACTORY is None:
         _CAND_FACTORY = _build_candidate_factory()
@@ -1191,46 +1405,44 @@ def _make_candidate(meta: dict[str, Any]) -> Any:
 # =============================================================================
 # Public API
 # =============================================================================
-async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
-    """
-    Canonical scanner entrypoint used by scanner.registry.
-
-    Supported call shapes (orchestrator-friendly):
-      - scan_raydium(redis=..., session=..., stop_evt=..., limit=...)
-      - scan_raydium(redis, session, stop_evt, limit)  (best-effort parsing)
-
-    Returns:
-        list[Candidate]
-    """
+async def scan_raydium(
+    *args: Any,
+    offline: bool = False,
+    dry: bool | None = None,
+    no_network: bool | None = None,
+    test_mode: bool | None = None,
+    **kwargs: Any,
+) -> list[CandidateT]:
     st = _settings()
     _RPS.set(st.rps_limit)
 
     if _disabled() or (not st.enabled) or st.mode == "off":
         return []
 
-    if aiohttp is None:
-        if _fast_fail():
-            raise RuntimeError("aiohttp is required for raydium_scanner but is not installed")
-        LOG.once("RAY_NO_AIOHTTP", ttl=60, msg="aiohttp missing; raydium scanner disabled")  # type: ignore[attr-defined]
-        return []
-
-    if Candidate is None:
-        if _fast_fail():
-            raise RuntimeError(
-                "scanner.registry.Candidate missing (cannot emit canonical candidates)"
-            )
-        LOG.once("RAY_NO_CANDIDATE", ttl=60, msg="Candidate missing; raydium scanner disabled")  # type: ignore[attr-defined]
-        return []
-
     ctx = _parse_ctx(*args, **kwargs)
     stop_evt = ctx.stop_evt
 
-    out_limit = int(
-        ctx.limit
-        if isinstance(ctx.limit, int)
-        else (kwargs.get("limit") if isinstance(kwargs.get("limit"), int) else st.out_limit)
-    )
-    out_limit = max(1, out_limit)
+    raw_limit = ctx.limit if ctx.limit is not None else kwargs.get("limit", None)
+    out_limit = max(1, _coerce_int(raw_limit, st.out_limit))
+
+    # OFFLINE mode: deterministic candidates, no HTTP.
+    if _offline_enabled(offline, dry, no_network, test_mode):
+        if CandidateClass is None:
+            return []
+        metas = _offline_meta(out_limit)
+        return [_make_candidate(m) for m in metas]
+
+    if aiohttp is None:
+        if _fast_fail():
+            raise RuntimeError("aiohttp is required for raydium_scanner but is not installed")
+        LOG.once("RAY_NO_AIOHTTP", ttl=60, msg="aiohttp missing; raydium scanner disabled")
+        return []
+
+    if CandidateClass is None:
+        if _fast_fail():
+            raise RuntimeError("scanner.registry.Candidate missing (cannot emit candidates)")
+        LOG.once("RAY_NO_CANDIDATE", ttl=60, msg="Candidate missing; raydium scanner disabled")
+        return []
 
     stats = ScanStats(t0=time.time())
 
@@ -1239,6 +1451,8 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
     if ctx.session is not None:
         sess = ctx.session
     else:
+        with contextlib.suppress(Exception):
+            _SETUP_LOGGING(service="scanner.raydium_scanner")
         sslctx = _sslctx()
         timeout = aiohttp.ClientTimeout(total=float(st.timeout_s) + 3.0)  # type: ignore[attr-defined]
         conn = aiohttp.TCPConnector(ssl=sslctx, limit=int(st.conn_limit))  # type: ignore[attr-defined]
@@ -1256,7 +1470,7 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
 
         # risk capacity (tags only; do NOT trade here)
         try:
-            risk_ctx = await risk_capacity_snapshot(ctx.redis)
+            risk_ctx = await _risk_capacity_snapshot(ctx.redis)
         except Exception:
             risk_ctx = {"risk_capacity": 1.0, "risk_shutdown": False, "risk_mode": "normal"}
             stats.rej("risk_snapshot_exc", st=st)
@@ -1266,10 +1480,10 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
         risk_mode = str(risk_ctx.get("risk_mode", "normal") or "normal")
 
         if risk_shutdown or risk_capacity <= 0.0:
-            LOG.every(  # type: ignore[attr-defined]
+            LOG.every(
                 "RAY_RISK_SHUTDOWN",
                 n=10,
-                level=20,
+                level=logging.INFO,
                 msg="RAY_RISK_SHUTDOWN",
                 risk_shutdown=int(risk_shutdown),
                 risk_capacity=round(risk_capacity, 3),
@@ -1279,10 +1493,10 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
 
         regime = await _regime_snapshot()
 
-        LOG.every(  # type: ignore[attr-defined]
+        LOG.every(
             "RAY_SCAN_START",
             n=5,
-            level=20,
+            level=logging.INFO,
             msg="RAY_SCAN_START",
             mode=st.mode,
             queries=",".join(st.queries),
@@ -1312,7 +1526,7 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
             m["risk_mode"] = risk_mode
             m["regime"] = regime
 
-            mint = str(m.get("mint") or "")
+            mint = str(m.get("mint") or "").strip()
             if not mint:
                 stats.rej("reject_no_mint_post", st=st)
                 continue
@@ -1328,7 +1542,7 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
         if st.seen_ttl_s > 0 and _redis_ok(ctx.redis) and metas:
             filtered: list[dict[str, Any]] = []
             for m in metas:
-                mint = str(m.get("mint") or "")
+                mint = str(m.get("mint") or "").strip()
                 if not mint:
                     continue
                 k = f"ray:seen:{mint}"
@@ -1358,11 +1572,11 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
             LOG.every(
                 "RAY_META_SAMPLE",
                 n=10,
-                level=20,
+                level=logging.INFO,
                 msg="RAY_META_SAMPLE",
                 count=len(metas),
                 first=sample,
-            )  # type: ignore[attr-defined]
+            )
 
         # Sort + cap
         metas.sort(key=_rank_key, reverse=True)
@@ -1374,7 +1588,7 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
             metas = metas[:allowed]
 
         # Convert to Candidate
-        candidates: list[Any] = []
+        candidates: list[CandidateT] = []
         for m in metas:
             if stop_evt is not None and stop_evt.is_set():
                 break
@@ -1422,9 +1636,9 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
             )
 
         # Best-effort MOMO alerts (only top few)
-        if st.momo_alerts and candidates and AlertManager is not None:
+        if st.momo_alerts and candidates and AlertManagerClass is not None:
             with contextlib.suppress(Exception):
-                am = AlertManager()  # type: ignore[misc]
+                am: Any = AlertManagerClass()
                 sent = 0
                 for c in candidates:
                     if sent >= max(0, st.max_momo_alerts):
@@ -1437,7 +1651,6 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
                     if not isinstance(meta, dict):
                         continue
 
-                    # dedupe (optional; uses redis if available)
                     mint = str(meta.get("mint") or "").strip()
                     if mint and _redis_ok(ctx.redis) and st.momo_dedup_s > 0:
                         k = f"ray:momo:{mint}"
@@ -1445,7 +1658,7 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
                             continue
                         await _redis_setex(ctx.redis, k, int(st.momo_dedup_s), "1")
 
-                    await am.send_momo_event(  # type: ignore[misc]
+                    out = am.send_momo_event(
                         "MOMO_OK",
                         {
                             "symbol": meta.get("symbol") or meta.get("mint"),
@@ -1461,6 +1674,8 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
                             "regime": (meta.get("regime") or {}).get("regime_label"),
                         },
                     )
+                    if asyncio.iscoroutine(out):
+                        await out
                     sent += 1
 
         return candidates
@@ -1468,7 +1683,7 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        LOG.every("RAY_SCAN_FAIL", n=5, level=40, msg="RAY_SCAN_FAIL", err=_short(e))  # type: ignore[attr-defined]
+        LOG.every("RAY_SCAN_FAIL", n=5, level=logging.ERROR, msg="RAY_SCAN_FAIL", err=_short(e))
         if _fast_fail():
             raise
         return []
@@ -1478,19 +1693,18 @@ async def scan_raydium(*args: Any, **kwargs: Any) -> list[Any]:
                 await sess.close()
 
 
-# Backwards-compat alias (some older code calls scan_once)
-async def scan_once(*args: Any, **kwargs: Any) -> list[Any]:
+async def scan_once(*args: Any, **kwargs: Any) -> list[CandidateT]:
     return await scan_raydium(*args, **kwargs)
 
 
-async def run(
-    *args: Any,
-    **kwargs: Any,
-) -> None:
+async def run(*args: Any, **kwargs: Any) -> None:
     """
-    Simple run loop helper (dev/tools/legacy). Registry usually does not need this.
+    Simple run loop helper (dev/tools/legacy).
     - If q is provided: q.put(candidate)
     - If emit is provided: emit(candidate) (sync or async)
+
+    Improvement vs old version:
+    - Reuses a session for the loop if none is provided (lower overhead).
     """
     st = _settings()
     _RPS.set(st.rps_limit)
@@ -1501,34 +1715,60 @@ async def run(
     interval = max(0.25, float(kwargs.get("interval_s") or _f("RAYDIUM_SCAN_INTERVAL_SEC", 2.0)))
     jitter = max(0.0, float(kwargs.get("jitter_s") or _f("RAYDIUM_SCAN_JITTER_SEC", 0.35)))
 
-    while not stop_evt.is_set():
-        try:
-            cands = await scan_raydium(redis=ctx.redis, session=ctx.session, stop_evt=stop_evt)
-            for c in cands:
-                if stop_evt.is_set():
-                    break
-                if ctx.q is not None:
-                    with contextlib.suppress(Exception):
-                        out = ctx.q.put(c)
-                        if asyncio.iscoroutine(out):
-                            await out
-                if ctx.emit is not None:
-                    with contextlib.suppress(Exception):
-                        out = ctx.emit(c)
-                        if asyncio.iscoroutine(out):
-                            await out
-            await asyncio.sleep(max(0.05, interval + random.uniform(-jitter, jitter)))
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            LOG.every("RAY_RUN_LOOP_ERR", n=10, level=30, msg="RAY_RUN_LOOP_ERR", err=_short(e))  # type: ignore[attr-defined]
-            if _fast_fail():
+    sess = ctx.session
+    own_session = False
+    if sess is None and aiohttp is not None:
+        with contextlib.suppress(Exception):
+            _SETUP_LOGGING(service="scanner.raydium_scanner")
+        sslctx = _sslctx()
+        timeout = aiohttp.ClientTimeout(total=float(st.timeout_s) + 3.0)  # type: ignore[attr-defined]
+        conn = aiohttp.TCPConnector(ssl=sslctx, limit=int(st.conn_limit))  # type: ignore[attr-defined]
+        sess = aiohttp.ClientSession(
+            headers=_headers(st),
+            connector=conn,
+            trust_env=bool(st.trust_env),
+            timeout=timeout,
+        )  # type: ignore[attr-defined]
+        own_session = True
+
+    try:
+        while not stop_evt.is_set():
+            try:
+                cands = await scan_raydium(redis=ctx.redis, session=sess, stop_evt=stop_evt)
+                for c in cands:
+                    if stop_evt.is_set():
+                        break
+                    if ctx.q is not None:
+                        with contextlib.suppress(Exception):
+                            out = ctx.q.put(c)
+                            if asyncio.iscoroutine(out):
+                                await out
+                    if ctx.emit is not None:
+                        with contextlib.suppress(Exception):
+                            out2 = ctx.emit(c)
+                            if asyncio.iscoroutine(out2):
+                                await out2
+                await asyncio.sleep(max(0.05, interval + random.uniform(-jitter, jitter)))
+            except asyncio.CancelledError:
                 raise
-            await asyncio.sleep(max(0.25, interval))
+            except Exception as e:
+                LOG.every(
+                    "RAY_RUN_LOOP_ERR",
+                    n=10,
+                    level=logging.WARNING,
+                    msg="RAY_RUN_LOOP_ERR",
+                    err=_short(e),
+                )
+                if _fast_fail():
+                    raise
+                await asyncio.sleep(max(0.25, interval))
+    finally:
+        if own_session and sess is not None:
+            with contextlib.suppress(Exception):
+                await sess.close()
 
 
 def scanner_health() -> dict[str, Any]:
-    """Non-network health snapshot (safe for /health)."""
     st = _settings()
     return {
         "name": "raydium_scanner",
@@ -1544,24 +1784,3 @@ def scanner_health() -> dict[str, Any]:
 
 
 __all__ = ["run", "scan_once", "scan_raydium", "scanner_health"]
-
-
-if __name__ == "__main__":  # pragma: no cover
-
-    async def _demo() -> None:
-        out = await scan_raydium()
-        print("candidates:", len(out))
-        if out:
-            c0 = out[0]
-            meta = (
-                getattr(c0, "meta", None) or getattr(c0, "data", None) or getattr(c0, "raw", None)
-            )
-            if isinstance(meta, dict):
-                print(
-                    meta.get("symbol"),
-                    meta.get("mint"),
-                    meta.get("liq_usd"),
-                    meta.get("vol_5m_usd"),
-                )
-
-    asyncio.run(_demo())

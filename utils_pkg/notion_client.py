@@ -8,7 +8,7 @@ Notion client (God-Tier / production-grade)
 Goals
 -----
 - ONE canonical Notion API client for the whole repo.
-- Safe, retrying, rate-aware, and *never* crashes the trading loop.
+- Safe, retrying, rate-aware, and *never* crashes the trading loop unless you choose strict behavior.
 - Supports both async (preferred) and sync (for scripts).
 - Schema discovery helpers (title/date props), generic query pagination,
   and safe upsert patterns (skip formula/rollup, coerce types, ignore unknowns).
@@ -44,7 +44,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -72,16 +72,27 @@ except Exception:  # pragma: no cover
 NOTION_API = "https://api.notion.com/v1"
 _DEFAULT_VER = "2022-06-28"
 
-
 # Notion transient-ish statuses; 409 happens for conflict/rate, 429 rate limit
-TRANSIENT_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+TRANSIENT_STATUS: set[int] = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Env helpers
+# ──────────────────────────────────────────────────────────────────────────────
+_TRUE = {"1", "true", "t", "yes", "y", "on"}
+_FALSE = {"0", "false", "f", "no", "n", "off"}
 
 
 def _b(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
-    return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
+    s = str(v).strip().lower()
+    if s in _TRUE:
+        return True
+    if s in _FALSE:
+        return False
+    return default
 
 
 def _s(name: str, default: str = "") -> str:
@@ -94,7 +105,7 @@ def _i(name: str, default: int) -> int:
     if v is None or str(v).strip() == "":
         return default
     try:
-        return int(str(v).strip())
+        return int(float(str(v).strip()))
     except Exception:
         return default
 
@@ -114,8 +125,8 @@ def _dryrun_on() -> bool:
 
 
 def _clip(s: str, n: int) -> str:
-    s = (s or "").strip()
-    return s if len(s) <= n else s[: max(0, n - 1)] + "…"
+    t = (s or "").strip()
+    return t if len(t) <= n else t[: max(0, n - 1)] + "…"
 
 
 def _json(obj: Any) -> str:
@@ -136,6 +147,11 @@ def normalize_notion_id(x: str) -> str:
     raw = t.replace("-", "")
     if len(raw) != 32:
         return t
+    # best-effort hex check
+    try:
+        int(raw, 16)
+    except Exception:
+        return t
     return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
 
 
@@ -152,6 +168,9 @@ def _utc_iso(ts: datetime | None = None) -> str:
     return dt.isoformat(timespec="seconds")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Types / Errors
+# ──────────────────────────────────────────────────────────────────────────────
 class NotionError(RuntimeError):
     def __init__(
         self,
@@ -221,7 +240,7 @@ def prop_multi_select(values: Any) -> dict[str, Any] | None:
         return None
     if isinstance(values, str):
         vals = [v.strip() for v in values.split(",") if v.strip()]
-    elif isinstance(values, list | tuple | set):
+    elif isinstance(values, (list, tuple, set)):
         vals = [str(v).strip() for v in values if str(v).strip()]
     else:
         vals = [str(values).strip()] if str(values).strip() else []
@@ -246,7 +265,7 @@ def prop_url(x: Any) -> dict[str, Any] | None:
 def prop_date_start(x: Any) -> dict[str, Any] | None:
     if x is None:
         return None
-    if isinstance(x, datetime | date):
+    if isinstance(x, (datetime, date)):
         if isinstance(x, date) and not isinstance(x, datetime):
             s = x.isoformat()
         else:
@@ -259,8 +278,7 @@ def prop_date_start(x: Any) -> dict[str, Any] | None:
     return {"date": {"start": s}}
 
 
-# map Notion property type -> builder
-_TYPE_BUILDERS = {
+_TYPE_BUILDERS: dict[str, Callable[[Any], dict[str, Any] | None]] = {
     "title": lambda v: prop_title(str(v or "")),
     "rich_text": lambda v: prop_rich_text(str(v or "")),
     "number": lambda v: prop_number(v),
@@ -279,11 +297,75 @@ def _looks_like_raw_prop_payload(v: Any) -> bool:
     if len(v.keys()) != 1:
         return False
     k = next(iter(v.keys()))
-    return k in _TYPE_BUILDERS or k in ("people", "email", "phone_number", "status", "relation")
+    return str(k) in _TYPE_BUILDERS or str(k) in (
+        "people",
+        "email",
+        "phone_number",
+        "status",
+        "relation",
+    )
+
+
+_SKIP_WRITE_TYPES = {"formula", "rollup", "created_time", "last_edited_time", "unique_id"}
+
+
+def build_properties_payload(
+    schema: DbSchema,
+    *,
+    values: Mapping[str, Any],
+    iso_date: str | None = None,
+    title_text: str | None = None,
+    allow_raw: bool = True,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """
+    Pure builder: create a Notion "properties" payload from python values, respecting schema types.
+    - Always sets schema.date_prop if iso_date provided
+    - Always sets schema.title_prop if title_text provided (can be empty string)
+    - Skips formula/rollup/created_time/last_edited_time/unique_id (Notion rejects writes)
+    - Unknown properties are skipped (unless strict=True)
+    """
+    props_out: dict[str, Any] = {}
+
+    if iso_date:
+        props_out[schema.date_prop] = {"date": {"start": str(iso_date)}}
+
+    if title_text is not None:
+        props_out[schema.title_prop] = prop_title(str(title_text))
+
+    for name, val in values.items():
+        if name in (schema.date_prop, schema.title_prop):
+            continue
+
+        if not schema.has_prop.get(name, False):
+            if strict:
+                raise NotionError(f"Property not found in DB schema: {name}")
+            continue
+
+        ptype = schema.prop_types.get(name) or ""
+        if ptype in _SKIP_WRITE_TYPES:
+            continue
+
+        if allow_raw and _looks_like_raw_prop_payload(val):
+            props_out[name] = val
+            continue
+
+        builder = _TYPE_BUILDERS.get(ptype)
+        if not builder:
+            if strict:
+                raise NotionError(f"Unsupported property type '{ptype}' for '{name}'")
+            continue
+
+        built = builder(val)
+        if built is None:
+            continue
+        props_out[name] = built
+
+    return props_out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Async client (preferred)
+# Rate gates
 # ──────────────────────────────────────────────────────────────────────────────
 class _AsyncRateGate:
     def __init__(self, rps: float) -> None:
@@ -302,13 +384,45 @@ class _AsyncRateGate:
             self._next = time.monotonic() + min_interval
 
 
+class _SyncRateGate:
+    def __init__(self, rps: float) -> None:
+        self._next = 0.0
+        self._rps = max(0.0, float(rps or 0.0))
+
+    def wait(self) -> None:
+        if self._rps <= 0:
+            return
+        min_interval = 1.0 / self._rps
+        now = time.monotonic()
+        if now < self._next:
+            time.sleep(self._next - now)
+        self._next = time.monotonic() + min_interval
+
+
+def _parse_retry_after(headers: Mapping[str, str]) -> float | None:
+    ra = headers.get("retry-after") or headers.get("Retry-After") or ""
+    if not ra:
+        return None
+    try:
+        return float(str(ra).strip())
+    except Exception:
+        return None
+
+
+def _request_id(headers: Mapping[str, str]) -> str | None:
+    return headers.get("x-request-id") or headers.get("request-id") or None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Async client (preferred)
+# ──────────────────────────────────────────────────────────────────────────────
 class NotionAsync:
     """
     Async Notion client for runtime usage in the bot.
 
     Best-effort:
-      - read methods raise NotionError (so scripts/tests can fail-fast)
-      - write methods can be set to swallow errors if desired (default raise)
+      - read methods raise NotionError (scripts/tests can fail-fast)
+      - writes respect dryrun gating (NOTION_ALLOW_DRYRUN=0 disables writes under DRYRUN)
     """
 
     def __init__(
@@ -341,12 +455,14 @@ class NotionAsync:
         self.allow_dryrun = bool(
             allow_dryrun if allow_dryrun is not None else _b("NOTION_ALLOW_DRYRUN", True)
         )
-        self._gate = _AsyncRateGate(float(rps if rps is not None else _f("NOTION_RPS", 2.0)))
+
+        rps_val = float(rps if rps is not None else _f("NOTION_RPS", 2.0))
+        self._gate = _AsyncRateGate(rps_val)
 
         self._external_client = client is not None
         self._client: httpx.AsyncClient | None = client
         self._client_lock = asyncio.Lock()
-        self._schema_cache: dict[str, DbSchema] = {}  # dbid -> schema
+        self._schema_cache: dict[str, DbSchema] = {}
 
         if self.token:
             log.info(
@@ -355,7 +471,7 @@ class NotionAsync:
                     "version": self.version,
                     "timeout": self.timeout_sec,
                     "max_retries": self.max_retries,
-                    "rps": float(rps if rps is not None else _f("NOTION_RPS", 2.0)),
+                    "rps": rps_val,
                     "dryrun": _dryrun_on(),
                     "allow_dryrun": self.allow_dryrun,
                 },
@@ -366,23 +482,40 @@ class NotionAsync:
     def ok(self) -> bool:
         return bool(self.token)
 
+    async def __aenter__(self) -> NotionAsync:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.aclose()
+
     async def _ensure_client(self) -> httpx.AsyncClient:
-        if self._client is not None:
-            return self._client
+        client = self._client
+        if client is not None:
+            return client
+
         async with self._client_lock:
-            if self._client is not None:
-                return self._client
-            self._client = httpx.AsyncClient(
+            client = self._client
+            if client is not None:
+                return client
+
+            client = httpx.AsyncClient(
                 headers=_hdrs(self.token, self.version),
                 timeout=httpx.Timeout(self.timeout_sec),
             )
-            return self._client
+            self._client = client
+            return client
 
     async def aclose(self) -> None:
         if not self._external_client and self._client is not None:
             with contextlib.suppress(Exception):
                 await self._client.aclose()
         self._client = None
+
+    def _writes_allowed(self) -> bool:
+        # If dryrun is ON and allow_dryrun is False -> block writes
+        if _dryrun_on() and (not self.allow_dryrun):
+            return False
+        return True
 
     async def _sleep_backoff(self, attempt: int, *, retry_after: float | None = None) -> None:
         if retry_after is not None:
@@ -412,17 +545,16 @@ class NotionAsync:
             await self._gate.wait()
             try:
                 resp = await c.request(method, url, json=json_body, params=params)
-                rid = resp.headers.get("x-request-id") or resp.headers.get("request-id") or None
+                rid = _request_id(resp.headers)
 
                 if resp.status_code in (200, 201):
                     bump("notion_ok")
-                    return resp.json()
+                    data = resp.json()
+                    return data if isinstance(data, dict) else {}
 
-                # 429: Notion may provide retry-after
                 if resp.status_code == 429:
                     bump("notion_429")
-                    ra = resp.headers.get("retry-after")
-                    retry_after = float(ra) if (ra and str(ra).strip().isdigit()) else None
+                    retry_after = _parse_retry_after(resp.headers)
                     last_err = NotionError(
                         f"Notion rate limited ({resp.status_code})",
                         status_code=resp.status_code,
@@ -445,7 +577,6 @@ class NotionAsync:
                     await self._sleep_backoff(attempt)
                     continue
 
-                # non-transient -> fail fast
                 bump("notion_fail")
                 raise NotionError(
                     f"Notion request failed ({resp.status_code})",
@@ -583,7 +714,7 @@ class NotionAsync:
         return normalize_notion_id(str(pid)) if pid else None
 
     # ────────────────────────────────────────────────────────────────────
-    # Safe property payload builder
+    # Property builder (pure)
     # ────────────────────────────────────────────────────────────────────
     def build_properties(
         self,
@@ -595,57 +726,18 @@ class NotionAsync:
         allow_raw: bool = True,
         strict: bool = False,
     ) -> dict[str, Any]:
-        """
-        Build a Notion "properties" payload from python values, respecting schema types.
-        - Always sets schema.date_prop if iso_date provided
-        - Always sets schema.title_prop if title_text provided
-        - Skips formula/rollup/created_time/last_edited_time (Notion rejects writes)
-        - Unknown properties are skipped (unless strict=True)
-        """
-        props_out: dict[str, Any] = {}
-
-        # Always include date/title if asked
-        if iso_date:
-            props_out[schema.date_prop] = {"date": {"start": str(iso_date)}}
-        if title_text is not None:
-            props_out[schema.title_prop] = prop_title(str(title_text))
-
-        for name, val in values.items():
-            if name in (schema.date_prop, schema.title_prop):
-                continue
-            if not schema.has_prop.get(name):
-                if strict:
-                    raise NotionError(f"Property not found in DB schema: {name}")
-                continue
-
-            ptype = schema.prop_types.get(name) or ""
-            if ptype in ("formula", "rollup", "created_time", "last_edited_time", "unique_id"):
-                continue
-
-            if allow_raw and _looks_like_raw_prop_payload(val):
-                props_out[name] = val
-                continue
-
-            builder = _TYPE_BUILDERS.get(ptype)
-            if not builder:
-                # unsupported for our workflow -> skip unless strict
-                if strict:
-                    raise NotionError(f"Unsupported property type '{ptype}' for '{name}'")
-                continue
-
-            built = builder(val)
-            if built is None:
-                continue
-            props_out[name] = built
-
-        return props_out
+        return build_properties_payload(
+            schema,
+            values=values,
+            iso_date=iso_date,
+            title_text=title_text,
+            allow_raw=allow_raw,
+            strict=strict,
+        )
 
     # ────────────────────────────────────────────────────────────────────
     # Writes (create/update/upsert)
     # ────────────────────────────────────────────────────────────────────
-    def _writes_allowed(self) -> bool:
-        return not (not self.allow_dryrun and _dryrun_on())
-
     async def create_page(self, database_id: str, properties: dict[str, Any]) -> str:
         if not self._writes_allowed():
             bump("notion_dryrun_skip")
@@ -678,12 +770,11 @@ class NotionAsync:
         strict: bool = False,
     ) -> str:
         """
-        Upsert pattern used by notion_pnl/notion_alert workflows:
+        Upsert pattern:
         - Find by schema.date_prop == iso_date
         - If exists: update properties
         - Else: create page
         """
-        # Determine title: explicit > values[schema.title_prop] > values["Notes"] > ""
         t = title_text
         if t is None:
             t = str(values.get(schema.title_prop) or values.get("Notes") or "")
@@ -691,7 +782,6 @@ class NotionAsync:
         props = self.build_properties(
             schema, values=values, iso_date=iso_date, title_text=t, strict=strict
         )
-
         pid = await self.find_page_by_date(database_id, schema.date_prop, iso_date)
         if pid:
             return await self.update_page(pid, props)
@@ -701,25 +791,9 @@ class NotionAsync:
 # ──────────────────────────────────────────────────────────────────────────────
 # Sync client (for scripts) — keeps old "Notion" name compatible
 # ──────────────────────────────────────────────────────────────────────────────
-class _SyncRateGate:
-    def __init__(self, rps: float) -> None:
-        self._next = 0.0
-        self._rps = max(0.0, float(rps or 0.0))
-
-    def wait(self) -> None:
-        if self._rps <= 0:
-            return
-        min_interval = 1.0 / self._rps
-        now = time.monotonic()
-        if now < self._next:
-            time.sleep(self._next - now)
-        self._next = time.monotonic() + min_interval
-
-
 class Notion:
     """
     Sync Notion client (scripts/tools). Backwards compatible with your existing usage.
-
     NOTE: In the live asyncio bot, prefer NotionAsync to avoid blocking the event loop.
     """
 
@@ -734,6 +808,7 @@ class Notion:
         backoff_max_sec: float | None = None,
         rps: float | None = None,
         allow_dryrun: bool | None = None,
+        client: httpx.Client | None = None,
     ) -> None:
         self.token = (token or _s("NOTION_TOKEN") or _s("NOTION_API_KEY")).strip()
         self.version = (version or _s("NOTION_VERSION", _DEFAULT_VER)).strip() or _DEFAULT_VER
@@ -750,13 +825,42 @@ class Notion:
         self.allow_dryrun = bool(
             allow_dryrun if allow_dryrun is not None else _b("NOTION_ALLOW_DRYRUN", True)
         )
-        self._gate = _SyncRateGate(float(rps if rps is not None else _f("NOTION_RPS", 2.0)))
+
+        rps_val = float(rps if rps is not None else _f("NOTION_RPS", 2.0))
+        self._gate = _SyncRateGate(rps_val)
+
+        self._external_client = client is not None
+        self._client_obj: httpx.Client | None = client
         self._schema_cache: dict[str, DbSchema] = {}
 
-    def _client(self) -> httpx.Client:
-        return httpx.Client(
-            headers=_hdrs(self.token, self.version), timeout=httpx.Timeout(self.timeout)
+    def ok(self) -> bool:
+        return bool(self.token)
+
+    def __enter__(self) -> Notion:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if not self._external_client and self._client_obj is not None:
+            with contextlib.suppress(Exception):
+                self._client_obj.close()
+        self._client_obj = None
+
+    def _ensure_client(self) -> httpx.Client:
+        if self._client_obj is not None:
+            return self._client_obj
+        self._client_obj = httpx.Client(
+            headers=_hdrs(self.token, self.version),
+            timeout=httpx.Timeout(self.timeout),
         )
+        return self._client_obj
+
+    def _writes_allowed(self) -> bool:
+        if _dryrun_on() and (not self.allow_dryrun):
+            return False
+        return True
 
     def _sleep_backoff(self, attempt: int, *, retry_after: float | None = None) -> None:
         if retry_after is not None:
@@ -779,22 +883,22 @@ class Notion:
 
         url = f"{NOTION_API}{path}"
         last_err: NotionError | None = None
+        c = self._ensure_client()
 
         for attempt in range(1, self.max_retries + 1):
             self._gate.wait()
             try:
-                with self._client() as c:
-                    resp = c.request(method, url, json=json_body, params=params)
-                rid = resp.headers.get("x-request-id") or resp.headers.get("request-id") or None
+                resp = c.request(method, url, json=json_body, params=params)
+                rid = _request_id(resp.headers)
 
                 if resp.status_code in (200, 201):
                     bump("notion_ok")
-                    return resp.json()
+                    data = resp.json()
+                    return data if isinstance(data, dict) else {}
 
                 if resp.status_code == 429:
                     bump("notion_429")
-                    ra = resp.headers.get("retry-after")
-                    retry_after = float(ra) if (ra and str(ra).strip().isdigit()) else None
+                    retry_after = _parse_retry_after(resp.headers)
                     last_err = NotionError(
                         f"Notion rate limited ({resp.status_code})",
                         status_code=resp.status_code,
@@ -891,14 +995,52 @@ class Notion:
         self._schema_cache[dbid] = schema
         return schema
 
-    def find_page_by_date(self, database_id: str, date_prop: str, iso_date: str) -> str | None:
+    def query_database(
+        self,
+        database_id: str,
+        *,
+        filter_obj: dict[str, Any] | None = None,
+        sorts: list[dict[str, Any]] | None = None,
+        page_size: int = 100,
+        start_cursor: str | None = None,
+        max_pages: int = 50,
+    ) -> list[dict[str, Any]]:
         dbid = normalize_notion_id(database_id)
-        payload = {"filter": {"property": date_prop, "date": {"equals": iso_date}}, "page_size": 1}
-        data = self._request("POST", f"/databases/{dbid}/query", json_body=payload)
-        results = data.get("results") or []
-        if not results:
+        out: list[dict[str, Any]] = []
+        cursor = start_cursor
+
+        for _ in range(max_pages):
+            payload: dict[str, Any] = {"page_size": max(1, min(int(page_size), 100))}
+            if filter_obj:
+                payload["filter"] = filter_obj
+            if sorts:
+                payload["sorts"] = sorts
+            if cursor:
+                payload["start_cursor"] = cursor
+
+            data = self._request("POST", f"/databases/{dbid}/query", json_body=payload)
+            results = data.get("results") or []
+            if isinstance(results, list):
+                out.extend([r for r in results if isinstance(r, dict)])
+
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+            if not cursor:
+                break
+
+        return out
+
+    def find_page_by_date(self, database_id: str, date_prop: str, iso_date: str) -> str | None:
+        rows = self.query_database(
+            database_id,
+            filter_obj={"property": date_prop, "date": {"equals": iso_date}},
+            page_size=1,
+            max_pages=1,
+        )
+        if not rows:
             return None
-        pid = (results[0] or {}).get("id")
+        pid = (rows[0] or {}).get("id")
         return normalize_notion_id(str(pid)) if pid else None
 
     def build_properties(
@@ -911,9 +1053,7 @@ class Notion:
         allow_raw: bool = True,
         strict: bool = False,
     ) -> dict[str, Any]:
-        # reuse async logic (pure)
-        na = NotionAsync(token=self.token, version=self.version, allow_dryrun=self.allow_dryrun)
-        return na.build_properties(
+        return build_properties_payload(
             schema,
             values=values,
             iso_date=iso_date,
@@ -929,11 +1069,10 @@ class Notion:
         Backwards compatible upsert: uses date match and writes properties.
         NOTE: blocking (sync) call.
         """
-        if (not self.allow_dryrun) and _dryrun_on():
+        if not self._writes_allowed():
             bump("notion_dryrun_skip")
             return "DRYRUN_PAGE"
 
-        # title text selection
         title_text = str(values.get(schema.title_prop) or values.get("Notes") or "")
         props = self.build_properties(
             schema, values=values, iso_date=iso_date, title_text=title_text
@@ -947,10 +1086,12 @@ class Notion:
 
         dbid = normalize_notion_id(database_id)
         data = self._request(
-            "POST", "/pages", json_body={"parent": {"database_id": dbid}, "properties": props}
+            "POST",
+            "/pages",
+            json_body={"parent": {"database_id": dbid}, "properties": props},
         )
-        pid = data.get("id")
-        return normalize_notion_id(str(pid)) if pid else ""
+        raw_id = data.get("id")
+        return normalize_notion_id(str(raw_id)) if raw_id else ""
 
 
 __all__ = [
@@ -959,6 +1100,7 @@ __all__ = [
     "Notion",
     "NotionAsync",
     "NotionError",
+    "build_properties_payload",
     "normalize_notion_id",
     "prop_checkbox",
     "prop_date_start",
@@ -966,7 +1108,6 @@ __all__ = [
     "prop_number",
     "prop_rich_text",
     "prop_select",
-    # property builders (useful for notion_alert/notion_pnl)
     "prop_title",
     "prop_url",
 ]

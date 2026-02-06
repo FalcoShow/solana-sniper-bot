@@ -1,26 +1,25 @@
-# playbook_logger.py
 from __future__ import annotations
 
 """
 playbook_logger.py — Runbook-grade events for “why not trading”
 ===============================================================
 
-This module is the canonical place to record *operational truth*:
+Canonical place to record *operational truth*:
 - What levers changed (who/why/old/new)
 - Why we are NOT trading right now (gates, infra, budget, scanner drought)
 - Key lifecycle events (startup/shutdown, health transitions)
 
 Storage targets (best-effort, never crash the bot):
-1) Redis stream     : playbook:events  (primary, fast, queryable)
-2) Redis status keys: playbook:status:<name> (for dashboards/health)
-3) Notion database  : NOTION_DB_PLAYBOOK (optional, human timeline)
+1) Redis stream      : playbook:events (primary, fast, queryable)
+2) Redis status keys : playbook:status:<name> (for dashboards/health)
+3) Notion database   : NOTION_DB_PLAYBOOK (optional, human timeline)
 
 Design goals
 ------------
 - Safe: never throws in production paths
 - Redacts secrets from fields/logs
 - Works with either utils_pkg.core_utils (preferred) or direct REDIS_URL
-- Supports both async usage (inside bot) and CLI usage (ops)
+- Supports async usage (inside bot) and CLI usage (ops)
 """
 
 import argparse
@@ -30,56 +29,121 @@ import json
 import logging
 import os
 import socket
+import sys
 import time
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import lru_cache
 from typing import Any
 
-log = logging.getLogger("playbook")
+LOG = logging.getLogger("playbook")
 
 
 # -----------------------------------------------------------------------------
-# Env / constants
+# Optional third-party imports (kept lightweight + mypy-safe)
 # -----------------------------------------------------------------------------
-
-REDIS_URL = (
-    os.getenv("REDIS_URL") or os.getenv("REDIS_TLS_URL") or "redis://localhost:6379"
-).strip()
-
-NOTION_TOKEN = (os.getenv("NOTION_TOKEN") or os.getenv("NOTION_API_KEY") or "").strip()
-NOTION_DB_PLAYBOOK = (
-    os.getenv("NOTION_DB_PLAYBOOK")
-    or os.getenv("NOTION_DATABASE_PLAYBOOK")
-    or os.getenv("NOTION_PLAYBOOK_DB")
-    or ""
-).strip()
-
-# Stream config
-PLAYBOOK_STREAM_KEY = os.getenv("PLAYBOOK_STREAM_KEY", "playbook:events").strip()
-PLAYBOOK_STREAM_MAXLEN = int(os.getenv("PLAYBOOK_STREAM_MAXLEN", "5000"))
-
-# Status config
-STATUS_KEY_PREFIX = os.getenv("PLAYBOOK_STATUS_PREFIX", "playbook:status:").strip()
-STATUS_DEFAULT_TTL_SEC = int(os.getenv("PLAYBOOK_STATUS_TTL_SEC", "900"))
-
-# Notion config
-NOTION_ENABLED = bool(
-    NOTION_TOKEN and NOTION_DB_PLAYBOOK and os.getenv("PLAYBOOK_NOTION_ENABLED", "1").strip() != "0"
-)
-NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28").strip()
-NOTION_TIMEOUT_SEC = float(os.getenv("PLAYBOOK_NOTION_TIMEOUT_SEC", "10"))
-NOTION_DEDUPE_TTL_SEC = int(os.getenv("PLAYBOOK_NOTION_DEDUPE_TTL_SEC", "86400"))
-
-# Safety
-MAX_FIELD_STR = int(os.getenv("PLAYBOOK_MAX_FIELD_STR", "400"))
-MAX_MSG_STR = int(os.getenv("PLAYBOOK_MAX_MSG_STR", "600"))
+redis_async: Any | None
+try:
+    import redis.asyncio as redis_async  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    redis_async = None
 
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Config (env-driven, cached)
 # -----------------------------------------------------------------------------
+@dataclass(frozen=True)
+class PlaybookConfig:
+    # Redis
+    redis_url: str
+    stream_key: str
+    stream_maxlen: int
+    status_prefix: str
+    status_default_ttl_sec: int
+
+    # Notion
+    notion_token: str
+    notion_db_playbook: str
+    notion_enabled: bool
+    notion_version: str
+    notion_timeout_sec: float
+    notion_dedupe_ttl_sec: int
+
+    # Safety / sizing
+    max_field_str: int
+    max_msg_str: int
+
+
+def _getenv_str(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip()
+
+
+def _getenv_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(float(raw))
+    except Exception:
+        return int(default)
+
+
+def _getenv_float(name: str, default: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+@lru_cache(maxsize=1)
+def cfg() -> PlaybookConfig:
+    """
+    Cached config. If you need to re-read env at runtime, call refresh_config().
+    """
+    # Keep your existing behavior: allow REDIS_TLS_URL fallback and local default.
+    redis_url = _getenv_str("REDIS_URL") or _getenv_str("REDIS_TLS_URL") or "redis://localhost:6379"
+
+    notion_token = _getenv_str("NOTION_TOKEN") or _getenv_str("NOTION_API_KEY")
+    notion_db_playbook = (
+        _getenv_str("NOTION_DB_PLAYBOOK")
+        or _getenv_str("NOTION_DATABASE_PLAYBOOK")
+        or _getenv_str("NOTION_PLAYBOOK_DB")
+    )
+
+    # Your existing enable switch: PLAYBOOK_NOTION_ENABLED != "0"
+    enabled_flag = _getenv_str("PLAYBOOK_NOTION_ENABLED", "1")
+    notion_enabled = bool(notion_token and notion_db_playbook and enabled_flag != "0")
+
+    return PlaybookConfig(
+        redis_url=redis_url,
+        stream_key=_getenv_str("PLAYBOOK_STREAM_KEY", "playbook:events"),
+        stream_maxlen=_getenv_int("PLAYBOOK_STREAM_MAXLEN", 5000),
+        status_prefix=_getenv_str("PLAYBOOK_STATUS_PREFIX", "playbook:status:"),
+        status_default_ttl_sec=_getenv_int("PLAYBOOK_STATUS_TTL_SEC", 900),
+        notion_token=notion_token,
+        notion_db_playbook=notion_db_playbook,
+        notion_enabled=notion_enabled,
+        notion_version=_getenv_str("NOTION_VERSION", "2022-06-28"),
+        notion_timeout_sec=_getenv_float("PLAYBOOK_NOTION_TIMEOUT_SEC", 10.0),
+        notion_dedupe_ttl_sec=_getenv_int("PLAYBOOK_NOTION_DEDUPE_TTL_SEC", 86400),
+        max_field_str=_getenv_int("PLAYBOOK_MAX_FIELD_STR", 400),
+        max_msg_str=_getenv_int("PLAYBOOK_MAX_MSG_STR", 600),
+    )
+
+
+def refresh_config() -> None:
+    cfg.cache_clear()
+
+
+# -----------------------------------------------------------------------------
+# Helpers (time, ids, strings, redaction)
+# -----------------------------------------------------------------------------
+_TRUE = {"1", "true", "yes", "y", "on"}
 
 
 def _now_ts() -> float:
@@ -87,17 +151,17 @@ def _now_ts() -> float:
 
 
 def _utc_iso(ts: float | None = None) -> str:
-    ts = float(ts if ts is not None else _now_ts())
-    return datetime.fromtimestamp(ts, tz=UTC).isoformat()
+    t = float(ts if ts is not None else _now_ts())
+    return datetime.fromtimestamp(t, tz=UTC).isoformat()
 
 
 def _truthy(v: str | None) -> bool:
     if v is None:
         return False
-    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return v.strip().lower() in _TRUE
 
 
-def _safe_str(x: Any, max_len: int = MAX_FIELD_STR) -> str:
+def _safe_str(x: Any, max_len: int) -> str:
     try:
         s = str(x)
     except Exception:
@@ -108,36 +172,50 @@ def _safe_str(x: Any, max_len: int = MAX_FIELD_STR) -> str:
     return s
 
 
-_SECRET_KEY_FRAGS = ("key", "token", "secret", "private", "pass", "pwd", "authorization", "bearer")
+_SECRET_KEY_FRAGS = (
+    "key",
+    "token",
+    "secret",
+    "private",
+    "pass",
+    "pwd",
+    "authorization",
+    "bearer",
+    "dsn",
+)
 
 
-def _redact_value(v: Any) -> str:
-    s = _safe_str(v, max_len=MAX_FIELD_STR)
+def _redact_value(v: Any, max_len: int) -> str:
+    s = _safe_str(v, max_len=max_len)
     if not s:
         return s
-    # Keep only ends for debugging
     if len(s) <= 10:
         return "***"
     return f"{s[:3]}…{s[-3:]}"
 
 
-def _sanitize_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
+def _sanitize_fields(fields: Mapping[str, Any], *, max_field_str: int) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for k, v in (fields or {}).items():
         ks = _safe_str(k, 80)
         low = ks.lower()
+
+        # Redact by key name
         if any(frag in low for frag in _SECRET_KEY_FRAGS):
-            out[ks] = _redact_value(v)
+            out[ks] = _redact_value(v, max_len=max_field_str)
             continue
+
         # JSON-safe coercions
-        if isinstance(v, str | int | float | bool) or v is None:
-            out[ks] = v if not isinstance(v, str) else _safe_str(v, MAX_FIELD_STR)
-        else:
-            # serialize complex values safely
-            try:
-                out[ks] = json.loads(json.dumps(v, default=str))
-            except Exception:
-                out[ks] = _safe_str(v, MAX_FIELD_STR)
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            out[ks] = _safe_str(v, max_field_str) if isinstance(v, str) else v
+            continue
+
+        # serialize complex values safely
+        try:
+            out[ks] = json.loads(json.dumps(v, default=str))
+        except Exception:
+            out[ks] = _safe_str(v, max_field_str)
+
     return out
 
 
@@ -145,9 +223,9 @@ def _host_meta() -> dict[str, Any]:
     return {
         "host": socket.gethostname(),
         "pid": os.getpid(),
-        "service": os.getenv("SERVICE", "sniper"),
-        "env": os.getenv("ENV", ""),
-        "version": os.getenv("VERSION", "") or os.getenv("GIT_SHA", "") or "",
+        "service": _getenv_str("SERVICE", "sniper"),
+        "env": _getenv_str("ENV", ""),
+        "version": _getenv_str("VERSION", "") or _getenv_str("GIT_SHA", "") or "",
     }
 
 
@@ -162,18 +240,37 @@ def _level_norm(level: str) -> str:
     return "INFO"
 
 
+def _json_compact(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
 # -----------------------------------------------------------------------------
-# Redis access (prefer core_utils; fallback to aioredis)
+# Redis access (prefer core_utils; fallback to redis_async; never raises)
 # -----------------------------------------------------------------------------
+class _NoopRedis:
+    async def xadd(self, *_a: Any, **_k: Any) -> None:
+        return None
 
-_aioredis = None
-try:
-    import redis.asyncio as _aioredis  # type: ignore
-except Exception:
-    _aioredis = None
+    async def set(self, *_a: Any, **_k: Any) -> None:
+        return None
+
+    async def setex(self, *_a: Any, **_k: Any) -> None:
+        return None
+
+    async def expire(self, *_a: Any, **_k: Any) -> None:
+        return None
+
+    async def incrby(self, *_a: Any, **_k: Any) -> None:
+        return None
+
+    async def ping(self) -> bool:
+        return False
+
+    async def close(self) -> None:
+        return None
 
 
-@dataclass
+@dataclass(frozen=True)
 class _RedisHandle:
     client: Any
     owned: bool  # if we created it, we should close it
@@ -185,7 +282,7 @@ _REDIS_LOCK = asyncio.Lock()
 
 async def _get_redis() -> _RedisHandle:
     """
-    Returns a redis handle (client + owned flag). Never raises.
+    Returns a redis handle (client + owned flag). Best-effort; never raises.
     """
     global _REDIS_SINGLETON
 
@@ -193,7 +290,7 @@ async def _get_redis() -> _RedisHandle:
         if _REDIS_SINGLETON is not None:
             return _REDIS_SINGLETON
 
-        # Prefer utils_pkg.core_utils
+        # Prefer utils_pkg.core_utils if available
         try:
             from utils_pkg import core_utils as cu  # type: ignore
 
@@ -208,57 +305,24 @@ async def _get_redis() -> _RedisHandle:
         except Exception:
             pass
 
-        # Fallback to aioredis
-        if _aioredis is None:
-            # Dummy no-op client
-            class _Dummy:
-                async def xadd(self, *_a, **_k):
-                    return None
-
-                async def set(self, *_a, **_k):
-                    return None
-
-                async def setex(self, *_a, **_k):
-                    return None
-
-                async def expire(self, *_a, **_k):
-                    return None
-
-                async def ping(self):
-                    return False
-
-                async def close(self):
-                    return None
-
-            _REDIS_SINGLETON = _RedisHandle(client=_Dummy(), owned=True)
+        # Fallback to redis_async if installed
+        if redis_async is None:
+            _REDIS_SINGLETON = _RedisHandle(client=_NoopRedis(), owned=True)
             return _REDIS_SINGLETON
 
+        # Create our own client (fast-fail connect parameters to avoid hanging)
         try:
-            r = _aioredis.from_url(REDIS_URL, decode_responses=True)
+            c = cfg()
+            r = redis_async.from_url(  # type: ignore[union-attr]
+                c.redis_url,
+                decode_responses=True,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
             _REDIS_SINGLETON = _RedisHandle(client=r, owned=True)
             return _REDIS_SINGLETON
         except Exception:
-            # Dummy if creation fails
-            class _Dummy:
-                async def xadd(self, *_a, **_k):
-                    return None
-
-                async def set(self, *_a, **_k):
-                    return None
-
-                async def setex(self, *_a, **_k):
-                    return None
-
-                async def expire(self, *_a, **_k):
-                    return None
-
-                async def ping(self):
-                    return False
-
-                async def close(self):
-                    return None
-
-            _REDIS_SINGLETON = _RedisHandle(client=_Dummy(), owned=True)
+            _REDIS_SINGLETON = _RedisHandle(client=_NoopRedis(), owned=True)
             return _REDIS_SINGLETON
 
 
@@ -276,68 +340,8 @@ async def close() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Notion (best-effort)
+# Notion (best-effort; never raises)
 # -----------------------------------------------------------------------------
-
-
-async def _notion_create_page(title: str, props: dict[str, Any]) -> None:
-    """
-    Create a page in Notion database. Best-effort.
-    """
-    if not NOTION_ENABLED:
-        return
-
-    # Prefer utils_pkg.notion_client if present
-    try:
-        from utils_pkg import notion_client as nc  # type: ignore
-
-        fn = getattr(nc, "create_page", None) or getattr(nc, "create_playbook_entry", None)
-        if callable(fn):
-            out = fn(database_id=NOTION_DB_PLAYBOOK, title=title, properties=props)  # type: ignore
-            if asyncio.iscoroutine(out):
-                await out
-            return
-    except Exception:
-        pass
-
-    # Fallback raw HTTP
-    try:
-        import aiohttp
-
-        headers = {
-            "Authorization": f"Bearer {NOTION_TOKEN}",
-            "Notion-Version": NOTION_VERSION,
-            "Content-Type": "application/json",
-        }
-
-        body = {"parent": {"database_id": NOTION_DB_PLAYBOOK}, "properties": props}
-
-        timeout = aiohttp.ClientTimeout(total=NOTION_TIMEOUT_SEC)
-
-        # Prefer utils_pkg.proxy_client session if available (proxy/timeouts unified)
-        try:
-            from utils_pkg.proxy_client import make_session  # type: ignore
-
-            async with make_session(timeout=NOTION_TIMEOUT_SEC) as s:  # type: ignore
-                async with s.post(
-                    "https://api.notion.com/v1/pages", headers=headers, json=body
-                ) as r:
-                    if r.status not in (200, 201):
-                        txt = await r.text()
-                        log.warning("[notion] create failed: %s %s", r.status, (txt or "")[:200])
-            return
-        except Exception:
-            pass
-
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.post("https://api.notion.com/v1/pages", headers=headers, json=body) as r:
-                if r.status not in (200, 201):
-                    txt = await r.text()
-                    log.warning("[notion] create failed: %s %s", r.status, (txt or "")[:200])
-    except Exception as e:
-        log.debug("[notion] error: %s", e)
-
-
 def _notion_rich_text(s: str) -> dict[str, Any]:
     return {"rich_text": [{"type": "text", "text": {"content": _safe_str(s, 1800)}}]}
 
@@ -350,11 +354,63 @@ def _notion_date_iso(ts: float) -> dict[str, Any]:
     return {"date": {"start": datetime.fromtimestamp(ts, tz=UTC).isoformat()}}
 
 
+async def _notion_create_page(*, title: str, props: dict[str, Any]) -> None:
+    c = cfg()
+    if not c.notion_enabled:
+        return
+
+    # Prefer utils_pkg.notion_client if present
+    try:
+        from utils_pkg import notion_client as nc  # type: ignore
+
+        fn = getattr(nc, "create_page", None) or getattr(nc, "create_playbook_entry", None)
+        if callable(fn):
+            out = fn(database_id=c.notion_db_playbook, title=title, properties=props)  # type: ignore
+            if asyncio.iscoroutine(out):
+                await out
+            return
+    except Exception:
+        pass
+
+    # Fallback raw HTTP (import aiohttp only when needed)
+    try:
+        import aiohttp  # type: ignore[import-not-found]
+
+        headers = {
+            "Authorization": f"Bearer {c.notion_token}",
+            "Notion-Version": c.notion_version,
+            "Content-Type": "application/json",
+        }
+        body = {"parent": {"database_id": c.notion_db_playbook}, "properties": props}
+        timeout = aiohttp.ClientTimeout(total=float(c.notion_timeout_sec))
+
+        # Prefer utils_pkg.proxy_client session if available (unified timeouts/proxy)
+        try:
+            from utils_pkg.proxy_client import make_session  # type: ignore
+
+            async with make_session(timeout=c.notion_timeout_sec) as s:  # type: ignore
+                async with s.post(
+                    "https://api.notion.com/v1/pages", headers=headers, json=body
+                ) as r:
+                    if r.status not in (200, 201):
+                        txt = await r.text()
+                        LOG.warning("[notion] create failed: %s %s", r.status, (txt or "")[:200])
+            return
+        except Exception:
+            pass
+
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.post("https://api.notion.com/v1/pages", headers=headers, json=body) as r:
+                if r.status not in (200, 201):
+                    txt = await r.text()
+                    LOG.warning("[notion] create failed: %s %s", r.status, (txt or "")[:200])
+    except Exception as e:
+        LOG.debug("[notion] error: %s", e)
+
+
 # -----------------------------------------------------------------------------
 # Public API: log_event / set_status / lever changes / why-not-trading
 # -----------------------------------------------------------------------------
-
-
 async def log_event(
     *,
     kind: str,
@@ -376,19 +432,20 @@ async def log_event(
     code  : optional reason code (e.g. "NO_CANDIDATES", "RPC_UNHEALTHY")
     fields: structured details (auto-redacted)
     """
+    c = cfg()
     ts = _now_ts()
     eid = event_id or _make_event_id()
     lvl = _level_norm(level)
 
-    msg_s = _safe_str(msg, MAX_MSG_STR)
+    msg_s = _safe_str(msg, c.max_msg_str)
     kind_s = _safe_str(kind or "event", 64)
     name_s = _safe_str(name, 96)
     code_s = _safe_str(code, 96)
 
     meta = _host_meta()
-    f = _sanitize_fields(fields or {})
+    f = _sanitize_fields(fields or {}, max_field_str=c.max_field_str)
 
-    event = {
+    event: dict[str, Any] = {
         "id": eid,
         "ts": ts,
         "time": _utc_iso(ts),
@@ -406,30 +463,28 @@ async def log_event(
         try:
             h = await _get_redis()
             r = h.client
-            # Streams only accept flat string fields; store compact JSON in one field
-            payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"), default=str)
+
+            payload = _json_compact(event)
             await r.xadd(
-                PLAYBOOK_STREAM_KEY,
+                c.stream_key,
                 {"json": payload, "kind": kind_s, "level": lvl, "code": code_s, "name": name_s},
-                maxlen=PLAYBOOK_STREAM_MAXLEN,
+                maxlen=int(c.stream_maxlen),
                 approximate=True,
             )
-            # Also keep "last event" pointer for dashboards
-            try:
+
+            # "last event" pointers for dashboards
+            with contextlib.suppress(Exception):
                 await r.set(f"playbook:last:{kind_s}", payload)
                 await r.set(f"playbook:last:{kind_s}:{name_s or 'default'}", payload)
-            except Exception:
-                pass
         except Exception:
-            # never fail callers
             pass
 
     # Notion write (best-effort, deduped)
     if to_notion is None:
-        # Default: only send warnings/errors or explicit why-not-trading codes
+        # Default: only send warnings/errors or explicit why-not-trading events
         to_notion = (lvl in {"WARNING", "ERROR", "CRITICAL"}) or (kind_s == "why_not_trading")
 
-    if to_notion and NOTION_ENABLED:
+    if to_notion and c.notion_enabled:
         try:
             # Dedupe to avoid Notion spam (per event id)
             try:
@@ -439,7 +494,9 @@ async def log_event(
                 ok = True
                 try:
                     # setnx style
-                    set_ok = await r.set(dedupe_key, "1", nx=True, ex=NOTION_DEDUPE_TTL_SEC)  # type: ignore
+                    set_ok = await r.set(  # type: ignore[call-arg]
+                        dedupe_key, "1", nx=True, ex=int(c.notion_dedupe_ttl_sec)
+                    )
                     ok = bool(set_ok)
                 except Exception:
                     ok = True
@@ -458,12 +515,10 @@ async def log_event(
                 "Message": _notion_rich_text(msg_s),
                 "Timestamp": _notion_date_iso(ts),
                 "EventId": _notion_rich_text(eid),
-                "Host": _notion_rich_text(_safe_str(meta.get("host", ""))),
-                "Service": _notion_rich_text(_safe_str(meta.get("service", ""))),
-                "Version": _notion_rich_text(_safe_str(meta.get("version", ""))),
-                "Fields": _notion_rich_text(
-                    _safe_str(json.dumps(f, ensure_ascii=False, default=str), 1800)
-                ),
+                "Host": _notion_rich_text(_safe_str(meta.get("host", ""), 200)),
+                "Service": _notion_rich_text(_safe_str(meta.get("service", ""), 200)),
+                "Version": _notion_rich_text(_safe_str(meta.get("version", ""), 200)),
+                "Fields": _notion_rich_text(_safe_str(_json_compact(f), 1800)),
             }
             await _notion_create_page(title=title, props=props)
         except Exception:
@@ -479,7 +534,7 @@ async def set_status(
     state: str = "",
     msg: str = "",
     fields: Mapping[str, Any] | None = None,
-    ttl_sec: int = STATUS_DEFAULT_TTL_SEC,
+    ttl_sec: int | None = None,
 ) -> dict[str, Any]:
     """
     Store a structured status snapshot used by dashboards / health tooling.
@@ -491,36 +546,40 @@ async def set_status(
       - "entry_gate"
       - "budget"
     """
+    c = cfg()
     ts = _now_ts()
-    payload = {
+    ttl = int(ttl_sec) if ttl_sec is not None else int(c.status_default_ttl_sec)
+
+    payload: dict[str, Any] = {
         "ts": ts,
         "time": _utc_iso(ts),
         "name": _safe_str(name, 120),
         "ok": ok,
         "state": _safe_str(state, 120),
-        "msg": _safe_str(msg, MAX_MSG_STR),
-        "fields": _sanitize_fields(fields or {}),
+        "msg": _safe_str(msg, c.max_msg_str),
+        "fields": _sanitize_fields(fields or {}, max_field_str=c.max_field_str),
         **_host_meta(),
     }
+
     try:
         h = await _get_redis()
         r = h.client
-        key = f"{STATUS_KEY_PREFIX}{payload['name']}"
-        blob = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+        key = f"{c.status_prefix}{payload['name']}"
+        blob = _json_compact(payload)
+
         try:
-            await r.setex(key, int(ttl_sec), blob)
+            await r.setex(key, ttl, blob)
         except Exception:
             await r.set(key, blob)
             with contextlib.suppress(Exception):
-                await r.expire(key, int(ttl_sec))
+                await r.expire(key, ttl)
     except Exception:
         pass
+
     return payload
 
 
 # --- Lever changes ------------------------------------------------------------
-
-
 async def log_lever_change(
     lever: str,
     old: Any,
@@ -532,8 +591,9 @@ async def log_lever_change(
     to_notion: bool | None = True,
 ) -> dict[str, Any]:
     """
-    Records a lever change to Redis (keys + stream) and optionally Notion.
+    Record a lever change to Redis (keys + stream) and optionally Notion.
     """
+    c = cfg()
     lever_s = _safe_str(lever, 180)
     ts = _now_ts()
 
@@ -542,11 +602,11 @@ async def log_lever_change(
         h = await _get_redis()
         r = h.client
         base = f"playbook:lever:{lever_s}"
-        await r.set(f"{base}:value", _safe_str(new))
-        await r.set(f"{base}:old_value", _safe_str(old))
-        await r.set(f"{base}:reason", _safe_str(reason))
-        await r.set(f"{base}:kpi_before", _safe_str(kpi_before))
-        await r.set(f"{base}:kpi_after", _safe_str(kpi_after))
+        await r.set(f"{base}:value", _safe_str(new, c.max_field_str))
+        await r.set(f"{base}:old_value", _safe_str(old, c.max_field_str))
+        await r.set(f"{base}:reason", _safe_str(reason, c.max_msg_str))
+        await r.set(f"{base}:kpi_before", _safe_str(kpi_before, c.max_msg_str))
+        await r.set(f"{base}:kpi_after", _safe_str(kpi_after, c.max_msg_str))
         await r.set(f"{base}:last_change_ts", str(ts))
         with contextlib.suppress(Exception):
             await r.incrby(f"{base}:changes", 1)
@@ -562,8 +622,8 @@ async def log_lever_change(
         msg=f"Lever changed: {lever_s} = {old} → {new}",
         fields={
             "lever": lever_s,
-            "old": _safe_str(old),
-            "new": _safe_str(new),
+            "old": _safe_str(old, c.max_field_str),
+            "new": _safe_str(new, c.max_field_str),
             "reason": reason,
             "kpi_before": kpi_before,
             "kpi_after": kpi_after,
@@ -573,7 +633,6 @@ async def log_lever_change(
 
 
 # --- Why-not-trading ----------------------------------------------------------
-
 WHY_CODES = {
     # infra
     "INFRA_DOWN",
@@ -623,7 +682,6 @@ async def why_not_trading(
     """
     code_s = _safe_str(code, 120)
     if code_s and code_s not in WHY_CODES:
-        # allow custom codes but keep it obvious in logs
         code_s = f"CUSTOM_{code_s}"
 
     ev = await log_event(
@@ -636,46 +694,55 @@ async def why_not_trading(
         to_notion=to_notion,
     )
 
-    # Also update status key for quick dashboard glance
     await set_status(
         f"why_not_trading:{name or 'global'}",
         ok=False,
         state=code_s,
         msg=msg,
         fields=fields,
-        ttl_sec=STATUS_DEFAULT_TTL_SEC,
     )
 
     return ev
 
 
 # -----------------------------------------------------------------------------
-# Sync convenience wrappers (safe in scripts)
+# Sync convenience wrappers (safe in scripts; not for use inside running loops)
 # -----------------------------------------------------------------------------
+def _run(coro: Any) -> Any:
+    try:
+        loop = asyncio.get_running_loop()
+    except Exception:
+        loop = None
+
+    if loop and loop.is_running():
+        # In an already-running loop you should call the async API directly.
+        raise RuntimeError(
+            "Use async functions inside a running event loop (log_event/why_not_trading/etc)."
+        )
+
+    return asyncio.run(coro)
 
 
 def log_event_sync(**kwargs: Any) -> dict[str, Any]:
-    return asyncio.run(log_event(**kwargs))
+    return _run(log_event(**kwargs))
 
 
 def log_lever_change_sync(
     lever: str, old: Any, new: Any, reason: str = "", kpi_before: str = "", kpi_after: str = ""
 ) -> dict[str, Any]:
-    return asyncio.run(log_lever_change(lever, old, new, reason, kpi_before, kpi_after))
+    return _run(log_lever_change(lever, old, new, reason, kpi_before, kpi_after))
 
 
 def why_not_trading_sync(
     code: str, msg: str, name: str = "", fields: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
-    return asyncio.run(why_not_trading(code, msg, name=name, fields=fields))
+    return _run(why_not_trading(code, msg, name=name, fields=fields))
 
 
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
-
-
-def _parse_json_kv(items: Iterable[str]) -> dict[str, Any]:
+def _parse_json_kv(items: Iterable[str], *, max_key_len: int = 120) -> dict[str, Any]:
     """
     Accepts:
       --field k=v
@@ -683,20 +750,25 @@ def _parse_json_kv(items: Iterable[str]) -> dict[str, Any]:
     """
     out: dict[str, Any] = {}
     for it in items:
-        it = (it or "").strip()
-        if not it:
+        s = (it or "").strip()
+        if not s:
             continue
-        if it.startswith("{") and it.endswith("}"):
+
+        if s.startswith("{") and s.endswith("}"):
             try:
-                out.update(json.loads(it))
-                continue
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    out.update(obj)
+                    continue
             except Exception:
                 pass
-        if "=" in it:
-            k, v = it.split("=", 1)
-            out[_safe_str(k, 120)] = v
+
+        if "=" in s:
+            k, v = s.split("=", 1)
+            out[_safe_str(k, max_key_len)] = v
         else:
-            out[f"arg_{len(out) + 1}"] = it
+            out[f"arg_{len(out) + 1}"] = s
+
     return out
 
 
@@ -733,71 +805,79 @@ def _build_parser() -> argparse.ArgumentParser:
     p_stat.add_argument("--ok", default="", help="true/false/blank")
     p_stat.add_argument("--state", default="", help="state string")
     p_stat.add_argument("--msg", default="", help="message")
-    p_stat.add_argument("--ttl", type=int, default=STATUS_DEFAULT_TTL_SEC, help="ttl seconds")
+    p_stat.add_argument("--ttl", type=int, default=0, help="ttl seconds (0 = default)")
     p_stat.add_argument("--field", action="append", default=[], help="extra fields: k=v or JSON")
 
     return p
 
 
-async def _amain(argv: list[str]) -> int:
-    # minimal logging if caller didn’t configure it
+async def _amain(argv: Sequence[str]) -> int:
+    # Minimal logging if caller didn’t configure it
     if not logging.getLogger().handlers:
         logging.basicConfig(
             level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
         )
 
-    args = _build_parser().parse_args(argv)
+    args = _build_parser().parse_args(list(argv))
+    cmd = str(getattr(args, "cmd", "")).strip()
 
-    if args.cmd == "lever":
+    if cmd == "lever":
         await log_lever_change(
             args.lever,
             args.old,
             args.new,
-            args.reason,
-            args.kpi_before,
-            args.kpi_after,
+            getattr(args, "reason", ""),
+            getattr(args, "kpi_before", ""),
+            getattr(args, "kpi_after", ""),
             to_notion=True,
         )
         return 0
 
-    if args.cmd == "event":
-        fields = _parse_json_kv(args.field)
+    if cmd == "event":
+        fields = _parse_json_kv(getattr(args, "field", []))
         await log_event(
             kind=args.kind,
             msg=args.msg,
-            level=args.level,
-            name=args.name,
-            code=args.code,
+            level=getattr(args, "level", "INFO"),
+            name=getattr(args, "name", ""),
+            code=getattr(args, "code", ""),
             fields=fields,
             to_notion=None,
         )
         return 0
 
-    if args.cmd == "why":
-        fields = _parse_json_kv(args.field)
-        await why_not_trading(args.code, args.msg, name=args.name, fields=fields, to_notion=True)
+    if cmd == "why":
+        fields = _parse_json_kv(getattr(args, "field", []))
+        await why_not_trading(
+            args.code,
+            args.msg,
+            name=getattr(args, "name", ""),
+            fields=fields,
+            to_notion=True,
+        )
         return 0
 
-    if args.cmd == "status":
-        ok_val: bool | None
-        ok_val = None if not str(args.ok).strip() else _truthy(str(args.ok))
-        fields = _parse_json_kv(args.field)
+    if cmd == "status":
+        ok_raw = str(getattr(args, "ok", "")).strip()
+        ok_val: bool | None = None if not ok_raw else _truthy(ok_raw)
+        fields = _parse_json_kv(getattr(args, "field", []))
+        ttl = int(getattr(args, "ttl", 0) or 0)
         await set_status(
             args.name,
             ok=ok_val,
-            state=args.state,
-            msg=args.msg,
+            state=getattr(args, "state", ""),
+            msg=getattr(args, "msg", ""),
             fields=fields,
-            ttl_sec=int(args.ttl),
+            ttl_sec=None if ttl <= 0 else ttl,
         )
         return 0
 
     return 2
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     try:
-        rc = asyncio.run(_amain(list(os.sys.argv[1:])))
+        rc = asyncio.run(_amain(list(sys.argv[1:]) if argv is None else argv))
     except KeyboardInterrupt:
         rc = 130
     raise SystemExit(int(rc))

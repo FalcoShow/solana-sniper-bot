@@ -1,4 +1,4 @@
-# ai_gate.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
@@ -7,8 +7,8 @@ ai_gate.py — Compatibility Gate (God-Tier Overhaul / P0→P2)
 
 IMPORTANT (architecture lock-in)
 --------------------------------
-This module is intentionally **NOT** a second “entry brain”.
-Your canonical entry decision is:
+This module is intentionally NOT a second “entry brain”.
+Your canonical entry decision remains:
     utils_pkg.ai_entry_logic.should_enter(features)
 
 This file exists for legacy callers that still do:
@@ -16,11 +16,13 @@ This file exists for legacy callers that still do:
 
 Design goals
 ------------
-- Never raise (fail-soft): always returns (ok, report)
+- Fail-soft: never raise for normal errors (always returns (ok, report))
+- Cancellation-safe: never swallow asyncio.CancelledError
 - Deterministic defaults; network calls are optional and timeboxed
-- No hard dependency on OpenAI at import time
+- No hard dependency on OpenAI at import time (lazy import)
 - Minimal duplication: honeypot + quote + optional AI hint only
-- Production-safe: caching, timeouts, rate limits, structured reasons
+- Production-safe: concurrency limits, micro-cache, structured reasons
+- Canonical logging: uses utils_pkg.logging_setup.get_logger -> EventLogger (single contract)
 
 Public API
 ----------
@@ -34,26 +36,96 @@ You may pass pre-fetched data to avoid duplicated calls:
       "honeypot": (hp_ok, hp_report)    # if you already ran honeypot_check
       "jup_buy_quote": {...}            # if you already fetched quote
       "decimals": 6                     # if you already know mint decimals
+      "entry_solin": 0.00012            # if you already computed entry price (SOL/token)
   }
 """
 
 import asyncio
 import base64
 import json
+import logging
 import os
+import threading
 import time
 from dataclasses import asdict, dataclass
-from typing import Any
-
-from logging_setup import get_logger
-
-log = get_logger(__name__)
+from typing import TYPE_CHECKING, Any
 
 Json = dict[str, Any]
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Canonical logging (EventLogger)
+# ──────────────────────────────────────────────────────────────────────────────
+if TYPE_CHECKING:
+    from utils_pkg.log_compat import EventLogger
+else:
+    EventLogger = Any  # type: ignore[assignment,misc]
+
+_LOG_LOCK = threading.Lock()
+_LOG: EventLogger | None = None
+
+_ONCE_LOCK = threading.Lock()
+_ONCE_SEEN: dict[str, float] = {}
+
+
+def _logger() -> EventLogger:
+    """
+    Lazy-get canonical EventLogger.
+    No import-time logging configuration side effects.
+    """
+    global _LOG
+    if _LOG is None:
+        with _LOG_LOCK:
+            if _LOG is None:
+                from utils_pkg.logging_setup import get_logger as _get_logger
+
+                _LOG = _get_logger("ai_gate")
+    return _LOG
+
+
+def _level_to_str(level: int | str) -> str | int:
+    # Keep compatible: EventLogger accepts str|int. Preserve ints.
+    if isinstance(level, int):
+        return level
+    s = str(level).upper().strip()
+    return s or "INFO"
+
+
+def _log_once(
+    event: str,
+    *,
+    ttl: float = 30.0,
+    level: int | str = logging.INFO,
+    msg: str | None = None,
+    **fields: Any,
+) -> bool:
+    """
+    Dedup bursts of identical events (per process).
+    """
+    now = time.monotonic()
+    with _ONCE_LOCK:
+        last = float(_ONCE_SEEN.get(event, 0.0))
+        if now - last < float(ttl):
+            return False
+        _ONCE_SEEN[event] = now
+
+    try:
+        _logger().event(event, msg=(msg or event), level=_level_to_str(level), **fields)
+    except Exception:
+        # never let logging break gate
+        pass
+    return True
+
+
+def _short(x: Any, n: int = 240) -> str:
+    try:
+        s = str(x)
+        return s if len(s) <= n else (s[:n] + "…")
+    except Exception:
+        return "<unprintable>"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Small env helpers
+# Small env helpers (NO new env key names introduced)
 # ──────────────────────────────────────────────────────────────────────────────
 def _env_str(key: str, default: str = "") -> str:
     v = os.getenv(key)
@@ -89,10 +161,14 @@ def _env_float(key: str, default: float) -> float:
 
 def _clip01(x: float) -> float:
     try:
-        x = float(x)
+        f = float(x)
     except Exception:
         return 0.0
-    return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+    if f < 0.0:
+        return 0.0
+    if f > 1.0:
+        return 1.0
+    return f
 
 
 def _now() -> float:
@@ -100,7 +176,7 @@ def _now() -> float:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Config (kept compatible with your existing env names; adds a few safe knobs)
+# Config (kept compatible with your existing env names)
 # ──────────────────────────────────────────────────────────────────────────────
 AIGATE_ENABLED = _env_bool("AIGATE_ENABLED", True)
 
@@ -113,9 +189,7 @@ AIGATE_REQUIRE_ENTRY_PRICE = _env_bool("AIGATE_REQUIRE_ENTRY_PRICE", False)
 
 AIGATE_MAX_PARALLEL = max(1, _env_int("AIGATE_MAX_PARALLEL", 12))
 AIGATE_NET_TIMEOUT_SEC = max(1.0, _env_float("AIGATE_NET_TIMEOUT_SEC", 8.0))
-AIGATE_CACHE_TTL_SEC = max(
-    0.0, _env_float("AIGATE_CACHE_TTL_SEC", 3.0)
-)  # short TTL to dedupe bursts
+AIGATE_CACHE_TTL_SEC = max(0.0, _env_float("AIGATE_CACHE_TTL_SEC", 3.0))
 
 # AI classifier (optional hint/block)
 AIGATE_AI_ENABLED = _env_bool("AIGATE_AI_ENABLED", True) and bool(_env_str("OPENAI_API_KEY", ""))
@@ -127,7 +201,7 @@ AIGATE_AI_TIMEOUT_SEC = max(1.0, _env_float("AIGATE_AI_TIMEOUT_SEC", 6.0))
 AIGATE_AI_COOLDOWN_SEC = max(0.0, _env_float("AIGATE_AI_COOLDOWN_SEC", 8.0))
 
 # Optional Birdeye fallback (only used if your honeypot module exposes it)
-AIGATE_SOL_USD = _env_float("AIGATE_SOL_USD", 0.0)  # if you want USD->SOL conversion fallback
+AIGATE_SOL_USD = _env_float("AIGATE_SOL_USD", 0.0)  # USD->SOL fallback only if >0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -139,11 +213,11 @@ _AI_LAST_CALL: dict[str, float] = {}  # mint -> ts
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# External dependencies (imported lazily)
+# External dependencies (imported lazily / best-effort)
 # ──────────────────────────────────────────────────────────────────────────────
 def _try_import_honeypot() -> Any | None:
     try:
-        from utils_pkg.honeypot import honeypot_check  # type: ignore
+        from utils_pkg.honeypot import honeypot_check  # type: ignore[import-not-found]
 
         return honeypot_check
     except Exception:
@@ -152,14 +226,13 @@ def _try_import_honeypot() -> Any | None:
 
 def _try_import_honeypot_bits() -> dict[str, Any]:
     """
-    Best-effort to reuse constants/helpers if your project has them.
-    We do NOT require these to exist.
+    Best-effort reuse of constants/helpers if your project exposes them.
+    No network calls here.
     """
     bits: dict[str, Any] = {}
     try:
-        from utils_pkg import honeypot as hp  # type: ignore
+        from utils_pkg import honeypot as hp  # type: ignore[import-not-found]
 
-        # Optional bits
         bits["WSOL_MINT"] = getattr(hp, "WSOL_MINT", "So11111111111111111111111111111111111111112")
         bits["JUPITER_QUOTE_URL"] = getattr(
             hp, "JUPITER_QUOTE_URL", "https://quote-api.jup.ag/v6/quote"
@@ -188,7 +261,7 @@ SHARED_SOLANA_CLIENT = _HP_BITS.get("SHARED_SOLANA_CLIENT", None)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Policy + reason codes (structured for analytics)
+# Policy snapshot (structured)
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class GatePolicy:
@@ -244,28 +317,30 @@ def safe_int(x: Any) -> int | None:
 
 
 def _price_impact_bps(q: Json | None) -> int | None:
+    """
+    Jupiter priceImpactPct is typically a fraction: 0.0123 == 1.23%.
+    Convert to bps: 0.0123 * 10_000 == 123 bps.
+    """
     if not q:
         return None
     f = safe_float(q.get("priceImpactPct"))
     if f is None:
         return None
-    # Jupiter returns fraction: 0.0123 = 1.23%
-    return int(round(f * 10_000))
+    return int(round(float(f) * 10_000))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Networking: Jupiter quote (ExactIn) + Birdeye fallback (optional)
+# Networking: use shared aiohttp session from honeypot (fail-soft if unavailable)
 # ──────────────────────────────────────────────────────────────────────────────
 async def _http_get_json(
-    url: str, params: dict[str, str], headers: dict[str, str] | None = None
+    url: str, *, params: dict[str, str], headers: dict[str, str] | None = None
 ) -> Json | None:
-    """
-    Uses your project's shared session if present; otherwise fails-soft.
-    """
     sess = None
     try:
         if callable(_get_session):
             sess = await _get_session()
+    except asyncio.CancelledError:
+        raise
     except Exception:
         sess = None
 
@@ -274,9 +349,13 @@ async def _http_get_json(
 
     try:
         async with sess.get(url, params=params, headers=headers) as resp:
-            if resp.status != 200:
+            status = int(getattr(resp, "status", 0) or 0)
+            if status != 200:
                 return None
-            return await resp.json()
+            js = await resp.json()
+            return js if isinstance(js, dict) else None
+    except asyncio.CancelledError:
+        raise
     except Exception:
         return None
 
@@ -296,8 +375,10 @@ async def jup_quote_buy(mint: str, sol_in_lamports: int = DEFAULT_SOL_IN_LAMPORT
     try:
         return await asyncio.wait_for(
             _http_get_json(JUPITER_QUOTE_URL, params=params),
-            timeout=AIGATE_NET_TIMEOUT_SEC,
+            timeout=float(AIGATE_NET_TIMEOUT_SEC),
         )
+    except asyncio.CancelledError:
+        raise
     except Exception:
         return None
 
@@ -310,33 +391,34 @@ async def token_decimals(mint: str, *, context: Json | None = None) -> int:
     try:
         if context and "decimals" in context:
             d = safe_int(context.get("decimals"))
-            if d is not None and 0 <= d <= 18:
+            if d is not None and 0 <= int(d) <= 18:
                 return int(d)
     except Exception:
         pass
 
-    client = None
-    try:
-        client = SHARED_SOLANA_CLIENT
-    except Exception:
-        client = None
-
+    client = SHARED_SOLANA_CLIENT
     if client is None:
         return 9
 
     try:
-        from solders.pubkey import Pubkey  # type: ignore
+        from solders.pubkey import Pubkey  # type: ignore[import-not-found]
 
         resp = await client.get_account_info(Pubkey.from_string(mint))
-        if not getattr(resp, "value", None):
+        val = getattr(resp, "value", None)
+        if not val:
             return 9
 
-        data_b64, _enc = resp.value.data
+        data = getattr(val, "data", None)
+        if not data or not isinstance(data, (tuple, list)) or len(data) < 1:
+            return 9
+
+        data_b64 = data[0]
         raw = base64.b64decode(data_b64)
-        # Classic SPL Mint layout: decimals byte at offset 44
         dec = raw[44] if len(raw) > 44 else 9
         dec_i = int(dec)
         return dec_i if 0 <= dec_i <= 18 else 9
+    except asyncio.CancelledError:
+        raise
     except Exception:
         return 9
 
@@ -357,9 +439,9 @@ async def estimate_entry_sol_per_token(
         out_raw = safe_int(q.get("outAmount"))
         if out_raw is not None and out_raw > 0:
             dec = await token_decimals(mint, context=context)
-            tokens = float(out_raw) / (10**dec)
+            tokens = float(out_raw) / float(10**dec)
             sol_in = float(sol_in_lamports) / 1_000_000_000.0
-            if tokens > 0:
+            if tokens > 0.0:
                 return sol_in / tokens
 
     # Optional Birdeye fallback if available + SOL_USD configured
@@ -367,15 +449,17 @@ async def estimate_entry_sol_per_token(
         try:
             js = await asyncio.wait_for(
                 _http_get_json(
-                    f"{BIRDEYE_API_URL}/public/price",
+                    f"{BIRDEYE_API_URL.rstrip('/')}/public/price",
                     params={"address": mint},
                     headers=_headers_birdeye(),
                 ),
-                timeout=AIGATE_NET_TIMEOUT_SEC,
+                timeout=float(AIGATE_NET_TIMEOUT_SEC),
             )
             usd = safe_float(((js or {}).get("data") or {}).get("value"))
-            if usd is not None and usd > 0:
-                return usd / float(AIGATE_SOL_USD)
+            if usd is not None and usd > 0.0:
+                return float(usd) / float(AIGATE_SOL_USD)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
 
@@ -383,7 +467,7 @@ async def estimate_entry_sol_per_token(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# AI classifier (optional): fail-soft + cooldown + JSON parsing
+# AI classifier (optional): fail-soft + cooldown + strict-ish JSON parsing
 # ──────────────────────────────────────────────────────────────────────────────
 def _ensure_openai_client() -> tuple[Any | None, str]:
     """
@@ -393,17 +477,15 @@ def _ensure_openai_client() -> tuple[Any | None, str]:
     if not api_key:
         return None, "none"
 
-    # SDK (openai>=1.x)
     try:
-        from openai import OpenAI  # type: ignore
+        from openai import OpenAI  # type: ignore[import-not-found]
 
         return OpenAI(api_key=api_key), "sdk"
     except Exception:
         pass
 
-    # Legacy (openai<=0.28)
     try:
-        import openai  # type: ignore
+        import openai  # type: ignore[import-not-found]
 
         if not getattr(openai, "api_key", None):
             openai.api_key = api_key
@@ -415,7 +497,7 @@ def _ensure_openai_client() -> tuple[Any | None, str]:
 async def _call_ai_classifier(context: Json) -> Json:
     """
     Returns:
-      { "model": str, "label": "GOOD|BAD|NEUTRAL"|None, "score": float|None, "raw": str }
+      { "model": str, "label": "GOOD|BAD|NEUTRAL"|None, "score": float|None, "why": str|None, "raw": str }
     or { "error": "...", "model": str }
     """
     if not AIGATE_AI_ENABLED:
@@ -423,8 +505,8 @@ async def _call_ai_classifier(context: Json) -> Json:
 
     mint = str(context.get("mint") or "").strip()
     if mint:
-        last = _AI_LAST_CALL.get(mint, 0.0)
-        if AIGATE_AI_COOLDOWN_SEC > 0 and (_now() - last) < AIGATE_AI_COOLDOWN_SEC:
+        last = float(_AI_LAST_CALL.get(mint, 0.0))
+        if AIGATE_AI_COOLDOWN_SEC > 0.0 and (_now() - last) < float(AIGATE_AI_COOLDOWN_SEC):
             return {"error": "ai_cooldown"}
         _AI_LAST_CALL[mint] = _now()
 
@@ -437,22 +519,21 @@ async def _call_ai_classifier(context: Json) -> Json:
     hp = context.get("honeypot") or {}
     q = context.get("jup_buy_quote") or {}
     entry_solin = context.get("entry_solin")
-    impact_bps = _price_impact_bps(q)
+    impact_bps = _price_impact_bps(q if isinstance(q, dict) else None)
 
-    # Keep prompt compact + structured
     payload = {
         "mint": mint,
         "impact_bps": impact_bps,
         "entry_solin": entry_solin,
         "honeypot": {
-            "ok": hp.get("ok"),
-            "reasons": hp.get("reasons"),
-            "sources": hp.get("sources"),
+            "ok": (hp or {}).get("ok") if isinstance(hp, dict) else None,
+            "reasons": (hp or {}).get("reasons") if isinstance(hp, dict) else None,
+            "sources": (hp or {}).get("sources") if isinstance(hp, dict) else None,
         },
         "quote": {
-            "outAmount": q.get("outAmount"),
-            "priceImpactPct": q.get("priceImpactPct"),
-            "routePlan": q.get("routePlan"),
+            "outAmount": (q or {}).get("outAmount") if isinstance(q, dict) else None,
+            "priceImpactPct": (q or {}).get("priceImpactPct") if isinstance(q, dict) else None,
+            "routePlan": (q or {}).get("routePlan") if isinstance(q, dict) else None,
         },
         "task": "classify_setup_for_entry",
     }
@@ -469,7 +550,6 @@ async def _call_ai_classifier(context: Json) -> Json:
         if kind == "sdk":
 
             def _do_req_sdk() -> Any:
-                # response_format supported on newer SDKs; fall back if not
                 try:
                     return client.chat.completions.create(
                         model=model,
@@ -493,7 +573,7 @@ async def _call_ai_classifier(context: Json) -> Json:
                     )
 
             resp = await asyncio.wait_for(
-                asyncio.to_thread(_do_req_sdk), timeout=AIGATE_AI_TIMEOUT_SEC
+                asyncio.to_thread(_do_req_sdk), timeout=float(AIGATE_AI_TIMEOUT_SEC)
             )
             raw = (resp.choices[0].message.content or "").strip()  # type: ignore[attr-defined]
         else:
@@ -510,20 +590,21 @@ async def _call_ai_classifier(context: Json) -> Json:
                 )
 
             resp = await asyncio.wait_for(
-                asyncio.to_thread(_do_req_legacy), timeout=AIGATE_AI_TIMEOUT_SEC
+                asyncio.to_thread(_do_req_legacy), timeout=float(AIGATE_AI_TIMEOUT_SEC)
             )
             raw = str(resp["choices"][0]["message"]["content"]).strip()  # type: ignore[index]
 
-        label = None
-        score = None
-        why = None
+        label: str | None = None
+        score: float | None = None
+        why: str | None = None
+
         try:
             obj = json.loads(raw)
-            label = str(obj.get("label") or "").upper().strip() or None
+            label_s = str(obj.get("label") or "").upper().strip()
+            label = label_s if label_s in ("GOOD", "BAD", "NEUTRAL") else None
             score = safe_float(obj.get("score"))
             why = str(obj.get("why") or "").strip() or None
         except Exception:
-            # very soft fallback
             up = raw.upper()
             if "BAD" in up:
                 label = "BAD"
@@ -533,13 +614,13 @@ async def _call_ai_classifier(context: Json) -> Json:
                 label = "NEUTRAL"
             score = 0.5
 
-        if label not in ("GOOD", "BAD", "NEUTRAL"):
-            label = None
         if score is not None:
             score = _clip01(score)
 
         return {"model": model, "label": label, "score": score, "why": why, "raw": raw[:1500]}
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         return {"error": f"{type(e).__name__}: {str(e)[:200]}", "model": model}
 
@@ -562,15 +643,27 @@ async def evaluate_candidate(mint: str, *, context: Json | None = None) -> tuple
           * BAD with score>=AI_BAD_THRESHOLD blocks
           * GOOD with score>=AI_GOOD_THRESHOLD adds positive reason (does not force entry)
     """
-    mint = (mint or "").strip()
+    mint_s = (mint or "").strip()
     ctx: Json = dict(context or {})
 
+    if not mint_s:
+        empty_report: Json = {
+            "mint": "",
+            "ok": False,
+            "reasons": ["mint:empty"],
+            "entry_solin": None,
+            "impact_bps": None,
+            "sources": {},
+            "policy": _policy_snapshot(),
+        }
+        return False, empty_report
+
     # micro-cache (dedupe bursts)
-    if AIGATE_CACHE_TTL_SEC > 0:
-        hit = _CACHE.get(mint)
+    if AIGATE_CACHE_TTL_SEC > 0.0:
+        hit = _CACHE.get(mint_s)
         if hit:
             ts, rep = hit
-            if (_now() - ts) <= AIGATE_CACHE_TTL_SEC:
+            if (_now() - float(ts)) <= float(AIGATE_CACHE_TTL_SEC):
                 return bool(rep.get("ok")), rep
 
     async with _SEMA:
@@ -578,28 +671,36 @@ async def evaluate_candidate(mint: str, *, context: Json | None = None) -> tuple
         sources: Json = {}
         reasons: list[str] = []
 
+        # Gate disabled: do not block; still include honeypot if available.
         if not AIGATE_ENABLED:
-            # Still try honeypot if provided; otherwise best-effort
-            hp_ok, hp_rep = True, {"ok": True, "reasons": ["aigate_disabled"]}
-            if (
-                "honeypot" in ctx
-                and isinstance(ctx["honeypot"], tuple | list)
-                and len(ctx["honeypot"]) == 2
-            ):
-                hp_ok, hp_rep = bool(ctx["honeypot"][0]), dict(ctx["honeypot"][1] or {})
+            hp_rep_local: Json = {"ok": True, "reasons": ["aigate_disabled"]}
+
+            if "honeypot" in ctx and isinstance(ctx.get("honeypot"), (tuple, list)):
+                tup = ctx.get("honeypot")
+                if isinstance(tup, (tuple, list)) and len(tup) == 2:
+                    ok_val = bool(tup[0])
+                    hp_rep_local = dict(tup[1] or {})
+                    if "ok" not in hp_rep_local:
+                        hp_rep_local["ok"] = ok_val
             else:
                 hp_fn = _try_import_honeypot()
                 if callable(hp_fn):
                     try:
-                        hp_ok, hp_rep = await asyncio.wait_for(
-                            hp_fn(mint), timeout=AIGATE_NET_TIMEOUT_SEC
+                        ok_val, rep = await asyncio.wait_for(
+                            hp_fn(mint_s), timeout=float(AIGATE_NET_TIMEOUT_SEC)
                         )
+                        hp_rep_local = dict(rep or {})
+                        if "ok" not in hp_rep_local:
+                            hp_rep_local["ok"] = bool(ok_val)
+                    except asyncio.CancelledError:
+                        raise
                     except Exception:
-                        hp_ok, hp_rep = True, {"ok": True, "reasons": ["honeypot_unavailable_soft"]}
-            sources["honeypot"] = hp_rep
+                        hp_rep_local = {"ok": True, "reasons": ["honeypot_unavailable_soft"]}
 
-            report = {
-                "mint": mint,
+            sources["honeypot"] = hp_rep_local
+
+            disabled_report: Json = {
+                "mint": mint_s,
                 "ok": True,
                 "reasons": ["aigate:disabled"],
                 "entry_solin": None,
@@ -607,26 +708,28 @@ async def evaluate_candidate(mint: str, *, context: Json | None = None) -> tuple
                 "sources": sources,
                 "policy": policy,
             }
-            if AIGATE_CACHE_TTL_SEC > 0:
-                _CACHE[mint] = (_now(), report)
-            return True, report
+            if AIGATE_CACHE_TTL_SEC > 0.0:
+                _CACHE[mint_s] = (_now(), disabled_report)
+            return True, disabled_report
 
-        # 1) Honeypot / risk suite (best-effort)
+        # 1) Honeypot (best-effort, fail-soft)
         hp_ok: bool = True
         hp_rep: Json = {"ok": True, "reasons": ["honeypot_skipped_soft"]}
-        if (
-            "honeypot" in ctx
-            and isinstance(ctx["honeypot"], tuple | list)
-            and len(ctx["honeypot"]) == 2
-        ):
-            hp_ok, hp_rep = bool(ctx["honeypot"][0]), dict(ctx["honeypot"][1] or {})
+
+        if "honeypot" in ctx and isinstance(ctx.get("honeypot"), (tuple, list)):
+            tup2 = ctx.get("honeypot")
+            if isinstance(tup2, (tuple, list)) and len(tup2) == 2:
+                hp_ok = bool(tup2[0])
+                hp_rep = dict(tup2[1] or {})
         else:
-            hp_fn = _try_import_honeypot()
-            if callable(hp_fn):
+            hp_fn2 = _try_import_honeypot()
+            if callable(hp_fn2):
                 try:
                     hp_ok, hp_rep = await asyncio.wait_for(
-                        hp_fn(mint), timeout=AIGATE_NET_TIMEOUT_SEC
+                        hp_fn2(mint_s), timeout=float(AIGATE_NET_TIMEOUT_SEC)
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     hp_ok, hp_rep = (
                         True,
@@ -634,27 +737,28 @@ async def evaluate_candidate(mint: str, *, context: Json | None = None) -> tuple
                     )
             else:
                 hp_ok, hp_rep = True, {"ok": True, "reasons": ["honeypot_missing_soft"]}
+
         sources["honeypot"] = hp_rep
 
         if REQUIRE_HONEYPOT_OK and not hp_ok:
             reasons.append("honeypot:not_ok")
 
         # 2) Jupiter buy quote (soft)
-        q: Json | None = None
-        if "jup_buy_quote" in ctx and isinstance(ctx["jup_buy_quote"], dict):
-            q = ctx["jup_buy_quote"]
+        q: Json | None
+        if "jup_buy_quote" in ctx and isinstance(ctx.get("jup_buy_quote"), dict):
+            q = ctx.get("jup_buy_quote")  # type: ignore[assignment]
         else:
-            q = await jup_quote_buy(mint, sol_in_lamports=DEFAULT_SOL_IN_LAMPORTS)
+            q = await jup_quote_buy(mint_s, sol_in_lamports=DEFAULT_SOL_IN_LAMPORTS)
 
         sources["jup_buy_quote"] = q or {}
         impact_bps = _price_impact_bps(q)
 
         if (
             impact_bps is not None
-            and MAX_PRICE_IMPACT_BPS > 0
-            and impact_bps > MAX_PRICE_IMPACT_BPS
+            and int(MAX_PRICE_IMPACT_BPS) > 0
+            and int(impact_bps) > int(MAX_PRICE_IMPACT_BPS)
         ):
-            reasons.append(f"impact_bps>{MAX_PRICE_IMPACT_BPS}")
+            reasons.append(f"impact_bps>{int(MAX_PRICE_IMPACT_BPS)}")
 
         # 3) Entry price estimate (soft unless require_entry_price)
         entry_solin: float | None = None
@@ -664,10 +768,12 @@ async def evaluate_candidate(mint: str, *, context: Json | None = None) -> tuple
             try:
                 entry_solin = await asyncio.wait_for(
                     estimate_entry_sol_per_token(
-                        mint, sol_in_lamports=DEFAULT_SOL_IN_LAMPORTS, quote=q, context=ctx
+                        mint_s, sol_in_lamports=DEFAULT_SOL_IN_LAMPORTS, quote=q, context=ctx
                     ),
-                    timeout=AIGATE_NET_TIMEOUT_SEC,
+                    timeout=float(AIGATE_NET_TIMEOUT_SEC),
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 entry_solin = None
 
@@ -682,7 +788,7 @@ async def evaluate_candidate(mint: str, *, context: Json | None = None) -> tuple
         ai_block = False
         if AIGATE_AI_ENABLED:
             ai_ctx = {
-                "mint": mint,
+                "mint": mint_s,
                 "honeypot": hp_rep,
                 "jup_buy_quote": q or {},
                 "entry_solin": entry_solin,
@@ -692,27 +798,27 @@ async def evaluate_candidate(mint: str, *, context: Json | None = None) -> tuple
 
             label = str(ai_res.get("label") or "").upper().strip()
             score = safe_float(ai_res.get("score"))
-            if label == "BAD" and score is not None and score >= AI_BAD_THRESHOLD:
-                reasons.append(f"ai:bad@{score:.3f}")
+            if label == "BAD" and score is not None and float(score) >= float(AI_BAD_THRESHOLD):
+                reasons.append(f"ai:bad@{float(score):.3f}")
                 ai_block = True
-            elif label == "GOOD" and score is not None and score >= AI_GOOD_THRESHOLD:
-                reasons.append(f"ai:good_hint@{score:.3f}")
+            elif label == "GOOD" and score is not None and float(score) >= float(AI_GOOD_THRESHOLD):
+                reasons.append(f"ai:good_hint@{float(score):.3f}")
             elif ai_res.get("error"):
-                reasons.append(f"ai:error:{ai_res.get('error')}")
+                reasons.append(f"ai:error:{_short(ai_res.get('error'))}")
 
         # 5) Final decision
         ok_honeypot = (not REQUIRE_HONEYPOT_OK) or hp_ok
         ok_impact = (
-            (MAX_PRICE_IMPACT_BPS <= 0)
+            (int(MAX_PRICE_IMPACT_BPS) <= 0)
             or (impact_bps is None)
-            or (impact_bps <= MAX_PRICE_IMPACT_BPS)
+            or (int(impact_bps) <= int(MAX_PRICE_IMPACT_BPS))
         )
         ok_entry = (not AIGATE_REQUIRE_ENTRY_PRICE) or (entry_solin is not None)
 
         ok = bool(ok_honeypot and ok_impact and ok_entry and (not ai_block))
 
-        report: Json = {
-            "mint": mint,
+        final_report: Json = {
+            "mint": mint_s,
             "ok": ok,
             "reasons": reasons,
             "entry_solin": entry_solin,
@@ -721,11 +827,26 @@ async def evaluate_candidate(mint: str, *, context: Json | None = None) -> tuple
             "policy": policy,
         }
 
-        # cache
-        if AIGATE_CACHE_TTL_SEC > 0:
-            _CACHE[mint] = (_now(), report)
+        # Optional: minimal observability without noise (deduped)
+        if not ok and reasons:
+            _log_once(
+                "AIGATE_BLOCK",
+                ttl=10.0,
+                level="INFO",
+                msg="ai_gate blocked candidate",
+                mint=mint_s,
+                reasons=reasons[:8],
+            )
 
-        return ok, report
+        if AIGATE_CACHE_TTL_SEC > 0.0:
+            _CACHE[mint_s] = (_now(), final_report)
+
+        return ok, final_report
 
 
-__all__ = ["estimate_entry_sol_per_token", "evaluate_candidate", "jup_quote_buy", "token_decimals"]
+__all__ = [
+    "estimate_entry_sol_per_token",
+    "evaluate_candidate",
+    "jup_quote_buy",
+    "token_decimals",
+]

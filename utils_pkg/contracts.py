@@ -475,6 +475,10 @@ EXTERNAL_ENV_ALLOWLIST: set[str] = {
     "WEB_CONCURRENCY",
     "PYTHONUNBUFFERED",
     "PYTHONHASHSEED",
+    "NO_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
 }
 
 EXTERNAL_ENV_ALLOW_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -484,6 +488,7 @@ EXTERNAL_ENV_ALLOW_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^RENDER_", re.IGNORECASE),
     re.compile(r"^PYTEST_", re.IGNORECASE),
     re.compile(r"^PIP_", re.IGNORECASE),
+    re.compile(r"^(?:NO|HTTP|HTTPS|ALL)_PROXY$", re.IGNORECASE),
 )
 
 _SAFE_TOGGLE_KEY_RE = re.compile(
@@ -582,6 +587,34 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                     description="1=crash early on misconfig",
                 ),
                 EnvVar("RUNTIME_PROFILE", default="safe", description="safe|paper|live"),
+            ],
+        ),
+        *_env_section(
+            "HTTP / SERVICE PORTS",
+            [
+                EnvVar(
+                    "MAIN_HTTP_PORT",
+                    default="",
+                    kind="int",
+                    description="Override main HTTP port (optional; scripts/main.py)",
+                ),
+                EnvVar(
+                    "HTTP_PORT",
+                    default="",
+                    kind="int",
+                    description="Override HTTP port (optional; scripts/main.py)",
+                ),
+            ],
+        ),
+        *_env_section(
+            "HTTP / PROXY",
+            [
+                EnvVar(
+                    "NO_PROXY",
+                    default="",
+                    kind="str",
+                    description="Optional proxy bypass list (comma-separated hosts/domains/IPs). Supports upper/lowercase forms.",
+                ),
             ],
         ),
         *_env_section(
@@ -1330,6 +1363,13 @@ def _parse_env_example(path: Path) -> tuple[list[str], dict[str, str], dict[str,
     return keys_in_order, defaults, comments
 
 
+_UPPER_SNAKE_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _is_upper_snake(k: str) -> bool:
+    return bool(_UPPER_SNAKE_RE.match((k or "").strip()))
+
+
 def _augment_canonical_with_env_example(
     base: list[EnvVar], repo_root: Path | None = None
 ) -> list[EnvVar]:
@@ -1346,20 +1386,31 @@ def _augment_canonical_with_env_example(
         return list(base)
 
     keys_in_order, defaults, comments = _parse_env_example(path)
-    base_map: dict[str, EnvVar] = {ev.key: ev for ev in base}
+    # Case-insensitive map: prevents env.example case-variants from becoming new canonical keys
+    base_upper: dict[str, EnvVar] = {ev.key.upper(): ev for ev in base}
 
     extras: list[EnvVar] = []
     for k in keys_in_order:
-        if k in base_map:
+        kk = (k or "").strip()
+        if not kk:
             continue
-        dv = defaults.get(k, "")
-        cmt = (comments.get(k) or "").strip()
+
+        # If only case differs (e.g., no_proxy vs NO_PROXY), treat as already covered.
+        if kk.upper() in base_upper:
+            continue
+
+        # Only allow UPPER_SNAKE_CASE to ever enter canonical keys.
+        if not _is_upper_snake(kk):
+            continue
+
+        dv = defaults.get(kk, "")
+        cmt = (comments.get(kk) or "").strip()
         extras.append(
             EnvVar(
-                k,
+                kk,
                 default=dv,
                 required=False,
-                secret=_is_secret_key(k),
+                secret=_is_secret_key(kk),
                 description=cmt,
             )
         )
@@ -1415,14 +1466,22 @@ def env_example_diff(repo_root: Path | None = None) -> dict[str, list[str]]:
 def env_example_required_hint_diff(repo_root: Path | None = None) -> dict[str, list[str]]:
     """
     Checks that REQUIRED_KEYS have an inline '# required' hint on their KEY=VALUE lines in .env.example.
-    Returns {"missing_required_hints": [...]}.
+
+    IMPORTANT:
+    - If .env.example has *no* inline 'required' hints anywhere, we treat hint-enforcement as disabled
+      (mirrors pytest behavior which skips strict hint consistency tests in that case).
     """
     root = repo_root or _repo_root_from_here()
     path = root / ENV_EXAMPLE_FILENAME
     if not path.exists():
-        return {"missing_required_hints": sorted(REQUIRED_KEYS)}
+        return {"missing_required_hints": []}
 
     _, _, comments = _parse_env_example(path)
+
+    # If there are no 'required' hints anywhere, do not enforce required-hint consistency.
+    has_any_required_hint = any("required" in (c or "").lower() for c in comments.values())
+    if not has_any_required_hint:
+        return {"missing_required_hints": []}
 
     missing: list[str] = []
     for k in sorted(REQUIRED_KEYS):

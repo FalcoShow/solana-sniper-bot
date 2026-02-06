@@ -6,7 +6,7 @@ utils_pkg/ai_sell_logic.py
 V3+++ / QUANT-GRADE SELL INTELLIGENCE ENGINE (GOD-TIER LOCK-IN)
 ==============================================================
 
-This is the SELL brain (guardrail-first, best-effort, production-safe).
+SELL brain: guardrail-first, best-effort, production-safe.
 
 Called by:
   • utils_pkg.exit_engine.on_buy_filled  -> schedule_after_buy(payload)
@@ -39,7 +39,6 @@ AI integration (LOCK-IN)
 This module does NOT directly prompt OpenAI.
 Instead it calls utils_pkg.ai_exit_model.predict_exit_score(...) (thin AI layer)
 when enabled. If ai_exit_model is missing or disabled, logic falls back to rules.
-
 """
 
 import asyncio
@@ -47,47 +46,66 @@ import contextlib
 import hashlib
 import inspect
 import json
+import math
 import os
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
+
 
 # =============================================================================
-# Logging (logging_setup compatible if present)
+# Logging (logging_setup / log_compat compatible if present)
 # =============================================================================
-try:
-    from logging_setup import get_logger  # type: ignore
+def _get_logger(name: str) -> Any:
+    # Prefer your repo’s compat layer if it exists, then legacy logging_setup, then stdlib logging.
+    with contextlib.suppress(Exception):
+        from utils_pkg.log_compat import get_logger as _gl  # type: ignore
 
-    log = get_logger("sniper.ai_sell")  # type: ignore
-except Exception:  # pragma: no cover
+        return _gl(name)  # type: ignore[misc]
+
+    with contextlib.suppress(Exception):
+        from logging_setup import get_logger as _gl2  # type: ignore
+
+        return _gl2(name)  # type: ignore[misc]
+
     import logging
 
-    log = logging.getLogger("sniper.ai_sell")
-    if not log.handlers:
-        logging.basicConfig(level=logging.INFO)
+    lg = logging.getLogger(name)
+    if not lg.handlers:
+        lg.addHandler(logging.NullHandler())
+    return lg
 
-if not hasattr(log, "event"):
 
-    def _event(name: str, **fields: Any) -> None:  # pragma: no cover
-        with contextlib.suppress(Exception):
-            log.info("%s %s", name, fields)
+log = _get_logger("sniper.ai_sell")
 
-    log.event = _event
 
-if not hasattr(log, "every"):
+def _ensure_event_methods(logger: Any) -> None:
+    if not hasattr(logger, "event"):
 
-    def _every(key: str, n: int = 60, **fields: Any) -> None:  # pragma: no cover
-        now = time.time()
-        store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
-        last = float(store.get(key, 0.0))
-        if now - last >= float(n):
-            store[key] = now
-            _every._store = store  # type: ignore[attr-defined]
+        def _event(name: str, **fields: Any) -> None:  # pragma: no cover
             with contextlib.suppress(Exception):
-                log.event(key, **fields)  # type: ignore[attr-defined]
+                logger.info("%s %s", name, fields)
 
-    log.every = _every
+        logger.event = _event  # type: ignore[attr-defined]
+
+    if not hasattr(logger, "every"):
+
+        def _every(key: str, n: int = 60, **fields: Any) -> None:  # pragma: no cover
+            now = time.time()
+            store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
+            last = float(store.get(key, 0.0))
+            if now - last >= float(n):
+                store[key] = now
+                _every._store = store  # type: ignore[attr-defined]
+                with contextlib.suppress(Exception):
+                    logger.event(key, **fields)  # type: ignore[attr-defined]
+
+        logger.every = _every  # type: ignore[attr-defined]
+
+
+_ensure_event_methods(log)
 
 
 def _log(name: str, level: str = "info", **fields: Any) -> None:
@@ -176,7 +194,7 @@ def _smoothstep01(x: float) -> float:
 def _finite(x: Any, d: float = 0.0) -> float:
     try:
         v = float(x)
-        if v != v or v in (float("inf"), float("-inf")):
+        if not math.isfinite(v):
             return d
         return v
     except Exception:
@@ -192,8 +210,7 @@ def _safe_int(x: Any, d: int = 0) -> int:
 
 def _safe_str(x: Any, d: str = "") -> str:
     try:
-        s = str(x)
-        return s.strip()
+        return str(x).strip()
     except Exception:
         return d
 
@@ -307,7 +324,7 @@ class SellCfg:
 
 
 def _load_cfg() -> SellCfg:
-    master = max(0, min(7, _env_int("MASTER_PHASE", _env_int("STRATEGY_PHASE", 7))))
+    master = max(0, min(12, _env_int("MASTER_PHASE", _env_int("STRATEGY_PHASE", 7))))
 
     dryrun = (
         _env_bool("AI_SELL_DRYRUN", False)
@@ -476,15 +493,13 @@ async def _get_redis() -> Any:
     if not cu:
         return None
 
-    # Try async getters first
     for nm in ("get_redis_async", "get_redis"):
         fn = getattr(cu, nm, None)
         if callable(fn):
             with contextlib.suppress(Exception):
                 r = fn()
-                r = await _maybe_await(r)
-                return r
-    # Fallback attribute
+                return await _maybe_await(r)
+
     with contextlib.suppress(Exception):
         return getattr(cu, "redis", None)
     return None
@@ -493,12 +508,17 @@ async def _get_redis() -> Any:
 async def _redis_get(r: Any, key: str) -> str | None:
     if r is None:
         return None
-    with contextlib.suppress(Exception):
+    try:
         raw = await _maybe_await(r.get(key))
-        if raw is None:
-            return None
-        if isinstance(raw, bytes | bytearray):
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    if isinstance(raw, (bytes, bytearray)):
+        with contextlib.suppress(Exception):
             return raw.decode("utf-8", "ignore")
+        return None
+    with contextlib.suppress(Exception):
         return str(raw)
     return None
 
@@ -514,7 +534,7 @@ async def _redis_setex(r: Any, key: str, value: str, ttl: int) -> None:
     if r is None:
         return
     ttl = int(max(1, ttl))
-    # Try common APIs; never throw
+    # Try common APIs; never throw.
     with contextlib.suppress(Exception):
         await _maybe_await(r.set(key, value, ex=ttl))
         return
@@ -534,7 +554,7 @@ def _prune_reservations(st: dict[str, Any], now: float) -> None:
         return
 
     ttl = float(CFG.reserve_ttl_sec)
-    keep: list[dict] = []
+    keep: list[dict[str, Any]] = []
     for item in res:
         if not isinstance(item, dict):
             continue
@@ -555,7 +575,6 @@ async def _load_state(mint: str) -> dict[str, Any]:
     if not mint:
         return {}
 
-    # Redis first
     r = await _get_redis()
     if r is not None:
         raw = await _redis_get(r, _state_key(mint))
@@ -565,7 +584,6 @@ async def _load_state(mint: str) -> dict[str, Any]:
                 if isinstance(obj, dict):
                     return obj
 
-    # Memory fallback
     async with _MEM_LOCK:
         st = _MEM.get(mint)
         if not st:
@@ -590,7 +608,6 @@ async def _save_state(mint: str, state: dict[str, Any]) -> None:
 
     _prune_reservations(st, now)
 
-    # bound memory
     async with _MEM_LOCK:
         if len(_MEM) > CFG.max_mints_in_mem:
             keys = list(_MEM.keys())
@@ -600,7 +617,6 @@ async def _save_state(mint: str, state: dict[str, Any]) -> None:
         st["_expires_ts"] = now + float(CFG.state_ttl_sec)
         _MEM[mint] = dict(st)
 
-    # publish to redis
     r = await _get_redis()
     if r is not None and CFG.publish_state_to_redis:
         payload = json.dumps(st, separators=(",", ":"), ensure_ascii=False)
@@ -639,14 +655,15 @@ def _extract_mint(ev: dict[str, Any]) -> str | None:
         v = ev.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
+
     with contextlib.suppress(Exception):
         for kk in ("pair", "token", "base", "asset"):
             o = ev.get(kk)
             if isinstance(o, dict):
                 for k2 in ("mint", "address", "id"):
-                    v = o.get(k2)
-                    if isinstance(v, str) and v.strip():
-                        return v.strip()
+                    v2 = o.get(k2)
+                    if isinstance(v2, str) and v2.strip():
+                        return v2.strip()
     return None
 
 
@@ -755,8 +772,7 @@ async def _risk_ctx() -> dict[str, Any]:
         fn = getattr(rm, name, None)
         if callable(fn):
             with contextlib.suppress(Exception):
-                out = fn()
-                out = await _maybe_await(out)
+                out = await _maybe_await(fn())
                 return out if isinstance(out, dict) else {}
     return {}
 
@@ -776,8 +792,7 @@ async def _kill_switch_active() -> bool:
         fn = getattr(rm, fnn, None)
         if callable(fn):
             with contextlib.suppress(Exception):
-                val = fn()
-                val = await _maybe_await(val)
+                val = await _maybe_await(fn())
                 if isinstance(val, bool):
                     return val
     return False
@@ -863,26 +878,22 @@ def _self_learning_refine(
 
 
 async def _log_sell_signal(payload: dict[str, Any]) -> None:
-    # data_logger
     dl = _get_mod("utils_pkg.data_logger")
     if dl:
         for nm in ("log_sell_signal", "log_exit_signal", "log_signal", "log_event"):
             fn = getattr(dl, nm, None)
             if callable(fn):
                 with contextlib.suppress(Exception):
-                    out = fn(payload)
-                    await _maybe_await(out)
+                    await _maybe_await(fn(payload))
                 break
 
-    # ai_db
     adb = _get_mod("utils_pkg.ai_db")
     if adb:
         for nm in ("log_event", "insert_event", "write_event", "log_sell_signal"):
             fn = getattr(adb, nm, None)
             if callable(fn):
                 with contextlib.suppress(Exception):
-                    out = fn({"type": "sell_signal", **payload})
-                    await _maybe_await(out)
+                    await _maybe_await(fn({"type": "sell_signal", **payload}))
                 break
 
 
@@ -893,8 +904,7 @@ async def _log_sell_enqueue(payload: dict[str, Any]) -> None:
             fn = getattr(dl, nm, None)
             if callable(fn):
                 with contextlib.suppress(Exception):
-                    out = fn(payload)
-                    await _maybe_await(out)
+                    await _maybe_await(fn(payload))
                 break
 
     adb = _get_mod("utils_pkg.ai_db")
@@ -903,8 +913,7 @@ async def _log_sell_enqueue(payload: dict[str, Any]) -> None:
             fn = getattr(adb, nm, None)
             if callable(fn):
                 with contextlib.suppress(Exception):
-                    out = fn({"type": "sell_enqueue", **payload})
-                    await _maybe_await(out)
+                    await _maybe_await(fn({"type": "sell_enqueue", **payload}))
                 break
 
 
@@ -914,7 +923,6 @@ async def _log_sell_enqueue(payload: dict[str, Any]) -> None:
 async def _build_features(
     mint: str, raw_event: dict[str, Any], state: dict[str, Any]
 ) -> dict[str, Any]:
-    # 1) passthrough provided features
     for k in ("features", "fb", "feat"):
         v = raw_event.get(k)
         if isinstance(v, dict) and v:
@@ -922,7 +930,6 @@ async def _build_features(
             out.setdefault("mint", mint)
             return out
 
-    # 2) try FeatureBuilder
     fb = _get_mod("utils_pkg.feature_builder")
     if fb:
         for fn_name in ("build_features_for_sell", "build_features_for_mint", "build_features"):
@@ -936,14 +943,12 @@ async def _build_features(
                     "ts": time.time(),
                 }
                 with contextlib.suppress(Exception):
-                    res = fn(payload)
-                    res = await _maybe_await(res)
+                    res = await _maybe_await(fn(payload))
                     if isinstance(res, dict) and res:
                         out = dict(res)
                         out.setdefault("mint", mint)
                         return out
 
-    # 3) fallback: raw tick
     out = dict(raw_event)
     out.setdefault("mint", mint)
     return out
@@ -952,6 +957,15 @@ async def _build_features(
 # =============================================================================
 # AI exit model call (preferred)
 # =============================================================================
+def _filter_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    try:
+        sig = inspect.signature(fn)
+        allowed = set(sig.parameters.keys())
+        return {k: v for k, v in kwargs.items() if k in allowed}
+    except Exception:
+        return kwargs
+
+
 async def _ai_exit_score_from_model(
     *, features: dict[str, Any], mint: str
 ) -> tuple[float | None, dict | None, str]:
@@ -973,14 +987,18 @@ async def _ai_exit_score_from_model(
         return None, None, "ai_exit_fn_missing"
 
     try:
-        coro = fn(features=features, mint=mint)
+        # Prefer kwargs; tolerate signature drift.
+        kwargs = _filter_kwargs(fn, {"features": features, "mint": mint})
+        coro = fn(**kwargs)
         out = await asyncio.wait_for(_maybe_await(coro), timeout=float(CFG.ai_timeout_sec))
+
         if isinstance(out, tuple) and len(out) == 2:
             score, meta = out
             with contextlib.suppress(Exception):
                 sc = _clip01(float(score))
                 return sc, (meta if isinstance(meta, dict) else None), "ai_exit_model_ok"
             return None, (meta if isinstance(meta, dict) else None), "ai_exit_model_bad_score"
+
         return None, None, "ai_exit_model_bad_return"
     except Exception as e:
         if CFG.debug:
@@ -989,26 +1007,16 @@ async def _ai_exit_score_from_model(
 
 
 # =============================================================================
-# Router quote sanity (optional) — FIXED SIGNATURE (no double "*")
+# Router quote sanity (optional)
 # =============================================================================
-def _filter_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
-    try:
-        sig = inspect.signature(fn)
-        allowed = set(sig.parameters.keys())
-        return {k: v for k, v in kwargs.items() if k in allowed}
-    except Exception:
-        return kwargs
-
-
 async def _quote_sanity_ok(*, mint: str, amount_raw: int, force: bool = False) -> tuple[bool, str]:
     """
     If disabled -> always OK.
 
     IMPORTANT:
-      - For normal tick-driven exits: can be used as a gate if enabled.
-      - For forced exits: MUST NOT block unless explicitly enabled.
+      - Tick-driven exits: can be used as a gate if enabled.
+      - Forced exits: MUST NOT block unless explicitly enabled.
     """
-    # Dryrun must never touch network
     if CFG.dryrun:
         return True, "quote_skipped_dryrun"
 
@@ -1026,29 +1034,29 @@ async def _quote_sanity_ok(*, mint: str, amount_raw: int, force: bool = False) -
     if not router:
         return True, "router_missing_allow"
 
-    # Prefer sell-quote method; tolerate signature drift
-    fns = [
-        getattr(router, "get_sell_quote", None),
-        getattr(router, "sell_quote", None),
-        getattr(router, "get_quote", None),
-    ]
-    fns = [fn for fn in fns if callable(fn)]
+    fns: list[Callable[..., Any]] = []
+    for nm in ("get_sell_quote", "sell_quote", "get_quote"):
+        cand = getattr(router, nm, None)
+        if callable(cand):
+            fns.append(cast(Callable[..., Any], cand))
+
     if not fns:
         return True, "quote_fn_missing_allow"
 
     fn = fns[0]
-    kwargs = {
-        "mint": mint,
-        "amount_raw": int(amount_raw),
-        "slippage_bps": int(CFG.default_slippage_bps),
-    }
-    kwargs = _filter_kwargs(fn, kwargs)
+    kwargs = _filter_kwargs(
+        fn,
+        {
+            "mint": mint,
+            "amount_raw": int(amount_raw),
+            "slippage_bps": int(CFG.default_slippage_bps),
+        },
+    )
 
     try:
         out = fn(**kwargs)
         out = await asyncio.wait_for(_maybe_await(out), timeout=float(CFG.quote_timeout_sec))
 
-        # If we got structured output, validate it
         if isinstance(out, dict):
             pib = _safe_int(out.get("priceImpactBps") or out.get("price_impact_bps") or 0, 0)
             if int(CFG.quote_max_price_impact_bps) > 0 and pib > int(
@@ -1070,7 +1078,7 @@ async def _quote_sanity_ok(*, mint: str, amount_raw: int, force: bool = False) -
     except Exception as e:
         if CFG.debug:
             _log("AI_SELL_QUOTE_FAIL", level="warning", mint=mint, err=_short_exc(e))
-        # Never block forced exits on quote failure; for tick exits, prefer allow-over-block too
+        # Never block forced exits on quote failure; for tick exits, prefer allow-over-block too.
         return True, "quote_fail_allow"
 
 
@@ -1087,8 +1095,7 @@ async def _enqueue_exit_request(**kwargs: Any) -> tuple[bool, str]:
 
     try:
         payload = _filter_kwargs(fn, dict(kwargs))
-        res = fn(**payload)
-        await _maybe_await(res)
+        await _maybe_await(fn(**payload))
         return True, "enqueued"
     except Exception as e:
         return False, _short_exc(e)
@@ -1098,7 +1105,7 @@ async def _enqueue_exit_request(**kwargs: Any) -> tuple[bool, str]:
 # Strategy cfg base (env-compatible)
 # =============================================================================
 def _base_sell_cfg_from_env() -> dict[str, Any]:
-    # This is intentionally a small, stable contract; self-learning can override.
+    # Intentionally small stable contract; self-learning can override.
     return {
         "MIN_PROFIT_PCT": _env_float("EXIT_MIN_PROFIT_PCT", CFG.min_profit_pct),
         "TP1_PCT": _env_float("EXIT_TP1_PCT", CFG.tp1_pct),
@@ -1126,6 +1133,7 @@ async def _resolve_amount_raw_from_wallet(mint: str) -> int | None:
     """
     if not CFG.resolve_amount_on_force_exit:
         return None
+
     mint = (mint or "").strip()
     if not mint or mint == _SOL_MINT:
         return None
@@ -1203,7 +1211,6 @@ def compute_sell_decision(
     hold_sec = max(0.0, _finite(trade.get("hold_sec"), 0.0))
     giveback_pct = max(0.0, max_up_pct - pnl_pct)
 
-    # Features (best-effort)
     sell_alpha = _finite(features.get("sell_alpha"), 0.0)  # 0..1
     micro_shift = _finite(features.get("micro_trend_shift"), 0.0)  # negative => deterioration
     liq_usd = max(
@@ -1223,7 +1230,6 @@ def compute_sell_decision(
         risk_ctx.get("regime_exit_bias"), _finite(features.get("regime_exit_bias"), 1.0)
     )
 
-    # Strategy thresholds
     min_profit = _finite(strat_ctx.get("MIN_PROFIT_PCT"), CFG.min_profit_pct)
     tp1 = _finite(strat_ctx.get("TP1_PCT"), CFG.tp1_pct)
     tp2 = _finite(strat_ctx.get("TP2_PCT"), CFG.tp2_pct)
@@ -1297,7 +1303,6 @@ def compute_sell_decision(
             "meta": meta,
         }
 
-    # Minimum hold guard
     if hold_sec < float(min_hold):
         meta.update({"min_hold_sec": float(min_hold)})
         return {
@@ -1308,7 +1313,6 @@ def compute_sell_decision(
             "meta": meta,
         }
 
-    # Max hold (time stop)
     if hold_sec >= float(max_hold):
         meta.update({"max_hold_sec": float(max_hold)})
         return {
@@ -1324,7 +1328,6 @@ def compute_sell_decision(
     # -------------------------
     in_profit = pnl_pct >= float(min_profit)
 
-    # Liquidity floor partial (profit-only)
     if liq_usd > 0 and liq_usd <= float(CFG.liquidity_floor_usd) and in_profit:
         meta.update({"liq_usd": float(liq_usd)})
         return {
@@ -1335,7 +1338,6 @@ def compute_sell_decision(
             "meta": meta,
         }
 
-    # Giveback protection (profit-only)
     if pnl_pct > float(min_profit) and max_up_pct > float(min_profit):
         if giveback_pct >= float(gb_hard):
             meta.update({"gb_hard": float(gb_hard)})
@@ -1356,7 +1358,6 @@ def compute_sell_decision(
                 "meta": meta,
             }
 
-    # Stagnation (profit-only)
     stagnation_seen_min = _finite(
         features.get("stagnation_min", features.get("stagnant_min", 0.0)), 0.0
     )
@@ -1377,7 +1378,6 @@ def compute_sell_decision(
             "meta": meta,
         }
 
-    # Take profit tiers (partial sells)
     if pnl_pct >= float(tp3):
         meta.update({"tp": "tp3"})
         return {
@@ -1398,7 +1398,6 @@ def compute_sell_decision(
         }
     if pnl_pct >= float(tp1):
         meta.update({"tp": "tp1"})
-        # micro deterioration or sell_alpha -> bump tp1 partial
         if sell_alpha > 0.55 or micro_shift < -0.40:
             return {
                 "action": "partial",
@@ -1426,7 +1425,6 @@ def compute_sell_decision(
     rug_soft = _clip01(rug_prob_pct / 100.0)
     whale_soft = _clip01(whale_exit)
 
-    # liquidity term: smaller liquidity increases exit pressure
     liq_term = (
         0.12
         if (liq_usd > 0 and liq_usd < 8_000)
@@ -1457,7 +1455,6 @@ def compute_sell_decision(
     regime_mult = _clamp(_finite(regime_exit_bias, 1.0), 0.50, 1.50)
     sell_score = _clip01(base_score * prof_mult * regime_mult)
 
-    # AI blend: reduce influence while red
     if ai_score is not None:
         w = float(CFG.ai_weight)
         if pnl_pct < 0:
@@ -1520,7 +1517,7 @@ def _reserve_remove(
     amt: int | None = None,
     now: float | None = None,
 ) -> int:
-    now = float(now if now is not None else time.time())
+    now_f = float(now if now is not None else time.time())
     res = st.get("reservations")
     if not isinstance(res, list) or not res:
         st["reservations"] = []
@@ -1528,7 +1525,7 @@ def _reserve_remove(
         return 0
 
     freed = 0
-    keep: list[dict] = []
+    keep: list[dict[str, Any]] = []
     rid = (request_id or "").strip()[:32]
 
     if rid:
@@ -1544,7 +1541,7 @@ def _reserve_remove(
         if dec <= 0:
             keep = list(res)
         else:
-            res2: list[dict] = [x for x in res if isinstance(x, dict)]
+            res2: list[dict[str, Any]] = [x for x in res if isinstance(x, dict)]
             res2.sort(key=lambda x: _finite(x.get("ts"), 0.0))
             for item in res2:
                 a = _safe_int(item.get("amt"), 0)
@@ -1561,7 +1558,7 @@ def _reserve_remove(
                     keep.append({**item, "amt": int(a2)})
 
     st["reservations"] = keep
-    _prune_reservations(st, now)
+    _prune_reservations(st, now_f)
     return int(max(0, freed))
 
 
@@ -1678,7 +1675,6 @@ async def schedule_after_buy(ev: dict[str, Any]) -> None:
             "entry_sig": ev.get("signature") or ev.get("tx_sig") or ev.get("tx"),
         }
 
-        # Optional self-learning hook
         sl = _get_mod("utils_pkg.self_learning_ai_strategy")
         hook = getattr(sl, "on_buy_registered", None) if sl else None
         if callable(hook):
@@ -1734,14 +1730,12 @@ async def on_trade_tick(raw_event: dict[str, Any]) -> None:
             now = time.time()
             _prune_reservations(state, now)
 
-            # circuit breaker: freeze after repeated enqueue failures
             freeze_until = _finite(state.get("freeze_until_ts"), 0.0)
             if freeze_until and now < freeze_until:
                 if CFG.debug:
                     _log("AI_SELL_FROZEN", mint=mint, until=freeze_until, instance=INSTANCE_ID)
                 return
 
-            # throttle evaluations
             last_eval = _finite(state.get("last_eval_ts"), 0.0)
             if CFG.eval_min_interval_ms > 0 and (now - last_eval) * 1000.0 < float(
                 CFG.eval_min_interval_ms
@@ -1749,13 +1743,11 @@ async def on_trade_tick(raw_event: dict[str, Any]) -> None:
                 return
             state["last_eval_ts"] = now
 
-            # require a price to evaluate
             price = _extract_price(raw_event)
             if price is None:
                 await _save_state(mint, state)
                 return
 
-            # tick dedupe window
             last_tick_ts = _finite(state.get("last_tick_ts"), 0.0)
             last_price = _finite(state.get("last_price"), 0.0)
 
@@ -1801,13 +1793,10 @@ async def on_trade_tick(raw_event: dict[str, Any]) -> None:
             features.setdefault("max_up_pct", max_up)
             features.setdefault("hold_sec", hold_sec)
 
-            # optional: enrich with ai_risk_model
             features = _ai_risk_patch(features, trade)
-
             risk_ctx = await _risk_ctx()
             strat_ctx = _self_learning_overrides(mint, _base_sell_cfg_from_env(), state, features)
 
-            # Dryrun should never call external AI either
             ai_score: float | None = None
             ai_meta: dict | None = None
             ai_reason = "ai_skipped"
@@ -1877,9 +1866,7 @@ async def on_trade_tick(raw_event: dict[str, Any]) -> None:
                 await _save_state(mint, state)
                 return
 
-            # Kill switch semantics:
             # Default: allow exits even if killed (risk reduction).
-            # If you want to block tick exits too:
             if await _kill_switch_active() and _env_bool(
                 "AI_SELL_BLOCK_TICK_SELL_WHEN_KILLED", False
             ):
@@ -1894,7 +1881,6 @@ async def on_trade_tick(raw_event: dict[str, Any]) -> None:
                 await _save_state(mint, state)
                 return
 
-            # dedupe repeated decisions
             sig = _decision_sig(action, pct, reason)
             last_sig = str(state.get("last_decision_sig") or "")
             last_enq = _finite(state.get("last_enqueue_ts"), 0.0)
@@ -1906,7 +1892,6 @@ async def on_trade_tick(raw_event: dict[str, Any]) -> None:
             position_raw = _safe_int(state.get("position_raw"), 0)
             reserved_raw = _safe_int(state.get("reserved_raw"), 0)
 
-            # optional: resolve amount on tick only if explicitly enabled
             if position_raw <= 0 and CFG.resolve_amount_on_tick_when_unknown:
                 resolved = await _resolve_amount_raw_from_wallet(mint)
                 if resolved:
@@ -2108,7 +2093,6 @@ async def schedule_force_exit(ev: dict[str, Any]) -> None:
             spend_sol = _finite(
                 ev.get("spend_sol"), _finite(state.get("entry_spend_sol") if state else 0.0, 0.0)
             )
-
             follow_stats = dict(ev.get("follow_stats") or {})
             follow_stats["quote_sanity"] = quote_reason
 

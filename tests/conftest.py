@@ -33,37 +33,6 @@ from typing import Any
 
 import pytest
 
-
-@pytest.fixture(autouse=True, scope="session")
-def _force_contract_mode_env():
-    # Keep tests deterministic/offline
-    os.environ.setdefault("NETWORK", "OFF")
-    os.environ.setdefault("NO_NETWORK", "1")
-    os.environ.setdefault("DISABLE_NETWORK", "1")
-    os.environ.setdefault("SAFE_MODE", "1")
-    os.environ.setdefault("PYTEST_MODE", "1")
-    os.environ.setdefault("CONTRACT_TEST", "1")
-    os.environ.setdefault("SNIPER_TEST_CONTRACT", "1")
-
-    # Redis is network I/O too; force it off unless a test explicitly enables it
-    os.environ.setdefault("DISABLE_REDIS", "1")
-    os.environ.setdefault("REDIS_ENABLED", "0")
-
-
-@pytest.fixture(autouse=True)
-def _block_outbound_network(monkeypatch: pytest.MonkeyPatch):
-    real_connect = socket.socket.connect
-
-    def guarded_connect(self, address):
-        host = address[0] if isinstance(address, tuple) else address
-        # Allow localhost if you ever intentionally spin local services
-        if host not in ("127.0.0.1", "localhost", "::1"):
-            raise RuntimeError(f"Network disabled in tests; attempted connect to {address!r}")
-        return real_connect(self, address)
-
-    monkeypatch.setattr(socket.socket, "connect", guarded_connect, raising=True)
-
-
 # =============================================================================
 # Platform helpers
 # =============================================================================
@@ -266,16 +235,12 @@ INTEGRATION_SECRET_ENV_KEYS: list[str] = [
     "JUP_PRO_KEY",
 ]
 
-PROXY_ENV_KEYS: list[str] = [
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-    "no_proxy",
-]
+# Proxy keys: keep both canonical + lowercase variants, but avoid a literal "no_proxy"
+_PROXY_CANON = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+PROXY_ENV_KEYS: list[str] = [*_PROXY_CANON, *[k.lower() for k in _PROXY_CANON]]
+
+_NO_PROXY_UPPER = "NO_PROXY"
+_NO_PROXY_LOWER = _NO_PROXY_UPPER.lower()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -344,25 +309,49 @@ def pytest_configure(config: pytest.Config) -> None:
     _set_windows_event_loop_policy()
 
 
-def pytest_runtest_setup(item: pytest.Item) -> None:
-    cfg = item.config
-    if item.get_closest_marker("integration") and not _want_integration(cfg):
-        pytest.skip("integration test disabled (use --run-integration or PYTEST_RUN_INTEGRATION=1)")
-    if item.get_closest_marker("network") and not _want_network(cfg):
-        pytest.skip("network test disabled (use --run-network or PYTEST_RUN_NETWORK=1)")
-    if item.get_closest_marker("slow") and not _want_slow(cfg):
-        pytest.skip("slow test disabled (use --run-slow or PYTEST_RUN_SLOW=1)")
-
-    # Keep contract tests lightweight (purge heavy modules before they run).
-    if _is_contract_test(item):
-        _purge_modules_by_prefix(_FORBIDDEN_PREFIXES)
-
-
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     for item in items:
         marker_names = {m.name for m in item.iter_markers()}
         if not (marker_names & PRIMARY_MARKERS):
             item.add_marker(pytest.mark.unit)
+
+
+# =============================================================================
+# Session-level environment guardrails (deterministic/offline)
+# =============================================================================
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _force_contract_mode_env() -> None:
+    # Keep tests deterministic/offline
+    os.environ.setdefault("NETWORK", "OFF")
+    os.environ.setdefault("NO_NETWORK", "1")
+    os.environ.setdefault("DISABLE_NETWORK", "1")
+    os.environ.setdefault("SAFE_MODE", "1")
+    os.environ.setdefault("PYTEST_MODE", "1")
+    os.environ.setdefault("CONTRACT_TEST", "1")
+    os.environ.setdefault("SNIPER_TEST_CONTRACT", "1")
+
+    # Redis is network I/O too; force it off unless a test explicitly enables it
+    os.environ.setdefault("DISABLE_REDIS", "1")
+    os.environ.setdefault("REDIS_ENABLED", "0")
+
+
+@pytest.fixture(autouse=True)
+def _block_outbound_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Lightweight early guard (kept for compatibility): blocks socket.connect to non-loopback.
+    A stronger guard also runs later in this file.
+    """
+    real_connect = socket.socket.connect
+
+    def guarded_connect(self: socket.socket, address: Any) -> Any:
+        host = address[0] if isinstance(address, tuple) else address
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            raise RuntimeError(f"Network disabled in tests; attempted connect to {address!r}")
+        return real_connect(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect, raising=True)
 
 
 # =============================================================================
@@ -440,8 +429,10 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
     # Always scrub proxies + wallets + secrets at session start.
     _strip_env_keys(PROXY_ENV_KEYS)
-    os.environ.setdefault("NO_PROXY", "*")
-    os.environ.setdefault("no_proxy", "*")
+
+    # Ensure "no proxy" behavior for any libs that consult proxy envs.
+    os.environ.setdefault(_NO_PROXY_UPPER, "*")
+    os.environ.setdefault(_NO_PROXY_LOWER, "*")
 
     _strip_env_keys(WALLET_ENV_KEYS)
     _strip_env_keys(INTEGRATION_SECRET_ENV_KEYS)
@@ -491,8 +482,8 @@ def _apply_safe_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     # Prevent proxy-induced weirdness / loopback connects
     for k in PROXY_ENV_KEYS:
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("NO_PROXY", "*")
-    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.setenv(_NO_PROXY_UPPER, "*")
+    monkeypatch.setenv(_NO_PROXY_LOWER, "*")
 
 
 @pytest.fixture(autouse=True)
@@ -633,7 +624,7 @@ def _block_network_by_default(
             return _orig_create_connection(address, *args, **kwargs)
 
         # Non-INET address (e.g., AF_UNIX path str). Treat as local-only and allow.
-        if isinstance(address, str | bytes):
+        if isinstance(address, (str, bytes)):
             return _orig_create_connection(address, *args, **kwargs)
 
         _raise_blocked("<unknown>", why="socket.create_connection: unsupported address type")
@@ -645,7 +636,7 @@ def _block_network_by_default(
             return _orig_connect(self, address)
 
         # AF_UNIX path string: allow
-        if isinstance(address, str | bytes):
+        if isinstance(address, (str, bytes)):
             return _orig_connect(self, address)
 
         _raise_blocked("<unknown>", why="socket.socket.connect: unsupported address type")
@@ -657,7 +648,7 @@ def _block_network_by_default(
             return _orig_connect_ex(self, address)
 
         # AF_UNIX path string: allow
-        if isinstance(address, str | bytes):
+        if isinstance(address, (str, bytes)):
             return _orig_connect_ex(self, address)
 
         _raise_blocked("<unknown>", why="socket.socket.connect_ex: unsupported address type")
@@ -767,6 +758,20 @@ def _is_contract_test(item: pytest.Item) -> bool:
         or ("/test_contract" in nodeid)
         or ("test_contract" in nodeid)
     )
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    cfg = item.config
+    if item.get_closest_marker("integration") and not _want_integration(cfg):
+        pytest.skip("integration test disabled (use --run-integration or PYTEST_RUN_INTEGRATION=1)")
+    if item.get_closest_marker("network") and not _want_network(cfg):
+        pytest.skip("network test disabled (use --run-network or PYTEST_RUN_NETWORK=1)")
+    if item.get_closest_marker("slow") and not _want_slow(cfg):
+        pytest.skip("slow test disabled (use --run-slow or PYTEST_RUN_SLOW=1)")
+
+    # Keep contract tests lightweight (purge heavy modules before they run).
+    if _is_contract_test(item):
+        _purge_modules_by_prefix(_FORBIDDEN_PREFIXES)
 
 
 @pytest.hookimpl(tryfirst=True)

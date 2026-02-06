@@ -13,7 +13,7 @@ This module has TWO responsibilities:
 --------------------------------------------------
     compute_ai_overlay(risk_snapshot, perf_snapshot=None, regime_snapshot=None, config=None) -> dict
 
-    Returns a PURE dict (no IO / no globals) that RiskManager and the rest of
+    Returns a PURE dict (no IO / no env / no globals) that RiskManager and the rest of
     the system can consume to modulate capacity, concurrency and entry gating.
 
     Strict output schema:
@@ -44,7 +44,7 @@ This module has TWO responsibilities:
 Design goals
 ------------
 - PURE / deterministic: dict in, dict out. No IO, no env, no imports that do IO.
-- Safe for missing fields: defaults are *neutral-to-conservative* (NOT “safe”).
+- Safe for missing fields: defaults are neutral-to-conservative (NOT “safe”).
 - Interpretable: exposes components + reasons + raw values.
 - Backward-compatible aliases: score_risk / risk_score / score / evaluate / score_entry.
 - Safe fallback: if anything internal errors,
@@ -80,7 +80,7 @@ __all__ = [
 ]
 
 # Bump whenever heuristics meaningfully change (stable for logging/audits)
-AI_RISK_MODEL_VERSION = "v3+++-2026-01-01"
+AI_RISK_MODEL_VERSION = "v3+++-2026-02-03"
 
 # =============================================================================
 # Output bounds
@@ -170,12 +170,12 @@ _SAFE_OVERLAY_FALLBACK: dict[str, Any] = {
         "error": "ai_risk_model_exception_fallback",
         "pnl_dd": {"pnl_score": 0.0, "dd_score": 0.0, "dd_pct": 0.0, "pnl_pct": 0.0},
         "perf": {
-            "winrate_score": 0.0,
-            "recent_winrate_score": 0.0,
-            "sharpe_score": 0.0,
-            "recent_sharpe_score": 0.0,
-            "kelly_confidence": 0.0,
-            "streak_bias": 0.0,
+            "winrate_score": 0.50,
+            "recent_winrate_score": 0.50,
+            "sharpe_score": 0.50,
+            "recent_sharpe_score": 0.50,
+            "kelly_confidence": 0.00,
+            "streak_bias": 0.00,
         },
         "regime": {
             "regime_score": 0.0,
@@ -212,7 +212,7 @@ def _clamp(x: float, lo: float, hi: float) -> float:
         return float(lo)
     if xf != xf:  # NaN
         return float(lo)
-    if xf == float("inf") or xf == float("-inf"):
+    if xf in (float("inf"), float("-inf")):
         return float(lo)
     return float(max(lo, min(hi, xf)))
 
@@ -240,22 +240,9 @@ def _truthy(v: Any, default: bool = False) -> bool:
     return default
 
 
-def _logistic(x: float, k: float = 1.0) -> float:
-    """Numerically guarded logistic."""
-    try:
-        z = -k * float(x)
-        if z > 50:
-            return 0.0
-        if z < -50:
-            return 1.0
-        return 1.0 / (1.0 + math.exp(z))
-    except Exception:
-        return 0.5
-
-
 def _map_linear(x: float, x0: float, x1: float) -> float:
     """
-    Map [x0,x1] -> [0,1] clamp; inverted if x0>x1.
+    Map [x0,x1] -> [0,1] with clamp; inverted if x0 > x1.
     """
     if x0 == x1:
         return 0.5
@@ -263,7 +250,10 @@ def _map_linear(x: float, x0: float, x1: float) -> float:
         xf = float(x)
     except Exception:
         xf = float(x0)
-    t = (xf - x0) / (x1 - x0) if x0 < x1 else (x0 - xf) / (x0 - x1)
+    if x0 < x1:
+        t = (xf - x0) / (x1 - x0)
+    else:
+        t = (x0 - xf) / (x0 - x1)
     return _clamp(t, 0.0, 1.0)
 
 
@@ -275,7 +265,7 @@ def _as_frac_01(v: Any) -> float:
         vf = float(v)
     except Exception:
         return 0.0
-    if vf > 1.0 and vf <= 100.0:
+    if 1.0 < vf <= 100.0:
         vf = vf / 100.0
     return _clamp(vf, 0.0, 1.0)
 
@@ -315,6 +305,7 @@ def _cfg_bool(cfg: Mapping[str, Any] | None, key: str, default: bool) -> bool:
 def _extract_budget_utilization(risk_snapshot: Mapping[str, Any]) -> float:
     """
     Extract risk budget utilization as 0..1+ (1.0 = hit limit) from several keys.
+    Accepts percent or fraction.
     """
     util = _first_present_float(
         risk_snapshot,
@@ -356,7 +347,7 @@ def _score_pnl_and_dd(risk_snapshot: Mapping[str, Any]) -> dict[str, float]:
     pnl = _safe_float(risk_snapshot, "daily_realized_pnl_pct", 0.0)
     dd = _safe_float(risk_snapshot, "daily_drawdown_pct", 0.0)
 
-    # tolerate dd magnitude convention: enforce negative = drawdown
+    # tolerate dd convention: enforce negative = drawdown
     if dd > 0:
         dd = -abs(dd)
 
@@ -602,7 +593,7 @@ def _compute_ai_capacity_delta(
     shrink = 0.50 + 0.50 * _clamp(k_conf, 0.0, 1.0)  # 0.5..1.0
     tilt *= shrink
 
-    # extra “anti-overconfidence” knob
+    # optional anti-overconfidence knob
     overconf_pen = _cfg_float(cfg, "AI_OVERLAY_OVERCONF_PEN", 0.0)
     if overconf_pen > 0.0 and goodness > 0.75 and k_conf < 0.35:
         tilt -= _clamp(overconf_pen, 0.0, 0.12)
@@ -843,14 +834,17 @@ def compute_ai_overlay(
 def explain_overlay(overlay: Mapping[str, Any]) -> str:
     """Human-readable summary (PURE). Safe even if overlay is partial."""
     try:
-        rp = str(overlay.get("risk_profile", "balanced"))
+        profile = str(overlay.get("risk_profile", "balanced"))
         mode = int(overlay.get("risk_mode", 1))
         block = bool(overlay.get("block_new_entries", False))
         delta = float(overlay.get("ai_capacity_delta", 0.0))
         gate = float(overlay.get("regime_entry_gate_factor", 1.0))
-        mm = float(overlay.get("recommend_max_pos_mult", 1.0))
-        lbl = "risk_off" if mode == 0 else ("risk_on" if mode == 2 else "normal")
-        return f"profile={rp} mode={lbl} block={int(block)} cap_delta={delta:+.2f} gate={gate:.2f} maxpos_mult={mm:.2f}"
+        maxpos = float(overlay.get("recommend_max_pos_mult", 1.0))
+        label = "risk_off" if mode == 0 else ("risk_on" if mode == 2 else "normal")
+        return (
+            f"profile={profile} mode={label} block={int(block)} "
+            f"cap_delta={delta:+.2f} gate={gate:.2f} maxpos_mult={maxpos:.2f}"
+        )
     except Exception:
         return "profile=unknown mode=unknown"
 
@@ -883,7 +877,7 @@ def is_risk_off(overlay: Mapping[str, Any]) -> bool:
     return bool(block or mode == 0)
 
 
-def validate_overlay(overlay: Mapping[str, Any]) -> tuple[bool, list[str]]:
+def validate_overlay(overlay: Mapping[str, Any] | None) -> tuple[bool, list[str]]:
     errs: list[str] = []
     if overlay is None:
         return False, ["overlay is None"]
@@ -927,6 +921,10 @@ def validate_overlay(overlay: Mapping[str, Any]) -> tuple[bool, list[str]]:
     rp = str(overlay.get("risk_profile", ""))
     if rp not in ("ultra_defensive", "defensive", "balanced", "aggressive", "degenerate"):
         errs.append("risk_profile invalid")
+
+    dbg = overlay.get("debug", {})
+    if not isinstance(dbg, dict):
+        errs.append("debug not_dict")
 
     return (len(errs) == 0), errs
 
@@ -1205,11 +1203,9 @@ def _candidate_components(
     freeze_auth_disabled = features.get("freeze_authority_disabled")
     raw["mint_authority_disabled"] = mint_auth_disabled
     raw["freeze_authority_disabled"] = freeze_auth_disabled
-    mint_r = (
-        0.0 if (mint_auth_disabled is True) else (0.85 if mint_auth_disabled is False else 0.50)
-    )
+    mint_r = 0.0 if mint_auth_disabled is True else (0.85 if mint_auth_disabled is False else 0.50)
     freeze_r = (
-        0.0 if (freeze_auth_disabled is True) else (0.85 if freeze_auth_disabled is False else 0.50)
+        0.0 if freeze_auth_disabled is True else (0.85 if freeze_auth_disabled is False else 0.50)
     )
     comp["authority_risk"] = _clamp(0.50 * mint_r + 0.50 * freeze_r, 0.0, 1.0)
     why["authority_risk"] = f"mint={mint_auth_disabled} freeze={freeze_auth_disabled}"
@@ -1236,7 +1232,7 @@ def _candidate_components(
         dev_hold /= 100.0
     raw["dev_sell_5m_usd"] = dev_sell
     raw["dev_hold_frac"] = dev_hold
-    dev_sell_r = _clamp(math.log10(dev_sell + 1.0) / 3.0, 0.0, 1.0)  # ~1k=>1, 10=>0.3
+    dev_sell_r = _clamp(math.log10(dev_sell + 1.0) / 3.0, 0.0, 1.0)
     dev_hold_r = _clamp(dev_hold * 1.7, 0.0, 1.0)
     comp["deployer_risk"] = _clamp(0.55 * dev_sell_r + 0.45 * dev_hold_r, 0.0, 1.0)
     why["deployer_risk"] = f"dev_sell5m=${dev_sell:.0f} dev_hold≈{dev_hold * 100:.0f}%"
@@ -1248,6 +1244,7 @@ def _candidate_components(
     raw["sells"] = sells
     total = buys + sells
     buy_ratio = (buys / total) if total > 0 else 0.5
+
     manip_r = 0.50 if total == 0 else 0.0  # no prints => NOT safe
     if total >= 6 and buy_ratio > 0.92 and sells <= 1:
         manip_r = 0.82
@@ -1255,6 +1252,7 @@ def _candidate_components(
         manip_r = 0.62
     elif total > 0 and buy_ratio < 0.25:
         manip_r = 0.55
+
     comp["manip_risk"] = _clamp(manip_r, 0.0, 1.0)
     why["manip_risk"] = f"buys/sells={int(buys)}/{int(sells)} br={buy_ratio:.2f}"
 
@@ -1275,11 +1273,9 @@ def _candidate_components(
     )
     raw["chg5_pct"] = chg5
     if chg5 >= 0:
-        # huge pumps are riskier (blow-off)
-        trend_risk = _map_linear(chg5, 80.0, 10.0)
+        trend_risk = _map_linear(chg5, 80.0, 10.0)  # huge pumps are riskier
     else:
-        # dumps are riskier
-        trend_risk = _map_linear(chg5, -5.0, -35.0)
+        trend_risk = _map_linear(chg5, -5.0, -35.0)  # dumps are riskier
     comp["trend_risk"] = _clamp(trend_risk, 0.0, 1.0)
     why["trend_risk"] = f"chg5m={chg5:.1f}%"
 
@@ -1297,12 +1293,12 @@ def _candidate_components(
     route_conf = _first_present_float(features, ("route_conf", "route_confidence"), 0.0)
     raw["route_ok"] = route_ok
     raw["route_conf"] = route_conf
+
     if route_ok is False:
         comp["route_risk"] = 0.95
         why["route_risk"] = "route_ok=False"
     else:
         rc = _as_frac_01(route_conf) if route_conf else 0.0
-        # unknown => 0.45 risk, high confidence => lower risk
         comp["route_risk"] = _clamp(0.45 - 0.35 * rc, 0.0, 1.0) if rc > 0 else 0.45
         why["route_risk"] = f"conf={rc:.2f}" if rc > 0 else "unknown"
 
@@ -1354,6 +1350,7 @@ def score_candidate(
                 if ck in config:
                     with contextlib.suppress(Exception):
                         w[k] = float(config[ck])
+
             s = sum(max(0.0, float(v)) for v in w.values())
             if s > 0:
                 for k in w:
@@ -1365,7 +1362,7 @@ def score_candidate(
         heur = _clamp(heur, 0.0, 1.0)
 
         # Optional blend with a precomputed score (if present)
-        pre = None
+        pre: float | None = None
         for key in ("ai_risk_score", "fraud_score", "rug_score", "security_risk_score"):
             if key in feats and feats[key] is not None:
                 try:
@@ -1381,7 +1378,7 @@ def score_candidate(
         score = (
             heur
             if pre is None
-            else _clamp(heur_weight * heur + (1.0 - heur_weight) * float(pre), 0.0, 1.0)
+            else _clamp(heur_weight * heur + (1.0 - heur_weight) * pre, 0.0, 1.0)
         )
 
         # Confidence: count of meaningful signals present
@@ -1562,7 +1559,7 @@ def candidate_gate(
 
 
 # =============================================================================
-# Aliases (candidate-level)
+# Aliases / adapters (candidate-level)
 # =============================================================================
 
 
@@ -1578,11 +1575,6 @@ def score(features: dict[str, Any], config: Mapping[str, Any] | None = None) -> 
 
 def evaluate(features: dict[str, Any], config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     return score_candidate(features, config)
-
-
-# =============================================================================
-# Adapters used by scoring_service (expects risk_score or score key)
-# =============================================================================
 
 
 def score_risk(
@@ -1616,7 +1608,7 @@ def risk_score(
 # =============================================================================
 
 
-def validate_candidate_score(out: Mapping[str, Any]) -> tuple[bool, list[str]]:
+def validate_candidate_score(out: Mapping[str, Any] | None) -> tuple[bool, list[str]]:
     errs: list[str] = []
     if out is None:
         return False, ["candidate_out is None"]
@@ -1643,15 +1635,80 @@ def validate_candidate_score(out: Mapping[str, Any]) -> tuple[bool, list[str]]:
     if lbl not in ("safe", "ok", "elevated", "critical"):
         errs.append("label invalid")
 
-    if not isinstance(out.get("reasons", []), list):
+    hb = out.get("hard_block")
+    if not isinstance(hb, bool):
+        errs.append("hard_block not_bool")
+
+    reasons = out.get("reasons", [])
+    if not isinstance(reasons, list):
         errs.append("reasons not_list")
+    else:
+        # Keep this lightweight; just ensure string-ish
+        for i, r in enumerate(reasons[:50]):
+            if not isinstance(r, str):
+                errs.append(f"reasons[{i}] not_str")
+                break
 
     comp = out.get("components", {})
     if not isinstance(comp, dict):
         errs.append("components not_dict")
+    else:
+        for k, v in list(comp.items())[:50]:
+            if not isinstance(k, str):
+                errs.append("components key not_str")
+                break
+            try:
+                fv = float(v)
+                if not (0.0 <= fv <= 1.0):
+                    errs.append(f"components[{k}] out_of_range")
+            except Exception:
+                errs.append(f"components[{k}] not_float")
 
     raw = out.get("raw", {})
     if not isinstance(raw, dict):
         errs.append("raw not_dict")
 
+    ver = out.get("version")
+    if not isinstance(ver, str) or not ver:
+        errs.append("version invalid")
+
     return (len(errs) == 0), errs
+
+
+# =============================================================================
+# Local smoke
+# =============================================================================
+
+if __name__ == "__main__":  # pragma: no cover
+    # quick sanity for manual runs (no IO)
+    rs = {
+        "equity_usd": 1000.0,
+        "daily_realized_pnl_pct": 4.0,
+        "daily_drawdown_pct": -3.5,
+        "regime_label_numeric": 0.3,
+        "regime_stress_score": 0.25,
+        "regime_signal_strength": 0.55,
+        "manipulation_risk": 0.15,
+        "risk_budget_util": 0.20,
+    }
+    ov = compute_ai_overlay(rs)
+    print("overlay:", ov)
+
+    feats = {
+        "age_min": 12.0,
+        "liq_usd": 12_000.0,
+        "vol_5m_usd": 4_000.0,
+        "top_holder_pct": 0.12,
+        "top10_holder_pct": 0.48,
+        "lp_locked_pct": 0.35,
+        "honeypot_score": 0.25,
+        "buy_tax_pct": 1.0,
+        "sell_tax_pct": 1.0,
+        "impact_1k_bps": 650,
+        "chg5": 22.0,
+        "route_ok": True,
+        "route_conf": 0.65,
+    }
+    cr = score_candidate(feats)
+    print("candidate:", cr)
+    print("gate:", candidate_gate(cr, ov))

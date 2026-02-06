@@ -57,41 +57,48 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Protocol, cast
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Logging (robust)
+# Logging (robust + mypy-safe)
 # ──────────────────────────────────────────────────────────────────────────────
-try:
-    from logging_setup import get_logger  # type: ignore
-
-    try:
-        log = get_logger(__name__)  # type: ignore[arg-type]
-    except TypeError:
-        log = get_logger()  # type: ignore[misc]
-except Exception:  # pragma: no cover
+def _mk_logger() -> Any:
+    # Prefer repo logger(s), fallback to stdlib.
+    for mod_name in ("utils_pkg.logging_setup", "logging_setup"):
+        with contextlib.suppress(Exception):
+            mod = __import__(mod_name, fromlist=["get_logger"])
+            fn = getattr(mod, "get_logger", None)
+            if callable(fn):
+                with contextlib.suppress(TypeError):
+                    return fn(__name__)
+                return fn()
     import logging
 
-    log = logging.getLogger("utils_pkg.scoring_service")
-    if not log.handlers:
+    lg = logging.getLogger("utils_pkg.scoring_service")
+    if not lg.handlers:
         logging.basicConfig(level=logging.INFO)
+    return lg
 
-# log.every shim (per-key "log every N occurrences")
+
+log: Any = _mk_logger()
+
+# "every" shim (per-key "log every N occurrences"), avoids mypy complaints
 if not hasattr(log, "every"):
     _EVERY_STATE: dict[str, int] = {}
 
     def _every(key: str, n: int = 60) -> bool:
         try:
-            n = int(n)
+            nn = int(n)
         except Exception:
-            n = 60
-        if n <= 1:
+            nn = 60
+        if nn <= 1:
             return True
         c = _EVERY_STATE.get(key, 0) + 1
         _EVERY_STATE[key] = c
-        return (c % n) == 1
+        return (c % nn) == 1
 
-    log.every = _every
+    log.every = _every  # type: ignore[attr-defined]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -127,9 +134,7 @@ def _safe_ratio(num: float, den: float, default: float = 0.0) -> float:
 
 def _first_present(*vals: Any, default: float | None = None) -> float | None:
     for v in vals:
-        if v is None:
-            continue
-        if isinstance(v, bool):
+        if v is None or isinstance(v, bool):
             continue
         try:
             return float(v)
@@ -244,8 +249,63 @@ async def _await_with_timeout(x: Any, timeout_s: float) -> Any:
     if timeout_s <= 0:
         return await _maybe_await(x)
     if inspect.isawaitable(x):
-        return await asyncio.wait_for(x, timeout=timeout_s)
+        return await asyncio.wait_for(cast(Any, x), timeout=timeout_s)
     return x
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Regime helpers (mypy-safe)
+# ──────────────────────────────────────────────────────────────────────────────
+class _RegimeNumeric(Protocol):
+    def as_numeric(self) -> float: ...
+
+
+class _RegimeManip(Protocol):
+    manipulation_risk: float
+
+
+def _regime_ln_manip(regime: Any | None) -> tuple[float, float]:
+    """
+    Extract (label_numeric, manipulation_risk) from regime objects/dicts safely.
+
+    Important: mypy sees context.get("regime") as Optional[Any] and does NOT narrow via hasattr,
+    so we use explicit `regime is not None` + Protocol casts to avoid union-attr errors.
+    """
+    ln = 0.0
+    manip = 0.0
+    if regime is None:
+        return ln, manip
+
+    if isinstance(regime, dict):
+        with contextlib.suppress(Exception):
+            ln = float(regime.get("label_numeric", regime.get("labelNumeric", 0.0)) or 0.0)
+        with contextlib.suppress(Exception):
+            manip = float(
+                regime.get("manipulation_risk", regime.get("manipulationRisk", 0.0)) or 0.0
+            )
+        return ln, manip
+
+    # Object-style regime
+    as_num = getattr(regime, "as_numeric", None)
+    if callable(as_num):
+        with contextlib.suppress(Exception):
+            ln = float(cast(_RegimeNumeric, regime).as_numeric())
+    with contextlib.suppress(Exception):
+        ln_attr = getattr(regime, "label_numeric", None)
+        if ln_attr is not None:
+            ln = float(ln_attr)
+
+    with contextlib.suppress(Exception):
+        manip = float(cast(_RegimeManip, regime).manipulation_risk)
+    return ln, manip
+
+
+def _regime_cache_key(regime: Any | None) -> str:
+    if regime is None:
+        return ""
+    ln, mr = _regime_ln_manip(regime)
+    # stable + compact
+    return f"ln={ln:.3f}|mr={mr:.3f}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -322,7 +382,7 @@ class ScoreConfig:
     source_overrides: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
     @classmethod
-    def from_env(cls) -> ScoreConfig:
+    def from_env(cls) -> "ScoreConfig":
         base = cls(
             min_liq_usd=_f_env("SCORING_MIN_LIQ_USD", 3_000.0),
             max_age_min=_f_env("SCORING_MAX_AGE_MIN", 720.0),
@@ -359,7 +419,8 @@ class ScoreConfig:
         if total <= 0:
             if log.every("SCORING_BAD_WEIGHTS", 600):
                 log.warning("SCORING: weights sum <= 0; resetting to defaults")
-            base = cls(source_overrides=base.source_overrides)
+            base = dataclasses.replace(cls(), source_overrides=base.source_overrides)
+            total = float(base.w_ai + base.w_momentum + base.w_quality + base.w_risk)
 
         cache_max_items = max(128, int(base.cache_max_items))
         max_conc = max(1, int(base.max_concurrency))
@@ -367,10 +428,10 @@ class ScoreConfig:
         if cache_key_mode not in {"mint", "mint_source", "mint_source_regime", "explicit_only"}:
             cache_key_mode = "mint"
 
-        w_ai = float(base.w_ai) / total if total > 0 else cls().w_ai
-        w_m = float(base.w_momentum) / total if total > 0 else cls().w_momentum
-        w_q = float(base.w_quality) / total if total > 0 else cls().w_quality
-        w_r = float(base.w_risk) / total if total > 0 else cls().w_risk
+        w_ai = float(base.w_ai) / total
+        w_m = float(base.w_momentum) / total
+        w_q = float(base.w_quality) / total
+        w_r = float(base.w_risk) / total
 
         return dataclasses.replace(
             base,
@@ -383,7 +444,7 @@ class ScoreConfig:
             cache_key_mode=cache_key_mode,
         )
 
-    def for_source(self, source: str) -> ScoreConfig:
+    def for_source(self, source: str) -> "ScoreConfig":
         s = (source or "").strip().lower()
         if not s:
             return self
@@ -508,24 +569,6 @@ def _cache_enabled(cfg: ScoreConfig) -> bool:
     return float(cfg.cache_ttl_s or 0.0) > 0.0
 
 
-def _regime_cache_key(regime: Any) -> str:
-    if regime is None:
-        return ""
-    if isinstance(regime, dict):
-        ln = regime.get("label_numeric", regime.get("labelNumeric", ""))
-        mr = regime.get("manipulation_risk", regime.get("manipulationRisk", ""))
-        return f"ln={ln}|mr={mr}"
-    with contextlib.suppress(Exception):
-        ln = (
-            regime.as_numeric()
-            if hasattr(regime, "as_numeric")
-            else getattr(regime, "label_numeric", "")
-        )
-    with contextlib.suppress(Exception):
-        mr = getattr(regime, "manipulation_risk", "")
-    return f"ln={ln}|mr={mr}"
-
-
 def _cache_key(mint: str, context: dict[str, Any], cfg: ScoreConfig) -> str:
     explicit = str(context.get("cache_key") or "").strip()
     if explicit:
@@ -539,7 +582,8 @@ def _cache_key(mint: str, context: dict[str, Any], cfg: ScoreConfig) -> str:
     if mode == "mint_source":
         return f"{mint}:{source}"
     if mode == "mint_source_regime":
-        reg = _regime_cache_key(context.get("regime"))
+        regime: Any | None = context.get("regime")
+        reg = _regime_cache_key(regime)
         return f"{mint}:{source}:{reg}"
     return mint
 
@@ -569,6 +613,46 @@ async def _cache_put(key: str, st: ScoredToken, cfg: ScoreConfig) -> None:
         max_items = int(cfg.cache_max_items or 2048)
         while len(_SCORE_CACHE) > max_items:
             _SCORE_CACHE.popitem(last=False)
+
+
+async def _inflight_get_or_create(key: str) -> tuple[asyncio.Future[ScoredToken], bool]:
+    """
+    Returns (future, is_owner).
+    IMPORTANT: never await while holding _CACHE_LOCK (prevents deadlocks).
+    """
+    loop = asyncio.get_running_loop()
+    async with _CACHE_LOCK:
+        fut = _INFLIGHT.get(key)
+        if fut is not None and not fut.done():
+            return fut, False
+        fut2: asyncio.Future[ScoredToken] = loop.create_future()
+        _INFLIGHT[key] = fut2
+        return fut2, True
+
+
+async def _inflight_resolve(
+    key: str,
+    fut: asyncio.Future[ScoredToken],
+    *,
+    result: ScoredToken | None,
+    exc: BaseException | None,
+) -> None:
+    async with _CACHE_LOCK:
+        cur = _INFLIGHT.get(key)
+        if cur is fut:
+            _INFLIGHT.pop(key, None)
+
+    if fut.done():
+        return
+    try:
+        if exc is not None:
+            fut.set_exception(exc)
+        elif result is not None:
+            fut.set_result(result)
+        else:
+            fut.set_exception(RuntimeError("scoring_service: inflight aborted"))
+    except Exception:
+        pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -727,7 +811,10 @@ def _normalize_pool_meta(raw_pool: Mapping[str, Any]) -> dict[str, Any]:
     )
     ai_rug = (
         _first_present(
-            rp.get("ai_rug_score_01"), rp.get("ai_rug_score"), rp.get("ai_fraud_score"), default=0.0
+            rp.get("ai_rug_score_01"),
+            rp.get("ai_rug_score"),
+            rp.get("ai_fraud_score"),
+            default=0.0,
         )
         or 0.0
     )
@@ -751,7 +838,7 @@ def _normalize_pool_meta(raw_pool: Mapping[str, Any]) -> dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Lazy imports (avoid cycles)
+# Lazy imports (avoid cycles) — best-effort
 # ──────────────────────────────────────────────────────────────────────────────
 def _lazy_imports() -> tuple[Any, Any, Any, Any]:
     FB = None
@@ -830,7 +917,7 @@ async def _build_features(
 def _normalize_score_reason(res: Any, *, key: str = "score") -> tuple[float | None, str]:
     if res is None:
         return None, ""
-    if isinstance(res, int | float) and not isinstance(res, bool):
+    if isinstance(res, (int, float)) and not isinstance(res, bool):
         return float(res), ""
     if isinstance(res, dict):
         sc = res.get(key)
@@ -842,7 +929,7 @@ def _normalize_score_reason(res: Any, *, key: str = "score") -> tuple[float | No
         with contextlib.suppress(Exception):
             return float(sc), why
         return None, why
-    if isinstance(res, tuple | list) and len(res) >= 1:
+    if isinstance(res, (tuple, list)) and len(res) >= 1:
         sc = None
         why = ""
         with contextlib.suppress(Exception):
@@ -863,11 +950,11 @@ def _normalize_pass_gate(res: Any) -> tuple[bool, float | None, str]:
         sc, why = _normalize_score_reason(res, key="score")
         why = why or str(res.get("why") or "")
         return ok, sc, why
-    if isinstance(res, tuple | list) and len(res) >= 1:
+    if isinstance(res, (tuple, list)) and len(res) >= 1:
         ok = bool(res[0])
         sc = None
         why = ""
-        if len(res) >= 2 and isinstance(res[1], int | float) and not isinstance(res[1], bool):
+        if len(res) >= 2 and isinstance(res[1], (int, float)) and not isinstance(res[1], bool):
             sc = float(res[1])
         if len(res) >= 3:
             why = str(res[2])
@@ -921,7 +1008,7 @@ async def _call_ai_buy_scoring(
         pass_gate = getattr(ABS, "pass_gate", None)
         Candidate = getattr(ABS, "Candidate", None)
         if callable(pass_gate) and Candidate is not None:
-            c = Candidate(**_candidate_kwargs(pool_meta, features))  # type: ignore
+            c = Candidate(**_candidate_kwargs(pool_meta, features))  # type: ignore[misc]
             res = pass_gate(c)
             res = await _await_with_timeout(res, float(cfg.timeout_abs_s or 0.0))
             ok, sc, why = _normalize_pass_gate(res)
@@ -1104,7 +1191,10 @@ def _compute_momentum_score(
     intensity = v_rel * 14.0  # 0..42
 
     score = _clamp(base + imbalance + intensity + 10.0 * pump_vel_norm)
-    why = f"chg1m={chg_1m:.2f}% chg5m={chg_5m:.2f}%; br={buy_ratio:.2f}; vol5/liq={v_rel:.2f}; pumpVelN={pump_vel_norm:.2f}"
+    why = (
+        f"chg1m={chg_1m:.2f}% chg5m={chg_5m:.2f}%; br={buy_ratio:.2f}; "
+        f"vol5/liq={v_rel:.2f}; pumpVelN={pump_vel_norm:.2f}"
+    )
     return score, why
 
 
@@ -1112,7 +1202,7 @@ def _compute_quality_score(
     cfg: ScoreConfig, features: dict[str, Any], pool_meta: dict[str, Any]
 ) -> tuple[float, str]:
     eq = features.get("entry_quality_score")
-    if isinstance(eq, int | float) and not isinstance(eq, bool):
+    if isinstance(eq, (int, float)) and not isinstance(eq, bool):
         sc = _clamp(float(eq) / 1.5 * 100.0)
         return sc, f"from entry_quality_score={float(eq):.3f}"
 
@@ -1183,8 +1273,8 @@ def _compute_risk_score(
     context: dict[str, Any],
 ) -> tuple[float, str]:
     entry_risk = features.get("entry_risk_score")
-    fb_risk_100 = None
-    if isinstance(entry_risk, int | float) and not isinstance(entry_risk, bool):
+    fb_risk_100: float | None = None
+    if isinstance(entry_risk, (int, float)) and not isinstance(entry_risk, bool):
         fb_risk_100 = _clamp(float(entry_risk) * 100.0)
 
     base = (
@@ -1275,24 +1365,8 @@ def _compute_risk_score(
         base += 10.0
         reasons.append("top10>80(+10)")
 
-    regime = context.get("regime")
-    ln = 0.0
-    manip = 0.0
-    if isinstance(regime, dict):
-        with contextlib.suppress(Exception):
-            ln = float(regime.get("label_numeric", regime.get("labelNumeric", 0.0)) or 0.0)
-        with contextlib.suppress(Exception):
-            manip = float(
-                regime.get("manipulation_risk", regime.get("manipulationRisk", 0.0)) or 0.0
-            )
-    else:
-        with contextlib.suppress(Exception):
-            if hasattr(regime, "as_numeric"):
-                ln = float(regime.as_numeric())
-        with contextlib.suppress(Exception):
-            if hasattr(regime, "manipulation_risk"):
-                manip = float(regime.manipulation_risk)
-
+    regime: Any | None = context.get("regime")
+    ln, manip = _regime_ln_manip(regime)
     if ln <= -0.7:
         base += 8.0
         reasons.append("regime_risk_off(+8)")
@@ -1328,23 +1402,7 @@ def _combine_scores(
     )
 
     regime = context.get("regime")
-    ln = 0.0
-    manip = 0.0
-    if isinstance(regime, dict):
-        with contextlib.suppress(Exception):
-            ln = float(regime.get("label_numeric", regime.get("labelNumeric", 0.0)) or 0.0)
-        with contextlib.suppress(Exception):
-            manip = float(
-                regime.get("manipulation_risk", regime.get("manipulationRisk", 0.0)) or 0.0
-            )
-    else:
-        with contextlib.suppress(Exception):
-            if hasattr(regime, "as_numeric"):
-                ln = float(regime.as_numeric())
-        with contextlib.suppress(Exception):
-            if hasattr(regime, "manipulation_risk"):
-                manip = float(regime.manipulation_risk)
-
+    ln, manip = _regime_ln_manip(regime)
     penalty = 0.0
     if ln <= -0.7:
         penalty += float(cfg.regime_risk_penalty)
@@ -1391,7 +1449,7 @@ async def _derive_trade_gate(
     if age > float(cfg.max_age_min):
         return False, f"age {age:.1f}m > max {cfg.max_age_min:.0f}m"
 
-    # FeatureBuilder hard blocks (common naming patterns)
+    # FeatureBuilder hard blocks
     entry_block_flag = float(features.get("entry_block_flag", 0.0) or 0.0)
     if entry_block_flag >= 1.0:
         return False, "feature_builder entry_block_flag"
@@ -1426,7 +1484,7 @@ async def _derive_trade_gate(
         return False, f"risk {risk:.0f} too high"
 
     soft_all = features.get("gate_all_soft_ok")
-    if isinstance(soft_all, int | float) and not isinstance(soft_all, bool):
+    if isinstance(soft_all, (int, float)) and not isinstance(soft_all, bool):
         if float(soft_all) <= 0.0 and label == "YELLOW":
             return False, "feature_builder soft-gate"
 
@@ -1488,36 +1546,38 @@ async def score_candidate(raw_pool: Any, context: dict[str, Any] | None = None) 
         if cached is not None:
             return cached
 
-    # In-flight de-dupe (prevents stampedes in parallel scans)
+    inflight_fut: asyncio.Future[ScoredToken] | None = None
+    is_owner = True
     if key:
-        async with _CACHE_LOCK:
-            fut = _INFLIGHT.get(key)
-            if fut is not None and not fut.done():
-                return await fut
-            loop = asyncio.get_running_loop()
-            fut = loop.create_future()
-            _INFLIGHT[key] = fut
+        inflight_fut, is_owner = await _inflight_get_or_create(key)
+        if not is_owner:
+            return await inflight_fut
 
     async def _compute() -> ScoredToken:
         # Features (canonical)
-        features: dict[str, Any] = {}
         try:
-            features = await _build_features(raw_dict, pool_meta, context, cfg)
-            if not isinstance(features, dict):
-                features = {}
-        except TimeoutError:
+            built: Any = await _build_features(raw_dict, pool_meta, context, cfg)
+        except TimeoutError as exc:
             if log.every("SCORING_FB_TIMEOUT", 120):
-                log.warning("SCORING: feature_builder timeout (src=%s mint=%s)", src or "na", mint)
-            if not cfg.fail_open:
-                raise
-        except Exception as exc:
-            if log.every("SCORING_FB_ERR", 120):
                 log.warning(
-                    "SCORING: feature_builder error (src=%s mint=%s): %s", src or "na", mint, exc
+                    "SCORING: feature_builder timeout (src=%s mint=%s): %s", src or "na", mint, exc
                 )
             if not cfg.fail_open:
                 raise
-            features = {}
+            built = {}
+        except Exception as exc:
+            if log.every("SCORING_FB_ERR", 120):
+                log.warning(
+                    "SCORING: feature_builder error (src=%s mint=%s): %s",
+                    src or "na",
+                    mint,
+                    exc,
+                )
+            if not cfg.fail_open:
+                raise
+            built = {}
+
+        features: dict[str, Any] = built if isinstance(built, dict) else {}
 
         # Optional time budget guard: if we already burned most budget, skip heavy AI calls
         elapsed = _now_mono() - start
@@ -1559,7 +1619,7 @@ async def score_candidate(raw_pool: Any, context: dict[str, Any] | None = None) 
         entry_block_flag = _clamp(features.get("entry_block_flag", 0.0) or 0.0, 0.0, 1.0)
 
         reasons = _format_reasons(
-            label=label,
+            label=str(label).upper().strip(),
             combined=combined_score,
             ai_entry=ai_entry_score,
             ai_entry_reason=ai_entry_reason,
@@ -1574,7 +1634,7 @@ async def score_candidate(raw_pool: Any, context: dict[str, Any] | None = None) 
             gate_reason=str(gate_reason or ""),
         )
 
-        st = ScoredToken(
+        return ScoredToken(
             mint=str(pool_meta.get("mint") or ""),
             symbol=str(pool_meta.get("symbol") or "UNKNOWN"),
             chain=str(pool_meta.get("chain") or "SOL"),
@@ -1594,8 +1654,9 @@ async def score_candidate(raw_pool: Any, context: dict[str, Any] | None = None) 
             raw_features=features,
             created_at_ts=time.time(),
         )
-        return st
 
+    st: ScoredToken | None = None
+    exc: BaseException | None = None
     try:
         st = await _compute()
         if key:
@@ -1614,25 +1675,13 @@ async def score_candidate(raw_pool: Any, context: dict[str, Any] | None = None) 
                 st.is_trade_viable,
                 st.size_hint,
             )
-
         return st
+    except BaseException as e:
+        exc = e
+        raise
     finally:
-        if key:
-            # Resolve inflight future
-            async with _CACHE_LOCK:
-                fut = _INFLIGHT.get(key)
-                if fut is not None and not fut.done():
-                    # If we got here via exception, we still want callers to proceed.
-                    # Best-effort: set exception; callers using fail_open paths won't usually hit this.
-                    try:
-                        # st may or may not exist in scope; guard safely.
-                        if "st" in locals():
-                            fut.set_result(locals()["st"])
-                        else:
-                            fut.set_exception(RuntimeError("scoring_service: inflight aborted"))
-                    except Exception:
-                        pass
-                _INFLIGHT.pop(key, None)
+        if key and inflight_fut is not None and is_owner:
+            await _inflight_resolve(key, inflight_fut, result=st, exc=exc)
 
 
 async def score_many(

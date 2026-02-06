@@ -8,7 +8,7 @@ Non-negotiables
 ---------------
 - Keep the "God Tier" feature surface (no amputations).
 - No I/O at import-time (no network sessions/clients, no redis connect, no disk).
-- FakeSession-first HTTP (tests inject session).
+- FakeSession-first HTTP (tests inject a session).
 - In contract/safe/pytest mode: NEVER sleep/backoff in a way that can hang tests.
 
 Key test contracts (LOCKED)
@@ -27,16 +27,15 @@ Render / module-matrix lock-in
 
 Notes
 -----
-This file is intentionally defensive:
-- Heavy deps are optional and imported lazily.
+- Heavy deps are optional and imported lazily where possible.
 - HTTP prefers injected session; creates real aiohttp/httpx clients only when allowed.
 - Redis/SQLite/Solana RPC are lazy and gated by contract/safe/pytest flags.
-
 """
 
 import asyncio
 import base64
 import contextlib
+import importlib
 import inspect
 import json
 import os
@@ -44,9 +43,9 @@ import random
 import ssl
 import struct
 import time
-from collections.abc import Awaitable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager
-from typing import Any, TypeVar, cast
+from typing import Any, Final, TypeVar, cast
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import certifi
@@ -56,8 +55,8 @@ import httpx
 # Contract / test / safe-mode gates (NO hangs, NO forced real network)
 # ──────────────────────────────────────────────────────────────────────────────
 
-_TRUE = {"1", "true", "t", "yes", "y", "on"}
-_FALSE = {"0", "false", "f", "no", "n", "off"}
+_TRUE: Final[set[str]] = {"1", "true", "t", "yes", "y", "on"}
+_FALSE: Final[set[str]] = {"0", "false", "f", "no", "n", "off"}
 
 
 def _env_str(name: str, default: str = "") -> str:
@@ -139,6 +138,7 @@ async def _sleep(seconds: float) -> None:
 
 
 def _jitter(min_ms: int = 20, max_ms: int = 120) -> float:
+    # Only used when network is allowed; tests/contract won't call this.
     return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
 
@@ -162,10 +162,10 @@ def _short(x: Any, n: int = 260) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Logging (safe fallback + .event/.every shim)
+# Logging (use logging_setup contract logger; no monkeypatching here)
 # ──────────────────────────────────────────────────────────────────────────────
 try:  # pragma: no cover
-    from logging_setup import get_logger  # type: ignore
+    from utils_pkg.logging_setup import get_logger  # type: ignore
 except Exception:  # pragma: no cover
     import logging
 
@@ -175,31 +175,38 @@ except Exception:  # pragma: no cover
 
 log = get_logger(__name__)
 
-if not hasattr(log, "event"):
 
-    def _event(name: str, **kw: Any) -> None:  # pragma: no cover
-        with contextlib.suppress(Exception):
-            log.info("%s %s", name, kw)
-
-    log.event = _event  # type: ignore[attr-defined]
-
-if not hasattr(log, "every"):
-
-    def _every(
-        key: str, n: int = 30, msg: str | None = None, **kw: Any
-    ) -> None:  # pragma: no cover
-        try:
-            now = time.monotonic()
-            store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
-            last = float(store.get(key, 0.0))
-            if (now - last) >= float(max(1, int(n))):
-                store[key] = now
-                _every._store = store  # type: ignore[attr-defined]
-                log.event(msg or key, **kw)
-        except Exception:
+def _log_event(name: str, **kw: Any) -> None:
+    try:
+        fn = getattr(log, "event", None)
+        if callable(fn):
+            fn(name, **kw)
             return
+    except Exception:
+        pass
+    with contextlib.suppress(Exception):
+        log.info("%s %s", name, kw)
 
-    log.every = _every  # type: ignore[attr-defined]
+
+def _log_every(key: str, n: int = 30, msg: str | None = None, **kw: Any) -> None:
+    try:
+        fn = getattr(log, "every", None)
+        if callable(fn):
+            fn(key, n=n, msg=msg, **kw)
+            return
+    except Exception:
+        pass
+    # fallback: very small local throttle
+    try:
+        now = time.monotonic()
+        store = getattr(_log_every, "_store", {})  # type: ignore[attr-defined]
+        last = float(store.get(key, 0.0))
+        if (now - last) >= float(max(1, int(n))):
+            store[key] = now
+            _log_every._store = store  # type: ignore[attr-defined]
+            _log_event(msg or key, **kw)
+    except Exception:
+        return
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -264,39 +271,42 @@ except Exception:  # pragma: no cover
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants / endpoints
 # ──────────────────────────────────────────────────────────────────────────────
-LAMPORTS_PER_SOL = 1_000_000_000
-LAMPORTS_PER_SOL_F = float(LAMPORTS_PER_SOL)
+LAMPORTS_PER_SOL: Final[int] = 1_000_000_000
+LAMPORTS_PER_SOL_F: Final[float] = float(LAMPORTS_PER_SOL)
 
-COINGECKO_SOL_API = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
-DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
-BIRDEYE_PRICE_URL = "https://public-api.birdeye.so/defi/price?address={mint}"
+COINGECKO_SOL_API: Final[str] = (
+    "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+)
+DEXSCREENER_TOKEN_URL: Final[str] = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
+BIRDEYE_PRICE_URL: Final[str] = "https://public-api.birdeye.so/defi/price?address={mint}"
 
-TELEGRAM_BOT_TOKEN = _env_str("TELEGRAM_BOT_TOKEN", "") or _env_str("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = _env_str("TELEGRAM_CHAT_ID", "") or _env_str("TG_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN: str = _env_str("TELEGRAM_BOT_TOKEN", "") or _env_str("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID: str = _env_str("TELEGRAM_CHAT_ID", "") or _env_str("TG_CHAT_ID", "")
 
-JUPITER_QUOTE_API = _env_str("JUPITER_QUOTE_API", "") or "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_API = _env_str("JUPITER_SWAP_API", "") or "https://quote-api.jup.ag/v6/swap"
+JUPITER_QUOTE_API: str = _env_str("JUPITER_QUOTE_API", "") or "https://quote-api.jup.ag/v6/quote"
+JUPITER_SWAP_API: str = _env_str("JUPITER_SWAP_API", "") or "https://quote-api.jup.ag/v6/swap"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Runtime globals (NO I/O here)
 # ──────────────────────────────────────────────────────────────────────────────
-_aiohttp_session: Any = None
-aiohttp_session: Any = None
-_http_session: Any = None
-http_session: Any = None
-_HTTP_SESSION: Any = None
-HTTP_SESSION: Any = None
-session: Any = None
+# Session aliases (compat)
+_aiohttp_session: Any | None = None
+aiohttp_session: Any | None = None
+_http_session: Any | None = None
+http_session: Any | None = None
+_HTTP_SESSION: Any | None = None
+HTTP_SESSION: Any | None = None
+session: Any | None = None
 
 _aiohttp_lock = asyncio.Lock()
 
 _httpx_client: httpx.AsyncClient | None = None
 _httpx_lock = asyncio.Lock()
 
-solana_client: AsyncClient | None = None
-wallet: Any = None
-redis: Any = None
+solana_client: Any | None = None
+wallet: Any | None = None
+redis: Any | None = None
 
 _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 _INIT_LOCK = asyncio.Lock()
@@ -361,7 +371,7 @@ _NULL_REDIS = _NullRedis()
 # ──────────────────────────────────────────────────────────────────────────────
 # FakeSession-first HTTP helpers
 # ──────────────────────────────────────────────────────────────────────────────
-def get_http_session() -> Any:
+def get_http_session() -> Any | None:
     g = globals()
     candidates = [
         "_aiohttp_session",
@@ -449,7 +459,7 @@ async def _read_json_resp(resp: Any) -> Any:
     return None
 
 
-async def _ensure_aiohttp_session() -> Any:
+async def _ensure_aiohttp_session() -> Any | None:
     global _aiohttp_session, aiohttp_session, HTTP_SESSION, session
     if _contract_no_network():
         return None
@@ -508,7 +518,6 @@ async def _get_json_with_status(
     """
     s = session or get_http_session()
 
-    # If no injected session AND we are offline/contract => stop (NO real network).
     if s is None:
         if _contract_no_network():
             return 0, None
@@ -728,9 +737,9 @@ async def get_redis_async() -> Any:
 # ──────────────────────────────────────────────────────────────────────────────
 # SQLite (entry price + sniped tokens) — disabled in pytest unless allowed
 # ──────────────────────────────────────────────────────────────────────────────
-_ENTRY_PRICE_PREFIX = "entry_price:"
-_SNIPED_KEY_PREFIX = "sniped:"
-_SNIPED_SET_KEY = "sniped_tokens"
+_ENTRY_PRICE_PREFIX: Final[str] = "entry_price:"
+_SNIPED_KEY_PREFIX: Final[str] = "sniped:"
+_SNIPED_SET_KEY: Final[str] = "sniped_tokens"
 
 
 async def _maybe_await(x: Any) -> Any:
@@ -1323,12 +1332,11 @@ async def get_jupiter_quote(
     if _in_pytest() and "/quote" not in path:
         return None
 
-    # Extract quote payload
     q = _find_quote(raw)
     if q is None and isinstance(raw, dict):
         q = raw
 
-    # TEST-LOCK: in pytest we return dict-ish if path is /quote (even if incomplete)
+    # TEST-LOCK: in pytest return dict-ish if path is /quote
     if _in_pytest() and "/quote" in path:
         if isinstance(q, dict):
             q.setdefault("inputMint", a)
@@ -1336,7 +1344,6 @@ async def get_jupiter_quote(
             return q
         return {"inputMint": a, "outputMint": b}
 
-    # PROD: require valid amounts
     if q is None or not _valid_quote(q):
         return None
 
@@ -1363,18 +1370,19 @@ async def swap_token_jupiter(
     _ = buy
     _ = kwargs
 
+    # In contract/no-network, never attempt real execution.
     if _contract_no_network():
         return (False, "")
 
     try:
-        raw = int(round(float(amount_float) * (10 ** int(decimals))))
+        raw_amt = int(round(float(amount_float) * (10 ** int(decimals))))
     except Exception:
         return (False, "")
 
     q = await get_jupiter_quote(
         input_mint=input_mint,
         output_mint=output_mint,
-        amount_lamports=int(raw),
+        amount_lamports=int(raw_amt),
         slippage_pct=float(slippage),
         session=session,
     )
@@ -1382,7 +1390,6 @@ async def swap_token_jupiter(
         return (False, "")
 
     # Delegate if your project has a real swap executor.
-    # We do NOT implement signing here (keeps import safe + avoids hidden side effects).
     for mod_name, fn_names in (
         ("utils_pkg.router", ("swap_token_jupiter", "swap", "swap_jupiter", "swap_token")),
         ("utils_pkg.jupiter", ("swap_token_jupiter", "swap", "swap_jupiter")),
@@ -1424,9 +1431,9 @@ def dca_profit_exit(
     **kwargs: Any,
 ) -> bool:
     if entry_price is None and "entry" in kwargs:
-        entry_price = kwargs.get("entry")
+        entry_price = cast(float | None, kwargs.get("entry"))
     if current_price is None and "current" in kwargs:
-        current_price = kwargs.get("current")
+        current_price = cast(float | None, kwargs.get("current"))
 
     target = kwargs.get("target")
 
@@ -1472,7 +1479,7 @@ def _base_rpc_url() -> str:
     return v or "https://api.mainnet-beta.solana.com"
 
 
-async def _ensure_solana_client() -> AsyncClient | None:
+async def _ensure_solana_client() -> Any | None:
     global solana_client
     if _contract_no_network():
         return None
@@ -1488,7 +1495,7 @@ async def _ensure_solana_client() -> AsyncClient | None:
     return solana_client
 
 
-async def _load_wallet_if_needed(*, require: bool) -> Any:
+async def _load_wallet_if_needed(*, require: bool) -> Any | None:
     global wallet
     if wallet is not None:
         return wallet
@@ -1549,7 +1556,7 @@ async def close_resources() -> None:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     with contextlib.suppress(Exception):
-        if solana_client is not None:
+        if solana_client is not None and hasattr(solana_client, "close"):
             await solana_client.close()
     solana_client = None
 
@@ -1578,7 +1585,7 @@ async def managed_resources(require_wallet: bool | None = None):
         await close_resources()
 
 
-def get_solana_client() -> AsyncClient | None:
+def get_solana_client() -> Any | None:
     return solana_client
 
 
@@ -1591,7 +1598,8 @@ def get_wallet_pubkey() -> str:
 
 async def get_wallet_keypair(required: bool = True) -> Any:
     await init_resources(require_wallet=bool(required))
-    return await _load_wallet_if_needed(require=bool(required))
+    kp = await _load_wallet_if_needed(require=bool(required))
+    return kp
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1640,8 +1648,8 @@ def create_task(coro: Awaitable[T], *, name: str | None = None) -> asyncio.Task[
 # ──────────────────────────────────────────────────────────────────────────────
 # Wallet token helpers (kept; lazy)
 # ──────────────────────────────────────────────────────────────────────────────
-TOKEN_PROGRAM_ID_STR = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-TOKEN_2022_PROGRAM_ID_STR = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+TOKEN_PROGRAM_ID_STR: Final[str] = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM_ID_STR: Final[str] = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
 
 def _parse_token_account_data(data: bytes) -> dict[str, Any]:
@@ -1735,7 +1743,7 @@ async def transfer_to_savings(
 
     dr = bool(dry_run) if dry_run is not None else _env_bool("DRY_RUN", False)
     if dr or _contract_no_network():
-        log.event(
+        _log_event(
             "TRANSFER_TO_SAVINGS_DRYRUN",
             amount_sol=amt_f,
             destination=(destination or to_pubkey or ""),
@@ -1770,15 +1778,55 @@ def transfer_to_savings_sync(*args: Any, **kwargs: Any) -> tuple[bool, str]:
             return (False, f"sync_err:{_short(e)}")
 
 
-def log_to_notion(*args: Any, **kwargs: Any):
-    try:
-        from utils_pkg.notion_alert import log_to_notion as _impl  # preferred
-    except Exception:
-        try:
-            from utils_pkg.notion_client import log_to_notion as _impl  # fallback
-        except Exception:
-            return None
-    return _impl(*args, **kwargs)
+# ──────────────────────────────────────────────────────────────────────────────
+# Notion logging shim (mypy-safe, import-safe, best-effort)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_NotionLogFn = Callable[..., Any]
+_NOTION_LOG_IMPL: _NotionLogFn | None = None
+_NOTION_LOG_TRIED = False
+
+
+def _resolve_log_to_notion() -> _NotionLogFn | None:
+    """
+    Resolve a project-provided Notion logger without requiring static exports.
+
+    Tries, in order:
+      - utils_pkg.notion_alert.log_to_notion
+      - utils_pkg.notion_client.log_to_notion
+
+    Returns None if unavailable. Never raises.
+    """
+    global _NOTION_LOG_IMPL, _NOTION_LOG_TRIED
+    if _NOTION_LOG_TRIED:
+        return _NOTION_LOG_IMPL
+
+    _NOTION_LOG_TRIED = True
+
+    for mod_name in ("utils_pkg.notion_alert", "utils_pkg.notion_client"):
+        with contextlib.suppress(Exception):
+            mod = importlib.import_module(mod_name)
+            fn = getattr(mod, "log_to_notion", None)
+            if callable(fn):
+                _NOTION_LOG_IMPL = cast(_NotionLogFn, fn)
+                return _NOTION_LOG_IMPL
+
+    _NOTION_LOG_IMPL = None
+    return None
+
+
+def log_to_notion(*args: Any, **kwargs: Any) -> Any:
+    """
+    Best-effort Notion logging hook.
+
+    - Never hard-fails in prod
+    - Never forces network at import time
+    - Mypy-safe even if notion modules don't export log_to_notion
+    """
+    fn = _resolve_log_to_notion()
+    if fn is None:
+        return None
+    return fn(*args, **kwargs)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

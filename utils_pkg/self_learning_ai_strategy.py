@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
@@ -6,21 +7,19 @@ utils_pkg/self_learning_ai_strategy.py
 Self-learning Strategy Brain — God Tier V4+++ (quant-grade)
 ===========================================================
 
-What this module DOES
----------------------
 A bounded, safety-first strategy tuner that:
   • Records closed trades (full/partial) into a rolling store
   • Computes robust performance stats (trimmed, downside-risk aware, drawdown-aware)
   • Reads risk_manager context (risk:ctx) and obeys it
   • Publishes live knobs to strategy:params (single source for tunable params)
   • Emits health snapshots + param history
+  • Optional (off by default) OpenAI micro-nudges that are STILL bounded + step-limited
 
-What this module DOES NOT DO
-----------------------------
-  • It does not execute trades
-  • It does not “invent” new params outside the contract
-  • It does not allow any tuning outside hard bounds + per-step limits
-  • LLM tuning is OPTIONAL, off by default, and can only suggest bounded micro nudges
+Non-goals:
+  • Does not execute trades
+  • Does not invent params outside the contract
+  • Does not tune outside hard bounds + per-step limits
+  • LLM tuning is optional, off by default, and only suggests bounded micro nudges
 
 Public API (stable)
 -------------------
@@ -38,6 +37,11 @@ Public API (stable)
         entry_score: float | None = None,
         hold_minutes: float | None = None,
         meta: dict | None = None,
+        # optional extra fields (safe, ignored if absent)
+        profit_usd: float | None = None,
+        equity_after_usd: float | None = None,
+        redis: RedisLike | None = None,
+        **_ignored: Any,
     ) -> None
 
     async def get_perf_snapshot(redis=None) -> dict
@@ -73,59 +77,297 @@ Notes
 -----
 - Safe by construction: all modifications are clamped + step-limited.
 - Mean-reverting: “aggressive” mode is earned and fades fast when regime degrades.
-- Risk_manager remains the ultimate authority via risk:ctx (hard_halt, caps, etc).
+- risk_manager remains the ultimate authority via risk:ctx (hard_halt, caps, etc).
+- Import is side-effect free (no network connections or background tasks at import).
 """
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import math
 import os
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from statistics import mean
-from typing import Any
-
-log = logging.getLogger("utils_pkg.self_learning_ai_strategy")
-
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 # =============================================================================
-# Optional dependencies
+# Canonical project logging (no conditional redefs, no signature mismatch)
 # =============================================================================
 
-# Redis async (optional)
+if TYPE_CHECKING:
+    from utils_pkg.log_compat import EventLogger, get_logger
+else:  # pragma: no cover
+    try:
+        from utils_pkg.log_compat import EventLogger, get_logger  # type: ignore
+    except Exception:  # pragma: no cover
+        EventLogger = Any  # type: ignore[misc,assignment]
+
+        def get_logger(  # type: ignore[no-redef]
+            name: str | None = None,
+            *,
+            service: str | None = None,
+            version: str | None = None,
+            env: str | None = None,
+            level: str | int | None = None,
+            json_logs: bool | None = None,
+            use_utc: bool | None = None,
+            include_src: bool | None = None,
+            stream: str | None = None,
+            force: bool = False,
+        ) -> Any:
+            lg = logging.getLogger(name or "self_learning_ai_strategy")
+            if force or not lg.handlers:
+                logging.basicConfig(level=logging.INFO)
+            if level is not None:
+                with contextlib.suppress(Exception):
+                    lg.setLevel(level)  # type: ignore[arg-type]
+            return lg
+
+
+log: "EventLogger" = get_logger(__name__)
+_stdlog = logging.getLogger(__name__)
+
+
+def _emit_event(name: str, **fields: Any) -> None:
+    """Best-effort structured event emission. Never raises."""
+    try:
+        ev = getattr(log, "event", None)
+        if callable(ev):
+            ev(name, **fields)  # type: ignore[misc]
+            return
+    except Exception:
+        pass
+    with contextlib.suppress(Exception):
+        _stdlog.info("[event] %s %s", name, fields)
+
+
+# Optional metric bump (best-effort).
+class _BumpImpl(Protocol):
+    def __call__(self, name: str, by: int = 1, **tags: Any) -> None: ...
+
+
+_bump_impl: _BumpImpl | None
 try:
-    import redis.asyncio as aioredis  # type: ignore[import-not-found]
+    from logging_setup import bump as _bump_func  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover
-    aioredis = None  # type: ignore[assignment]
+    _bump_impl = None
+else:
+    _bump_impl = _bump_func
 
-# Prefer project Redis factory
+
+def _metric(name: str, value: int = 1) -> None:
+    if _bump_impl is None:
+        return
+    with contextlib.suppress(Exception):
+        _bump_impl(name, int(value))
+
+
+async def _maybe_await(x: Any) -> Any:
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+
+# =============================================================================
+# Optional dependencies (keep imports lightweight)
+# =============================================================================
+
+# Redis asyncio (optional)
+_redis_async: Any | None
+try:
+    import redis.asyncio as _redis_async  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    _redis_async = None
+
+
+# =============================================================================
+# Redis interface typing (kept intentionally SMALL + compatible)
+# =============================================================================
+
+
+class RedisLike(Protocol):
+    async def get(self, key: str) -> str | None: ...
+    async def set(self, key: str, value: Any, ex: int | None = ...) -> Any: ...
+    async def lrange(self, key: str, start: int, end: int) -> list[str]: ...
+    async def lpush(self, key: str, value: str) -> Any: ...
+    async def ltrim(self, key: str, start: int, end: int) -> Any: ...
+    async def hgetall(self, key: str) -> dict[str, str]: ...
+    async def eval(self, script: str, numkeys: int, *args: Any) -> Any: ...
+
+
+# Project redis factory (optional)
+_GetRedisAsync = Callable[[], Awaitable["RedisLike | None"]]
+_project_get_redis_async: _GetRedisAsync | None
+
 try:
     from utils_pkg.core_utils import (
-        get_redis_async as _get_redis_async_project,  # type: ignore[attr-defined]
+        get_redis_async as _project_get_redis_async_raw,  # type: ignore[attr-defined]
     )
 except Exception:  # pragma: no cover
-    _get_redis_async_project = None  # type: ignore[assignment]
+    _project_get_redis_async = None
+else:
+    _project_get_redis_async = cast(_GetRedisAsync, _project_get_redis_async_raw)
 
-# Telegram/Notion best-effort
+
+# ---- Telegram (optional, but mypy-safe) -------------------------------------
+
+_SendTelegramImpl = Callable[..., Any]
+
+_send_telegram_impl: _SendTelegramImpl | None
 try:
-    from utils_pkg.core_utils import log_to_notion, send_telegram  # type: ignore[attr-defined]
+    from utils_pkg.core_utils import (
+        send_telegram as _send_telegram_func,  # type: ignore[attr-defined]
+    )
 except Exception:  # pragma: no cover
+    _send_telegram_impl = None
+else:
+    _send_telegram_impl = cast(_SendTelegramImpl, _send_telegram_func)
 
-    async def send_telegram(msg: str) -> None:  # type: ignore[override]
-        log.info("[TG] %s", msg)
 
-    async def log_to_notion(**_: Any) -> None:  # type: ignore[override]
+# ---- Notion (optional, but mypy-safe) ---------------------------------------
+
+_LogToNotionImpl = Callable[..., Any]
+
+_log_to_notion_impl: _LogToNotionImpl | None
+try:
+    from utils_pkg.core_utils import (
+        log_to_notion as _log_to_notion_func,  # type: ignore[attr-defined]
+    )
+except Exception:  # pragma: no cover
+    _log_to_notion_impl = None
+else:
+    _log_to_notion_impl = _log_to_notion_func
+
+
+# ---- Data logger (optional) -------------------------------------------------
+
+_log_event_impl: Callable[..., Any] | None
+try:
+    from utils_pkg.data_logger import log_event as _log_event_func  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    _log_event_impl = None
+else:
+    _log_event_impl = cast(Callable[..., Any], _log_event_func)
+
+
+async def send_telegram(
+    text: str | None = None,
+    *,
+    message: str | None = None,
+    msg: str | None = None,
+    session: Any | None = None,
+    chat_id: str | None = None,
+    token: str | None = None,
+    parse_mode: str | None = None,
+    disable_preview: bool | None = None,
+    timeout_s: float | None = None,
+    sol_value: float | None = None,
+    usd_value: float | None = None,
+    **_ignored: Any,
+) -> bool:
+    """
+    Stable wrapper matching the project's widest expected signature.
+    Returns bool (best-effort). Never raises.
+    """
+    final = msg if msg is not None else message if message is not None else text
+    if not final:
+        return False
+
+    impl = _send_telegram_impl
+    if impl is None:
+        with contextlib.suppress(Exception):
+            _stdlog.info("[TG] %s", final)
+        return False
+
+    # Build a "wide" kwargs set, then filter to what the impl actually accepts.
+    wide_kwargs: dict[str, Any] = {
+        "session": session,
+        "chat_id": chat_id,
+        "token": token,
+        "parse_mode": parse_mode,
+        "timeout_s": timeout_s,
+        "sol_value": sol_value,
+        "usd_value": usd_value,
+    }
+    # Some implementations use different naming for this.
+    if disable_preview is not None:
+        wide_kwargs["disable_preview"] = bool(disable_preview)
+        wide_kwargs["disable_web_page_preview"] = bool(disable_preview)
+
+    # Drop None values early.
+    wide_kwargs = {k: v for k, v in wide_kwargs.items() if v is not None}
+
+    try:
+        sig = inspect.signature(impl)
+        params = sig.parameters
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+        # Choose the message field name if present; otherwise we'll pass positional.
+        use_positional = True
+        call_kwargs = dict(wide_kwargs)
+
+        if "msg" in params:
+            call_kwargs["msg"] = final
+            use_positional = False
+        elif "message" in params:
+            call_kwargs["message"] = final
+            use_positional = False
+        elif "text" in params:
+            call_kwargs["text"] = final
+            use_positional = False
+
+        if not has_varkw:
+            call_kwargs = {k: v for k, v in call_kwargs.items() if k in params}
+
+        out = impl(final, **call_kwargs) if use_positional else impl(**call_kwargs)
+        out2 = await _maybe_await(out)
+        return bool(out2) if out2 is not None else True
+    except TypeError:
+        # Signature mismatch — last-chance fallback: try keyword text then positional.
+        try:
+            out = impl(text=final, **wide_kwargs)  # type: ignore[misc]
+            out2 = await _maybe_await(out)
+            return bool(out2) if out2 is not None else True
+        except Exception:
+            try:
+                out = impl(final)  # type: ignore[misc]
+                out2 = await _maybe_await(out)
+                return bool(out2) if out2 is not None else True
+            except Exception:
+                return False
+    except Exception:
+        return False
+
+
+async def log_to_notion(*args: Any, **kwargs: Any) -> Any:
+    """
+    Stable async wrapper; safely awaits if impl returns awaitable.
+    """
+    impl = _log_to_notion_impl
+    if impl is None:
+        return None
+    try:
+        out = impl(*args, **kwargs)
+        return await _maybe_await(out)
+    except Exception:
+        return None
+
+
+async def log_event(name: str, payload: dict[str, Any] | None = None, **fields: Any) -> None:
+    """
+    Stable async wrapper for telemetry/event logging.
+    """
+    impl = _log_event_impl
+    if impl is None:
         return
-
-
-# Structured event logger best-effort
-try:
-    from utils_pkg.data_logger import log_event  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-
-    async def log_event(*_: Any, **__: Any) -> None:  # type: ignore[override]
+    try:
+        out = impl(name, payload, **fields)
+        await _maybe_await(out)
+    except Exception:
         return
 
 
@@ -141,7 +383,7 @@ _OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 try:
     from openai import AsyncOpenAI  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover
-    AsyncOpenAI = None  # type: ignore[assignment]
+    AsyncOpenAI = None
 
 
 # =============================================================================
@@ -159,13 +401,11 @@ PARAM_HISTORY_KEY = "strategy:param_history"
 HEALTH_KEY = "strategy:health"
 REINVEST_HISTORY_KEY = "strategy:reinvest_history"
 
-# Distributed tuning lock
 TUNE_LOCK_KEY = "strategy:tune_lock"
 TUNE_LOCK_TTL_SEC = int(os.getenv("STRAT_TUNE_LOCK_TTL_SEC", "30"))
 
-# Cadence / gating
-LEARNING_INTERVAL_SECONDS = int(os.getenv("LEARNING_INTERVAL_SECONDS", "1800"))  # 30m default
-LLM_MIN_INTERVAL_SECONDS = int(os.getenv("LLM_MIN_INTERVAL_SECONDS", "3600"))  # 60m default
+LEARNING_INTERVAL_SECONDS = int(os.getenv("LEARNING_INTERVAL_SECONDS", "1800"))  # 30m
+LLM_MIN_INTERVAL_SECONDS = int(os.getenv("LLM_MIN_INTERVAL_SECONDS", "3600"))  # 60m
 
 MIN_TRADES_FOR_TUNING = int(os.getenv("MIN_TRADES_FOR_TUNING", "12"))
 MIN_TRADES_FOR_LLM = int(os.getenv("STRAT_MIN_TRADES_FOR_LLM", "30"))
@@ -180,7 +420,6 @@ STRAT_REQUIRE_RUNTIME_STABLE = os.getenv(
     "STRAT_REQUIRE_RUNTIME_STABLE", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
 
-# Step limits
 MAX_STEP_REL = float(os.getenv("STRAT_MAX_STEP_REL", "0.12"))  # 12% per tune
 LLM_MAX_REL_MOVE = float(
     os.getenv("STRAT_LLM_MAX_REL_MOVE", "0.20")
@@ -210,37 +449,30 @@ HALT_COOLDOWN_SEC = int(os.getenv("STRAT_HALT_COOLDOWN_SEC", "1800"))  # 30m
 
 SCHEMA_VERSION = 4
 
-
 # =============================================================================
 # Param schema (hard bounds + defaults + abs-step caps)
 # =============================================================================
 
 BOUNDS: dict[str, tuple[float, float]] = {
-    # Exit / execution
     "STOP_LOSS_PERCENT": (6.0, 35.0),
     "TARGET_PROFIT_PERCENT": (0.0, 600.0),
     "MAX_HOLD_TIME_MINUTES": (20.0, 1440.0),
     "SLIPPAGE": (0.0015, 0.02),  # 0.15%..2%
-    # Reinvestment / risk
     "REINVEST_PERCENT": (5.0, 95.0),
     "MAX_RISK_PER_TRADE": (0.01, 0.12),  # fraction of equity
     "MIN_SOL_BALANCE": (0.05, 3.0),
-    # Entry/exit interactions
     "HOLD_IF_SCORE_ABOVE": (0.60, 0.99),
     "MIN_PROFIT_THRESHOLD": (3.0, 30.0),
     "PARTIAL_TP_CHUNKS": (2.0, 8.0),
     "ENTRY_SCORE_GATE": (0.45, 0.90),
-    # Concurrency / gating
     "ENTRY_MAX_PARALLEL": (1.0, 16.0),
     "ENTRY_RISK_BOOST_FACTOR": (0.4, 1.6),
-    # Laddered exits
     "EXIT_TAKE_PROFIT_1": (8.0, 60.0),
     "EXIT_TAKE_PROFIT_2": (20.0, 200.0),
     "EXIT_TAKE_PROFIT_3": (40.0, 350.0),
     "EXIT_TP_1_SIZE": (0.05, 0.50),
     "EXIT_TP_2_SIZE": (0.05, 0.60),
     "EXIT_TP_3_SIZE": (0.05, 0.80),
-    # Plan
     "PLAN_TARGET_APR_PCT": (20.0, 400.0),
     "PLAN_START_EQUITY_USD": (0.0, 1_000_000_000.0),
     "PLAN_START_TS": (0.0, 4_000_000_000.0),
@@ -303,7 +535,6 @@ DEFAULTS: dict[str, Any] = {
     "PLAN_STATUS": "n/a",
 }
 
-
 # In-memory fallbacks (Redis optional)
 _mem_params: dict[str, Any] = dict(DEFAULTS)
 _mem_trades: list[dict[str, Any]] = []
@@ -312,14 +543,13 @@ _mem_last_tune_ts: float = 0.0
 _mem_last_llm_ts: float = 0.0
 _mem_last_health_alert_ts: float = 0.0
 
-
 # =============================================================================
-# Helpers
+# JSON + parsing helpers
 # =============================================================================
 
 
 def _dumps(obj: Any) -> str:
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
 
 
 def _parse_bool(v: Any, default: bool = False) -> bool:
@@ -327,7 +557,7 @@ def _parse_bool(v: Any, default: bool = False) -> bool:
         return default
     if isinstance(v, bool):
         return v
-    if isinstance(v, int | float):
+    if isinstance(v, (int, float)):
         return bool(v)
     if isinstance(v, str):
         return v.strip().lower() in ("1", "true", "yes", "on")
@@ -349,7 +579,8 @@ def _safe_int(x: Any, default: int = 0) -> int:
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
-    return float(min(max(float(v), float(lo)), float(hi)))
+    vv = float(v)
+    return float(min(max(vv, float(lo)), float(hi)))
 
 
 def _safe_mean(xs: list[float]) -> float:
@@ -357,7 +588,6 @@ def _safe_mean(xs: list[float]) -> float:
 
 
 def _trimmed_mean(xs: list[float], trim: float = 0.10) -> float:
-    """Robust mean: drop top/bottom trim fraction."""
     if not xs:
         return 0.0
     ys = sorted(xs)
@@ -383,14 +613,13 @@ def _downside_deviation(pnl: list[float], threshold: float = 0.0) -> float:
     return float(math.sqrt(_safe_mean([d * d for d in downs])))
 
 
-def _sharpe_like(mu: float, std: float) -> float:
-    if std <= 1e-9:
+def _sharpe_like(mu: float, stdv: float) -> float:
+    if stdv <= 1e-9:
         return 0.0
-    return float(mu / std)
+    return float(mu / stdv)
 
 
 def _equity_curve_metrics(pnl_newest_first: list[float]) -> dict[str, float]:
-    """Multiplicative equity curve metrics (older -> newer)."""
     if not pnl_newest_first:
         return {"equity_cum_return_pct": 0.0, "equity_max_dd_pct": 0.0}
 
@@ -442,23 +671,72 @@ def _classify_trade(profit_pct: float, hold_minutes: float | None) -> str:
 
 
 # =============================================================================
-# Redis factory
+# Redis client factory (lazy, import-safe)
 # =============================================================================
 
+_redis_singleton: RedisLike | None = None
+_redis_singleton_lock: asyncio.Lock | None = None
 
-async def _get_redis():
-    """Best-effort Redis client factory. Returns None if unavailable."""
-    if _get_redis_async_project is not None:
+
+async def _ensure_redis(redis: RedisLike | None) -> RedisLike | None:
+    global _redis_singleton, _redis_singleton_lock
+
+    if redis is not None:
+        return redis
+
+    rs = _redis_singleton
+    if rs is not None:
+        return rs
+
+    if _redis_singleton_lock is None:
+        _redis_singleton_lock = asyncio.Lock()
+
+    lock = _redis_singleton_lock
+    assert lock is not None
+
+    async with lock:
+        rs2 = _redis_singleton
+        if rs2 is not None:
+            return rs2
+
+        # Prefer project Redis
+        if _project_get_redis_async is not None:
+            try:
+                r = await _project_get_redis_async()
+            except Exception:
+                r = None
+            if r is not None:
+                _redis_singleton = r
+                return r
+
+        # Fallback to redis.asyncio
+        if _redis_async is None:
+            return None
+
         try:
-            return await _get_redis_async_project()
+            r2 = _redis_async.from_url(REDIS_URL, decode_responses=True)
         except Exception:
-            pass
-    if aioredis is None:
+            return None
+
+        _redis_singleton = cast(RedisLike, r2)
+        return _redis_singleton
+
+
+async def _redis_set(redis: Any, key: str, value: Any, **kwargs: Any) -> Any:
+    """Dynamic set() to support nx/ex/etc without hard-typing mismatches."""
+    fn = getattr(redis, "set", None)
+    if not callable(fn):
         return None
-    try:
-        return aioredis.from_url(REDIS_URL, decode_responses=True)
-    except Exception:
+    out = fn(key, value, **kwargs)
+    return await _maybe_await(out)
+
+
+async def _redis_eval(redis: Any, script: str, numkeys: int, *args: Any) -> Any:
+    fn = getattr(redis, "eval", None)
+    if not callable(fn):
         return None
+    out = fn(script, numkeys, *args)
+    return await _maybe_await(out)
 
 
 # =============================================================================
@@ -492,11 +770,9 @@ def _sanitize_params(params: dict[str, Any]) -> dict[str, Any]:
 
     p["SCHEMA_VERSION"] = SCHEMA_VERSION
 
-    # Clamp bounded numeric keys
     for k, (lo, hi) in BOUNDS.items():
         p[k] = _clamp(_safe_float(p.get(k, DEFAULTS.get(k, lo))), lo, hi)
 
-    # Coerce ints
     p["PARTIAL_TP_CHUNKS"] = _safe_int(
         p.get("PARTIAL_TP_CHUNKS", DEFAULTS["PARTIAL_TP_CHUNKS"]),
         int(DEFAULTS["PARTIAL_TP_CHUNKS"]),
@@ -510,18 +786,14 @@ def _sanitize_params(params: dict[str, Any]) -> dict[str, Any]:
         int(DEFAULTS["ENTRY_MAX_PARALLEL"]),
     )
 
-    # Coerce bools
     p["TRAILING_STOP_ENABLED"] = _parse_bool(p.get("TRAILING_STOP_ENABLED", True), True)
     p["HARD_HALT"] = _parse_bool(p.get("HARD_HALT", False), False)
 
-    # Strategy mode: 0/1/2 only
     mode = _safe_int(p.get("STRAT_MODE", DEFAULTS["STRAT_MODE"]), int(DEFAULTS["STRAT_MODE"]))
     p["STRAT_MODE"] = 0 if mode < 0 else 2 if mode > 2 else mode
 
-    # Internal timestamp
     p["HARD_HALT_TS"] = _safe_float(p.get("HARD_HALT_TS", 0.0), 0.0)
 
-    # TP-size invariant
     _normalize_tp_sizes(p)
     for k in ("EXIT_TP_1_SIZE", "EXIT_TP_2_SIZE", "EXIT_TP_3_SIZE"):
         lo, hi = BOUNDS[k]
@@ -539,7 +811,6 @@ def _limit_step(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
         cur = _safe_float(old.get(k, DEFAULTS.get(k, lo)), DEFAULTS.get(k, lo))
         nxt = _safe_float(out.get(k, cur), cur)
 
-        # absolute cap
         abs_cap = MAX_STEP_ABS.get(k)
         if abs_cap is not None:
             delta = nxt - cur
@@ -548,7 +819,6 @@ def _limit_step(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
             elif delta < -abs_cap:
                 nxt = cur - abs_cap
 
-        # relative cap
         if MAX_STEP_REL > 0 and abs(cur) > 1e-12:
             rel_cap = abs(cur) * MAX_STEP_REL
             delta = nxt - cur
@@ -559,20 +829,13 @@ def _limit_step(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
 
         out[k] = _clamp(nxt, lo, hi)
 
-    # Preserve boolean flags unless explicitly set
     out["TRAILING_STOP_ENABLED"] = _parse_bool(
         out.get("TRAILING_STOP_ENABLED", old.get("TRAILING_STOP_ENABLED", True)), True
     )
     out["HARD_HALT"] = _parse_bool(out.get("HARD_HALT", old.get("HARD_HALT", False)), False)
 
-    # Preserve/limit STRAT_MODE
-    out["STRAT_MODE"] = _safe_int(
-        out.get("STRAT_MODE", old.get("STRAT_MODE", 1)), int(old.get("STRAT_MODE", 1))
-    )
-    if out["STRAT_MODE"] < 0:
-        out["STRAT_MODE"] = 0
-    if out["STRAT_MODE"] > 2:
-        out["STRAT_MODE"] = 2
+    mode = _safe_int(out.get("STRAT_MODE", old.get("STRAT_MODE", 1)), int(old.get("STRAT_MODE", 1)))
+    out["STRAT_MODE"] = 0 if mode < 0 else 2 if mode > 2 else mode
 
     out["HARD_HALT_TS"] = _safe_float(
         out.get("HARD_HALT_TS", old.get("HARD_HALT_TS", 0.0)),
@@ -587,38 +850,30 @@ def _limit_step(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
 # =============================================================================
 
 
-async def get_strategy_params(redis=None) -> dict[str, Any]:
-    """
-    Canonical strategy params.
-    Reads Redis if available, else in-memory.
-    """
+async def get_strategy_params(redis: RedisLike | None = None) -> dict[str, Any]:
     try:
-        if redis is None:
-            redis = await _get_redis()
-        if redis:
-            raw = await redis.get(PARAMS_KEY)
+        r = await _ensure_redis(redis)
+        if r is not None:
+            raw = await r.get(PARAMS_KEY)
             if raw:
                 try:
                     parsed = json.loads(raw)
                 except Exception:
                     parsed = {}
-                return _sanitize_params(_merge_defaults(parsed))
+                if isinstance(parsed, dict):
+                    return _sanitize_params(_merge_defaults(parsed))
         return _sanitize_params(dict(_mem_params))
     except Exception:
         return _sanitize_params(dict(_mem_params))
 
 
-async def set_strategy_params(redis, params: dict[str, Any]) -> None:
-    """
-    Persist strategy params (Redis + memory) after sanitation.
-    """
+async def set_strategy_params(redis: RedisLike | None, params: dict[str, Any]) -> None:
     cleaned = _sanitize_params(_merge_defaults(params or {}))
     _mem_params.update(cleaned)
     try:
-        if redis is None:
-            redis = await _get_redis()
-        if redis:
-            await redis.set(PARAMS_KEY, _dumps(cleaned))
+        r = await _ensure_redis(redis)
+        if r is not None:
+            await r.set(PARAMS_KEY, _dumps(cleaned))
     except Exception:
         pass
 
@@ -628,44 +883,37 @@ async def set_strategy_params(redis, params: dict[str, Any]) -> None:
 # =============================================================================
 
 
-async def _read_trades(redis, limit: int) -> list[dict[str, Any]]:
-    limit = max(0, int(limit))
-    if limit <= 0:
+async def _read_trades(redis: RedisLike | None, limit: int) -> list[dict[str, Any]]:
+    lim = max(0, int(limit))
+    if lim <= 0:
         return []
     try:
-        if redis:
-            raw = await redis.lrange(TRADES_KEY, 0, limit - 1)
+        if redis is not None:
+            raw = await redis.lrange(TRADES_KEY, 0, lim - 1)
             out: list[dict[str, Any]] = []
             for x in raw:
                 try:
-                    out.append(json.loads(x))
+                    v = json.loads(x)
+                    if isinstance(v, dict):
+                        out.append(v)
                 except Exception:
                     continue
             return out
-        return list(_mem_trades[:limit])
+        return list(_mem_trades[:lim])
     except Exception:
         return []
 
 
-async def _store_stats(redis, stats: dict[str, Any]) -> None:
+async def _store_stats(redis: RedisLike | None, stats: dict[str, Any]) -> None:
     _mem_stats.update(stats or {})
     try:
-        if redis:
+        if redis is not None:
             await redis.set(STATS_KEY, _dumps(stats))
     except Exception:
         pass
 
 
-async def _recompute_and_store_stats(redis) -> None:
-    """
-    Deterministic stats aggregation from last MAX_TRADES_KEEP trades.
-
-    Robust aspects:
-      - trimmed mean (reduces outlier domination)
-      - downside deviation
-      - equity drawdown from multiplicative curve
-      - kelly suggestion (bounded) with confidence
-    """
+async def _recompute_and_store_stats(redis: RedisLike | None) -> None:
     trades = await _read_trades(redis, MAX_TRADES_KEEP)
     if not trades:
         await _store_stats(
@@ -705,6 +953,7 @@ async def _recompute_and_store_stats(redis) -> None:
 
     pnl = [float(t.get("profit_pct", 0.0)) for t in trades]
     sorted_pnl = sorted(pnl)
+
     mu = _safe_mean(pnl)
     tmu = _trimmed_mean(pnl, trim=0.10)
     s = _std(pnl)
@@ -802,14 +1051,15 @@ async def _recompute_and_store_stats(redis) -> None:
     await _store_stats(redis, stats)
 
 
-async def get_perf_snapshot(redis=None) -> dict[str, Any]:
+async def get_perf_snapshot(redis: RedisLike | None = None) -> dict[str, Any]:
     try:
-        if redis is None:
-            redis = await _get_redis()
-        if redis:
-            raw = await redis.get(STATS_KEY)
+        r = await _ensure_redis(redis)
+        if r is not None:
+            raw = await r.get(STATS_KEY)
             if raw:
-                return json.loads(raw)
+                v = json.loads(raw)
+                if isinstance(v, dict):
+                    return v
         return dict(_mem_stats)
     except Exception:
         return dict(_mem_stats)
@@ -826,9 +1076,14 @@ async def process_trade_closure(
     entry_score: float | None = None,
     hold_minutes: float | None = None,
     meta: dict[str, Any] | None = None,
+    profit_usd: float | None = None,
+    equity_after_usd: float | None = None,
+    redis: RedisLike | None = None,
+    **_ignored: Any,
 ) -> None:
     """
     Record a trade closure (full or partial) and refresh stats.
+    Accepts extra keyword fields for forward compatibility.
     """
     try:
         if buy_price <= 0 or amount <= 0:
@@ -841,6 +1096,7 @@ async def process_trade_closure(
             "amount": float(amount),
             "partial": bool(partial),
             "timestamp": str(timestamp),
+            "tag": _classify_trade(profit_pct, hold_minutes),
         }
         if entry_score is not None:
             rec["entry_score"] = float(entry_score)
@@ -848,23 +1104,27 @@ async def process_trade_closure(
             rec["hold_minutes"] = float(hold_minutes)
         if meta:
             rec["meta"] = dict(meta)
+        if profit_usd is not None:
+            rec["profit_usd"] = float(profit_usd)
+        if equity_after_usd is not None:
+            rec["equity_after_usd"] = float(equity_after_usd)
 
-        rec["tag"] = _classify_trade(profit_pct, hold_minutes)
-
-        redis = await _get_redis()
-        if redis:
-            await redis.lpush(TRADES_KEY, _dumps(rec))
-            await redis.ltrim(TRADES_KEY, 0, MAX_TRADES_KEEP - 1)
-            await _recompute_and_store_stats(redis)
+        r = await _ensure_redis(redis)
+        if r is not None:
+            await r.lpush(TRADES_KEY, _dumps(rec))
+            await r.ltrim(TRADES_KEY, 0, MAX_TRADES_KEEP - 1)
+            await _recompute_and_store_stats(r)
         else:
             _mem_trades.insert(0, rec)
             del _mem_trades[MAX_TRADES_KEEP:]
             await _recompute_and_store_stats(None)
 
+        _metric("selflearn.trade_closure", 1)
         with contextlib.suppress(Exception):
             await log_event("trade_closed", rec)
     except Exception as e:  # pragma: no cover
-        log.warning("process_trade_closure failed: %s", e)
+        with contextlib.suppress(Exception):
+            _stdlog.warning("process_trade_closure failed: %s", e)
 
 
 # =============================================================================
@@ -872,10 +1132,7 @@ async def process_trade_closure(
 # =============================================================================
 
 
-async def _read_risk_ctx(redis) -> dict[str, Any]:
-    """
-    Pull risk:ctx from risk_manager if present; else best-effort defaults.
-    """
+async def _read_risk_ctx(redis: RedisLike | None) -> dict[str, Any]:
     base: dict[str, Any] = {
         "runtime_stable": True,
         "risk_capacity": 1.0,
@@ -896,7 +1153,7 @@ async def _read_risk_ctx(redis) -> dict[str, Any]:
         "min_sol_balance": 0.0,
         "hard_halt": False,
     }
-    if not redis:
+    if redis is None:
         return base
 
     try:
@@ -939,18 +1196,13 @@ async def _read_risk_ctx(redis) -> dict[str, Any]:
 def _rule_based_adjust(
     params: dict[str, Any], stats: dict[str, Any], risk_ctx: dict[str, Any]
 ) -> tuple[dict[str, Any], str]:
-    """
-    Deterministic, bounded adjustments based on stats & risk context.
-    Returns (new_params, reason).
-    """
     out = dict(params)
     reason_parts: list[str] = []
 
-    # Core stats
     win_rate = float(stats.get("win_rate", 0.0))
     recent_wr = float(stats.get("recent_win_rate", 0.0))
     tmean = float(stats.get("pnl_tmean", stats.get("pnl_mean", 0.0)))
-    std = float(stats.get("pnl_std", 0.0))
+    stdv = float(stats.get("pnl_std", 0.0))
     ddev = float(stats.get("pnl_downside_dev", 0.0))
     sharpe = float(stats.get("sharpe_like", 0.0))
     equity_max_dd = float(stats.get("equity_max_dd_pct", 0.0))
@@ -961,7 +1213,6 @@ def _rule_based_adjust(
     kelly = float(stats.get("kelly_suggestion", 0.02))
     k_conf = float(stats.get("kelly_confidence", 0.0))
 
-    # Risk context
     risk_capacity = float(risk_ctx.get("risk_capacity", 1.0))
     risk_mode = int(risk_ctx.get("risk_mode", 1))
     daily_pnl_pct = float(risk_ctx.get("daily_realized_pnl_pct", 0.0))
@@ -969,26 +1220,23 @@ def _rule_based_adjust(
     open_positions = int(risk_ctx.get("open_positions", 0))
     max_positions = int(risk_ctx.get("max_positions", 0))
 
-    regime_label = float(risk_ctx.get("regime_label_numeric", 0.0))  # ~[-1..+1]
-    regime_stress = float(risk_ctx.get("regime_stress_score", 0.0))  # 0..1
-    regime_signal = float(risk_ctx.get("regime_signal_strength", 0.0))  # 0..1
-    regime_gate = float(risk_ctx.get("regime_entry_gate_factor", 1.0))  # ~0.2..1.5
+    regime_label = float(risk_ctx.get("regime_label_numeric", 0.0))
+    regime_stress = float(risk_ctx.get("regime_stress_score", 0.0))
+    regime_signal = float(risk_ctx.get("regime_signal_strength", 0.0))
+    regime_gate = float(risk_ctx.get("regime_entry_gate_factor", 1.0))
 
     plan_gap_pct = float(risk_ctx.get("plan_gap_pct", 0.0))
 
-    # Risk-manager says "stop"
     if bool(risk_ctx.get("hard_halt", False)) or risk_capacity <= 0.0:
         out["HARD_HALT"] = True
         out["STRAT_MODE"] = 0
         out["HARD_HALT_TS"] = time.time()
         return _sanitize_params(out), "risk_hard_halt"
 
-    # Cooldown logic (if we previously halted ourselves)
     now = time.time()
     prev_halt = bool(out.get("HARD_HALT", False))
     last_halt_ts = float(out.get("HARD_HALT_TS", 0.0) or 0.0)
     if prev_halt and (now - last_halt_ts) < HALT_COOLDOWN_SEC:
-        # Only allow release if materially improved
         if not (
             risk_capacity > 0.60
             and recent_wr > 0.50
@@ -999,14 +1247,12 @@ def _rule_based_adjust(
             out["STRAT_MODE"] = 0
             return _sanitize_params(out), "halt_cooldown"
 
-    # Catastrophic performance halt (defensive + stop)
     if win_rate < HEALTH_HARD_HALT_WR and sharpe < HEALTH_HARD_HALT_SHARPE and risk_capacity < 0.40:
         out["HARD_HALT"] = True
         out["STRAT_MODE"] = 0
         out["HARD_HALT_TS"] = now
         return _sanitize_params(out), "health_catastrophic_halt"
 
-    # Regime classifications
     losing_regime = (
         win_rate < 0.45
         or recent_wr < 0.40
@@ -1031,7 +1277,6 @@ def _rule_based_adjust(
 
     mode = int(out.get("STRAT_MODE", 1))
 
-    # Defensive adjustment
     if losing_regime:
         reason_parts.append("losing_regime")
         mode = 0
@@ -1054,7 +1299,6 @@ def _rule_based_adjust(
             out["REINVEST_PERCENT"] = float(out["REINVEST_PERCENT"]) - 3.0
             out["ENTRY_SCORE_GATE"] = float(out["ENTRY_SCORE_GATE"]) + 0.008
 
-    # Extreme bad -> further defensive + possible hard halt
     if extreme_bad:
         reason_parts.append("extreme_bad")
         mode = 0
@@ -1069,11 +1313,10 @@ def _rule_based_adjust(
             out["HARD_HALT_TS"] = now
             reason_parts.append("hard_halt_triggered")
 
-    # Aggressive qualification
     strong_regime = (
         win_rate > AGGRESSIVE_MIN_WINRATE
         and tmean > AGGRESSIVE_MIN_MEAN
-        and std < 35.0
+        and stdv < 35.0
         and ddev < 12.0
         and daily_dd_pct > -5.0
         and sharpe > 0.30
@@ -1085,7 +1328,6 @@ def _rule_based_adjust(
         and not losing_regime
         and not extreme_bad
     )
-    # If plan is behind, we do NOT automatically go aggressive (stability > chase)
     if plan_gap_pct > 10.0:
         strong_regime = False
 
@@ -1108,7 +1350,6 @@ def _rule_based_adjust(
             out["REINVEST_PERCENT"] = float(out["REINVEST_PERCENT"]) + 2.0
             out["ENTRY_SCORE_GATE"] = float(out["ENTRY_SCORE_GATE"]) - 0.004
 
-    # Plan catch-up (very mild; still bounded by risk)
     if (
         plan_gap_pct < -8.0
         and not losing_regime
@@ -1123,12 +1364,10 @@ def _rule_based_adjust(
         out["ENTRY_MAX_PARALLEL"] = float(out["ENTRY_MAX_PARALLEL"]) + 1.0
         out["ENTRY_SCORE_GATE"] = float(out["ENTRY_SCORE_GATE"]) - 0.003
 
-    # Reduce dead-coin exposure when mean is weak
     if tmean < 5.0 and float(out["MAX_HOLD_TIME_MINUTES"]) > 60.0:
         reason_parts.append("weak_mean_reduce_hold")
         out["MAX_HOLD_TIME_MINUTES"] = float(out["MAX_HOLD_TIME_MINUTES"]) - 30.0
 
-    # Kelly nudges risk (damped)
     if k_conf > 0.0:
         target = max(0.01, min(kelly * 0.70, 0.10))
         if risk_capacity < 0.50 or daily_dd_pct <= -6.0 or risk_mode in (0, 3):
@@ -1138,7 +1377,6 @@ def _rule_based_adjust(
         elif regime_label > 0.40 and regime_signal > 0.40 and regime_stress < 0.40:
             target *= 1.08
 
-        # If position slots are full, don't increase risk
         if max_positions > 0 and open_positions >= max_positions:
             target = min(target, float(out["MAX_RISK_PER_TRADE"]))
 
@@ -1146,7 +1384,6 @@ def _rule_based_adjust(
         out["MAX_RISK_PER_TRADE"] = cur + (0.08 * k_conf) * (target - cur)
         reason_parts.append("kelly_nudge")
 
-    # Align entry gate with regime gate factor (mild)
     if 0.1 <= regime_gate <= 2.0:
         desired = float(out["ENTRY_SCORE_GATE"])
         if regime_gate > 1.05:
@@ -1163,9 +1400,6 @@ def _rule_based_adjust(
 
 
 def _enforce_risk_api_contract(params: dict[str, Any], risk_ctx: dict[str, Any]) -> dict[str, Any]:
-    """
-    Final pass: enforce ceilings/floors from risk_manager, mirror hard_halt.
-    """
     if not RESPECT_RISK_API_LIMITS:
         return _sanitize_params(params)
 
@@ -1198,10 +1432,6 @@ def _enforce_risk_api_contract(params: dict[str, Any], risk_ctx: dict[str, Any])
 
 
 def _update_equity_plan(params: dict[str, Any], risk_ctx: dict[str, Any]) -> dict[str, Any]:
-    """
-    Maintain PLAN_* fields:
-      target_equity(t) = start_equity * (1 + APR) ** (days/365)
-    """
     out = dict(params)
     equity = float(risk_ctx.get("equity_usd", 0.0) or 0.0)
 
@@ -1248,12 +1478,8 @@ def _update_equity_plan(params: dict[str, Any], risk_ctx: dict[str, Any]) -> dic
 
 
 async def _maybe_llm_adjust(
-    params: dict[str, Any], stats: dict[str, Any], risk_ctx: dict[str, Any], redis
+    params: dict[str, Any], stats: dict[str, Any], risk_ctx: dict[str, Any], redis: RedisLike | None
 ) -> tuple[dict[str, Any], str]:
-    """
-    Optional OpenAI refinement (bounded micro-nudges only).
-    Returns (params, llm_reason).
-    """
     global _mem_last_llm_ts
 
     if not (_ENABLE_AI_TUNING and AsyncOpenAI is not None):
@@ -1261,7 +1487,7 @@ async def _maybe_llm_adjust(
 
     try:
         now = time.time()
-        if redis:
+        if redis is not None:
             raw = await redis.get(LAST_LLM_TS_KEY)
             last_ts = float(raw) if raw else 0.0
         else:
@@ -1272,7 +1498,6 @@ async def _maybe_llm_adjust(
         if int(stats.get("trades", 0)) < max(MIN_TRADES_FOR_LLM, MIN_TRADES_FOR_TUNING, 8):
             return params, "llm_not_enough_trades"
 
-        # LLM can only suggest numeric bounded adjustments to existing non-PLAN keys.
         prompt = (
             "You are a systematic risk optimizer for a Solana microcap sniper strategy.\n"
             "Propose SMALL numeric adjustments to current params.\n\n"
@@ -1307,6 +1532,8 @@ async def _maybe_llm_adjust(
 
         filtered: dict[str, Any] = {}
         for k, v in proposed.items():
+            if not isinstance(k, str):
+                continue
             if k not in params:
                 continue
             if k == "STRAT_MODE" or k.startswith("PLAN_"):
@@ -1316,7 +1543,7 @@ async def _maybe_llm_adjust(
             if k not in BOUNDS:
                 continue
 
-            v_f = _safe_float(v, None)  # type: ignore[arg-type]
+            v_f = _safe_float(v, 0.0)
             cur = float(params.get(k, DEFAULTS.get(k, v_f)))
             if abs(cur) > 1e-12 and LLM_MAX_REL_MOVE > 0:
                 v_f = max(cur * (1.0 - LLM_MAX_REL_MOVE), min(v_f, cur * (1.0 + LLM_MAX_REL_MOVE)))
@@ -1329,7 +1556,7 @@ async def _maybe_llm_adjust(
 
         merged = _sanitize_params({**params, **filtered})
 
-        if redis:
+        if redis is not None:
             await redis.set(LAST_LLM_TS_KEY, str(now))
         else:
             _mem_last_llm_ts = now
@@ -1345,12 +1572,11 @@ async def _maybe_llm_adjust(
 
 
 def _health_score(stats: dict[str, Any], risk_ctx: dict[str, Any]) -> float:
-    """0..100 health score blending WR, Sharpe-like, DD, capacity, equity DD, plan gap."""
     wr = float(stats.get("win_rate", 0.0))
     sharpe = float(stats.get("sharpe_like", 0.0))
-    dd = float(risk_ctx.get("daily_drawdown_pct", 0.0))  # negative bad
+    dd = float(risk_ctx.get("daily_drawdown_pct", 0.0))
     cap = float(risk_ctx.get("risk_capacity", 1.0))
-    eq_dd = float(stats.get("equity_max_dd_pct", 0.0))  # negative bad
+    eq_dd = float(stats.get("equity_max_dd_pct", 0.0))
     plan_gap = float(risk_ctx.get("plan_gap_pct", 0.0))
 
     wr_score = max(0.0, min(1.0, (wr - 0.30) / 0.40)) * 100.0
@@ -1378,7 +1604,7 @@ def _health_score(stats: dict[str, Any], risk_ctx: dict[str, Any]) -> float:
 
 
 async def _record_param_history(
-    redis,
+    redis: RedisLike | None,
     diffs: dict[str, tuple[Any, Any]],
     stats: dict[str, Any],
     risk_ctx: dict[str, Any],
@@ -1386,6 +1612,7 @@ async def _record_param_history(
 ) -> None:
     if not diffs:
         return
+
     entry = {
         "ts": time.time(),
         "reason": reason,
@@ -1407,15 +1634,18 @@ async def _record_param_history(
         "current_win_streak": int(stats.get("current_win_streak", 0)),
         "current_loss_streak": int(stats.get("current_loss_streak", 0)),
     }
+
     try:
-        if redis:
+        if redis is not None:
             await redis.lpush(PARAM_HISTORY_KEY, _dumps(entry))
             await redis.ltrim(PARAM_HISTORY_KEY, 0, MAX_PARAM_HISTORY_KEEP - 1)
     except Exception:
         pass
 
 
-async def _update_health(redis, stats: dict[str, Any], risk_ctx: dict[str, Any]) -> None:
+async def _update_health(
+    redis: RedisLike | None, stats: dict[str, Any], risk_ctx: dict[str, Any]
+) -> None:
     global _mem_last_health_alert_ts
 
     score = _health_score(stats, risk_ctx)
@@ -1454,7 +1684,6 @@ async def _update_health(redis, stats: dict[str, Any], risk_ctx: dict[str, Any])
         "plan_gap_pct": float(risk_ctx.get("plan_gap_pct", 0.0)),
         "plan_status": str(risk_ctx.get("plan_status", "n/a")),
         "risk_profile": str(risk_ctx.get("risk_profile", "balanced")),
-        # Selected live knobs for visibility
         "entry_score_gate": float(params.get("ENTRY_SCORE_GATE", DEFAULTS["ENTRY_SCORE_GATE"])),
         "entry_max_parallel": int(params.get("ENTRY_MAX_PARALLEL", DEFAULTS["ENTRY_MAX_PARALLEL"])),
         "max_risk_per_trade": float(
@@ -1473,9 +1702,10 @@ async def _update_health(redis, stats: dict[str, Any], risk_ctx: dict[str, Any])
     }
 
     try:
-        if redis:
+        if redis is not None:
             await redis.set(HEALTH_KEY, _dumps(health))
         await log_event("strategy_health", health)
+        _emit_event("strategy_health", health_score=score, trades=int(stats.get("trades", 0)))
     except Exception:
         pass
 
@@ -1495,20 +1725,21 @@ async def _update_health(redis, stats: dict[str, Any], risk_ctx: dict[str, Any])
         pass
 
 
-async def get_health_snapshot(redis=None) -> dict[str, Any]:
+async def get_health_snapshot(redis: RedisLike | None = None) -> dict[str, Any]:
     try:
-        if redis is None:
-            redis = await _get_redis()
-        if redis:
-            raw = await redis.get(HEALTH_KEY)
+        r = await _ensure_redis(redis)
+        if r is not None:
+            raw = await r.get(HEALTH_KEY)
             if raw:
-                return json.loads(raw)
+                v = json.loads(raw)
+                if isinstance(v, dict):
+                    return v
         return {}
     except Exception:
         return {}
 
 
-async def get_plan_snapshot(redis=None) -> dict[str, Any]:
+async def get_plan_snapshot(redis: RedisLike | None = None) -> dict[str, Any]:
     params = await get_strategy_params(redis)
     return {
         "plan_target_apr_pct": float(
@@ -1522,19 +1753,22 @@ async def get_plan_snapshot(redis=None) -> dict[str, Any]:
     }
 
 
-async def get_param_history(redis=None, limit: int = 50) -> list[dict[str, Any]]:
+async def get_param_history(
+    redis: RedisLike | None = None, limit: int = 50
+) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
     try:
-        if redis is None:
-            redis = await _get_redis()
-        if not redis:
+        r = await _ensure_redis(redis)
+        if r is None:
             return []
-        raw = await redis.lrange(PARAM_HISTORY_KEY, 0, limit - 1)
+        raw = await r.lrange(PARAM_HISTORY_KEY, 0, limit - 1)
         out: list[dict[str, Any]] = []
         for x in raw:
             try:
-                out.append(json.loads(x))
+                v = json.loads(x)
+                if isinstance(v, dict):
+                    out.append(v)
             except Exception:
                 continue
         return out
@@ -1547,52 +1781,54 @@ async def get_param_history(redis=None, limit: int = 50) -> list[dict[str, Any]]
 # =============================================================================
 
 
-async def _store_reinvest_event(redis, event: dict[str, Any]) -> None:
+async def _store_reinvest_event(redis: RedisLike | None, event: dict[str, Any]) -> None:
     try:
-        if redis is None:
-            redis = await _get_redis()
+        r = await _ensure_redis(redis)
         e = dict(event or {})
         e.setdefault("ts", time.time())
-        if redis:
-            await redis.lpush(REINVEST_HISTORY_KEY, _dumps(e))
-            await redis.ltrim(REINVEST_HISTORY_KEY, 0, MAX_REINVEST_HISTORY_KEEP - 1)
+        if r is not None:
+            await r.lpush(REINVEST_HISTORY_KEY, _dumps(e))
+            await r.ltrim(REINVEST_HISTORY_KEY, 0, MAX_REINVEST_HISTORY_KEEP - 1)
     except Exception:
         pass
     with contextlib.suppress(Exception):
         await log_event("reinvest_event", event)
 
 
-async def note_reinvest_decision(redis, payload: dict[str, Any]) -> None:
+async def note_reinvest_decision(redis: RedisLike | None, payload: dict[str, Any]) -> None:
     e = {"kind": "decision"}
     e.update(payload or {})
     await _store_reinvest_event(redis, e)
 
 
-async def note_reinvest_result(redis, payload: dict[str, Any]) -> None:
+async def note_reinvest_result(redis: RedisLike | None, payload: dict[str, Any]) -> None:
     e = {"kind": "result"}
     e.update(payload or {})
     await _store_reinvest_event(redis, e)
 
 
-async def note_reinvest_skipped(redis, payload: dict[str, Any]) -> None:
+async def note_reinvest_skipped(redis: RedisLike | None, payload: dict[str, Any]) -> None:
     e = {"kind": "skipped"}
     e.update(payload or {})
     await _store_reinvest_event(redis, e)
 
 
-async def get_reinvest_history(redis=None, limit: int = 100) -> list[dict[str, Any]]:
+async def get_reinvest_history(
+    redis: RedisLike | None = None, limit: int = 100
+) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
     try:
-        if redis is None:
-            redis = await _get_redis()
-        if not redis:
+        r = await _ensure_redis(redis)
+        if r is None:
             return []
-        raw = await redis.lrange(REINVEST_HISTORY_KEY, 0, limit - 1)
+        raw = await r.lrange(REINVEST_HISTORY_KEY, 0, limit - 1)
         out: list[dict[str, Any]] = []
         for x in raw:
             try:
-                out.append(json.loads(x))
+                v = json.loads(x)
+                if isinstance(v, dict):
+                    out.append(v)
             except Exception:
                 continue
         return out
@@ -1605,22 +1841,20 @@ async def get_reinvest_history(redis=None, limit: int = 100) -> list[dict[str, A
 # =============================================================================
 
 
-async def get_strategy_with_risk(redis=None) -> dict[str, Any]:
-    if redis is None:
-        redis = await _get_redis()
-    params = await get_strategy_params(redis)
-    risk_ctx = await _read_risk_ctx(redis)
-    health = await get_health_snapshot(redis)
+async def get_strategy_with_risk(redis: RedisLike | None = None) -> dict[str, Any]:
+    r = await _ensure_redis(redis)
+    params = await get_strategy_params(r)
+    risk_ctx = await _read_risk_ctx(r)
+    health = await get_health_snapshot(r)
     return {"params": params, "risk_ctx": risk_ctx, "health": health}
 
 
-async def get_full_debug_snapshot(redis=None) -> dict[str, Any]:
-    if redis is None:
-        redis = await _get_redis()
-    params = await get_strategy_params(redis)
-    stats = await get_perf_snapshot(redis)
-    risk_ctx = await _read_risk_ctx(redis)
-    health = await get_health_snapshot(redis)
+async def get_full_debug_snapshot(redis: RedisLike | None = None) -> dict[str, Any]:
+    r = await _ensure_redis(redis)
+    params = await get_strategy_params(r)
+    stats = await get_perf_snapshot(r)
+    risk_ctx = await _read_risk_ctx(r)
+    health = await get_health_snapshot(r)
     return {"params": params, "stats": stats, "risk_ctx": risk_ctx, "health": health}
 
 
@@ -1637,22 +1871,22 @@ end
 """
 
 
-async def _acquire_tune_lock(redis) -> tuple[bool, str]:
-    if not redis:
+async def _acquire_tune_lock(redis: RedisLike | None) -> tuple[bool, str]:
+    if redis is None:
         return True, "no_redis"
     token = uuid.uuid4().hex
     try:
-        ok = await redis.set(TUNE_LOCK_KEY, token, nx=True, ex=TUNE_LOCK_TTL_SEC)
+        ok = await _redis_set(redis, TUNE_LOCK_KEY, token, nx=True, ex=TUNE_LOCK_TTL_SEC)
         return bool(ok), token
     except Exception:
         return True, "lock_fail_open"
 
 
-async def _release_tune_lock(redis, token: str) -> None:
-    if not redis:
+async def _release_tune_lock(redis: RedisLike | None, token: str) -> None:
+    if redis is None:
         return
     with contextlib.suppress(Exception):
-        await redis.eval(_RELEASE_LOCK_LUA, 1, TUNE_LOCK_KEY, token)
+        await _redis_eval(redis, _RELEASE_LOCK_LUA, 1, TUNE_LOCK_KEY, token)
 
 
 # =============================================================================
@@ -1665,7 +1899,7 @@ async def _apply_and_announce(
     new: dict[str, Any],
     stats: dict[str, Any],
     risk_ctx: dict[str, Any],
-    redis,
+    redis: RedisLike | None,
     *,
     reason: str,
     llm_reason: str,
@@ -1679,7 +1913,6 @@ async def _apply_and_announce(
     if not diffs:
         return
 
-    # Telegram summary (bounded length)
     try:
         mode = int(new.get("STRAT_MODE", 1))
         mode_label = {0: "DEFENSIVE", 1: "NEUTRAL", 2: "AGGRESSIVE"}.get(mode, "NEUTRAL")
@@ -1704,7 +1937,6 @@ async def _apply_and_announce(
     except Exception:
         pass
 
-    # Notion record (best-effort)
     try:
         reason_line = "; ".join(f"{k}:{a}→{b}" for k, (a, b) in diffs.items())
         await log_to_notion(
@@ -1730,6 +1962,7 @@ async def _apply_and_announce(
                 "risk_ctx": risk_ctx,
             },
         )
+    _metric("selflearn.tune_applied", 1)
 
 
 # =============================================================================
@@ -1737,23 +1970,12 @@ async def _apply_and_announce(
 # =============================================================================
 
 
-async def tune_once(redis=None) -> None:
-    """
-    One safe tuning step.
-
-    Guarantees:
-      • bounds enforced
-      • per-tune step limits enforced
-      • risk API contract enforced
-      • distributed lock (no concurrent tuning)
-      • optional runtime_stable gate
-    """
+async def tune_once(redis: RedisLike | None = None) -> None:
     global _mem_last_tune_ts
 
-    if redis is None:
-        redis = await _get_redis()
+    r = await _ensure_redis(redis)
 
-    locked, token = await _acquire_tune_lock(redis)
+    locked, token = await _acquire_tune_lock(r)
     if not locked:
         return
 
@@ -1761,25 +1983,26 @@ async def tune_once(redis=None) -> None:
         now = time.time()
         try:
             last_ts = (
-                float((await redis.get(LAST_TUNE_TS_KEY)) or 0.0) if redis else _mem_last_tune_ts
+                float((await r.get(LAST_TUNE_TS_KEY)) or 0.0)
+                if r is not None
+                else _mem_last_tune_ts
             )
         except Exception:
             last_ts = _mem_last_tune_ts
 
-        # minimum interval: half learning interval, floor 5m
         min_interval = max(int(LEARNING_INTERVAL_SECONDS * 0.50), 300)
         if (now - last_ts) < min_interval:
             return
 
-        await _recompute_and_store_stats(redis)
-        stats = await get_perf_snapshot(redis)
-        cur = await get_strategy_params(redis)
-        risk_ctx = await _read_risk_ctx(redis)
+        await _recompute_and_store_stats(r)
+        stats = await get_perf_snapshot(r)
+        cur = await get_strategy_params(r)
+        risk_ctx = await _read_risk_ctx(r)
 
         if STRAT_REQUIRE_RUNTIME_STABLE and not bool(risk_ctx.get("runtime_stable", True)):
-            await _update_health(redis, stats, risk_ctx)
-            if redis:
-                await redis.set(LAST_TUNE_TS_KEY, str(now))
+            await _update_health(r, stats, risk_ctx)
+            if r is not None:
+                await r.set(LAST_TUNE_TS_KEY, str(now))
             else:
                 _mem_last_tune_ts = now
             with contextlib.suppress(Exception):
@@ -1787,9 +2010,9 @@ async def tune_once(redis=None) -> None:
             return
 
         if int(stats.get("trades", 0)) < MIN_TRADES_FOR_TUNING:
-            await _update_health(redis, stats, risk_ctx)
-            if redis:
-                await redis.set(LAST_TUNE_TS_KEY, str(now))
+            await _update_health(r, stats, risk_ctx)
+            if r is not None:
+                await r.set(LAST_TUNE_TS_KEY, str(now))
             else:
                 _mem_last_tune_ts = now
             return
@@ -1801,34 +2024,30 @@ async def tune_once(redis=None) -> None:
         proposed = _enforce_risk_api_contract(proposed, risk_ctx)
         proposed = _update_equity_plan(proposed, risk_ctx)
 
-        proposed, llm_reason = await _maybe_llm_adjust(proposed, stats, risk_ctx, redis)
-        proposed = _enforce_risk_api_contract(proposed, risk_ctx)  # re-enforce after LLM
+        proposed, llm_reason = await _maybe_llm_adjust(proposed, stats, risk_ctx, r)
+        proposed = _enforce_risk_api_contract(proposed, risk_ctx)
         proposed = _update_equity_plan(proposed, risk_ctx)
 
         limited = _limit_step(cur, proposed)
 
         await _apply_and_announce(
-            cur, limited, stats, risk_ctx, redis, reason=reason, llm_reason=llm_reason
+            cur, limited, stats, risk_ctx, r, reason=reason, llm_reason=llm_reason
         )
 
         try:
-            if redis:
-                await redis.set(LAST_TUNE_TS_KEY, str(now))
+            if r is not None:
+                await r.set(LAST_TUNE_TS_KEY, str(now))
             else:
                 _mem_last_tune_ts = now
         except Exception:
             pass
 
     finally:
-        await _release_tune_lock(redis, token)
+        await _release_tune_lock(r, token)
 
 
-async def run_self_learning_loop(redis=None) -> None:
-    """
-    Long-running tuning loop.
-    """
-    if redis is None:
-        redis = await _get_redis()
+async def run_self_learning_loop(redis: RedisLike | None = None) -> None:
+    r = await _ensure_redis(redis)
 
     log.info(
         "[self_learning] started interval=%ss require_stable=%s ai_tuning=%s",
@@ -1839,9 +2058,10 @@ async def run_self_learning_loop(redis=None) -> None:
 
     while True:
         try:
-            await tune_once(redis)
+            await tune_once(r)
         except Exception as e:  # pragma: no cover
-            log.error("[self_learning] tune_once error: %s", e, exc_info=True)
+            with contextlib.suppress(Exception):
+                _stdlog.error("[self_learning] tune_once error: %s", e, exc_info=True)
         await asyncio.sleep(max(60, LEARNING_INTERVAL_SECONDS))
 
 
@@ -1851,8 +2071,8 @@ async def run_self_learning_loop(redis=None) -> None:
 
 if __name__ == "__main__":  # pragma: no cover
 
-    async def _demo():
-        r = await _get_redis()
+    async def _demo() -> None:
+        r = await _ensure_redis(None)
         await tune_once(r)
         print(json.dumps(await get_full_debug_snapshot(r), indent=2))
 

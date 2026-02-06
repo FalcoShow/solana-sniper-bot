@@ -43,84 +43,101 @@ Design principles
 - PnL-positive safety: warmup & stale clamps *only reduce risk*.
 - “Strict inputs, graceful degradation”: missing scanner stats tolerated.
 - Async-safe: one lock; compute-heavy work outside lock.
+- Import-safe: no network calls on import; SOL fetch only in refresh loop (opt-in).
 - Backwards-compatible exports:
     regime_state singleton, regime_risk_ctx(), regime_entry_ctx(), regime_features().
-
-Integration (recommended)
--------------------------
-- Startup (main/sniper bootstrap):
-    from utils_pkg.regime import regime_state
-    regime_state.ensure_background_task()
-
-- Scanners:
-    await regime_state.update_from_scanner_batch(...)
-
-- Smart wallets / whale feed:
-    await regime_state.update_from_smart_wallets_global(...)
-
-- Infra guard (when you already have infra snapshot / flags):
-    await regime_state.update_from_infra(infra_degraded_score=..., infra_hard_block=...)
-
-- Account/risk manager:
-    await regime_state.update_from_account(...)
 
 Optional Redis publishing (for health endpoints / multi-worker visibility)
 -------------------------------------------------------------------------
 Set REGIME_WRITE_REDIS=1 to publish a compact snapshot periodically.
-
 """
 
 import asyncio
+import json
 import os
 import random
 import statistics
 import time
 from bisect import bisect_left
 from dataclasses import dataclass
-from typing import Any, Literal
-
-from logging_setup import get_logger
-from utils_pkg.core_utils import get_sol_usd
-
-# Optional shared redis from core_utils (if you already maintain one there)
-try:  # pragma: no cover
-    from utils_pkg.core_utils import redis as shared_redis  # type: ignore
-except Exception:  # pragma: no cover
-    shared_redis = None  # type: ignore
-
-try:  # pragma: no cover
-    import redis.asyncio as aioredis
-except Exception:  # pragma: no cover
-    aioredis = None  # type: ignore[assignment]
-
+from typing import Any, Callable, Coroutine, Literal, Protocol, TypeGuard, cast
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Logger (robust to get_logger signature differences)
+# Version (keep stable for telemetry / contracts)
 # ──────────────────────────────────────────────────────────────────────────────
-def _get_log():
-    try:
-        return get_logger("sniper.regime")  # type: ignore[arg-type]
-    except TypeError:
-        try:
-            lg = get_logger()
-            if hasattr(lg, "getChild"):
-                return lg.getChild("regime")
-            return lg
-        except Exception:
-            import logging
 
-            return logging.getLogger("sniper.regime")
-
-
-log = _get_log()
-
-Regime = Literal["risk_on", "normal", "risk_off"]
 REGIME_VERSION = "v3+++_godtier_2026-01-01"
 
+Regime = Literal["risk_on", "normal", "risk_off"]
+ForceLabel = Literal["", "risk_on", "normal", "risk_off"]
+
+_REGIME_LABELS: tuple[Regime, ...] = ("risk_on", "normal", "risk_off")
+
+
+def _is_regime_label(x: ForceLabel) -> TypeGuard[Regime]:
+    return x in _REGIME_LABELS
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Env helpers
+# Logger (canonical contract: prefer utils_pkg.log_compat.get_logger)
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def _get_logger() -> Any:
+    """
+    Resolve logger with maximum compatibility:
+    - prefers utils_pkg.log_compat.get_logger (canonical EventLogger)
+    - falls back to logging_setup.get_logger
+    - finally falls back to stdlib logging.getLogger
+
+    We intentionally keep this import-safe and tolerant to signature variations.
+    """
+    get_logger_fn: Callable[..., Any] | None = None
+
+    try:  # pragma: no cover
+        from utils_pkg.log_compat import get_logger as _compat_get_logger  # type: ignore
+
+        get_logger_fn = _compat_get_logger
+    except Exception:  # pragma: no cover
+        get_logger_fn = None
+
+    if get_logger_fn is None:
+        try:  # pragma: no cover
+            from logging_setup import get_logger as _setup_get_logger  # type: ignore
+
+            get_logger_fn = _setup_get_logger
+        except Exception:  # pragma: no cover
+            get_logger_fn = None
+
+    if get_logger_fn is not None:
+        # Try the canonical signature first (name + kwargs allowed).
+        try:
+            return get_logger_fn("sniper.regime", service="regime", version=REGIME_VERSION)
+        except TypeError:
+            # Older signature variants
+            try:
+                return get_logger_fn("sniper.regime")
+            except TypeError:
+                try:
+                    lg = get_logger_fn()
+                    if hasattr(lg, "getChild"):
+                        return lg.getChild("regime")
+                    return lg
+                except Exception:
+                    pass
+
+    import logging
+
+    return logging.getLogger("sniper.regime")
+
+
+log = _get_logger()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Small utilities
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 def _env_float(key: str, default: float) -> float:
     try:
         return float(os.getenv(key, str(default)))
@@ -219,23 +236,31 @@ def _weekend_factor(ts: float | None = None) -> float:
     return 1.0
 
 
-async def _call_maybe_async(fn, *args, **kwargs) -> Any:
+async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     res = fn(*args, **kwargs)
     if asyncio.iscoroutine(res):
         return await res
     return res
 
 
+def _json_compact(obj: Any) -> str:
+    """Compact, deterministic-ish JSON for Redis publishing."""
+    try:
+        return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        return str(obj)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Config (env)
 # ──────────────────────────────────────────────────────────────────────────────
+
 REGIME_ENABLED = _env_bool("REGIME_ENABLED", True)
 
 REGIME_POLL_SEC = max(5, _env_int("REGIME_POLL_SEC", 60))
 REGIME_HISTORY_HORIZON_SEC = _env_int("REGIME_HISTORY_HORIZON_SEC", 7200)  # 2h
 REGIME_HISTORY_MAX_POINTS = _env_int("REGIME_HISTORY_MAX_POINTS", 900)
 REGIME_MIN_OBS_SEC = _env_int("REGIME_MIN_OBS_SEC", 600)  # warmup
-
 REGIME_STALE_SEC = _env_int("REGIME_STALE_SEC", REGIME_POLL_SEC * 4)
 
 REGIME_SOL_FETCH_TIMEOUT_S = _env_float("REGIME_SOL_FETCH_TIMEOUT_S", 3.0)
@@ -325,10 +350,11 @@ REGIME_DEBUG_EVERY_SEC = max(5, _env_int("REGIME_DEBUG_EVERY_SEC", 180))
 
 # Override (env)
 REGIME_FORCE_LABEL_RAW = os.getenv("REGIME_FORCE_LABEL", "").strip().lower()
-REGIME_FORCE_LABEL: str = (
+REGIME_FORCE_LABEL: ForceLabel = cast(
+    ForceLabel,
     REGIME_FORCE_LABEL_RAW
     if REGIME_FORCE_LABEL_RAW in ("", "risk_on", "normal", "risk_off")
-    else ""
+    else "",
 )
 
 # Optional Redis publishing
@@ -344,17 +370,27 @@ REGIME_LOOP_JITTER_SEC = _clamp(_env_float("REGIME_LOOP_JITTER_SEC", 0.25), 0.0,
 # ──────────────────────────────────────────────────────────────────────────────
 # History helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 def _rolling_return(history: list[tuple[float, float]], horizon_sec: float) -> float:
     """% return over horizon using the first obs with ts >= now - horizon."""
     if len(history) < 2:
         return 0.0
+
     now_ts = history[-1][0]
     newest = history[-1][1]
     target_ts = now_ts - float(horizon_sec)
 
     ts_list = [t for (t, _) in history]
     idx = bisect_left(ts_list, target_ts)
-    ref_px = history[0][1] if idx <= 0 else history[min(idx, len(history) - 1)][1]
+
+    if idx <= 0:
+        ref_px = history[0][1]
+    elif idx >= len(history):
+        ref_px = history[-1][1]
+    else:
+        ref_px = history[idx][1]
+
     return _pct_ret(newest, ref_px)
 
 
@@ -377,7 +413,7 @@ def _step_returns(history: list[tuple[float, float]], max_gap_sec: float) -> lis
     out: list[float] = []
     prev_ts, prev_px = history[0]
     for ts, px in history[1:]:
-        if ts - prev_ts <= max_gap_sec and prev_px > 0:
+        if (ts - prev_ts) <= max_gap_sec and prev_px > 0:
             out.append(_pct_ret(px, prev_px))
         prev_ts, prev_px = ts, px
     return out
@@ -397,23 +433,26 @@ def _calc_sol_stats(history: list[tuple[float, float]]) -> tuple[float, float, f
     step1 = _step_returns(h1, max_gap_sec=max_gap)
     if step1:
         vol = float(statistics.pstdev(step1))
-    else:
-        h2 = _subset_history(history, float(REGIME_VOL_FALLBACK_SEC))
-        step2 = _step_returns(h2, max_gap_sec=max_gap)
-        if step2:
-            vol = float(statistics.pstdev(step2))
-        else:
-            h3 = _subset_history(history, 60 * 60)
-            step3 = _step_returns(h3, max_gap_sec=max_gap)
-            vol = float(statistics.pstdev(step3)) if step3 else 0.0
+        return float(ret_5m), float(ret_1h), float(vol)
 
+    h2 = _subset_history(history, float(REGIME_VOL_FALLBACK_SEC))
+    step2 = _step_returns(h2, max_gap_sec=max_gap)
+    if step2:
+        vol = float(statistics.pstdev(step2))
+        return float(ret_5m), float(ret_1h), float(vol)
+
+    h3 = _subset_history(history, 60 * 60)
+    step3 = _step_returns(h3, max_gap_sec=max_gap)
+    vol = float(statistics.pstdev(step3)) if step3 else 0.0
     return float(ret_5m), float(ret_1h), float(vol)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Snapshot (safe read)
 # ──────────────────────────────────────────────────────────────────────────────
-@dataclass(frozen=True)
+
+
+@dataclass(frozen=True, slots=True)
 class _RegimeSnap:
     regime: Regime
     last_change_ts: float
@@ -435,6 +474,7 @@ class _RegimeSnap:
 
     # Scanner aggregates
     meme_breadth_up_ratio: float
+    meme_breadth_down_ratio: float
     meme_liq_score: float
     meme_pump_density: float
     meme_rug_rate: float
@@ -462,12 +502,24 @@ class _RegimeSnap:
     # External overrides
     external_macro_bias: float
     external_risk_off_flag: bool
-    runtime_force_label: str
+    runtime_force_label: ForceLabel
+
+
+class _RedisLike(Protocol):
+    async def set(self, key: str, value: str, ex: int | None = None) -> Any:  # pragma: no cover
+        ...
+
+
+class _GetSolUsd(Protocol):
+    def __call__(self) -> float | Coroutine[Any, Any, float]:  # pragma: no cover
+        ...
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Regime engine
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 class RegimeState:
     """
     Global macro + memecoin + infra regime engine.
@@ -497,6 +549,7 @@ class RegimeState:
         # Scanner aggregates (EMA)
         self._meme_liq_score: float = 0.5
         self._meme_breadth_up_ratio: float = 0.5
+        self._meme_breadth_down_ratio: float = 0.5
         self._meme_pump_density: float = 0.0
         self._meme_rug_rate: float = 0.0
 
@@ -531,14 +584,16 @@ class RegimeState:
         self._external_risk_off_flag: bool = False
 
         # Runtime override (non-env)
-        self._runtime_force_label: str = ""
+        self._runtime_force_label: ForceLabel = ""
 
         # Internals
         self._lock = asyncio.Lock()
-        self._running_task: asyncio.Task | None = None
+        self._running_task: asyncio.Task[None] | None = None
         self._force_label_logged: bool = False
         self._last_debug_ts: float = 0.0
-        self._redis_client = None
+
+        # Optional redis client cache
+        self._redis_client: _RedisLike | None = None
 
     # ────────────────────────────────────────────────────────────────────
     # Sync accessors (cheap)
@@ -598,37 +653,39 @@ class RegimeState:
     # ────────────────────────────────────────────────────────────────────
     # Risk knobs (sync)
     # ────────────────────────────────────────────────────────────────────
-    def _base_risk_mult(self) -> float:
-        if self._regime == "risk_off":
+    def _base_risk_mult(self, regime: Regime) -> float:
+        if regime == "risk_off":
             return max(0.0, RISK_MULT_RISK_OFF)
-        if self._regime == "risk_on":
+        if regime == "risk_on":
             return max(0.0, RISK_MULT_RISK_ON)
         return max(0.0, RISK_MULT_NORMAL)
 
     def risk_multiplier(self) -> float:
-        base = self._base_risk_mult()
-        liq = _clamp(self.liquidity_score, 0.0, 1.0)
-        manip = _clamp(self.manipulation_risk, 0.0, 1.0)
+        now = time.time()
+        regime = self._regime
+        liq = _clamp(float(self.liquidity_score), 0.0, 1.0)
+        manip = _clamp(float(self.manipulation_risk), 0.0, 1.0)
+        account_bias = _clamp(float(self.account_risk_bias), -1.0, 1.0)
+        ext_bias = _clamp(float(self._external_macro_bias), -1.0, 1.0)
+
+        base = self._base_risk_mult(regime)
         macro_signal = liq - manip  # [-1,+1]
 
         span = max(0.0, REGIME_DYNAMIC_MULT_SPAN)
         dynamic_mod = 1.0 + span * macro_signal
 
-        account_bias = _clamp(self.account_risk_bias, -1.0, 1.0)
         account_mod = 1.0 + 0.30 * account_bias
-
-        ext_bias = _clamp(self._external_macro_bias, -1.0, 1.0)
         external_mod = 1.0 + 0.20 * ext_bias
 
         raw = base * dynamic_mod * account_mod * external_mod
 
-        now = time.time()
         if REGIME_SESSION_BIAS_ENABLED:
             session = _session_of_day(now)
             if session == "asia":
                 raw *= 0.90
             elif session == "us":
                 raw *= 1.05
+
         if REGIME_WEAK_WEEKEND_MODE:
             raw *= _weekend_factor(now)
 
@@ -731,7 +788,7 @@ class RegimeState:
             "regime_volatility": float(self.volatility_score),
             "regime_liquidity": float(self.liquidity_score),
             "regime_manipulation_risk": float(self.manipulation_risk),
-            "manipulation_risk": float(self.manipulation_risk),  # important for ai_risk_model
+            "manipulation_risk": float(self.manipulation_risk),
             "regime_meme_heat": float(self.meme_heat),
             "regime_stress_score": float(self.regime_stress_score),
             "regime_signal_strength": float(self.regime_signal_strength),
@@ -782,7 +839,7 @@ class RegimeState:
     # Internal: snapshot
     # ────────────────────────────────────────────────────────────────────
     def _snapshot_unlocked(self) -> _RegimeSnap:
-        force_label = self._runtime_force_label or REGIME_FORCE_LABEL
+        force_label: ForceLabel = self._runtime_force_label or REGIME_FORCE_LABEL
         return _RegimeSnap(
             regime=self._regime,
             last_change_ts=self._last_change_ts,
@@ -799,6 +856,7 @@ class RegimeState:
             confidence_score=float(self.confidence_score),
             meme_heat=float(self.meme_heat),
             meme_breadth_up_ratio=float(self._meme_breadth_up_ratio),
+            meme_breadth_down_ratio=float(self._meme_breadth_down_ratio),
             meme_liq_score=float(self._meme_liq_score),
             meme_pump_density=float(self._meme_pump_density),
             meme_rug_rate=float(self._meme_rug_rate),
@@ -818,26 +876,26 @@ class RegimeState:
             infra_hard_block=bool(self.infra_hard_block),
             external_macro_bias=float(self._external_macro_bias),
             external_risk_off_flag=bool(self._external_risk_off_flag),
-            runtime_force_label=str(force_label),
+            runtime_force_label=force_label,
         )
 
     # ────────────────────────────────────────────────────────────────────
     # Decision logic
     # ────────────────────────────────────────────────────────────────────
     def _decide_regime(self, *, ret_5m: float, ret_1h: float, vol_5m: float) -> tuple[Regime, str]:
-        # Runtime override dominates env override
-        if self._runtime_force_label:
-            return self._runtime_force_label, "runtime_force_label"
-        if REGIME_FORCE_LABEL:
+        runtime_label: ForceLabel = self._runtime_force_label
+        if _is_regime_label(runtime_label):
+            return runtime_label, "runtime_force_label"
+
+        env_label: ForceLabel = REGIME_FORCE_LABEL
+        if _is_regime_label(env_label):
             if not self._force_label_logged:
                 self._force_label_logged = True
                 if hasattr(log, "event"):
-                    log.event(
-                        "REGIME_FORCE_LABEL", label=REGIME_FORCE_LABEL, version=REGIME_VERSION
-                    )
+                    log.event("REGIME_FORCE_LABEL", label=env_label, version=REGIME_VERSION)
                 else:
-                    log.warning("REGIME_FORCE_LABEL=%s (override)", REGIME_FORCE_LABEL)
-            return REGIME_FORCE_LABEL, "env_force_label"
+                    log.warning("REGIME_FORCE_LABEL=%s (override)", env_label)
+            return env_label, "env_force_label"
 
         if self._external_risk_off_flag:
             return "risk_off", "external_risk_off_flag"
@@ -1168,14 +1226,17 @@ class RegimeState:
         hist = list(snap.history)
         ret_5m, ret_1h, vol_5m = _calc_sol_stats(hist)
 
+        rm = float(self.risk_multiplier())
+        eg = float(self.entry_gate_factor())
+
         payload: dict[str, float] = {
             "regime_label_numeric": float(numeric),
             "regime_numeric": float(numeric),
             "regime_risk_mode": float({"risk_off": 0, "normal": 1, "risk_on": 2}[snap.regime]),
-            "regime_risk_multiplier": float(self.risk_multiplier()),
-            "regime_mult": float(self.risk_multiplier()),
+            "regime_risk_multiplier": rm,
+            "regime_mult": rm,
             "regime_entry_tighten": float(self.entry_tighten()),
-            "regime_entry_gate_factor": float(self.entry_gate_factor()),
+            "regime_entry_gate_factor": eg,
             "regime_slippage_hint_bps": float(self.slippage_hint_bps()),
             "regime_is_risk_on": 1.0 if snap.regime == "risk_on" else 0.0,
             "regime_is_risk_off": 1.0 if snap.regime == "risk_off" else 0.0,
@@ -1196,6 +1257,7 @@ class RegimeState:
             "regime_signal_strength": float(self.regime_signal_strength),
             "tradeability_score": float(self.tradeability_score),
             "meme_breadth_up_ratio": float(snap.meme_breadth_up_ratio),
+            "meme_breadth_down_ratio": float(snap.meme_breadth_down_ratio),
             "meme_liq_score": float(snap.meme_liq_score),
             "meme_pump_density": float(snap.meme_pump_density),
             "meme_rug_rate": float(snap.meme_rug_rate),
@@ -1247,7 +1309,7 @@ class RegimeState:
         if lab not in ("risk_on", "normal", "risk_off", ""):
             return
         async with self._lock:
-            self._runtime_force_label = lab
+            self._runtime_force_label = cast(ForceLabel, lab)
 
     async def apply_external_macro_hint(
         self,
@@ -1272,36 +1334,44 @@ class RegimeState:
     # ────────────────────────────────────────────────────────────────────
     # Redis (optional)
     # ────────────────────────────────────────────────────────────────────
-    async def _get_redis(self):
-        if shared_redis is not None:
-            return shared_redis
+    async def _get_redis(self) -> _RedisLike | None:
         if self._redis_client is not None:
             return self._redis_client
-        if aioredis is None:
-            return None
-        try:
-            self._redis_client = aioredis.from_url(REGIME_REDIS_URL, decode_responses=True)
+
+        try:  # pragma: no cover
+            from utils_pkg.core_utils import redis as shared_redis  # type: ignore
+
+            if shared_redis is not None:
+                self._redis_client = cast(_RedisLike, shared_redis)
+                return self._redis_client
+        except Exception:  # pragma: no cover
+            pass
+
+        try:  # pragma: no cover
+            import redis.asyncio as aioredis  # type: ignore
+
+            self._redis_client = cast(
+                _RedisLike, aioredis.from_url(REGIME_REDIS_URL, decode_responses=True)
+            )
             return self._redis_client
-        except Exception:
+        except Exception:  # pragma: no cover
             return None
 
     async def _publish_redis_snapshot(self, snap: dict[str, Any]) -> None:
         if not REGIME_WRITE_REDIS:
             return
         r = await self._get_redis()
-        if not r:
+        if r is None:
             return
         try:
             key = f"{REGIME_REDIS_PREFIX}:last_snapshot"
             key2 = f"{REGIME_REDIS_PREFIX}:label"
             key3 = f"{REGIME_REDIS_PREFIX}:reason"
-            await r.set(
-                key, str(snap), ex=REGIME_REDIS_EX_SEC
-            )  # compact string; scripts can eval/jsonify later if needed
+            await r.set(key, _json_compact(snap), ex=REGIME_REDIS_EX_SEC)
             await r.set(key2, str(self.label()), ex=REGIME_REDIS_EX_SEC)
             await r.set(key3, str(self.reason()), ex=REGIME_REDIS_EX_SEC)
         except Exception:
-            pass
+            return
 
     # ────────────────────────────────────────────────────────────────────
     # Macro loop (compute-heavy outside lock)
@@ -1310,18 +1380,28 @@ class RegimeState:
         if not REGIME_ENABLED:
             return
 
-        px: float = 0.0
+        # Lazy import to keep module import side-effect free.
+        get_sol_usd: _GetSolUsd | None
         try:
-            if REGIME_SOL_FETCH_TIMEOUT_S > 0:
-                px = float(
-                    await asyncio.wait_for(
-                        _call_maybe_async(get_sol_usd), timeout=REGIME_SOL_FETCH_TIMEOUT_S
-                    )
-                )
-            else:
-                px = float(await _call_maybe_async(get_sol_usd))
+            from utils_pkg.core_utils import get_sol_usd as _gsu  # type: ignore
+
+            get_sol_usd = cast(_GetSolUsd, _gsu)
         except Exception:
-            px = 0.0
+            get_sol_usd = None
+
+        px: float = 0.0
+        if get_sol_usd is not None:
+            try:
+                if REGIME_SOL_FETCH_TIMEOUT_S > 0:
+                    px = float(
+                        await asyncio.wait_for(
+                            _call_maybe_async(get_sol_usd), timeout=REGIME_SOL_FETCH_TIMEOUT_S
+                        )
+                    )
+                else:
+                    px = float(await _call_maybe_async(get_sol_usd))
+            except Exception:
+                px = 0.0
 
         now = time.time()
         if px <= 0.0:
@@ -1385,7 +1465,7 @@ class RegimeState:
             feats = await self.features()
             await self._publish_redis_snapshot(feats)
         except Exception:
-            pass
+            return
 
     async def refresh_loop(self) -> None:
         if not REGIME_ENABLED:
@@ -1413,13 +1493,14 @@ class RegimeState:
         while True:
             try:
                 await self.refresh_once()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 if hasattr(log, "event"):
                     log.event("REGIME_LOOP_ERROR", error=str(e)[:200])
                 else:
                     log.exception("REGIME_LOOP_ERROR: %s", e)
 
-            # jitter to avoid herd effects across workers
             jitter = (
                 random.random() * float(REGIME_LOOP_JITTER_SEC)
                 if REGIME_LOOP_JITTER_SEC > 0
@@ -1436,7 +1517,27 @@ class RegimeState:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 return
-            self._running_task = loop.create_task(self.refresh_loop(), name="regime.loop")
+            task: asyncio.Task[None] = loop.create_task(self.refresh_loop(), name="regime.loop")
+            self._running_task = task
+
+            def _clear(_t: asyncio.Task[None]) -> None:
+                if self._running_task is _t:
+                    self._running_task = None
+
+            task.add_done_callback(_clear)
+
+    async def shutdown(self) -> None:
+        """Optional: clean shutdown of background loop."""
+        t = self._running_task
+        if t is None:
+            return
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._running_task = None
 
     # ────────────────────────────────────────────────────────────────────
     # Scanner integration
@@ -1461,10 +1562,11 @@ class RegimeState:
 
         total = max(1, int(total_tokens))
         up_ratio = _clamp(int(up_tokens) / float(total), 0.0, 1.0)
+        down_ratio = _clamp(int(down_tokens) / float(total), 0.0, 1.0)
+
         liq_score = _norm_between(
             _safe_float(avg_liq_usd, 0.0), MEME_LOW_LIQ_USD, MEME_HIGH_LIQ_USD
         )
-
         pump_d = _clamp(_safe_float(pump_density), 0.0, 1.0)
         rug_r = _clamp(_safe_float(rug_rate), 0.0, 1.0)
 
@@ -1476,6 +1578,7 @@ class RegimeState:
         async with self._lock:
             a = REGIME_SCANNER_EMA_ALPHA
             self._meme_breadth_up_ratio = _ema(self._meme_breadth_up_ratio, up_ratio, a)
+            self._meme_breadth_down_ratio = _ema(self._meme_breadth_down_ratio, down_ratio, a)
             self._meme_liq_score = _ema(self._meme_liq_score, liq_score, a)
             self._meme_pump_density = _ema(self._meme_pump_density, pump_d, a)
             self._meme_rug_rate = _ema(self._meme_rug_rate, rug_r, a)
@@ -1498,6 +1601,7 @@ class RegimeState:
                 "REGIME_SCANNER_UPDATE",
                 source=source,
                 up_ratio=float(up_ratio),
+                down_ratio=float(down_ratio),
                 liq_score=float(liq_score),
                 pump=float(pump_d),
                 rug=float(rug_r),
@@ -1658,15 +1762,14 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    # Standalone: python -m utils_pkg.regime
-    async def _main():
+
+    async def _main() -> None:
         regime_state.ensure_background_task()
-        # Print a few cycles then exit
         for _ in range(5):
             await asyncio.sleep(1.0)
             print(regime_state.debug_summary())
-        # Force one refresh for quick local sanity
         await regime_state.refresh_once()
         print(regime_state.debug_summary())
+        await regime_state.shutdown()
 
     asyncio.run(_main())

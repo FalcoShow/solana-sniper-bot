@@ -15,21 +15,21 @@ Hard requirements (enforced)
 ----------------------------
 - 24/7 safe: never hard-fail on optional modules or transient HTTP errors.
 - Zero network at import time.
+- Import side-effect free: does not create sessions or SSL contexts until runtime.
 - Orchestrator-friendly signatures: accepts (redis/session/stop_evt/q/emit) in any order.
 - Emits BOTH modern keys and legacy aliases (liq/vol5/buys5/chg5/age_min, etc.).
 - Ranking path:
     1) utils_pkg.scoring_service.score_candidate (if present & enabled)
     2) utils_pkg.pair_filters viability + scoring (legacy path)
     3) Heuristic fallback
-- Silent no-buy elimination:
-    Every reject increments a reason bucket; scan logs compact reject summary.
+- Silent no-buy elimination: reject buckets incremented; compact reject summary logs.
 
 Public API
 ----------
-- async def scan_dexscreener(*args, **kwargs) -> List[Dict[str, Any]]
-- async def scan_once(*args, **kwargs) -> List[Dict[str, Any]]
+- async def scan_dexscreener(*args, **kwargs) -> list[dict[str, Any]]
+- async def scan_once(*args, **kwargs) -> list[dict[str, Any]]
 - async def run_scanner(*args, **kwargs) -> None
-- def scanner_health() -> Dict[str, Any]
+- def scanner_health() -> dict[str, Any]
 """
 
 import asyncio
@@ -44,72 +44,93 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from math import log1p
-from typing import Any
+from typing import Any, cast
 
-import aiohttp
-import certifi
-
-# =============================================================================
-# Logging (root logging_setup is canonical; utils_pkg.logging_setup is wrapper)
-# =============================================================================
+# Optional HTTP deps: degrade gracefully if missing
 try:
-    from logging_setup import get_logger  # type: ignore
-
-    LOG = get_logger("scanner.dexscreener")
+    import aiohttp  # type: ignore
 except Exception:  # pragma: no cover
-    LOG = logging.getLogger("scanner.dexscreener")
-    if not LOG.handlers:
-        logging.basicConfig(level=logging.INFO)
+    aiohttp = None  # type: ignore
+
+try:
+    import certifi  # type: ignore
+except Exception:  # pragma: no cover
+    certifi = None  # type: ignore
 
 
-def _ensure_logger_shims() -> None:
-    """Provide LOG.event / LOG.once / LOG.every shims for stdlib loggers."""
-    if not hasattr(LOG, "event"):
+# =============================================================================
+# Logging (no monkey-patching; proxy provides event/once/every)
+# =============================================================================
+def _get_base_logger(name: str) -> Any:
+    try:
+        from logging_setup import get_logger  # type: ignore
 
-        def _event(name: str, **fields: Any) -> None:  # pragma: no cover
+        try:
+            return get_logger(name)
+        except TypeError:
+            return get_logger()
+    except Exception:
+        lg = logging.getLogger(name)
+        if not lg.handlers:
+            logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+        return lg
+
+
+class _LogProxy:
+    __slots__ = ("_lg", "_seen")
+
+    def __init__(self, lg: Any) -> None:
+        self._lg = lg
+        self._seen: dict[str, float] = {}
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._lg, item)
+
+    def event(self, name: str, **fields: Any) -> None:
+        ev = getattr(self._lg, "event", None)
+        if callable(ev):
             with contextlib.suppress(Exception):
-                LOG.info("%s %s", name, fields)
+                ev(name, **fields)
+            return
+        with contextlib.suppress(Exception):
+            self._lg.info("%s %s", name, fields)
 
-        LOG.event = _event  # type: ignore[attr-defined]
-
-    if not hasattr(LOG, "once"):
-        _seen: dict[str, float] = {}
-
-        def _once(
-            key: str,
-            ttl: float = 30.0,
-            level: int = logging.INFO,
-            msg: str | None = None,
-            **fields: Any,
-        ) -> bool:  # pragma: no cover
-            now = time.monotonic()
-            last = float(_seen.get(key, 0.0))
-            if now - last < float(ttl):
-                return False
-            _seen[key] = now
+    def once(
+        self,
+        key: str,
+        *,
+        ttl: float = 30.0,
+        level: int = logging.INFO,
+        msg: str | None = None,
+        **fields: Any,
+    ) -> bool:
+        fn = getattr(self._lg, "once", None)
+        if callable(fn):
             with contextlib.suppress(Exception):
-                LOG.log(level, "%s %s", (msg or key), fields)
-            return True
+                return bool(fn(key, ttl=ttl, level=level, msg=msg, **fields))
+        now = time.monotonic()
+        last = float(self._seen.get(key, 0.0))
+        if now - last < float(ttl):
+            return False
+        self._seen[key] = now
+        with contextlib.suppress(Exception):
+            self._lg.log(level, "%s %s", (msg or key), fields)
+        return True
 
-        LOG.once = _once  # type: ignore[attr-defined]
-
-    if not hasattr(LOG, "every"):
-
-        def _every(
-            key: str,
-            n: float = 10.0,
-            level: int = logging.INFO,
-            msg: str | None = None,
-            **fields: Any,
-        ) -> None:  # pragma: no cover
-            once = getattr(LOG, "once", None)
-            if callable(once):
-                once(key, ttl=float(n), level=level, msg=msg or key, **fields)
-
-        LOG.every = _every  # type: ignore[attr-defined]
+    def every(
+        self,
+        key: str,
+        *,
+        n: float = 10.0,
+        level: int = logging.INFO,
+        msg: str | None = None,
+        **fields: Any,
+    ) -> None:
+        self.once(key, ttl=float(n), level=level, msg=msg or key, **fields)
 
 
-_ensure_logger_shims()
+LOG = _LogProxy(_get_base_logger("scanner.dexscreener"))
+
 
 # =============================================================================
 # Optional: scanner registry (canonical Candidate schema)
@@ -117,16 +138,22 @@ _ensure_logger_shims()
 RegistryEnsure: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 RegistryValidate: Callable[[dict[str, Any]], bool] | None = None
 
-try:
-    from scanner import registry as _REG  # type: ignore
+for _try_mod in ("scanner.registry", "scanner.registry", "scanner.registry"):  # stable order
+    if RegistryEnsure is not None or RegistryValidate is not None:
+        break
+    try:
+        # Prefer package-local import if scanner is a package
+        from scanner import registry as _REG  # type: ignore
 
-    RegistryEnsure = getattr(_REG, "ensure_candidate", None) or getattr(
-        _REG, "normalize_candidate", None
-    )
-    RegistryValidate = getattr(_REG, "validate_candidate", None)
-except Exception:  # pragma: no cover
-    RegistryEnsure = None
-    RegistryValidate = None
+        RegistryEnsure = getattr(_REG, "ensure_candidate", None) or getattr(
+            _REG, "normalize_candidate", None
+        )
+        RegistryValidate = getattr(_REG, "validate_candidate", None)
+    except Exception:  # pragma: no cover
+        RegistryEnsure = None
+        RegistryValidate = None
+        break
+
 
 # =============================================================================
 # Optional internal modules (soft imports)
@@ -209,7 +236,7 @@ except Exception:  # pragma: no cover
 
 
 # =============================================================================
-# Config helpers
+# Config helpers (do not add new env keys here)
 # =============================================================================
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
 _FALSE = {"0", "false", "f", "no", "n", "off"}
@@ -234,16 +261,20 @@ def _s(name: str, default: str = "") -> str:
 
 def _i(name: str, default: int) -> int:
     v = os.getenv(name)
+    if v is None or v == "":
+        return default
     try:
-        return int(float(v)) if v not in (None, "") else default
+        return int(float(v))
     except Exception:
         return default
 
 
 def _f(name: str, default: float) -> float:
     v = os.getenv(name)
+    if v is None or v == "":
+        return default
     try:
-        return float(v) if v not in (None, "") else default
+        return float(v)
     except Exception:
         return default
 
@@ -262,7 +293,7 @@ def _regex(name: str) -> re.Pattern[str] | None:
     try:
         return re.compile(pat, re.IGNORECASE)
     except Exception:
-        LOG.every("DEX_INVALID_REGEX", n=30, level=logging.WARNING, var=name)  # type: ignore[attr-defined]
+        LOG.every("DEX_INVALID_REGEX", n=30, level=logging.WARNING, var=name)
         return None
 
 
@@ -275,7 +306,7 @@ def _kill_or_disabled() -> bool:
 
 
 # =============================================================================
-# Defaults from config.py if present
+# Defaults from config.py if present (safe import; no network)
 # =============================================================================
 try:
     from config import (  # type: ignore
@@ -429,7 +460,7 @@ _LABEL_LEVEL = {"RED": 0, "YELLOW": 1, "GREEN": 2}
 _REQUIRED_LABEL_LEVEL = _LABEL_LEVEL.get(CFG.scoring_min_label, 0)
 
 # =============================================================================
-# Internal bounded state
+# Internal bounded state (no network at import)
 # =============================================================================
 _LAST_SUMMARY: dict[str, Any] = {}
 _SSLCTX: ssl.SSLContext | None = None
@@ -470,7 +501,7 @@ class _Buckets:
             return
         self._last_emit_ts = now
         top = dict(sorted(self.rejects.items(), key=lambda kv: kv[1], reverse=True)[:12])
-        LOG.event("DEX_REJECT_BUCKETS", rejects=top)  # type: ignore[attr-defined]
+        LOG.event("DEX_REJECT_BUCKETS", rejects=top)
 
 
 # =============================================================================
@@ -479,7 +510,7 @@ class _Buckets:
 @dataclass
 class _CallCtx:
     redis: Any = None
-    session: aiohttp.ClientSession | None = None
+    session: Any = None
     stop_evt: asyncio.Event | None = None
     q: Any = None
     emit: Callable[[Any], Any] | None = None
@@ -499,6 +530,18 @@ def _looks_like_redis(x: Any) -> bool:
     return any(callable(getattr(x, nm, None)) for nm in ("get", "set", "hget", "hset", "ping"))
 
 
+def _is_aiohttp_session(x: Any) -> bool:
+    if aiohttp is None:
+        return False
+    cls = cast(Any, getattr(aiohttp, "ClientSession", None))
+    if cls is None:
+        return False
+    try:
+        return isinstance(x, cls)
+    except Exception:
+        return False
+
+
 def _parse_ctx(*args: Any, **kwargs: Any) -> _CallCtx:
     ctx = _CallCtx()
 
@@ -510,7 +553,7 @@ def _parse_ctx(*args: Any, **kwargs: Any) -> _CallCtx:
 
     for k in ("session", "sess", "http", "client"):
         v = kwargs.get(k)
-        if isinstance(v, aiohttp.ClientSession):
+        if _is_aiohttp_session(v):
             ctx.session = v
             break
 
@@ -526,15 +569,15 @@ def _parse_ctx(*args: Any, **kwargs: Any) -> _CallCtx:
             ctx.q = v
             break
 
-    v = kwargs.get("emit")
-    if callable(v):
-        ctx.emit = v
+    v_emit = kwargs.get("emit")
+    if callable(v_emit):
+        ctx.emit = v_emit
 
     for a in args:
         if ctx.stop_evt is None and isinstance(a, asyncio.Event):
             ctx.stop_evt = a
             continue
-        if ctx.session is None and isinstance(a, aiohttp.ClientSession):
+        if ctx.session is None and _is_aiohttp_session(a):
             ctx.session = a
             continue
         if ctx.q is None and _looks_like_queue(a):
@@ -549,7 +592,6 @@ def _parse_ctx(*args: Any, **kwargs: Any) -> _CallCtx:
             and not isinstance(a, (str, bytes, dict, list, tuple, set))
         ):
             ctx.emit = a  # type: ignore[assignment]
-            continue
 
     return ctx
 
@@ -614,13 +656,16 @@ async def _regime_snapshot() -> dict[str, Any]:
             "label": str(feats.get("regime_label", "")) or "unknown",
         }
     except Exception:
+        label = "unknown"
+        with contextlib.suppress(Exception):
+            label = str(getattr(regime_state, "get", lambda: "unknown")() or "unknown")
         return {
             "label_numeric": 0.0,
             "trend_score": 0.0,
             "volatility_score": 0.0,
             "liquidity_score": 0.5,
             "manipulation_risk": 0.0,
-            "label": str(getattr(regime_state, "get", lambda: "unknown")() or "unknown"),
+            "label": label,
         }
 
 
@@ -642,12 +687,14 @@ def _regime_tune_thresholds(regime: dict[str, Any]) -> tuple[float, float, float
         soft_liq *= 0.70
         soft_mcap *= 0.70
         fb_min_vol *= 0.70
-        fb_max_imp = fb_max_imp * 1.20 if fb_max_imp > 0 else fb_max_imp
+        if fb_max_imp > 0:
+            fb_max_imp *= 1.20
     elif ln <= -0.7 or manip >= 0.8:
         soft_liq *= 1.40
         soft_mcap *= 1.40
         fb_min_vol *= 1.30
-        fb_max_imp = fb_max_imp * 0.85 if fb_max_imp > 0 else fb_max_imp
+        if fb_max_imp > 0:
+            fb_max_imp *= 0.85
 
     return (
         max(0.0, soft_liq),
@@ -658,12 +705,15 @@ def _regime_tune_thresholds(regime: dict[str, Any]) -> tuple[float, float, float
 
 
 # =============================================================================
-# HTTP + rate limiting (no network at import time; ssl ctx is lazy)
+# HTTP + rate limiting (SSL ctx is lazy)
 # =============================================================================
 def _sslctx() -> ssl.SSLContext:
     global _SSLCTX
     if _SSLCTX is None:
-        _SSLCTX = ssl.create_default_context(cafile=certifi.where())
+        if certifi is not None:
+            _SSLCTX = ssl.create_default_context(cafile=certifi.where())  # type: ignore[attr-defined]
+        else:  # pragma: no cover
+            _SSLCTX = ssl.create_default_context()
     return _SSLCTX
 
 
@@ -699,7 +749,7 @@ _RPS = _RpsGate(CFG.rps_limit)
 
 
 async def _fetch_json(
-    session: aiohttp.ClientSession,
+    session: Any,
     url: str,
     *,
     params: dict[str, Any] | None = None,
@@ -707,6 +757,9 @@ async def _fetch_json(
 ) -> tuple[dict[str, Any] | None, int, str]:
     status = 0
     first = ""
+
+    if aiohttp is None:  # pragma: no cover
+        return None, 0, "aiohttp_missing"
 
     for attempt in range(1, int(CFG.retries) + 1):
         if stop_evt is not None and stop_evt.is_set():
@@ -720,9 +773,9 @@ async def _fetch_json(
                 params=params,
                 headers=_hdrs(),
                 ssl=_sslctx(),
-                timeout=aiohttp.ClientTimeout(total=float(CFG.timeout_s)),
+                timeout=aiohttp.ClientTimeout(total=float(CFG.timeout_s)),  # type: ignore[attr-defined]
             ) as r:
-                status = int(r.status)
+                status = int(getattr(r, "status", 0) or 0)
                 text = await r.text()
                 first = (text or "")[:180]
 
@@ -738,12 +791,11 @@ async def _fetch_json(
                     await asyncio.sleep(float(CFG.backoff_s) * attempt + random.uniform(0.0, 0.25))
                     continue
 
-                # 4xx: usually terminal; 5xx: retry
                 if 400 <= status < 500:
                     return None, status, first
 
-        except (TimeoutError, aiohttp.ClientError):
-            pass
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
 
@@ -753,13 +805,15 @@ async def _fetch_json(
     return None, status, first
 
 
-def _make_session() -> aiohttp.ClientSession:
-    conn = aiohttp.TCPConnector(ssl=_sslctx(), limit=int(CFG.conn_limit))
-    return aiohttp.ClientSession(
+def _make_session() -> Any:
+    if aiohttp is None:  # pragma: no cover
+        return None
+    conn = aiohttp.TCPConnector(ssl=_sslctx(), limit=int(CFG.conn_limit))  # type: ignore[attr-defined]
+    return aiohttp.ClientSession(  # type: ignore[attr-defined]
         headers={"User-Agent": CFG.ua},
         connector=conn,
         trust_env=bool(CFG.trust_env),
-        timeout=aiohttp.ClientTimeout(total=float(CFG.timeout_s) + 5.0),
+        timeout=aiohttp.ClientTimeout(total=float(CFG.timeout_s) + 5.0),  # type: ignore[attr-defined]
     )
 
 
@@ -769,7 +823,7 @@ def _make_session() -> aiohttp.ClientSession:
 def _nz(x: Any, d: float = 0.0) -> float:
     try:
         fx = float(x)
-        if fx != fx:
+        if fx != fx:  # NaN
             return float(d)
         return fx
     except Exception:
@@ -848,7 +902,6 @@ def _extract_metrics(pair: dict[str, Any]) -> dict[str, Any]:
     buys_24h = _safe_int(h24.get("buys"))
     sells_24h = _safe_int(h24.get("sells"))
 
-    # Backfill 5m if missing
     if buys_5m == 0 and buys_1h > 0:
         buys_5m = max(1, buys_1h // 12)
     if buys_5m == 0 and buys_24h > 0:
@@ -956,7 +1009,6 @@ def _normalize_pair_to_meta(
         if not _allowed_by_lists(pair, mint, sym, buckets):
             return None
 
-        # soft gates
         if soft_liq > 0 and float(m["liq_usd"]) < soft_liq:
             buckets.r("soft_liq")
             return None
@@ -1113,7 +1165,7 @@ def _to_candidate(meta: dict[str, Any]) -> dict[str, Any] | None:
 # Fetch pairs
 # =============================================================================
 async def _fetch_pairs_for_query(
-    session: aiohttp.ClientSession,
+    session: Any,
     q: str,
     *,
     stop_evt: asyncio.Event | None,
@@ -1124,7 +1176,7 @@ async def _fetch_pairs_for_query(
     if not payload:
         buckets.r("search_empty")
         if status:
-            LOG.every(  # type: ignore[attr-defined]
+            LOG.every(
                 "DEX_SEARCH_EMPTY",
                 n=10,
                 level=logging.INFO,
@@ -1145,7 +1197,7 @@ async def _fetch_pairs_for_query(
 
 
 async def _fetch_pairs(
-    session: aiohttp.ClientSession,
+    session: Any,
     *,
     stop_evt: asyncio.Event | None,
     buckets: _Buckets,
@@ -1160,14 +1212,14 @@ async def _fetch_pairs(
         for p in res:
             try:
                 pid = p.get("pairAddress") or ((p.get("baseToken") or {}).get("address")) or ""
-                pid = str(pid).strip().lower()
-                if not pid:
+                pid_s = str(pid).strip().lower()
+                if not pid_s:
                     buckets.r("pair_missing_id")
                     continue
-                if pid in seen_ids:
+                if pid_s in seen_ids:
                     buckets.r("pair_dupe")
                     continue
-                seen_ids.add(pid)
+                seen_ids.add(pid_s)
                 all_pairs.append(p)
             except Exception:
                 buckets.r("pair_id_exc")
@@ -1194,7 +1246,7 @@ async def _attach_ai_rug(
     stop_evt: asyncio.Event | None,
     buckets: _Buckets,
 ) -> None:
-    if not (CFG.ai_rug_enabled and ai_fraud_score and metas):
+    if not (CFG.ai_rug_enabled and (ai_fraud_score is not None) and metas):
         return
 
     targets = metas[: max(1, int(CFG.ai_rug_max_per_scan))]
@@ -1229,7 +1281,7 @@ async def _score_with_service(
     stop_evt: asyncio.Event | None,
     buckets: _Buckets,
 ) -> list[dict[str, Any]]:
-    if not (CFG.scoring_enabled and score_candidate and metas):
+    if not (CFG.scoring_enabled and (score_candidate is not None) and metas):
         return []
 
     metas_sorted = sorted(
@@ -1269,7 +1321,7 @@ async def _score_with_service(
 
         async with sem:
             try:
-                st = await score_candidate(dict(meta), context=ctx)  # type: ignore[misc]
+                st = await _maybe_call(score_candidate, dict(meta), context=ctx)  # type: ignore[misc]
             except Exception:
                 buckets.r("score_exc")
                 return
@@ -1432,7 +1484,7 @@ async def _send_momo_for_runners(
     max_n = max(0, min(int(CFG.max_alerts_per_scan), len(runners)))
     for c in runners[:max_n]:
         try:
-            mint = (c.get("mint") or "").strip()
+            mint = str(c.get("mint") or "").strip()
             if not mint:
                 continue
 
@@ -1480,7 +1532,7 @@ async def _log_scan_summary(summary: dict[str, Any]) -> None:
                 await out
             return
 
-    LOG.event("DEX_SCAN_SUMMARY", **summary)  # type: ignore[attr-defined]
+    LOG.event("DEX_SCAN_SUMMARY", **summary)
 
 
 # =============================================================================
@@ -1510,6 +1562,15 @@ async def _emit_one(ctx: _CallCtx, item: Any) -> None:
 # =============================================================================
 async def scan_once(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
     if _kill_or_disabled():
+        return []
+
+    if aiohttp is None:  # pragma: no cover
+        LOG.every(
+            "DEX_AIOHTTP_MISSING",
+            n=60,
+            level=logging.WARNING,
+            msg="aiohttp not installed; dexscreener_scanner disabled",
+        )
         return []
 
     ctx = _parse_ctx(*args, **kwargs)
@@ -1551,12 +1612,16 @@ async def scan_once(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
 
     sess = ctx.session
     own_session = False
-    if sess is None:
+    if sess is None or not _is_aiohttp_session(sess):
         sess = _make_session()
         own_session = True
 
+    if sess is None:  # pragma: no cover
+        buckets.r("no_session")
+        return []
+
     try:
-        pairs = await _fetch_pairs(sess, stop_evt=stop_evt, buckets=buckets)
+        pairs = cast(list[Any], await _fetch_pairs(sess, stop_evt=stop_evt, buckets=buckets))
 
         metas: list[dict[str, Any]] = []
         for p in pairs:
@@ -1578,7 +1643,7 @@ async def scan_once(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
 
         metas = _dedupe_by_mint(metas, buckets)
 
-        # optional redis seen-dedupe
+        # Optional Redis seen-dedupe
         if CFG.seen_ttl_s > 0 and _redis_ok(ctx.redis):
             filtered: list[dict[str, Any]] = []
             for m in metas:
@@ -1603,6 +1668,7 @@ async def scan_once(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         scored: list[dict[str, Any]] = []
         runners: list[dict[str, Any]] = []
 
+        # 1) scoring_service path
         if CFG.scoring_enabled and (stop_evt is None or not stop_evt.is_set()):
             scored = await _score_with_service(
                 metas,
@@ -1615,6 +1681,7 @@ async def scan_once(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
             if not runners:
                 buckets.r("no_runners_scored")
 
+        # 2) legacy pair_filters path
         if (
             not runners
             and CFG.legacy_pf_enabled
@@ -1625,6 +1692,7 @@ async def scan_once(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
             if not runners:
                 buckets.r("no_runners_pf")
 
+        # 3) heuristic fallback
         if not runners and (stop_evt is None or not stop_evt.is_set()):
             runners = _fallback_pick(
                 metas,
@@ -1642,6 +1710,7 @@ async def scan_once(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         )
         runners = runners[: int(CFG.max_emit)]
 
+        # Apply risk capacity as a throttle (keeps at least 1 if any exist)
         if runners and risk_capacity < 1.0:
             keep = int(len(runners) * max(0.0, min(1.0, risk_capacity)))
             keep = max(1, keep)
@@ -1695,9 +1764,11 @@ async def scan_once(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
 
         return candidates
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         buckets.r("scan_once_exc")
-        LOG.every(  # type: ignore[attr-defined]
+        LOG.every(
             "DEX_SCAN_CRASH",
             n=10,
             level=logging.ERROR,
@@ -1706,9 +1777,9 @@ async def scan_once(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         buckets.maybe_log()
         return []
     finally:
-        if own_session and sess is not None:
+        if own_session and sess is not None and _is_aiohttp_session(sess):
             with contextlib.suppress(Exception):
-                await sess.close()
+                await sess.close()  # type: ignore[func-returns-value]
 
 
 async def scan_dexscreener(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
@@ -1719,9 +1790,14 @@ async def run_scanner(*args: Any, **kwargs: Any) -> None:
     ctx = _parse_ctx(*args, **kwargs)
     stop_evt = ctx.stop_evt or asyncio.Event()
 
+    if aiohttp is None:  # pragma: no cover
+        while not stop_evt.is_set():
+            await asyncio.sleep(1.0)
+        return
+
     sess = ctx.session
     own_session = False
-    if sess is None:
+    if sess is None or not _is_aiohttp_session(sess):
         sess = _make_session()
         own_session = True
 
@@ -1748,9 +1824,9 @@ async def run_scanner(*args: Any, **kwargs: Any) -> None:
                 )
             await asyncio.sleep(max(0.05, dt))
     finally:
-        if own_session and sess is not None:
+        if own_session and sess is not None and _is_aiohttp_session(sess):
             with contextlib.suppress(Exception):
-                await sess.close()
+                await sess.close()  # type: ignore[func-returns-value]
 
 
 async def run(*args: Any, **kwargs: Any) -> None:

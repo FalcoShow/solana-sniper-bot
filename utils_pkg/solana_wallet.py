@@ -18,13 +18,21 @@ Primary responsibilities
    - confirmSignature polling helper
    - getTransaction + realized deltas extraction (SOL + token deltas) for PnL
 
+Logging / typing contract (Phase A)
+-----------------------------------
+- Exposes a logger adapter with:
+  - .handlers (typed) + .info/.warning/.error/.debug
+  - .event(name, **fields) and .every(key, n=..., msg=..., **fields)
+- NO monkeypatching / NO method-assign
+- Safe fallbacks (stdlib logging) if repo logging not available
+
 Backwards compatibility exports
 -------------------------------
 - RPC_URL
 - load_keypair(), load_keypair_async(), reset_keypair_cache()
 - get_pubkey(), get_pubkey_str()
 - get_balance_lamports(), get_balance_sol(), get_sol_balance
-- sign_and_send_b64_tx()
+- sign_and_send_b64_tx()  (kp is OPTIONAL; loads cached keypair if omitted)
 - _send_b64_with_diag()   (preferred by lightning_impl when present)
 - confirm_signature()
 - get_tx_deltas(), get_tx_deltas_async()
@@ -33,7 +41,7 @@ Notes
 -----
 - Blockhash refresh for Jupiter-built txs is not feasible client-side without rebuilding.
   If we detect blockhash-expired errors, we classify them so the caller can re-quote/rebuild.
-- No network at import time. (Creating requests.Session is safe.)
+- No network at import time. (Creating sessions/locks/semaphores is safe.)
 """
 
 import asyncio
@@ -42,9 +50,11 @@ import contextlib
 import json
 import os
 import random
+import threading
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, cast, overload
 
 import requests
 
@@ -80,16 +90,121 @@ from solders.pubkey import Pubkey
 from solders.signature import Signature
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Logger shim (no hard dependency)
+# Logger contract (Phase A): handlers + classic methods + event/every
 # ──────────────────────────────────────────────────────────────────────────────
-try:  # pragma: no cover
-    from logging_setup import get_logger  # type: ignore
 
-    log = get_logger(__name__)  # type: ignore
-except Exception:  # pragma: no cover
+
+class LoggerLike(Protocol):
+    @property
+    def handlers(self) -> Sequence[Any]: ...
+
+    def info(self, msg: str, *a: Any, **k: Any) -> Any: ...
+    def warning(self, msg: str, *a: Any, **k: Any) -> Any: ...
+    def error(self, msg: str, *a: Any, **k: Any) -> Any: ...
+    def debug(self, msg: str, *a: Any, **k: Any) -> Any: ...
+
+    def event(self, name: str, **fields: Any) -> Any: ...
+    def every(self, key: str, n: int = 30, msg: str | None = None, **fields: Any) -> Any: ...
+
+
+class _LoggerAdapter:
+    """
+    Adapter that guarantees:
+      - .handlers exists (Sequence[Any])
+      - .info/.warning/.error/.debug exist
+      - .event/.every exist
+    WITHOUT mutating the underlying logger.
+    """
+
+    __slots__ = ("_get", "_every_store")
+
+    def __init__(self, supplier: Callable[[], Any]) -> None:
+        self._get = supplier
+        self._every_store: dict[str, float] = {}
+
+    @property
+    def handlers(self) -> Sequence[Any]:
+        lg = self._safe()
+        hs = getattr(lg, "handlers", None) if lg is not None else None
+        if isinstance(hs, list):
+            return hs
+        if isinstance(hs, tuple):
+            return hs
+        return []
+
+    def _safe(self) -> Any:
+        with contextlib.suppress(Exception):
+            return self._get()
+        return None
+
+    def _call(self, method: str, msg: str, *a: Any, **k: Any) -> None:
+        lg = self._safe()
+        if lg is None:
+            return
+        fn = getattr(lg, method, None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(msg, *a, **k)
+
+    def info(self, msg: str, *a: Any, **k: Any) -> None:
+        self._call("info", msg, *a, **k)
+
+    def warning(self, msg: str, *a: Any, **k: Any) -> None:
+        self._call("warning", msg, *a, **k)
+
+    def error(self, msg: str, *a: Any, **k: Any) -> None:
+        self._call("error", msg, *a, **k)
+
+    def debug(self, msg: str, *a: Any, **k: Any) -> None:
+        self._call("debug", msg, *a, **k)
+
+    def event(self, name: str, **fields: Any) -> None:
+        lg = self._safe()
+        if lg is None:
+            return
+        fn = getattr(lg, "event", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(name, **fields)
+                return
+        # fallback to info
+        self.info("%s %s", name, fields)
+
+    def every(self, key: str, n: int = 30, msg: str | None = None, **fields: Any) -> None:
+        try:
+            now = time.monotonic()
+            sec = float(max(1, int(n)))
+            last = float(self._every_store.get(key, 0.0))
+            if (now - last) >= sec:
+                self._every_store[key] = now
+                self.event(msg or key, **fields)
+        except Exception:
+            return
+
+
+def _resolve_logger() -> Any:
+    # Prefer repo compat
+    with contextlib.suppress(Exception):
+        from utils_pkg.log_compat import get_logger as gl  # type: ignore
+
+        return gl(__name__)
+    with contextlib.suppress(Exception):
+        from utils_pkg.logging_setup import get_logger as gl2  # type: ignore
+
+        try:
+            return gl2(__name__)
+        except TypeError:
+            return gl2()
+
     import logging
 
-    log = logging.getLogger("solana_wallet")  # type: ignore
+    lg = logging.getLogger("solana_wallet")
+    if not getattr(lg, "handlers", None):
+        logging.basicConfig(level=logging.INFO)
+    return lg
+
+
+log: LoggerLike = _LoggerAdapter(_resolve_logger)
 
 
 def _short(x: Any, n: int = 260) -> str:
@@ -98,35 +213,6 @@ def _short(x: Any, n: int = 260) -> str:
         return s if len(s) <= n else (s[:n] + "…")
     except Exception:
         return "<?>"
-
-
-if not hasattr(log, "event"):
-
-    def _event(name: str, **kw: Any) -> None:  # pragma: no cover
-        with contextlib.suppress(Exception):
-            log.info("%s %s", name, kw)
-
-    log.event = _event  # type: ignore[attr-defined]
-
-
-if not hasattr(log, "every"):
-
-    def _every(
-        key: str, n: int = 30, msg: str | None = None, **kw: Any
-    ) -> None:  # pragma: no cover
-        """Throttle by seconds. n is seconds."""
-        try:
-            now = time.monotonic()
-            store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
-            last = float(store.get(key, 0.0))
-            if (now - last) >= float(max(1, int(n))):
-                store[key] = now
-                _every._store = store  # type: ignore[attr-defined]
-                log.event(msg or key, **kw)
-        except Exception:
-            return None
-
-    log.every = _every  # type: ignore[attr-defined]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -203,7 +289,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _sanitize_url(u: str | None) -> str:
     s = (u or "").strip()
-    if s.startswith("${") and s.endswith("}"):  # templated var not expanded
+    if s.startswith("${") and s.endswith("}"):
         return ""
     if s in ("", "None", "null"):
         return ""
@@ -219,7 +305,7 @@ def _norm_commitment(c: str) -> str:
 
 def _dedupe_preserve(items: list[str]) -> list[str]:
     out: list[str] = []
-    seen = set()
+    seen: set[str] = set()
     for it in items:
         s = (it or "").strip()
         if not s or s in seen:
@@ -242,14 +328,22 @@ def _mask_pubkey(pk: str) -> str:
 LAMPORTS_PER_SOL = 1_000_000_000
 _PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
 
-_UA = {
+_UA: dict[str, str] = {
     "user-agent": _env_str("RPC_USER_AGENT", "pnlsniper.wallet/v3"),
     "accept": "application/json",
     "content-type": "application/json",
 }
 
-# Reuse TCP connections (requests keep-alive). Safe at import time (no network).
-_SESSION = requests.Session()
+_TLS = threading.local()
+
+
+def _session() -> requests.Session:
+    s = getattr(_TLS, "session", None)
+    if s is None:
+        s = requests.Session()
+        _TLS.session = s
+    return cast(requests.Session, s)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RPC selection + failover (SEND vs READ)
@@ -281,7 +375,6 @@ _READ_RPC_FALLBACKS = [
 
 RPC_URL = _SEND_RPC_URL  # back-compat alias
 
-# Timeouts / retries
 _RPC_TIMEOUT_SEC = max(
     2.0, _env_float("ROUTER_RPC_TIMEOUT_SEC", _env_float("RPC_TIMEOUT_SEC", 12.0))
 )
@@ -290,13 +383,11 @@ _RPC_BACKOFF_BASE = max(0.05, _env_float("RPC_BACKOFF_BASE", 0.35))
 _RPC_BACKOFF_MAX = max(_RPC_BACKOFF_BASE, _env_float("RPC_BACKOFF_MAX", 2.5))
 _RPC_JITTER = max(0.0, _env_float("RPC_BACKOFF_JITTER", 0.20))
 
-# Concurrency guards for async callers
 _RPC_READ_MAX_CONCURRENCY = max(1, _env_int("RPC_READ_MAX_CONCURRENCY", 24))
 _RPC_SEND_MAX_CONCURRENCY = max(1, _env_int("RPC_SEND_MAX_CONCURRENCY", 12))
 _READ_SEMA = asyncio.Semaphore(_RPC_READ_MAX_CONCURRENCY)
 _SEND_SEMA = asyncio.Semaphore(_RPC_SEND_MAX_CONCURRENCY)
 
-# send knobs
 _TX_COMMITMENT_RAW = _norm_commitment(
     _env_str("PF_TX_SEND_COMMITMENT", "") or _env_str("SOL_COMMITMENT", "") or "confirmed"
 )
@@ -305,32 +396,28 @@ _TX_SEND_SKIP_PREFLIGHT_DEFAULT = _env_bool(
     "PF_TX_SKIP_PREFLIGHT", _env_bool("SOLANA_SKIP_PREFLIGHT", True)
 )
 
-# diag controls
 SIMULATE_ON_SEND_FAIL = _env_bool("PF_TX_SIM_ON_FAIL", True)
 CONFIRM_AFTER_SEND = _env_bool("PF_TX_CONFIRM_AFTER_SEND", False)
 CONFIRM_TIMEOUT_S = max(5.0, _env_float("PF_TX_CONFIRM_TIMEOUT_S", 45.0))
 CONFIRM_POLL_S = max(0.2, _env_float("PF_TX_CONFIRM_POLL_S", 0.8))
 
-# getTransaction parsing knobs
 GETTX_MAX_SUPPORTED_VERSION = max(0, _env_int("PF_GETTX_MAX_SUPPORTED_TX_VERSION", 0))
 
-# Budget “weights”
 W_READ = max(1, _env_int("RPC_WEIGHT_READ", 1))
 W_SEND = max(1, _env_int("RPC_WEIGHT_SEND", 2))
 W_HEAVY = max(W_READ, _env_int("RPC_WEIGHT_HEAVY", 4))
 
-# Per-URL health / cooldown (sticky + cooldown to avoid thrash)
 RPC_BASE_FAIL_LIMIT = max(1, _env_int("RPC_BASE_FAIL_LIMIT", 3))
 RPC_BASE_COOLDOWN_S = max(2.0, _env_float("RPC_BASE_COOLDOWN_S", 10.0))
 
-# Global breaker
 RPC_BREAKER_ENABLED = _env_bool("RPC_BREAKER_ENABLED", True)
 _RPC_FAIL_COUNT = 0
 _RPC_FAIL_LIMIT = max(1, _env_int("RPC_FAIL_LIMIT", 12))
 _RPC_BREAKER_COOLDOWN_S = max(5.0, _env_float("RPC_BREAKER_COOLDOWN_S", 25.0))
 _RPC_BREAKER_UNTIL = 0.0
 
-# per-kind base tracking
+_STATE_LOCK = threading.Lock()
+
 _RPC_BASE_FAILS_SEND: dict[str, int] = {}
 _RPC_BASE_UNTIL_SEND: dict[str, float] = {}
 _RPC_BASE_SCORE_SEND: dict[str, int] = {}
@@ -343,22 +430,11 @@ _RPC_LAST_GOOD_READ: str | None = None
 
 
 def _rpc_urls(kind: str) -> list[str]:
-    """
-    Build candidate URLs (NO network here).
-
-    SEND: TX_RPC_URL + TX_RPC_FALLBACK_URLS
-    READ: READ_RPC_URL + READ_RPC_FALLBACK_URLS
-
-    Also (best-effort) pull from utils_pkg.rpc_failover.gather_http_candidates()
-    because your repo centralizes env naming there.
-    """
     urls = (
-        ([_SEND_RPC_URL, *_SEND_RPC_FALLBACKS])
+        [_SEND_RPC_URL, *_SEND_RPC_FALLBACKS]
         if kind == "send"
         else ([_READ_RPC_URL, *_READ_RPC_FALLBACKS])
     )
-
-    # Best-effort harvest from rpc_failover (must remain env-only; no network)
     with contextlib.suppress(Exception):
         from utils_pkg.rpc_failover import gather_http_candidates  # type: ignore
 
@@ -373,9 +449,11 @@ def _rpc_urls(kind: str) -> list[str]:
 
 
 def _base_maps(kind: str) -> tuple[dict[str, int], dict[str, float], dict[str, int]]:
-    if kind == "send":
-        return _RPC_BASE_FAILS_SEND, _RPC_BASE_UNTIL_SEND, _RPC_BASE_SCORE_SEND
-    return _RPC_BASE_FAILS_READ, _RPC_BASE_UNTIL_READ, _RPC_BASE_SCORE_READ
+    return (
+        (_RPC_BASE_FAILS_SEND, _RPC_BASE_UNTIL_SEND, _RPC_BASE_SCORE_SEND)
+        if kind == "send"
+        else (_RPC_BASE_FAILS_READ, _RPC_BASE_UNTIL_READ, _RPC_BASE_SCORE_READ)
+    )
 
 
 def _last_good(kind: str) -> str | None:
@@ -392,40 +470,45 @@ def _remember_last_good(kind: str, url: str) -> None:
 
 def _base_allowed(kind: str, base: str) -> bool:
     _, until_map, _ = _base_maps(kind)
-    return time.time() >= float(until_map.get(base, 0.0) or 0.0)
+    until = float(until_map.get(base, 0.0) or 0.0)
+    return time.time() >= until
 
 
 def _base_note_ok(kind: str, base: str) -> None:
     fails, until_map, score = _base_maps(kind)
-    fails[base] = 0
-    until_map.pop(base, None)
-    score[base] = int(score.get(base, 0)) + 1
-    _remember_last_good(kind, base)
+    with _STATE_LOCK:
+        fails[base] = 0
+        until_map.pop(base, None)
+        score[base] = int(score.get(base, 0)) + 1
+        _remember_last_good(kind, base)
 
 
 def _base_note_fail(kind: str, base: str) -> None:
     fails, until_map, score = _base_maps(kind)
-    n = int(fails.get(base, 0)) + 1
-    fails[base] = n
-    score[base] = int(score.get(base, 0)) - 1
-    if n >= int(RPC_BASE_FAIL_LIMIT):
-        until_map[base] = time.time() + float(RPC_BASE_COOLDOWN_S)
-        log.every(
-            "RPC_BASE_COOLDOWN",
-            n=10,
-            msg="RPC_BASE_COOLDOWN",
-            kind=kind,
-            base=base,
-            fails=n,
-            cooldown_s=RPC_BASE_COOLDOWN_S,
-        )
+    with _STATE_LOCK:
+        n = int(fails.get(base, 0)) + 1
+        fails[base] = n
+        score[base] = int(score.get(base, 0)) - 1
+        if n >= int(RPC_BASE_FAIL_LIMIT):
+            until_map[base] = time.time() + float(RPC_BASE_COOLDOWN_S)
+            log.every(
+                "RPC_BASE_COOLDOWN",
+                n=10,
+                msg="RPC_BASE_COOLDOWN",
+                kind=kind,
+                base=base,
+                fails=n,
+                cooldown_s=RPC_BASE_COOLDOWN_S,
+            )
 
 
 def _bases_in_preferred_order(kind: str) -> list[str]:
     urls = _rpc_urls(kind)
     _, _, score = _base_maps(kind)
+
     allowed = [u for u in urls if _base_allowed(kind, u)]
     blocked = [u for u in urls if u not in allowed]
+
     allowed.sort(key=lambda u: int(score.get(u, 0)), reverse=True)
 
     sticky = _last_good(kind)
@@ -437,10 +520,8 @@ def _bases_in_preferred_order(kind: str) -> list[str]:
 
 def _sleep_backoff(attempt: int) -> None:
     base = min(_RPC_BACKOFF_MAX, _RPC_BACKOFF_BASE * (2 ** max(0, int(attempt))))
-    jitter = 0.0
-    if _RPC_JITTER > 0:
-        jitter = _RPC_JITTER * (0.5 + random.random())
-    time.sleep(base + jitter)
+    jitter = (_RPC_JITTER * (0.5 + random.random())) if _RPC_JITTER > 0 else 0.0
+    time.sleep(max(0.0, float(base) + float(jitter)))
 
 
 @dataclass(frozen=True)
@@ -452,36 +533,43 @@ class RpcError(RuntimeError):
     code: int | None = None
 
     def __str__(self) -> str:
-        return f"RpcError(method={self.method}, kind={self.kind}, url={self.url}, code={self.code}, detail={self.detail})"
+        return (
+            f"RpcError(method={self.method}, kind={self.kind}, url={self.url}, "
+            f"code={self.code}, detail={self.detail})"
+        )
 
 
 def _rpc_breaker_check() -> None:
     if not RPC_BREAKER_ENABLED:
         return
-    if time.time() < float(_RPC_BREAKER_UNTIL):
+    with _STATE_LOCK:
+        until = float(_RPC_BREAKER_UNTIL)
+    if time.time() < until:
         raise RuntimeError("rpc_breaker_active")
 
 
 def _rpc_breaker_success() -> None:
     global _RPC_FAIL_COUNT, _RPC_BREAKER_UNTIL
-    if _RPC_FAIL_COUNT > 0:
-        log.every("RPC_BREAKER_RESET", n=10, msg="RPC_BREAKER_RESET", fails=_RPC_FAIL_COUNT)
-    _RPC_FAIL_COUNT = 0
-    _RPC_BREAKER_UNTIL = 0.0
+    with _STATE_LOCK:
+        if _RPC_FAIL_COUNT > 0:
+            log.every("RPC_BREAKER_RESET", n=10, msg="RPC_BREAKER_RESET", fails=_RPC_FAIL_COUNT)
+        _RPC_FAIL_COUNT = 0
+        _RPC_BREAKER_UNTIL = 0.0
 
 
 def _rpc_breaker_fail() -> None:
     global _RPC_FAIL_COUNT, _RPC_BREAKER_UNTIL
-    _RPC_FAIL_COUNT += 1
-    if int(_RPC_FAIL_LIMIT) <= _RPC_FAIL_COUNT:
-        _RPC_BREAKER_UNTIL = time.time() + float(_RPC_BREAKER_COOLDOWN_S)
-        log.every(
-            "RPC_BREAKER_TRIP",
-            n=10,
-            msg="RPC_BREAKER_TRIP",
-            until=_RPC_BREAKER_UNTIL,
-            fails=_RPC_FAIL_COUNT,
-        )
+    with _STATE_LOCK:
+        _RPC_FAIL_COUNT += 1
+        if int(_RPC_FAIL_LIMIT) <= _RPC_FAIL_COUNT:
+            _RPC_BREAKER_UNTIL = time.time() + float(_RPC_BREAKER_COOLDOWN_S)
+            log.every(
+                "RPC_BREAKER_TRIP",
+                n=10,
+                msg="RPC_BREAKER_TRIP",
+                until=_RPC_BREAKER_UNTIL,
+                fails=_RPC_FAIL_COUNT,
+            )
 
 
 def _rpc_weight(method: str, kind: str) -> int:
@@ -492,12 +580,12 @@ def _rpc_weight(method: str, kind: str) -> int:
 
 
 def _rpc_post_raw(url: str, payload: dict[str, Any]) -> dict[str, Any]:
-    r = _SESSION.post(url, json=payload, timeout=_RPC_TIMEOUT_SEC, headers=_UA)
+    r = _session().post(url, json=payload, timeout=float(_RPC_TIMEOUT_SEC), headers=_UA)
     r.raise_for_status()
     try:
         js = r.json()
-    except Exception:
-        raise RuntimeError(f"RPC JSON decode failed: {(r.text or '')[:400]}") from None
+    except Exception as e:
+        raise RuntimeError(f"RPC JSON decode failed: {(r.text or '')[:400]}") from e
     if not isinstance(js, dict):
         raise RuntimeError(f"RPC non-dict JSON: {type(js)}")
     return js
@@ -514,24 +602,7 @@ def _parse_rpc_error(err: Any) -> tuple[int | None, str]:
         return None, "rpc_error"
 
 
-def _rpc_unwrap(js: dict[str, Any]) -> Any:
-    if not isinstance(js, dict):
-        raise RuntimeError(f"RPC bad response type: {type(js)}")
-    err = js.get("error")
-    if err:
-        code, msg = _parse_rpc_error(err)
-        raise RpcError(method="?", kind="?", url="?", detail=str(msg), code=code)
-    return js.get("result")
-
-
 def _rpc_call_failover(method: str, params: list, *, kind: str) -> Any:
-    """
-    Sync JSON-RPC call with URL failover + retry rounds + health scoring.
-
-    Budget accounting:
-      - before_rpc(): gate once per call
-      - after_rpc(): called ONLY on success (valid response with no "error")
-    """
     _rpc_breaker_check()
 
     payload = {
@@ -552,15 +623,16 @@ def _rpc_call_failover(method: str, params: list, *, kind: str) -> Any:
         for url in _bases_in_preferred_order(kind):
             try:
                 js = _rpc_post_raw(url, payload)
-                # unwrap errors as failover-able
                 if js.get("error"):
                     code, msg = _parse_rpc_error(js["error"])
                     raise RpcError(method=method, kind=kind, url=url, detail=str(msg), code=code)
+
                 res = js.get("result")
                 _rpc_breaker_success()
                 _base_note_ok(kind, url)
                 _budget_after(method, weight)
                 return res
+
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
                 _base_note_fail(kind, url)
@@ -593,6 +665,7 @@ async def _rpc_call_failover_async(method: str, params: list, *, kind: str) -> A
 # ──────────────────────────────────────────────────────────────────────────────
 _KP: Keypair | None = None
 _KP_LOCK = asyncio.Lock()
+_KP_TLOCK = threading.Lock()
 
 
 def _parse_json_secret(raw: str, *, label: str) -> bytes:
@@ -611,15 +684,6 @@ def _parse_json_secret(raw: str, *, label: str) -> bytes:
 
 
 def _load_keypair_from_env_or_file() -> Keypair:
-    """
-    Load a keypair from (first match wins):
-      - WALLET_PRIVKEY_B58                  (base58 64-byte secret)
-      - WALLET_PRIVKEY_B64                  (base64 64-byte secret)
-      - WALLET_PRIVKEY_JSON                 (JSON array of 64 ints)
-      - WALLET_KEYPAIR_JSON / KEYPAIR_JSON / WALLET_JSON (JSON array of 64 ints)
-      - WALLET_PRIVATE_KEY / WALLET_KEYPAIR_PATH / KEYPAIR_PATH (file path OR json array string)
-      - default: ~/.config/solana/id.json
-    """
     b58 = _env_str("WALLET_PRIVKEY_B58", "")
     if b58:
         sk = _b58decode(b58)
@@ -650,7 +714,6 @@ def _load_keypair_from_env_or_file() -> Keypair:
         or os.path.expanduser("~/.config/solana/id.json")
     ).strip()
 
-    # allow inline JSON array for WALLET_PRIVATE_KEY
     if raw_or_path.startswith("[") and raw_or_path.endswith("]"):
         sk_bytes = _parse_json_secret(raw_or_path, label="WALLET_PRIVATE_KEY")
         return Keypair.from_bytes(sk_bytes)
@@ -658,28 +721,32 @@ def _load_keypair_from_env_or_file() -> Keypair:
     path = os.path.expanduser(raw_or_path)
     with open(path, encoding="utf-8") as f:
         arr = json.load(f)
+
     if not isinstance(arr, list) or len(arr) != 64:
         raise RuntimeError(f"Keypair at {path} must contain a JSON array of 64 bytes")
+
     sk_bytes = bytearray()
     for i, v in enumerate(arr):
         if not isinstance(v, int) or v < 0 or v > 255:
             raise RuntimeError(f"Keypair at {path}: byte[{i}] must be int 0..255")
         sk_bytes.append(v)
+
     return Keypair.from_bytes(bytes(sk_bytes))
 
 
 def load_keypair() -> Keypair:
-    """Sync entrypoint (back-compat)."""
     global _KP
-    if _KP is None:
-        _KP = _load_keypair_from_env_or_file()
-        with contextlib.suppress(Exception):
-            log.event("WALLET_LOADED", pubkey=_mask_pubkey(str(_KP.pubkey())))
-    return _KP
+    if _KP is not None:
+        return _KP
+    with _KP_TLOCK:
+        if _KP is None:
+            _KP = _load_keypair_from_env_or_file()
+            with contextlib.suppress(Exception):
+                log.event("WALLET_LOADED", pubkey=_mask_pubkey(str(_KP.pubkey())))
+        return _KP
 
 
 async def load_keypair_async() -> Keypair:
-    """Async-safe loader (prevents duplicate reads in concurrent boots)."""
     global _KP
     if _KP is not None:
         return _KP
@@ -693,7 +760,8 @@ async def load_keypair_async() -> Keypair:
 
 def reset_keypair_cache() -> None:
     global _KP
-    _KP = None
+    with _KP_TLOCK:
+        _KP = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -713,10 +781,6 @@ def get_pubkey_str(kp: Keypair | None = None) -> str:
 # Balances
 # ──────────────────────────────────────────────────────────────────────────────
 def get_balance_lamports(owner: str | None = None) -> int:
-    """
-    Sync getter (safe for callers that wrap in asyncio.to_thread()).
-    Returns 0 on failure (do not throw in hot paths).
-    """
     try:
         if not owner:
             owner = get_pubkey_str(load_keypair())
@@ -736,8 +800,7 @@ async def get_balance_sol(owner: str | None = None) -> float:
     return float(lamports) / float(LAMPORTS_PER_SOL)
 
 
-# Back-compat alias
-get_sol_balance = get_balance_sol
+get_sol_balance = get_balance_sol  # back-compat alias
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -762,22 +825,10 @@ def _read_shortvec(data: bytes, offset: int = 0) -> tuple[int, int]:
 
 
 def _is_versioned_message(msg_bytes: bytes) -> bool:
-    # Versioned message has top bit set in first byte (0x80 | version)
     return bool(msg_bytes and (msg_bytes[0] & 0x80) != 0)
 
 
 def _sign_wire_tx(raw: bytes, kp: Keypair) -> tuple[bytes, str, bool, int]:
-    """
-    Transaction wire format:
-      - shortvec sig_count
-      - sig_count * 64 signature bytes
-      - message bytes (legacy or versioned)
-
-    Replace signature[0] with kp.sign_message(message_bytes).
-
-    Returns:
-      (signed_wire_bytes, signature_base58, is_versioned, sig_count)
-    """
     sig_count, pos = _read_shortvec(raw, 0)
     if int(sig_count) <= 0:
         raise RuntimeError("bad tx wire format (sig_count <= 0)")
@@ -809,11 +860,7 @@ def _sign_wire_tx(raw: bytes, kp: Keypair) -> tuple[bytes, str, bool, int]:
 # JSON-RPC send/sim helpers (base64)
 # ──────────────────────────────────────────────────────────────────────────────
 def _rpc_send_transaction_b64(
-    tx_b64_signed: str,
-    *,
-    skip_preflight: bool,
-    commitment: str,
-    max_retries: int,
+    tx_b64_signed: str, *, skip_preflight: bool, commitment: str, max_retries: int
 ) -> str:
     opts: dict[str, Any] = {
         "encoding": "base64",
@@ -844,11 +891,6 @@ def _rpc_simulate_transaction_b64(tx_b64_signed: str) -> dict[str, Any]:
 
 
 def _sim_extract(sim_result: dict[str, Any]) -> tuple[Any, list[str], int | None]:
-    """
-    simulateTransaction result shape:
-      { "context": {...}, "value": { "err": ..., "logs": [...], "unitsConsumed": n, ... } }
-    Some nodes may return the value fields at top-level; handle both.
-    """
     val = sim_result.get("value")
     if isinstance(val, dict):
         err = val.get("err")
@@ -865,7 +907,8 @@ def _sim_extract(sim_result: dict[str, Any]) -> tuple[Any, list[str], int | None
     for x in logs[:220]:
         s = str(x)
         logs2.append(s if len(s) <= 280 else (s[:280] + "…"))
-    units_i = None
+
+    units_i: int | None = None
     with contextlib.suppress(Exception):
         units_i = int(units) if units is not None else None
     return err, logs2, units_i
@@ -904,19 +947,31 @@ def _classify_send_error_text(s: str) -> str:
     return "rpc_send_failed"
 
 
+@overload
 async def sign_and_send_b64_tx(
-    tx_b64: str,
-    kp: Keypair,
-    *,
-    skip_preflight: bool | None = None,
+    tx_b64: str, kp: Keypair, *, skip_preflight: bool | None = None
+) -> str: ...
+
+
+@overload
+async def sign_and_send_b64_tx(
+    tx_b64: str, kp: None = None, *, skip_preflight: bool | None = None
+) -> str: ...
+
+
+async def sign_and_send_b64_tx(
+    tx_b64: str, kp: Keypair | None = None, *, skip_preflight: bool | None = None
 ) -> str:
     """
-    Decode base64 Jupiter transaction (legacy OR v0), sign it, and submit.
-    Returns base58 signature. Never fakes success.
+    Signs and sends a base64 wire transaction (legacy or v0).
+    Back-compat: kp is optional; if omitted we use load_keypair().
 
-    On send failure (optional), runs simulateTransaction and surfaces useful logs.
-    Also classifies common send failures (blockhash expired, rate limit, etc.).
+    This signature helps eliminate downstream call-arg mismatches during Phase D.
     """
+    tx_b64 = (tx_b64 or "").strip()
+    if kp is None:
+        kp = load_keypair()
+
     try:
         raw = base64.b64decode(tx_b64, validate=False)
     except Exception as e:
@@ -972,9 +1027,9 @@ async def sign_and_send_b64_tx(
                 signed_raw, sig_str, _is_v, _sig_count = _sign_wire_tx(raw, kp)
                 signed_b64 = base64.b64encode(signed_raw).decode("utf-8")
                 sim = await asyncio.to_thread(_rpc_simulate_transaction_b64, signed_b64)
-                err, logs, units = _sim_extract(sim if isinstance(sim, dict) else {"value": sim})
+                err, logs2, units = _sim_extract(sim if isinstance(sim, dict) else {"value": sim})
                 raise RuntimeError(
-                    f"sendTransaction failed ({cls}): {e!r}; simulate err={err}; units={units}; logs={logs}"
+                    f"sendTransaction failed ({cls}): {e!r}; simulate err={err}; units={units}; logs={logs2}"
                 ) from e
             except Exception as e2:
                 raise RuntimeError(
@@ -983,17 +1038,14 @@ async def sign_and_send_b64_tx(
         raise RuntimeError(f"sendTransaction failed ({cls}): {e!r}") from e
 
 
-# Preferred diagnostic sender (used by lightning_impl if present)
 async def _send_b64_with_diag(tx_b64: str, *, skip_preflight: bool | None = None) -> str:
-    kp = load_keypair()
-    return await sign_and_send_b64_tx(tx_b64, kp, skip_preflight=skip_preflight)
+    return await sign_and_send_b64_tx(tx_b64, None, skip_preflight=skip_preflight)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Confirm helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _status_from_sig(sig: str) -> dict[str, Any]:
-    # Some nodes need searchTransactionHistory for older sigs
     try:
         res = _rpc_call_failover(
             "getSignatureStatuses", [[sig], {"searchTransactionHistory": True}], kind="read"
@@ -1090,16 +1142,10 @@ def _extract_account_keys(tx: dict[str, Any]) -> list[str]:
 
 
 def get_tx_deltas(signature: str, owner: str | None = None) -> dict[str, Any]:
-    """
-    Best-effort realized deltas:
-      - sol_delta_lamports/sol_delta_sol for owner
-      - fee_lamports
-      - token_deltas by mint (SUMMED delta_ui across all owner token accounts)
-    """
-    owner = (owner or get_pubkey_str(load_keypair())).strip()
+    owner2 = (owner or get_pubkey_str(load_keypair())).strip()
     tx = _rpc_get_transaction(signature)
     if not tx:
-        return {"ok": False, "sig": signature, "owner": owner, "err": "no_tx"}
+        return {"ok": False, "sig": signature, "owner": owner2, "err": "no_tx"}
 
     meta = tx.get("meta") or {}
     keys = _extract_account_keys(tx)
@@ -1107,18 +1153,18 @@ def get_tx_deltas(signature: str, owner: str | None = None) -> dict[str, Any]:
     out: dict[str, Any] = {
         "ok": True,
         "sig": signature,
-        "owner": owner,
+        "owner": owner2,
         "slot": tx.get("slot"),
         "blockTime": tx.get("blockTime"),
         "meta_err": meta.get("err"),
         "fee_lamports": meta.get("fee"),
     }
 
-    # SOL delta (includes fee + transfers)
+    # SOL delta
     try:
         pre = meta.get("preBalances") or []
         post = meta.get("postBalances") or []
-        idx = keys.index(owner) if owner in keys else -1
+        idx = keys.index(owner2) if owner2 in keys else -1
         if idx >= 0 and idx < len(pre) and idx < len(post):
             sol_delta = int(post[idx]) - int(pre[idx])
             out["sol_delta_lamports"] = sol_delta
@@ -1144,30 +1190,34 @@ def get_tx_deltas(signature: str, owner: str | None = None) -> dict[str, Any]:
     def _by_owner(lst: Any) -> list[dict[str, Any]]:
         if not isinstance(lst, list):
             return []
-        res: list[dict[str, Any]] = []
+        res2: list[dict[str, Any]] = []
         for it in lst:
-            if isinstance(it, dict) and (it.get("owner") == owner) and it.get("mint"):
-                res.append(it)
-        return res
+            if isinstance(it, dict) and (it.get("owner") == owner2) and it.get("mint"):
+                res2.append(it)
+        return res2
 
     pre_tb = _by_owner(meta.get("preTokenBalances"))
     post_tb = _by_owner(meta.get("postTokenBalances"))
 
-    def _key(it: dict[str, Any]) -> tuple[str, int]:
+    def _tkey(it: dict[str, Any]) -> tuple[str, int]:
         mint = str(it.get("mint"))
-        ai = it.get("accountIndex")
-        with contextlib.suppress(Exception):
-            ai = int(ai)
-        return mint, int(ai) if ai is not None else -1
+        raw_ai = it.get("accountIndex")
 
-    pre_map: dict[tuple[str, int], dict[str, Any]] = {_key(x): x for x in pre_tb}
-    post_map: dict[tuple[str, int], dict[str, Any]] = {_key(x): x for x in post_tb}
-    keys2 = sorted(set(pre_map.keys()) | set(post_map.keys()))
+        ai_i = -1
+        if raw_ai is not None:
+            with contextlib.suppress(Exception):
+                ai_i = int(raw_ai)
+
+        return mint, ai_i
+
+    pre_map: dict[tuple[str, int], dict[str, Any]] = {_tkey(x): x for x in pre_tb}
+    post_map: dict[tuple[str, int], dict[str, Any]] = {_tkey(x): x for x in post_tb}
+    all_keys = sorted(set(pre_map.keys()) | set(post_map.keys()))
 
     detailed: dict[str, Any] = {}
     summed: dict[str, Any] = {}
 
-    for k2 in keys2:
+    for k2 in all_keys:
         a = pre_map.get(k2) or {}
         b = post_map.get(k2) or {}
         mint, acct_idx = k2
@@ -1176,6 +1226,7 @@ def get_tx_deltas(signature: str, owner: str | None = None) -> dict[str, Any]:
         dec = (b.get("uiTokenAmount") or {}).get("decimals") or (a.get("uiTokenAmount") or {}).get(
             "decimals"
         )
+
         d = {
             "mint": mint,
             "accountIndex": acct_idx,
@@ -1219,4 +1270,5 @@ __all__ = [
     "load_keypair_async",
     "reset_keypair_cache",
     "sign_and_send_b64_tx",
+    "log",
 ]

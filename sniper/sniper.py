@@ -72,51 +72,44 @@ import signal
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import ModuleType
 from typing import Any, Union
 
 # =============================================================================
 # Logging (canonical get_logger preferred, fallback safe)
 # =============================================================================
-try:
-    from logging_setup import get_logger  # type: ignore
+_GetLogger = callable  # runtime hint only; keep log as Any to avoid tight coupling
 
-    log = get_logger("sniper")
-except Exception:  # pragma: no cover
+
+def _resolve_get_logger():
+    """
+    Resolve get_logger without mypy 'no-redef' issues.
+    Returns a callable (name: str) -> logger-like object.
+    """
+    for mod_name in ("utils_pkg.logging_setup", "logging_setup"):
+        try:
+            m = importlib.import_module(mod_name)
+            fn = getattr(m, "get_logger", None)
+            if callable(fn):
+                return fn
+        except Exception:
+            continue
+
+    # Fallback: stdlib logger
     _LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").upper()
     logging.basicConfig(
         level=getattr(logging, _LOG_LEVEL, logging.INFO),
         format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
     )
-    log = logging.getLogger("sniper")
+
+    def _fallback(name: str = "sniper"):
+        return logging.getLogger(name)
+
+    return _fallback
 
 
-def _ensure_log_shims() -> None:
-    if not hasattr(log, "event"):
-
-        def _event(name: str, **kw: Any) -> None:  # pragma: no cover
-            with contextlib.suppress(Exception):
-                log.info("%s %s", name, kw)
-
-        log.event = _event  # type: ignore[attr-defined]
-
-    if not hasattr(log, "every"):
-
-        def _every(
-            key: str, n: int = 60, msg: str | None = None, **kw: Any
-        ) -> None:  # pragma: no cover
-            now = time.time()
-            store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
-            last = float(store.get(key, 0.0))
-            if (now - last) >= float(n):
-                store[key] = now
-                _every._store = store  # type: ignore[attr-defined]
-                with contextlib.suppress(Exception):
-                    log.event(msg or key, **kw)
-
-        log.every = _every  # type: ignore[attr-defined]
-
-
-_ensure_log_shims()
+_get_logger = _resolve_get_logger()
+log = _get_logger("sniper")
 
 # =============================================================================
 # Tiny helpers
@@ -144,16 +137,20 @@ def _s(name: str, default: str = "") -> str:
 
 def _i(name: str, default: int) -> int:
     v = os.getenv(name)
+    if v is None or v == "":
+        return int(default)
     try:
-        return int(float(v)) if v not in (None, "") else int(default)
+        return int(float(v))
     except Exception:
         return int(default)
 
 
 def _f(name: str, default: float) -> float:
     v = os.getenv(name)
+    if v is None or v == "":
+        return float(default)
     try:
-        return float(v) if v not in (None, "") else float(default)
+        return float(v)
     except Exception:
         return float(default)
 
@@ -209,13 +206,13 @@ def _cfg(name: str, default: Any) -> Any:
 # =============================================================================
 # Canonical Candidate schema (prefer scanner.registry)
 # =============================================================================
-RegistryCandidate = None
-reg = None
+reg: ModuleType | None = None
+RegistryCandidate: type[Any] | None = None
 try:
     reg = importlib.import_module("scanner.registry")
     RegistryCandidate = getattr(reg, "Candidate", None)
 except Exception:
-    reg = None  # type: ignore[assignment]
+    reg = None
     RegistryCandidate = None
 
 _BASE58_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
@@ -303,7 +300,7 @@ def _as_dict(c: CandidateT) -> dict[str, Any]:
 
 
 def _normalize_candidate(raw: Any, *, source: str) -> CandidateT | None:
-    if RegistryCandidate is not None and isinstance(raw, RegistryCandidate):  # type: ignore[arg-type]
+    if RegistryCandidate is not None and isinstance(raw, RegistryCandidate):
         return raw
     if isinstance(raw, CandidateLite):
         return raw
@@ -329,18 +326,29 @@ def _normalize_candidate(raw: Any, *, source: str) -> CandidateT | None:
         sym_s = str(sym).strip() if sym is not None else mint_s[:6]
 
         ts = d.get("ts") or d.get("scan_ts") or d.get("timestamp")
-        ts_f = float(ts) if isinstance(ts, int | float) and float(ts) > 0 else _now_ts()
+        ts_f = float(ts) if isinstance(ts, (int, float)) and float(ts) > 0 else _now_ts()
 
         liq = _nzf(_coalesce(d, "liq_usd", "liquidity_usd", "liquidityUSD", "liq"), 0.0)
         age = _nzf(
-            _coalesce(d, "pool_age_min", "token_age_min", "poolAgeMin", "ageMin", "age_min"), 9999.0
+            _coalesce(
+                d,
+                "pool_age_min",
+                "token_age_min",
+                "poolAgeMin",
+                "ageMin",
+                "age_min",
+            ),
+            9999.0,
         )
         vol5 = _nzf(_coalesce(d, "vol_5m_usd", "vol5m_usd", "volumeUsd5m", "vol5"), 0.0)
         vol24 = _nzf(_coalesce(d, "vol_24h_usd", "volumeUsd24h", "vol24", "vol_24h"), 0.0)
         impact1k = _nzf(_coalesce(d, "impact_1k_bps", "priceImpact1kBps", "impact_bps"), 0.0)
 
         buys = _nzi(_coalesce(d, "buys_5m", "buys5m", "tx_buys_5m", "buys5", "buys"), 0)
-        sells = _nzi(_coalesce(d, "sells_5m", "sells5m", "tx_sells_5m", "sells5", "sells"), 0)
+        sells = _nzi(
+            _coalesce(d, "sells_5m", "sells5m", "tx_sells_5m", "sells5", "sells"),
+            0,
+        )
         skew = _nzf(_coalesce(d, "buy_skew_5m", "skew5m", "buy_ratio_5m"), 0.0)
         if skew <= 0:
             skew = (buys + 1) / (sells + 1)
@@ -453,9 +461,9 @@ async def init_resources() -> None:
         if callable(gr):
             _redis_ref = gr()
 
-        log.every("CORE_INIT_OK", 30, has_redis=bool(_redis_ref), has_session=bool(_session_ref))  # type: ignore[misc]
+        log.every("CORE_INIT_OK", 30, has_redis=bool(_redis_ref), has_session=bool(_session_ref))
     except Exception as e:
-        log.every("CORE_INIT_FAIL", 15, err=_short(e))  # type: ignore[misc]
+        log.every("CORE_INIT_FAIL", 15, err=_short(e))
         if _fast_fail():
             raise
 
@@ -525,14 +533,14 @@ async def swap_token_jupiter(**kwargs: Any) -> tuple[bool, str, dict[str, Any]]:
 
         if isinstance(out, tuple) and len(out) >= 2:
             ok = bool(out[0])
-            sig = str(out[1] or "")
+            sig_s = str(out[1] or "")
             meta = out[2] if (len(out) >= 3 and isinstance(out[2], dict)) else {}
-            return ok, sig, dict(meta)
+            return ok, sig_s, dict(meta)
 
         if isinstance(out, dict):
             ok = bool(out.get("ok", False))
-            sig = str(out.get("sig") or out.get("signature") or "")
-            return ok, sig, dict(out)
+            sig_s = str(out.get("sig") or out.get("signature") or "")
+            return ok, sig_s, dict(out)
 
         return False, "", {"err": "swap_bad_return", "raw": _short(out)}
     except Exception as e:
@@ -599,8 +607,8 @@ async def start_exit_supervisor(redis: Any) -> None:
                 or getattr(m, "start", None)
             )
             if callable(fn):
-                sig = inspect.signature(fn)
-                n = len(sig.parameters)
+                fn_sig = inspect.signature(fn)
+                n = len(fn_sig.parameters)
                 if n == 0:
                     out = fn()
                 elif n == 1:
@@ -641,8 +649,8 @@ async def build_features(
             fn = getattr(m, nm, None)
             if callable(fn):
                 try:
-                    sig = inspect.signature(fn)
-                    out = fn(candidate) if len(sig.parameters) == 1 else fn(candidate, ctx)
+                    fn_sig = inspect.signature(fn)
+                    out = fn(candidate) if len(fn_sig.parameters) == 1 else fn(candidate, ctx)
                 except TypeError:
                     out = fn(candidate)
                 out = await _maybe_await(out)
@@ -755,8 +763,8 @@ async def router_precheck_buy(
             "slippage_bps": int(slippage_bps),
         }
         with contextlib.suppress(Exception):
-            sig = inspect.signature(fn)
-            allowed = set(sig.parameters.keys())
+            fn_sig = inspect.signature(fn)
+            allowed = set(fn_sig.parameters.keys())
             kw = {k: v for k, v in kw.items() if k in allowed}
 
         q = fn(**kw)
@@ -1014,10 +1022,10 @@ async def _is_halted() -> bool:
                     k: (v.decode() if isinstance(v, (bytes, bytearray)) else v)
                     for k, v in zip(HALT_KEYS, vals, strict=False)
                 },
-            )  # type: ignore[misc]
+            )
         return halted
     except Exception as e:
-        log.every("HALT_CHECK_ERR", 10, err=_short(e))  # type: ignore[misc]
+        log.every("HALT_CHECK_ERR", 10, err=_short(e))
         return False
 
 
@@ -1062,8 +1070,8 @@ async def scan_candidates() -> list[CandidateT]:
             if callable(fn):
                 try:
                     try:
-                        sig = inspect.signature(fn)
-                        n = len(sig.parameters)
+                        fn_sig = inspect.signature(fn)
+                        n = len(fn_sig.parameters)
                     except Exception:
                         n = 0
 
@@ -1097,7 +1105,7 @@ async def scan_candidates() -> list[CandidateT]:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    log.every("REGISTRY_SCAN_ERR", 10, err=_short(e))  # type: ignore[misc]
+                    log.every("REGISTRY_SCAN_ERR", 10, err=_short(e))
                     if _fast_fail():
                         raise
                     break
@@ -1144,7 +1152,6 @@ async def scan_candidates() -> list[CandidateT]:
                 except TypeError:
                     continue
 
-    # Best-effort legacy scanners
     async with asyncio.TaskGroup() as tg:
         tg.create_task(_collect_from("scanner.raydium", "scan_raydium", "raydium"))
         tg.create_task(_collect_from("scanner.dexscreener", "scan_dexscreener", "dexscreener"))
@@ -1270,7 +1277,7 @@ async def _send_heartbeat(equity_usd: float) -> None:
         await _redis_set(r, "hb:last_ts", str(now), ex=24 * 3600, nx=False)
         await _redis_set(r, "hb:last_equity", f"{equity_usd:.2f}", ex=24 * 3600, nx=False)
     except Exception as e:
-        log.every("HB_ERR", 20, err=_short(e))  # type: ignore[misc]
+        log.every("HB_ERR", 20, err=_short(e))
 
 
 # =============================================================================
@@ -1485,8 +1492,8 @@ class Sniper:
                 m = importlib.import_module("utils_pkg.core_utils")
                 fn = getattr(m, "swap_token_jupiter", None)
                 if callable(fn):
-                    sig = inspect.signature(fn)
-                    allowed = set(sig.parameters.keys())
+                    fn_sig = inspect.signature(fn)
+                    allowed = set(fn_sig.parameters.keys())
                     kw = {k: v for k, v in kw.items() if k in allowed}
 
             self.stats.enters_try += 1
@@ -1505,8 +1512,8 @@ class Sniper:
                     },
                 )
 
-            ok_swap, sig, swap_meta = await swap_token_jupiter(**kw)
-            if not ok_swap or not sig:
+            ok_swap, tx_sig, swap_meta = await swap_token_jupiter(**kw)
+            if not ok_swap or not tx_sig:
                 await _reject(
                     RB.SWAP_FAIL, mint, sym, "swap_failed", cand=c, extra={"meta": swap_meta}
                 )
@@ -1523,7 +1530,9 @@ class Sniper:
                     )
                 return False
 
-            ok_fill = await confirm_signature(sig, timeout_s=float(_f("CONFIRM_TIMEOUT_S", 20.0)))
+            ok_fill = await confirm_signature(
+                tx_sig, timeout_s=float(_f("CONFIRM_TIMEOUT_S", 20.0))
+            )
             if not ok_fill:
                 await _reject(
                     RB.UNVERIFIED,
@@ -1531,12 +1540,12 @@ class Sniper:
                     sym,
                     "tx_unconfirmed_or_timeout",
                     cand=c,
-                    extra={"sig": sig},
+                    extra={"sig": tx_sig},
                 )
                 with contextlib.suppress(Exception):
                     await log_event(
                         "buy_unverified",
-                        {"ts": _now_utc().isoformat(), "mint": mint, "symbol": sym, "sig": sig},
+                        {"ts": _now_utc().isoformat(), "mint": mint, "symbol": sym, "sig": tx_sig},
                     )
                 return False
 
@@ -1547,7 +1556,7 @@ class Sniper:
                     entry_ts=_now_ts(),
                     ticket_usd=float(ticket_usd),
                     sol_spent=float(sol_to_spend),
-                    signature=sig,
+                    signature=tx_sig,
                     score=float(score01),
                     preset=PRESET,
                     route_meta=dict(rmeta),
@@ -1566,7 +1575,7 @@ class Sniper:
                         "symbol": sym,
                         "ticket_usd": float(ticket_usd),
                         "sol_spent": float(sol_to_spend),
-                        "signature": sig,
+                        "signature": tx_sig,
                         "swap_meta": swap_meta,
                         "score": float(score01),
                         "why": str(why or ""),
@@ -1578,7 +1587,7 @@ class Sniper:
                 await send_telegram(
                     f"✅ SNIPED {sym}\n"
                     f"Spent: {sol_to_spend:.4f} SOL (~${usd_est:.2f})\n"
-                    f"Mint: {mint}\nTx: {sig}\n"
+                    f"Mint: {mint}\nTx: {tx_sig}\n"
                     f"EntryIQ: {score01:.3f} {why or ''}".strip()
                 )
 
@@ -1703,19 +1712,17 @@ class Sniper:
                         },
                     )
 
-                # Backpressure: don't let tasks grow unbounded
                 if len(self._tasks) > MAX_OUTSTANDING_TASKS:
                     log.every(
                         "TASK_BACKPRESSURE",
                         10,
                         outstanding=len(self._tasks),
                         max_outstanding=MAX_OUTSTANDING_TASKS,
-                    )  # type: ignore[misc]
+                    )
                 else:
                     for cand in top:
                         if self.stop_evt.is_set():
                             break
-                        # Explicit snapshot binding (B023-safe)
                         t = asyncio.create_task(self._run_candidate(cand, float(equity_usd)))
                         self._track_task(t)
 
@@ -1726,7 +1733,7 @@ class Sniper:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log.every("LOOP_ERR", 5, err=_short(e))  # type: ignore[misc]
+            log.every("LOOP_ERR", 5, err=_short(e))
             with contextlib.suppress(Exception):
                 await log_event(
                     "error", {"ts": _now_utc().isoformat(), "where": "main_loop", "err": _short(e)}

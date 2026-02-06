@@ -2,71 +2,51 @@
 from __future__ import annotations
 
 """
-scripts/preflight.py — God-Tier Preflight Gatekeeper (P0 LOCK-IN)
+scripts/preflight.py — God-Tier Preflight Gatekeeper (P0 LOCK-IN) — v12.1
 
-Preflight is the SINGLE gatekeeper for boot. It runs a deterministic plan of checks
-and exits non-zero if required steps fail.
+This file is the single, deterministic boot gatekeeper used to prevent "deploy roulette".
+It enforces a stable, secret-safe contract and runs a predictable plan of checks.
 
-NEW (LOCK-IN): Config Gatekeeper
---------------------------------
-This preflight now treats `validate_config(C)` from `config.py` as the single
-authoritative configuration gatekeeper:
-  - Preflight imports `from config import C, validate_config`
-  - Runs `validate_config(C)` first
-  - If config validation fails -> FAIL FAST (RC_REQUIRED_FAILED=2)
-  - The result is emitted as the first `results[]` entry in JSON output.
-
-Core guarantees
----------------
-- Child checks are side-effect-free in the parent process:
-    * network probes / infra checks run in subprocesses (python -m ...) or inline (python -c ...)
-- Secret-safe output:
-    * URL credential masking
-    * header token masking
-    * key=value secret masking
-    * query-param masking
-    * exact env secret value replacement
-    * optional long-token masking (preserves Solana base58 pubkeys/mints)
+Hard guarantees:
+- Import-time: no network, no dotenv, no heavy imports.
 - Deterministic exit codes:
-    0   = pass
-    1   = only optional steps failed AND PREFLIGHT_FAIL_ON_OPTIONAL=1
-    2   = required step failed OR required canary cannot run OR CLI error
-    130 = Ctrl-C
-- Human logs -> STDERR, JSON summary -> STDOUT (when enabled).
+    0   pass
+    1   optional failed AND PREFLIGHT_FAIL_ON_OPTIONAL=1
+    2   required failed OR gatekeeper failure OR CLI error
+    130 Ctrl-C
+- Human logs -> STDERR; JSON summary -> STDOUT (when enabled).
+- Secret-safe output (mask DSNs, tokens, and env secret values).
+- Router check contract:
+    * CHECK_ROUTER_HARD_EXIT=1
+    * CHECK_ROUTER_JSON_ONLY=1
+    * child --total-timeout aligned to step timeout
 
-Policy
-------
-- Reachability checks (DNS/RPC/Router/Jupiter/DB) run only when network is allowed:
+Policy:
+- Network reachability checks only run when network is allowed:
     NO_NETWORK=1 or DISABLE_NETWORK=1 or SAFE_MODE=1 or DRYRUN=1  => network disallowed
-- Additionally, preflight becomes policy-aware from check_env output:
-    * If DISABLE_SCANNERS=1, scanner reachability steps are pruned.
-    * If DISABLE_BUYS=1 and DISABLE_SELLS=1, router/jupiter reachability steps are pruned.
-    * If check_env says db_required=0, DB probe is pruned.
+- Policy-aware pruning after check_env:
+    * db_required=0 => skip pg_probe
+    * DISABLE_SCANNERS=1 => prune scanner reachability steps
+    * DISABLE_BUYS=1 and DISABLE_SELLS=1 => prune router/jupiter reachability steps
 
-DNS hardening (IMPORTANT)
--------------------------
-- Render stays STRICT (DNS failures are CRITICAL).
-- Local/dev defaults to SOFT (DNS failures won't hard-fail):
-    * internal-only hosts are skipped (e.g., Render internal Postgres hostnames with no dots)
-    * pass if at least PREFLIGHT_DNS_MIN_OK hosts resolve (default 1)
-    * warnings/fix_hints included in JSON summary
+DNS policy:
+- Render strict (critical).
+- Local soft (warnings) by default.
+Override with PREFLIGHT_DNS_MODE=strict|soft|off
 
-Override knobs:
-  PREFLIGHT_DNS_MODE=strict|soft|off
-  PREFLIGHT_DNS_MIN_OK=1
-  PREFLIGHT_DNS_ATTEMPTS=3
-  PREFLIGHT_DNS_HOSTS=comma,separated,hosts,to,check
-  PREFLIGHT_DNS_SKIP_INTERNAL=1 (default in soft mode)
+Healthcheck:
+- Optional step; can be skipped entirely with:
+    SKIP_PREFLIGHT_HEALTHCHECK=1 OR SKIP_HEALTHCHECK=1 OR PREFLIGHT_SKIP_HEALTHCHECK=1
 """
 
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import importlib.util
 import json
 import os
 import platform
-import random
 import re
 import socket
 import sys
@@ -78,24 +58,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-
-def _load_repo_dotenv_best_effort() -> None:
-    with contextlib.suppress(Exception):
-        from dotenv import load_dotenv  # type: ignore
-
-        repo = Path(__file__).resolve().parents[1]
-        p = repo / ".env"
-        if p.is_file():
-            load_dotenv(p, override=False)
-
-
-_load_repo_dotenv_best_effort()
-
 # =============================================================================
 # contract
 # =============================================================================
 SCRIPT_NAME = "scripts.preflight"
-VERSION = "v12.0"
+VERSION = "v12.1"
 
 # =============================================================================
 # exit codes (DO NOT CHANGE)
@@ -105,13 +72,13 @@ RC_OPTIONAL_FAILED = 1
 RC_REQUIRED_FAILED = 2
 RC_CTRL_C = 130
 
-# =============================================================================
-# env parsing
-# =============================================================================
 _TRUE = {"1", "true", "yes", "y", "on", "t"}
 _FALSE = {"0", "false", "no", "n", "off", "f"}
 
 
+# =============================================================================
+# small utils
+# =============================================================================
 def _ts() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -141,7 +108,7 @@ def _envb(k: str, d: bool = False) -> bool:
 
 
 def _envi(k: str, d: int) -> int:
-    s = _envs(k, str(d)).replace("_", "")
+    s = _envs(k, str(d)).replace("_", "").strip()
     try:
         return int(float(s))
     except Exception:
@@ -149,7 +116,7 @@ def _envi(k: str, d: int) -> int:
 
 
 def _envf(k: str, d: float) -> float:
-    s = _envs(k, str(d)).replace("_", "")
+    s = _envs(k, str(d)).replace("_", "").strip()
     try:
         return float(s)
     except Exception:
@@ -170,6 +137,19 @@ def _dig(dct: Any, path: Sequence[str], default: Any = None) -> Any:
             return default
         cur = cur.get(key)
     return default if cur is None else cur
+
+
+# =============================================================================
+# dotenv (best-effort; NO import-time side effects)
+# =============================================================================
+def _load_repo_dotenv_best_effort() -> None:
+    with contextlib.suppress(Exception):
+        from dotenv import load_dotenv  # type: ignore
+
+        repo = Path(__file__).resolve().parents[1]
+        p = repo / ".env"
+        if p.is_file():
+            load_dotenv(p, override=False)
 
 
 # =============================================================================
@@ -206,7 +186,6 @@ def _bootstrap_repo_root() -> str:
     root_s = str(root)
     os.environ.setdefault("REPO_ROOT", root_s)
 
-    # Harmless: helps child module resolution if PYTHONPATH is not set.
     with contextlib.suppress(Exception):
         if root_s and root_s not in sys.path:
             sys.path.insert(0, root_s)
@@ -244,131 +223,7 @@ def _render_like() -> bool:
 
 
 # =============================================================================
-# DB DSN router (Render internal vs local external)
-# =============================================================================
-_DB_DSN_KEYS = ("DATABASE_URL", "POSTGRES_DSN", "PG_DSN", "PG_DSN_INTERNAL", "PG_DSN_EXTERNAL")
-
-
-def _dsn_host(dsn: str) -> str:
-    try:
-        s = (dsn or "").strip()
-        if not s:
-            return ""
-        if "://" not in s:
-            s = "postgresql://" + s
-        u = urlparse(s)
-        return (u.hostname or "").strip()
-    except Exception:
-        return ""
-
-
-def _is_ip(host: str) -> bool:
-    h = (host or "").strip()
-    if not h:
-        return False
-    try:
-        socket.inet_pton(socket.AF_INET, h)
-        return True
-    except Exception:
-        pass
-    try:
-        socket.inet_pton(socket.AF_INET6, h)
-        return True
-    except Exception:
-        return False
-
-
-def _looks_internal_host(host: str) -> bool:
-    h = (host or "").strip()
-    if not h:
-        return False
-    if _is_ip(h):
-        return False
-    # Render internal hostnames often have no dots.
-    return "." not in h
-
-
-def _ensure_sslmode_require(dsn: str) -> str:
-    """
-    If host endswith render.com and sslmode is missing, append sslmode=require.
-    Safe no-op otherwise.
-    """
-    s = (dsn or "").strip()
-    if not s:
-        return ""
-    try:
-        raw = s if "://" in s else "postgresql://" + s
-        u = urlparse(raw)
-        host = (u.hostname or "").strip().lower()
-        q = dict(parse_qsl(u.query, keep_blank_values=True))
-        if host.endswith("render.com") and not q.get("sslmode"):
-            q["sslmode"] = "require"
-            rebuilt = urlunparse(
-                (u.scheme, u.netloc, u.path, u.params, urlencode(q, doseq=True), u.fragment)
-            )
-            return rebuilt if "://" in s else rebuilt.replace("postgresql://", "", 1)
-    except Exception:
-        pass
-    return s
-
-
-def _pick_canonical_db_dsn() -> tuple[str, str]:
-    """
-    Returns (dsn_value, source_key).
-    Policy:
-      - Render-like: prefer DATABASE_URL, then PG_DSN_INTERNAL, then POSTGRES_DSN, then PG_DSN, then PG_DSN_EXTERNAL
-      - Local/dev: prefer PG_DSN_EXTERNAL, then POSTGRES_DSN, then DATABASE_URL, then PG_DSN, then PG_DSN_INTERNAL
-      - Additionally: if local/dev and DATABASE_URL host looks internal-only and PG_DSN_EXTERNAL exists, pick external.
-    """
-    vals = {k: _envs(k, "").strip() for k in _DB_DSN_KEYS}
-    render = _render_like()
-
-    db_url = vals.get("DATABASE_URL", "")
-    ext = vals.get("PG_DSN_EXTERNAL", "")
-
-    if not render:
-        if db_url and ext and _looks_internal_host(_dsn_host(db_url)):
-            return ext, "PG_DSN_EXTERNAL"
-
-    if render:
-        for k in ("DATABASE_URL", "PG_DSN_INTERNAL", "POSTGRES_DSN", "PG_DSN", "PG_DSN_EXTERNAL"):
-            v = vals.get(k, "")
-            if v:
-                return v, k
-    else:
-        for k in ("PG_DSN_EXTERNAL", "POSTGRES_DSN", "DATABASE_URL", "PG_DSN", "PG_DSN_INTERNAL"):
-            v = vals.get(k, "")
-            if v:
-                return v, k
-
-    return "", ""
-
-
-def _db_router_env_overrides() -> tuple[dict[str, str], str]:
-    """
-    Child-process env overrides so strict check_env sees ONE canonical DSN only.
-    We normalize by setting DATABASE_URL to the chosen DSN and blanking the others.
-    """
-    chosen, source = _pick_canonical_db_dsn()
-    if not chosen:
-        return {}, ""
-
-    chosen = _ensure_sslmode_require(chosen)
-    host = _dsn_host(chosen) or "unknown"
-
-    overrides = {
-        "DATABASE_URL": chosen,
-        "POSTGRES_DSN": "",
-        "PG_DSN": "",
-        "PG_DSN_INTERNAL": "",
-        "PG_DSN_EXTERNAL": "",
-    }
-    note = f"db_dsn_router: {source or 'unknown'} -> DATABASE_URL host={host}"
-    return overrides, note
-
-
-# =============================================================================
-# DNS mode policy (strict on Render, soft on dev)
+# DNS mode policy
 # =============================================================================
 def _dns_mode() -> str:
     """
@@ -425,7 +280,12 @@ def _safe_print_json(obj: dict[str, Any]) -> None:
     ensure_ascii = _envb("PREFLIGHT_JSON_ENSURE_ASCII", (os.name == "nt"))
     pretty = _envb("PREFLIGHT_JSON_PRETTY", False)
     try:
-        s = json.dumps(obj, ensure_ascii=ensure_ascii, default=str, indent=(2 if pretty else None))
+        s = json.dumps(
+            obj,
+            ensure_ascii=ensure_ascii,
+            default=str,
+            indent=(2 if pretty else None),
+        )
     except Exception:
         s = json.dumps({"ok": False, "error": "json_dump_failed"}, ensure_ascii=True)
 
@@ -447,7 +307,7 @@ def _hlog(msg: str, *, json_only: bool) -> None:
 
 
 # =============================================================================
-# redaction / safety (aligned with check_env intent)
+# redaction / safety
 # =============================================================================
 _URL_CRED_RE = re.compile(r"(://)([^/@\s]+)@")
 _APIKEY_HDR_RE = re.compile(r"(?i)(x-api-key:\s*)([^\s]+)")
@@ -510,6 +370,7 @@ def _redact_keys_raw() -> list[str]:
         "WALLET_PRIVATE_KEY",
         "KEYPAIR_B64",
         "KEYPAIR_PATH",
+        "SNIPER_DB_DSN",
         "DATABASE_URL",
         "POSTGRES_DSN",
         "PG_DSN",
@@ -539,7 +400,7 @@ def _refresh_redaction_cache() -> None:
     keys = _redact_keys_raw()
     keyset = set(keys)
 
-    for k in os.environ.keys():
+    for k in sorted(os.environ.keys()):
         if _sensitive_key_name(k):
             keyset.add(k)
 
@@ -606,16 +467,12 @@ def _sanitize(text: Any) -> str:
 def _sanitize_json(obj: Any, *, depth: int = 0, max_depth: int = 12, max_items: int = 4000) -> Any:
     if depth > max_depth:
         return "***"
-
     if obj is None:
         return None
-
     if isinstance(obj, (bool, int, float)):
         return obj
-
     if isinstance(obj, str):
         return _sanitize(obj)
-
     if isinstance(obj, list):
         out_l: list[Any] = []
         for i, v in enumerate(obj):
@@ -626,11 +483,9 @@ def _sanitize_json(obj: Any, *, depth: int = 0, max_depth: int = 12, max_items: 
                 _sanitize_json(v, depth=depth + 1, max_depth=max_depth, max_items=max_items)
             )
         return out_l
-
     if isinstance(obj, dict):
         out_d: dict[str, Any] = {}
-        ks = list(obj.keys())
-        for i, k in enumerate(ks):
+        for i, k in enumerate(list(obj.keys())):
             if i >= max_items:
                 out_d["...truncated..."] = True
                 break
@@ -643,7 +498,6 @@ def _sanitize_json(obj: Any, *, depth: int = 0, max_depth: int = 12, max_items: 
                     v, depth=depth + 1, max_depth=max_depth, max_items=max_items
                 )
         return out_d
-
     return _sanitize(obj)
 
 
@@ -694,6 +548,152 @@ def _extract_json(text: str) -> dict[str, Any] | None:
                 if isinstance(obj, dict):
                     return obj
     return None
+
+
+# =============================================================================
+# DB DSN router (Render internal vs local external)
+# =============================================================================
+_DB_DSN_KEYS = (
+    "SNIPER_DB_DSN",
+    "DATABASE_URL",
+    "POSTGRES_DSN",
+    "PG_DSN",
+    "PG_DSN_INTERNAL",
+    "PG_DSN_EXTERNAL",
+)
+
+
+def _dsn_host(dsn: str) -> str:
+    try:
+        s = (dsn or "").strip()
+        if not s:
+            return ""
+        if "://" not in s:
+            s = "postgresql://" + s
+        u = urlparse(s)
+        return (u.hostname or "").strip()
+    except Exception:
+        return ""
+
+
+def _is_ip(host: str) -> bool:
+    h = (host or "").strip()
+    if not h:
+        return False
+    try:
+        socket.inet_pton(socket.AF_INET, h)
+        return True
+    except Exception:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, h)
+        return True
+    except Exception:
+        return False
+
+
+def _looks_internal_host(host: str) -> bool:
+    h = (host or "").strip()
+    if not h:
+        return False
+    if _is_ip(h):
+        return False
+    return "." not in h
+
+
+def _ensure_sslmode_require(dsn: str) -> str:
+    """
+    If host endswith render.com and sslmode is missing, append sslmode=require.
+    Safe no-op otherwise.
+    """
+    s = (dsn or "").strip()
+    if not s:
+        return ""
+    try:
+        raw = s if "://" in s else "postgresql://" + s
+        u = urlparse(raw)
+        host = (u.hostname or "").strip().lower()
+        q = dict(parse_qsl(u.query, keep_blank_values=True))
+        if host.endswith("render.com") and not q.get("sslmode"):
+            q["sslmode"] = "require"
+            rebuilt = urlunparse(
+                (u.scheme, u.netloc, u.path, u.params, urlencode(q, doseq=True), u.fragment)
+            )
+            return rebuilt if "://" in s else rebuilt.replace("postgresql://", "", 1)
+    except Exception:
+        pass
+    return s
+
+
+def _pick_canonical_db_dsn() -> tuple[str, str]:
+    """
+    Returns (dsn_value, source_key).
+    Policy:
+      - Render-like: prefer SNIPER_DB_DSN, then DATABASE_URL, then PG_DSN_INTERNAL, then POSTGRES_DSN, then PG_DSN, then PG_DSN_EXTERNAL
+      - Local/dev: prefer PG_DSN_EXTERNAL, then SNIPER_DB_DSN, then POSTGRES_DSN, then DATABASE_URL, then PG_DSN, then PG_DSN_INTERNAL
+      - Additionally: if local/dev and DATABASE_URL host looks internal-only and PG_DSN_EXTERNAL exists, pick external.
+    """
+    vals = {k: _envs(k, "").strip() for k in _DB_DSN_KEYS}
+    render = _render_like()
+
+    db_url = vals.get("DATABASE_URL", "")
+    ext = vals.get("PG_DSN_EXTERNAL", "")
+
+    if not render:
+        if db_url and ext and _looks_internal_host(_dsn_host(db_url)):
+            return ext, "PG_DSN_EXTERNAL"
+
+    if render:
+        for k in (
+            "SNIPER_DB_DSN",
+            "DATABASE_URL",
+            "PG_DSN_INTERNAL",
+            "POSTGRES_DSN",
+            "PG_DSN",
+            "PG_DSN_EXTERNAL",
+        ):
+            v = vals.get(k, "")
+            if v:
+                return v, k
+    else:
+        for k in (
+            "PG_DSN_EXTERNAL",
+            "SNIPER_DB_DSN",
+            "POSTGRES_DSN",
+            "DATABASE_URL",
+            "PG_DSN",
+            "PG_DSN_INTERNAL",
+        ):
+            v = vals.get(k, "")
+            if v:
+                return v, k
+
+    return "", ""
+
+
+def _db_router_env_overrides() -> tuple[dict[str, str], str]:
+    """
+    Child-process env overrides:
+    - Normalize chosen DSN into DATABASE_URL and SNIPER_DB_DSN (both set to the same value).
+    - Clear secondary DSN keys to reduce ambiguity in child tools.
+    """
+    chosen, source = _pick_canonical_db_dsn()
+    if not chosen:
+        return {}, ""
+
+    chosen = _ensure_sslmode_require(chosen)
+    host = _dsn_host(chosen) or "unknown"
+
+    overrides = {
+        "DATABASE_URL": chosen,
+        "SNIPER_DB_DSN": chosen,
+        "POSTGRES_DSN": "",
+        "PG_DSN": "",
+        "PG_DSN_INTERNAL": "",
+        "PG_DSN_EXTERNAL": "",
+    }
+    note = f"db_dsn_router: {source or 'unknown'} -> DATABASE_URL host={host}"
+    return overrides, note
 
 
 # =============================================================================
@@ -760,8 +760,7 @@ class StepResult:
 # subprocess runner
 # =============================================================================
 def _win_creationflags() -> int:
-    # CREATE_NEW_PROCESS_GROUP (helps ctrl-c handling)
-    return 0x00000200
+    return 0x00000200  # CREATE_NEW_PROCESS_GROUP
 
 
 def _inherit_pythonpath(env: dict[str, str]) -> None:
@@ -977,9 +976,17 @@ def _retry_policy() -> tuple[int, float, float, set[str]]:
     return max_retries, base_s, jitter_s, steps
 
 
-async def _sleep_backoff(attempt_idx: int, base_s: float, jitter_s: float) -> None:
+def _stable_unit_float(tag: str) -> float:
+    b = hashlib.sha256(tag.encode("utf-8", "ignore")).digest()
+    n = int.from_bytes(b[:8], "big", signed=False)
+    return (n % (2**64)) / float(2**64)
+
+
+async def _sleep_backoff(step_name: str, attempt_idx: int, base_s: float, jitter_s: float) -> None:
     delay = base_s * (2 ** max(0, attempt_idx - 1))
-    delay += random.random() * jitter_s
+    if jitter_s > 0:
+        u = _stable_unit_float(f"{SCRIPT_NAME}:{step_name}:{attempt_idx}")
+        delay += u * jitter_s
     await asyncio.sleep(min(delay, 8.0))
 
 
@@ -1032,25 +1039,19 @@ def _postcheck(
 
 
 # =============================================================================
-# CONFIG GATEKEEPER (NEW): validate_config(C) is the single fail-fast gate
+# CONFIG GATEKEEPER (FAIL FAST): validate_config(C) is the single gate
 # =============================================================================
 def _interpret_validate_config_result(
     res: Any,
 ) -> tuple[bool, list[str], list[str], dict[str, Any]]:
-    """
-    Accept a wide range of validate_config(C) return styles.
-    Returns: (ok, errors, warnings, extra_json)
-    """
     errors: list[str] = []
     warnings: list[str] = []
     extra: dict[str, Any] = {}
 
     if res is None:
         return True, [], [], {}
-
     if isinstance(res, bool):
         return bool(res), [], [], {}
-
     if isinstance(res, dict):
         ok = bool(res.get("ok")) if "ok" in res else True
         errors = _coerce_list(res.get("errors") or res.get("error") or [])
@@ -1061,28 +1062,24 @@ def _interpret_validate_config_result(
             k: v for k, v in res.items() if k not in {"ok", "errors", "error", "warnings", "warn"}
         }
         return ok, errors, warnings, extra
-
     if isinstance(res, (list, tuple)):
         seq = list(res)
-        if len(seq) == 0:
+        if not seq:
             return True, [], [], {}
         if isinstance(seq[0], bool):
             ok = bool(seq[0])
             errors = _coerce_list(seq[1]) if len(seq) >= 2 else []
             warnings = _coerce_list(seq[2]) if len(seq) >= 3 else []
             extra = {"raw": seq[3:]} if len(seq) > 3 else {}
-            return ok if "ok" else ok, errors, warnings, extra
-        # assume it's a list of errors
+            return ok, errors, warnings, extra
         errors = [str(x) for x in seq if str(x).strip()]
         return (len(errors) == 0), errors, [], {}
-
     if isinstance(res, str):
         msg = res.strip()
         if not msg:
             return True, [], [], {}
         return False, [msg], [], {}
 
-    # fallback: treat as ok, but record
     return (
         True,
         [],
@@ -1092,19 +1089,10 @@ def _interpret_validate_config_result(
 
 
 def _config_gatekeeper(*, json_only: bool) -> StepResult:
-    """
-    Runs:
-        from config import C, validate_config
-        validate_config(C)
-    Fail-fast semantics:
-      - import failure or thrown exception => FAIL (critical)
-      - returned errors => FAIL (critical)
-    """
     t0 = time.monotonic()
     name = "validate_config"
     critical = True
 
-    # Best-effort relax knobs for offline preflight runs (does NOT weaken production policy unless env already set)
     if not _network_allowed():
         os.environ.setdefault("SKIP_DSN_REQUIRED", "1")
         os.environ.setdefault("DISABLE_SCANNERS", "1")
@@ -1112,7 +1100,6 @@ def _config_gatekeeper(*, json_only: bool) -> StepResult:
         os.environ.setdefault("DISABLE_SELLS", "1")
 
     try:
-        # REQUIRED BY USER: explicit wiring
         from config import C, validate_config  # type: ignore
     except Exception as e:
         dt = time.monotonic() - t0
@@ -1174,13 +1161,13 @@ def _config_gatekeeper(*, json_only: bool) -> StepResult:
             )
         if "dsn" in low or "database" in low or "postgres" in low:
             fix_hints.append(
-                "Database config issue. Verify DATABASE_URL / PG_DSN_* selection and sslmode=require on Render."
+                "Database config issue. Verify DATABASE_URL / SNIPER_DB_DSN / PG_DSN_* selection and sslmode=require on Render."
             )
         if "redis" in low:
             fix_hints.append(
                 "Redis config issue. Verify REDIS_URL/REDIS_TLS_URL and network policy."
             )
-    # cap
+
     errors = list(dict.fromkeys([_sanitize(x) for x in errors if str(x).strip()]))[:80]
     warnings = list(dict.fromkeys([_sanitize(x) for x in warnings if str(x).strip()]))[:40]
     fix_hints = list(dict.fromkeys([_sanitize(x) for x in fix_hints if str(x).strip()]))[:20]
@@ -1224,6 +1211,38 @@ def _config_gatekeeper(*, json_only: bool) -> StepResult:
         attempts=1,
         child_json=child_payload_s if isinstance(child_payload_s, dict) else None,
     )
+
+
+# =============================================================================
+# Router timeout alignment + hard-exit contract
+# =============================================================================
+def _argv_has_flag(argv: Sequence[str], flag: str) -> bool:
+    fl = flag.strip()
+    for a in argv:
+        if a == fl:
+            return True
+        if a.startswith(fl + "="):
+            return True
+    return False
+
+
+def _router_total_timeout(step_timeout_s: float) -> float:
+    hard = float(_envf("PREFLIGHT_ROUTER_TOTAL_TIMEOUT_S", 0.0))
+    if hard > 0:
+        return max(5.0, hard)
+
+    margin = float(_envf("PREFLIGHT_ROUTER_TIMEOUT_MARGIN_S", 2.5))
+    margin = max(0.5, min(10.0, margin))
+    derived = float(step_timeout_s) - margin
+    return float(max(8.0, min(float(step_timeout_s), derived)))
+
+
+def _inject_total_timeout(argv: list[str], total_timeout_s: float) -> list[str]:
+    if _argv_has_flag(argv, "--total-timeout"):
+        return argv
+    v = float(total_timeout_s)
+    s = str(int(v)) if abs(v - int(v)) < 1e-9 else f"{v:.1f}"
+    return [*argv, "--total-timeout", s]
 
 
 # =============================================================================
@@ -1325,7 +1344,7 @@ if csv:
         if h:
             hosts.append(h)
 
-for k in ["SOL_RPC_URL","RPC_URL","SOL_RPC_URLS","REDIS_URL","REDIS_TLS_URL","DATABASE_URL","POSTGRES_DSN","PG_DSN","PNL_DSN","JUP_BASE_URL","JUPITER_SWAP_API"]:
+for k in ["SOL_RPC_URL","RPC_URL","SOL_RPC_URLS","REDIS_URL","REDIS_TLS_URL","DATABASE_URL","SNIPER_DB_DSN","POSTGRES_DSN","PG_DSN","PNL_DSN","JUP_BASE_URL","JUPITER_SWAP_API"]:
     raw = (_envs(k,"") or "").strip()
     if not raw:
         continue
@@ -1485,6 +1504,7 @@ def _clean_dsn_and_ssl(dsn: str):
 async def _amain():
     dsn = (
         _envs("DATABASE_URL","")
+        or _envs("SNIPER_DB_DSN","")
         or _envs("POSTGRES_DSN","")
         or _envs("PG_DSN","")
         or _envs("PG_DSN_EXTERNAL","")
@@ -1496,7 +1516,7 @@ async def _amain():
             "ok": False,
             "exit_code": 1,
             "error": "missing_dsn",
-            "fix_hints": ["Set DATABASE_URL (or POSTGRES_DSN). For local runs with Render, PG_DSN_EXTERNAL is recommended."]
+            "fix_hints": ["Set DATABASE_URL (or SNIPER_DB_DSN/POSTGRES_DSN). For local runs with Render, PG_DSN_EXTERNAL is recommended."]
         }, ensure_ascii=True))
         return 1
 
@@ -1629,6 +1649,11 @@ if __name__ == "__main__":
             critical=True,
             timeout_s=min(t, 75.0),
             argv=("--json-only",),
+            env_overrides={
+                "CHECK_ROUTER_HARD_EXIT": "1",
+                "CHECK_ROUTER_JSON_ONLY": "1",
+                "CHECK_ROUTER_JSON": "1",
+            },
             optional_if_missing=True,
             tags=("router", "required"),
         ),
@@ -1649,6 +1674,7 @@ if __name__ == "__main__":
             critical=True,
             timeout_s=min(t, 90.0),
             tags=("db", "required"),
+            skip_if_env_true=("SKIP_PREFLIGHT_PG_PROBE",),
         ),
         StepSpec(
             name="healthcheck",
@@ -1659,6 +1685,11 @@ if __name__ == "__main__":
             argv=("--json-only",),
             optional_if_missing=True,
             tags=("optional",),
+            skip_if_env_true=(
+                "SKIP_PREFLIGHT_HEALTHCHECK",
+                "SKIP_HEALTHCHECK",
+                "PREFLIGHT_SKIP_HEALTHCHECK",
+            ),
         ),
     ]
 
@@ -1679,11 +1710,7 @@ def _profile_select(profile: str, registry: list[StepSpec]) -> list[StepSpec]:
         "pg_probe",
         "healthcheck",
     }
-    names_full = set(names_deploy)
-
-    wanted = (
-        names_full if profile == "full" else (names_fast if profile == "fast" else names_deploy)
-    )
+    wanted = names_fast if profile == "fast" else names_deploy
     return [s for s in registry if s.name in wanted]
 
 
@@ -1709,25 +1736,21 @@ def _initial_policy_prune(plan: list[StepSpec]) -> tuple[list[StepSpec], list[di
             skips.append({"name": s.name, "reason": "policy_skip:no_network_or_dryrun"})
             continue
 
-        env_skip = None
         for k in s.skip_if_env_true:
             if _envb(k, False):
-                env_skip = k
+                skips.append({"name": s.name, "reason": f"policy_skip:{k}=1"})
                 break
-        if env_skip:
-            skips.append({"name": s.name, "reason": f"policy_skip:{env_skip}=1"})
-            continue
+        else:
+            if s.inline_py:
+                pruned.append(s)
+                continue
 
-        if s.inline_py:
+            resolved = s.resolve_module()
+            if resolved is None and s.optional_if_missing:
+                skips.append({"name": s.name, "reason": "missing_module"})
+                continue
+
             pruned.append(s)
-            continue
-
-        resolved = s.resolve_module()
-        if resolved is None and s.optional_if_missing:
-            skips.append({"name": s.name, "reason": "missing_module"})
-            continue
-
-        pruned.append(s)
 
     return pruned, skips
 
@@ -1850,7 +1873,6 @@ async def _run_step(
             argv.append("--strict")
 
         if not _network_allowed():
-            # offline policy: preflight should be runnable without live secrets
             env_overrides.setdefault("SKIP_DSN_REQUIRED", "1")
             env_overrides.setdefault("DISABLE_SCANNERS", "1")
             env_overrides.setdefault("DISABLE_BUYS", "1")
@@ -1860,8 +1882,16 @@ async def _run_step(
         if cfg_mod and ("--config-module" not in " ".join(argv)):
             argv.append(f"--config-module={cfg_mod}")
 
+    if spec.name == "check_router":
+        env_overrides.setdefault("CHECK_ROUTER_HARD_EXIT", "1")
+        env_overrides.setdefault("CHECK_ROUTER_JSON_ONLY", "1")
+        env_overrides.setdefault("CHECK_ROUTER_JSON", "1")
+        tt = _router_total_timeout(step_timeout)
+        argv = _inject_total_timeout(argv, tt)
+
     _hlog(
-        f"STEP start: {spec.name} ({'inline' if spec.inline_py else module_name}) timeout={int(step_timeout)}s argv={argv}",
+        f"STEP start: {spec.name} ({'inline' if spec.inline_py else module_name}) "
+        f"timeout={int(step_timeout)}s argv={argv}",
         json_only=json_only,
     )
 
@@ -1927,7 +1957,7 @@ async def _run_step(
                 f"STEP retry: {spec.name} attempt={attempts + 1}/{1 + max_retries}",
                 json_only=json_only,
             )
-            await _sleep_backoff(attempts, base_s, jitter_s)
+            await _sleep_backoff(spec.name, attempts, base_s, jitter_s)
             continue
 
         dt = time.monotonic() - t0
@@ -1995,6 +2025,8 @@ async def amain(argv: Sequence[str] | None = None) -> int:
     with contextlib.suppress(Exception):
         _bootstrap_repo_root()
     with contextlib.suppress(Exception):
+        _load_repo_dotenv_best_effort()
+    with contextlib.suppress(Exception):
         _refresh_redaction_cache()
 
     try:
@@ -2045,7 +2077,6 @@ async def amain(argv: Sequence[str] | None = None) -> int:
     include_stdio = bool(_envb("PREFLIGHT_INCLUDE_CHILD_STDIO", False))
 
     start_prechecks = _envb("START_PRECHECKS", False)
-
     strict_requested = bool(args.strict or _envb("START_PRECHECKS_STRICT", False))
     strict = bool(strict_requested)
 
@@ -2122,7 +2153,7 @@ async def amain(argv: Sequence[str] | None = None) -> int:
         return RC_OK
 
     # -------------------------------------------------------------------------
-    # CONFIG GATEKEEPER (FAIL FAST): validate_config(C)
+    # CONFIG GATEKEEPER (FAIL FAST)
     # -------------------------------------------------------------------------
     gate = _config_gatekeeper(json_only=json_only)
     preface_results: list[StepResult] = [gate]
@@ -2205,8 +2236,7 @@ async def amain(argv: Sequence[str] | None = None) -> int:
     tuned: list[StepSpec] = []
     for s in plan:
         if s.name == "check_dns":
-            dns_is_strict = dns_mode == "strict"
-            tuned.append(replace(s, critical=bool(dns_is_strict)))
+            tuned.append(replace(s, critical=(dns_mode == "strict")))
         else:
             tuned.append(s)
     plan = tuned
@@ -2219,6 +2249,12 @@ async def amain(argv: Sequence[str] | None = None) -> int:
 
     plan, skips_1 = _initial_policy_prune(plan)
 
+    # Ensure check_env is first (avoid “plan roulette”)
+    for i, s in enumerate(plan):
+        if s.name == "check_env" and i != 0:
+            plan = [plan[i], *plan[:i], *plan[i + 1 :]]
+            break
+
     _hlog(
         f"BOOT profile={profile} strict={int(strict)} dns_mode={dns_mode} render_like={int(_render_like())} "
         f"network_allowed={int(_network_allowed())} timeout_s={int(timeout_s)} total_timeout_s={int(total_timeout_s)} "
@@ -2228,16 +2264,14 @@ async def amain(argv: Sequence[str] | None = None) -> int:
 
     results: list[StepResult] = list(preface_results)
     skips_final: list[dict[str, Any]] = list(skips_1)
+
     t_start = time.monotonic()
     critical_failed = False
     optional_failed = False
 
-    if plan and plan[0].name != "check_env":
-        plan = sorted(plan, key=lambda x: (0 if x.name == "check_env" else 1, x.name))
-
     check_env_json: dict[str, Any] | None = None
 
-    for idx, spec in enumerate(plan):
+    for idx, spec in enumerate(list(plan)):
         elapsed = time.monotonic() - t_start
         remaining_total: float | None = None
         if total_timeout_s > 0:

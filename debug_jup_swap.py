@@ -2,19 +2,27 @@
 from __future__ import annotations
 
 """
-debug_jup_swap.py — Jupiter quote/swap debug harness (P2 / dev-only)
-===================================================================
+debug_jup_swap.py — Jupiter quote/swap debug harness (DEV-ONLY)
+===============================================================
 
 What this is
 ------------
 A *safe* diagnostic script that validates:
-- your utils_pkg.router Jupiter connectivity
+- your utils_pkg.router Jupiter connectivity (quote call path)
 - quote response shape (keys, route plan)
 - (optional) swap tx build endpoint behavior (NO signing/broadcast here)
 
 This is intentionally dev-only. Keep it in:
   tools/debug_jup_swap.py   (recommended)
-or archive under scripts/ if you prefer, but DO NOT import this in production.
+
+DO NOT import this from production code.
+
+Notes
+-----
+- This script tries hard to be compatible across router refactors by discovering
+  quote/swap callables dynamically (prefers public functions; falls back to _jup_*).
+- Swap mode assumes the discovered "swap" callable is BUILD-ONLY.
+  If your router's swap broadcasts, DO NOT run swap mode until a build-only API is exposed.
 
 Usage
 -----
@@ -28,44 +36,148 @@ Env
 ---
 Optional:
   PUBKEY=<YOUR_PUBKEY>    (if --pubkey not provided)
-
-Notes
------
-- This script tries hard to be compatible across router refactors by discovering
-  quote/swap callables dynamically (prefers public functions; falls back to _jup_*).
-- If your router exposes different function names, add them to the resolver lists below.
 """
 
 import argparse
 import asyncio
+import contextlib
 import json
+import logging
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Final, Protocol, TypeAlias, cast
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Logging
+# Phase A — Logging contract (EventLogger + safe get_logger)
 # ──────────────────────────────────────────────────────────────────────────────
-try:
-    from logging_setup import get_logger  # canonical
 
-    LOG = get_logger("debug_jup_swap")
-except Exception:  # pragma: no cover
-    import logging
 
-    logging.basicConfig(
-        level=logging.INFO, format="[debug_jup_swap] %(asctime)s %(levelname)s %(message)s"
-    )
-    LOG = logging.getLogger("debug_jup_swap")
+class EventLogger(Protocol):
+    handlers: list[Any]
+
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def log(self, level: int, msg: str, *args: Any, **kwargs: Any) -> None: ...
+
+
+class _EventCapable(EventLogger, Protocol):
+    def event(self, name: str, **fields: Any) -> None: ...
+
+
+class _LoggerProxy:
+    """
+    Adapter that guarantees `.handlers` exists for typing compatibility,
+    while forwarding standard logging methods to the underlying logger.
+    """
+
+    def __init__(self, base: Any):
+        self._base = base
+        self.handlers: list[Any] = []
+        with contextlib.suppress(Exception):
+            h = getattr(base, "handlers", None)
+            if isinstance(h, list):
+                self.handlers = h
+
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        cast(Any, self._base).debug(msg, *args, **kwargs)
+
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        cast(Any, self._base).info(msg, *args, **kwargs)
+
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        fn = getattr(self._base, "warning", None) or getattr(self._base, "warn", None)
+        if callable(fn):
+            fn(msg, *args, **kwargs)
+            return
+        self.info(msg, *args, **kwargs)
+
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        cast(Any, self._base).error(msg, *args, **kwargs)
+
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        fn = getattr(self._base, "exception", None)
+        if callable(fn):
+            fn(msg, *args, **kwargs)
+            return
+        self.error(msg, *args, **kwargs)
+
+    def log(self, level: int, msg: str, *args: Any, **kwargs: Any) -> None:
+        cast(Any, self._base).log(level, msg, *args, **kwargs)
+
+    def event(self, name: str, **fields: Any) -> None:
+        fn = getattr(self._base, "event", None)
+        if callable(fn):
+            fn(name, **fields)
+            return
+        self.info("%s %s", name, fields)
+
+
+def get_logger(name: str | None = None) -> EventLogger:
+    """
+    Always returns an EventLogger-compatible object.
+
+    Priority:
+      1) utils_pkg.log_compat.get_event_logger / get_logger
+      2) logging_setup.get_logger
+      3) stdlib logging.getLogger (basicConfig if needed)
+    """
+    nm = (name or "debug_jup_swap").strip() or "debug_jup_swap"
+
+    with contextlib.suppress(Exception):
+        from utils_pkg.log_compat import get_event_logger  # type: ignore
+
+        return cast(EventLogger, _LoggerProxy(get_event_logger(nm)))
+
+    with contextlib.suppress(Exception):
+        from utils_pkg.log_compat import get_logger as gl  # type: ignore
+
+        return cast(EventLogger, _LoggerProxy(gl(nm)))
+
+    with contextlib.suppress(Exception):
+        from logging_setup import get_logger as gl2  # type: ignore
+
+        return cast(EventLogger, _LoggerProxy(gl2(nm)))
+
+    lg = logging.getLogger(nm)
+    if not lg.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="[debug_jup_swap] %(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+    return cast(EventLogger, _LoggerProxy(lg))
+
+
+LOG: EventLogger = get_logger("debug_jup_swap")
+
+
+def _event(name: str, **fields: Any) -> None:
+    """Best-effort structured event. Never raises."""
+    try:
+        fn = getattr(LOG, "event", None)
+        if callable(fn):
+            cast(_EventCapable, LOG).event(str(name), **fields)
+        else:
+            LOG.info("%s %s", str(name), fields)
+    except Exception:
+        return
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants / defaults
 # ──────────────────────────────────────────────────────────────────────────────
-DEFAULT_SOL_MINT = "So11111111111111111111111111111111111111112"
-DEFAULT_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-LAMPORTS_PER_SOL = 1_000_000_000
+DEFAULT_SOL_MINT: Final[str] = "So11111111111111111111111111111111111111112"
+DEFAULT_USDC_MINT: Final[str] = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+LAMPORTS_PER_SOL: Final[int] = 1_000_000_000
+
+JsonDict: TypeAlias = dict[str, Any]
+
+# Router callables are intentionally "Any-return" because signatures vary across refactors.
+QuoteFn: TypeAlias = Callable[..., Awaitable[Any]]
+SwapFn: TypeAlias = Callable[..., Awaitable[Any]]
 
 
 def _envs(k: str, d: str = "") -> str:
@@ -74,9 +186,9 @@ def _envs(k: str, d: str = "") -> str:
 
 
 def _to_lamports(amount_sol: float) -> int:
-    if amount_sol <= 0:
+    if float(amount_sol) <= 0.0:
         return 0
-    return max(1, int(amount_sol * LAMPORTS_PER_SOL))
+    return max(1, int(float(amount_sol) * float(LAMPORTS_PER_SOL)))
 
 
 def _pretty(obj: Any, max_chars: int = 4000) -> str:
@@ -89,22 +201,24 @@ def _pretty(obj: Any, max_chars: int = 4000) -> str:
     return s
 
 
-def _pick(d: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
-    return {k: d.get(k) for k in keys if k in d}
+def _pick(d: JsonDict, keys: tuple[str, ...]) -> JsonDict:
+    out: JsonDict = {}
+    for k in keys:
+        if k in d:
+            out[k] = d.get(k)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Router callable discovery (forward-compatible)
 # ──────────────────────────────────────────────────────────────────────────────
-QuoteFn = Callable[..., Awaitable[dict[str, Any]]]
-SwapFn = Callable[..., Awaitable[Any]]
-
-
 @dataclass(frozen=True)
 class RouterAPI:
     sol_mint: str
     quote_fn: QuoteFn
+    quote_name: str
     swap_fn: SwapFn | None
+    swap_name: str | None
 
 
 def _get_attr(module: Any, name: str) -> Any | None:
@@ -116,56 +230,68 @@ def _get_attr(module: Any, name: str) -> Any | None:
 
 def _resolve_router() -> RouterAPI:
     """
-    Tries to discover a stable quote/swap interface from utils_pkg.router.
+    Discover a stable quote/swap build interface from utils_pkg.router.
 
-    Preferred (public) names for quote:
+    Quote candidates (prefer public):
+      - get_quote_with_age_io
       - get_quote
       - quote
       - get_buy_quote
       - get_sell_quote
-    Fallback (private/legacy):
-      - _jup_quote
+      - _jup_quote   (legacy/private)
 
-    Preferred (public) names for swap build:
+    Swap build candidates (optional; prefer build-only names):
       - get_swap_tx
       - build_swap_tx
-      - swap
-      - execute_swap   (if it *builds* and does not broadcast; depends on your impl)
-    Fallback (private/legacy):
-      - _jup_swap
+      - build_swap
+      - get_swap
+      - swap          (ONLY if it builds, not broadcasts)
+      - _jup_swap     (legacy/private)
     """
     try:
-        from utils_pkg import router as R  # canonical
+        from utils_pkg import router as R  # type: ignore[import-not-found]
     except Exception as e:
         raise RuntimeError(f"Failed to import utils_pkg.router: {e}") from e
 
     sol_mint = str(_get_attr(R, "SOL_MINT") or DEFAULT_SOL_MINT)
 
-    # quote
-    quote_candidates = ["get_quote", "quote", "get_buy_quote", "get_sell_quote", "_jup_quote"]
+    quote_candidates = [
+        "get_quote_with_age_io",
+        "get_quote",
+        "quote",
+        "get_buy_quote",
+        "get_sell_quote",
+        "_jup_quote",
+    ]
     quote_fn: QuoteFn | None = None
     quote_name: str | None = None
     for n in quote_candidates:
         fn = _get_attr(R, n)
         if callable(fn):
-            quote_fn = fn
+            quote_fn = cast(QuoteFn, fn)
             quote_name = n
             break
-    if quote_fn is None:
+    if quote_fn is None or quote_name is None:
         raise RuntimeError(
             "No quote function found in utils_pkg.router (expected one of: "
             + ", ".join(quote_candidates)
             + ")"
         )
 
-    # swap (optional)
-    swap_candidates = ["get_swap_tx", "build_swap_tx", "swap", "execute_swap", "_jup_swap"]
+    swap_candidates = [
+        "get_swap_tx",
+        "build_swap_tx",
+        "build_swap",
+        "get_swap",
+        "swap",
+        "_jup_swap",
+    ]
     swap_fn: SwapFn | None = None
     swap_name: str | None = None
     for n in swap_candidates:
         fn = _get_attr(R, n)
         if callable(fn):
-            swap_fn = fn
+            swap_fn = cast(SwapFn, fn)
             swap_name = n
             break
 
@@ -175,37 +301,67 @@ def _resolve_router() -> RouterAPI:
         quote_name,
         swap_name or "None",
     )
-    return RouterAPI(sol_mint=sol_mint, quote_fn=quote_fn, swap_fn=swap_fn)
+    _event("DEBUG_JUP_SWAP_ROUTER", sol_mint=sol_mint, quote_fn=quote_name, swap_fn=swap_name)
+
+    return RouterAPI(
+        sol_mint=sol_mint,
+        quote_fn=quote_fn,
+        quote_name=quote_name,
+        swap_fn=swap_fn,
+        swap_name=swap_name,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Best-effort call adapters (signature-flex)
+# ──────────────────────────────────────────────────────────────────────────────
+def _ensure_dict(obj: Any, *, where: str) -> JsonDict:
+    if isinstance(obj, dict):
+        return cast(JsonDict, obj)
+    raise RuntimeError(f"Expected dict result from {where}, got {type(obj)!r}")
 
 
 async def _call_quote(
-    api: RouterAPI, in_mint: str, out_mint: str, amount_raw: int, slippage_bps: int
-) -> dict[str, Any]:
+    api: RouterAPI,
+    in_mint: str,
+    out_mint: str,
+    amount_raw: int,
+    slippage_bps: int,
+) -> JsonDict:
     """
-    Calls router quote using best-effort signature compatibility.
+    Calls the router quote function using best-effort signature compatibility.
+    Returns a dict or raises RuntimeError.
     """
     fn = api.quote_fn
 
-    # Try most common signatures first
-    # (inputMint, outputMint, amount, slippage_bps=..)
+    # 1) common positional + keyword slippage
     try:
-        return await fn(in_mint, out_mint, amount_raw, slippage_bps=slippage_bps)  # type: ignore[misc]
+        res = await fn(in_mint, out_mint, amount_raw, slippage_bps=slippage_bps)  # type: ignore[misc]
+        return _ensure_dict(res, where=f"{api.quote_name}(positional)")
     except TypeError:
         pass
 
-    # (in_mint=, out_mint=, amount_raw=, slippage_bps=)
+    # 2) common keyword style (snake)
     try:
-        return await fn(
-            in_mint=in_mint, out_mint=out_mint, amount_raw=amount_raw, slippage_bps=slippage_bps
+        res = await fn(
+            in_mint=in_mint,
+            out_mint=out_mint,
+            amount_raw=amount_raw,
+            slippage_bps=slippage_bps,
         )  # type: ignore[misc]
+        return _ensure_dict(res, where=f"{api.quote_name}(snake_kwargs)")
     except TypeError:
         pass
 
-    # (inputMint=, outputMint=, amount=, slippageBps=)
+    # 3) Jupiter-style keys (camel)
     try:
-        return await fn(
-            inputMint=in_mint, outputMint=out_mint, amount=amount_raw, slippageBps=slippage_bps
+        res = await fn(
+            inputMint=in_mint,
+            outputMint=out_mint,
+            amount=amount_raw,
+            slippageBps=slippage_bps,
         )  # type: ignore[misc]
+        return _ensure_dict(res, where=f"{api.quote_name}(camel_kwargs)")
     except TypeError as e:
         raise RuntimeError(f"Quote call failed due to incompatible signature: {e}") from e
 
@@ -213,32 +369,34 @@ async def _call_quote(
 async def _call_swap_build(
     api: RouterAPI,
     user_pubkey: str,
-    quote: dict[str, Any],
+    quote: JsonDict,
     priority_lamports: int | None,
     compute_units: int | None,
 ) -> Any:
     """
     Calls router swap builder using best-effort signature compatibility.
 
-    Important: this is intended to ONLY build tx(s). If your router's 'swap'
-    function broadcasts, do NOT use this script in swap mode until you expose
-    a build-only API.
+    IMPORTANT:
+      This is intended to ONLY build tx(s).
+      If your router's swap broadcasts, do NOT run swap mode.
     """
-    if api.swap_fn is None:
+    if api.swap_fn is None or api.swap_name is None:
         raise RuntimeError("No swap function found in utils_pkg.router (swap mode unavailable).")
 
     fn = api.swap_fn
 
-    # Try common signatures:
-    # (user_pubkey, quote, priority_lamports=None, compute_units=None)
+    # 1) positional (pubkey, quote) + keywords
     try:
         return await fn(
-            user_pubkey, quote, priority_lamports=priority_lamports, compute_units=compute_units
+            user_pubkey,
+            quote,
+            priority_lamports=priority_lamports,
+            compute_units=compute_units,
         )  # type: ignore[misc]
     except TypeError:
         pass
 
-    # keyword-style
+    # 2) keyword style
     try:
         return await fn(
             user_pubkey=user_pubkey,
@@ -249,7 +407,7 @@ async def _call_swap_build(
     except TypeError:
         pass
 
-    # Some routers use: (user_pubkey, quote, priority_lamports, compute_units)
+    # 3) pure positional fallback
     try:
         return await fn(user_pubkey, quote, priority_lamports, compute_units)  # type: ignore[misc]
     except TypeError as e:
@@ -257,7 +415,7 @@ async def _call_swap_build(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main
+# CLI
 # ──────────────────────────────────────────────────────────────────────────────
 def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Debug Jupiter quote/swap via utils_pkg.router")
@@ -265,12 +423,15 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--mode",
         choices=["quote", "swap"],
         default="quote",
-        help="quote only, or attempt swap-tx build",
+        help="quote only, or attempt swap-tx build (build-only!)",
     )
     p.add_argument("--out-mint", default=DEFAULT_USDC_MINT, help="Output mint (default USDC)")
     p.add_argument("--in-mint", default="", help="Input mint (default SOL mint from router)")
     p.add_argument(
-        "--amount-sol", type=float, default=0.004, help="Amount in SOL (only used if input is SOL)"
+        "--amount-sol",
+        type=float,
+        default=0.004,
+        help="Amount in SOL (only used if input is SOL)",
     )
     p.add_argument(
         "--amount-raw",
@@ -279,9 +440,12 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Override amount raw base units (takes precedence)",
     )
     p.add_argument("--slippage-bps", type=int, default=30, help="Slippage in bps")
-    p.add_argument("--pubkey", default="", help="User pubkey for swap build (or set env PUBKEY)")
+    p.add_argument("--pubkey", default="", help="User pubkey for swap build (or env PUBKEY)")
     p.add_argument(
-        "--priority-lamports", type=int, default=0, help="Optional priority fee lamports (0 = none)"
+        "--priority-lamports",
+        type=int,
+        default=0,
+        help="Optional priority fee lamports (0 = none)",
     )
     p.add_argument(
         "--compute-units",
@@ -293,18 +457,20 @@ def _build_argparser() -> argparse.ArgumentParser:
     return p
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
 async def _amain() -> int:
     args = _build_argparser().parse_args()
 
     api = _resolve_router()
+
     in_mint = args.in_mint.strip() or api.sol_mint
     out_mint = args.out_mint.strip()
-
     if not out_mint:
         LOG.error("out_mint required")
         return 2
 
-    # amount
     amount_raw = int(args.amount_raw or 0)
     if amount_raw <= 0:
         if in_mint == api.sol_mint:
@@ -322,13 +488,22 @@ async def _amain() -> int:
         amount_raw,
         slippage_bps,
     )
-    quote = await _call_quote(api, in_mint, out_mint, amount_raw, slippage_bps)
+    _event(
+        "DEBUG_JUP_SWAP_QUOTE_REQ",
+        in_mint=in_mint,
+        out_mint=out_mint,
+        amount_raw=amount_raw,
+        slippage_bps=slippage_bps,
+    )
 
-    if not isinstance(quote, dict) or not quote:
-        LOG.error("Quote failed or empty response.")
+    try:
+        quote = await _call_quote(api, in_mint, out_mint, amount_raw, slippage_bps)
+    except Exception as e:
+        LOG.error("Quote failed: %s", e)
+        _event("DEBUG_JUP_SWAP_QUOTE_FAIL", err=str(e))
         return 1
 
-    # Print a compact summary
+    # Compact quote summary
     summary_keys = (
         "inAmount",
         "outAmount",
@@ -338,27 +513,25 @@ async def _amain() -> int:
         "contextSlot",
         "timeTaken",
     )
-    route_keys = ("routePlan", "routes", "platformFee")
     summary = _pick(quote, summary_keys)
-    _pick(quote, route_keys)
 
     print("\n=== QUOTE SUMMARY ===")
     print(_pretty(summary))
 
-    # routePlan can be huge; show first step summary
     rp = quote.get("routePlan") or quote.get("routes")
     if isinstance(rp, list) and rp:
         print("\n=== ROUTE (first hop preview) ===")
-        print(_pretty(rp[0]))
+        print(_pretty(rp[0], max_chars=6000))
 
     if args.print_full:
         print("\n=== FULL QUOTE JSON ===")
         print(_pretty(quote, max_chars=200000))
 
     if args.mode == "quote":
+        _event("DEBUG_JUP_SWAP_DONE", mode="quote")
         return 0
 
-    # swap build mode
+    # Swap build mode
     pubkey = args.pubkey.strip() or _envs("PUBKEY", "")
     if not pubkey:
         LOG.error("Swap mode requires --pubkey or env PUBKEY.")
@@ -367,11 +540,15 @@ async def _amain() -> int:
     priority_lamports = int(args.priority_lamports or 0) or None
     compute_units = int(args.compute_units or 0) or None
 
-    LOG.info(
-        "Attempting swap-tx build for pubkey=%s (priority=%s cu=%s)",
-        pubkey,
-        priority_lamports,
-        compute_units,
+    LOG.warning(
+        "SWAP MODE: this assumes the router swap callable is BUILD-ONLY (no broadcast). "
+        "If your router broadcasts, stop now and expose a build-only API."
+    )
+    _event(
+        "DEBUG_JUP_SWAP_BUILD_REQ",
+        swap_fn=api.swap_name,
+        priority_lamports=priority_lamports,
+        compute_units=compute_units,
     )
 
     try:
@@ -379,18 +556,21 @@ async def _amain() -> int:
     except Exception as e:
         print("\n=== SWAP BUILD ERROR ===")
         print(repr(e))
+        _event("DEBUG_JUP_SWAP_BUILD_FAIL", err=str(e))
         return 1
 
     print("\n=== SWAP BUILD RESULT (type) ===")
     print(type(swap_result))
 
-    # Many Jupiter responses include {"swapTransaction": "..."} or a base64 string
-    if isinstance(swap_result, str | bytes):
-        print("\n=== SWAP TX (base64 present?) ===")
+    # Common shapes: dict (Jupiter response), bytes/str (tx b64), or object wrapper
+    if isinstance(swap_result, (str, bytes)):
+        print("\n=== SWAP TX (present?) ===")
         print(bool(swap_result))
-    elif isinstance(swap_result, dict):
-        # print likely fields
-        likely = {}
+        _event("DEBUG_JUP_SWAP_DONE", mode="swap", result_type="str_or_bytes")
+        return 0
+
+    if isinstance(swap_result, dict):
+        likely: JsonDict = {}
         for k in (
             "swapTransaction",
             "tx",
@@ -398,15 +578,21 @@ async def _amain() -> int:
             "setupTransaction",
             "cleanupTransaction",
             "addressLookupTableAddresses",
+            "lastValidBlockHeight",
+            "prioritizationFeeLamports",
+            "computeUnitLimit",
         ):
             if k in swap_result:
                 likely[k] = swap_result.get(k)
-        print("\n=== SWAP RESULT (selected fields) ===")
-        print(_pretty(likely if likely else swap_result))
-    else:
-        print("\n=== SWAP RESULT (repr) ===")
-        print(repr(swap_result)[:2000])
 
+        print("\n=== SWAP RESULT (selected fields) ===")
+        print(_pretty(likely if likely else cast(JsonDict, swap_result), max_chars=12000))
+        _event("DEBUG_JUP_SWAP_DONE", mode="swap", result_type="dict")
+        return 0
+
+    print("\n=== SWAP RESULT (repr) ===")
+    print(repr(swap_result)[:4000])
+    _event("DEBUG_JUP_SWAP_DONE", mode="swap", result_type=str(type(swap_result)))
     return 0
 
 
@@ -423,3 +609,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+__all__ = ["EventLogger", "get_logger", "main"]

@@ -12,70 +12,201 @@ interface defined in utils_pkg/positions_backend.py.
 
 LOCK-IN RULES
 -------------
-- position_store.py (Redis-first) is the **canonical** runtime truth.
+- utils_pkg.position_store (Redis-first) is the **canonical** runtime truth.
 - This file is ONLY an *optional mirror* used for:
     - reporting / analytics
     - audits / recovery
     - health verification that persistence is working
 - It MUST NOT become a second execution engine.
 
-It implements:
+Design goals
+------------
+- Import-time safety: importing this module must not touch the network or DB.
+- Best-effort: failure to reach Postgres must never crash the bot.
+- Render-friendly pool defaults + statement timeouts.
+- Minimal dependencies at import-time (SQLAlchemy is imported lazily).
+
+Implements:
     class PostgresPositionsBackend
 
-and keeps a small set of DEPRECATED legacy helper functions for compatibility
+Also keeps a small set of DEPRECATED legacy helper functions for compatibility
 with older call sites that still do:
     from utils_pkg.positions_pg import record_buy, update_after_sell, ...
 
 Those legacy helpers are best-effort and are meant to be removed once
-utils_pkg/trader.py + utils_pkg/ledger.py are rewritten to the new contracts.
+trader/ledger move to the new contracts.
+
+Phase A Note
+------------
+This file hardens the Logger ↔ EventLogger typing contract by:
+- Using a small adapter that guarantees .debug/.info/.warning/.error/.exception
+  and provides .event/.every without mutating the underlying logger object.
+- Avoiding mypy-incompatible Callable assignments and avoiding mid-file imports.
 """
 
 import asyncio
+import contextlib
+import importlib
+import logging
 import os
 import time
-from typing import Any
+from functools import lru_cache
+from typing import Any, Callable, Coroutine, Protocol, cast
 
-# Safe logger import
-try:  # pragma: no cover
-    from logging_setup import get_logger  # type: ignore
-except Exception:  # pragma: no cover
-    import logging
+JsonDict = dict[str, Any]
 
-    def get_logger(name: str | None = None):  # type: ignore
-        return logging.getLogger(name or "positions_pg")
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging (safe, mypy-stable)
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-log = get_logger(__name__)
+class LoggerLike(Protocol):
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
 
-# SQLAlchemy Core (sync). We run DB ops in a thread via asyncio.to_thread.
-from sqlalchemy import (
-    BigInteger,
-    Column,
-    Float,
-    Index,
-    MetaData,
-    String,
-    Table,
-    create_engine,
-    delete as sa_delete,
-    select,
-    text as sa_text,
-    update as sa_update,
-)
-from sqlalchemy.engine import Engine
-
-try:
-    from sqlalchemy.dialects.postgresql import (
-        JSONB,  # type: ignore
-        insert as pg_insert,  # type: ignore
-    )
-except Exception as e:  # pragma: no cover
-    raise RuntimeError("positions_pg requires SQLAlchemy with postgres dialect support") from e
+    # structured helpers (guaranteed by adapter)
+    def event(self, name: str, **kw: Any) -> None: ...
+    def every(self, key: str, n: int = 10, msg: str | None = None, **kw: Any) -> None: ...
 
 
-# -----------------------------------------------------------------------------
+class _LogAdapter:
+    """
+    Adapter that normalizes Logger/EventLogger differences without mutating the base object.
+    - All standard logging methods exist, and tolerate signature differences.
+    - event/every always exist.
+    """
+
+    __slots__ = ("_base", "_every_store", "_fallback")
+
+    def __init__(self, base: Any) -> None:
+        self._base = base
+        self._every_store: dict[str, float] = {}
+        self._fallback = logging.getLogger("positions_pg")
+
+    def _call(self, method: str, msg: str, *args: Any, **kwargs: Any) -> None:
+        fn = getattr(self._base, method, None)
+        if callable(fn):
+            # Some custom loggers don't accept kwargs like `extra=...`.
+            with contextlib.suppress(Exception):
+                try:
+                    fn(msg, *args, **kwargs)
+                    return
+                except TypeError:
+                    fn(msg, *args)
+                    return
+
+        # Fallback to std logging
+        fb = getattr(self._fallback, method, None)
+        if callable(fb):
+            with contextlib.suppress(Exception):
+                fb(msg, *args, **kwargs)
+
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._call("debug", msg, *args, **kwargs)
+
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._call("info", msg, *args, **kwargs)
+
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._call("warning", msg, *args, **kwargs)
+
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._call("error", msg, *args, **kwargs)
+
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._call("exception", msg, *args, **kwargs)
+
+    def event(self, name: str, **kw: Any) -> None:
+        fn = getattr(self._base, "event", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(name, **kw)
+                return
+        # Fallback: log as a single structured line
+        try:
+            self.info("%s %s", name, kw)
+        except Exception:
+            return
+
+    def every(self, key: str, n: int = 10, msg: str | None = None, **kw: Any) -> None:
+        fn = getattr(self._base, "every", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(key, n=n, msg=msg, **kw)
+                return
+
+        # Fallback: at most once per n seconds per key
+        try:
+            now = time.monotonic()
+            last = float(self._every_store.get(key, 0.0))
+            interval = float(max(1, int(n)))
+            if (now - last) >= interval:
+                self._every_store[key] = now
+                self.event(msg or key, **kw)
+        except Exception:
+            return
+
+
+def _fallback_get_logger(name: str | None = None, *_a: Any, **_k: Any) -> logging.Logger:
+    return logging.getLogger(name or "positions_pg")
+
+
+def _resolve_get_logger() -> Callable[..., Any]:
+    """
+    Resolve get_logger without mid-file imports and without strict signature assumptions.
+    Precedence:
+      - utils_pkg.log_compat.get_logger
+      - logging_setup.get_logger
+      - fallback std logging
+    """
+    # utils_pkg.log_compat
+    with contextlib.suppress(Exception):
+        mod = importlib.import_module("utils_pkg.log_compat")
+        fn = getattr(mod, "get_logger", None)
+        if callable(fn):
+            return cast(Callable[..., Any], fn)
+
+    # logging_setup
+    with contextlib.suppress(Exception):
+        mod2 = importlib.import_module("logging_setup")
+        fn2 = getattr(mod2, "get_logger", None)
+        if callable(fn2):
+            return cast(Callable[..., Any], fn2)
+
+    return _fallback_get_logger
+
+
+_GET_LOGGER = _resolve_get_logger()
+
+
+def _get_log(name: str) -> LoggerLike:
+    base: Any = None
+    with contextlib.suppress(Exception):
+        base = _GET_LOGGER(name)
+    if base is None:
+        base = _fallback_get_logger(name)
+    return cast(LoggerLike, _LogAdapter(base))
+
+
+log = _get_log(__name__)
+
+
+def _log_event(name: str, **fields: Any) -> None:
+    """
+    Structured event helper. Always safe.
+    """
+    try:
+        log.event(name, **fields)
+    except Exception:
+        return
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Small helpers
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 def _truthy(x: Any) -> bool:
     return str(x or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -102,12 +233,12 @@ def _now_ts() -> int:
 
 
 def _get_config_attr(name: str) -> Any:
-    try:
+    # Best-effort; avoid hard import-time coupling.
+    with contextlib.suppress(Exception):
         import config as C  # type: ignore
 
         return getattr(C, name)
-    except Exception:
-        return None
+    return None
 
 
 def _first_nonempty(*vals: Any) -> str:
@@ -122,14 +253,13 @@ def _normalize_dsn(dsn: str) -> str:
     """
     Normalize DSN for SQLAlchemy sync engine.
     - postgres:// -> postgresql://
-    - remove +asyncpg
+    - remove +asyncpg (we use sync engine in a thread)
     """
     dsn = (dsn or "").strip()
     if not dsn:
         return ""
     if dsn.startswith("postgres://"):
         dsn = "postgresql://" + dsn[len("postgres://") :]
-    # driver normalization
     dsn = dsn.replace("+asyncpg", "")
     return dsn
 
@@ -172,51 +302,133 @@ def _default_wallet() -> str:
     )
 
 
-def _log_event(name: str, **fields: Any) -> None:
+def _mask_dsn(dsn: str) -> str:
     """
-    Support both custom logger.event(...) and standard logger.info(...)
+    Best-effort DSN masking for logs.
     """
+    s = (dsn or "").strip()
+    if not s:
+        return ""
+    # Prefer SQLAlchemy URL parser if available; otherwise basic masking.
+    with contextlib.suppress(Exception):
+        from sqlalchemy.engine.url import make_url  # type: ignore
+
+        u = make_url(s)
+        if getattr(u, "password", None):
+            u = u.set(password="***")  # type: ignore[attr-defined]
+        return str(u)
+    if "@" in s:
+        return "***@" + s.split("@", 1)[1]
+    return s
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lazy SQLAlchemy import + schema build (keeps module import safe)
+# ──────────────────────────────────────────────────────────────────────────────
+@lru_cache(maxsize=1)
+def _sa() -> dict[str, Any]:
+    """
+    Import SQLAlchemy lazily.
+    Returns a dict of the few symbols we use, so callers don't import at module scope.
+    """
+    import sqlalchemy as sa  # type: ignore
+    from sqlalchemy import (  # type: ignore
+        BigInteger,
+        Column,
+        Float,
+        Index,
+        MetaData,
+        String,
+        Table,
+        create_engine,
+        delete as sa_delete,
+        func,
+        insert as sa_insert,
+        select,
+        text as sa_text,
+        update as sa_update,
+    )
+
     try:
-        if hasattr(log, "event") and callable(log.event):
-            log.event(name, **fields)  # type: ignore
-        else:
-            log.info(name, extra=fields)
+        from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert  # type: ignore
     except Exception:
-        # never crash from logging
-        return
+        JSONB = sa.JSON  # type: ignore[attr-defined]
+        pg_insert = None
+
+    return {
+        "sa": sa,
+        "BigInteger": BigInteger,
+        "Column": Column,
+        "Float": Float,
+        "Index": Index,
+        "MetaData": MetaData,
+        "String": String,
+        "Table": Table,
+        "create_engine": create_engine,
+        "sa_delete": sa_delete,
+        "sa_insert": sa_insert,
+        "sa_text": sa_text,
+        "sa_update": sa_update,
+        "select": select,
+        "func": func,
+        "JSONB": JSONB,
+        "pg_insert": pg_insert,
+    }
 
 
-# -----------------------------------------------------------------------------
-# Schema (mirror table; backend-agnostic shape)
-# -----------------------------------------------------------------------------
-_META = MetaData()
-
-positions_mirror = Table(
-    "positions_mirror",
-    _META,
-    Column("wallet", String(96), primary_key=True),
-    Column("mint", String(96), primary_key=True),
-    Column("pool", String(128), primary_key=True),
-    Column("symbol", String(64), nullable=True),
-    Column("status", String(16), nullable=False, default="open"),  # open|closed|failed
-    Column("size_raw", BigInteger, nullable=True),  # raw token qty (legacy compat)
-    Column("size_sol", Float, nullable=True),  # SOL spent/received if known
-    Column("entry_price", Float, nullable=True),  # price (unit defined by caller)
-    Column("opened_ts", BigInteger, nullable=True),
-    Column("closed_ts", BigInteger, nullable=True),
-    Column("updated_ts", BigInteger, nullable=False),
-    Column("extra", JSONB, nullable=True),
-)
-
-Index("idx_posm_wallet_status", positions_mirror.c.wallet, positions_mirror.c.status)
-Index("idx_posm_mint", positions_mirror.c.mint)
-Index("idx_posm_updated_ts", positions_mirror.c.updated_ts)
+_SCHEMA_READY = False
+_META: Any = None
+positions_mirror: Any = None  # intentionally Any to avoid stub friction
 
 
-# -----------------------------------------------------------------------------
+def _ensure_schema_sync() -> tuple[Any, Any]:
+    """
+    Define metadata + table lazily (first engine creation).
+    """
+    global _SCHEMA_READY, _META, positions_mirror
+    if _SCHEMA_READY and _META is not None and positions_mirror is not None:
+        return _META, positions_mirror
+
+    s = _sa()
+    MetaData = s["MetaData"]
+    Table = s["Table"]
+    Column = s["Column"]
+    String = s["String"]
+    Float = s["Float"]
+    BigInteger = s["BigInteger"]
+    Index = s["Index"]
+    JSONB = s["JSONB"]
+
+    _META = MetaData()
+    positions_mirror = Table(
+        "positions_mirror",
+        _META,
+        Column("wallet", String(96), primary_key=True),
+        Column("mint", String(96), primary_key=True),
+        Column("pool", String(128), primary_key=True),
+        Column("symbol", String(64), nullable=True),
+        Column("status", String(16), nullable=False, default="open"),  # open|closed|failed
+        Column("size_raw", BigInteger, nullable=True),
+        Column("size_sol", Float, nullable=True),
+        Column("entry_price", Float, nullable=True),
+        Column("opened_ts", BigInteger, nullable=True),
+        Column("closed_ts", BigInteger, nullable=True),
+        Column("updated_ts", BigInteger, nullable=False),
+        Column("extra", JSONB, nullable=True),
+    )
+
+    Index("idx_posm_wallet_status", positions_mirror.c.wallet, positions_mirror.c.status)
+    Index("idx_posm_mint", positions_mirror.c.mint)
+    Index("idx_posm_updated_ts", positions_mirror.c.updated_ts)
+
+    _SCHEMA_READY = True
+    return _META, positions_mirror
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Engine (lazy singleton)
-# -----------------------------------------------------------------------------
-_ENGINE: Engine | None = None
+# ──────────────────────────────────────────────────────────────────────────────
+_ENGINE: Any | None = None
 _ENGINE_LOCK = asyncio.Lock()
 
 
@@ -231,23 +443,23 @@ def _engine_settings() -> dict[str, Any]:
     stmt_timeout_ms = _safe_int(os.getenv("PG_STATEMENT_TIMEOUT_MS", "5000"), 5000)
 
     connect_args: dict[str, Any] = {}
-    # libpq statement_timeout option
     if stmt_timeout_ms > 0:
+        # libpq statement_timeout option
         connect_args["options"] = f"-c statement_timeout={stmt_timeout_ms}"
 
-    return dict(
-        pool_size=max(1, pool_size),
-        max_overflow=max(0, max_overflow),
-        pool_timeout=max(1, pool_timeout),
-        pool_recycle=max(30, pool_recycle),
-        connect_args=connect_args,
-    )
+    return {
+        "pool_size": max(1, pool_size),
+        "max_overflow": max(0, max_overflow),
+        "pool_timeout": max(1, pool_timeout),
+        "pool_recycle": max(30, pool_recycle),
+        "connect_args": connect_args,
+    }
 
 
-def _ensure_engine_sync() -> Engine:
+def _ensure_engine_sync() -> Any:
     """
-    Sync engine initializer. Raises on fatal DSN errors.
-    (Called inside a thread via asyncio.to_thread)
+    Sync engine initializer. Called inside a worker thread.
+    Raises only inside this function; callers wrap safely.
     """
     global _ENGINE
     if _ENGINE is not None:
@@ -260,50 +472,68 @@ def _ensure_engine_sync() -> Engine:
             "Set POSTGRES_DSN (or PG_DSN/PG_DSN_INTERNAL/PG_DSN_EXTERNAL/DATABASE_URL)."
         )
 
-    s = _engine_settings()
-    _ENGINE = create_engine(
+    s = _sa()
+    create_engine = s["create_engine"]
+
+    meta, _tbl = _ensure_schema_sync()
+    settings = _engine_settings()
+
+    eng = create_engine(
         dsn,
-        future=True,
         pool_pre_ping=True,
-        pool_size=s["pool_size"],
-        max_overflow=s["max_overflow"],
-        pool_timeout=s["pool_timeout"],
-        pool_recycle=s["pool_recycle"],
-        connect_args=s["connect_args"],
+        pool_size=settings["pool_size"],
+        max_overflow=settings["max_overflow"],
+        pool_timeout=settings["pool_timeout"],
+        pool_recycle=settings["pool_recycle"],
+        connect_args=settings["connect_args"],
     )
 
-    # Ensure schema
     try:
-        _META.create_all(_ENGINE)
+        meta.create_all(eng)
     except Exception as e:
         raise RuntimeError(f"positions_pg: schema create_all failed: {e}") from e
 
-    masked = dsn.split("@")[-1] if "@" in dsn else dsn
+    _ENGINE = eng
     _log_event(
         "PG_POSITIONS_ENGINE_READY",
-        dsn=masked,
-        pool_size=s["pool_size"],
-        max_overflow=s["max_overflow"],
+        dsn=_mask_dsn(dsn),
+        pool_size=settings["pool_size"],
+        max_overflow=settings["max_overflow"],
     )
     return _ENGINE
 
 
-async def _ensure_engine() -> Engine:
+async def _ensure_engine() -> Any | None:
     """
     Async wrapper: create engine once safely.
+    Returns None if engine cannot be created.
     """
     global _ENGINE
-    if _ENGINE is not None:
-        return _ENGINE
+
+    eng = _ENGINE
+    if eng is not None:
+        return eng
+
     async with _ENGINE_LOCK:
-        if _ENGINE is not None:
-            return _ENGINE
-        return await asyncio.to_thread(_ensure_engine_sync)
+        eng = _ENGINE
+        if eng is not None:
+            return eng
+
+        try:
+            eng = await asyncio.to_thread(_ensure_engine_sync)
+        except Exception as err:
+            # No hard crash: mirror is optional
+            log.warning("PG_POSITIONS_ENGINE_INIT_FAIL: %s", str(err)[:220])
+            _log_event("PG_POSITIONS_ENGINE_INIT_FAIL", err=str(err)[:500])
+            return None
+
+        _ENGINE = eng
+        return eng
 
 
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Backend implementation
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 class PostgresPositionsBackend:
     """
     Postgres implementation of utils_pkg.positions_backend.PositionsBackend.
@@ -316,17 +546,23 @@ class PostgresPositionsBackend:
     name = "pg"
 
     async def healthcheck(self) -> bool:
+        eng = await _ensure_engine()
+        if eng is None:
+            return False
+
+        s = _sa()
+        sa_text = s["sa_text"]
+
+        def _ping() -> bool:
+            with eng.connect() as cx:
+                cx.execute(sa_text("SELECT 1"))
+            return True
+
         try:
-            eng = await _ensure_engine()
-
-            def _ping() -> bool:
-                with eng.connect() as cx:
-                    cx.execute(sa_text("SELECT 1"))
-                return True
-
             return await asyncio.to_thread(_ping)
         except Exception as e:
-            log.warning("PG_POSITIONS_HEALTHCHECK_FAIL", extra={"err": str(e)[:200]})
+            log.warning("PG_POSITIONS_HEALTHCHECK_FAIL: %s", str(e)[:200])
+            _log_event("PG_POSITIONS_HEALTHCHECK_FAIL", err=str(e)[:500])
             return False
 
     async def upsert_position(
@@ -344,75 +580,129 @@ class PostgresPositionsBackend:
         updated_ts: int | None = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
-        try:
-            eng = await _ensure_engine()
-            w = str(wallet or "").strip()[:96] or "unknown_wallet"
-            m = str(mint or "").strip()[:96]
-            p = str(pool or "").strip()[:128] or "unknown_pool"
-            if not m:
-                return
+        eng = await _ensure_engine()
+        if eng is None:
+            return
 
-            now = int(updated_ts or _now_ts())
-            opened = int(opened_ts or 0) or None
+        _meta, tbl = _ensure_schema_sync()
+        s = _sa()
+        func = s["func"]
+        pg_insert = s["pg_insert"]
+        sa_insert = s["sa_insert"]
+        sa_update = s["sa_update"]
+        select = s["select"]
 
-            # size_raw is typed as float in the interface, but we store as BIGINT when integer-like.
-            sr: int | None = None
-            if size_raw is not None:
-                try:
-                    sr = int(float(size_raw))
-                except Exception:
-                    sr = None
+        w = str(wallet or "").strip()[:96] or "unknown_wallet"
+        m = str(mint or "").strip()[:96]
+        p = str(pool or "").strip()[:128] or "unknown_pool"
+        if not m:
+            return
 
-            def _do() -> None:
-                ins = pg_insert(positions_mirror).values(
+        now = int(updated_ts or _now_ts())
+        opened = int(opened_ts or 0) or None
+
+        sr: int | None = None
+        if size_raw is not None:
+            with contextlib.suppress(Exception):
+                sr = int(float(size_raw))
+
+        sym = str(symbol).strip()[:64] if symbol else None
+        st = str(status or "open")[:16]
+        ex = extra if isinstance(extra, dict) else None
+
+        def _do() -> None:
+            # If dialect insert is available, use true upsert.
+            if pg_insert is not None:
+                ins = pg_insert(tbl).values(
                     wallet=w,
                     mint=m,
                     pool=p,
-                    symbol=(str(symbol).strip()[:64] if symbol else None),
-                    status=str(status or "open")[:16],
+                    symbol=sym,
+                    status=st,
                     size_raw=sr,
                     size_sol=(float(size_sol) if size_sol is not None else None),
                     entry_price=(float(entry_price) if entry_price is not None else None),
                     opened_ts=opened,
                     closed_ts=None,
                     updated_ts=now,
-                    extra=(extra if isinstance(extra, dict) else None),
+                    extra=ex,
                 )
 
-                # Only overwrite optional cols if provided; otherwise keep existing.
                 upd = {
-                    "symbol": ins.excluded.symbol.coalesce(positions_mirror.c.symbol),
+                    "symbol": func.coalesce(ins.excluded.symbol, tbl.c.symbol),
                     "status": ins.excluded.status,
-                    "size_raw": ins.excluded.size_raw.coalesce(positions_mirror.c.size_raw),
-                    "size_sol": ins.excluded.size_sol.coalesce(positions_mirror.c.size_sol),
-                    "entry_price": ins.excluded.entry_price.coalesce(
-                        positions_mirror.c.entry_price
-                    ),
-                    "opened_ts": ins.excluded.opened_ts.coalesce(positions_mirror.c.opened_ts),
+                    "size_raw": func.coalesce(ins.excluded.size_raw, tbl.c.size_raw),
+                    "size_sol": func.coalesce(ins.excluded.size_sol, tbl.c.size_sol),
+                    "entry_price": func.coalesce(ins.excluded.entry_price, tbl.c.entry_price),
+                    "opened_ts": func.coalesce(ins.excluded.opened_ts, tbl.c.opened_ts),
                     "updated_ts": ins.excluded.updated_ts,
-                    "extra": ins.excluded.extra.coalesce(positions_mirror.c.extra),
-                    # do not touch closed_ts on upsert; close_position owns it
+                    "extra": func.coalesce(ins.excluded.extra, tbl.c.extra),
                 }
 
                 stmt = ins.on_conflict_do_update(
-                    index_elements=[
-                        positions_mirror.c.wallet,
-                        positions_mirror.c.mint,
-                        positions_mirror.c.pool,
-                    ],
+                    index_elements=[tbl.c.wallet, tbl.c.mint, tbl.c.pool],
                     set_=upd,
                 )
 
                 with eng.begin() as cx:
                     cx.execute(stmt)
+                return
 
+            # Fallback path without postgres dialect: UPDATE then INSERT if missing.
+            with eng.begin() as cx:
+                res = cx.execute(
+                    sa_update(tbl)
+                    .where((tbl.c.wallet == w) & (tbl.c.mint == m) & (tbl.c.pool == p))
+                    .values(
+                        symbol=(sym if sym is not None else tbl.c.symbol),
+                        status=st,
+                        size_raw=(sr if sr is not None else tbl.c.size_raw),
+                        size_sol=(float(size_sol) if size_sol is not None else tbl.c.size_sol),
+                        entry_price=(
+                            float(entry_price) if entry_price is not None else tbl.c.entry_price
+                        ),
+                        opened_ts=(opened if opened is not None else tbl.c.opened_ts),
+                        updated_ts=now,
+                        extra=(ex if ex is not None else tbl.c.extra),
+                    )
+                )
+
+                # If updated nothing, insert a new row (best-effort mirror).
+                rowcount = getattr(res, "rowcount", 0) or 0
+                if int(rowcount) > 0:
+                    return
+
+                # Confirm doesn't exist (avoid duplicate if rowcount unavailable)
+                exists = cx.execute(
+                    select(tbl.c.wallet).where(
+                        (tbl.c.wallet == w) & (tbl.c.mint == m) & (tbl.c.pool == p)
+                    )
+                ).first()
+                if exists:
+                    return
+
+                cx.execute(
+                    sa_insert(tbl).values(
+                        wallet=w,
+                        mint=m,
+                        pool=p,
+                        symbol=sym,
+                        status=st,
+                        size_raw=sr,
+                        size_sol=(float(size_sol) if size_sol is not None else None),
+                        entry_price=(float(entry_price) if entry_price is not None else None),
+                        opened_ts=opened,
+                        closed_ts=None,
+                        updated_ts=now,
+                        extra=ex,
+                    )
+                )
+
+        try:
             await asyncio.to_thread(_do)
         except Exception as e:
-            log.warning(
-                "PG_POS_UPSERT_FAIL",
-                extra={"err": str(e)[:220], "wallet": str(wallet)[:48], "mint": str(mint)[:48]},
-            )
-            return
+            log.warning("PG_POS_UPSERT_FAIL: %s", str(e)[:220])
+            _log_event("PG_POS_UPSERT_FAIL", err=str(e)[:500], wallet=w[:48], mint=m[:48])
 
     async def close_position(
         self,
@@ -425,87 +715,141 @@ class PostgresPositionsBackend:
         updated_ts: int | None = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
-        try:
-            eng = await _ensure_engine()
-            w = str(wallet or "").strip()[:96] or "unknown_wallet"
-            m = str(mint or "").strip()[:96]
-            p = str(pool or "").strip()[:128] or "unknown_pool"
-            if not m:
-                return
-
-            now = int(updated_ts or _now_ts())
-            cts = int(closed_ts or _now_ts())
-
-            def _do() -> None:
-                with eng.begin() as cx:
-                    # merge extra best-effort (read current, merge in python)
-                    cur_extra = None
-                    if extra:
-                        row = cx.execute(
-                            select(positions_mirror.c.extra).where(
-                                (positions_mirror.c.wallet == w)
-                                & (positions_mirror.c.mint == m)
-                                & (positions_mirror.c.pool == p)
-                            )
-                        ).first()
-                        cur_extra = (row[0] if row else None) or {}
-                        if not isinstance(cur_extra, dict):
-                            cur_extra = {}
-                        merged = dict(cur_extra)
-                        merged.update(extra)
-                    else:
-                        merged = None
-
-                    cx.execute(
-                        sa_update(positions_mirror)
-                        .where(
-                            (positions_mirror.c.wallet == w)
-                            & (positions_mirror.c.mint == m)
-                            & (positions_mirror.c.pool == p)
-                        )
-                        .values(
-                            status=str(status or "closed")[:16],
-                            closed_ts=cts,
-                            updated_ts=now,
-                            extra=(merged if merged is not None else positions_mirror.c.extra),
-                        )
-                    )
-
-            await asyncio.to_thread(_do)
-        except Exception as e:
-            log.warning(
-                "PG_POS_CLOSE_FAIL",
-                extra={"err": str(e)[:220], "wallet": str(wallet)[:48], "mint": str(mint)[:48]},
-            )
+        eng = await _ensure_engine()
+        if eng is None:
             return
 
-    async def fetch_position(self, *, wallet: str, mint: str, pool: str):
-        from .positions_backend import PositionRow  # local import to avoid cycles at import-time
+        _meta, tbl = _ensure_schema_sync()
+        s = _sa()
+        select = s["select"]
+        sa_update = s["sa_update"]
 
-        try:
-            eng = await _ensure_engine()
-            w = str(wallet or "").strip()[:96] or "unknown_wallet"
-            m = str(mint or "").strip()[:96]
-            p = str(pool or "").strip()[:128] or "unknown_pool"
-            if not m:
-                return None
+        w = str(wallet or "").strip()[:96] or "unknown_wallet"
+        m = str(mint or "").strip()[:96]
+        p = str(pool or "").strip()[:128] or "unknown_pool"
+        if not m:
+            return
 
-            def _do() -> PositionRow | None:
-                with eng.connect() as cx:
+        now = int(updated_ts or _now_ts())
+        cts = int(closed_ts or _now_ts())
+        st = str(status or "closed")[:16]
+        ex = extra if isinstance(extra, dict) else None
+
+        def _do() -> None:
+            with eng.begin() as cx:
+                merged_extra = None
+                if ex:
                     row = cx.execute(
-                        select(positions_mirror).where(
-                            (positions_mirror.c.wallet == w)
-                            & (positions_mirror.c.mint == m)
-                            & (positions_mirror.c.pool == p)
+                        select(tbl.c.extra).where(
+                            (tbl.c.wallet == w) & (tbl.c.mint == m) & (tbl.c.pool == p)
                         )
                     ).first()
-                    if not row:
-                        return None
-                    d = dict(row._mapping)
-                    return PositionRow(
-                        wallet=d.get("wallet") or w,
-                        mint=d.get("mint") or m,
-                        pool=d.get("pool") or p,
+                    cur_extra = (row[0] if row else None) or {}
+                    if not isinstance(cur_extra, dict):
+                        cur_extra = {}
+                    merged_extra = dict(cur_extra)
+                    merged_extra.update(ex)
+
+                cx.execute(
+                    sa_update(tbl)
+                    .where((tbl.c.wallet == w) & (tbl.c.mint == m) & (tbl.c.pool == p))
+                    .values(
+                        status=st,
+                        closed_ts=cts,
+                        updated_ts=now,
+                        extra=(merged_extra if merged_extra is not None else tbl.c.extra),
+                    )
+                )
+
+        try:
+            await asyncio.to_thread(_do)
+        except Exception as e:
+            log.warning("PG_POS_CLOSE_FAIL: %s", str(e)[:220])
+            _log_event("PG_POS_CLOSE_FAIL", err=str(e)[:500], wallet=w[:48], mint=m[:48])
+
+    async def fetch_position(self, *, wallet: str, mint: str, pool: str) -> Any:
+        # local import to avoid cycles at import-time
+        from .positions_backend import PositionRow
+
+        eng = await _ensure_engine()
+        if eng is None:
+            return None
+
+        _meta, tbl = _ensure_schema_sync()
+        s = _sa()
+        select = s["select"]
+
+        w = str(wallet or "").strip()[:96] or "unknown_wallet"
+        m = str(mint or "").strip()[:96]
+        p = str(pool or "").strip()[:128] or "unknown_pool"
+        if not m:
+            return None
+
+        def _do() -> Any:
+            with eng.connect() as cx:
+                row = cx.execute(
+                    select(tbl).where((tbl.c.wallet == w) & (tbl.c.mint == m) & (tbl.c.pool == p))
+                ).first()
+                if not row:
+                    return None
+                d = dict(row._mapping)
+                return PositionRow(
+                    wallet=d.get("wallet") or w,
+                    mint=d.get("mint") or m,
+                    pool=d.get("pool") or p,
+                    symbol=d.get("symbol"),
+                    status=d.get("status"),
+                    size_raw=float(d["size_raw"]) if d.get("size_raw") is not None else None,
+                    size_sol=float(d["size_sol"]) if d.get("size_sol") is not None else None,
+                    entry_price=float(d["entry_price"])
+                    if d.get("entry_price") is not None
+                    else None,
+                    opened_ts=int(d["opened_ts"]) if d.get("opened_ts") is not None else None,
+                    closed_ts=int(d["closed_ts"]) if d.get("closed_ts") is not None else None,
+                    updated_ts=int(d["updated_ts"]) if d.get("updated_ts") is not None else None,
+                    extra=d.get("extra") if isinstance(d.get("extra"), dict) else None,
+                )
+
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as e:
+            log.warning("PG_POS_FETCH_FAIL: %s", str(e)[:200])
+            _log_event("PG_POS_FETCH_FAIL", err=str(e)[:500], wallet=w[:48], mint=m[:48])
+            return None
+
+    async def fetch_open_positions(
+        self, *, wallet: str | None = None, limit: int = 500
+    ) -> list[Any]:
+        # local import to avoid cycles at import-time
+        from .positions_backend import PositionRow
+
+        eng = await _ensure_engine()
+        if eng is None:
+            return []
+
+        _meta, tbl = _ensure_schema_sync()
+        s = _sa()
+        select = s["select"]
+
+        lim = max(1, min(int(limit or 500), 5000))
+        w = str(wallet or "").strip()[:96] if wallet else None
+
+        def _do() -> list[Any]:
+            with eng.connect() as cx:
+                q = select(tbl).where(tbl.c.status == "open")
+                if w:
+                    q = q.where(tbl.c.wallet == w)
+                q = q.order_by(tbl.c.updated_ts.desc()).limit(lim)
+                rows = cx.execute(q).fetchall()
+
+            out: list[Any] = []
+            for row in rows:
+                d = dict(row._mapping)
+                out.append(
+                    PositionRow(
+                        wallet=d.get("wallet") or (w or "unknown_wallet"),
+                        mint=d.get("mint") or "",
+                        pool=d.get("pool") or "",
                         symbol=d.get("symbol"),
                         status=d.get("status"),
                         size_raw=float(d["size_raw"]) if d.get("size_raw") is not None else None,
@@ -520,73 +864,20 @@ class PostgresPositionsBackend:
                         else None,
                         extra=d.get("extra") if isinstance(d.get("extra"), dict) else None,
                     )
-
-            return await asyncio.to_thread(_do)
-        except Exception as e:
-            log.warning("PG_POS_FETCH_FAIL", extra={"err": str(e)[:200]})
-            return None
-
-    async def fetch_open_positions(self, *, wallet: str | None = None, limit: int = 500):
-        from .positions_backend import PositionRow  # local import
+                )
+            return out
 
         try:
-            eng = await _ensure_engine()
-            lim = max(1, min(int(limit or 500), 5000))
-
-            w = str(wallet or "").strip()[:96] if wallet else None
-
-            def _do() -> list[PositionRow]:
-                with eng.connect() as cx:
-                    q = select(positions_mirror).where(positions_mirror.c.status == "open")
-                    if w:
-                        q = q.where(positions_mirror.c.wallet == w)
-                    q = q.order_by(positions_mirror.c.updated_ts.desc()).limit(lim)
-                    res = cx.execute(q).fetchall()
-
-                out: list[PositionRow] = []
-                for row in res:
-                    d = dict(row._mapping)
-                    out.append(
-                        PositionRow(
-                            wallet=d.get("wallet") or (w or "unknown_wallet"),
-                            mint=d.get("mint") or "",
-                            pool=d.get("pool") or "",
-                            symbol=d.get("symbol"),
-                            status=d.get("status"),
-                            size_raw=float(d["size_raw"])
-                            if d.get("size_raw") is not None
-                            else None,
-                            size_sol=float(d["size_sol"])
-                            if d.get("size_sol") is not None
-                            else None,
-                            entry_price=float(d["entry_price"])
-                            if d.get("entry_price") is not None
-                            else None,
-                            opened_ts=int(d["opened_ts"])
-                            if d.get("opened_ts") is not None
-                            else None,
-                            closed_ts=int(d["closed_ts"])
-                            if d.get("closed_ts") is not None
-                            else None,
-                            updated_ts=int(d["updated_ts"])
-                            if d.get("updated_ts") is not None
-                            else None,
-                            extra=d.get("extra") if isinstance(d.get("extra"), dict) else None,
-                        )
-                    )
-                return out
-
             return await asyncio.to_thread(_do)
         except Exception as e:
-            log.warning("PG_POS_FETCH_OPEN_FAIL", extra={"err": str(e)[:200]})
+            log.warning("PG_POS_FETCH_OPEN_FAIL: %s", str(e)[:200])
+            _log_event("PG_POS_FETCH_OPEN_FAIL", err=str(e)[:500], wallet=(w or "")[:48])
             return []
 
 
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # DEPRECATED legacy helpers (compat only; remove after trader/ledger rewrite)
-# -----------------------------------------------------------------------------
-# These helpers map older "mint-only" calls onto positions_mirror using a default wallet.
-# They are intentionally minimal and best-effort.
+# ──────────────────────────────────────────────────────────────────────────────
 _PG_BACKEND_SINGLETON: PostgresPositionsBackend | None = None
 
 
@@ -597,19 +888,16 @@ def _backend() -> PostgresPositionsBackend:
     return _PG_BACKEND_SINGLETON
 
 
-def _run(coro):
+def _run(coro: Coroutine[Any, Any, Any]) -> Any:
     """
     Run a coroutine from sync legacy calls.
-    If already in an event loop, schedule + wait is unsafe; so we no-op safely.
+    If already in an event loop, schedule and return immediately (safe no-block).
     """
     try:
         loop = asyncio.get_running_loop()
-        # If we are already inside asyncio (bot runtime), legacy sync calls should not be used.
-        # Best-effort: schedule and return immediately (don’t block the loop).
-        loop.create_task(coro)  # type: ignore
+        loop.create_task(coro)
         return None
     except RuntimeError:
-        # no running loop -> ok to run
         return asyncio.run(coro)
 
 
@@ -617,16 +905,13 @@ def all() -> list[dict[str, Any]]:
     """
     Legacy: return all open mirrored rows (across wallets). Best-effort.
     """
-    out: list[dict[str, Any]] = []
 
-    async def _c():
+    async def _c() -> list[dict[str, Any]]:
         rows = await _backend().fetch_open_positions(wallet=None, limit=2000)
-        return [r.__dict__ for r in rows]  # PositionRow is dataclass-like
+        return [r.__dict__ for r in rows]
 
     res = _run(_c())
-    if isinstance(res, list):
-        out = res
-    return out
+    return res if isinstance(res, list) else []
 
 
 def get(mint: str) -> dict[str, Any] | None:
@@ -637,17 +922,15 @@ def get(mint: str) -> dict[str, Any] | None:
     if not m:
         return None
 
-    async def _c():
+    async def _c() -> dict[str, Any] | None:
         w = _default_wallet()
-        # try default wallet first
         rows = await _backend().fetch_open_positions(wallet=w, limit=500)
         for r in rows:
-            if r.mint == m:
+            if getattr(r, "mint", None) == m:
                 return r.__dict__
-        # fallback: any wallet
         rows2 = await _backend().fetch_open_positions(wallet=None, limit=2000)
         for r in rows2:
-            if r.mint == m:
+            if getattr(r, "mint", None) == m:
                 return r.__dict__
         return None
 
@@ -657,18 +940,22 @@ def get(mint: str) -> dict[str, Any] | None:
 
 def remove(mint: str) -> None:
     """
-    Legacy: hard-delete ALL mirror rows for this mint (admin only).
+    Legacy: hard-delete ALL mirror rows for this mint (admin only). Best-effort.
     """
     m = str(mint or "").strip()
     if not m:
         return
 
-    async def _c():
+    async def _c() -> None:
         eng = await _ensure_engine()
+        if eng is None:
+            return
+        _meta, tbl = _ensure_schema_sync()
+        sa_delete = _sa()["sa_delete"]
 
-        def _do():
+        def _do() -> None:
             with eng.begin() as cx:
-                cx.execute(sa_delete(positions_mirror).where(positions_mirror.c.mint == m))
+                cx.execute(sa_delete(tbl).where(tbl.c.mint == m))
 
         await asyncio.to_thread(_do)
 
@@ -678,24 +965,29 @@ def remove(mint: str) -> None:
 def decrement_qty(mint: str, sold_raw: int) -> None:
     """
     Legacy: decrement size_raw for default wallet rows of mint.
-    If size_raw <= 0, close the row.
+    If size_raw <= 0, close the row. Best-effort.
     """
     m = str(mint or "").strip()
     sr = _safe_int(sold_raw, 0)
     if not m or sr <= 0:
         return
 
-    async def _c():
+    async def _c() -> None:
         eng = await _ensure_engine()
+        if eng is None:
+            return
+        _meta, tbl = _ensure_schema_sync()
+        s = _sa()
+        select = s["select"]
+        sa_update = s["sa_update"]
+
         w = _default_wallet()
 
-        def _do():
+        def _do() -> None:
             with eng.begin() as cx:
                 rows = cx.execute(
-                    select(positions_mirror).where(
-                        (positions_mirror.c.wallet == w)
-                        & (positions_mirror.c.mint == m)
-                        & (positions_mirror.c.status == "open")
+                    select(tbl).where(
+                        (tbl.c.wallet == w) & (tbl.c.mint == m) & (tbl.c.status == "open")
                     )
                 ).fetchall()
 
@@ -706,11 +998,9 @@ def decrement_qty(mint: str, sold_raw: int) -> None:
                     newq = max(0, cur - sr)
                     if newq <= 0:
                         cx.execute(
-                            sa_update(positions_mirror)
+                            sa_update(tbl)
                             .where(
-                                (positions_mirror.c.wallet == w)
-                                & (positions_mirror.c.mint == m)
-                                & (positions_mirror.c.pool == key_pool)
+                                (tbl.c.wallet == w) & (tbl.c.mint == m) & (tbl.c.pool == key_pool)
                             )
                             .values(
                                 status="closed",
@@ -721,11 +1011,9 @@ def decrement_qty(mint: str, sold_raw: int) -> None:
                         )
                     else:
                         cx.execute(
-                            sa_update(positions_mirror)
+                            sa_update(tbl)
                             .where(
-                                (positions_mirror.c.wallet == w)
-                                & (positions_mirror.c.mint == m)
-                                & (positions_mirror.c.pool == key_pool)
+                                (tbl.c.wallet == w) & (tbl.c.mint == m) & (tbl.c.pool == key_pool)
                             )
                             .values(size_raw=newq, updated_ts=_now_ts())
                         )
@@ -737,24 +1025,31 @@ def decrement_qty(mint: str, sold_raw: int) -> None:
 
 def update_after_sell(*, mint: str, sold_raw: int, tx_sig: str | None, closed: bool) -> None:
     """
-    Legacy: decrement size_raw and optionally force-close.
+    Legacy: decrement size_raw and optionally force-close. Best-effort.
+    tx_sig is accepted for backward compatibility (not required in mirror).
     """
+    _ = tx_sig  # compat placeholder (legacy callers pass it)
     m = str(mint or "").strip()
     sr = _safe_int(sold_raw, 0)
     if not m or sr <= 0:
         return
 
-    async def _c():
+    async def _c() -> None:
         eng = await _ensure_engine()
+        if eng is None:
+            return
+        _meta, tbl = _ensure_schema_sync()
+        s = _sa()
+        select = s["select"]
+        sa_update = s["sa_update"]
+
         w = _default_wallet()
 
-        def _do():
+        def _do() -> None:
             with eng.begin() as cx:
                 rows = cx.execute(
-                    select(positions_mirror).where(
-                        (positions_mirror.c.wallet == w)
-                        & (positions_mirror.c.mint == m)
-                        & (positions_mirror.c.status == "open")
+                    select(tbl).where(
+                        (tbl.c.wallet == w) & (tbl.c.mint == m) & (tbl.c.status == "open")
                     )
                 ).fetchall()
 
@@ -764,19 +1059,16 @@ def update_after_sell(*, mint: str, sold_raw: int, tx_sig: str | None, closed: b
                     cur = int(d.get("size_raw") or 0)
                     newq = max(0, cur - sr)
                     force = bool(closed) or (newq <= 0)
+
                     cx.execute(
-                        sa_update(positions_mirror)
-                        .where(
-                            (positions_mirror.c.wallet == w)
-                            & (positions_mirror.c.mint == m)
-                            & (positions_mirror.c.pool == key_pool)
-                        )
+                        sa_update(tbl)
+                        .where((tbl.c.wallet == w) & (tbl.c.mint == m) & (tbl.c.pool == key_pool))
                         .values(
                             size_raw=(0 if force else newq),
                             status=("closed" if force else "open"),
-                            closed_ts=(_now_ts() if force else positions_mirror.c.closed_ts),
+                            closed_ts=(_now_ts() if force else tbl.c.closed_ts),
                             updated_ts=_now_ts(),
-                            extra=positions_mirror.c.extra,  # do not mutate here
+                            extra=tbl.c.extra,  # do not mutate mirror-extra here
                         )
                     )
 
@@ -787,7 +1079,7 @@ def update_after_sell(*, mint: str, sold_raw: int, tx_sig: str | None, closed: b
 
 def record_sell(*, mint: str, qty_raw: int, sig: str | None) -> None:
     """
-    Legacy: a sell record is just a decrement.
+    Legacy: a sell record is just a decrement (best-effort mirror).
     """
     update_after_sell(mint=mint, sold_raw=int(qty_raw or 0), tx_sig=sig, closed=False)
 
@@ -809,7 +1101,7 @@ def record_buy(
 
     We store:
       - size_raw := qty_raw
-      - entry_price := price_per_token_sol (unit: sol_per_token) in extra
+      - entry_price := price_per_token_sol (unit: sol_per_token)
       - extra includes decimals/token_program/owner_ata/last_sig
     """
     m = str(mint or "").strip()
@@ -817,7 +1109,7 @@ def record_buy(
     if not m or q <= 0:
         return
 
-    async def _c():
+    async def _c() -> None:
         w = _default_wallet()
         p = (pool or "legacy")[:128]
         extra = {

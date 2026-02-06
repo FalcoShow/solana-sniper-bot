@@ -1,4 +1,3 @@
-# utils_pkg/txlearn.py
 from __future__ import annotations
 
 """
@@ -66,38 +65,113 @@ import asyncio
 import os
 import random
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, TypedDict
 
 import aiohttp
 
-from logging_setup import bump, get_logger
 
-# Budget hooks (soft gates). Fail-open if module not present.
-try:
-    from utils_pkg import budget  # type: ignore
-except Exception:  # pragma: no cover
-
-    class _BudgetNoop:
-        def before_quote(self, units: int = 1) -> bool:
-            return True
-
-        def after_quote(self, units: int = 1) -> None:
-            return None
-
-        def before_rpc(self, method: str, *, weight: int | None = None) -> bool:
-            return True
-
-        def after_rpc(self, method: str, *, weight: int | None = None) -> None:
-            return None
-
-    budget = _BudgetNoop()  # type: ignore
+# -----------------------------------------------------------------------------
+# Logger (canonical contract with safe fallback)
+# -----------------------------------------------------------------------------
+class EventLogger(Protocol):
+    def event(self, name: str, /, **fields: Any) -> None: ...
+    def info(self, msg: str, /, *args: Any, **kwargs: Any) -> None: ...
+    def warning(self, msg: str, /, *args: Any, **kwargs: Any) -> None: ...
+    def error(self, msg: str, /, *args: Any, **kwargs: Any) -> None: ...
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────────────────
+def _resolve_logger() -> EventLogger:
+    # Prefer canonical repo logger compat
+    try:
+        from utils_pkg.log_compat import get_logger as gl  # type: ignore
+
+        lg = gl(__name__)
+        return lg  # type: ignore[return-value]
+    except Exception:
+        pass
+
+    # Legacy path (root logging_setup)
+    try:
+        from logging_setup import get_logger as gl2  # type: ignore
+
+        lg2 = gl2(__name__)
+        return lg2  # type: ignore[return-value]
+    except Exception:
+        pass
+
+    # Final fallback to stdlib logging
+    import logging
+
+    lg3 = logging.getLogger(__name__)
+    if not getattr(lg3, "handlers", None):
+        logging.basicConfig(level=logging.INFO)
+    return lg3  # type: ignore[return-value]
+
+
+log: EventLogger = _resolve_logger()
+
+
+def _bump(name: str) -> None:
+    """
+    Metrics counter shim. Best-effort, no hard dependency.
+    """
+    try:
+        from utils_pkg.log_compat import bump as b  # type: ignore
+
+        b(name)
+        return
+    except Exception:
+        pass
+    try:
+        from logging_setup import bump as b2  # type: ignore
+
+        b2(name)
+    except Exception:
+        return
+
+
+# -----------------------------------------------------------------------------
+# Optional budget hooks (soft gates). Fail-open if module not present.
+# -----------------------------------------------------------------------------
+class BudgetAPI(Protocol):
+    def before_rpc(self, method: str, *, weight: int | None = None) -> bool: ...
+    def after_rpc(self, method: str, *, weight: int | None = None) -> None: ...
+    def before_quote(self, units: int = 1) -> bool: ...
+    def after_quote(self, units: int = 1) -> None: ...
+
+
+class _BudgetNoop:
+    def before_quote(self, units: int = 1) -> bool:
+        return True
+
+    def after_quote(self, units: int = 1) -> None:
+        return None
+
+    def before_rpc(self, method: str, *, weight: int | None = None) -> bool:
+        return True
+
+    def after_rpc(self, method: str, *, weight: int | None = None) -> None:
+        return None
+
+
+def _resolve_budget() -> BudgetAPI:
+    try:
+        from utils_pkg import budget as mod  # type: ignore
+
+        # If the module provides these callables, it satisfies BudgetAPI structurally.
+        return mod  # type: ignore[return-value]
+    except Exception:
+        return _BudgetNoop()
+
+
+budget: BudgetAPI = _resolve_budget()
+
+# -----------------------------------------------------------------------------
+# Config (NO new env names; keep contract stable)
+# -----------------------------------------------------------------------------
+JsonDict = dict[str, Any]
 
 
 def _env_str(name: str, default: str = "") -> str:
@@ -106,16 +180,18 @@ def _env_str(name: str, default: str = "") -> str:
 
 def _env_int(name: str, default: int) -> int:
     try:
-        return int(_env_str(name, str(default)) or str(default))
+        v = _env_str(name, str(default))
+        return int(v) if v else int(default)
     except Exception:
-        return default
+        return int(default)
 
 
 def _env_float(name: str, default: float) -> float:
     try:
-        return float(_env_str(name, str(default)) or str(default))
+        v = _env_str(name, str(default))
+        return float(v) if v else float(default)
     except Exception:
-        return default
+        return float(default)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -153,17 +229,14 @@ SPL_TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
 _UA = {"user-agent": "pnlsniper/1.0 (+txlearn)"}
-
-log = get_logger()
-
 _BASE58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
 
-def _jitter(t: float, frac: float = 0.25) -> float:
-    if t <= 0:
+def _jitter(seconds: float, frac: float = 0.25) -> float:
+    if seconds <= 0:
         return 0.0
-    d = t * frac
-    return max(0.0, t + random.uniform(-d, d))
+    d = seconds * frac
+    return max(0.0, seconds + random.uniform(-d, d))
 
 
 def _is_likely_pubkey(s: str) -> bool:
@@ -181,11 +254,9 @@ def _is_probably_pump_id(s: str) -> bool:
     return s.endswith("pump") and len(s) >= 36
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Tiny TTL cache
-# ──────────────────────────────────────────────────────────────────────────────
-
-
+# -----------------------------------------------------------------------------
+# Tiny TTL cache (generic, mypy-friendly)
+# -----------------------------------------------------------------------------
 class _TTLCache:
     __slots__ = ("_m", "_ttl")
 
@@ -193,37 +264,33 @@ class _TTLCache:
         self._ttl = float(ttl_sec)
         self._m: dict[str, tuple[float, Any]] = {}
 
-    def get(self, k: str) -> Any | None:
+    def get(self, key: str) -> Any | None:
         if self._ttl <= 0:
             return None
         now = time.time()
-        rec = self._m.get(k)
+        rec = self._m.get(key)
         if not rec:
             return None
         exp, val = rec
         if exp < now:
-            self._m.pop(k, None)
+            self._m.pop(key, None)
             return None
         return val
 
-    def set(self, k: str, v: Any) -> None:
+    def set(self, key: str, val: Any) -> None:
         if self._ttl <= 0:
             return
-        self._m[k] = (time.time() + self._ttl, v)
+        self._m[key] = (time.time() + self._ttl, val)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Minimal JSON-RPC client (budget-aware + TTL caches)
-# ──────────────────────────────────────────────────────────────────────────────
-
-
+# -----------------------------------------------------------------------------
 class _SoftBudgetBlock(Exception):
     """Internal: budget asked us to skip a call this tick."""
 
-    pass
 
-
-@dataclass
+@dataclass(frozen=True)
 class _RpcOptions:
     timeout_total: float = 20.0
     timeout_connect: float = 7.0
@@ -253,7 +320,7 @@ class _Rpc:
     def present(self) -> bool:
         return bool(self.url)
 
-    async def _ensure(self) -> aiohttp.ClientSession:
+    async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(
                 total=self._opts.timeout_total, connect=self._opts.timeout_connect
@@ -265,17 +332,23 @@ class _Rpc:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def _call_raw(self, method: str, params: list, *, weight: int = 1) -> Any:
+    async def _call_raw(self, method: str, params: list[Any], *, weight: int = 1) -> Any:
         if not self.present:
             raise RuntimeError("RPC URL not set")
 
         if not budget.before_rpc(method, weight=weight):
             raise _SoftBudgetBlock()
 
-        session = await self._ensure()
+        session = await self._ensure_session()
         self._req_id += 1
-        payload = {"jsonrpc": "2.0", "id": self._req_id, "method": method, "params": params}
+        payload: JsonDict = {
+            "jsonrpc": "2.0",
+            "id": self._req_id,
+            "method": method,
+            "params": params,
+        }
 
+        data: Any = None
         try:
             async with session.post(self.url, json=payload) as resp:
                 txt = await resp.text()
@@ -284,7 +357,6 @@ class _Rpc:
                 try:
                     data = await resp.json(content_type=None)
                 except Exception as err:
-                    # B904: explicit chaining distinguishes parse failure vs except-clause error
                     raise RuntimeError(f"json parse error: {txt[:240]}") from err
         finally:
             budget.after_rpc(method, weight=weight)
@@ -293,19 +365,15 @@ class _Rpc:
             raise RuntimeError(str(data["error"]))
         return data.get("result") if isinstance(data, dict) else None
 
-    # Convenience wrappers (all return None/[] on soft block or failures)
-
-    async def get_signature_status(self, sig: str) -> dict | None:
+    async def get_signature_status(self, sig: str) -> JsonDict | None:
         now = time.time()
 
-        # Status poll floor:
         if (now - self._last_status_call_ts) < STATUS_POLL_SEC:
             cached = self._status_cache.get(sig)
-            if cached is not None:
-                return cached
+            return cached if isinstance(cached, dict) else None
 
         cached = self._status_cache.get(sig)
-        if cached is not None:
+        if isinstance(cached, dict):
             return cached
 
         self._last_status_call_ts = now
@@ -316,23 +384,27 @@ class _Rpc:
                 [[sig], {"searchTransactionHistory": True}],
                 weight=1,
             )
-            arr = (res or {}).get("value") or []
-            out = arr[0] if arr else None
-            if out is not None:
+            if not isinstance(res, dict):
+                return None
+            val = res.get("value")
+            if not isinstance(val, list) or not val:
+                return None
+            out = val[0]
+            if isinstance(out, dict):
                 self._status_cache.set(sig, out)
-            return out
+                return out
+            return None
         except _SoftBudgetBlock:
             return None
         except Exception:
             return None
 
-    async def get_transaction(self, sig: str, commitment: str) -> dict | None:
+    async def get_transaction(self, sig: str, commitment: str) -> JsonDict | None:
         cached = self._tx_cache.get(sig)
-        if cached is not None:
+        if isinstance(cached, dict):
             return cached
 
-        # Try a few compatible option sets
-        attempts = [
+        attempts: list[JsonDict] = [
             {
                 "commitment": commitment,
                 "encoding": "jsonParsed",
@@ -344,72 +416,74 @@ class _Rpc:
         for i, cfg in enumerate(attempts, start=1):
             try:
                 res = await self._call_raw("getTransaction", [sig, cfg], weight=2)
-                if res:
+                if isinstance(res, dict) and res:
                     self._tx_cache.set(sig, res)
                     return res
             except _SoftBudgetBlock:
                 return None
             except Exception:
-                # tiny backoff between encodings
                 if i < len(attempts):
                     await asyncio.sleep(0.2)
-
         return None
 
-    async def get_account_info(self, addr: str) -> dict | None:
+    async def get_account_info(self, addr: str) -> JsonDict | None:
         try:
-            return await self._call_raw(
+            res = await self._call_raw(
                 "getAccountInfo", [addr, {"encoding": "jsonParsed"}], weight=1
             )
+            return res if isinstance(res, dict) else None
         except _SoftBudgetBlock:
             return None
         except Exception:
             return None
 
-    async def get_multiple_accounts(self, addrs: list[str]) -> dict | None:
+    async def get_multiple_accounts(self, addrs: list[str]) -> JsonDict | None:
         if not addrs:
             return None
         try:
-            return await self._call_raw(
+            res = await self._call_raw(
                 "getMultipleAccounts",
                 [addrs, {"encoding": "jsonParsed", "commitment": TX_COMMITMENT}],
                 weight=2,
             )
+            return res if isinstance(res, dict) else None
         except _SoftBudgetBlock:
             return None
         except Exception:
             return None
 
-    async def get_token_accounts_by_owner_mint(self, owner: str, mint: str) -> list[dict]:
+    async def get_token_accounts_by_owner_mint(self, owner: str, mint: str) -> list[JsonDict]:
         try:
             res = await self._call_raw(
                 "getTokenAccountsByOwner",
                 [owner, {"mint": mint}, {"encoding": "jsonParsed", "commitment": TX_COMMITMENT}],
                 weight=2,
             )
-            return (res or {}).get("value") or []
+            if not isinstance(res, dict):
+                return []
+            val = res.get("value")
+            return val if isinstance(val, list) else []
         except _SoftBudgetBlock:
             return []
         except Exception:
             return []
 
-    async def get_balance(self, owner: str) -> dict | None:
+    async def get_balance(self, owner: str) -> JsonDict | None:
         try:
-            return await self._call_raw(
+            res = await self._call_raw(
                 "getBalance", [owner, {"commitment": TX_COMMITMENT}], weight=1
             )
+            return res if isinstance(res, dict) else None
         except _SoftBudgetBlock:
             return None
         except Exception:
             return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Token helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def _extract_ui_amount_from_acc(acc: dict) -> tuple[int, int, float]:
+# -----------------------------------------------------------------------------
+def _extract_ui_amount_from_acc(acc: JsonDict) -> tuple[int, int, float]:
     """
     Returns (raw, decimals, ui) from getTokenAccountsByOwner parsed account item.
     """
@@ -420,17 +494,19 @@ def _extract_ui_amount_from_acc(acc: dict) -> tuple[int, int, float]:
         dec = int(amt.get("decimals", 0) or 0)
         ui_val = amt.get("uiAmount")
         if ui_val is None:
-            # uiAmountString is sometimes present
             ui_str = amt.get("uiAmountString")
-            ui = float(ui_str) if ui_str is not None else raw / 10**dec if dec else float(raw)
+            if ui_str is not None:
+                ui = float(ui_str)
+            else:
+                ui = raw / (10**dec) if dec else float(raw)
         else:
             ui = float(ui_val)
-        return raw, dec, ui
+        return raw, dec, float(ui)
     except Exception:
         return 0, 0, 0.0
 
 
-def _pick_best_owner_ata(accounts: list[dict]) -> tuple[str | None, int, int, float]:
+def _pick_best_owner_ata(accounts: list[JsonDict]) -> tuple[str | None, int, int, float]:
     best_pub: str | None = None
     best_raw = 0
     best_dec = 0
@@ -439,7 +515,8 @@ def _pick_best_owner_ata(accounts: list[dict]) -> tuple[str | None, int, int, fl
         pub = a.get("pubkey")
         raw, dec, ui = _extract_ui_amount_from_acc(a)
         if ui > best_ui:
-            best_pub, best_raw, best_dec, best_ui = pub, raw, dec, ui
+            best_pub = str(pub) if pub is not None else None
+            best_raw, best_dec, best_ui = raw, dec, ui
     return best_pub, best_raw, best_dec, best_ui
 
 
@@ -457,7 +534,7 @@ async def _mint_program_owner(rpc: _Rpc, mint: str) -> str:
     try:
         owner = ((info or {}).get("value") or {}).get("owner")
         if owner in (SPL_TOKEN, TOKEN_2022):
-            return owner
+            return str(owner)
     except Exception:
         pass
     return SPL_TOKEN
@@ -466,39 +543,33 @@ async def _mint_program_owner(rpc: _Rpc, mint: str) -> str:
 async def _is_valid_mint_account(rpc: _Rpc, addr: str) -> bool:
     if not _is_likely_pubkey(addr):
         return False
-
     info = await rpc.get_account_info(addr)
     try:
         val = (info or {}).get("value")
         if not val:
             return False
         data = val.get("data")
-        # jsonParsed mint returns {"parsed": {"type": "mint", ...}, "program": "...", ...}
         if isinstance(data, dict):
             parsed = data.get("parsed") or {}
-            if parsed.get("type") == "mint":
+            if isinstance(parsed, dict) and parsed.get("type") == "mint":
                 return True
-        # Some RPCs may not parse; accept if owner matches known token programs
         owner = val.get("owner")
-        if owner in (SPL_TOKEN, TOKEN_2022):
-            return True
+        return owner in (SPL_TOKEN, TOKEN_2022)
     except Exception:
         return False
 
-    return False
 
-
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Mint inference
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def _ui_amount_int(bal: dict) -> int:
+# -----------------------------------------------------------------------------
+def _ui_amount_int(bal: JsonDict) -> int:
     """
     Robustly coerce uiTokenAmount.amount (string integer) into int.
     """
     try:
         ui = (bal or {}).get("uiTokenAmount") or {}
+        if not isinstance(ui, dict):
+            return 0
         amt = ui.get("amount", "0")
         return int(str(amt))
     except Exception:
@@ -525,29 +596,29 @@ async def _infer_mint_from_rpc_tx(
 
         meta = (tx or {}).get("meta") or {}
         post = meta.get("postTokenBalances") or []
-        if not post:
+        if not isinstance(post, list) or not post:
             continue
 
-        # owner-preferred
         best_owner: tuple[str, int] | None = None
         best_any: tuple[str, int] | None = None
 
         for b in post:
-            try:
-                m = (b or {}).get("mint")
-                if not _is_likely_pubkey(m or ""):
-                    continue
-                amt = _ui_amount_int(b)
-                if amt <= 0:
-                    continue
-                who = (b or {}).get("owner")
-                if owner and who == owner:
-                    if best_owner is None or amt > best_owner[1]:
-                        best_owner = (m, amt)
-                if best_any is None or amt > best_any[1]:
-                    best_any = (m, amt)
-            except Exception:
+            if not isinstance(b, dict):
                 continue
+            m = b.get("mint")
+            m_str = str(m) if m is not None else ""
+            if not _is_likely_pubkey(m_str):
+                continue
+            amt = _ui_amount_int(b)
+            if amt <= 0:
+                continue
+            who = b.get("owner")
+            who_str = str(who) if who is not None else ""
+            if owner and who_str == owner:
+                if best_owner is None or amt > best_owner[1]:
+                    best_owner = (m_str, amt)
+            if best_any is None or amt > best_any[1]:
+                best_any = (m_str, amt)
 
         if best_owner:
             return best_owner[0]
@@ -574,6 +645,7 @@ async def _hel_parse_for_mint(
     if not budget.before_rpc("helius_parse", weight=2):
         return None
 
+    data: Any = None
     try:
         async with session.post(
             HELIUS_PARSE_URL, json={"transactions": [sig]}, headers=_UA
@@ -589,55 +661,64 @@ async def _hel_parse_for_mint(
     if not isinstance(data, list) or not data:
         return None
 
-    tx = data[0] or {}
+    tx = data[0] if isinstance(data[0], dict) else {}
     tbc = tx.get("tokenBalanceChanges") or []
+    if not isinstance(tbc, list):
+        tbc = []
 
     best_owner: tuple[str, float] | None = None
     best_any: tuple[str, float] | None = None
 
     for change in tbc:
-        try:
-            mint = (change or {}).get("mint")
-            if not _is_likely_pubkey(mint or ""):
-                continue
+        if not isinstance(change, dict):
+            continue
+        mint = change.get("mint")
+        mint_str = str(mint) if mint is not None else ""
+        if not _is_likely_pubkey(mint_str):
+            continue
 
-            # Helius provides both tokenAmount and rawTokenAmount structures; normalize to ui float
-            ui = None
+        ui: float | None = None
+        try:
             if "tokenAmount" in change and change["tokenAmount"] is not None:
                 ui = float(change["tokenAmount"])
             else:
-                raw_amt = float(
-                    ((change or {}).get("rawTokenAmount") or {}).get("tokenAmount", 0) or 0
-                )
-                dec = int(((change or {}).get("rawTokenAmount") or {}).get("decimals", 0) or 0)
+                raw_struct = change.get("rawTokenAmount") or {}
+                if not isinstance(raw_struct, dict):
+                    raw_struct = {}
+                raw_amt = float(raw_struct.get("tokenAmount", 0) or 0)
+                dec = int(raw_struct.get("decimals", 0) or 0)
                 ui = raw_amt / (10**dec) if dec else raw_amt
-
-            if ui is None or ui <= 0:
-                continue
-
-            who = (change or {}).get("userAccount") or (change or {}).get("owner")
-            if owner and who == owner and (best_owner is None or ui > best_owner[1]):
-                best_owner = (mint, ui)
-            if best_any is None or ui > best_any[1]:
-                best_any = (mint, ui)
         except Exception:
+            ui = None
+
+        if ui is None or ui <= 0:
             continue
+
+        who = change.get("userAccount") or change.get("owner")
+        who_str = str(who) if who is not None else ""
+        if owner and who_str == owner and (best_owner is None or ui > best_owner[1]):
+            best_owner = (mint_str, ui)
+        if best_any is None or ui > best_any[1]:
+            best_any = (mint_str, ui)
 
     if best_owner:
         return best_owner[0]
     if best_any:
         return best_any[0]
 
-    # Fallback: scan events for mint-ish keys
     events = tx.get("events") or {}
+    if not isinstance(events, dict):
+        return None
+
     for v in events.values():
         seq = v if isinstance(v, list) else [v]
         for ev in seq:
             if not isinstance(ev, dict):
                 continue
             m = ev.get("mint") or ev.get("mintAddress") or ev.get("token")
-            if _is_likely_pubkey(str(m or "")):
-                return str(m)
+            m_str = str(m) if m is not None else ""
+            if _is_likely_pubkey(m_str):
+                return m_str
 
     return None
 
@@ -649,7 +730,7 @@ async def _maybe_await(x: Any) -> Any:
 
 
 async def resolve_mint_best_effort(
-    tx_rpcs: list[_Rpc] | tuple[_Rpc, ...],
+    tx_rpcs: Sequence[_Rpc],
     rpc_general: _Rpc,
     raw_id_or_mint: str,
     *,
@@ -666,27 +747,30 @@ async def resolve_mint_best_effort(
       4) Direct validation if `raw` already looks like a mint
     """
     raw = (raw_id_or_mint or "").strip()
-    owner = (owner or "").strip() or None
+    owner_norm = (owner or "").strip() or None
 
     # 1) Helius Parse API
     if signature and HELIUS_API_KEY:
         try:
-            # Prefer reusing an existing rpc session if available
             session: aiohttp.ClientSession | None = None
             created = False
+
+            # Reuse an existing RPC session if possible (best-effort)
             for r in tx_rpcs:
                 try:
                     if r.present:
-                        session = await r._ensure()  # reuse headers/timeout
+                        session = await r._ensure_session()
                         break
                 except Exception:
                     session = None
+
             if session is None:
                 timeout = aiohttp.ClientTimeout(total=20, connect=7)
                 session = aiohttp.ClientSession(timeout=timeout, headers=_UA)
                 created = True
+
             try:
-                m = await _hel_parse_for_mint(session, signature, owner)
+                m = await _hel_parse_for_mint(session, signature, owner_norm)
                 if m:
                     return m
             finally:
@@ -699,10 +783,7 @@ async def resolve_mint_best_effort(
     if signature:
         try:
             m = await _infer_mint_from_rpc_tx(
-                [r for r in tx_rpcs if r.present],
-                signature,
-                owner,
-                commitment=TX_COMMITMENT,
+                tx_rpcs, signature, owner_norm, commitment=TX_COMMITMENT
             )
             if m:
                 return m
@@ -711,32 +792,37 @@ async def resolve_mint_best_effort(
 
     # 3) Pump resolvers
     if _is_probably_pump_id(raw):
+        _rtm: Any | None = None
+        _rtm_pid: Any | None = None
         try:
             from utils_pkg.pump_trader import (  # type: ignore
-                resolve_true_mint as _rtm,
-                resolve_true_mint_from_pump_id as _rtm_pid,
+                resolve_true_mint as _rtm_import,
+                resolve_true_mint_from_pump_id as _rtm_pid_import,
             )
-        except Exception:
-            _rtm = None  # type: ignore
-            _rtm_pid = None  # type: ignore
 
-        if signature and _rtm:
+            _rtm = _rtm_import
+            _rtm_pid = _rtm_pid_import
+        except Exception:
+            _rtm = None
+            _rtm_pid = None
+
+        if signature and _rtm is not None:
             try:
                 m = await _maybe_await(_rtm(raw, signature=signature))
                 if m:
-                    return m
+                    return str(m)
             except Exception:
                 pass
 
-        if _rtm_pid:
+        if _rtm_pid is not None:
             try:
                 m = await _maybe_await(_rtm_pid(raw))
                 if m:
-                    return m
+                    return str(m)
             except Exception:
                 pass
 
-    # 4) Direct mint
+    # 4) Direct mint validate
     if _is_likely_pubkey(raw):
         try:
             if await _is_valid_mint_account(rpc_general, raw):
@@ -747,11 +833,29 @@ async def resolve_mint_best_effort(
     return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Result contract
+# -----------------------------------------------------------------------------
+class TxLearnResult(TypedDict):
+    mint: str | None
+    token_program: str | None
+    owner: str | None
+    owner_ata: str | None
+    qty_raw: int
+    qty_ui: float
+    decimals: int
+    sig: str
+    block_time: int | None
+    status: JsonDict | None
+    transaction: JsonDict | None
+    tx_found: bool
+    attempts: int
+    elapsed_ms: int
+
+
+# -----------------------------------------------------------------------------
 # Learner
-# ──────────────────────────────────────────────────────────────────────────────
-
-
+# -----------------------------------------------------------------------------
 class TxLearner:
     """
     Learns position details after a buy.
@@ -777,10 +881,9 @@ class TxLearner:
         self.tx_helius = _Rpc(HELIUS_RPC_URL) if HELIUS_RPC_URL else _Rpc("")
         self.rpc = _Rpc(rpc_url_general)
 
-        self.owner = (owner or _env_str("PF_PP_ACCOUNT")).strip() or ""
+        self.owner = (owner or _env_str("PF_PP_ACCOUNT")).strip()
         self.commitment = (commitment or TX_COMMITMENT).strip().lower() or "processed"
         self.tries = max(1, int(tries))
-        # never tighter than status poll floor
         self.delay = max(STATUS_POLL_SEC, float(delay_sec))
         self.warmup = max(0.0, float(warmup_sec))
 
@@ -789,7 +892,7 @@ class TxLearner:
         await self.tx_helius.close()
         await self.rpc.close()
 
-    async def resolve_then_learn(self, raw_id_or_mint: str, tx_sig: str) -> dict[str, Any]:
+    async def resolve_then_learn(self, raw_id_or_mint: str, tx_sig: str) -> TxLearnResult:
         """
         Preferred when you have a pump id or uncertain mint.
         """
@@ -798,8 +901,10 @@ class TxLearner:
             await asyncio.sleep(self.warmup)
 
         resolved: str | None = None
+        last_attempt = 0
 
         for attempt in range(1, RESOLVE_TRIES + 1):
+            last_attempt = attempt
             resolved = await resolve_mint_best_effort(
                 (self.tx_primary, self.tx_helius),
                 self.rpc,
@@ -819,18 +924,22 @@ class TxLearner:
             return await self._learn_tx_only(tx_sig, attempts=RESOLVE_TRIES, t0=t0)
 
         log.event(
-            "TXLEARN_RESOLVED_MINT", raw=raw_id_or_mint, mint=resolved, sig=tx_sig, attempts=attempt
+            "TXLEARN_RESOLVED_MINT",
+            raw=raw_id_or_mint,
+            mint=resolved,
+            sig=tx_sig,
+            attempts=last_attempt,
         )
         return await self.learn(resolved, tx_sig, t0=t0)
 
     async def learn(
         self, mint_or_id: str, tx_sig: str, *, t0: float | None = None
-    ) -> dict[str, Any]:
+    ) -> TxLearnResult:
         """
         Learn with known/validated mint. If it doesn't look like a mint, it will
         attempt one quick best-effort resolve pass.
         """
-        t0 = t0 or time.time()
+        start = t0 or time.time()
         original = (mint_or_id or "").strip()
 
         mint = original
@@ -847,22 +956,22 @@ class TxLearner:
 
         if not _is_likely_pubkey(mint):
             log.event("TXLEARN_UNRESOLVED_ID_TXONLY", raw=original, sig=tx_sig)
-            return await self._learn_tx_only(tx_sig, t0=t0)
+            return await self._learn_tx_only(tx_sig, t0=start)
 
-        # Validate mint (best-effort). If mint not ready yet, fall back to tx-only.
+        ok_mint = False
         try:
             ok_mint = await _is_valid_mint_account(self.rpc, mint)
         except Exception:
             ok_mint = False
         if not ok_mint:
             log.event("TXLEARN_MINT_NOT_READY", mint=mint, sig=tx_sig)
-            return await self._learn_tx_only(tx_sig, t0=t0)
+            return await self._learn_tx_only(tx_sig, t0=start)
 
         token_program = await _mint_program_owner(self.rpc, mint)
 
-        last_tx: dict | None = None
-        last_status: dict | None = None
-        last_owner_ui: float = 0.0
+        last_tx: JsonDict | None = None
+        last_status: JsonDict | None = None
+        last_owner_ui = 0.0
         attempt = 0
 
         if DEBUG:
@@ -889,7 +998,7 @@ class TxLearner:
                     "TXLEARN_TX_ERROR", mint=mint, sig=tx_sig, err=str(last_status.get("err"))
                 )
                 return self._result(
-                    t0=t0,
+                    t0=start,
                     tx_found=False,
                     sig=tx_sig,
                     mint=mint,
@@ -938,15 +1047,16 @@ class TxLearner:
             accounts = await self.rpc.get_token_accounts_by_owner_mint(self.owner, mint)
             owner_ata, qty_raw, decimals, qty_ui = _pick_best_owner_ata(accounts)
 
-        block_time = None
-        try:
-            if last_tx and "blockTime" in last_tx:
-                block_time = last_tx["blockTime"]
-        except Exception:
-            block_time = None
+        block_time: int | None = None
+        if last_tx and "blockTime" in last_tx:
+            try:
+                bt = last_tx.get("blockTime")
+                block_time = int(bt) if bt is not None else None
+            except Exception:
+                block_time = None
 
         result = self._result(
-            t0=t0,
+            t0=start,
             tx_found=bool(last_tx),
             sig=tx_sig,
             mint=mint,
@@ -971,20 +1081,20 @@ class TxLearner:
             decimals=decimals,
             tx_found=bool(last_tx),
             attempts=attempt,
-            ms=int((time.time() - t0) * 1000),
+            ms=int((time.time() - start) * 1000),
         )
-        bump("txlearn_done")
+        _bump("txlearn_done")
         return result
 
     async def _learn_tx_only(
         self, tx_sig: str, attempts: int = 0, *, t0: float | None = None
-    ) -> dict[str, Any]:
+    ) -> TxLearnResult:
         """
         Transaction-only visibility when mint can't be resolved/validated.
         """
-        t0 = t0 or time.time()
-        last_tx: dict | None = None
-        last_status: dict | None = None
+        start = t0 or time.time()
+        last_tx: JsonDict | None = None
+        last_status: JsonDict | None = None
 
         max_tries = min(5, self.tries)
         for i in range(1, max_tries + 1):
@@ -1021,10 +1131,11 @@ class TxLearner:
             sig=tx_sig,
             tx_found=bool(last_tx),
             attempts=attempts + min(max_tries, self.tries),
-            ms=int((time.time() - t0) * 1000),
+            ms=int((time.time() - start) * 1000),
         )
+
         return self._result(
-            t0=t0,
+            t0=start,
             tx_found=bool(last_tx),
             sig=tx_sig,
             mint=None,
@@ -1047,15 +1158,15 @@ class TxLearner:
         sig: str,
         mint: str | None,
         token_program: str | None,
-        status: dict | None,
-        tx: dict | None,
+        status: JsonDict | None,
+        tx: JsonDict | None,
         owner_ata: str | None,
         qty_raw: int,
         qty_ui: float,
         decimals: int,
         attempts: int,
         block_time: int | None,
-    ) -> dict[str, Any]:
+    ) -> TxLearnResult:
         return {
             "mint": mint,
             "token_program": token_program,
@@ -1074,11 +1185,9 @@ class TxLearner:
         }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Top-level helpers (stable public API)
-# ──────────────────────────────────────────────────────────────────────────────
-
-
+# -----------------------------------------------------------------------------
 async def learn_position(
     mint: str,
     tx_sig: str,
@@ -1086,7 +1195,7 @@ async def learn_position(
     owner: str | None = None,
     rpc_url_tx: str = TX_RPC_URL,
     rpc_url_general: str = RPC_URL,
-) -> dict[str, Any]:
+) -> TxLearnResult:
     """
     Use when you already know the real mint.
     """
@@ -1104,7 +1213,7 @@ async def resolve_then_learn_position(
     owner: str | None = None,
     rpc_url_tx: str = TX_RPC_URL,
     rpc_url_general: str = RPC_URL,
-) -> dict[str, Any]:
+) -> TxLearnResult:
     """
     Preferred when you have a pump id or uncertain mint.
     """

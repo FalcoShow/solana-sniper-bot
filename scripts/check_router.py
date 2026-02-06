@@ -10,10 +10,12 @@ Repo-clean contract (LOCKED)
 - When --json-only (or CHECK_ROUTER_JSON_ONLY=1): emit ONLY JSON to stdout.
 - Never return rc=2/3/etc (those break repo-clean preflight).
 
-Key upgrades vs v3
-------------------
-- Preflight-safe: auto total timeout under PREFLIGHT=1 if unset/0.
+Key upgrades (hang-proof)
+-------------------------
+- Deterministic exit: sync calls run in DAEMON threads (cannot keep process alive).
+- Optional hard-exit failsafe: --hard-exit or CHECK_ROUTER_HARD_EXIT=1
 - Deadline-aware: every call clamps to time remaining.
+- Preflight-safe: auto total timeout under PREFLIGHT=1 if unset/0.
 - Variant explosion control: minimal set by default; use --debug or CHECK_ROUTER_EXHAUSTIVE=1.
 - Strict-auth relaxation (precheck only): may set ROUTER_STRICT_AUTH=0 when no valid JUP key.
 - Quote-only: no swaps/tx signing/sending.
@@ -33,6 +35,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 from collections.abc import Sequence
@@ -103,7 +106,7 @@ def _load_dotenv_best_effort(repo_root: str) -> None:
     - Skips on Render by default
     """
     try:
-        if os.getenv("RENDER", "").strip() in _TRUE:
+        if os.getenv("RENDER", "").strip().lower() in _TRUE:
             return
         if os.getenv("CHECK_ROUTER_LOAD_DOTENV", "1").strip().lower() in _FALSE:
             return
@@ -133,13 +136,12 @@ def _load_dotenv_best_effort(repo_root: str) -> None:
             if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
                 v = v[1:-1]
 
-            # remove trailing inline comment only if it's clearly separated
+            # remove trailing inline comment only if clearly separated
             if " #" in v:
                 v = v.split(" #", 1)[0].rstrip()
 
             os.environ[k] = v
     except Exception:
-        # best effort only — never crash precheck because of dotenv parsing
         return
 
 
@@ -459,7 +461,7 @@ class TraceEvent:
 
 
 # =============================================================================
-# Signature-drift tolerant calling (SYNC safe)
+# Signature-drift tolerant calling + hang-proof sync execution
 # =============================================================================
 def _signature_params(fn: Any) -> list[str]:
     try:
@@ -533,13 +535,46 @@ def _build_kwargs_from_signature(
     return out
 
 
+async def _run_sync_daemon(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """
+    Run a sync callable in a DAEMON thread and return its result.
+
+    Key property:
+    - daemon threads can never keep the process alive
+    - safe with wait_for() timeouts (won't crash if future already cancelled)
+    """
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Any] = loop.create_future()
+
+    def _set_result_safe(res: Any) -> None:
+        if fut.cancelled() or fut.done():
+            return
+        fut.set_result(res)
+
+    def _set_exc_safe(exc: BaseException) -> None:
+        if fut.cancelled() or fut.done():
+            return
+        fut.set_exception(exc)
+
+    def _worker() -> None:
+        try:
+            res = fn(*args, **kwargs)
+            if inspect.isawaitable(res):
+                # Handle "sync" function returning an awaitable (rare).
+                res = asyncio.run(res)
+            loop.call_soon_threadsafe(_set_result_safe, res)
+        except BaseException as e:  # noqa: BLE001
+            loop.call_soon_threadsafe(_set_exc_safe, e)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    return await fut
+
+
 async def _invoke(fn: Any, *args: Any, **kwargs: Any) -> Any:
     if inspect.iscoroutinefunction(fn):
         return await fn(*args, **kwargs)
-    res = await asyncio.to_thread(fn, *args, **kwargs)
-    if inspect.isawaitable(res):
-        return await res
-    return res
+    return await _run_sync_daemon(fn, *args, **kwargs)
 
 
 @dataclass
@@ -848,9 +883,7 @@ async def _resolve_router_target(
             t_call = deadline.clamp(timeout_s)
             if t_call <= 0:
                 return router_mod, "module"
-            obj = await asyncio.wait_for(
-                asyncio.to_thread(RouterCls), timeout=max(0.5, float(t_call))
-            )
+            obj = await asyncio.wait_for(_invoke(RouterCls), timeout=max(0.5, float(t_call)))
             return obj, "Router()"
         except Exception as e:
             if debug:
@@ -919,12 +952,38 @@ async def _get_decimals_any(
     json_only: bool,
     trace: list[TraceEvent] | None,
 ) -> tuple[int | None, str]:
+    """
+    Decimals lookup (deadline-safe).
+
+    Fixes:
+    - Uses a SMALL dedicated decimals timeout budget (default 2.5s)
+    - Under PREFLIGHT, disables RPC-based decimals fallback unless explicitly enabled
+      (prevents consuming the whole total-timeout and causing deadline_exceeded).
+    - Adds static known decimals for SOL/USDC.
+    """
+    mint_s = (mint or "").strip()
+
+    # Small, dedicated budget for decimals so it can't starve the quote step.
+    dec_timeout_s = min(float(timeout_s), float(_envf("CHECK_ROUTER_DECIMALS_TIMEOUT_S", 2.5)))
+
+    # Under PREFLIGHT, default to NOT doing RPC fallback unless explicitly enabled.
+    allow_rpc_default = not _envb("PREFLIGHT", False)
+    allow_rpc = _envb("CHECK_ROUTER_ALLOW_RPC_DECIMALS", allow_rpc_default)
+
+    # Static known decimals for canonical mints.
+    sol_m, usdc_m = _canonical_mints()
+    if mint_s == sol_m:
+        return 9, "static_sol"
+    if mint_s == usdc_m:
+        return 6, "static_usdc"
+
+    # 1) target methods
     hit = await _try_call(
         "target",
         target,
         ("get_decimals", "mint_decimals", "decimals", "fetch_decimals"),
-        variants=[((mint,), {}), ((), {"mint": mint})],
-        timeout_s=timeout_s,
+        variants=[((mint_s,), {}), ((), {"mint": mint_s})],
+        timeout_s=dec_timeout_s,
         deadline=deadline,
         debug=debug,
         json_only=json_only,
@@ -935,12 +994,13 @@ async def _get_decimals_any(
         if 0 < d <= 18:
             return d, f"target.{hit.used}"
 
+    # 2) module methods
     hit2 = await _try_call(
         "module",
         router_mod,
         ("get_decimals", "mint_decimals", "decimals", "fetch_decimals"),
-        variants=[((mint,), {}), ((), {"mint": mint})],
-        timeout_s=timeout_s,
+        variants=[((mint_s,), {}), ((), {"mint": mint_s})],
+        timeout_s=dec_timeout_s,
         deadline=deadline,
         debug=debug,
         json_only=json_only,
@@ -951,23 +1011,28 @@ async def _get_decimals_any(
         if 0 < d <= 18:
             return d, f"module.{hit2.used}"
 
-    with contextlib.suppress(Exception):
-        from utils_pkg import solana_token as st  # type: ignore
+    # 3) RPC fallback (DISABLED by default under PREFLIGHT)
+    if allow_rpc and not deadline.expired():
+        with contextlib.suppress(Exception):
+            from utils_pkg import solana_token as st  # type: ignore
 
-        for fn_name in ("get_token_decimals", "token_decimals", "get_decimals"):
-            fn = getattr(st, fn_name, None)
-            if callable(fn):
+            for fn_name in ("get_token_decimals", "token_decimals", "get_decimals"):
+                fn = getattr(st, fn_name, None)
+                if not callable(fn):
+                    continue
+
+                t_call = deadline.clamp(dec_timeout_s)
+                if t_call <= 0:
+                    break
+
                 try:
-                    t_call = deadline.clamp(timeout_s)
-                    if t_call <= 0:
-                        break
                     try:
                         val = await asyncio.wait_for(
-                            _invoke(fn, mint, default=None), timeout=max(0.5, float(t_call))
+                            _invoke(fn, mint_s, default=None), timeout=max(0.5, float(t_call))
                         )
                     except TypeError:
                         val = await asyncio.wait_for(
-                            _invoke(fn, mint), timeout=max(0.5, float(t_call))
+                            _invoke(fn, mint_s), timeout=max(0.5, float(t_call))
                         )
                 except Exception:
                     continue
@@ -977,6 +1042,7 @@ async def _get_decimals_any(
                     if 0 < d3 <= 18:
                         return d3, f"solana_token.{fn_name}"
 
+    # Return best error source
     err = hit.err if hit.err != "no_callable_found" else hit2.err
     return None, err
 
@@ -1001,7 +1067,6 @@ async def _get_buy_quote_any(
 ) -> tuple[dict[str, Any] | None, str, str]:
     lamports = _sol_to_lamports(amount_sol, sol_decimals=sol_decimals)
     sb = int(slippage_bps)
-
     exhaustive = _is_exhaustive(debug)
 
     variants_buy_min = [
@@ -1171,7 +1236,6 @@ async def _get_sell_quote_any(
 ) -> tuple[dict[str, Any] | None, str]:
     amt = int(max(1, int(amount_raw)))
     sb = int(slippage_bps)
-
     exhaustive = _is_exhaustive(debug)
 
     variants_sell_min = [
@@ -1314,8 +1378,9 @@ def _hintify(
         hints.append(
             "Router precheck failed. Use --debug or set CHECK_ROUTER_TRACE=1 to embed call trace in JSON."
         )
+
     out: list[str] = []
-    seen = set()
+    seen: set[str] = set()
     for h in hints:
         if h not in seen:
             seen.add(h)
@@ -1329,8 +1394,9 @@ def _hintify(
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="God-Tier Router quote-only precheck (Repo-clean FINAL v3.1)",
-        add_help=True,
+        add_help=False,
     )
+    ap.add_argument("-h", "--help", action="store_true", help="Show help and exit")
     ap.add_argument(
         "--module",
         default=_envs("CHECK_ROUTER_MODULE", "utils_pkg.router"),
@@ -1382,26 +1448,20 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--print-config", action="store_true", help="Print resolved config JSON and exit"
     )
+    ap.add_argument(
+        "--hard-exit",
+        action="store_true",
+        help="After printing final JSON, force os._exit(rc). Use for absolute determinism.",
+    )
     return ap
 
 
 def _parse_args_repo_clean(
     argv: list[str],
-) -> tuple[argparse.Namespace | None, list[str], str | None]:
-    """
-    Repo-clean parse:
-      - never let argparse exit(2) for unknown args
-      - returns (args, unknown, err_text)
-    """
+) -> tuple[argparse.Namespace, list[str]]:
     ap = _build_parser()
-    try:
-        args, unknown = ap.parse_known_args(argv)
-        return args, unknown, None
-    except SystemExit as e:
-        # argparse help/usage or errors. Map to repo-clean fatal, but preserve message if possible.
-        return None, [], f"argparse_systemexit:{e.code}"
-    except Exception as e:
-        return None, [], _short_exc(e)
+    args, unknown = ap.parse_known_args(argv)
+    return args, unknown
 
 
 def _list_callables(obj: Any) -> list[str]:
@@ -1434,6 +1494,7 @@ def _should_skip(args: argparse.Namespace) -> tuple[bool, str]:
         or args.json_only
         or args.list
         or args.print_config
+        or args.hard_exit
         or (args.module and args.module != "utils_pkg.router")
     )
 
@@ -1461,37 +1522,77 @@ def _auto_total_timeout_if_preflight(requested: float) -> float:
     return float(cap)
 
 
+def _hard_exit_enabled(args: argparse.Namespace) -> bool:
+    if args.hard_exit:
+        return True
+    if _envb("CHECK_ROUTER_HARD_EXIT", False):
+        return True
+    # Safe default under preflight unless explicitly disabled
+    if _envb("PREFLIGHT", False) and _envb("CHECK_ROUTER_HARD_EXIT_PREFLIGHT", True):
+        return True
+    return False
+
+
 async def _amain(argv: list[str]) -> int:
+    # Capture real stdout immediately (the JSON must go here).
+    real_stdout = sys.stdout
+    json_out = real_stdout
+
+    # EARLY redirect if CLI requested json-only, so any imported modules that bind to
+    # sys.stdout will bind to stderr instead (prevents stdout pollution).
+    if "--json-only" in argv:
+        sys.stdout = sys.stderr
+
     _load_dotenv_best_effort(_REPO_ROOT)
-    # -------------------------------------------------------------------------
+
     # JSON-only contract: if json_only, stdout must contain ONLY the final JSON.
-    # Everything else (human logs, library logs, router logs) must go to stderr.
-    # -------------------------------------------------------------------------
     env_json = _envb("CHECK_ROUTER_JSON", True)
     env_json_only = _envb("CHECK_ROUTER_JSON_ONLY", False)
 
-    # We may need json_mode/json_only even when parsing fails
-    json_only = bool(env_json_only or ("--json-only" in argv))
-    json_mode = bool(env_json or env_json_only or ("--json-only" in argv) or ("--json" in argv))
-
-    # Capture the real stdout BEFORE we redirect anything.
-    real_stdout = sys.stdout
-    if json_only:
-        # Force all incidental prints/logs from imports/runtime to stderr.
-        # The ONLY thing that may write to real stdout is our final JSON summary.
+    # Use this hint (fixes Ruff F841) and ensure redirect happens before router import.
+    json_only_hint = bool(env_json_only or ("--json-only" in argv))
+    if json_only_hint:
         sys.stdout = sys.stderr
 
-    # Always write JSON summaries to this handle (real stdout).
-    json_out = real_stdout
-
-    # Parse args (repo-clean: never exit(2); unknown args => JSON error + rc=1)
-    args, unknown, parse_err = _parse_args_repo_clean(argv)
-
-    debug = (
-        bool(args.debug)
-        if args is not None
-        else bool(_envb("CHECK_ROUTER_DEBUG", False) or _envb("ROUTER_DEBUG", False))
+    json_mode_hint = bool(
+        env_json or env_json_only or ("--json-only" in argv) or ("--json" in argv)
     )
+
+    # Parse args (repo-clean: unknown args => JSON error + rc=1)
+    try:
+        args, unknown = _parse_args_repo_clean(argv)
+    except Exception as e:
+        # Extremely rare; still repo-clean
+        summary = {
+            "ts": _ts(),
+            "ok": False,
+            "exit_code": RC_FATAL,
+            "repo_root": _sanitize_text(_REPO_ROOT),
+            "module": _sanitize_text(_envs("CHECK_ROUTER_MODULE", "utils_pkg.router")),
+            "errors": [f"cli_parse_failed:{_short_exc(e)}"],
+            "warnings": [],
+            "fix_hints": ["Check CLI flags. Use --help to see supported options."],
+            "elapsed_ms": 0,
+            "contract": {
+                "script": "scripts.check_router",
+                "version": "v3.1",
+                "exit_codes": {"ok": RC_OK, "fatal": RC_FATAL, "ctrl_c": RC_CTRL_C},
+            },
+        }
+        if json_mode_hint:
+            _safe_print(
+                json.dumps(_safe_jsonable(summary), ensure_ascii=False, default=str), file=json_out
+            )
+        return RC_FATAL
+
+    if args.help:
+        # Help should work normally even if json-only env is set.
+        _build_parser().print_help(file=real_stdout)
+        return RC_OK
+
+    json_only = bool(args.json_only or env_json_only)
+    json_mode = bool(args.json or args.json_only or env_json or env_json_only)
+    debug = bool(args.debug)
     strict = bool(args.strict) if args is not None else bool(_envb("CHECK_ROUTER_STRICT", False))
     require_price = (
         bool(args.require_price)
@@ -1501,7 +1602,11 @@ async def _amain(argv: list[str]) -> int:
     trace_on = bool(_envb("CHECK_ROUTER_TRACE", False) or debug)
     trace: list[TraceEvent] | None = [] if trace_on else None
 
-    # Base summary (always available for repo-clean error reporting)
+    # If json_only, redirect all incidental stdout to stderr.
+    if json_only:
+        sys.stdout = sys.stderr
+
+    # Base summary
     t0_ms = _now_ms()
     summary: dict[str, Any] = {
         "ts": _ts(),
@@ -1526,23 +1631,6 @@ async def _amain(argv: list[str]) -> int:
     if trace is not None:
         summary["trace"] = []
 
-    # Parse failed -> repo-clean fatal (rc=1), but still emit JSON if json_mode
-    if parse_err or args is None:
-        summary["errors"].append(f"cli_parse_failed:{_sanitize_text(parse_err)}")
-        summary["fix_hints"] = ["Check CLI flags. Use --help to see supported options."]
-        summary["elapsed_ms"] = _now_ms() - t0_ms
-        summary["exit_code"] = RC_FATAL
-        if trace is not None:
-            summary["trace"] = [t.as_dict() for t in trace][-250:]
-        if json_mode:
-            _safe_print(
-                json.dumps(_safe_jsonable(summary), ensure_ascii=False, default=str),
-                file=json_out,
-            )
-        else:
-            _hlog(f"FAIL parse args: {parse_err}", json_only=json_only)
-        return RC_FATAL
-
     # Unknown args -> repo-clean fatal (rc=1)
     if unknown:
         summary["errors"].append(f"unknown_args:{_sanitize_text(' '.join(unknown))}")
@@ -1555,20 +1643,9 @@ async def _amain(argv: list[str]) -> int:
             summary["trace"] = [t.as_dict() for t in trace][-250:]
         if json_mode:
             _safe_print(
-                json.dumps(_safe_jsonable(summary), ensure_ascii=False, default=str),
-                file=json_out,
+                json.dumps(_safe_jsonable(summary), ensure_ascii=False, default=str), file=json_out
             )
-        else:
-            _hlog(f"FAIL unknown args: {unknown}", json_only=json_only)
         return RC_FATAL
-
-    # Re-resolve json flags now that args parsed
-    json_only = bool(args.json_only or env_json_only)
-    json_mode = bool(args.json or args.json_only or env_json or env_json_only)
-
-    # If json_only becomes true here (rare), enforce redirection now.
-    if json_only and sys.stdout is not sys.stderr:
-        sys.stdout = sys.stderr
 
     timeout_s = max(3.0, float(args.timeout))
     total_timeout_s = _auto_total_timeout_if_preflight(float(args.total_timeout))
@@ -1593,8 +1670,7 @@ async def _amain(argv: list[str]) -> int:
         }
         if json_mode:
             _safe_print(
-                json.dumps(_safe_jsonable(out), ensure_ascii=False, default=str),
-                file=json_out,
+                json.dumps(_safe_jsonable(out), ensure_ascii=False, default=str), file=json_out
             )
         _hlog(f"SKIP ({reason})", json_only=json_only)
         return RC_OK
@@ -1678,8 +1754,7 @@ async def _amain(argv: list[str]) -> int:
             summary["trace"] = [t.as_dict() for t in trace][-250:]
         if json_mode:
             _safe_print(
-                json.dumps(_safe_jsonable(summary), ensure_ascii=False, default=str),
-                file=json_out,
+                json.dumps(_safe_jsonable(summary), ensure_ascii=False, default=str), file=json_out
             )
         else:
             _hlog(f"FAIL import {args.module} err={_short_exc(e)}", json_only=json_only)
@@ -1711,8 +1786,7 @@ async def _amain(argv: list[str]) -> int:
             summary["trace"] = [t.as_dict() for t in trace][-250:]
         if json_mode:
             _safe_print(
-                json.dumps(_safe_jsonable(summary), ensure_ascii=False, default=str),
-                file=json_out,
+                json.dumps(_safe_jsonable(summary), ensure_ascii=False, default=str), file=json_out
             )
         else:
             _hlog("LIST done", json_only=json_only)
@@ -1947,8 +2021,7 @@ async def _amain(argv: list[str]) -> int:
 
         if json_mode:
             _safe_print(
-                json.dumps(_safe_jsonable(summary), ensure_ascii=False, default=str),
-                file=json_out,
+                json.dumps(_safe_jsonable(summary), ensure_ascii=False, default=str), file=json_out
             )
         else:
             _hlog(
@@ -1963,17 +2036,58 @@ async def _amain(argv: list[str]) -> int:
     return int(rc)
 
 
+def _run_amain_no_asyncio_run(argv: list[str]) -> int:
+    """
+    Run _amain() without asyncio.run().
+
+    Why:
+    asyncio.run() waits up to ~300s for the default executor to join threads.
+    In preflight, we want deterministic exit immediately after printing JSON.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return int(loop.run_until_complete(_amain(argv)))
+    finally:
+        with contextlib.suppress(Exception):
+            loop.stop()
+        with contextlib.suppress(Exception):
+            loop.close()
+        with contextlib.suppress(Exception):
+            asyncio.set_event_loop(None)
+
+
 def main() -> None:
     argv = sys.argv[1:]
+
+    hard_exit_requested = (
+        ("--hard-exit" in argv)
+        or _envb("CHECK_ROUTER_HARD_EXIT", False)
+        or (_envb("PREFLIGHT", False) and _envb("CHECK_ROUTER_HARD_EXIT_PREFLIGHT", True))
+    )
+
     try:
-        rc = asyncio.run(_amain(argv))
+        if hard_exit_requested:
+            # Deterministic path: avoid asyncio.run() shutdown waits entirely.
+            rc = _run_amain_no_asyncio_run(argv)
+        else:
+            rc = int(asyncio.run(_amain(argv)))
     except KeyboardInterrupt:
         rc = RC_CTRL_C
     except Exception:
         err = _sanitize_text(traceback.format_exc())
         _safe_print(f"[check_router] {_ts()} FAIL unhandled\n{err[:1600]}", file=sys.stderr)
         rc = RC_FATAL
-    raise SystemExit(rc)
+
+    # Absolute determinism option: force process exit NOW (no background thread join waits).
+    if hard_exit_requested:
+        with contextlib.suppress(Exception):
+            sys.stdout.flush()
+        with contextlib.suppress(Exception):
+            sys.stderr.flush()
+        os._exit(int(rc))  # noqa: S606
+
+    raise SystemExit(int(rc))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,3 @@
-# utils_pkg/ai_exit_model.py
 from __future__ import annotations
 
 """
@@ -32,37 +31,78 @@ Design goals
 - Low latency: strict timeouts + concurrency cap + TTL cache.
 - Explainable: baseline factors + AI factors + blend diagnostics.
 - Provider-agnostic: OpenAI (AsyncOpenAI) or generic HTTP JSON endpoint.
-- Side-effect free: no DB writes, no RPC, no global state mutation (beyond cache/circuit-breaker).
+- Side-effect free: no DB writes, no RPC, no global mutation beyond cache/circuit state.
 
-NOTE
-----
-Hard exits still belong in:
-  - utils_pkg/exit_engine.py (canonical exit brain)
-  - utils_pkg/ai_sell_logic.py (blends this AI score with rules/risk/regime)
-
+Notes
+-----
+- Hard exits still belong in:
+    - utils_pkg/auto_exit_worker/exit_engine.py (canonical exit brain)
+    - utils_pkg/ai_sell_logic.py (blends AI score with rules/risk/regime)
 """
 
 import asyncio
+import copy
 import hashlib
 import json
-import logging
 import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
 try:  # optional HTTP provider
-    import httpx  # type: ignore[import]
-except Exception:
+    import httpx  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
     httpx = None  # type: ignore[assignment]
-
-logger = logging.getLogger("sniper.ai_exit_model")
 
 __all__ = ["predict_exit_score"]
 
-AI_EXIT_MODEL_VERSION = "v3+++"
-_JSON_LIMIT = 10_000  # bytes-ish for prompt safety
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging (canonical contract friendly; never creates type-mismatch cascades)
+# ──────────────────────────────────────────────────────────────────────────────
 
+
+def _resolve_logger(name: str) -> Any:
+    """
+    Prefer project logger factories if available; else use stdlib logging.
+
+    Must NOT create conditional signature/type mismatches (mypy-friendly).
+    """
+    # Preferred: utils_pkg.log_compat.get_logger
+    try:
+        from utils_pkg.log_compat import get_logger as _get_logger  # type: ignore
+
+        try:
+            return _get_logger(name)
+        except TypeError:
+            return _get_logger()
+    except Exception:
+        pass
+
+    # Legacy fallback: logging_setup.get_logger
+    try:
+        from logging_setup import get_logger as _get_logger2  # type: ignore
+
+        try:
+            return _get_logger2(name)
+        except TypeError:
+            return _get_logger2()
+    except Exception:
+        pass
+
+    import logging
+
+    return logging.getLogger(name)
+
+
+logger: Any = _resolve_logger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────────────
+
+AI_EXIT_MODEL_VERSION = "v3+++"
+_JSON_LIMIT = 10_000  # prompt safety, bytes-ish
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Env helpers
@@ -77,15 +117,17 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 
 def _env_int(key: str, default: int) -> int:
+    raw = os.getenv(key, str(default))
     try:
-        return int(str(os.getenv(key, str(default))).strip())
+        return int(str(raw).strip())
     except Exception:
         return default
 
 
 def _env_float(key: str, default: float) -> float:
+    raw = os.getenv(key, str(default))
     try:
-        return float(str(os.getenv(key, str(default))).strip())
+        return float(str(raw).strip())
     except Exception:
         return default
 
@@ -105,6 +147,10 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _dur_ms(t0_perf: float) -> int:
+    return int((time.perf_counter() - t0_perf) * 1000)
 
 
 def _safe_json(obj: Any, limit: int = _JSON_LIMIT) -> str:
@@ -131,23 +177,19 @@ def _f(x: Any, default: float = 0.0) -> float:
 # Config (env)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Global enable / disable (safe default OFF)
 AI_EXIT_MODEL_ENABLED = _env_bool("AI_EXIT_MODEL_ENABLED", False)
 
-# Providers:
-#   - "openai"
-#   - "http"
-#   - "none"
-AI_EXIT_MODEL_PROVIDER = _env_str("AI_EXIT_MODEL_PROVIDER", "openai").lower() or "openai"
+# Providers: "openai" | "http" | "none"
+AI_EXIT_MODEL_PROVIDER = (_env_str("AI_EXIT_MODEL_PROVIDER", "openai").lower() or "openai").strip()
 
 # OpenAI model
 AI_EXIT_MODEL_NAME = _env_str("AI_EXIT_MODEL_NAME", "")
-AI_EXIT_OPENAI_KEY = _env_str("AI_EXIT_OPENAI_KEY", "")  # optional override (else OPENAI_API_KEY)
+AI_EXIT_OPENAI_KEY = _env_str("AI_EXIT_OPENAI_KEY", "")  # optional override, else OPENAI_API_KEY
 AI_EXIT_MODEL_TIMEOUT_S = _env_float("AI_EXIT_MODEL_TIMEOUT_S", 1.6)
 AI_EXIT_MODEL_MAX_TOKENS = _env_int("AI_EXIT_MODEL_MAX_TOKENS", 220)
 AI_EXIT_MODEL_TEMPERATURE = _env_float("AI_EXIT_MODEL_TEMPERATURE", 0.10)
 
-# HTTP model endpoint
+# HTTP endpoint
 AI_EXIT_HTTP_URL = _env_str("AI_EXIT_HTTP_URL", "")
 AI_EXIT_HTTP_AUTH_HEADER = _env_str("AI_EXIT_HTTP_AUTH_HEADER", "")  # "Header: value" or raw token
 
@@ -155,55 +197,56 @@ AI_EXIT_HTTP_AUTH_HEADER = _env_str("AI_EXIT_HTTP_AUTH_HEADER", "")  # "Header: 
 AI_EXIT_MODEL_FALLBACK_SCORE = _clamp(_env_float("AI_EXIT_MODEL_FALLBACK_SCORE", 0.50))
 AI_EXIT_MODEL_MIN_CONF = _clamp(_env_float("AI_EXIT_MODEL_MIN_CONF", 0.35))
 AI_EXIT_MODEL_MAX_WEIGHT = _clamp(_env_float("AI_EXIT_MODEL_MAX_WEIGHT", 0.80))
-AI_EXIT_MODEL_MIN_WEIGHT = _clamp(
-    _env_float("AI_EXIT_MODEL_MIN_WEIGHT", 0.10)
-)  # if confident, at least this weight
+AI_EXIT_MODEL_MIN_WEIGHT = _clamp(_env_float("AI_EXIT_MODEL_MIN_WEIGHT", 0.10))
 AI_EXIT_MODEL_DRY_RUN = _env_bool("AI_EXIT_MODEL_DRY_RUN", False)
 AI_EXIT_MODEL_DEBUG = _env_bool("AI_EXIT_MODEL_DEBUG", False)
 
 # Latency control
 AI_EXIT_MODEL_MAX_PARALLEL = max(1, _env_int("AI_EXIT_MODEL_MAX_PARALLEL", 4))
 
-# Cache (TTL seconds). Cache is safe because this is advisory, not execution.
+# Cache
 AI_EXIT_MODEL_CACHE_TTL_S = max(0, _env_int("AI_EXIT_MODEL_CACHE_TTL_S", 15))
 AI_EXIT_MODEL_CACHE_MAX = max(64, _env_int("AI_EXIT_MODEL_CACHE_MAX", 2048))
 
 # Circuit breaker
-AI_EXIT_MODEL_FAIL_OPEN = _env_bool("AI_EXIT_MODEL_FAIL_OPEN", True)  # baseline-only on failure
+AI_EXIT_MODEL_FAIL_OPEN = _env_bool("AI_EXIT_MODEL_FAIL_OPEN", True)
 AI_EXIT_MODEL_MAX_FAILS = max(1, _env_int("AI_EXIT_MODEL_MAX_FAILS", 6))
 AI_EXIT_MODEL_COOLDOWN_S = max(1, _env_int("AI_EXIT_MODEL_COOLDOWN_S", 30))
 
-# Feature selection / prompt minimization
-# If empty, we build a compact model_features dict from common keys.
+# Feature allowlist (optional)
 AI_EXIT_MODEL_ALLOWLIST = [
     s.strip() for s in _env_str("AI_EXIT_MODEL_ALLOWLIST", "").split(",") if s.strip()
 ]
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional OpenAI client (lazy)
 # ──────────────────────────────────────────────────────────────────────────────
 
-_OPENAI_AVAILABLE = False
-AsyncOpenAI = None  # type: ignore[assignment]
-_client: Any = None
-
-try:  # pragma: no cover
-    from openai import AsyncOpenAI as _AsyncOpenAI  # type: ignore[attr-defined]
-
-    AsyncOpenAI = _AsyncOpenAI  # type: ignore[misc]
-    _OPENAI_AVAILABLE = True
-except Exception:
-    _OPENAI_AVAILABLE = False
-    AsyncOpenAI = None  # type: ignore[assignment]
+_client: Any | None = None
+_openai_ready_checked = False
+_openai_available = False
+_openai_class: Any | None = None
 
 
-def _get_openai_client() -> Any:
+def _get_openai_client() -> Any | None:
     """
     Returns AsyncOpenAI client or None if unavailable / no key.
+    Lazy import to keep module side-effect free and lightweight.
     """
-    global _client
-    if not _OPENAI_AVAILABLE or AsyncOpenAI is None:
+    global _client, _openai_ready_checked, _openai_available, _openai_class
+
+    if not _openai_ready_checked:
+        _openai_ready_checked = True
+        try:  # pragma: no cover
+            from openai import AsyncOpenAI as _AsyncOpenAI  # type: ignore[attr-defined]
+
+            _openai_class = _AsyncOpenAI
+            _openai_available = True
+        except Exception:  # pragma: no cover
+            _openai_class = None
+            _openai_available = False
+
+    if not _openai_available or _openai_class is None:
         return None
 
     key = AI_EXIT_OPENAI_KEY or _env_str("OPENAI_API_KEY", "")
@@ -211,7 +254,7 @@ def _get_openai_client() -> Any:
         return None
 
     if _client is None:
-        _client = AsyncOpenAI(api_key=key)
+        _client = _openai_class(api_key=key)
     return _client
 
 
@@ -234,15 +277,14 @@ def _metric_inc(name: str, value: int = 1) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@dataclass
+@dataclass(frozen=True)
 class _CacheItem:
     exp_ms: int
     score: float
     meta: dict[str, Any]
 
 
-_cache: dict[str, _CacheItem] = {}
-_cache_order: list[str] = []  # simple FIFO (good enough)
+_cache: OrderedDict[str, _CacheItem] = OrderedDict()
 _cache_lock = asyncio.Lock()
 
 _sem = asyncio.Semaphore(AI_EXIT_MODEL_MAX_PARALLEL)
@@ -252,15 +294,24 @@ _cooldown_until_ms = 0
 _state_lock = asyncio.Lock()
 
 
-def _hash_key(mint: str | None, features: dict[str, Any]) -> str:
+def _hash_key(
+    mint: str | None,
+    provider: str,
+    used_model: str | None,
+    features: dict[str, Any],
+) -> str:
     """
     Stable key for short TTL caching.
 
-    We do NOT hash the entire raw features (could be huge / unstable). We hash the
-    compact model_features dict produced by _prepare_model_features.
+    We hash a compact model_features dict (not raw full features).
+    Include provider + model + version so changing config won't reuse stale cache.
     """
     base = {
+        "v": AI_EXIT_MODEL_VERSION,
+        "p": provider,
+        "m": used_model or "",
         "mint": mint or "",
+        "allowlist": AI_EXIT_MODEL_ALLOWLIST,
         "mf": _prepare_model_features(features),
     }
     b = _safe_json(base, limit=4096).encode("utf-8", "ignore")
@@ -270,28 +321,26 @@ def _hash_key(mint: str | None, features: dict[str, Any]) -> str:
 async def _cache_get(key: str) -> _CacheItem | None:
     if AI_EXIT_MODEL_CACHE_TTL_S <= 0:
         return None
+    now = _now_ms()
     async with _cache_lock:
         item = _cache.get(key)
-        if not item:
+        if item is None:
             return None
-        if item.exp_ms <= _now_ms():
+        if item.exp_ms <= now:
             _cache.pop(key, None)
             return None
-        return item
+        _cache.move_to_end(key)
+        return copy.deepcopy(item)
 
 
 async def _cache_put(key: str, item: _CacheItem) -> None:
     if AI_EXIT_MODEL_CACHE_TTL_S <= 0:
         return
     async with _cache_lock:
-        if key not in _cache:
-            _cache_order.append(key)
-        _cache[key] = item
-
-        # prune
-        while len(_cache_order) > AI_EXIT_MODEL_CACHE_MAX:
-            old = _cache_order.pop(0)
-            _cache.pop(old, None)
+        _cache[key] = copy.deepcopy(item)
+        _cache.move_to_end(key)
+        while len(_cache) > AI_EXIT_MODEL_CACHE_MAX:
+            _cache.popitem(last=False)
 
 
 async def _circuit_allows_call() -> bool:
@@ -311,6 +360,7 @@ async def _record_failure() -> None:
         _fail_count += 1
         if _fail_count >= AI_EXIT_MODEL_MAX_FAILS:
             _cooldown_until_ms = _now_ms() + int(AI_EXIT_MODEL_COOLDOWN_S * 1000)
+            _fail_count = 0  # reset after tripping
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -329,8 +379,7 @@ def _baseline_exit_score(features: dict[str, Any]) -> tuple[float, dict[str, Any
     """
     Deterministic, explainable baseline exit pressure.
 
-    Returns:
-        (score in [0,1], explain dict with top factors)
+    Returns: (score in [0,1], explain dict)
     """
     pnl_pct = _get_common(features, "pnl_pct", default=0.0)
     max_up_pct = _get_common(features, "max_up_pct", default=pnl_pct)
@@ -338,7 +387,6 @@ def _baseline_exit_score(features: dict[str, Any]) -> tuple[float, dict[str, Any
     hold_sec = _get_common(features, "hold_sec", default=0.0)
     hold_min = _get_common(features, "hold_minutes", default=hold_sec / 60.0)
 
-    # risk signals (normalized 0..1)
     fraud = max(
         _clamp(_get_common(features, "fraud_risk_pct", default=0.0) / 100.0),
         _clamp(_get_common(features, "fraud_score", default=0.0)),
@@ -346,7 +394,6 @@ def _baseline_exit_score(features: dict[str, Any]) -> tuple[float, dict[str, Any
     rug = _clamp(_get_common(features, "rug_prob_pct", "rug_prob", default=0.0) / 100.0)
     whale_exit = _clamp(_get_common(features, "whale_exit_pressure", default=0.0))
 
-    # flow / market
     vol_30s = _get_common(features, "vol_pct_30s", "vol_30s_pct", default=0.0)
     liq_usd = max(
         _get_common(features, "liq_usd", "liquidity_usd", default=0.0),
@@ -356,114 +403,76 @@ def _baseline_exit_score(features: dict[str, Any]) -> tuple[float, dict[str, Any
     last_move_pct = _get_common(features, "last_move_pct", "move_pct", default=0.0)
 
     regime_stress = _clamp(_get_common(features, "regime_stress_score", default=0.0))
-    regime_label = _get_common(features, "regime_label_numeric", default=0.0)  # negative => worse
+    regime_label = _get_common(features, "regime_label_numeric", default=0.0)
 
-    # overlays
     risk_profile = str(features.get("risk_profile") or "").strip().lower() or "balanced"
-    risk_mode = int(_f(features.get("risk_mode"), 1))  # 0=risk_off, 1=normal, 2=risk_on
+    risk_mode = int(_f(features.get("risk_mode"), 1))
     ai_capacity_delta = _get_common(features, "ai_capacity_delta", default=0.0)
 
     score = 0.50
     reasons: list[tuple[str, float]] = []
 
-    # Fraud / rug / whales are the strongest "get out" nudges
+    def bump(tag: str, delta: float) -> None:
+        nonlocal score
+        score += delta
+        reasons.append((tag, delta))
+
     if fraud > 0:
-        add = 0.35 * fraud
-        score += add
-        reasons.append(("fraud", add))
+        bump("fraud", 0.35 * fraud)
     if rug > 0:
-        add = 0.30 * rug
-        score += add
-        reasons.append(("rug", add))
+        bump("rug", 0.30 * rug)
     if whale_exit > 0:
-        add = 0.25 * whale_exit
-        score += add
-        reasons.append(("whales", add))
+        bump("whales", 0.25 * whale_exit)
 
-    # Drawdown severity (if supplied negative)
     if dd_pct <= -20.0:
-        score += 0.20
-        reasons.append(("dd<=-20", 0.20))
+        bump("dd<=-20", 0.20)
     elif dd_pct <= -10.0:
-        score += 0.10
-        reasons.append(("dd<=-10", 0.10))
+        bump("dd<=-10", 0.10)
 
-    # Negative PnL
     if pnl_pct < 0:
-        add = _clamp((-pnl_pct) / 40.0, 0.0, 0.35)
-        score += add
-        reasons.append(("red_pnl", add))
+        bump("red_pnl", _clamp((-pnl_pct) / 40.0, 0.0, 0.35))
 
-    # Giveback from peak
     if max_up_pct > 0 and pnl_pct < (max_up_pct - 12.0):
-        add = _clamp((max_up_pct - pnl_pct) / 60.0, 0.0, 0.30)
-        score += add
-        reasons.append(("giveback", add))
+        bump("giveback", _clamp((max_up_pct - pnl_pct) / 60.0, 0.0, 0.30))
 
-    # Liquidity / volatility
     if liq_usd < 8_000:
-        score += 0.15
-        reasons.append(("thin_liq<8k", 0.15))
+        bump("thin_liq<8k", 0.15)
     elif liq_usd < 20_000:
-        score += 0.05
-        reasons.append(("thin_liq<20k", 0.05))
+        bump("thin_liq<20k", 0.05)
 
     if vol_30s < -35.0 and liq_usd < 15_000:
-        score += 0.25
-        reasons.append(("vol_crush+thin", 0.25))
+        bump("vol_crush+thin", 0.25)
     elif vol_30s < -20.0:
-        score += 0.10
-        reasons.append(("vol_crush", 0.10))
+        bump("vol_crush", 0.10)
 
-    # Stagnation
     if stagnation_min >= 10.0 and abs(last_move_pct) < 4.0:
-        add = _clamp((stagnation_min - 10.0) / 60.0, 0.0, 0.25)
-        score += add
-        reasons.append(("stagnation", add))
+        bump("stagnation", _clamp((stagnation_min - 10.0) / 60.0, 0.0, 0.25))
 
-    # Time decay
     if hold_min >= 90.0:
-        add = _clamp((hold_min - 90.0) / 360.0, 0.0, 0.20)
-        score += add
-        reasons.append(("time_decay", add))
+        bump("time_decay", _clamp((hold_min - 90.0) / 360.0, 0.0, 0.20))
 
-    # Regime / stress
     if regime_label <= -0.7 or regime_stress >= 0.9:
-        score += 0.20
-        reasons.append(("regime_bad", 0.20))
+        bump("regime_bad", 0.20)
     elif regime_label <= -0.4 or regime_stress >= 0.7:
-        score += 0.10
-        reasons.append(("regime_soft_bad", 0.10))
+        bump("regime_soft_bad", 0.10)
 
-    # Risk mode
     if risk_mode == 0:
-        score += 0.15
-        reasons.append(("risk_off", 0.15))
+        bump("risk_off", 0.15)
     elif risk_mode == 2:
-        score -= 0.05
-        reasons.append(("risk_on", -0.05))
+        bump("risk_on", -0.05)
 
-    # Profile tilt
     if risk_profile in ("ultra_defensive", "defensive"):
-        score += 0.05
-        reasons.append(("defensive_profile", 0.05))
+        bump("defensive_profile", 0.05)
     elif risk_profile in ("aggressive", "degenerate"):
-        score -= 0.05
-        reasons.append(("aggressive_profile", -0.05))
+        bump("aggressive_profile", -0.05)
 
-    # Capacity tilt
     if ai_capacity_delta < 0:
-        add = _clamp(-ai_capacity_delta / 0.6, 0.0, 0.12)
-        score += add
-        reasons.append(("capacity_down", add))
+        bump("capacity_down", _clamp(-ai_capacity_delta / 0.6, 0.0, 0.12))
     elif ai_capacity_delta > 0.2:
-        sub = _clamp((ai_capacity_delta - 0.2) / 0.6, 0.0, 0.07)
-        score -= sub
-        reasons.append(("capacity_up", -sub))
+        bump("capacity_up", -_clamp((ai_capacity_delta - 0.2) / 0.6, 0.0, 0.07))
 
     score = _clamp(score)
 
-    # Keep top factors for explainability
     reasons_sorted = sorted(reasons, key=lambda t: abs(t[1]), reverse=True)
     explain = {
         "baseline_score": score,
@@ -492,10 +501,10 @@ def _baseline_exit_score(features: dict[str, Any]) -> tuple[float, dict[str, Any
 
 def _safety_floor_from_features(features: dict[str, Any]) -> float:
     """
-    Safety floors: if certain extreme-risk signals are present, ensure the
-    *final* score never gets unrealistically low even if the model says "hold".
+    Safety floors: if extreme-risk signals are present, ensure final score is not
+    unrealistically low even if the AI says "hold".
 
-    This does NOT replace exit_engine hard rules; it only stabilizes AI output.
+    Advisory only; hard exits still live in exit_engine.
     """
     fraud = max(
         _clamp(_get_common(features, "fraud_risk_pct", default=0.0) / 100.0),
@@ -531,18 +540,18 @@ def _prepare_model_features(features: dict[str, Any]) -> dict[str, Any]:
     Build a compact, stable, model-friendly feature dict.
 
     If AI_EXIT_MODEL_ALLOWLIST is set, we send only those keys (if present).
-    Otherwise we send a compact summary (recommended).
+    Otherwise we send a compact summary.
     """
     if AI_EXIT_MODEL_ALLOWLIST:
         out: dict[str, Any] = {}
         for k in AI_EXIT_MODEL_ALLOWLIST:
-            if k in features:
-                v = features.get(k)
-                # keep JSON-safe primitives
-                if isinstance(v, str | int | float | bool) or v is None:
-                    out[k] = v
-                else:
-                    out[k] = str(v)[:256]
+            if k not in features:
+                continue
+            v = features.get(k)
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                out[k] = v
+            else:
+                out[k] = str(v)[:256]
         return out
 
     pnl_pct = _get_common(features, "pnl_pct", default=0.0)
@@ -574,7 +583,6 @@ def _prepare_model_features(features: dict[str, Any]) -> dict[str, Any]:
     risk_mode = int(_f(features.get("risk_mode"), 1))
     ai_capacity_delta = _get_common(features, "ai_capacity_delta", default=0.0)
 
-    # tiny derived buckets (helps models generalize)
     liq_bucket = "unknown"
     if liq_usd > 0:
         if liq_usd < 8_000:
@@ -585,23 +593,19 @@ def _prepare_model_features(features: dict[str, Any]) -> dict[str, Any]:
             liq_bucket = "deep"
 
     return {
-        # shape
         "pnl_pct": pnl_pct,
         "max_up_pct": max_up_pct,
         "giveback_pct": giveback,
         "dd_pct": dd_pct,
         "hold_min": hold_min,
-        # risk
         "fraud": fraud,
         "rug": rug,
         "whale_exit": whale_exit,
-        # market
         "liq_usd": liq_usd,
         "liq_bucket": liq_bucket,
         "vol_30s": vol_30s,
         "stagnation_min": stagnation_min,
         "last_move_pct": last_move_pct,
-        # regime & overlays
         "regime_label": regime_label,
         "regime_stress": regime_stress,
         "risk_profile": risk_profile,
@@ -619,14 +623,14 @@ async def _call_openai(
     *, features: dict[str, Any], mint: str | None, timeout_s: float
 ) -> dict[str, Any]:
     client = _get_openai_client()
-    if not client or not AI_EXIT_MODEL_NAME:
+    if client is None or not AI_EXIT_MODEL_NAME:
         return {}
 
     system_msg = (
         "You are an EXIT advisory model for a Solana memecoin trading bot.\n"
         "You NEVER execute trades. You ONLY output a JSON object.\n"
         "Return exit pressure score in [0,1] where higher = stronger exit bias.\n"
-        "Be conservative: do not suggest exit without a clear downside or deteriorating conditions.\n"
+        "Be conservative: do not suggest exit without clear downside or deteriorating conditions.\n"
     )
 
     payload = {
@@ -644,17 +648,32 @@ async def _call_openai(
     }
 
     async def _do() -> dict[str, Any]:
-        resp = await client.chat.completions.create(
-            model=AI_EXIT_MODEL_NAME,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": f"Return ONLY JSON:\n{_safe_json(payload)}"},
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=AI_EXIT_MODEL_MAX_TOKENS,
-            temperature=AI_EXIT_MODEL_TEMPERATURE,
-        )
-        txt = (resp.choices[0].message.content or "").strip() or "{}"
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": f"Return ONLY JSON:\n{_safe_json(payload)}"},
+        ]
+        try:
+            resp = await client.chat.completions.create(
+                model=AI_EXIT_MODEL_NAME,
+                messages=messages,
+                response_format={"type": "json_object"},
+                max_tokens=AI_EXIT_MODEL_MAX_TOKENS,
+                temperature=AI_EXIT_MODEL_TEMPERATURE,
+            )
+        except TypeError:
+            resp = await client.chat.completions.create(
+                model=AI_EXIT_MODEL_NAME,
+                messages=messages,
+                max_tokens=AI_EXIT_MODEL_MAX_TOKENS,
+                temperature=AI_EXIT_MODEL_TEMPERATURE,
+            )
+
+        try:
+            txt = (resp.choices[0].message.content or "").strip()  # type: ignore[attr-defined]
+        except Exception:
+            txt = ""
+        if not txt:
+            return {}
         try:
             out = json.loads(txt)
             return out if isinstance(out, dict) else {}
@@ -673,9 +692,8 @@ async def _call_http(
     if not AI_EXIT_HTTP_URL or httpx is None:
         return {}
 
-    headers = {"content-type": "application/json"}
+    headers: dict[str, str] = {"content-type": "application/json"}
     if AI_EXIT_HTTP_AUTH_HEADER:
-        # Accept either "Header: value" or "Bearer xxx"
         if ":" in AI_EXIT_HTTP_AUTH_HEADER:
             try:
                 name, val = AI_EXIT_HTTP_AUTH_HEADER.split(":", 1)
@@ -685,14 +703,10 @@ async def _call_http(
         else:
             headers["authorization"] = AI_EXIT_HTTP_AUTH_HEADER.strip()
 
-    payload = {
-        "mint": mint,
-        "schema_version": 1,
-        "features": _prepare_model_features(features),
-    }
+    payload = {"mint": mint, "schema_version": 1, "features": _prepare_model_features(features)}
 
     async def _do() -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=timeout_s) as c:
+        async with httpx.AsyncClient(timeout=timeout_s) as c:  # type: ignore[union-attr]
             r = await c.post(AI_EXIT_HTTP_URL, json=payload, headers=headers)
             r.raise_for_status()
             data = r.json()
@@ -716,8 +730,7 @@ def _parse_model_response(resp: dict[str, Any]) -> tuple[float | None, float, di
 
     score: float | None
     try:
-        score = float(raw)  # type: ignore[arg-type]
-        score = _clamp(score)
+        score = _clamp(float(raw))  # type: ignore[arg-type]
     except Exception:
         score = None
 
@@ -730,7 +743,7 @@ def _parse_model_response(resp: dict[str, Any]) -> tuple[float | None, float, di
     for k in ("action", "label", "notes"):
         v = resp.get(k)
         if isinstance(v, str):
-            meta[k] = v[:400]  # bound
+            meta[k] = v[:400]
     rc = resp.get("reason_codes")
     if isinstance(rc, list):
         meta["reason_codes"] = [str(x)[:64] for x in rc[:12]]
@@ -741,12 +754,8 @@ def _parse_model_response(resp: dict[str, Any]) -> tuple[float | None, float, di
 def _blend(*, baseline: float, ai_score: float, confidence: float) -> tuple[float, dict[str, Any]]:
     """
     Confidence-aware blending, bounded + explainable.
-
-    - If confidence is low, AI weight stays tiny.
-    - If confidence is high, AI can dominate (up to MAX_WEIGHT) but never 100%.
     """
     c = _clamp(confidence)
-    # smooth confidence curve: c^2 makes medium confidence much less impactful
     w_ai = (c * c) * AI_EXIT_MODEL_MAX_WEIGHT
     if c >= AI_EXIT_MODEL_MIN_CONF:
         w_ai = max(w_ai, AI_EXIT_MODEL_MIN_WEIGHT)
@@ -754,12 +763,32 @@ def _blend(*, baseline: float, ai_score: float, confidence: float) -> tuple[floa
     w_base = 1.0 - w_ai
 
     blended = _clamp((w_base * baseline) + (w_ai * ai_score))
-    diag = {
-        "w_ai": w_ai,
-        "w_base": w_base,
-        "confidence": c,
-    }
+    diag = {"w_ai": w_ai, "w_base": w_base, "confidence": c}
     return blended, diag
+
+
+def _provider_ready(provider: str) -> tuple[bool, str | None]:
+    """
+    Returns (ready, used_model_str_or_none).
+    """
+    if provider == "openai":
+        used = AI_EXIT_MODEL_NAME or None
+        if _get_openai_client() is None:
+            return False, used
+        if not AI_EXIT_MODEL_NAME:
+            return False, used
+        return True, used
+
+    if provider == "http":
+        used = AI_EXIT_HTTP_URL or None
+        if httpx is None or not AI_EXIT_HTTP_URL:
+            return False, used
+        return True, used
+
+    if provider == "none":
+        return False, None
+
+    return False, None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -773,25 +802,12 @@ async def predict_exit_score(
     """
     Main entrypoint (LOCK-IN).
     Returns (score, meta).
-
-    meta fields (stable-ish):
-      - version, mint
-      - provider, used_model
-      - baseline_exit_score, baseline_explain
-      - ai_raw_score, ai_confidence, ai_meta
-      - blended_score, blend_diag
-      - safety_floor_applied
-      - cached (bool)
-      - dry_run (bool)
-      - duration_ms
-      - reason, error
     """
-    t0 = _now_ms()
+    t0 = time.perf_counter()
 
-    if not isinstance(features, dict):
-        features = {}
+    feats: dict[str, Any] = features if isinstance(features, dict) else {}
 
-    baseline, baseline_explain = _baseline_exit_score(features)
+    baseline, baseline_explain = _baseline_exit_score(feats)
 
     meta: dict[str, Any] = {
         "version": AI_EXIT_MODEL_VERSION,
@@ -813,55 +829,68 @@ async def predict_exit_score(
         "duration_ms": 0,
     }
 
-    # fast path: disabled or provider none
+    # disabled => baseline
     if (not AI_EXIT_MODEL_ENABLED) or (AI_EXIT_MODEL_PROVIDER == "none"):
         meta["provider"] = AI_EXIT_MODEL_PROVIDER
         meta["reason"] = "model_disabled_use_baseline"
         meta["blended_score"] = float(baseline)
-        meta["duration_ms"] = _now_ms() - t0
+        meta["duration_ms"] = _dur_ms(t0)
+        return float(baseline), meta
+
+    provider = AI_EXIT_MODEL_PROVIDER.strip().lower()
+    meta["provider"] = provider
+
+    # dry-run => baseline only
+    if AI_EXIT_MODEL_DRY_RUN:
+        meta["reason"] = "dry_run_use_baseline"
+        meta["blended_score"] = float(baseline)
+        meta["duration_ms"] = _dur_ms(t0)
+        return float(baseline), meta
+
+    ready, used_model = _provider_ready(provider)
+    meta["used_model"] = used_model
+    if not ready:
+        meta["reason"] = "provider_unavailable_use_baseline"
+        meta["error"] = f"provider_unavailable:{provider}"
+        meta["blended_score"] = float(baseline)
+        meta["duration_ms"] = _dur_ms(t0)
         return float(baseline), meta
 
     # circuit breaker
     if not await _circuit_allows_call():
-        meta["provider"] = AI_EXIT_MODEL_PROVIDER
         meta["reason"] = "circuit_open_use_baseline"
         meta["error"] = "circuit_open"
         meta["blended_score"] = float(baseline)
-        meta["duration_ms"] = _now_ms() - t0
+        meta["duration_ms"] = _dur_ms(t0)
         _metric_inc("ai_exit_model_circuit_open", 1)
         return float(baseline), meta
 
-    # cache
-    ck = _hash_key(mint, features)
+    # cache (only when model enabled)
+    ck = _hash_key(mint, provider=provider, used_model=used_model, features=feats)
     cached = await _cache_get(ck)
     if cached is not None:
-        meta.update(cached.meta)
-        meta["cached"] = True
-        meta["duration_ms"] = _now_ms() - t0
-        return float(cached.score), meta
+        out_meta = cached.meta
+        out_meta["cached"] = True
+        out_meta["duration_ms"] = _dur_ms(t0)
+        return float(cached.score), out_meta
 
-    provider = AI_EXIT_MODEL_PROVIDER
-    meta["provider"] = provider
-
-    # provider call (guarded by semaphore)
+    # provider call guarded by semaphore
+    resp: dict[str, Any] = {}
     async with _sem:
-        resp: dict[str, Any] = {}
         try:
             if provider == "openai":
-                meta["used_model"] = AI_EXIT_MODEL_NAME or None
                 resp = await _call_openai(
-                    features=features, mint=mint, timeout_s=AI_EXIT_MODEL_TIMEOUT_S
+                    features=feats, mint=mint, timeout_s=AI_EXIT_MODEL_TIMEOUT_S
                 )
             elif provider == "http":
-                meta["used_model"] = AI_EXIT_HTTP_URL or None
                 resp = await _call_http(
-                    features=features, mint=mint, timeout_s=AI_EXIT_MODEL_TIMEOUT_S
+                    features=feats, mint=mint, timeout_s=AI_EXIT_MODEL_TIMEOUT_S
                 )
             else:
                 meta["reason"] = "unknown_provider_use_baseline"
                 meta["error"] = f"unknown_provider:{provider}"
                 meta["blended_score"] = float(baseline)
-                meta["duration_ms"] = _now_ms() - t0
+                meta["duration_ms"] = _dur_ms(t0)
                 return float(baseline), meta
         except Exception as e:
             resp = {}
@@ -869,10 +898,10 @@ async def predict_exit_score(
 
     ai_score, ai_conf, ai_meta = _parse_model_response(resp)
     meta["ai_raw_score"] = ai_score
-    meta["ai_confidence"] = ai_conf
+    meta["ai_confidence"] = float(ai_conf)
     meta["ai_meta"] = ai_meta if ai_meta else None
 
-    # failure -> baseline (fail-open)
+    # model failure -> baseline or fallback
     if ai_score is None:
         await _record_failure()
         _metric_inc("ai_exit_model_fail", 1)
@@ -880,8 +909,8 @@ async def predict_exit_score(
         if AI_EXIT_MODEL_FAIL_OPEN:
             meta["reason"] = "ai_unavailable_use_baseline"
             meta["blended_score"] = float(baseline)
-            meta["duration_ms"] = _now_ms() - t0
-            # cache baseline-only briefly too (optional)
+            meta["duration_ms"] = _dur_ms(t0)
+
             await _cache_put(
                 ck,
                 _CacheItem(
@@ -892,11 +921,11 @@ async def predict_exit_score(
             )
             return float(baseline), meta
 
-        # fail-closed is strongly discouraged, but supported
         fb = float(AI_EXIT_MODEL_FALLBACK_SCORE)
         meta["reason"] = "ai_unavailable_use_fallback"
         meta["blended_score"] = fb
-        meta["duration_ms"] = _now_ms() - t0
+        meta["duration_ms"] = _dur_ms(t0)
+
         await _cache_put(
             ck,
             _CacheItem(
@@ -910,42 +939,39 @@ async def predict_exit_score(
     await _record_success()
     _metric_inc("ai_exit_model_ok", 1)
 
-    blended, diag = _blend(baseline=baseline, ai_score=float(ai_score), confidence=float(ai_conf))
+    blended, diag = _blend(
+        baseline=float(baseline), ai_score=float(ai_score), confidence=float(ai_conf)
+    )
     meta["blend_diag"] = diag
 
     # safety floor
-    floor = _safety_floor_from_features(features)
-    if floor > 0:
-        blended2 = max(blended, floor)
+    floor = _safety_floor_from_features(feats)
+    if floor > 0.0:
+        blended = max(blended, floor)
         meta["safety_floor_applied"] = float(floor)
-        blended = blended2
 
     blended = _clamp(blended)
     meta["blended_score"] = float(blended)
+    meta["reason"] = "low_conf_blend_baseline" if ai_conf < AI_EXIT_MODEL_MIN_CONF else "ai_blended"
+    meta["duration_ms"] = _dur_ms(t0)
 
-    # reason string (stable & compact)
-    if ai_conf < AI_EXIT_MODEL_MIN_CONF:
-        meta["reason"] = "low_conf_blend_baseline"
-    else:
-        meta["reason"] = "ai_blended"
+    if AI_EXIT_MODEL_DEBUG:
+        try:
+            logger.info(
+                "AI_EXIT mint=%s provider=%s raw=%.3f conf=%.3f baseline=%.3f blended=%.3f w_ai=%.3f floor=%.3f label=%s",
+                mint,
+                provider,
+                float(ai_score),
+                float(ai_conf),
+                float(baseline),
+                float(blended),
+                float((diag or {}).get("w_ai", 0.0)),
+                float(floor),
+                (ai_meta or {}).get("label") if isinstance(ai_meta, dict) else None,
+            )
+        except Exception:
+            pass
 
-    meta["duration_ms"] = _now_ms() - t0
-
-    if AI_EXIT_MODEL_DEBUG and not AI_EXIT_MODEL_DRY_RUN:
-        logger.info(
-            "AI_EXIT mint=%s provider=%s raw=%.3f conf=%.3f baseline=%.3f blended=%.3f w_ai=%.3f floor=%.3f label=%s",
-            mint,
-            provider,
-            float(ai_score),
-            float(ai_conf),
-            float(baseline),
-            float(blended),
-            float((diag or {}).get("w_ai", 0.0)),
-            float(floor),
-            (ai_meta or {}).get("label") if isinstance(ai_meta, dict) else None,
-        )
-
-    # cache result
     await _cache_put(
         ck,
         _CacheItem(

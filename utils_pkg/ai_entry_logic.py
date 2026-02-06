@@ -3,8 +3,8 @@ from __future__ import annotations
 """
 utils_pkg/ai_entry_logic.py
 
-Entry IQ engine (V3+++ / God-Tier Overhaul) — LOCK-IN, production-first
-======================================================================
+Entry IQ engine (V3+++ / God-Tier Overhaul) — production lock-in
+================================================================
 
 Role
 ----
@@ -22,6 +22,14 @@ Hard requirements
 - Avoid import cycles (risk_manager/data_logger/regime imported locally & optional).
 - Mutates input features ONLY by attaching/merging `features["entry_meta"]` (a dict).
   (No other top-level keys are added/modified.)
+
+Phase A — Logging + typing contract
+-----------------------------------
+- Eliminate Logger ↔ EventLogger incompatibilities:
+  ✅ .handlers present
+  ✅ .info/.warning/.error/.debug present
+  ✅ .event/.every present
+- No monkeypatching. No method-assign.
 
 Public API (signature-stable, test-friendly)
 --------------------------------------------
@@ -46,12 +54,24 @@ import math
 import os
 import re
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
+
+# -----------------------------------------------------------------------------
+# Contract guards (NO IO / NO NETWORK)
+# -----------------------------------------------------------------------------
+_TRUE = {"1", "true", "t", "yes", "y", "on"}
+_FALSE = {"0", "false", "f", "no", "n", "off"}
+
+_JSON_EXTRACT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _contract_no_io() -> bool:
-    # Contract harness signals (your pytest banner shows network=OFF)
+    """
+    Hard guard used by contract harness / CI:
+    When active, this module must avoid Redis/network calls and any best-effort IO.
+    """
     v = os.getenv("NETWORK", "").strip().lower()
     if v in ("off", "0", "false", "no"):
         return True
@@ -61,47 +81,146 @@ def _contract_no_io() -> bool:
         return True
     if os.getenv("CONTRACT_TEST", "").strip() == "1":
         return True
-    if os.getenv("PYTEST_MODE", "").strip() in ("1", "true", "yes", "on"):
+    if os.getenv("PYTEST_MODE", "").strip().lower() in ("1", "true", "yes", "on"):
         return True
-    if os.getenv("NO_NETWORK", "").strip() in ("1", "true", "yes", "on"):
+    if os.getenv("NO_NETWORK", "").strip().lower() in ("1", "true", "yes", "on"):
         return True
-    if os.getenv("DISABLE_NETWORK", "").strip() in ("1", "true", "yes", "on"):
+    if os.getenv("DISABLE_NETWORK", "").strip().lower() in ("1", "true", "yes", "on"):
         return True
 
     # Optional: if you use these toggles elsewhere
-    if os.getenv("DISABLE_REDIS", "").strip() in ("1", "true", "yes", "on"):
+    if os.getenv("DISABLE_REDIS", "").strip().lower() in ("1", "true", "yes", "on"):
         return True
     return os.getenv("REDIS_ENABLED", "").strip().lower() in ("0", "false", "off", "no")
 
 
 # -----------------------------------------------------------------------------
-# Logger (logging_setup compatible; safe fallback)
+# Logger contract (Phase A): handlers + classic methods + event/every
 # -----------------------------------------------------------------------------
-try:
-    from logging_setup import get_logger  # type: ignore
+class LoggerLike(Protocol):
+    @property
+    def handlers(self) -> Sequence[Any]: ...
 
-    log = get_logger("utils_pkg.ai_entry_logic")  # type: ignore
-except Exception:  # pragma: no cover
+    def info(self, msg: str, *a: Any, **k: Any) -> Any: ...
+    def warning(self, msg: str, *a: Any, **k: Any) -> Any: ...
+    def error(self, msg: str, *a: Any, **k: Any) -> Any: ...
+    def debug(self, msg: str, *a: Any, **k: Any) -> Any: ...
+
+    def event(self, name: str, **fields: Any) -> Any: ...
+    def every(self, key: str, n: int = 30, msg: str | None = None, **fields: Any) -> Any: ...
+
+
+class _LoggerAdapter:
+    """
+    Adapter that guarantees:
+      - .handlers exists (read-only)
+      - .info/.warning/.error/.debug exist
+      - .event/.every exist
+    WITHOUT mutating the underlying logger.
+    """
+
+    __slots__ = ("_get", "_every_store")
+
+    def __init__(self, supplier: Callable[[], Any]) -> None:
+        self._get = supplier
+        self._every_store: dict[str, float] = {}
+
+    def _safe(self) -> Any:
+        with contextlib.suppress(Exception):
+            return self._get()
+        return None
+
+    @property
+    def handlers(self) -> Sequence[Any]:
+        lg = self._safe()
+        hs = getattr(lg, "handlers", None) if lg is not None else None
+        if isinstance(hs, (list, tuple)):
+            return hs
+        return []
+
+    def _call(self, method: str, msg: str, *a: Any, **k: Any) -> None:
+        lg = self._safe()
+        if lg is None:
+            return
+        fn = getattr(lg, method, None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(msg, *a, **k)
+
+    def info(self, msg: str, *a: Any, **k: Any) -> None:
+        self._call("info", msg, *a, **k)
+
+    def warning(self, msg: str, *a: Any, **k: Any) -> None:
+        self._call("warning", msg, *a, **k)
+
+    def error(self, msg: str, *a: Any, **k: Any) -> None:
+        self._call("error", msg, *a, **k)
+
+    def debug(self, msg: str, *a: Any, **k: Any) -> None:
+        self._call("debug", msg, *a, **k)
+
+    def event(self, name: str, **fields: Any) -> None:
+        lg = self._safe()
+        if lg is None:
+            return
+        fn = getattr(lg, "event", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(name, **fields)
+                return
+        self.info("%s %s", name, fields)
+
+    def every(self, key: str, n: int = 30, msg: str | None = None, **fields: Any) -> None:
+        try:
+            now = time.monotonic()
+            sec = float(max(1, int(n)))
+            last = float(self._every_store.get(key, 0.0))
+            if (now - last) >= sec:
+                self._every_store[key] = now
+                self.event(msg or key, **fields)
+        except Exception:
+            return
+
+
+def _resolve_logger() -> Any:
+    # Prefer your repo's compat shim if present (Phase A)
+    with contextlib.suppress(Exception):
+        from utils_pkg.log_compat import get_logger as gl  # type: ignore
+
+        return gl("utils_pkg.ai_entry_logic")
+
+    # Legacy path: some repos keep logging_setup at root or under utils_pkg
+    with contextlib.suppress(Exception):
+        from utils_pkg.logging_setup import get_logger as gl2  # type: ignore
+
+        try:
+            return gl2("utils_pkg.ai_entry_logic")
+        except TypeError:
+            return gl2()
+
+    with contextlib.suppress(Exception):
+        from logging_setup import get_logger as gl3  # type: ignore
+
+        try:
+            return gl3("utils_pkg.ai_entry_logic")
+        except TypeError:
+            return gl3()
+
     import logging
 
-    log = logging.getLogger("utils_pkg.ai_entry_logic")
-    if not log.handlers:
+    lg = logging.getLogger("utils_pkg.ai_entry_logic")
+    if not getattr(lg, "handlers", None):
         logging.basicConfig(level=logging.INFO)
+    return lg
+
+
+log: LoggerLike = _LoggerAdapter(_resolve_logger)
 
 
 def _log_event(name: str, **fields: Any) -> None:
-    """Best-effort structured log, never throws."""
-    try:
-        if hasattr(log, "event"):
-            log.event(name, **fields)  # type: ignore[attr-defined]
-            return
-    except Exception:
-        pass
-    try:
-        log.info("%s %s", name, json.dumps(fields, default=str)[:2000])
-    except Exception:
-        with contextlib.suppress(Exception):
-            log.info("%s", name)
+    """Best-effort structured log. Never throws."""
+    with contextlib.suppress(Exception):
+        log.event(name, **fields)
 
 
 def _log_every(key: str, n: int = 200) -> bool:
@@ -113,54 +232,8 @@ def _log_every(key: str, n: int = 200) -> bool:
 
 
 # -----------------------------------------------------------------------------
-# Small helpers (numeric safety)
+# Env helpers (keep keys stable; do not invent new)
 # -----------------------------------------------------------------------------
-_TRUE = {"1", "true", "t", "yes", "y", "on"}
-_FALSE = {"0", "false", "f", "no", "n", "off"}
-_JSON_EXTRACT_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
-def _now() -> float:
-    return time.time()
-
-
-def _finite(x: Any, default: float = 0.0) -> float:
-    try:
-        xf = float(x)
-        return xf if math.isfinite(xf) else float(default)
-    except Exception:
-        return float(default)
-
-
-def _clip(x: Any, lo: float, hi: float) -> float:
-    xf = _finite(x, lo)
-    if xf < lo:
-        return lo
-    if xf > hi:
-        return hi
-    return xf
-
-
-def _clip01(x: Any) -> float:
-    return _clip(x, 0.0, 1.0)
-
-
-def _sigmoid(x: Any) -> float:
-    xf = _finite(x, 0.0)
-    if xf >= 35.0:
-        return 1.0
-    if xf <= -35.0:
-        return 0.0
-    return 1.0 / (1.0 + math.exp(-xf))
-
-
-def _log1p_pos(x: Any) -> float:
-    xf = _finite(x, 0.0)
-    if xf <= 0.0:
-        return 0.0
-    return math.log1p(xf)
-
-
 def _env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
     if v is None:
@@ -205,6 +278,50 @@ def _env_json_dict(key: str) -> dict[str, Any] | None:
         return None
 
 
+# -----------------------------------------------------------------------------
+# Numeric safety
+# -----------------------------------------------------------------------------
+def _now() -> float:
+    return time.time()
+
+
+def _finite(x: Any, default: float = 0.0) -> float:
+    try:
+        xf = float(x)
+        return xf if math.isfinite(xf) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _clip(x: Any, lo: float, hi: float) -> float:
+    xf = _finite(x, lo)
+    if xf < lo:
+        return lo
+    if xf > hi:
+        return hi
+    return xf
+
+
+def _clip01(x: Any) -> float:
+    return _clip(x, 0.0, 1.0)
+
+
+def _sigmoid(x: Any) -> float:
+    xf = _finite(x, 0.0)
+    if xf >= 35.0:
+        return 1.0
+    if xf <= -35.0:
+        return 0.0
+    return 1.0 / (1.0 + math.exp(-xf))
+
+
+def _log1p_pos(x: Any) -> float:
+    xf = _finite(x, 0.0)
+    if xf <= 0.0:
+        return 0.0
+    return math.log1p(xf)
+
+
 def _f(d: dict[str, Any], key: str, default: float = 0.0) -> float:
     return _finite(d.get(key, default), default)
 
@@ -224,6 +341,9 @@ def _reason(s: str | None) -> str:
     return s2 if s2 else "unknown"
 
 
+# -----------------------------------------------------------------------------
+# Meta helpers (ONLY allowed mutation surface)
+# -----------------------------------------------------------------------------
 def _ensure_meta(features: dict[str, Any]) -> dict[str, Any]:
     m = features.get("entry_meta")
     if isinstance(m, dict):
@@ -245,7 +365,6 @@ def _meta_ctx(meta: dict[str, Any]) -> dict[str, Any]:
 def _merge_ctx_best_effort(features: dict[str, Any], ctx: dict | None) -> None:
     """
     Merge external ctx into entry_meta.ctx (best-effort, non-destructive).
-    This keeps test harness + runtime consistent without changing top-level keys.
     """
     if not isinstance(ctx, dict) or not ctx:
         return
@@ -265,7 +384,7 @@ def _append_flag(meta: dict[str, Any], flag: str) -> None:
             flags.append(flag)
         meta["flags"] = flags
     except Exception:
-        pass
+        return
 
 
 def _ctx_get(features: dict[str, Any], meta: dict[str, Any], key: str, default: Any = None) -> Any:
@@ -320,7 +439,7 @@ def _one_line_explain(features: dict[str, Any], prefix: str = "") -> str:
 
 
 # -----------------------------------------------------------------------------
-# Config (same env keys as your current file)
+# Config (env keys kept stable)
 # -----------------------------------------------------------------------------
 ENTRY_MODEL = (os.getenv("ENTRY_MODEL_NAME", "") or os.getenv("ENTRY_MODEL", "")).strip()
 ENTRY_MODEL_ROUTING = _env_json_dict("ENTRY_MODEL_ROUTING_JSON") or {}
@@ -463,7 +582,7 @@ class EntryDecision:
 
 
 # -----------------------------------------------------------------------------
-# OpenAI client shim (SDK + legacy)
+# OpenAI client shim (SDK + legacy; lazy)
 # -----------------------------------------------------------------------------
 _CLIENT: Any = None
 _CLIENT_KIND: str = "none"  # "sdk" | "legacy" | "none"
@@ -473,6 +592,12 @@ def _ensure_client() -> Any | None:
     global _CLIENT, _CLIENT_KIND
     if _CLIENT is not None:
         return _CLIENT
+
+    # Never attempt in contract mode
+    if _contract_no_io():
+        _CLIENT = None
+        _CLIENT_KIND = "none"
+        return None
 
     try:
         from openai import OpenAI  # type: ignore
@@ -545,7 +670,7 @@ def _source_key(features: dict[str, Any]) -> str:
         or features.get("segment")
         or ""
     )
-    if isinstance(src, int | float):
+    if isinstance(src, (int, float)):
         return f"id_{int(src)}"
     return str(src).strip().lower()
 
@@ -580,6 +705,9 @@ def _risk_profile_threshold_adjust(base: float, features: dict[str, Any]) -> flo
 
 
 def _effective_regime_mode(features: dict[str, Any], meta: dict[str, Any] | None = None) -> int:
+    """
+    Return -1/0/1/2 regime lock mode.
+    """
     try:
         v = features.get("regime_risk_mode_lock")
         if v is not None:
@@ -671,7 +799,7 @@ def _playbook_score_bonus(features: dict[str, Any]) -> float:
 
 
 # -----------------------------------------------------------------------------
-# Deterministic heuristic scoring
+# Deterministic heuristic scoring (baseline)
 # -----------------------------------------------------------------------------
 def _norm_fraud_01(features: dict[str, Any]) -> float:
     raw = _f(
@@ -888,16 +1016,17 @@ def _heuristic_score(features: dict[str, Any]) -> float:
 # -----------------------------------------------------------------------------
 # RiskManager enrichment helper (cycle-safe) — meta-only
 # -----------------------------------------------------------------------------
-async def _maybe_enrich_risk_context(features: dict[str, Any], *args: Any, **kwargs: Any) -> None:
-    # 🚫 Contract/NO_NETWORK: never touch Redis / network
-    if _contract_no_io():
-        # Optional breadcrumbs (stable / deterministic)
-        features.setdefault("risk_ctx_mode", "contract_no_io")
-        return
-
-    # ... existing logic continues below (risk_manager snapshot, redis reads, etc.)
+async def _maybe_enrich_risk_context(features: dict[str, Any]) -> None:
+    """
+    Enrich entry_meta.ctx with risk context. Never mutates top-level keys.
+    Contract/NO_NETWORK: does nothing (but may set a meta flag).
+    """
     meta = _ensure_meta(features)
     ctx = _meta_ctx(meta)
+
+    if _contract_no_io():
+        _append_flag(meta, "contract_no_io")
+        return
 
     wants = (
         "risk_capacity_score",
@@ -920,8 +1049,9 @@ async def _maybe_enrich_risk_context(features: dict[str, Any], *args: Any, **kwa
     try:
         from utils_pkg import risk_manager as _rm  # local import
 
-        snap = await _rm.risk_capacity_snapshot()
+        snap: Any = await _rm.risk_capacity_snapshot()
         if not isinstance(snap, dict):
+            _append_flag(meta, "risk_snapshot_not_dict")
             return
 
         ctx.setdefault("risk_capacity_score", float(_finite(snap.get("risk_capacity", 1.0), 1.0)))
@@ -979,7 +1109,7 @@ def _prune_ai_last_calls(max_age_sec: float = 900.0, max_items: int = 5000) -> N
             if t < cutoff:
                 _AI_LAST_CALL.pop(k, None)
     except Exception:
-        pass
+        return
 
 
 def _safe_dumps(obj: Any, max_bytes: int | None = None) -> str:
@@ -1081,6 +1211,9 @@ def _parse_ai_gate(content: str) -> tuple[str | None, float | None]:
 def _should_call_ai(heuristic: float, threshold: float) -> bool:
     if not ENTRY_AI_ENABLED:
         return False
+    if _contract_no_io():
+        return False
+
     pol = ENTRY_AI_CALL_POLICY
     if pol == "never":
         return False
@@ -1088,6 +1221,7 @@ def _should_call_ai(heuristic: float, threshold: float) -> bool:
         return True
     if pol == "pass_only":
         return heuristic >= threshold
+    # default borderline policy
     return heuristic >= max(0.0, threshold - ENTRY_AI_BORDERLINE_MARGIN)
 
 
@@ -1158,6 +1292,9 @@ def _shrink_for_ai(features: dict[str, Any]) -> dict[str, Any]:
 async def _ai_gate(
     features: dict[str, Any], heuristic: float, threshold: float
 ) -> tuple[str | None, float | None, str | None]:
+    if _contract_no_io():
+        return None, None, "contract_no_io"
+
     if not os.getenv("OPENAI_API_KEY"):
         return None, None, "no_api_key"
 
@@ -1322,6 +1459,8 @@ async def _log_entry_decision_best_effort(
 ) -> None:
     if not ENTRY_LOG_DECISIONS:
         return
+    if _contract_no_io():
+        return
     try:
         from utils_pkg import data_logger as _dl  # type: ignore
 
@@ -1352,9 +1491,6 @@ async def _log_entry_decision_best_effort(
 # Core structured decision API (canonical for internal modules)
 # -----------------------------------------------------------------------------
 async def decide_entry_obj(features: dict[str, Any], ctx: dict | None = None) -> EntryDecision:
-    """
-    Canonical internal decision function (structured object).
-    """
     _merge_ctx_best_effort(features, ctx)
     score = await score_entry(features, ctx=ctx)
 
@@ -1485,7 +1621,7 @@ async def decide_entry_obj(features: dict[str, Any], ctx: dict | None = None) ->
                 False, float(score), 1.0, reason, reason, meta if isinstance(meta, dict) else None
             )
 
-    if ENTRY_CTX_MAX_DRAWDOWN_PCT > 0 and ctx_dd <= -ENTRY_CTX_MAX_DRAWDOWN_PCT:
+    if ENTRY_CTX_MAX_DRAWDOWN_PCT > 0 and ctx_dd <= -ENTRY_CTX_MAX_DRAWDOWN_PCT * 0.5:
         reason = f"session_drawdown_limit({ctx_dd:.2f}<=-{ENTRY_CTX_MAX_DRAWDOWN_PCT:.1f})"
         meta.update({"reason": reason, "pass": False, "dd_lock": True})
         _append_flag(meta, "dd_lock")
@@ -1643,10 +1779,6 @@ async def decide_entry_obj(features: dict[str, Any], ctx: dict | None = None) ->
 # Test-friendly + JSON-safe decision API
 # -----------------------------------------------------------------------------
 async def decide_entry(features: dict[str, Any], ctx: dict | None = None) -> dict[str, Any]:
-    """
-    Returns a JSON-safe dict with bool decision fields.
-    (This is what tests expect.)
-    """
     d = await decide_entry_obj(features, ctx=ctx)
     return d.to_dict()
 
@@ -1681,7 +1813,8 @@ def score_entry_sync(features: dict[str, Any], ctx: dict | None = None) -> float
 
 def decide_entry_sync_obj(features: dict[str, Any], ctx: dict | None = None) -> EntryDecision:
     """
-    Sync wrapper returning the structured decision object (internal use).
+    Sync wrapper returning structured decision. If called inside a running loop,
+    returns a deterministic heuristic-only decision (no IO).
     """
     _merge_ctx_best_effort(features, ctx)
     try:
@@ -1712,9 +1845,6 @@ def decide_entry_sync_obj(features: dict[str, Any], ctx: dict | None = None) -> 
 
 
 def decide_entry_sync(features: dict[str, Any], ctx: dict | None = None) -> dict[str, Any]:
-    """
-    Sync wrapper returning JSON-safe decision dict (test/API friendly).
-    """
     d = decide_entry_sync_obj(features, ctx=ctx)
     return d.to_dict()
 
@@ -1748,13 +1878,14 @@ async def ai_maintenance_loop(stop_evt: asyncio.Event) -> None:
     while not stop_evt.is_set():
         try:
             snap: dict[str, Any] = {}
-            try:
-                from utils_pkg import risk_manager as _rm  # type: ignore
+            if not _contract_no_io():
+                try:
+                    from utils_pkg import risk_manager as _rm  # type: ignore
 
-                snap = await _rm.risk_capacity_snapshot()
-            except Exception as e:
-                if ENTRY_DEBUG_LOG:
-                    _log_event("AI_MAINT_RISK_SNAPSHOT_FAIL", err=str(e)[:200])
+                    snap = await _rm.risk_capacity_snapshot()
+                except Exception as e:
+                    if ENTRY_DEBUG_LOG:
+                        _log_event("AI_MAINT_RISK_SNAPSHOT_FAIL", err=str(e)[:200])
 
             win_rate = float(_finite(snap.get("rolling_win_rate_pct", 0.0), 0.0))
             daily_pnl_pct = float(_finite(snap.get("daily_realized_pnl_pct", 0.0), 0.0))
@@ -1863,6 +1994,7 @@ async def diag_snapshot() -> dict[str, Any]:
         "has_openai_key": bool(os.getenv("OPENAI_API_KEY")),
         "ai_last_call_items": len(_AI_LAST_CALL),
         "model": _pick_entry_model({}),
+        "contract_no_io": _contract_no_io(),
     }
 
     try:

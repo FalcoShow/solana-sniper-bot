@@ -2,40 +2,65 @@
 from __future__ import annotations
 
 """
-daytrader.risk
---------------
+daytrader.risk — V3+++ (God-Tier Overhaul, Phase P5) — CANONICAL / LOCK-IN
+============================================================================
+
 Risk sizing + portfolio gates for the Daytrader stack (NOT the sniper stack).
 
-Design goals (God-Tier Overhaul / “no competing engines”)
+Design goals
+------------
 - Daytrader-only: MUST NOT silently compete with canonical sniper risk logic.
 - Deterministic, env-driven, production-safe.
 - Never raise to caller (best-effort persistence).
 - Fail-closed for NEW opens when critical inputs are missing, but allow SELL/risk-off.
 
 Provides
+--------
 - Portfolio gate: can we open a NEW position now? (max DD, max positions, exposure cap)
 - Volatility-aware sizing: fixed % risk per trade using stop distance (ATR-based).
 - Trailing stop helpers + optional break-even move.
+- Optional TP ladder generation (ATR-multiple ladder) when enabled.
+- Optional cooldowns after losses/blocks to prevent churn.
 - RiskManager.refine_intent(...) to refine TradeIntent from daytrader/features.py.
 
 Units
+-----
 - Quote-currency agnostic. Env names may still say *_SOL for legacy, but treat as QUOTE.
 
 Env (recommended)
+-----------------
+Core sizing:
 - DT_RISK_PCT                float  default 0.005    (0.5% of equity risk per trade)
 - DT_MIN_TRADE_QUOTE         float  default ""       (overrides DT_MIN_TRADE_SOL if set)
 - DT_MIN_TRADE_SOL           float  default 0.02     (legacy name; quote units)
 - DT_MAX_TRADE_QUOTE         float  default 0        (0 = no cap)
+- DT_SIZE_SAFETY_FRACTION    float  default 0.98     (leave dust for fees)
+
+Stops/targets:
 - DT_SL_ATR_MULT             float  default 1.5
 - DT_TP_ATR_MULT             float  default 3.0
 - DT_TRAIL_ATR_MULT          float  default 2.0
+- DT_BE_ATR_MULT             float  default 1.0      (move stop to breakeven after +k*ATR)
+
+Portfolio gates:
 - DT_MAX_CONCURRENT_POS      int    default 4
 - DT_DAILY_MAX_DD_PCT        float  default 0.03     (stop opens after -3% from peak)
 - DT_ENABLE_CIRCUIT_BREAKER  bool   default true
 - DT_MAX_GROSS_EXPOSURE_PCT  float  default 1.25     (125% of equity)
 - DT_MAX_ATR_PCT             float  default 0.30     (hard block opens if ATR% too high)
-- DT_BE_ATR_MULT             float  default 1.0      (move stop to breakeven after +k*ATR)
-- DT_SIZE_SAFETY_FRACTION    float  default 0.98     (leave dust for fees)
+
+Hard-stop guards (additional P5 safety):
+- DT_MAX_LOSS_PER_TRADE_PCT  float  default 0.02     (hard cap; blocks/reshapes opens if risk>cap)
+
+Optional cooldowns (anti-churn):
+- DT_COOLDOWN_AFTER_LOSS_SEC int    default 0        (0 disables)
+- DT_COOLDOWN_AFTER_BLOCK_SEC int   default 0        (0 disables)
+- DT_SYMBOL_COOLDOWN_MAX     int    default 256      (cap persisted cooldown map size)
+
+Optional TP ladder (ATR-based take-profit ladder):
+- DT_ENABLE_TP_LADDER        bool   default false
+- DT_TP_LADDER_ATR_MULTS     csv    default "1.5,3,6"
+- DT_TP_LADDER_SPLITS        csv    default "0.4,0.3,0.3"
 
 Optional (state)
 - DT_STATE_DIR               path   default ./state
@@ -45,16 +70,16 @@ Optional (state)
 import json
 import math
 import os
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
+
 # =============================================================================
 # Env helpers (safe, bounded)
 # =============================================================================
-
-
 def _is_finite(x: float) -> bool:
     return math.isfinite(x)
 
@@ -140,19 +165,48 @@ def _today_key_utc() -> str:
 
 
 def _json_dumps(obj: Any) -> str:
-    # Deterministic JSON (stable diffs)
     return json.dumps(obj, indent=2, sort_keys=True)
+
+
+def _parse_csv_floats(raw: str) -> list[float]:
+    out: list[float] = []
+    compact = (raw or "").replace(" ", "")
+    for part in compact.split(","):
+        if not part:
+            continue
+        try:
+            val = float(part)
+        except Exception:
+            continue
+        if _is_finite(val):
+            out.append(float(val))
+    return out
+
+
+def _cap_dict_size(d: dict[str, Any], max_items: int) -> None:
+    if max_items <= 0:
+        d.clear()
+        return
+    if len(d) <= max_items:
+        return
+    # Drop oldest by timestamp if values are numeric timestamps; else arbitrary pop
+    items = list(d.items())
+    try:
+        items.sort(key=lambda kv: float(kv[1]))
+        for k, _ in items[: max(0, len(items) - max_items)]:
+            d.pop(k, None)
+    except Exception:
+        while len(d) > max_items:
+            d.pop(next(iter(d)), None)
 
 
 # =============================================================================
 # Tunables (module-level, deterministic)
 # =============================================================================
-
 RISK_PCT: Final[float] = _clamp(
     _env_float("DT_RISK_PCT", 0.005, min_value=0.0, max_value=0.25), 0.0, 0.25
 )
 
-# Back-compat: DT_MIN_TRADE_SOL is quote-units floor; prefer DT_MIN_TRADE_QUOTE.
 _legacy_min_trade_sol: Final[float] = _env_float(
     "DT_MIN_TRADE_SOL", 0.02, min_value=0.0, max_value=1e12
 )
@@ -187,6 +241,31 @@ SIZE_SAFETY_FRACTION: Final[float] = _env_float(
     "DT_SIZE_SAFETY_FRACTION", 0.98, min_value=0.1, max_value=1.0
 )
 
+# P5 hard guard: cap per-trade loss
+MAX_LOSS_PER_TRADE_PCT: Final[float] = _env_float(
+    "DT_MAX_LOSS_PER_TRADE_PCT", 0.02, min_value=0.0, max_value=1.0
+)
+
+# Optional cooldowns
+COOLDOWN_AFTER_LOSS_SEC: Final[int] = _env_int(
+    "DT_COOLDOWN_AFTER_LOSS_SEC", 0, min_value=0, max_value=86_400
+)
+COOLDOWN_AFTER_BLOCK_SEC: Final[int] = _env_int(
+    "DT_COOLDOWN_AFTER_BLOCK_SEC", 0, min_value=0, max_value=86_400
+)
+SYMBOL_COOLDOWN_MAX: Final[int] = _env_int(
+    "DT_SYMBOL_COOLDOWN_MAX", 256, min_value=0, max_value=50_000
+)
+
+# Optional TP ladder
+ENABLE_TP_LADDER: Final[bool] = _env_bool("DT_ENABLE_TP_LADDER", False)
+TP_LADDER_ATR_MULTS: Final[list[float]] = _parse_csv_floats(
+    _env_str("DT_TP_LADDER_ATR_MULTS", "1.5,3,6")
+) or [1.5, 3.0, 6.0]
+TP_LADDER_SPLITS: Final[list[float]] = _parse_csv_floats(
+    _env_str("DT_TP_LADDER_SPLITS", "0.4,0.3,0.3")
+) or [0.4, 0.3, 0.3]
+
 DT_STATE_DIR = Path(_env_str("DT_STATE_DIR", "./state"))
 DT_RISK_STATE_FILE = _env_str("DT_RISK_STATE_FILE", "daytrader_risk_state.json")
 _STATE_PATH = DT_STATE_DIR / DT_RISK_STATE_FILE
@@ -200,8 +279,6 @@ except Exception:
 # =============================================================================
 # Data models
 # =============================================================================
-
-
 @dataclass
 class OpenContext:
     """
@@ -230,6 +307,7 @@ class RiskState:
     - day_key_utc: YYYY-MM-DD
     - equity_peak_quote: day peak used for DD checks
     - opens_blocked: latch to stop new opens for the day
+    - symbol_cooldown_until_ts: unix ts per symbol (optional anti-churn)
     """
 
     day_key_utc: str = ""
@@ -237,43 +315,65 @@ class RiskState:
     opens_blocked: bool = False
     blocked_reason: str = ""
     updated_at: str = ""
+    symbol_cooldown_until_ts: dict[str, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if d.get("symbol_cooldown_until_ts") is None:
+            d["symbol_cooldown_until_ts"] = {}
+        return d
 
     @staticmethod
     def from_dict(obj: dict[str, Any]) -> "RiskState":
         try:
+            cooldown_obj = obj.get("symbol_cooldown_until_ts")
+            cooldown_map: dict[str, float] = {}
+            if isinstance(cooldown_obj, dict):
+                for k, v in cooldown_obj.items():
+                    if not k:
+                        continue
+                    cooldown_map[str(k)] = _safe_float(v, 0.0)
+
             return RiskState(
                 day_key_utc=str(obj.get("day_key_utc") or ""),
                 equity_peak_quote=_safe_float(obj.get("equity_peak_quote"), 0.0),
                 opens_blocked=bool(obj.get("opens_blocked") or False),
                 blocked_reason=str(obj.get("blocked_reason") or ""),
                 updated_at=str(obj.get("updated_at") or ""),
+                symbol_cooldown_until_ts=cooldown_map,
             )
         except Exception:
-            return RiskState()
+            return RiskState(symbol_cooldown_until_ts={})
 
 
 # =============================================================================
 # Persistence (best-effort, never raises)
 # =============================================================================
-
-
 def _load_state() -> RiskState:
     st: RiskState
     try:
         if not _STATE_PATH.exists():
-            st = RiskState(day_key_utc=_today_key_utc(), updated_at=_now_iso())
+            st = RiskState(
+                day_key_utc=_today_key_utc(), updated_at=_now_iso(), symbol_cooldown_until_ts={}
+            )
         else:
             txt = _STATE_PATH.read_text(encoding="utf-8", errors="replace").strip()
             if not txt:
-                st = RiskState(day_key_utc=_today_key_utc(), updated_at=_now_iso())
+                st = RiskState(
+                    day_key_utc=_today_key_utc(), updated_at=_now_iso(), symbol_cooldown_until_ts={}
+                )
             else:
                 data = json.loads(txt)
-                st = RiskState.from_dict(data) if isinstance(data, dict) else RiskState()
+                st = (
+                    RiskState.from_dict(data)
+                    if isinstance(data, dict)
+                    else RiskState(symbol_cooldown_until_ts={})
+                )
     except Exception:
-        st = RiskState()
+        st = RiskState(symbol_cooldown_until_ts={})
+
+    if st.symbol_cooldown_until_ts is None:
+        st.symbol_cooldown_until_ts = {}
 
     today = _today_key_utc()
     if st.day_key_utc != today:
@@ -283,6 +383,7 @@ def _load_state() -> RiskState:
             opens_blocked=False,
             blocked_reason="",
             updated_at=_now_iso(),
+            symbol_cooldown_until_ts={},
         )
     return st
 
@@ -301,6 +402,11 @@ def _save_state(st: RiskState) -> None:
 # =============================================================================
 # Bar math (ATR)
 # =============================================================================
+def _bar_get(b: dict[str, Any], *keys: str) -> float:
+    for k in keys:
+        if k in b:
+            return _safe_float(b.get(k), 0.0)
+    return 0.0
 
 
 def _atr_abs_from_bars(bars: list[dict[str, Any]], period: int = 14) -> float | None:
@@ -310,9 +416,9 @@ def _atr_abs_from_bars(bars: list[dict[str, Any]], period: int = 14) -> float | 
 
     true_ranges: list[float] = []
     for idx in range(1, len(bars)):
-        prev_close = _safe_float(bars[idx - 1].get("c"), 0.0)
-        high_px = _safe_float(bars[idx].get("h"), 0.0)
-        low_px = _safe_float(bars[idx].get("l"), 0.0)  # key is "l"; variable is NOT `l`
+        prev_close = _bar_get(bars[idx - 1], "c", "close")
+        high_px = _bar_get(bars[idx], "h", "high")
+        low_px = _bar_get(bars[idx], "l", "low")  # key is "l"; variable is NOT ambiguous
 
         if prev_close <= 0.0 or high_px <= 0.0 or low_px <= 0.0:
             continue
@@ -330,7 +436,7 @@ def _atr_pct_from_bars(bars: list[dict[str, Any]], period: int = 14) -> float | 
     atr_abs = _atr_abs_from_bars(bars, period=period)
     if atr_abs is None:
         return None
-    last_close = _safe_float(bars[-1].get("c"), 0.0)
+    last_close = _bar_get(bars[-1], "c", "close")
     if last_close <= 0.0:
         return None
     return float(atr_abs) / float(last_close)
@@ -339,8 +445,6 @@ def _atr_pct_from_bars(bars: list[dict[str, Any]], period: int = 14) -> float | 
 # =============================================================================
 # Public helpers (kept stable)
 # =============================================================================
-
-
 def atr_to_price(atr_pct: float, price_quote: float) -> float:
     ap = _safe_float(atr_pct, 0.0)
     px = _safe_float(price_quote, 0.0)
@@ -356,7 +460,13 @@ def size_from_risk(balance_quote: float, entry_price_quote: float, atr_price: fl
     if bal <= 0.0 or entry_px <= 0.0 or atr_abs <= 0.0:
         return 0.0
 
+    # nominal risk per trade
     risk_amt = max(0.0, bal * max(0.0, RISK_PCT))
+
+    # hard cap risk (P5)
+    if MAX_LOSS_PER_TRADE_PCT > 0.0:
+        risk_amt = min(risk_amt, bal * MAX_LOSS_PER_TRADE_PCT)
+
     stop_dist = max(1e-12, SL_ATR_MULT * atr_abs)
     qty_token = risk_amt / stop_dist
     notional = qty_token * entry_px
@@ -436,15 +546,26 @@ def should_move_to_break_even(
 
 
 def normalize_stop(
-    entry_price_quote: float, raw_stop: float, min_tick: float | None = None
+    entry_price_quote: float,
+    raw_stop: float,
+    min_tick: float | None = None,
+    side: str = "buy",
 ) -> float:
+    """
+    Backward-compatible helper with added `side` (default buy).
+    Ensures stops are on the correct side of entry.
+    """
     entry_px = _safe_float(entry_price_quote, 0.0)
     stop_px = _safe_float(raw_stop, 0.0)
     if stop_px <= 0.0:
         return 0.0
 
+    s = (side or "buy").lower().strip()
     if entry_px > 0.0:
-        stop_px = max(1e-12, min(entry_px, stop_px))
+        if s == "sell":
+            stop_px = max(1e-12, max(entry_px, stop_px))
+        else:
+            stop_px = max(1e-12, min(entry_px, stop_px))
     else:
         stop_px = max(1e-12, stop_px)
 
@@ -455,10 +576,60 @@ def normalize_stop(
 
 
 # =============================================================================
+# TP ladder (optional)
+# =============================================================================
+def tp_ladder_from_atr(
+    entry_price_quote: float,
+    atr_price: float,
+    *,
+    side: str = "buy",
+    atr_mults: list[float] | None = None,
+    splits: list[float] | None = None,
+) -> list[dict[str, float]]:
+    """
+    Build a TP ladder as a list of {price, fraction} steps.
+    Only used when DT_ENABLE_TP_LADDER is enabled.
+    """
+    entry_px = _safe_float(entry_price_quote, 0.0)
+    atr_abs = _safe_float(atr_price, 0.0)
+    if entry_px <= 0.0 or atr_abs <= 0.0:
+        return []
+
+    s = (side or "buy").lower().strip()
+    mults = atr_mults or TP_LADDER_ATR_MULTS
+    fracs = splits or TP_LADDER_SPLITS
+
+    m2 = [float(x) for x in mults if _is_finite(float(x)) and float(x) > 0.0]
+    f2 = [float(x) for x in fracs if _is_finite(float(x)) and float(x) > 0.0]
+    if not m2 or not f2:
+        return []
+
+    # normalize fractions to sum 1.0
+    ssum = sum(f2)
+    if ssum <= 0.0:
+        return []
+    f2 = [x / ssum for x in f2]
+
+    # align lengths: repeat last fraction if needed
+    if len(f2) < len(m2):
+        f2 = f2 + [f2[-1]] * (len(m2) - len(f2))
+    if len(m2) < len(f2):
+        f2 = f2[: len(m2)]
+
+    out: list[dict[str, float]] = []
+    for mult, frac in zip(m2, f2, strict=False):
+        if s == "sell":
+            tp_px = max(1e-12, entry_px - (mult * atr_abs))
+        else:
+            tp_px = max(1e-12, entry_px + (mult * atr_abs))
+        out.append({"price": float(tp_px), "fraction": float(_clamp(frac, 0.0, 1.0))})
+
+    return out
+
+
+# =============================================================================
 # Portfolio gate
 # =============================================================================
-
-
 def can_open_position(ctx: OpenContext) -> RiskDecision:
     eq = _safe_float(ctx.equity_quote, 0.0)
     peak = _safe_float(ctx.equity_peak_quote, 0.0)
@@ -499,20 +670,19 @@ def can_open_position(ctx: OpenContext) -> RiskDecision:
 
 def risk_summary() -> str:
     return (
-        f"[dt_risk] RISK_PCT={RISK_PCT:.3%} MIN_TRADE_Q={MIN_TRADE_QUOTE:.6f} "
-        f"MAX_TRADE_Q={MAX_TRADE_QUOTE:.6f} SLxATR={SL_ATR_MULT:.2f} "
-        f"TPxATR={TP_ATR_MULT:.2f} TRAILxATR={TRAIL_ATR_MULT:.2f} "
+        f"[dt_risk] RISK_PCT={RISK_PCT:.3%} MAX_LOSS_TRADE={MAX_LOSS_PER_TRADE_PCT:.2%} "
+        f"MIN_TRADE_Q={MIN_TRADE_QUOTE:.6f} MAX_TRADE_Q={MAX_TRADE_QUOTE:.6f} "
+        f"SLxATR={SL_ATR_MULT:.2f} TPxATR={TP_ATR_MULT:.2f} TRAILxATR={TRAIL_ATR_MULT:.2f} "
         f"MAX_POS={MAX_CONCURRENT_POS} DAILY_MAX_DD={DAILY_MAX_DD_PCT:.2%} "
         f"CIRCUIT={'on' if ENABLE_CIRCUIT_BREAKER else 'off'} "
-        f"GROSS_CAP={MAX_GROSS_EXPOSURE_PCT:.0%} MAX_ATR%={MAX_ATR_PCT:.2f}"
+        f"GROSS_CAP={MAX_GROSS_EXPOSURE_PCT:.0%} MAX_ATR%={MAX_ATR_PCT:.2f} "
+        f"TP_LADDER={'on' if ENABLE_TP_LADDER else 'off'}"
     )
 
 
 # =============================================================================
 # RiskManager (preferred API)
 # =============================================================================
-
-
 class RiskManager:
     """
     Refines TradeIntent objects produced by daytrader/features.py.
@@ -520,6 +690,7 @@ class RiskManager:
     - BUY: gates opens, ensures stop/tp, computes risk-based sizing (size_frac).
     - SELL: passes through (risk-off) with basic sanity.
     - Persistence: per-day peak + optional latch block. Best-effort IO.
+    - Optional symbol cooldowns (anti-churn).
     """
 
     def __init__(self) -> None:
@@ -532,6 +703,7 @@ class RiskManager:
             opens_blocked=False,
             blocked_reason="",
             updated_at=_now_iso(),
+            symbol_cooldown_until_ts={},
         )
         _save_state(self._st)
 
@@ -549,6 +721,22 @@ class RiskManager:
     def latch_block(self, reason: str) -> None:
         self._st.opens_blocked = True
         self._st.blocked_reason = str(reason or "blocked")
+        _save_state(self._st)
+
+    def _cooldown_until(self, symbol: str) -> float:
+        m = self._st.symbol_cooldown_until_ts or {}
+        return _safe_float(m.get(symbol, 0.0), 0.0)
+
+    def _set_cooldown(self, symbol: str, seconds: int, reason: str) -> None:
+        if seconds <= 0 or not symbol:
+            return
+        m = self._st.symbol_cooldown_until_ts
+        if m is None:
+            m = {}
+            self._st.symbol_cooldown_until_ts = m
+        until_ts = float(time.time()) + float(seconds)
+        m[str(symbol)] = until_ts
+        _cap_dict_size(m, SYMBOL_COOLDOWN_MAX)
         _save_state(self._st)
 
     def can_open(self, ctx: OpenContext) -> RiskDecision:
@@ -595,7 +783,7 @@ class RiskManager:
         Refine and validate intent. Returns modified intent, or None to reject.
         Never raises.
 
-        Expected intent shape:
+        Expected intent shape (best-effort):
           - intent.side in {"buy","sell","hold"}
           - intent.size_frac in [0..1]
           - intent.stop / intent.take_profit are prices (quote per token)
@@ -604,21 +792,26 @@ class RiskManager:
             if intent is None:
                 return None
 
+            sym = str(symbol or "").strip()
             side = str(getattr(intent, "side", "")).lower().strip()
             if side not in ("buy", "sell"):
                 return None
 
-            last_px = _safe_float(bars[-1].get("c"), 0.0) if bars else 0.0
+            if sym and self._cooldown_until(sym) > float(time.time()):
+                return None
+
+            last_px = _bar_get(bars[-1], "c", "close") if bars else 0.0
             if last_px <= 0.0:
                 return None
 
             atr_abs = _atr_abs_from_bars(bars, period=14) or 0.0
             atr_pct = _atr_pct_from_bars(bars, period=14)
 
+            # BUY gate: fail-closed without equity context
             if side == "buy":
                 eq = _safe_float(equity_quote, 0.0)
                 if eq <= 0.0:
-                    return None  # fail-closed for opens without equity context
+                    return None
 
                 peak = _safe_float(equity_peak_quote, 0.0)
                 ctx = OpenContext(
@@ -631,11 +824,14 @@ class RiskManager:
                 )
                 dec = self.can_open(ctx)
                 if not dec.ok:
+                    if sym and COOLDOWN_AFTER_BLOCK_SEC > 0:
+                        self._set_cooldown(sym, COOLDOWN_AFTER_BLOCK_SEC, reason=dec.reason)
                     return None
 
             stop_px = _safe_float(getattr(intent, "stop", 0.0), 0.0)
             tp_px = _safe_float(getattr(intent, "take_profit", 0.0), 0.0)
 
+            # Derive stop/tp if missing and ATR available
             if atr_abs > 0.0 and (stop_px <= 0.0 or tp_px <= 0.0):
                 derived_stop, derived_tp = stops_from_atr(last_px, atr_abs, side=side)
                 if stop_px <= 0.0:
@@ -643,6 +839,7 @@ class RiskManager:
                 if tp_px <= 0.0:
                     tp_px = derived_tp
 
+            # Sanity correct stop/tp
             if side == "buy":
                 if stop_px <= 0.0 or stop_px >= last_px:
                     if atr_abs > 0.0:
@@ -655,12 +852,14 @@ class RiskManager:
                     else:
                         return None
             else:
+                # sells are risk-off; keep reasonable if ATR available
                 if atr_abs > 0.0:
                     if stop_px <= 0.0 or stop_px <= last_px:
                         stop_px = max(1e-12, last_px + SL_ATR_MULT * atr_abs)
                     if tp_px <= 0.0 or tp_px >= last_px:
                         tp_px = max(1e-12, last_px - TP_ATR_MULT * atr_abs)
 
+            # BUY sizing (risk based)
             if side == "buy":
                 eq = _safe_float(equity_quote, 0.0)
                 if eq <= 0.0:
@@ -672,7 +871,11 @@ class RiskManager:
                 if stop_dist <= 0.0:
                     return None
 
+                # risk amount with hard cap (P5)
                 risk_amt = max(0.0, eq * max(0.0, RISK_PCT))
+                if MAX_LOSS_PER_TRADE_PCT > 0.0:
+                    risk_amt = min(risk_amt, eq * MAX_LOSS_PER_TRADE_PCT)
+
                 qty_token = risk_amt / max(1e-12, stop_dist)
                 notional = qty_token * last_px
 
@@ -685,28 +888,50 @@ class RiskManager:
 
                 intent.size_frac = float(_clamp(notional / eq, 0.0, 1.0))
 
+            # Attach stop/tp
             intent.stop = float(stop_px)
             intent.take_profit = float(tp_px)
+
+            # Optional TP ladder (non-breaking: set only if attribute is writable)
+            if ENABLE_TP_LADDER and atr_abs > 0.0:
+                ladder = tp_ladder_from_atr(last_px, atr_abs, side=side)
+                if ladder:
+                    # Try multiple conventional attribute names without breaking slots
+                    for attr in ("tp_ladder", "take_profit_ladder", "tp_steps"):
+                        try:
+                            setattr(intent, attr, ladder)
+                            break
+                        except Exception:
+                            continue
+
             return intent
 
         except Exception:
+            # Optional: cooldown after loss is enforced by the caller when loss realized.
             return None
 
 
 __all__ = [
     "BE_ATR_MULT",
+    "COOLDOWN_AFTER_BLOCK_SEC",
+    "COOLDOWN_AFTER_LOSS_SEC",
     "DAILY_MAX_DD_PCT",
     "ENABLE_CIRCUIT_BREAKER",
+    "ENABLE_TP_LADDER",
     "MAX_ATR_PCT",
     "MAX_CONCURRENT_POS",
     "MAX_GROSS_EXPOSURE_PCT",
+    "MAX_LOSS_PER_TRADE_PCT",
     "MAX_TRADE_QUOTE",
     "MIN_TRADE_QUOTE",
     "MIN_TRADE_SOL",
     "RISK_PCT",
     "SIZE_SAFETY_FRACTION",
     "SL_ATR_MULT",
+    "SYMBOL_COOLDOWN_MAX",
     "TP_ATR_MULT",
+    "TP_LADDER_ATR_MULTS",
+    "TP_LADDER_SPLITS",
     "TRAIL_ATR_MULT",
     "OpenContext",
     "RiskDecision",
@@ -720,6 +945,7 @@ __all__ = [
     "should_move_to_break_even",
     "size_from_risk",
     "stops_from_atr",
+    "tp_ladder_from_atr",
     "trailing_stop_from_high",
     "update_trailing_stop",
 ]

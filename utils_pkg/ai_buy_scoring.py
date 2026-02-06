@@ -45,13 +45,6 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from logging_setup import get_logger
-
-try:
-    log = get_logger(__name__)
-except TypeError:
-    log = get_logger()
-
 __all__ = [
     "Candidate",
     "explain",
@@ -61,6 +54,32 @@ __all__ = [
     "pass_gate",
     "score_only",
 ]
+
+
+# =============================================================================
+# Logging (logging_setup / log_compat compatible if present)
+# =============================================================================
+
+
+def _get_logger(name: str):
+    """
+    Keep compatibility with projects that provide logging_setup.get_logger()
+    with either (name) or () signatures; fall back to stdlib logging.
+    """
+    try:
+        from logging_setup import get_logger as _gl  # type: ignore
+    except Exception:  # pragma: no cover
+        import logging
+
+        return logging.getLogger(name)
+
+    try:
+        return _gl(name)
+    except TypeError:
+        return _gl()
+
+
+log = _get_logger(__name__)
 
 
 # =============================================================================
@@ -82,16 +101,16 @@ def _as_float(x: Any, fallback: float = 0.0) -> float:
 
 def _as_int(x: Any, fallback: int = 0) -> int:
     if x is None:
-        return fallback
+        return int(fallback)
     try:
         return int(x)
     except Exception:
-        return fallback
+        return int(fallback)
 
 
 def _clamp(x: Any, lo: float = 0.0, hi: float = 1.0) -> float:
     v = _as_float(x, lo)
-    return max(lo, min(hi, v))
+    return max(float(lo), min(float(hi), v))
 
 
 def _safe_div(n: Any, d: Any, fallback: float = 0.0) -> float:
@@ -349,8 +368,8 @@ class Candidate:
         self.top10_pct = _as_float(self.top10_pct, 100.0)
         self.honeypot_flag = bool(self.honeypot_flag)
         self.whale_touches_1h = _as_int(self.whale_touches_1h, 0)
-        if self.meta is None:
-            self.meta = {}
+        # meta is typed as dict, but tolerate callers passing None at runtime
+        self.meta = self.meta or {}
 
 
 # =============================================================================
@@ -619,7 +638,6 @@ def _hard_filters(c: Candidate) -> tuple[bool, list[str], dict[str, str]]:
     # Liquidity (pump infra softening)
     if c.liq_usd < AI_MIN_LIQ_USD:
         if AI_INFRA_NO_ACCOUNT_SOFT_LIQ and bool(c.infra_no_account) and _is_pump_source(c.source):
-            # do not hard reject; we'll penalize softly (and keep a detail marker)
             details["LOW_LIQ_SOFT"] = f"${c.liq_usd:,.0f}<${AI_MIN_LIQ_USD:,.0f}"
         else:
             add("LOW_LIQ", f"${c.liq_usd:,.0f}<${AI_MIN_LIQ_USD:,.0f}")
@@ -750,8 +768,7 @@ def _hard_filters(c: Candidate) -> tuple[bool, list[str], dict[str, str]]:
         AI_CTX_LOCK_AFTER_TARGET_PNL > 0
         and c.ctx_daily_pnl_pct is not None
         and c.ctx_risk_mode is not None
-    ) and (
-        _as_float(c.ctx_daily_pnl_pct, 0.0) >= AI_CTX_LOCK_AFTER_TARGET_PNL
+        and _as_float(c.ctx_daily_pnl_pct, 0.0) >= AI_CTX_LOCK_AFTER_TARGET_PNL
         and _as_float(c.ctx_risk_mode, 1.0) <= 1.0
     ):
         add(
@@ -764,7 +781,7 @@ def _hard_filters(c: Candidate) -> tuple[bool, list[str], dict[str, str]]:
         AI_CTX_MAX_OPEN_POS_RATIO > 0
         and c.ctx_open_positions is not None
         and c.ctx_max_positions is not None
-        and _as_float(c.ctx_max_positions, 0.0) > 0
+        and _as_float(c.ctx_max_positions, 0.0) > 0.0
     ):
         ratio = _safe_div(
             _as_float(c.ctx_open_positions, 0.0), _as_float(c.ctx_max_positions, 0.0), 0.0
@@ -1345,7 +1362,7 @@ def _compute_score_detail(c: Candidate) -> dict[str, Any]:
     base_threshold = float(_source_gate_threshold(c.source))
     size_scalar = _size_scalar_from_candidate(c, entry_quality)
 
-    out: dict[str, Any] = {
+    return {
         "ok_hard": hard_ok,
         "hard_reasons": hard_reasons,
         "hard_details": hard_details,
@@ -1363,13 +1380,12 @@ def _compute_score_detail(c: Candidate) -> dict[str, Any]:
         "risk_bucket_utilization": _clamp(_as_float(c.risk_bucket_utilization, 0.0), 0.0, 2.0),
         "ctx_global_block_flag": _as_float(c.ctx_global_block_flag, 0.0),
         "base_gate_threshold": float(base_threshold),
-        "gate_threshold": float(base_threshold),  # may be updated in gate phase
+        "gate_threshold": float(base_threshold),  # updated in gate phase
         "entry_tier": _as_float(c.entry_tier_bucket, 0.0),
         "position_size_tier": _as_float(c.position_size_bucket, 0.0),
         "source": _normalize_source_key(c.source),
         "infra_no_account": bool(c.infra_no_account),
     }
-    return out
 
 
 def _apply_dynamic_threshold(
@@ -1417,13 +1433,12 @@ def _apply_dynamic_threshold(
 def _soft_explain(parts: dict[str, float], topk: int) -> dict[str, Any]:
     """
     Explain score drivers without leaking weights into reason strings.
-    Returns top positive + top negative parts (by distance from 0.5).
+    Returns top positive + top negative parts (by value).
     """
     items = [(k, float(v)) for k, v in (parts or {}).items() if isinstance(v, int | float)]
     if not items:
         return {"top_pos": [], "top_neg": []}
 
-    # positive: high values, negative: low values
     top_pos = sorted(items, key=lambda kv: kv[1], reverse=True)[: max(1, topk)]
     top_neg = sorted(items, key=lambda kv: kv[1])[: max(1, topk)]
     return {
@@ -1486,14 +1501,12 @@ def explain(c: Candidate) -> dict[str, Any]:
     detail["gate_threshold"] = float(final_thr)
     detail["gate_notes"] = list(notes)
 
-    # soft explain: top drivers (not weights, just component values)
     try:
         parts = detail.get("parts") or {}
         detail["soft_explain"] = _soft_explain(parts, topk=max(1, AI_BUY_EXPLAIN_TOPK))
     except Exception:
         detail["soft_explain"] = {"top_pos": [], "top_neg": []}
 
-    # add a compact machine-friendly delta field
     detail["gate_margin"] = round(score - float(final_thr), 6)
 
     if AI_BUY_ATTACH_PARTS and "parts_json" not in detail:
@@ -1549,8 +1562,7 @@ def pass_gate(c: Candidate) -> tuple[bool, float, str]:
 
     # If risk_mode explicitly off, emit a clear stable reason
     if c.ctx_risk_mode is not None and _as_float(c.ctx_risk_mode, 1.0) <= 0.0:
-        msg = f"RISK_MODE_OFF score={score:.3f} thr={thr:.3f}"
-        return False, score, msg
+        return False, score, f"RISK_MODE_OFF score={score:.3f} thr={thr:.3f}"
 
     if score >= thr:
         msg = f"PASS score={score:.3f} thr={thr:.3f} size={float(d['size_scalar']):.2f}"
@@ -1719,7 +1731,8 @@ def from_feature_vector(feats: dict[str, Any]) -> Candidate:
             _pick(feats, "impact_1k_bps", "impact_1000usd_bps", default=999.0), 999.0
         ),
         vol5m_pct=_as_float(
-            _pick(feats, "vol5m_pct", "vol_5m_pct", "price_change_5m_pct", "chg5", default=0.0), 0.0
+            _pick(feats, "vol5m_pct", "vol_5m_pct", "price_change_5m_pct", "chg5", default=0.0),
+            0.0,
         ),
         top10_pct=_as_float(_pick(feats, "top10_pct", default=100.0), 100.0),
         honeypot_flag=bool(_pick(feats, "honeypot_flag", "rug_risk", "is_honeypot", default=False)),
@@ -1832,7 +1845,6 @@ def gate_feature_vector(feats: dict[str, Any]) -> tuple[bool, float, str]:
     """
     cand = from_feature_vector(feats)
 
-    # one-pass scoring detail
     d = _compute_score_detail(cand)
     ok_hard = bool(d["ok_hard"])
     score = float(d["score"])
@@ -1867,7 +1879,6 @@ def gate_feature_vector(feats: dict[str, Any]) -> tuple[bool, float, str]:
                     if notes:
                         reason += " [" + ",".join(notes) + "]"
 
-    # write feature fields
     feats["ai_buy_score"] = float(score)
     feats["ai_buy_ok_hard"] = bool(ok_hard)
     feats["ai_buy_pass_gate"] = bool(ok)
