@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bootstrap_pro_overlay.py
+bootstrap_pre_overlay.py
 
 Turn-key readiness + bootstrap for the Solana sniper/daytrader stack.
 
@@ -11,27 +11,21 @@ What it does
   * Helius/Solana RPC
   * Jupiter v6 quote API
   * Redis
-  * Postgres (optional: migrate schema)
+  * Postgres (optional: migrate schema)  [uses asyncpg; NO greenlet needed]
   * Notion DB schema sanity
-  * Telegram token format (optional send ping)
+  * Telegram token format (optional)
 - Emits a readiness matrix and optional Render start instructions
 
 Usage
 =====
-  python bootstrap_pro_overlay.py --check-all
-  python bootstrap_pro_overlay.py --check-all --migrate-db
-  python bootstrap_pro_overlay.py --emit-render-readme
+  python bootstrap_pre_overlay.py --check-all
+  python bootstrap_pre_overlay.py --check-all --migrate-db
+  python bootstrap_pre_overlay.py --emit-render-readme
 
-Flags
-=====
-  --check-all          : run every connectivity check
-  --migrate-db         : create/alter 'trades' table + indexes if PG enabled
-  --notion-check       : validate Notion DB properties match your mapping
-  --emit-render-readme : print a snippet you can paste into README for Render
-  --timeout SEC        : network timeout (default 12)
-  --verbose            : more logs
-  --no-color           : disable ANSI colors
-  --json               : print JSON summary (good for CI / logs)
+Exit contract
+=============
+- Exit 0 if all REQUIRED checks pass (optional failures are warnings)
+- Exit 2 if any REQUIRED check fails
 """
 
 from __future__ import annotations
@@ -42,77 +36,73 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional third-party imports (script remains importable without them)
+# Keep them typed as Any|None to avoid mypy locking them to Module types.
 # ──────────────────────────────────────────────────────────────────────────────
-# Optional third-party imports (script remains importable without them)
-find_dotenv: Any | None
-load_dotenv: Any | None
-aiohttp: Any | None
-aioredis: Any | None
-sa_text: Any | None
-create_async_engine: Any | None
+
+find_dotenv: Any | None = None
+load_dotenv: Any | None = None
+aiohttp: Any | None = None
+redis_asyncio: Any | None = None
+asyncpg: Any | None = None
 
 try:
     from dotenv import find_dotenv as _find_dotenv, load_dotenv as _load_dotenv
 except Exception:  # pragma: no cover
-    _find_dotenv = None
-    _load_dotenv = None
-
-find_dotenv = _find_dotenv
-load_dotenv = _load_dotenv
+    pass
+else:
+    find_dotenv = _find_dotenv
+    load_dotenv = _load_dotenv
 
 try:
     import aiohttp as _aiohttp
 except Exception:  # pragma: no cover
-    _aiohttp = None
-
-aiohttp = _aiohttp
-
-_aioredis: Any | None
-try:
-    import redis.asyncio as _aioredis
-except Exception:  # pragma: no cover
-    _aioredis = None
-
-aioredis = _aioredis
+    pass
+else:
+    aiohttp = _aiohttp
 
 try:
-    from sqlalchemy import text as _sa_text
-    from sqlalchemy.ext.asyncio import create_async_engine as _create_async_engine
+    import redis.asyncio as _redis_asyncio
 except Exception:  # pragma: no cover
-    _sa_text = None
-    _create_async_engine = None
+    pass
+else:
+    redis_asyncio = _redis_asyncio
 
-sa_text = _sa_text
-create_async_engine = _create_async_engine
-
+try:
+    import asyncpg as _asyncpg
+except Exception:  # pragma: no cover
+    pass
+else:
+    asyncpg = _asyncpg
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────────────────────────────────────
+
 LOG = logging.getLogger("bootstrap")
 
 
 def _setup_logging(verbose: bool) -> None:
-    # Avoid duplicate handlers if imported/re-run.
     if any(isinstance(h, logging.StreamHandler) for h in LOG.handlers):
         LOG.setLevel(logging.DEBUG if verbose else logging.INFO)
         return
-
-    h = logging.StreamHandler(sys.stdout)
-    h.setFormatter(logging.Formatter("%(levelname)s:%(name)s: %(message)s"))
-    LOG.addHandler(h)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s: %(message)s"))
+    LOG.addHandler(handler)
     LOG.setLevel(logging.DEBUG if verbose else logging.INFO)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
 _FALSE = {"0", "false", "f", "no", "n", "off"}
 
@@ -140,45 +130,9 @@ def _looks_like_hosted_env() -> bool:
     return os.getenv("ENV", "").strip().lower() in ("prod", "production")
 
 
-def _normalize_pg_dsn(raw: str) -> str:
-    """
-    Normalize common Postgres DSN forms to something sqlalchemy async can use.
-    - postgres://  -> postgresql+asyncpg://
-    - postgresql:// -> postgresql+asyncpg://
-    Leaves already-async dialects untouched.
-    """
-    dsn = raw.strip()
-    if not dsn:
-        return dsn
-    if "://" not in dsn:
-        return dsn
-
-    # Already explicit async dialect
-    if dsn.startswith("postgresql+asyncpg://"):
-        return dsn
-
-    if dsn.startswith("postgres://"):
-        return "postgresql+asyncpg://" + dsn[len("postgres://") :]
-    if dsn.startswith("postgresql://"):
-        return "postgresql+asyncpg://" + dsn[len("postgresql://") :]
-    return dsn
-
-
-def _safe_int(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(float(raw))
-    except Exception:
-        return default
-
-
 def _supports_color(no_color: bool) -> bool:
     if no_color:
         return False
-    # Contract-safe: do not reference extra env vars here.
-    # Auto-disable colors unless stdout is a TTY.
     return bool(getattr(sys.stdout, "isatty", lambda: False)())
 
 
@@ -205,48 +159,27 @@ def _bold(s: str, enabled: bool) -> str:
 
 
 def _redact_value(key: str, value: str) -> str:
-    """
-    Never print secrets raw in README output.
-    """
     if not value:
         return "<set me>"
-
     k = key.upper()
     is_secret = any(
-        frag in k
-        for frag in (
-            "PRIVATE",
-            "SECRET",
-            "TOKEN",
-            "API_KEY",
-            "PASSWORD",
-            "DSN",
-        )
+        frag in k for frag in ("PRIVATE", "SECRET", "TOKEN", "API_KEY", "PASSWORD", "DSN")
     )
     if not is_secret:
         return value
-
-    # Keep short values fully hidden too.
     if len(value) <= 8:
         return "<redacted>"
-
-    # If it's obviously a JSON list (wallet arrays), redact completely.
     if value.lstrip().startswith("[") and value.rstrip().endswith("]"):
         return "<redacted>"
-
     return f"{value[:3]}…{value[-3:]}"
 
 
 async def _safe_read_json(resp: Any) -> tuple[dict[str, Any], str]:
-    """
-    Try parse JSON; also return a safe text snippet for debugging.
-    """
     text = ""
     try:
         text = await resp.text()
     except Exception:
         text = ""
-
     try:
         data = await resp.json(content_type=None)
         if isinstance(data, dict):
@@ -256,38 +189,71 @@ async def _safe_read_json(resp: Any) -> tuple[dict[str, Any], str]:
         return {"_json_parse_failed": True}, text[:240]
 
 
+def _pick_pg_dsn_raw() -> str:
+    return (
+        os.getenv("PG_DSN") or os.getenv("PG_DSN_INTERNAL") or os.getenv("PG_DSN_EXTERNAL") or ""
+    ).strip()
+
+
+def _normalize_pg_dsn_for_asyncpg(raw: str) -> str:
+    """
+    asyncpg expects postgres:// or postgresql:// style DSNs.
+    If someone stored postgresql+asyncpg://, convert it.
+    """
+    dsn = raw.strip()
+    if not dsn:
+        return dsn
+    if dsn.startswith("postgresql+asyncpg://"):
+        return "postgresql://" + dsn[len("postgresql+asyncpg://") :]
+    return dsn
+
+
+def _dns_probe(url: str) -> tuple[bool, str]:
+    """
+    Best-effort DNS probe so we can emit a clean warning when DNS is the issue.
+    """
+    try:
+        host = urlparse(url).hostname
+        if not host:
+            return False, "invalid URL (no hostname)"
+        socket.getaddrinfo(host, 443)
+        return True, "dns_ok"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Data structures
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 @dataclass(frozen=True)
 class CheckResult:
     name: str
     ok: bool
     detail: str = ""
-    severity: str = "required"  # "required" | "optional"
+    severity: str = "required"  # required | optional
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Env validation
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 def validate_env() -> list[CheckResult]:
     out: list[CheckResult] = []
 
-    # Wallet (required for live; still validate)
     wp = os.getenv("WALLET_PUBKEY", "").strip()
     wpk = os.getenv("WALLET_PRIVATE_KEY", "").strip()
     out.append(CheckResult("WALLET_PUBKEY", bool(wp), "set" if wp else "missing"))
     out.append(CheckResult("WALLET_PRIVATE_KEY", bool(wpk), "set" if wpk else "missing"))
 
-    # RPC
     rpc = (os.getenv("HELIUS_RPC_URL") or os.getenv("RPC_URL") or "").strip()
     out.append(CheckResult("HELIUS_RPC_URL/RPC_URL", bool(rpc), "set" if rpc else "missing"))
 
-    # Redis (required for most prod modes)
     red_url = os.getenv("REDIS_URL", "").strip()
     out.append(CheckResult("REDIS_URL", bool(red_url), "set" if red_url else "missing"))
 
-    # Postgres
     pg_enabled = env_bool("PG_ENABLED", False)
     out.append(
         CheckResult("PG_ENABLED", True, "true" if pg_enabled else "false", severity="optional")
@@ -304,7 +270,6 @@ def validate_env() -> list[CheckResult]:
         )
         out.append(CheckResult("PG DSNs", any_dsn, detail))
 
-    # Notion (optional)
     notion_key = (os.getenv("NOTION_API_KEY") or "").strip()
     notion_db = (os.getenv("NOTION_DB_TRADES") or "").strip()
     out.append(
@@ -324,7 +289,6 @@ def validate_env() -> list[CheckResult]:
         )
     )
 
-    # Telegram (optional)
     tg_token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     tg_chat = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
     out.append(
@@ -344,10 +308,8 @@ def validate_env() -> list[CheckResult]:
         )
     )
 
-    # Jupiter (public)
     out.append(CheckResult("JUPITER v6", True, "public; no API key required", severity="optional"))
 
-    # OpenAI (optional)
     openai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     out.append(
         CheckResult(
@@ -364,16 +326,16 @@ def validate_env() -> list[CheckResult]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Connectivity checks
 # ──────────────────────────────────────────────────────────────────────────────
-async def check_rpc(session: Any, timeout: int) -> CheckResult:
+
+
+async def check_rpc(session: Any) -> CheckResult:
     rpc = (os.getenv("HELIUS_RPC_URL") or os.getenv("RPC_URL") or "").strip()
     if not rpc:
         return CheckResult("RPC ping", False, "RPC env missing")
-
     payload = {"jsonrpc": "2.0", "id": 1, "method": "getHealth"}
     try:
         async with session.post(rpc, json=payload) as resp:
             data, snippet = await _safe_read_json(resp)
-            # Solana typically returns {"result": "ok"}
             ok = (resp.status == 200) and (
                 str(data.get("result", "")).lower() == "ok" or "ok" in snippet.lower()
             )
@@ -384,13 +346,24 @@ async def check_rpc(session: Any, timeout: int) -> CheckResult:
 
 
 async def check_jupiter(session: Any) -> CheckResult:
-    # USDC -> SOL small quote
+    """
+    Optional check. If DNS is broken locally, show a warning (not a hard fail).
+    Allow override with:
+      JUPITER_QUOTE_URL (full URL) OR JUPITER_QUOTE_BASE (base host)
+    """
     usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
     sol = "So11111111111111111111111111111111111111112"
-    url = (
-        "https://quote-api.jup.ag/v6/quote"
-        f"?inputMint={usdc}&outputMint={sol}&amount=100000&swapMode=ExactIn"
+
+    base = (os.getenv("JUPITER_QUOTE_BASE") or "https://quote-api.jup.ag").strip().rstrip("/")
+    override = (os.getenv("JUPITER_QUOTE_URL") or "").strip()
+    url = override or (
+        f"{base}/v6/quote?inputMint={usdc}&outputMint={sol}&amount=100000&swapMode=ExactIn"
     )
+
+    dns_ok, dns_detail = _dns_probe(url)
+    if not dns_ok:
+        return CheckResult("Jupiter v6", False, f"DNS: {dns_detail}", severity="optional")
+
     try:
         async with session.get(url) as resp:
             data, snippet = await _safe_read_json(resp)
@@ -406,54 +379,62 @@ async def check_redis() -> CheckResult:
     url = (os.getenv("REDIS_URL") or "").strip()
     if not url:
         return CheckResult("Redis", True, "disabled (no URL)", severity="optional")
-    if aioredis is None:
+    if redis_asyncio is None:
         return CheckResult("Redis", False, "redis package not installed")
+
     try:
-        r = aioredis.from_url(url, decode_responses=True)
+        r = redis_asyncio.from_url(
+            url,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
         await r.ping()
-        await r.close()
+
+        # redis-py deprecates close() in favor of aclose()
+        aclose = getattr(r, "aclose", None)
+        if callable(aclose):
+            await aclose()
+        else:  # pragma: no cover
+            await r.close()
+
         return CheckResult("Redis", True, "PING ok")
     except Exception as e:
         return CheckResult("Redis", False, f"{type(e).__name__}: {e}")
 
 
-def _pick_pg_dsn() -> str:
-    return (
-        os.getenv("PG_DSN") or os.getenv("PG_DSN_INTERNAL") or os.getenv("PG_DSN_EXTERNAL") or ""
-    ).strip()
-
-
-async def check_pg_connect() -> CheckResult:
+async def check_pg_connect(timeout: int) -> CheckResult:
     if not env_bool("PG_ENABLED", False):
         return CheckResult("Postgres", True, "disabled", severity="optional")
 
-    dsn = _normalize_pg_dsn(_pick_pg_dsn())
+    if asyncpg is None:
+        return CheckResult("Postgres", False, "asyncpg not installed", severity="optional")
+
+    dsn = _normalize_pg_dsn_for_asyncpg(_pick_pg_dsn_raw())
     if not dsn:
-        return CheckResult("Postgres", False, "no DSN")
-    if create_async_engine is None or sa_text is None:
-        return CheckResult("Postgres", False, "sqlalchemy[asyncpg] not installed")
+        return CheckResult("Postgres", False, "no DSN", severity="optional")
 
     try:
-        eng = create_async_engine(dsn, future=True)
-        async with eng.connect() as conn:
-            await conn.execute(sa_text("SELECT 1"))
-        await eng.dispose()
+        conn = await asyncpg.connect(dsn=dsn, timeout=timeout)
+        try:
+            await conn.execute("SELECT 1")
+        finally:
+            await conn.close()
         return CheckResult("Postgres", True, "connected", severity="optional")
     except Exception as e:
         return CheckResult("Postgres", False, f"{type(e).__name__}: {e}", severity="optional")
 
 
-async def migrate_pg_schema() -> CheckResult:
+async def migrate_pg_schema(timeout: int) -> CheckResult:
     if not env_bool("PG_ENABLED", False):
         return CheckResult("PG migrate", True, "disabled", severity="optional")
 
-    dsn = _normalize_pg_dsn(_pick_pg_dsn())
+    if asyncpg is None:
+        return CheckResult("PG migrate", False, "asyncpg not installed", severity="optional")
+
+    dsn = _normalize_pg_dsn_for_asyncpg(_pick_pg_dsn_raw())
     if not dsn:
         return CheckResult("PG migrate", False, "no DSN", severity="optional")
-    if create_async_engine is None or sa_text is None:
-        return CheckResult(
-            "PG migrate", False, "sqlalchemy[asyncpg] not installed", severity="optional"
-        )
 
     stmts = [
         """
@@ -478,11 +459,12 @@ async def migrate_pg_schema() -> CheckResult:
     ]
 
     try:
-        eng = create_async_engine(dsn, future=True)
-        async with eng.begin() as conn:
+        conn = await asyncpg.connect(dsn=dsn, timeout=timeout)
+        try:
             for s in stmts:
-                await conn.execute(sa_text(s))
-        await eng.dispose()
+                await conn.execute(s)
+        finally:
+            await conn.close()
         return CheckResult("PG migrate", True, "trades table ready", severity="optional")
     except Exception as e:
         return CheckResult("PG migrate", False, f"{type(e).__name__}: {e}", severity="optional")
@@ -534,6 +516,7 @@ async def notion_db_check(session: Any) -> CheckResult:
                     f"missing properties: {', '.join(missing)}",
                     severity="optional",
                 )
+
             return CheckResult("Notion DB", True, "properties OK", severity="optional")
     except Exception as e:
         return CheckResult("Notion DB", False, f"{type(e).__name__}: {e}", severity="optional")
@@ -555,12 +538,12 @@ def check_telegram_format() -> CheckResult:
 # ──────────────────────────────────────────────────────────────────────────────
 # Render README helper
 # ──────────────────────────────────────────────────────────────────────────────
+
 DEFAULT_RENDER_START = (
     "python -m scripts.sniper_bot --mode prod --enable-daytrader --enable-sniper --log-level INFO"
 )
 
 ENV_KEYS: list[str] = [
-    # critical
     "WALLET_PUBKEY",
     "WALLET_PRIVATE_KEY",
     "HELIUS_RPC_URL",
@@ -570,7 +553,6 @@ ENV_KEYS: list[str] = [
     "PG_DSN",
     "PG_DSN_INTERNAL",
     "PG_DSN_EXTERNAL",
-    # telemetry/alerts
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
     "NOTION_API_KEY",
@@ -580,11 +562,9 @@ ENV_KEYS: list[str] = [
     "NOTION_PROP_ENTRY",
     "NOTION_PROP_CURRENT",
     "NOTION_PROP_TIME",
-    # ai
     "OPENAI_API_KEY",
     "OPENAI_MODEL",
     "OPENAI_BASE_URL",
-    # strategy / discovery
     "ENABLE_WHALE_FILTER",
     "DYNAMIC_WHALE_DISCOVERY",
     "CURATED_WHALE_WALLETS",
@@ -614,53 +594,59 @@ def emit_render_readme(color: bool) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Orchestrator
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def _icon_for(result: CheckResult, color: bool) -> str:
+    if result.ok:
+        return _green("✔", color)
+    if result.severity == "optional":
+        return _yellow("⚠", color)
+    return _red("✖", color)
+
+
 async def run_checks(args: argparse.Namespace) -> tuple[int, list[CheckResult], dict[str, Any]]:
     color = _supports_color(bool(args.no_color))
     results: list[CheckResult] = []
 
-    # Env pass
     results.extend(validate_env())
 
-    # Connectivity
+    optional_warnings = 0
+    required_failures = 0
+
     if args.check_all:
+        results.append(await check_redis())
+
         if aiohttp is None:
             results.append(CheckResult("aiohttp", False, "aiohttp not installed"))
         else:
             timeout = int(args.timeout)
             ct = aiohttp.ClientTimeout(total=timeout)
             async with aiohttp.ClientSession(timeout=ct) as session:
-                # Required-ish checks
-                results.append(await check_rpc(session, timeout))
-                results.append(await check_redis())
-
-                # Optional checks
+                results.append(await check_rpc(session))
                 results.append(await check_jupiter(session))
-                results.append(await check_pg_connect())
+                results.append(await check_pg_connect(timeout))
                 if args.migrate_db:
-                    results.append(await migrate_pg_schema())
+                    results.append(await migrate_pg_schema(timeout))
                 if args.notion_check:
                     results.append(await notion_db_check(session))
                 results.append(check_telegram_format())
 
-    # Pretty print matrix
     print("\n" + "=" * 72)
     print("Readiness Matrix")
     print("=" * 72)
 
-    bad_required = 0
-    bad_any = 0
-
     for r in results:
-        icon = _green("✔", color) if r.ok else _red("✖", color)
+        icon = _icon_for(r, color)
         name = _bold(r.name, color)
         detail = f" — {r.detail}" if r.detail else ""
-        sev = f" [{r.severity}]" if r.severity != "required" else ""
-        sev = _yellow(sev, color) if sev else ""
+        sev = "" if r.severity == "required" else _yellow(" [optional]", color)
         print(f"{icon} {name}{sev}{detail}")
+
         if not r.ok:
-            bad_any += 1
             if r.severity == "required":
-                bad_required += 1
+                required_failures += 1
+            else:
+                optional_warnings += 1
 
     print("")
 
@@ -668,9 +654,9 @@ async def run_checks(args: argparse.Namespace) -> tuple[int, list[CheckResult], 
         emit_render_readme(color)
 
     summary: dict[str, Any] = {
-        "ok": bad_required == 0,
-        "bad_required": bad_required,
-        "bad_any": bad_any,
+        "ok": required_failures == 0,
+        "required_failures": required_failures,
+        "optional_warnings": optional_warnings,
         "hosted_env_detected": _looks_like_hosted_env(),
         "timeout_sec": int(args.timeout),
         "checks": [
@@ -679,11 +665,7 @@ async def run_checks(args: argparse.Namespace) -> tuple[int, list[CheckResult], 
         ],
     }
 
-    # Exit contract:
-    # - 0 if no REQUIRED failures
-    # - 2 if any REQUIRED failures
-    exit_code = 0 if bad_required == 0 else 2
-    return exit_code, results, summary
+    return (0 if required_failures == 0 else 2), results, summary
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

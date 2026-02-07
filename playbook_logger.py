@@ -1,10 +1,11 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
 playbook_logger.py — Runbook-grade events for “why not trading”
 ===============================================================
 
-Canonical place to record *operational truth*:
+Canonical place to record operational truth:
 - What levers changed (who/why/old/new)
 - Why we are NOT trading right now (gates, infra, budget, scanner drought)
 - Key lifecycle events (startup/shutdown, health transitions)
@@ -20,6 +21,10 @@ Design goals
 - Redacts secrets from fields/logs
 - Works with either utils_pkg.core_utils (preferred) or direct REDIS_URL
 - Supports async usage (inside bot) and CLI usage (ops)
+- Import is side-effect free (no network calls, no background tasks)
+
+IMPORTANT:
+- Do not add new env keys here without updating env contract/tests.
 """
 
 import argparse
@@ -40,10 +45,10 @@ from typing import Any
 
 LOG = logging.getLogger("playbook")
 
-
 # -----------------------------------------------------------------------------
 # Optional third-party imports (kept lightweight + mypy-safe)
 # -----------------------------------------------------------------------------
+# Optional third-party imports (kept lightweight + mypy-safe)
 redis_async: Any | None
 try:
     import redis.asyncio as redis_async  # type: ignore[import-not-found]
@@ -52,7 +57,7 @@ except Exception:  # pragma: no cover
 
 
 # -----------------------------------------------------------------------------
-# Config (env-driven, cached)
+# Config (env-driven, cached) — DO NOT introduce new env keys here.
 # -----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PlaybookConfig:
@@ -105,7 +110,7 @@ def cfg() -> PlaybookConfig:
     """
     Cached config. If you need to re-read env at runtime, call refresh_config().
     """
-    # Keep your existing behavior: allow REDIS_TLS_URL fallback and local default.
+    # Keep existing behavior: allow REDIS_TLS_URL fallback and local default.
     redis_url = _getenv_str("REDIS_URL") or _getenv_str("REDIS_TLS_URL") or "redis://localhost:6379"
 
     notion_token = _getenv_str("NOTION_TOKEN") or _getenv_str("NOTION_API_KEY")
@@ -115,7 +120,7 @@ def cfg() -> PlaybookConfig:
         or _getenv_str("NOTION_PLAYBOOK_DB")
     )
 
-    # Your existing enable switch: PLAYBOOK_NOTION_ENABLED != "0"
+    # Existing enable switch: PLAYBOOK_NOTION_ENABLED != "0"
     enabled_flag = _getenv_str("PLAYBOOK_NOTION_ENABLED", "1")
     notion_enabled = bool(notion_token and notion_db_playbook and enabled_flag != "0")
 
@@ -205,12 +210,12 @@ def _sanitize_fields(fields: Mapping[str, Any], *, max_field_str: int) -> dict[s
             out[ks] = _redact_value(v, max_len=max_field_str)
             continue
 
-        # JSON-safe coercions
+        # JSON-safe primitives
         if isinstance(v, (str, int, float, bool)) or v is None:
             out[ks] = _safe_str(v, max_field_str) if isinstance(v, str) else v
             continue
 
-        # serialize complex values safely
+        # Serialize complex values safely
         try:
             out[ks] = json.loads(json.dumps(v, default=str))
         except Exception:
@@ -242,6 +247,10 @@ def _level_norm(level: str) -> str:
 
 def _json_compact(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+async def _maybe_await(x: Any) -> Any:
+    return await x if asyncio.iscoroutine(x) else x
 
 
 # -----------------------------------------------------------------------------
@@ -277,7 +286,14 @@ class _RedisHandle:
 
 
 _REDIS_SINGLETON: _RedisHandle | None = None
-_REDIS_LOCK = asyncio.Lock()
+_REDIS_LOCK: asyncio.Lock | None = None
+
+
+def _get_lock() -> asyncio.Lock:
+    global _REDIS_LOCK
+    if _REDIS_LOCK is None:
+        _REDIS_LOCK = asyncio.Lock()
+    return _REDIS_LOCK
 
 
 async def _get_redis() -> _RedisHandle:
@@ -285,8 +301,9 @@ async def _get_redis() -> _RedisHandle:
     Returns a redis handle (client + owned flag). Best-effort; never raises.
     """
     global _REDIS_SINGLETON
+    lock = _get_lock()
 
-    async with _REDIS_LOCK:
+    async with lock:
         if _REDIS_SINGLETON is not None:
             return _REDIS_SINGLETON
 
@@ -296,9 +313,11 @@ async def _get_redis() -> _RedisHandle:
 
             fn = getattr(cu, "get_redis_async", None) or getattr(cu, "get_redis", None)
             if callable(fn):
-                r = fn()
-                if asyncio.iscoroutine(r):
-                    r = await r
+                try:
+                    r = fn()
+                except TypeError:
+                    r = None
+                r = await _maybe_await(r)
                 if r is not None:
                     _REDIS_SINGLETON = _RedisHandle(client=r, owned=False)
                     return _REDIS_SINGLETON
@@ -310,7 +329,7 @@ async def _get_redis() -> _RedisHandle:
             _REDIS_SINGLETON = _RedisHandle(client=_NoopRedis(), owned=True)
             return _REDIS_SINGLETON
 
-        # Create our own client (fast-fail connect parameters to avoid hanging)
+        # Create our own client (avoid hanging connects)
         try:
             c = cfg()
             r = redis_async.from_url(  # type: ignore[union-attr]
@@ -331,12 +350,22 @@ async def close() -> None:
     Close redis if we own the connection.
     """
     global _REDIS_SINGLETON
-    async with _REDIS_LOCK:
+    lock = _get_lock()
+
+    async with lock:
         h = _REDIS_SINGLETON
         _REDIS_SINGLETON = None
-    if h and h.owned:
-        with contextlib.suppress(Exception):
-            await h.client.close()
+
+    if not h or not h.owned:
+        return
+
+    with contextlib.suppress(Exception):
+        # redis-py 5+ deprecates close() in favor of aclose()
+        aclose = getattr(h.client, "aclose", None)
+        if callable(aclose):
+            await _maybe_await(aclose())
+        else:
+            await _maybe_await(h.client.close())
 
 
 # -----------------------------------------------------------------------------
@@ -354,7 +383,7 @@ def _notion_date_iso(ts: float) -> dict[str, Any]:
     return {"date": {"start": datetime.fromtimestamp(ts, tz=UTC).isoformat()}}
 
 
-async def _notion_create_page(*, title: str, props: dict[str, Any]) -> None:
+async def _notion_create_page(*, props: dict[str, Any]) -> None:
     c = cfg()
     if not c.notion_enabled:
         return
@@ -365,9 +394,8 @@ async def _notion_create_page(*, title: str, props: dict[str, Any]) -> None:
 
         fn = getattr(nc, "create_page", None) or getattr(nc, "create_playbook_entry", None)
         if callable(fn):
-            out = fn(database_id=c.notion_db_playbook, title=title, properties=props)  # type: ignore
-            if asyncio.iscoroutine(out):
-                await out
+            out = fn(database_id=c.notion_db_playbook, properties=props)  # type: ignore
+            await _maybe_await(out)
             return
     except Exception:
         pass
@@ -384,7 +412,7 @@ async def _notion_create_page(*, title: str, props: dict[str, Any]) -> None:
         body = {"parent": {"database_id": c.notion_db_playbook}, "properties": props}
         timeout = aiohttp.ClientTimeout(total=float(c.notion_timeout_sec))
 
-        # Prefer utils_pkg.proxy_client session if available (unified timeouts/proxy)
+        # Prefer utils_pkg.proxy_client session if available
         try:
             from utils_pkg.proxy_client import make_session  # type: ignore
 
@@ -465,14 +493,30 @@ async def log_event(
             r = h.client
 
             payload = _json_compact(event)
-            await r.xadd(
-                c.stream_key,
-                {"json": payload, "kind": kind_s, "level": lvl, "code": code_s, "name": name_s},
-                maxlen=int(c.stream_maxlen),
-                approximate=True,
-            )
+            stream_fields = {
+                "json": payload,
+                "kind": kind_s,
+                "level": lvl,
+                "code": code_s,
+                "name": name_s,
+            }
 
-            # "last event" pointers for dashboards
+            # xadd signatures vary across versions -> tolerate TypeError
+            try:
+                await r.xadd(
+                    c.stream_key,
+                    stream_fields,
+                    maxlen=int(c.stream_maxlen),
+                    approximate=True,
+                )
+            except TypeError:
+                await r.xadd(
+                    c.stream_key,
+                    stream_fields,
+                    maxlen=int(c.stream_maxlen),
+                )
+
+            # Last-event pointers for dashboards
             with contextlib.suppress(Exception):
                 await r.set(f"playbook:last:{kind_s}", payload)
                 await r.set(f"playbook:last:{kind_s}:{name_s or 'default'}", payload)
@@ -487,40 +531,39 @@ async def log_event(
     if to_notion and c.notion_enabled:
         try:
             # Dedupe to avoid Notion spam (per event id)
+            allow = True
             try:
                 h = await _get_redis()
                 r = h.client
                 dedupe_key = f"playbook:notion:dedupe:{eid}"
-                ok = True
                 try:
-                    # setnx style
                     set_ok = await r.set(  # type: ignore[call-arg]
                         dedupe_key, "1", nx=True, ex=int(c.notion_dedupe_ttl_sec)
                     )
-                    ok = bool(set_ok)
+                    # redis may return True/False, "OK", or None
+                    allow = bool(set_ok)
                 except Exception:
-                    ok = True
-                if not ok:
-                    return event
+                    allow = True
             except Exception:
-                pass
+                allow = True
 
-            title = f"[{lvl}] {kind_s}{('/' + name_s) if name_s else ''}"
-            props = {
-                "Title": _notion_title(title),
-                "Kind": _notion_rich_text(kind_s),
-                "Name": _notion_rich_text(name_s or ""),
-                "Code": _notion_rich_text(code_s or ""),
-                "Level": _notion_rich_text(lvl),
-                "Message": _notion_rich_text(msg_s),
-                "Timestamp": _notion_date_iso(ts),
-                "EventId": _notion_rich_text(eid),
-                "Host": _notion_rich_text(_safe_str(meta.get("host", ""), 200)),
-                "Service": _notion_rich_text(_safe_str(meta.get("service", ""), 200)),
-                "Version": _notion_rich_text(_safe_str(meta.get("version", ""), 200)),
-                "Fields": _notion_rich_text(_safe_str(_json_compact(f), 1800)),
-            }
-            await _notion_create_page(title=title, props=props)
+            if allow:
+                title = f"[{lvl}] {kind_s}{('/' + name_s) if name_s else ''}"
+                props = {
+                    "Title": _notion_title(title),
+                    "Kind": _notion_rich_text(kind_s),
+                    "Name": _notion_rich_text(name_s or ""),
+                    "Code": _notion_rich_text(code_s or ""),
+                    "Level": _notion_rich_text(lvl),
+                    "Message": _notion_rich_text(msg_s),
+                    "Timestamp": _notion_date_iso(ts),
+                    "EventId": _notion_rich_text(eid),
+                    "Host": _notion_rich_text(_safe_str(meta.get("host", ""), 200)),
+                    "Service": _notion_rich_text(_safe_str(meta.get("service", ""), 200)),
+                    "Version": _notion_rich_text(_safe_str(meta.get("version", ""), 200)),
+                    "Fields": _notion_rich_text(_safe_str(_json_compact(f), 1800)),
+                }
+                await _notion_create_page(props=props)
         except Exception:
             pass
 
@@ -538,13 +581,6 @@ async def set_status(
 ) -> dict[str, Any]:
     """
     Store a structured status snapshot used by dashboards / health tooling.
-
-    Example names:
-      - "infra"
-      - "router"
-      - "scanner:raydium"
-      - "entry_gate"
-      - "budget"
     """
     c = cfg()
     ts = _now_ts()
@@ -613,7 +649,6 @@ async def log_lever_change(
     except Exception:
         pass
 
-    # Stream + Notion entry
     return await log_event(
         kind="lever",
         name=lever_s,
@@ -677,8 +712,6 @@ async def why_not_trading(
 ) -> dict[str, Any]:
     """
     Runbook-grade “why not trading” event + status snapshot.
-
-    code should be one of WHY_CODES (best-effort; not enforced).
     """
     code_s = _safe_str(code, 120)
     if code_s and code_s not in WHY_CODES:
@@ -715,7 +748,6 @@ def _run(coro: Any) -> Any:
         loop = None
 
     if loop and loop.is_running():
-        # In an already-running loop you should call the async API directly.
         raise RuntimeError(
             "Use async functions inside a running event loop (log_event/why_not_trading/etc)."
         )
@@ -815,7 +847,8 @@ async def _amain(argv: Sequence[str]) -> int:
     # Minimal logging if caller didn’t configure it
     if not logging.getLogger().handlers:
         logging.basicConfig(
-            level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+            level=logging.INFO,
+            format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         )
 
     args = _build_parser().parse_args(list(argv))

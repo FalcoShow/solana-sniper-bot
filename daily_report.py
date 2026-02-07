@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
@@ -6,8 +7,6 @@ daily_report.py
 God-Tier Daily Report Worker (P0)
 =================================
 
-What this does
---------------
 A resilient daily summary worker that:
 
 1) Reads daily performance primarily from Postgres (preferred).
@@ -35,10 +34,11 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Logging: canonical contract (no conditional signature mismatch)
+# Logging (compat: utils_pkg.log_compat if present; stdlib logger fallback)
 # ──────────────────────────────────────────────────────────────────────────────
 
 if TYPE_CHECKING:
@@ -96,25 +96,27 @@ def _log_error(msg: str, *args: Any, exc_info: bool = False) -> None:
 
 
 async def _maybe_await(x: Any) -> Any:
-    if inspect.isawaitable(x):
-        return await x
-    return x
+    return await x if inspect.isawaitable(x) else x
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Env helpers
+# Env helpers (no contract drift: only use existing keys already in .env.example)
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def _env_str(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or default).strip()
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    v = (os.getenv(name) or "").strip().lower()
+    v = _env_str(name, "")
     if not v:
         return default
-    return v in ("1", "true", "yes", "on", "y")
+    return v.lower() in ("1", "true", "yes", "on", "y")
 
 
-def _env_int(name: str, default: int, lo: int | None = None, hi: int | None = None) -> int:
-    v = (os.getenv(name) or "").strip()
+def _env_int(name: str, default: int, *, lo: int | None = None, hi: int | None = None) -> int:
+    v = _env_str(name, "")
     try:
         n = int(v) if v else int(default)
     except Exception:
@@ -126,8 +128,8 @@ def _env_int(name: str, default: int, lo: int | None = None, hi: int | None = No
     return n
 
 
-def _env_float(name: str, default: float, lo: float | None = None) -> float:
-    v = (os.getenv(name) or "").strip()
+def _env_float(name: str, default: float, *, lo: float | None = None) -> float:
+    v = _env_str(name, "")
     try:
         x = float(v) if v else float(default)
     except Exception:
@@ -147,10 +149,11 @@ _sender_lock: asyncio.Lock | None = None
 
 
 async def _build_sender() -> SendFn | None:
+    # Keep behavior: default enabled unless TELEGRAM_ENABLED explicitly false.
     if not _env_bool("TELEGRAM_ENABLED", True):
         return None
 
-    # 1) AlertManager module (runtime getattr to avoid mypy attr-defined)
+    # 1) AlertManager
     try:
         am_mod = importlib.import_module("utils_pkg.alert_manager")
         get_am = getattr(am_mod, "get_alert_manager", None)
@@ -201,6 +204,7 @@ async def _build_sender() -> SendFn | None:
         if callable(send_message):
 
             async def _tg_send(text: str) -> None:
+                # Best effort kwargs (filtered if function doesn't accept)
                 wide: dict[str, Any] = {
                     "parse_mode": "Markdown",
                     "disable_web_page_preview": True,
@@ -223,7 +227,7 @@ async def _build_sender() -> SendFn | None:
     except Exception:
         pass
 
-    # 3) core_utils.send_telegram
+    # 3) core_utils.send_telegram (legacy)
     try:
         cu_mod = importlib.import_module("utils_pkg.core_utils")
         send_telegram = getattr(cu_mod, "send_telegram", None)
@@ -233,18 +237,14 @@ async def _build_sender() -> SendFn | None:
                 try:
                     sig = inspect.signature(send_telegram)
                     params = sig.parameters
-                    kw: dict[str, Any] = {}
                     if "msg" in params:
-                        kw["msg"] = text
-                        await _maybe_await(send_telegram(**kw))
+                        await _maybe_await(send_telegram(msg=text))
                         return
                     if "message" in params:
-                        kw["message"] = text
-                        await _maybe_await(send_telegram(**kw))
+                        await _maybe_await(send_telegram(message=text))
                         return
                     if "text" in params:
-                        kw["text"] = text
-                        await _maybe_await(send_telegram(**kw))
+                        await _maybe_await(send_telegram(text=text))
                         return
                     await _maybe_await(send_telegram(text))
                 except Exception:
@@ -258,26 +258,22 @@ async def _build_sender() -> SendFn | None:
 
 
 async def _get_sender() -> SendFn | None:
-    """
-    Mypy-clean lazy init.
-    Avoids the 'double-check unreachable' pattern by using a local variable.
-    """
     global _sender, _sender_lock
 
-    sender = _sender
-    if sender is not None:
-        return sender
+    s = _sender
+    if s is not None:
+        return s
 
     if _sender_lock is None:
         _sender_lock = asyncio.Lock()
     lock = _sender_lock
 
     async with lock:
-        sender2 = _sender
-        if sender2 is None:
-            sender2 = await _build_sender()
-            _sender = sender2
-        return sender2
+        s2 = _sender
+        if s2 is None:
+            s2 = await _build_sender()
+            _sender = s2
+        return s2
 
 
 async def send_report(text: str) -> None:
@@ -286,8 +282,8 @@ async def send_report(text: str) -> None:
         sender = await _get_sender()
         if sender is None:
             _log_warn("No Telegram sender available; report text:\n%s", text)
-        else:
-            await sender(text)
+            return
+        await sender(text)
     except Exception as e:  # pragma: no cover
         _log_error("send_report failed: %s", e, exc_info=True)
 
@@ -305,29 +301,38 @@ class RedisLike(Protocol):
 GetRedisAsync = Callable[[], Awaitable[Any]]
 
 _get_redis_async: GetRedisAsync | None = None
-_redis_async_mod: Any | None = None
-
-try:
-    import redis.asyncio as _redis_async_mod  # type: ignore[import-not-found,import-untyped]
-except Exception:  # pragma: no cover
-    _redis_async_mod = None
-
-try:
-    _cu_mod = importlib.import_module("utils_pkg.core_utils")
-    _fn = getattr(_cu_mod, "get_redis_async", None)
-    _get_redis_async = cast(GetRedisAsync, _fn) if callable(_fn) else None
-except Exception:  # pragma: no cover
-    _get_redis_async = None
-
-_REDIS_URL = (
-    os.getenv("REDIS_URL", "redis://localhost:6379") or ""
-).strip() or "redis://localhost:6379"
 _redis_singleton: RedisLike | None = None
 _redis_lock: asyncio.Lock | None = None
 
 
+def _try_load_core_get_redis_async() -> GetRedisAsync | None:
+    try:
+        cu_mod = importlib.import_module("utils_pkg.core_utils")
+        fn = getattr(cu_mod, "get_redis_async", None)
+        return cast(GetRedisAsync, fn) if callable(fn) else None
+    except Exception:
+        return None
+
+
+def _redis_from_url(url: str) -> Any | None:
+    # Lazy import keeps module import light.
+    try:
+        import redis.asyncio as redis_async  # type: ignore[import-not-found,import-untyped]
+    except Exception:
+        return None
+    try:
+        return redis_async.from_url(
+            url,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+    except Exception:
+        return None
+
+
 async def get_redis() -> RedisLike | None:
-    global _redis_singleton, _redis_lock
+    global _redis_singleton, _redis_lock, _get_redis_async
 
     cached = _redis_singleton
     if cached is not None:
@@ -335,12 +340,14 @@ async def get_redis() -> RedisLike | None:
 
     if _redis_lock is None:
         _redis_lock = asyncio.Lock()
-    lock = _redis_lock
 
-    async with lock:
+    async with _redis_lock:
         cached2 = _redis_singleton
         if cached2 is not None:
             return cached2
+
+        if _get_redis_async is None:
+            _get_redis_async = _try_load_core_get_redis_async()
 
         if _get_redis_async is not None:
             with contextlib.suppress(Exception):
@@ -349,15 +356,13 @@ async def get_redis() -> RedisLike | None:
                     _redis_singleton = cast(RedisLike, r)
                     return _redis_singleton
 
-        if _redis_async_mod is None:
-            return None
-
-        try:
-            r2 = _redis_async_mod.from_url(_REDIS_URL, decode_responses=True)  # type: ignore[union-attr]
+        url = _env_str("REDIS_URL", "redis://localhost:6379") or "redis://localhost:6379"
+        r2 = _redis_from_url(url)
+        if r2 is not None:
             _redis_singleton = cast(RedisLike, r2)
             return _redis_singleton
-        except Exception:
-            return None
+
+        return None
 
 
 async def r_get_float(r: RedisLike, key: str, default: float = 0.0) -> float:
@@ -369,6 +374,10 @@ async def r_get_float(r: RedisLike, key: str, default: float = 0.0) -> float:
 
 
 async def r_set_once(r: RedisLike, key: str, value: str, ttl_sec: int) -> bool:
+    """
+    Best-effort NX set for dedupe.
+    Returns True if caller should proceed; False if already set (when NX works).
+    """
     ttl = max(60, int(ttl_sec))
     try:
         res = await r.set(key, value, ex=ttl, nx=True)
@@ -381,9 +390,24 @@ async def r_set_once(r: RedisLike, key: str, value: str, ttl_sec: int) -> bool:
         return True
 
 
+# In-process dedupe fallback (prevents spam if Redis is down/unavailable).
+_LAST_SENT_DAY_TAG: str | None = None
+_LAST_SENT_LOCK: asyncio.Lock | None = None
+
+
+async def _inproc_set_once(day_tag: str) -> bool:
+    global _LAST_SENT_DAY_TAG, _LAST_SENT_LOCK
+    if _LAST_SENT_LOCK is None:
+        _LAST_SENT_LOCK = asyncio.Lock()
+    async with _LAST_SENT_LOCK:
+        if _LAST_SENT_DAY_TAG == day_tag:
+            return False
+        _LAST_SENT_DAY_TAG = day_tag
+        return True
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Postgres (best-effort): psycopg3 async preferred, asyncpg fallback
-#   Fixes mypy no-redef by using aliases.
 # ──────────────────────────────────────────────────────────────────────────────
 
 try:
@@ -405,7 +429,7 @@ asyncpg = _asyncpg
 
 def resolve_pg_dsn() -> str | None:
     for k in ("POSTGRES_DSN", "PG_DSN", "PG_DSN_INTERNAL", "PG_DSN_EXTERNAL", "DATABASE_URL"):
-        v = (os.getenv(k) or "").strip()
+        v = _env_str(k, "")
         if v:
             return v
     return None
@@ -426,6 +450,7 @@ class _PgConn:
 
     @staticmethod
     def _psycopg_sql(sql: str) -> str:
+        # Convert asyncpg $1/$2 to psycopg %s placeholders.
         return re.sub(r"\$\d+", "%s", sql)
 
     async def fetchrow(self, sql: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
@@ -486,7 +511,10 @@ def _utc_day_bounds(day: datetime) -> tuple[datetime, datetime]:
     return start, end
 
 
-def _build_pg_probes() -> tuple[list[tuple[str, str, ProbeMode]], list[tuple[str, str, ProbeMode]]]:
+@lru_cache(maxsize=1)
+def _cached_pg_probes() -> tuple[
+    list[tuple[str, str, ProbeMode]], list[tuple[str, str, ProbeMode]]
+]:
     ts_cols = ("ts", "time", "created_at", "filled_at", "executed_at")
     trade_tables = ("trades", "bot_trades", "trade_fills", "fills")
 
@@ -585,8 +613,10 @@ def _build_pg_probes() -> tuple[list[tuple[str, str, ProbeMode]], list[tuple[str
 
 async def pg_fetch_daily_summary(conn: _PgConn, day_utc: datetime) -> dict[str, Any] | None:
     start, end = _utc_day_bounds(day_utc)
-    probes, pos_probes = _build_pg_probes()
-    out: dict[str, Any] = {}
+    probes, pos_probes = _cached_pg_probes()
+
+    best: dict[str, Any] | None = None
+    best_score: tuple[int, float] = (-1, -1.0)
 
     for _label, sql, mode in probes:
         try:
@@ -603,52 +633,68 @@ async def pg_fetch_daily_summary(conn: _PgConn, day_utc: datetime) -> dict[str, 
             trades = int(row.get("trades", 0) or 0)
             wins = int(row.get("wins", 0) or 0)
 
-            out["realized_usd"] = realized
-            out["trades"] = trades
-            out["wins"] = wins
-            out["losses"] = max(0, trades - wins)
-
+            cand: dict[str, Any] = {
+                "realized_usd": realized,
+                "trades": trades,
+                "wins": wins,
+                "losses": max(0, trades - wins),
+            }
             if "unrealized_usd" in row:
-                out["unrealized_usd"] = float(row.get("unrealized_usd", 0) or 0)
+                cand["unrealized_usd"] = float(row.get("unrealized_usd", 0) or 0)
             if "open_positions" in row:
-                out["open_positions"] = int(row.get("open_positions", 0) or 0)
-            break
+                cand["open_positions"] = int(row.get("open_positions", 0) or 0)
+
+            score = (trades, abs(realized))
+            if score > best_score:
+                best = cand
+                best_score = score
         except Exception:
             continue
 
-    if not out:
+    if best is None:
         return None
 
+    # Fill open_positions/unrealized if missing (best-effort)
     for _label, sql, _mode in pos_probes:
         try:
             row = await conn.fetchrow(sql, ())
             if row is None:
                 continue
-            if "open_positions" in row and "open_positions" not in out:
-                out["open_positions"] = int(row.get("open_positions", 0) or 0)
-            if "unrealized_usd" in row and "unrealized_usd" not in out:
-                out["unrealized_usd"] = float(row.get("unrealized_usd", 0) or 0)
+            if "open_positions" in row and "open_positions" not in best:
+                best["open_positions"] = int(row.get("open_positions", 0) or 0)
+            if "unrealized_usd" in row and "unrealized_usd" not in best:
+                best["unrealized_usd"] = float(row.get("unrealized_usd", 0) or 0)
         except Exception:
             continue
 
-    return out
+    return best
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Notion PnL push (optional)
+# Optional integrations (lazy import; keeps import-time safe)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Optional Notion hook (mypy-safe for single-file + mypy .)
-push_daily_pnl: Callable[[dict[str, Any]], Any] | None = None
 
-try:
-    from utils_pkg.notion_pnl import (
-        push_daily_pnl as _push_daily_pnl_func,  # type: ignore[import-not-found]
-    )
+def _get_push_daily_pnl_fn() -> Callable[[dict[str, Any]], Any] | None:
+    try:
+        mod = importlib.import_module("utils_pkg.notion_pnl")
+        fn = getattr(mod, "push_daily_pnl", None)
+        return cast(Callable[[dict[str, Any]], Any], fn) if callable(fn) else None
+    except Exception:
+        return None
 
-    push_daily_pnl = _push_daily_pnl_func
-except Exception:  # pragma: no cover
-    pass
+
+def _get_current_limits_fn() -> Callable[[Any], Any] | None:
+    # Prefer utils_pkg.risk_manager, fallback to legacy risk_manager.
+    for mod_name in ("utils_pkg.risk_manager", "risk_manager"):
+        try:
+            mod = importlib.import_module(mod_name)
+            fn = getattr(mod, "current_limits", None)
+            if callable(fn):
+                return cast(Callable[[Any], Any], fn)
+        except Exception:
+            continue
+    return None
 
 
 async def _call_best_effort(func: Any, *args: Any, **kwargs: Any) -> None:
@@ -663,16 +709,6 @@ async def _call_best_effort(func: Any, *args: Any, **kwargs: Any) -> None:
             await res
     except Exception:
         return
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Legacy risk limits (optional)
-# ──────────────────────────────────────────────────────────────────────────────
-
-try:
-    from risk_manager import current_limits  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover
-    current_limits = None  # type: ignore[assignment]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -698,7 +734,7 @@ def load_report_config() -> ReportConfig:
     poll_sec = _env_float("REPORT_POLL_SEC", 20.0, lo=5.0)
     send_on_start = _env_bool("REPORT_SEND_ON_START", False)
     dedup_ttl_sec = _env_int("REPORT_DEDUP_TTL_SEC", 26 * 3600, lo=3600)
-    display_tz = (os.getenv("REPORT_TZ", "UTC") or "UTC").strip() or "UTC"
+    display_tz = _env_str("REPORT_TZ", "UTC") or "UTC"
     return ReportConfig(
         enabled=enabled,
         hour_utc=hour_utc,
@@ -743,6 +779,7 @@ async def build_daily_snapshot(day_utc: datetime) -> dict[str, Any]:
         "time": datetime.now(UTC).isoformat(),
     }
 
+    # Postgres preferred
     conn = await pg_connect()
     if conn is not None:
         try:
@@ -754,6 +791,7 @@ async def build_daily_snapshot(day_utc: datetime) -> dict[str, Any]:
         finally:
             await conn.close()
 
+    # Redis fallback/augmentation
     r = await get_redis()
     if r is not None:
         with contextlib.suppress(Exception):
@@ -772,9 +810,11 @@ async def build_daily_snapshot(day_utc: datetime) -> dict[str, Any]:
                     snapshot["price_usd"] = p
                     break
 
-    if current_limits is not None and r is not None:
+    # Optional risk limits (legacy+new)
+    cur_limits = _get_current_limits_fn()
+    if cur_limits is not None and r is not None:
         with contextlib.suppress(Exception):
-            limits_obj = current_limits(r)
+            limits_obj = cur_limits(r)
             if inspect.isawaitable(limits_obj):
                 limits_obj = await limits_obj
             if isinstance(limits_obj, dict):
@@ -805,6 +845,31 @@ async def build_daily_snapshot(day_utc: datetime) -> dict[str, Any]:
     return snapshot
 
 
+def _format_as_of(snapshot: dict[str, Any]) -> str:
+    ts_raw = str(snapshot.get("time") or "").strip()
+    if not ts_raw:
+        return ""
+    try:
+        dt_utc = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).astimezone(UTC)
+    except Exception:
+        return ""
+
+    tz_name = _env_str("REPORT_TZ", "UTC") or "UTC"
+    if tz_name.upper() == "UTC":
+        return f"As of: `{dt_utc.strftime('%Y-%m-%d %H:%M')} UTC`"
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        dt_local = dt_utc.astimezone(ZoneInfo(tz_name))
+        return (
+            f"As of: `{dt_utc.strftime('%Y-%m-%d %H:%M')} UTC`"
+            f"  (`{dt_local.strftime('%Y-%m-%d %H:%M')} {tz_name}`)"
+        )
+    except Exception:
+        return f"As of: `{dt_utc.strftime('%Y-%m-%d %H:%M')} UTC`"
+
+
 def format_report(snapshot: dict[str, Any]) -> str:
     day = str(snapshot.get("date") or snapshot.get("date_utc") or "")[:10].strip() or "today"
     realized = float(snapshot.get("realized_usd", 0.0) or 0.0)
@@ -829,11 +894,16 @@ def format_report(snapshot: dict[str, Any]) -> str:
     open_pos = snapshot.get("open_positions")
     workers = snapshot.get("workers") if isinstance(snapshot.get("workers"), list) else []
 
-    stop_after_profit = (os.getenv("STOP_AFTER_DAILY_PROFIT_PCT") or "").strip()
-    spend_cap_pct = (os.getenv("DAILY_SPEND_CAP_PCT") or "").strip()
+    stop_after_profit = _env_str("STOP_AFTER_DAILY_PROFIT_PCT", "")
+    spend_cap_pct = _env_str("DAILY_SPEND_CAP_PCT", "")
 
     lines: list[str] = []
     lines.append(f"📊 *Daily Summary* (UTC {day})")
+
+    as_of = _format_as_of(snapshot)
+    if as_of:
+        lines.append(as_of)
+
     lines.append("")
 
     if equity is not None:
@@ -874,7 +944,7 @@ def format_report(snapshot: dict[str, Any]) -> str:
 
 
 async def maybe_push_notion(snapshot: dict[str, Any]) -> None:
-    fn = push_daily_pnl
+    fn = _get_push_daily_pnl_fn()
     if fn is None:
         return
     await _call_best_effort(fn, snapshot)
@@ -883,13 +953,19 @@ async def maybe_push_notion(snapshot: dict[str, Any]) -> None:
 async def send_once_for_day(day_utc: datetime, *, dedup: bool = True) -> bool:
     cfg = load_report_config()
     r = await get_redis()
+
     day_tag = _day_tag_utc(day_utc)
     key = _sent_key(day_tag)
 
-    if dedup and r is not None:
-        ok = await r_set_once(r, key, "1", ttl_sec=cfg.dedup_ttl_sec)
-        if not ok:
+    if dedup:
+        ok_inproc = await _inproc_set_once(day_tag)
+        if not ok_inproc:
             return False
+
+        if r is not None:
+            ok = await r_set_once(r, key, "1", ttl_sec=cfg.dedup_ttl_sec)
+            if not ok:
+                return False
 
     snapshot = await build_daily_snapshot(day_utc)
     text = format_report(snapshot)
@@ -897,6 +973,7 @@ async def send_once_for_day(day_utc: datetime, *, dedup: bool = True) -> bool:
     await send_report(text)
     await maybe_push_notion(snapshot)
 
+    # Re-assert the sent key (best-effort)
     if dedup and r is not None:
         with contextlib.suppress(Exception):
             await r.set(key, "1", ex=int(cfg.dedup_ttl_sec))
@@ -904,29 +981,45 @@ async def send_once_for_day(day_utc: datetime, *, dedup: bool = True) -> bool:
     return True
 
 
+def _scheduled_dt_for_today(now_utc: datetime, cfg: ReportConfig) -> datetime:
+    return datetime(
+        now_utc.year,
+        now_utc.month,
+        now_utc.day,
+        cfg.hour_utc,
+        cfg.minute_utc,
+        tzinfo=UTC,
+    )
+
+
 async def run_worker() -> None:
     cfg = load_report_config()
     if not cfg.enabled:
         _log_info("Daily report disabled (REPORT_ENABLED=false)")
-    else:
-        await send_report("📝 Daily report worker started ✅")
+        return
 
-        if cfg.send_on_start:
-            with contextlib.suppress(Exception):
-                await send_once_for_day(datetime.now(UTC), dedup=True)
+    await send_report("📝 Daily report worker started ✅")
 
-        while True:
-            try:
-                now = datetime.now(UTC)
-                if now.hour == cfg.hour_utc and now.minute == cfg.minute_utc:
-                    sent = await send_once_for_day(now, dedup=True)
-                    if sent:
-                        await asyncio.sleep(65)
-                        continue
-                await asyncio.sleep(cfg.poll_sec)
-            except Exception as e:  # pragma: no cover
-                _log_error("[daily_report] loop error: %s", e, exc_info=True)
-                await asyncio.sleep(60)
+    if cfg.send_on_start:
+        with contextlib.suppress(Exception):
+            await send_once_for_day(datetime.now(UTC), dedup=True)
+
+    while True:
+        try:
+            now = datetime.now(UTC)
+            sched = _scheduled_dt_for_today(now, cfg)
+
+            # Send if at/after scheduled time and not yet sent today.
+            if now >= sched:
+                sent = await send_once_for_day(now, dedup=True)
+                if sent:
+                    await asyncio.sleep(65)
+                    continue
+
+            await asyncio.sleep(cfg.poll_sec)
+        except Exception as e:  # pragma: no cover
+            _log_error("[daily_report] loop error: %s", e, exc_info=True)
+            await asyncio.sleep(60)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -955,13 +1048,12 @@ def _parse_date_utc(s: str) -> datetime:
 
 async def _main_async() -> None:
     args = _parse_args()
-
     if args.once:
         day = _parse_date_utc(args.date)
         sent = await send_once_for_day(day, dedup=not args.no_dedup)
         _log_info("daily_report --once done (sent=%s)", sent)
-    else:
-        await run_worker()
+        return
+    await run_worker()
 
 
 def main() -> None:

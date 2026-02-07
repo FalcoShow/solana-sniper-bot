@@ -66,11 +66,14 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 # -----------------------------------------------------------------------------
 # Optional redis asyncio (redis-py)
 # -----------------------------------------------------------------------------
-aioredis: Any | None
+_redis_async: Any | None
 try:  # pragma: no cover
-    import redis.asyncio as aioredis  # type: ignore[import-not-found]
+    import redis.asyncio as _redis_async  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover
-    aioredis = None
+    _redis_async = None
+
+# IMPORTANT: keep Optional typing so mypy doesn't mark None-guard branches unreachable.
+redis_async: Any | None = _redis_async
 
 # -----------------------------------------------------------------------------
 # Core deps (required)
@@ -491,24 +494,39 @@ def _closed_trade_key(trade_id: str) -> str:
 # Time + Redis helpers
 # =============================================================================
 def _now_ts() -> float:
+    """UTC timestamp (seconds)."""
     return datetime.now(UTC).timestamp()
 
 
-def _midnight_utc() -> datetime:
-    now = datetime.now(UTC)
-    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+def _midnight_utc(now: datetime | None = None) -> datetime:
+    """
+    Next midnight in UTC as an aware datetime.
+    Accepts an optional `now` to ensure single-time sampling when desired.
+    """
+    n = now or datetime.now(UTC)
+    # next day at 00:00:00
+    return (n + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def _ttl_to_midnight_sec() -> int:
-    ttl = int((_midnight_utc() - datetime.now(UTC)).total_seconds())
+def _ttl_to_midnight_sec(now: datetime | None = None) -> int:
+    """
+    TTL (seconds) until next UTC midnight. Always >= 1.
+    """
+    n = now or datetime.now(UTC)
+    ttl = int((_midnight_utc(n) - n).total_seconds())
     return max(1, ttl)
 
 
 async def _set_expire_at_midnight(redis: RedisLike | None, key: str) -> None:
-    if not redis:
+    """
+    Best-effort: set expiry on `key` at next UTC midnight.
+    Contract-safe: no redis => no-op.
+    """
+    if redis is None:
         return
+    ttl = _ttl_to_midnight_sec()
     with contextlib.suppress(Exception):
-        await redis.expire(key, _ttl_to_midnight_sec())
+        await redis.expire(key, ttl)
 
 
 _redis_singleton: RedisLike | None = None
@@ -516,32 +534,47 @@ _redis_singleton: RedisLike | None = None
 
 async def _get_redis(url: str | None = None) -> RedisLike | None:
     """
-    Prefer core_utils shared redis (if present), otherwise core_utils.get_redis_async(),
-    otherwise fallback to redis.asyncio singleton (if available).
+    Prefer, in order:
+      1) utils_pkg.core_utils.redis (shared instance)
+      2) utils_pkg.core_utils.get_redis_async (factory; signature may vary)
+      3) redis.asyncio.from_url singleton fallback
+
+    Returns None if redis is unavailable/disabled/import-missing.
+    Never raises (risk_manager must degrade safely).
     """
     global _redis_singleton
 
+    # 1) Shared instance from core_utils (if present)
     shared = getattr(cu, "redis", None)
     if shared is not None:
-        return shared  # type: ignore[return-value]
+        return cast(RedisLike, shared)
 
+    # 2) Factory from core_utils (signature drift safe)
     getter = getattr(cu, "get_redis_async", None)
     if getter is not None:
-        with contextlib.suppress(Exception):
-            r = await _maybe_await(getter())
-            if r is not None:
-                return r  # type: ignore[return-value]
+        try:
+            # Some versions accept url; others accept none.
+            try:
+                candidate = getter(url or REDIS_URL)
+            except TypeError:
+                candidate = getter()
+            r_any = await _maybe_await(candidate)
+            if r_any is not None:
+                return cast(RedisLike, r_any)
+        except Exception:
+            # best-effort only
+            pass
 
+    # 3) Process-local singleton via redis.asyncio (if available)
     if _redis_singleton is not None:
         return _redis_singleton
 
-    if aioredis is None:
+    if redis_async is None:
         return None
 
     try:
-        _redis_singleton = cast(
-            "RedisLike", aioredis.from_url(url or REDIS_URL, decode_responses=True)
-        )
+        client_any = redis_async.from_url(url or REDIS_URL, decode_responses=True)
+        _redis_singleton = cast(RedisLike, client_any)
         return _redis_singleton
     except Exception:
         _redis_singleton = None
@@ -549,23 +582,35 @@ async def _get_redis(url: str | None = None) -> RedisLike | None:
 
 
 def _alert_ok(token: str) -> bool:
+    """
+    Process-local throttle to prevent spam.
+    """
     if RISK_DISABLE_ALERTS:
         return False
     if ALERT_COOLDOWN_SECONDS <= 0:
         return True
+
     now = _now_ts()
     until = _COOLDOWNS.get(token)
     if until is not None and until > now:
         return False
+
     _COOLDOWNS[token] = now + float(ALERT_COOLDOWN_SECONDS)
     return True
 
 
 def _parse_trading_days(raw: str) -> set[int] | None:
-    raw = (raw or "").strip().lower()
-    if not raw:
+    """
+    Parse allowed weekdays from comma-separated tokens:
+      - numbers 0..6
+      - names: mon,tue,wed,thu,fri,sat,sun (and long forms)
+    Returns None if empty / invalid.
+    """
+    s = (raw or "").strip().lower()
+    if not s:
         return None
-    name_to_idx = {
+
+    name_to_idx: dict[str, int] = {
         "mon": 0,
         "monday": 0,
         "tue": 1,
@@ -585,8 +630,9 @@ def _parse_trading_days(raw: str) -> set[int] | None:
         "sun": 6,
         "sunday": 6,
     }
+
     out: set[int] = set()
-    for part in raw.split(","):
+    for part in s.split(","):
         p = part.strip()
         if not p:
             continue
@@ -595,20 +641,26 @@ def _parse_trading_days(raw: str) -> set[int] | None:
                 v = int(p)
                 if 0 <= v <= 6:
                     out.add(v)
-        else:
-            v_opt = name_to_idx.get(p)
-            if v_opt is not None:
-                out.add(v_opt)
+            continue
+
+        v2 = name_to_idx.get(p)
+        if v2 is not None:
+            out.add(v2)
+
     return out or None
 
 
 def _trading_window_status() -> tuple[bool, str]:
+    """
+    Returns (ok, reason). Fully deterministic and UTC-based.
+    Supports overnight windows where start > end.
+    """
     if not RISK_TRADING_WINDOW_ENABLED:
         return True, "trading_window_disabled"
 
     now = datetime.now(UTC)
-    hour = now.hour
-    weekday = now.weekday()
+    hour = int(now.hour)
+    weekday = int(now.weekday())
 
     allowed_days = _parse_trading_days(RISK_TRADING_DAYS)
     if allowed_days is not None and weekday not in allowed_days:
@@ -616,6 +668,8 @@ def _trading_window_status() -> tuple[bool, str]:
 
     start = max(0, min(23, int(RISK_TRADING_START_HOUR_UTC)))
     end = max(0, min(24, int(RISK_TRADING_END_HOUR_UTC)))
+
+    # If equal, interpret as 24h window
     if start == end:
         return True, "24h_window"
 
@@ -623,6 +677,7 @@ def _trading_window_status() -> tuple[bool, str]:
         ok = start <= hour < end
         return ok, (f"within [{start},{end})" if ok else f"hour {hour} outside [{start},{end})")
 
+    # Overnight window: e.g. start=22, end=6 means [22..24) U [0..6)
     ok = (hour >= start) or (hour < end)
     return ok, (f"within overnight {start}->{end}" if ok else f"hour {hour} outside {start}->{end}")
 
@@ -821,20 +876,15 @@ def _load_open_positions_safe() -> list[dict[str, Any]]:
             list_open_positions as _list_open_positions,
         )
 
-        # Make mypy happy across multiple possible implementations:
-        # - some versions require wallet positional/kw
-        # - some versions may be async (return coroutine)
         lop: Any = _list_open_positions
 
         out_any: Any
         try:
             out_any = lop(wallet=str(WALLET_PUBKEY or ""))
         except TypeError:
-            # Back-compat: older signature may not accept wallet kw
             out_any = lop(str(WALLET_PUBKEY or ""))
 
         if asyncio.iscoroutine(out_any):
-            # We cannot await from this sync helper; treat as unknown/empty here.
             return []
 
         return list(out_any or [])
@@ -2135,7 +2185,6 @@ async def note_trade_result(
             log.warning("[RISK] note_trade_result failed for %s: %s", token_address, err)
 
 
-# Backwards-compatible note_spend signatures
 @overload
 async def note_spend(redis: RedisLike, usd: float) -> None: ...
 @overload
@@ -2196,17 +2245,14 @@ async def entry_gate_debug(
 
     reasons: list[str] = []
 
-    # 0) Hard halt fast path
     halted, halt_reason = await _is_halted_fast(redis)
     if halted:
         reasons.append(halt_reason or "halted")
 
-    # 1) Trading window
     tw_open, tw_reason = _trading_window_status()
     if not tw_open:
         reasons.append(f"trading window closed ({tw_reason})")
 
-    # 2) Limits
     limits = await current_limits(redis)
     equity = float(limits.get("equity_usd", 0.0))
     risk_mode = int(limits.get("risk_mode", 1))
@@ -2214,12 +2260,10 @@ async def entry_gate_debug(
     max_conc = int(limits.get("max_concurrent", 0))
     daily_spend_cap = float(limits.get("daily_spend_usd", 0.0))
 
-    # 3) Concurrency
     open_positions = _positions_open_count()
     if max_conc > 0 and open_positions >= max_conc:
         reasons.append(f"open_positions {open_positions} ≥ max_concurrent {max_conc}")
 
-    # 4) Per-mint cooldown
     mint_cd_active = False
     mint_cd_until = 0.0
     if mint and redis:
@@ -2228,7 +2272,6 @@ async def entry_gate_debug(
             rem = max(0.0, mint_cd_until - _now_ts())
             reasons.append(f"mint cooldown active ({rem:.0f}s remaining)")
 
-    # 5) Strategy params
     try:
         strat_params = await get_strategy_params(redis)
     except Exception:
@@ -2244,19 +2287,16 @@ async def entry_gate_debug(
             f"plan_gap_pct {plan_gap_pct:.2f}% ≥ hard-stop {RISK_PLAN_AHEAD_HARD_STOP_PCT:.2f}%"
         )
 
-    # 6) Mode + capacity floor
     if risk_mode == 0:
         reasons.append("risk_mode=0 (OFF)")
     if capacity < float(RISK_MIN_CAPACITY_FOR_ENTRY):
         reasons.append(f"risk_capacity {capacity:.3f} < floor {RISK_MIN_CAPACITY_FOR_ENTRY:.3f}")
 
-    # 7) Regime hard risk-off (sync/async safe)
     with contextlib.suppress(Exception):
         fn = getattr(regime_state, "is_hard_risk_off", None)
         if fn is not None and await _maybe_bool(fn()):
             reasons.append("regime_state.is_hard_risk_off()")
 
-    # 8) Loss/DD cooldown
     cooldown_active = False
     if redis:
         with contextlib.suppress(Exception):
@@ -2265,11 +2305,9 @@ async def entry_gate_debug(
                 cooldown_active = True
                 reasons.append("loss/DD cooldown active")
 
-    # 9) Equity floor
     if RISK_MIN_EQUITY_USD > 0 and equity < float(RISK_MIN_EQUITY_USD):
         reasons.append(f"equity_usd {equity:.2f} < RISK_MIN_EQUITY_USD {RISK_MIN_EQUITY_USD:.2f}")
 
-    # 10) Profit stop + loss cap
     realized = await _daily_realized_usd(redis)
     profit_stop_usd = equity * (STOP_AFTER_DAILY_PROFIT_PCT / 100.0)
     loss_cap_usd = equity * (DAILY_LOSS_CAP_PCT / 100.0) if DAILY_LOSS_CAP_PCT > 0 else 0.0
@@ -2278,12 +2316,10 @@ async def entry_gate_debug(
     if loss_cap_usd > 0 and realized <= -abs(loss_cap_usd):
         reasons.append(f"daily loss cap hit ({realized:.2f} ≤ -{abs(loss_cap_usd):.2f})")
 
-    # 11) Spend budget
     spent_usd = await _daily_spent_usd(redis)
     if daily_spend_cap > 0 and spent_usd >= daily_spend_cap:
         reasons.append(f"daily spend cap hit (spent {spent_usd:.2f} ≥ cap {daily_spend_cap:.2f})")
 
-    # 12) Daily caps
     trades_today = await _daily_trades(redis)
     if RISK_MAX_DAILY_TRADES > 0 and trades_today >= int(RISK_MAX_DAILY_TRADES):
         reasons.append(f"daily trades cap hit ({trades_today} ≥ cap {RISK_MAX_DAILY_TRADES})")
@@ -2292,7 +2328,6 @@ async def entry_gate_debug(
     if RISK_MAX_DAILY_ENTRIES > 0 and entries_today >= int(RISK_MAX_DAILY_ENTRIES):
         reasons.append(f"daily entries cap hit ({entries_today} ≥ cap {RISK_MAX_DAILY_ENTRIES})")
 
-    # 13) MIN_SOL_BALANCE (strategy param)
     strat_min_sol_balance = float(strat_params.get("MIN_SOL_BALANCE", 0.0))
     sol_bal = 0.0
     if strat_min_sol_balance > 0:
@@ -2302,7 +2337,6 @@ async def entry_gate_debug(
                 f"SOL balance {sol_bal:.4f} < MIN_SOL_BALANCE {strat_min_sol_balance:.4f}"
             )
 
-    # 14) Exposure cap
     open_exposure = _positions_open_exposure_usd()
     max_exposure = 0.0
     if RISK_MAX_EXPOSURE_USD > 0:
@@ -2417,6 +2451,7 @@ async def read_risk_ctx_hash(redis: RedisLike | None = None) -> dict[str, float]
 
 
 async def risk_capacity_snapshot(redis: RedisLike | None = None) -> dict[str, Any]:
+    # (kept identical logic to your original; contract-safe + degraded-safe)
     if _contract_no_io():
         prof = (os.getenv("RISK_PROFILE") or "balanced").strip().lower()
         return {
@@ -2593,6 +2628,7 @@ async def risk_capacity_score(redis: RedisLike | None = None) -> float:
 
 
 async def risk_budget_summary(redis: RedisLike | None = None) -> dict[str, Any]:
+    # (kept identical logic to your original)
     if _contract_no_io():
         return {
             "equity_usd": 0.0,
@@ -2636,6 +2672,7 @@ async def risk_budget_summary(redis: RedisLike | None = None) -> dict[str, Any]:
 
 
 async def risk_snapshot(redis: RedisLike | None = None) -> dict[str, Any]:
+    # (kept identical logic to your original)
     if _contract_no_io():
         prof = (os.getenv("RISK_PROFILE") or "balanced").strip().lower()
         tw_open, tw_reason = _trading_window_status()

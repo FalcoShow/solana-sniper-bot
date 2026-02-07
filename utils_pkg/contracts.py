@@ -796,13 +796,26 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                     description="Jupiter API base URL",
                 ),
                 EnvVar(
+                    "JUPITER_QUOTE_BASE",
+                    default="https://quote-api.jup.ag",
+                    description="Quote API base (bootstrap_pre_overlay override; default matches Jupiter quote base)",
+                ),
+                EnvVar(
+                    "JUPITER_QUOTE_URL",
+                    default="",
+                    description="Optional full Quote URL override (bootstrap_pre_overlay). If set, wins over JUPITER_QUOTE_BASE.",
+                ),
+                EnvVar(
                     "JUPITER_MAX_SLIPPAGE_BPS",
                     default="200",
                     kind="int",
                     description="Max slippage bps",
                 ),
                 EnvVar(
-                    "JUPITER_TIMEOUT_S", default="8", kind="int", description="HTTP timeout seconds"
+                    "JUPITER_TIMEOUT_S",
+                    default="8",
+                    kind="int",
+                    description="HTTP timeout seconds",
                 ),
                 EnvVar(
                     "JUPITER_API_KEY",
