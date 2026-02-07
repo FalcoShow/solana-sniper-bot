@@ -37,12 +37,14 @@ dependencies = [
 
 [project.optional-dependencies]
 # Dev tooling is intentionally pinned to major ranges to prevent drift.
+# Ruff is pinned EXACTLY to guarantee identical formatting locally + CI.
 dev = [
   "pytest>=7.4,<9",
   "pytest-asyncio>=0.23,<1",
   "pytest-cov>=4.1,<6",
   "pytest-xdist>=3.5,<4",
-  "ruff>=0.6,<1",
+
+  "ruff==0.9.2",
   "mypy>=1.8,<2",
 
   # Types (only what we already use; keep bounded stability).
@@ -77,6 +79,9 @@ exclude = ["tests*", "data*", "logs*", "tmp*", "node_modules*", "dist*", "build*
 # Ruff (lint + formatting) — deterministic + low-noise + CI-safe
 # =============================================================================
 [tool.ruff]
+# HARD lock Ruff version so CI/local cannot diverge.
+required-version = "==0.9.2"
+
 line-length = 100
 target-version = "py313"
 extend-exclude = [
@@ -118,7 +123,8 @@ combine-as-imports = true
 quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
-line-ending = "auto"
+# Deterministic across Windows/Linux; aligns with .gitattributes and CI.
+line-ending = "lf"
 
 # =============================================================================
 # Mypy — strict-enough for safety, without exploding on third-party libs
@@ -143,7 +149,7 @@ files = [
   "route_telemetry.py",
 ]
 
-# You’ve been keeping this pragmatic; preserve that posture.
+# Pragmatic posture.
 ignore_missing_imports = true
 
 check_untyped_defs = false
