@@ -9,12 +9,11 @@
 ###############################################################################
 
 # -----------------------------------------------------------------------------
-# Deploy blockers / local scratch (explicit)
+# Merge / scratch helpers (explicit)
 # -----------------------------------------------------------------------------
+_merge/
 .wip_local.patch
 mypy.out.txt
-.state/
-.state/**
 
 # -----------------------------------------------------------------------------
 # Python bytecode / caches
@@ -31,7 +30,7 @@ __pycache__/
 .cache/
 .ipynb_checkpoints/
 
-# Bytecode + editor backup crumbs
+# Editor / backup crumbs
 *.bak
 *.old
 *.orig
@@ -55,7 +54,7 @@ __pypackages__/
 # NOTE:
 # We intentionally DO NOT ignore `.python-version` by default.
 # If you use it to pin Python for local parity, it should be tracked.
-# (If you personally want it ignored, add `.python-version` back.)
+# (If you personally want it ignored, add it here.)
 # .python-version
 
 # -----------------------------------------------------------------------------
@@ -145,6 +144,8 @@ state.sqlite3-*
 *.sqlite
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 
 # Redis persistence files (if you ever run Redis locally)
 dump.rdb
@@ -153,6 +154,7 @@ appendonly.aof
 # -----------------------------------------------------------------------------
 # Local data outputs (keep repo clean; allow .gitkeep placeholders)
 # -----------------------------------------------------------------------------
+.state/
 state/
 runtime/
 run/
@@ -232,7 +234,6 @@ out/
 # Intentional choices:
 # - We do NOT ignore *.csv globally (you may track config/whales.csv, etc.)
 # - We do NOT ignore project wiring/audit docs
-# - We do NOT ignore lint/config files (ruff/pyproject/workflows must be tracked)
 ###############################################################################
 
 # If you specifically want this directory ignored, keep it here:
@@ -240,3 +241,9 @@ out/
 
 # Local Render export (never commit)
 render.env
+
+###############################################################################
+# IMPORTANT:
+# Do NOT ignore lint/config files. These must remain tracked for CI parity.
+# (Intentionally NOT ignoring ruff.toml / .ruff.toml / pyproject.toml / workflows)
+###############################################################################

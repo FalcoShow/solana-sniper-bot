@@ -66,6 +66,7 @@ import asyncio
 import contextlib
 import datetime as _dt
 import importlib
+import inspect
 import json
 import os
 import time
@@ -76,10 +77,12 @@ from typing import Any
 # =============================================================================
 # Identity / constants
 # =============================================================================
-EXIT_ENGINE_VERSION = "V3+++_LOCKIN_2026-01-28"
+EXIT_ENGINE_VERSION = "V3+++_LOCKIN_2026-02-06"
 _SOL_MINT = "So11111111111111111111111111111111111111112"
 _BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
-LAMPORTS_PER_SOL = 1_000_000_000  # downstream compatibility
+
+# kept for downstream compatibility
+LAMPORTS_PER_SOL = 1_000_000_000
 
 INSTANCE_ID = (
     (os.getenv("INSTANCE_ID") or "").strip()
@@ -132,7 +135,6 @@ _install_log_shims()
 
 
 def _log(name: str, level: str = "info", **fields: Any) -> None:
-    # best-effort structured
     with contextlib.suppress(Exception):
         log.event(name, **fields)  # type: ignore[misc]
         return
@@ -216,16 +218,15 @@ def _short_exc(e: BaseException, n: int = 260) -> str:
 
 
 async def _maybe_await(x: Any) -> Any:
-    if asyncio.iscoroutine(x):
+    if inspect.isawaitable(x):
         return await x
     return x
 
 
 def _json_default(o: Any) -> str:
-    try:
+    with contextlib.suppress(Exception):
         return str(o)
-    except Exception:
-        return "<unserializable>"
+    return "<unserializable>"
 
 
 def _json_dumps(payload: Any) -> str:
@@ -335,13 +336,19 @@ def _to_float(v: Any) -> float | None:
         if isinstance(v, bool):
             return float(int(v))
         if isinstance(v, (int, float)):
-            return float(v)
+            f = float(v)
+            if f != f or f in (float("inf"), float("-inf")):
+                return None
+            return f
         if isinstance(v, str):
             s = v.strip()
             if not s:
                 return None
             s = s.replace(",", "")
-            return float(s)
+            f2 = float(s)
+            if f2 != f2 or f2 in (float("inf"), float("-inf")):
+                return None
+            return f2
     except Exception:
         return None
     return None
@@ -396,10 +403,12 @@ def _parse_ts_any(v: Any) -> float | None:
         if not s:
             return None
 
+        # numeric string path
         fv_opt = _to_float(s)
         if fv_opt is not None and fv_opt > 0:
             return float(fv_opt)
 
+        # ISO8601 path
         with contextlib.suppress(Exception):
             ss = s.replace("Z", "+00:00")
             dt = _dt.datetime.fromisoformat(ss)
@@ -834,6 +843,7 @@ async def _get_redis_async() -> Any:
         with contextlib.suppress(Exception):
             out2 = gr()
             return await _maybe_await(out2)
+
     return None
 
 
@@ -1182,7 +1192,9 @@ async def _log_exit_event_safe(event: dict[str, Any]) -> None:
 async def _load_position_from_store_best_effort(mint: str) -> Mapping[str, Any] | None:
     if not mint:
         return None
-    ps = _get_mod("utils_pkg.position_store") or _get_mod("utils_pkg.positions")
+    ps = _get_mod("utils_pkg.position_store")
+    if not ps:
+        ps = _get_mod("utils_pkg.positions")
     if not ps:
         return None
 
@@ -1212,65 +1224,6 @@ async def _load_position_from_store_best_effort(mint: str) -> Mapping[str, Any] 
 # =============================================================================
 # Optional risk_manager gate (best-effort; NO hard dependency)
 # =============================================================================
-def _risk_gate(decision: Mapping[str, Any], snapshot: Mapping[str, Any]) -> tuple[bool, str]:
-    """
-    Returns (allow, note). Hard exits always allowed if gate is uncertain.
-    We do NOT add env keys here; we only consult optional risk_manager hooks.
-    """
-    hard = bool(decision.get("hard") or False)
-    rm = _get_mod("utils_pkg.risk_manager")
-    if not rm:
-        return True, "no_risk_manager"
-
-    # Try common hook names; any can exist, we adapt to return types.
-    candidates = (
-        "allow_exit",
-        "can_exit",
-        "exit_allowed",
-        "check_exit_allowed",
-        "is_exit_allowed",
-        "guard_exit",
-        "gate_exit",
-    )
-
-    for nm in candidates:
-        fn = getattr(rm, nm, None)
-        if not callable(fn):
-            continue
-        try:
-            out = fn(dict(decision), dict(snapshot))
-            if asyncio.iscoroutine(out):
-                # NOTE: gate is called in async contexts; coroutine will be awaited by caller if needed
-                pass
-        except Exception:
-            continue
-
-    # Async-aware pass (we keep it simple + safe by doing sync calls only).
-    for nm in candidates:
-        fn = getattr(rm, nm, None)
-        if not callable(fn):
-            continue
-        try:
-            out2 = fn(dict(decision), dict(snapshot))
-            if asyncio.iscoroutine(out2):
-                # Can't await here; caller will use async wrapper.
-                return True, "risk_gate_async_skip"
-            if isinstance(out2, bool):
-                if (not out2) and hard:
-                    return True, "risk_gate_block_soft_only"
-                return bool(out2), "risk_gate_bool"
-            if isinstance(out2, Mapping):
-                allow = out2.get("allow")
-                if isinstance(allow, bool):
-                    if (not allow) and hard:
-                        return True, "risk_gate_block_soft_only"
-                    return bool(allow), str(out2.get("reason") or "risk_gate_map")
-        except Exception:
-            continue
-
-    return True, "risk_gate_unknown"
-
-
 async def _risk_gate_async(
     decision: Mapping[str, Any], snapshot: Mapping[str, Any]
 ) -> tuple[bool, str]:
@@ -1350,7 +1303,9 @@ class _QuoteSanity:
 
 def _parse_price_impact_pct(v: Any) -> float | None:
     f = _to_float(v)
-    if f is None or f != f:
+    if f is None:
+        return None
+    if f != f:
         return None
     if 0.0 <= f <= 1.0:
         return f * 100.0
@@ -1627,7 +1582,6 @@ async def _delegate_exit(
         except Exception as e:
             _log("EXIT_AI_HOOK_FAIL", level="warning", mint=mint, hook=hook_name, err=_short_exc(e))
 
-    # Worker enqueue
     if CFG.allow_worker_enqueue:
         ok = await _enqueue_exit_request_best_effort(
             mint=mint,
@@ -1680,7 +1634,6 @@ async def request_exit(ev: dict[str, Any]) -> bool:
     pool = _extract_pool(ev)
     now = time.time()
 
-    # allow caller to supply sell_pct (e.g. TP ladder external)
     snapshot: dict[str, Any] = dict(ev)
     if "sell_pct" not in snapshot and "sellPct" in snapshot:
         snapshot["sell_pct"] = snapshot.get("sellPct")
@@ -1851,7 +1804,6 @@ def _parse_tp_ladder_from_any(obj: Mapping[str, Any] | None) -> list[tuple[float
                     if a2 is not None and b2 is not None:
                         ladder.append((float(a2), float(b2)))
         if ladder:
-            # normalize + sort
             norm: dict[float, float] = {}
             for pnl, sp in ladder:
                 if pnl != pnl:
@@ -2024,6 +1976,8 @@ async def on_trade_tick(
     trades_after: int
     max_price: float | None
     min_price: float | None
+    amount_raw_opt: int | None
+    tp_next_idx: int
 
     async with _OPEN_LOCK:
         p = _OPEN.get(mint)
@@ -2096,14 +2050,15 @@ async def on_trade_tick(
 
     metrics = _compute_metrics(entry_price, max_price, min_price, last_price)
 
-    # TP ladder can also come from meta
+    # TP ladder can come from position OR meta
     tp_ladder = []
-    if isinstance(pos_norm.get("tp_ladder"), list):
-        tp_ladder = [
-            (float(a), float(b))
-            for (a, b) in pos_norm["tp_ladder"]
-            if isinstance(a, (int, float)) and isinstance(b, (int, float))
-        ]
+    with contextlib.suppress(Exception):
+        if isinstance(pos_norm.get("tp_ladder"), list):
+            tp_ladder = [
+                (float(a), float(b))
+                for (a, b) in pos_norm["tp_ladder"]
+                if isinstance(a, (int, float)) and isinstance(b, (int, float))
+            ]
     if not tp_ladder:
         tp_ladder = _parse_tp_ladder_from_any(meta_in)
 
@@ -2114,7 +2069,7 @@ async def on_trade_tick(
         "entry_ts": float(entry_ts),
         "age_sec": float(age_sec),
         "spend_sol": float(spend_sol),
-        "amount_raw": amount_raw_opt,
+        "amount_raw": amount_raw_opt,  # int|None
         "candidate_id": pos_norm.get("candidate_id"),
         "entry_price": entry_price,
         "last_price": last_price,
@@ -2221,7 +2176,6 @@ async def on_trade_tick(
 
     # 3) Optional TP ladder (only if provided)
     if tp_ladder and float(metrics["pnl_pct"]) > 0.0:
-        # find next ladder step
         if 0 <= tp_next_idx < len(tp_ladder):
             target_pnl, sell_pct = tp_ladder[tp_next_idx]
             if float(metrics["pnl_pct"]) >= float(target_pnl):

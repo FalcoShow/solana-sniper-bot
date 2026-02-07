@@ -1,8 +1,10 @@
 # scripts/ci_smoke.py
 from __future__ import annotations
 
+import argparse
 import asyncio
 import importlib
+import json
 import os
 import socket
 import sys
@@ -10,22 +12,57 @@ import traceback
 import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable
 
+# =============================================================================
+# CI Smoke: hard no-network import spine
+#
+# Goals:
+# - Ensure core modules can be imported with SAFE_MODE/DRYRUN/NO_NETWORK enabled.
+# - Ensure imports do not perform outbound network calls.
+# - Optionally call an env validator (best-effort, non-strict).
+#
+# Run patterns:
+#   python -m scripts.ci_smoke
+#   python scripts/ci_smoke.py
+#
+# NOTE:
+# - Do NOT add new env keys here unless they are already present in the env contract.
+# =============================================================================
+
 
 # -----------------------------------------------------------------------------
-# Path bootstrap (CRITICAL for pre-commit)
-#
-# If executed as:
-#   python scripts/ci_smoke.py
-# then sys.path[0] becomes "scripts/" and imports like "utils_pkg" can fail.
-# We force repo root (+ optional src/) onto sys.path.
+# Repo root + sys.path bootstrap
 # -----------------------------------------------------------------------------
+def _find_repo_root(start: Path) -> Path:
+    """
+    Find repo root by walking upward for markers.
+    Falls back to <repo>/scripts -> parents[1] if markers are absent.
+    """
+    start = start.resolve()
+    for p in (start,) + tuple(start.parents):
+        if (p / "pyproject.toml").is_file():
+            return p
+        if (p / ".git").exists():
+            return p
+    # Fallback: <repo>/scripts/ci_smoke.py -> <repo>
+    try:
+        return start.parents[1]
+    except Exception:
+        return start
+
+
 def _bootstrap_sys_path() -> Path:
+    """
+    If executed as `python scripts/ci_smoke.py`, sys.path[0] becomes `scripts/`
+    and imports like `utils_pkg` can fail. We force repo root (+ optional src/)
+    onto sys.path.
+    """
     here = Path(__file__).resolve()
-    repo_root = here.parents[1]  # <repo>/scripts/ci_smoke.py -> <repo>
+    repo_root = _find_repo_root(here)
 
     root_str = str(repo_root)
     if root_str not in sys.path:
@@ -45,220 +82,182 @@ REPO_ROOT = _bootstrap_sys_path()
 
 # -----------------------------------------------------------------------------
 # Environment: force safe/no-network execution
-#
-# NOTE: Do NOT add new env keys here unless they are already in the contract.
 # -----------------------------------------------------------------------------
 def force_safe_env() -> None:
     """
     Force a deterministic, no-network, CI-friendly environment.
-    These toggles are intentionally redundant so whichever your code recognizes will apply.
+    Redundant toggles are intentional: whichever your code recognizes will apply.
+
+    IMPORTANT: only set keys already present in the env contract.
     """
-    os.environ.setdefault("SAFE_MODE", "1")
-    os.environ.setdefault("DRYRUN", "1")
-    os.environ.setdefault("NO_NETWORK", "1")
-    os.environ.setdefault("DISABLE_NETWORK", "1")
     os.environ.setdefault("CI", "1")
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
-    # Some codepaths gate on these names:
+    os.environ.setdefault("SAFE_MODE", "1")
+    os.environ.setdefault("DRYRUN", "1")
+    os.environ.setdefault("DRY_RUN", "1")
+
+    os.environ.setdefault("NO_NETWORK", "1")
+    os.environ.setdefault("DISABLE_NETWORK", "1")
+
+    # Common “contract scripts” knobs
     os.environ.setdefault("CHECK_ENV_JSON", "1")
     os.environ.setdefault("CHECK_ENV_JSON_ONLY", "1")
 
 
 # -----------------------------------------------------------------------------
-# Hard network guard
+# Hard network guard (strict by design)
 # -----------------------------------------------------------------------------
 class NetworkBlockedError(RuntimeError):
-    pass
+    """Raised when outbound network is attempted during CI smoke."""
 
 
-def _setattr_if_present(obj: Any, name: str, value: Any) -> None:
-    """
-    setattr wrapper used to avoid mypy 'Cannot assign to a type' / attr-defined errors
-    while keeping behavior identical.
-    """
-    try:
-        setattr(obj, name, value)
-    except Exception:
-        # If an attribute is readonly or missing on some platforms, ignore;
-        # the smoke still blocks the primary channels.
-        pass
+@dataclass(frozen=True)
+class _Patch:
+    obj: Any
+    attr: str
+    original: Any
 
 
-def _wrap_blocked(msg: str) -> Callable[..., Any]:
+def _blocked_fn(msg: str) -> Callable[..., Any]:
     def _blocked(*_args: Any, **_kwargs: Any) -> Any:
         raise NetworkBlockedError(msg)
 
     return _blocked
 
 
+def _safe_setattr(obj: Any, name: str, value: Any) -> bool:
+    try:
+        setattr(obj, name, value)
+        return True
+    except Exception:
+        return False
+
+
 @contextmanager
 def block_network() -> Iterator[None]:
     """
-    Block common outbound network pathways. If anything tries to open a socket / HTTP client,
-    it should fail fast with a clear error.
+    Block common outbound network pathways (socket/urllib/requests/aiohttp/httpx).
+    CI smoke must not touch the network.
 
-    This is intentionally strict: CI smoke must not touch the network.
+    This is intentionally strict and will fail fast with a clear error message.
     """
-    # --- socket guards ---
-    orig_socket = getattr(socket, "socket", None)
-    orig_create_conn = getattr(socket, "create_connection", None)
-    orig_getaddrinfo = getattr(socket, "getaddrinfo", None)
+    patches: list[_Patch] = []
 
-    _setattr_if_present(
-        socket, "socket", _wrap_blocked("Network is blocked in ci_smoke.py (socket.socket).")
-    )
-    if callable(orig_create_conn):
-        _setattr_if_present(
+    def patch(obj: Any, attr: str, value: Any) -> None:
+        try:
+            orig = getattr(obj, attr)
+        except Exception:
+            return
+        if _safe_setattr(obj, attr, value):
+            patches.append(_Patch(obj=obj, attr=attr, original=orig))
+
+    # socket guards
+    patch(socket, "socket", _blocked_fn("Network blocked (socket.socket) in ci_smoke."))
+    if hasattr(socket, "create_connection"):
+        patch(
             socket,
             "create_connection",
-            _wrap_blocked("Network is blocked in ci_smoke.py (socket.create_connection)."),
+            _blocked_fn("Network blocked (socket.create_connection) in ci_smoke."),
         )
-    if callable(orig_getaddrinfo):
-        _setattr_if_present(
-            socket,
-            "getaddrinfo",
-            _wrap_blocked("Network is blocked in ci_smoke.py (socket.getaddrinfo)."),
+    if hasattr(socket, "getaddrinfo"):
+        patch(
+            socket, "getaddrinfo", _blocked_fn("Network blocked (socket.getaddrinfo) in ci_smoke.")
         )
 
-    # --- urllib guard (stdlib) ---
-    orig_urlopen = getattr(urllib.request, "urlopen", None)
-    _setattr_if_present(
+    # urllib guard
+    patch(
         urllib.request,
         "urlopen",
-        _wrap_blocked("Network is blocked in ci_smoke.py (urllib.request.urlopen)."),
+        _blocked_fn("Network blocked (urllib.request.urlopen) in ci_smoke."),
     )
 
-    # --- requests guard (if installed) ---
-    requests_mod: Any | None = None
-    orig_requests_request: Any = None
-    orig_requests_get: Any = None
-    orig_requests_post: Any = None
+    # requests guard (optional)
     try:
         import requests as _requests  # type: ignore[import-not-found]
 
-        requests_mod = _requests
-        orig_requests_request = getattr(_requests, "request", None)
-        orig_requests_get = getattr(_requests, "get", None)
-        orig_requests_post = getattr(_requests, "post", None)
-
-        if callable(orig_requests_request):
-            _setattr_if_present(
-                _requests, "request", _wrap_blocked("Network is blocked (requests.request).")
-            )
-        if callable(orig_requests_get):
-            _setattr_if_present(
-                _requests, "get", _wrap_blocked("Network is blocked (requests.get).")
-            )
-        if callable(orig_requests_post):
-            _setattr_if_present(
-                _requests, "post", _wrap_blocked("Network is blocked (requests.post).")
-            )
+        patch(_requests, "request", _blocked_fn("Network blocked (requests.request) in ci_smoke."))
+        patch(_requests, "get", _blocked_fn("Network blocked (requests.get) in ci_smoke."))
+        patch(_requests, "post", _blocked_fn("Network blocked (requests.post) in ci_smoke."))
     except Exception:
         pass
 
-    # --- aiohttp guard (if installed) ---
-    aiohttp_mod: Any | None = None
-    orig_aiohttp_session: Any = None
+    # aiohttp guard (optional)
     try:
         import aiohttp as _aiohttp  # type: ignore[import-not-found]
 
-        aiohttp_mod = _aiohttp
-        orig_aiohttp_session = getattr(_aiohttp, "ClientSession", None)
-
-        class _BlockedClientSession:
+        class _BlockedClientSession:  # noqa: D401
             def __init__(self, *args: Any, **kwargs: Any) -> None:
-                raise NetworkBlockedError(
-                    "Network is blocked in ci_smoke.py (aiohttp.ClientSession)."
-                )
+                raise NetworkBlockedError("Network blocked (aiohttp.ClientSession) in ci_smoke.")
 
-        if orig_aiohttp_session is not None:
-            _setattr_if_present(_aiohttp, "ClientSession", _BlockedClientSession)
+        if hasattr(_aiohttp, "ClientSession"):
+            patch(_aiohttp, "ClientSession", _BlockedClientSession)
     except Exception:
         pass
 
-    # --- httpx guard (if installed) ---
-    httpx_mod: Any | None = None
-    orig_httpx_client: Any = None
-    orig_httpx_async_client: Any = None
+    # httpx guard (optional)
     try:
         import httpx as _httpx  # type: ignore[import-not-found]
 
-        httpx_mod = _httpx
-        orig_httpx_client = getattr(_httpx, "Client", None)
-        orig_httpx_async_client = getattr(_httpx, "AsyncClient", None)
-
-        class _BlockedClient:
+        class _BlockedClient:  # noqa: D401
             def __init__(self, *args: Any, **kwargs: Any) -> None:
-                raise NetworkBlockedError("Network is blocked in ci_smoke.py (httpx.Client).")
+                raise NetworkBlockedError("Network blocked (httpx.Client) in ci_smoke.")
 
-        class _BlockedAsyncClient:
+        class _BlockedAsyncClient:  # noqa: D401
             def __init__(self, *args: Any, **kwargs: Any) -> None:
-                raise NetworkBlockedError("Network is blocked in ci_smoke.py (httpx.AsyncClient).")
+                raise NetworkBlockedError("Network blocked (httpx.AsyncClient) in ci_smoke.")
 
-        if orig_httpx_client is not None:
-            _setattr_if_present(_httpx, "Client", _BlockedClient)
-        if orig_httpx_async_client is not None:
-            _setattr_if_present(_httpx, "AsyncClient", _BlockedAsyncClient)
+        if hasattr(_httpx, "Client"):
+            patch(_httpx, "Client", _BlockedClient)
+        if hasattr(_httpx, "AsyncClient"):
+            patch(_httpx, "AsyncClient", _BlockedAsyncClient)
     except Exception:
         pass
 
     try:
         yield
     finally:
-        # Restore everything we changed (best-effort; do not fail on restore)
-        if orig_socket is not None:
-            _setattr_if_present(socket, "socket", orig_socket)
-        if callable(orig_create_conn):
-            _setattr_if_present(socket, "create_connection", orig_create_conn)
-        if callable(orig_getaddrinfo):
-            _setattr_if_present(socket, "getaddrinfo", orig_getaddrinfo)
-
-        if orig_urlopen is not None:
-            _setattr_if_present(urllib.request, "urlopen", orig_urlopen)
-
-        if requests_mod is not None:
-            if callable(orig_requests_request):
-                _setattr_if_present(requests_mod, "request", orig_requests_request)
-            if callable(orig_requests_get):
-                _setattr_if_present(requests_mod, "get", orig_requests_get)
-            if callable(orig_requests_post):
-                _setattr_if_present(requests_mod, "post", orig_requests_post)
-
-        if aiohttp_mod is not None and orig_aiohttp_session is not None:
-            _setattr_if_present(aiohttp_mod, "ClientSession", orig_aiohttp_session)
-
-        if httpx_mod is not None:
-            if orig_httpx_client is not None:
-                _setattr_if_present(httpx_mod, "Client", orig_httpx_client)
-            if orig_httpx_async_client is not None:
-                _setattr_if_present(httpx_mod, "AsyncClient", orig_httpx_async_client)
+        # Restore in reverse order (best-effort).
+        for p in reversed(patches):
+            _safe_setattr(p.obj, p.attr, p.original)
 
 
 # -----------------------------------------------------------------------------
 # Import + env contract probing
 # -----------------------------------------------------------------------------
-def try_import(name: str) -> tuple[bool, ModuleType | None, str | None, str | None]:
+@dataclass
+class ImportResult:
+    name: str
+    ok: bool
+    err: str | None = None
+    tb: str | None = None
+
+
+def try_import(name: str) -> ImportResult:
     try:
-        mod = importlib.import_module(name)
-        return True, mod, None, None
+        importlib.import_module(name)
+        return ImportResult(name=name, ok=True)
     except Exception as e:
-        return False, None, f"{type(e).__name__}: {e}", traceback.format_exc()
+        return ImportResult(
+            name=name,
+            ok=False,
+            err=f"{type(e).__name__}: {e}",
+            tb=traceback.format_exc(),
+        )
 
 
-def _run_maybe_async(result: Any) -> None:
+def _run_maybe_async(val: Any) -> None:
     """
     Run coroutine-like return values safely.
-    Supports coroutines and generic awaitables by wrapping them.
+    Supports coroutines and generic awaitables.
     """
     import inspect
 
-    if inspect.iscoroutine(result):
-        asyncio.run(result)
+    if inspect.iscoroutine(val):
+        asyncio.run(val)
         return
-
-    if inspect.isawaitable(result):
-        aw = result
+    if inspect.isawaitable(val):
+        aw = val
 
         async def _wrap() -> Any:
             return await aw
@@ -269,7 +268,7 @@ def _run_maybe_async(result: Any) -> None:
 def call_env_validator(mod: ModuleType) -> tuple[bool, str]:
     """
     Best-effort env validation call (NON-STRICT).
-    Supports common function names used in your overhaul.
+    Supports common function names used across the overhaul.
     Must never require network; block_network() guarantees that.
     """
     candidates = (
@@ -313,69 +312,149 @@ def call_env_validator(mod: ModuleType) -> tuple[bool, str]:
     return True, f"no env validator found in {mod.__name__} (skipped)"
 
 
+def _is_missing_module_error(err: str | None) -> bool:
+    """
+    Conservative check for "the module itself doesn't exist".
+    We only use this for modules explicitly marked optional.
+    """
+    if not err:
+        return False
+    return err.startswith("ModuleNotFoundError") or err.startswith("ImportError")
+
+
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+DEFAULT_TARGETS: list[str] = [
+    # Core import spine
+    "utils_pkg.core_utils",
+    "utils_pkg.router",
+    "utils_pkg.feature_builder",
+    "utils_pkg.ai_entry_logic",
+    "utils_pkg.exit_engine",
+    # Optional: only skip if missing
+    "utils_pkg.auto_exit_worker.exit_engine",
+]
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="CI smoke: hard no-network spine imports.")
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a JSON summary line to stdout (in addition to human logs).",
+    )
+    p.add_argument(
+        "--json-only",
+        action="store_true",
+        help="Emit ONLY JSON summary to stdout (no human logs).",
+    )
+    p.add_argument(
+        "--targets",
+        nargs="*",
+        default=None,
+        help="Override default import targets (space-separated module names).",
+    )
+    return p.parse_args(argv)
+
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
-def main() -> int:
+def _human_print(enabled: bool, msg: str) -> None:
+    if enabled:
+        print(msg)
+
+
+def _json_dump(obj: dict[str, Any]) -> None:
+    print(json.dumps(obj, sort_keys=True))
+
+
+def run_ci_smoke(targets: list[str], human: bool) -> tuple[int, dict[str, Any]]:
     force_safe_env()
 
-    # Minimal, high-signal import targets (the spine)
-    targets: list[str] = [
-        "utils_pkg.core_utils",
-        "utils_pkg.router",
-        "utils_pkg.feature_builder",
-        "utils_pkg.ai_entry_logic",
-        "utils_pkg.exit_engine",
-        # Optional: only skip if it is truly missing. If it exists but errors, we want to know.
-        "utils_pkg.auto_exit_worker.exit_engine",
-    ]
+    _human_print(human, "[ci_smoke] SAFE_MODE/DRYRUN/NO_NETWORK enabled")
+    _human_print(human, f"[ci_smoke] repo_root={REPO_ROOT}")
+    _human_print(human, f"[ci_smoke] cwd={Path.cwd()}")
+    _human_print(human, f"[ci_smoke] sys.path[0]={sys.path[0]}")
+    _human_print(human, "[ci_smoke] Blocking outbound network...")
 
-    print("[ci_smoke] SAFE_MODE/DRYRUN/NO_NETWORK enabled")
-    print(f"[ci_smoke] repo_root={REPO_ROOT}")
-    print(f"[ci_smoke] cwd={Path.cwd()}")
-    print(f"[ci_smoke] sys.path[0]={sys.path[0]}")
-
+    results: list[ImportResult] = []
     failures: list[str] = []
     last_tb: str | None = None
 
-    print("[ci_smoke] Blocking outbound network...")
-
     with block_network():
         for name in targets:
-            ok, mod, err, tb = try_import(name)
-            if ok and mod is not None:
-                print(f"[ci_smoke] import OK: {name}")
+            r = try_import(name)
+            results.append(r)
 
-                # Only validate env contract from the canonical spine module
+            if r.ok:
+                _human_print(human, f"[ci_smoke] import OK: {name}")
+
+                # Best-effort env validation from canonical spine module.
                 if name == "utils_pkg.core_utils":
-                    v_ok, msg = call_env_validator(mod)
-                    print(f"[ci_smoke] {msg}")
-                    if not v_ok:
-                        failures.append(msg)
+                    try:
+                        mod = importlib.import_module(name)
+                        v_ok, msg = call_env_validator(mod)
+                        _human_print(human, f"[ci_smoke] {msg}")
+                        if not v_ok:
+                            failures.append(msg)
+                    except Exception as e:
+                        failures.append(
+                            f"env validator failed unexpectedly: {type(e).__name__}: {e}"
+                        )
                 continue
 
-            # Optional module handling: skip ONLY if module is missing.
-            if name == "utils_pkg.auto_exit_worker.exit_engine" and err:
-                if err.startswith("ModuleNotFoundError") or err.startswith("ImportError"):
-                    print(f"[ci_smoke] import SKIP (optional missing): {name} ({err})")
-                    continue
+            # Optional target handling: skip ONLY when the module is missing.
+            if name == "utils_pkg.auto_exit_worker.exit_engine" and _is_missing_module_error(r.err):
+                _human_print(human, f"[ci_smoke] import SKIP (optional missing): {name} ({r.err})")
+                continue
 
-            failures.append(f"import FAILED: {name} ({err})")
-            print(f"[ci_smoke] import FAILED: {name} ({err})")
-            last_tb = tb or last_tb
+            failures.append(f"import FAILED: {name} ({r.err})")
+            _human_print(human, f"[ci_smoke] import FAILED: {name} ({r.err})")
+            last_tb = r.tb or last_tb
+
+    exit_code = 0 if not failures else 1
 
     if failures:
-        print("\n[ci_smoke] FAILURES:")
+        _human_print(human, "\n[ci_smoke] FAILURES:")
         for f in failures:
-            print("  -", f)
-
+            _human_print(human, f"  - {f}")
         if last_tb:
-            print("\n[ci_smoke] Traceback (last failure):")
-            print(last_tb)
-        return 1
+            _human_print(human, "\n[ci_smoke] Traceback (last failure):")
+            _human_print(human, last_tb)
+    else:
+        _human_print(
+            human,
+            "\n[ci_smoke] SUCCESS: spine imports OK, env contract sane, network remained blocked.",
+        )
 
-    print("\n[ci_smoke] SUCCESS: spine imports OK, env contract sane, network remained blocked.")
-    return 0
+    summary = {
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "repo_root": str(REPO_ROOT),
+        "cwd": str(Path.cwd()),
+        "targets": list(targets),
+        "results": [{"name": r.name, "ok": r.ok, "err": r.err} for r in results],
+        "failures": list(failures),
+    }
+    return exit_code, summary
+
+
+def main(argv: list[str] | None = None) -> int:
+    ns = _parse_args(sys.argv[1:] if argv is None else argv)
+    targets = list(DEFAULT_TARGETS if ns.targets is None else ns.targets)
+    human = not ns.json_only
+
+    exit_code, summary = run_ci_smoke(targets=targets, human=human)
+
+    if ns.json or ns.json_only:
+        _json_dump(summary)
+
+    return exit_code
 
 
 if __name__ == "__main__":

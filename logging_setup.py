@@ -17,7 +17,7 @@ Key guarantees
 - Spam guards: logger.every(...) and logger.once(...).
 - Bind helpers: logger.bind(...) -> BoundLogger with merged extras.
 - Import-time safe (no networking; env read only during configure/get_logger).
-- Pytest-safe: never breaks capture handlers; only mutates handlers we own.
+- Pytest-safe: does not break capture handlers; only mutates handlers we own.
 - Collision-safe extra= handling (prevents LogRecord reserved overwrites).
 """
 
@@ -46,10 +46,6 @@ from utils_pkg.log_redaction import MASK, RedactionFilter, redact_obj, redact_te
 
 UTC = timezone.utc
 
-# -----------------------------------------------------------------------------
-# Baseline stdio (avoid recursion when sys.stdout is hooked)
-# -----------------------------------------------------------------------------
-
 _BASE_STDOUT = getattr(sys, "__stdout__", None) or sys.stdout
 _BASE_STDERR = getattr(sys, "__stderr__", None) or sys.stderr
 
@@ -59,7 +55,6 @@ _BASE_STDERR = getattr(sys, "__stderr__", None) or sys.stderr
 
 
 class EventLogger(Protocol):
-    # stdlib logger attrs commonly used across repo
     handlers: list[logging.Handler]
 
     def debug(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
@@ -71,7 +66,6 @@ class EventLogger(Protocol):
     def log(self, level: int, msg: str, *args: Any, **kwargs: Any) -> None: ...
     def isEnabledFor(self, level: int) -> bool: ...  # noqa: N802
 
-    # structured extensions installed onto logging.Logger class
     def event(
         self, name: str, /, msg: str | None = None, level: str | int = logging.INFO, **fields: Any
     ) -> None: ...
@@ -93,6 +87,34 @@ class EventLogger(Protocol):
     def bind(self, /, **fields: Any) -> "BoundLogger": ...
 
 
+__all__ = [
+    "EventLogger",
+    "BoundLogger",
+    "bind",
+    "bump",
+    "clear_log_context",
+    "configure_logging",
+    "event",
+    "get_event_logger",
+    "get_log_context",
+    "get_logger",
+    "hook_stdio",
+    "install_excepthook",
+    "mask_url",
+    "metrics_snapshot",
+    "new_run_id",
+    "redact_value",
+    "reset_metrics",
+    "reset_logging_state",
+    "set_log_context",
+    "setup_logging",
+    "start_global_heartbeat",
+    "stop_global_heartbeat",
+    "unhook_stdio",
+    "uninstall_excepthook",
+    "with_log_context",
+]
+
 # -----------------------------------------------------------------------------
 # Contextvars (per-task/per-request metadata)
 # -----------------------------------------------------------------------------
@@ -100,7 +122,7 @@ class EventLogger(Protocol):
 _LOG_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar("_LOG_CONTEXT", default=None)
 
 # -----------------------------------------------------------------------------
-# Simple in-process metrics (for bump())
+# Metrics
 # -----------------------------------------------------------------------------
 
 _METRICS_LOCK = threading.Lock()
@@ -120,15 +142,17 @@ class _LogDefaults:
     json_logs: bool
     use_utc: bool
     include_src: bool
+    include_process: bool
+    include_host: bool
     stream: str  # stderr|stdout
     exc_max_chars: int
     stack_max_chars: int
     value_max_chars: int
     noisy_min_level: str
     every_default_sec: float
+    redact_enabled: bool
     redact_key_fragments: set[str]
-    redact_secret_values: bool
-    force_reset: bool
+    dedupe_window_sec: float
 
 
 _DEFAULT_REDACT_KEY_FRAGMENTS: set[str] = {
@@ -169,15 +193,17 @@ _DEFAULTS: _LogDefaults = _LogDefaults(
     json_logs=True,
     use_utc=True,
     include_src=False,
-    stream="stderr",  # keep stdout clean for json-only scripts
+    include_process=True,
+    include_host=True,
+    stream="stderr",
     exc_max_chars=8000,
     stack_max_chars=8000,
     value_max_chars=4096,
     noisy_min_level="INFO",
     every_default_sec=30.0,
+    redact_enabled=True,
     redact_key_fragments=set(_DEFAULT_REDACT_KEY_FRAGMENTS),
-    redact_secret_values=True,
-    force_reset=False,
+    dedupe_window_sec=0.0,
 )
 
 _LEVEL_ALIASES: dict[str, str] = {
@@ -187,85 +213,15 @@ _LEVEL_ALIASES: dict[str, str] = {
     "TRACE": "DEBUG",
 }
 
-_RESERVED_RECORD_KEYS: set[str] = {
-    # Standard LogRecord fields
-    "name",
-    "msg",
-    "args",
-    "levelname",
-    "levelno",
-    "pathname",
-    "filename",
-    "module",
-    "exc_info",
-    "exc_text",
-    "stack_info",
-    "lineno",
-    "funcName",
-    "created",
-    "msecs",
-    "relativeCreated",
-    "thread",
-    "threadName",
-    "processName",
-    "process",
-    "message",
-    "asctime",
-    # common payload keys
-    "logger",
-    "level",
-    "time",
-    "ts",
-    "ts_ms",
-    "event",
-    "fields",  # special-cased and flattened
-    # our injected keys
-    "service",
-    "version",
-    "env",
-    "host",
-    "pid",
-    "thread_name",
-    "taskName",
-    "_include_src",
-}
-
 # Collision-safe extra handling: logging rejects overwriting LogRecord core keys.
 _RESERVED_LOGRECORD_KEYS: set[str] = set(logging.makeLogRecord({}).__dict__.keys()) | {
     "message",
     "asctime",
 }
 
-__all__ = [
-    "EventLogger",
-    "BoundLogger",
-    "bind",
-    "bump",
-    "clear_log_context",
-    "configure_logging",
-    "event",
-    "get_event_logger",
-    "get_log_context",
-    "get_logger",
-    "hook_stdio",
-    "install_excepthook",
-    "mask_url",
-    "metrics_snapshot",
-    "new_run_id",
-    "redact_value",
-    "reset_metrics",
-    "reset_logging_state",
-    "set_log_context",
-    "setup_logging",
-    "start_global_heartbeat",
-    "stop_global_heartbeat",
-    "unhook_stdio",
-    "uninstall_excepthook",
-    "with_log_context",
-]
 
 # -----------------------------------------------------------------------------
-# Env parsing helpers
+# Env parsing helpers (ONLY keys already in env contract)
 # -----------------------------------------------------------------------------
 
 
@@ -297,16 +253,19 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _infer_env_name() -> str:
-    env = (os.getenv("LOG_ENV", "") or "").strip()
-    if env:
-        return env
+    # Prefer explicit logging env.
+    v = (os.getenv("LOG_ENV", "") or "").strip()
+    if v:
+        return v
 
-    for key in ("ENV", "APP_ENV", "ENVIRONMENT", "RUNTIME_ENV", "RENDER_ENV"):
-        val = (os.getenv(key, "") or "").strip()
-        if val:
-            return val
+    # Standard env contract keys you already use.
+    for k in ("APP_ENV", "ENV"):
+        vv = (os.getenv(k, "") or "").strip()
+        if vv:
+            return vv
 
-    if (os.getenv("RENDER", "") or "").strip():
+    # Render presence => prod-ish
+    if (os.getenv("RENDER", "") or "").strip() not in ("", "0", "false", "False"):
         return "prod"
     if (os.getenv("RENDER_SERVICE_ID", "") or "").strip():
         return "prod"
@@ -325,23 +284,27 @@ def _read_env_defaults() -> _LogDefaults:
     json_logs = _env_bool("LOG_JSON", _DEFAULTS.json_logs)
     use_utc = _env_bool("LOG_TIME_UTC", _DEFAULTS.use_utc)
     include_src = _env_bool("LOG_INCLUDE_SRC", _DEFAULTS.include_src)
+    include_process = _env_bool("LOG_INCLUDE_PROCESS", _DEFAULTS.include_process)
+    include_host = _env_bool("LOG_INCLUDE_HOST", _DEFAULTS.include_host)
+
     stream = (os.getenv("LOG_STREAM", _DEFAULTS.stream) or _DEFAULTS.stream).strip().lower()
     if stream not in ("stderr", "stdout"):
         stream = "stderr"
 
-    exc_max_chars = _env_int("LOG_EXC_MAX_CHARS", _DEFAULTS.exc_max_chars)
-    stack_max_chars = _env_int("LOG_STACK_MAX_CHARS", _DEFAULTS.stack_max_chars)
-    value_max_chars = _env_int("LOG_VALUE_MAX_CHARS", _DEFAULTS.value_max_chars)
+    # Keep these as in-code knobs (no new env keys).
+    exc_max_chars = int(_DEFAULTS.exc_max_chars)
+    stack_max_chars = int(_DEFAULTS.stack_max_chars)
+    value_max_chars = int(_DEFAULTS.value_max_chars)
 
     noisy_min_level = (
         (os.getenv("LOG_NOISY_LEVEL", _DEFAULTS.noisy_min_level) or _DEFAULTS.noisy_min_level)
         .strip()
         .upper()
     )
-    every_default_sec = _env_float("LOG_EVERY_DEFAULT_SEC", _DEFAULTS.every_default_sec)
+    every_default_sec = float(_DEFAULTS.every_default_sec)
 
-    redact_secret_values = _env_bool("LOG_SECRET_VALUE_REDACTION", _DEFAULTS.redact_secret_values)
-    force_reset = _env_bool("LOG_FORCE_RESET", _DEFAULTS.force_reset)
+    # Redaction is controlled by your contract key LOG_REDACT plus fragments key.
+    redact_enabled = _env_bool("LOG_REDACT", _DEFAULTS.redact_enabled)
 
     extra = os.getenv("LOG_REDACT_KEYS", "") or ""
     fragments = set(_DEFAULT_REDACT_KEY_FRAGMENTS)
@@ -350,11 +313,8 @@ def _read_env_defaults() -> _LogDefaults:
         if p:
             fragments.add(p)
 
-    exc_max_chars = max(512, min(int(exc_max_chars), 200_000))
-    stack_max_chars = max(512, min(int(stack_max_chars), 200_000))
-    if int(value_max_chars) != 0:
-        value_max_chars = max(256, min(int(value_max_chars), 200_000))
-    every_default_sec = max(0.001, min(float(every_default_sec), 3600.0))
+    dedupe_window_sec = _env_float("LOG_DEDUP_WINDOW_SEC", _DEFAULTS.dedupe_window_sec)
+    dedupe_window_sec = max(0.0, min(float(dedupe_window_sec), 3600.0))
 
     service = (service or "sniper")[:64]
     version = (version or "v1")[:64]
@@ -368,15 +328,17 @@ def _read_env_defaults() -> _LogDefaults:
         json_logs=bool(json_logs),
         use_utc=bool(use_utc),
         include_src=bool(include_src),
+        include_process=bool(include_process),
+        include_host=bool(include_host),
         stream=str(stream),
-        exc_max_chars=int(exc_max_chars),
-        stack_max_chars=int(stack_max_chars),
-        value_max_chars=int(value_max_chars),
+        exc_max_chars=exc_max_chars,
+        stack_max_chars=stack_max_chars,
+        value_max_chars=value_max_chars,
         noisy_min_level=noisy_min_level,
-        every_default_sec=float(every_default_sec),
+        every_default_sec=every_default_sec,
+        redact_enabled=bool(redact_enabled),
         redact_key_fragments={k.lower() for k in fragments},
-        redact_secret_values=bool(redact_secret_values),
-        force_reset=bool(force_reset),
+        dedupe_window_sec=float(dedupe_window_sec),
     )
 
 
@@ -443,7 +405,6 @@ def _is_sensitive_env_key(k: str) -> bool:
         "database_url",
         "redis_url",
         "rpc_url",
-        "jupiter",
         "openai",
         "telegram",
         "discord",
@@ -451,8 +412,8 @@ def _is_sensitive_env_key(k: str) -> bool:
     return any(n in kk for n in needles)
 
 
-def _collect_secret_values(enabled: bool) -> list[str]:
-    if not enabled:
+def _collect_secret_values(redaction_enabled: bool) -> list[str]:
+    if not redaction_enabled:
         return []
     values: set[str] = set()
     try:
@@ -472,21 +433,18 @@ def _collect_secret_values(enabled: bool) -> list[str]:
 def _refresh_secret_values() -> None:
     global _SECRET_VALUES
     with _SECRET_VALUES_LOCK:
-        _SECRET_VALUES = _collect_secret_values(_DEFAULTS.redact_secret_values)
+        _SECRET_VALUES = _collect_secret_values(_DEFAULTS.redact_enabled)
 
 
 def _sanitize_text(text: Any) -> str:
     try:
         s = "" if text is None else str(text)
-        if _DEFAULTS.redact_secret_values:
+        if _DEFAULTS.redact_enabled:
             with _SECRET_VALUES_LOCK:
-                sv = list(_SECRET_VALUES)
-            for sec in sv:
-                try:
-                    if sec and sec in s:
-                        s = s.replace(sec, "***")
-                except Exception:
-                    continue
+                secrets = list(_SECRET_VALUES)
+            for sec in secrets:
+                if sec and sec in s:
+                    s = s.replace(sec, "***")
         return redact_text(s)
     except Exception:
         return MASK
@@ -527,7 +485,7 @@ def _is_sensitive_key_name(key: str) -> bool:
 def redact_value(key: str, value: Any) -> Any:
     try:
         k = str(key or "")
-        if _is_sensitive_key_name(k):
+        if _DEFAULTS.redact_enabled and _is_sensitive_key_name(k):
             return "***"
 
         if isinstance(value, str):
@@ -547,11 +505,6 @@ def _format_exc(exc_info: Any, max_chars: int) -> str:
         return _cap_text(s, max_chars)
     except Exception:
         return "<exc_format_failed>"
-
-
-# -----------------------------------------------------------------------------
-# Extra collision sanitization (prevents LogRecord overwrite KeyError)
-# -----------------------------------------------------------------------------
 
 
 def _sanitize_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -655,24 +608,30 @@ def _current_task_name() -> str | None:
 
 
 class ContextFilter(logging.Filter):
-    def __init__(self, include_src: bool = False) -> None:
+    def __init__(self, *, include_src: bool, include_process: bool, include_host: bool) -> None:
         super().__init__()
         self.include_src = bool(include_src)
+        self.include_process = bool(include_process)
+        self.include_host = bool(include_host)
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
         record.service = _RUNTIME.service
         record.version = _RUNTIME.version
         record.env = _RUNTIME.env
-        record.host = _RUNTIME.host
-        record.pid = _RUNTIME.pid
-        record.taskName = _current_task_name()
-        record.thread_name = threading.current_thread().name
+
+        if self.include_host:
+            record.host = _RUNTIME.host
+        if self.include_process:
+            record.pid = _RUNTIME.pid
+            record.thread_name = threading.current_thread().name
+            record.taskName = _current_task_name()
+
         record._include_src = bool(self.include_src)
 
         ctx = get_log_context()
         for k, v in ctx.items():
             ks = str(k)
-            if ks in _RESERVED_RECORD_KEYS or ks.startswith("_"):
+            if ks.startswith("_"):
                 continue
             try:
                 setattr(record, ks, redact_value(ks, v))
@@ -687,7 +646,7 @@ class ContextFilter(logging.Filter):
 
 
 class JsonFormatter(logging.Formatter):
-    def __init__(self, use_utc: bool = True) -> None:
+    def __init__(self, *, use_utc: bool) -> None:
         super().__init__()
         self.use_utc = bool(use_utc)
 
@@ -725,14 +684,18 @@ class JsonFormatter(logging.Formatter):
             "service": getattr(record, "service", _DEFAULTS.service),
             "version": getattr(record, "version", _DEFAULTS.version),
             "env": getattr(record, "env", _DEFAULTS.env),
-            "host": getattr(record, "host", ""),
-            "pid": getattr(record, "pid", os.getpid()),
-            "thread": getattr(record, "thread_name", ""),
         }
 
-        tn = getattr(record, "taskName", None)
-        if tn not in (None, "", False):
-            payload["taskName"] = tn
+        if hasattr(record, "host"):
+            payload["host"] = getattr(record, "host", "")
+        if hasattr(record, "pid"):
+            payload["pid"] = getattr(record, "pid", os.getpid())
+        if hasattr(record, "thread_name"):
+            payload["thread"] = getattr(record, "thread_name", "")
+        if hasattr(record, "taskName"):
+            tn = getattr(record, "taskName", None)
+            if tn:
+                payload["taskName"] = tn
 
         ev = getattr(record, "event", None)
         if ev not in (None, "", False):
@@ -748,18 +711,18 @@ class JsonFormatter(logging.Formatter):
                 }
             )
 
-        # Special-case: flatten `fields` if present (adapter-style structured logs)
+        # Flatten adapter-style fields if present.
         fields_obj = getattr(record, "fields", None)
         if isinstance(fields_obj, dict):
             for k, v in fields_obj.items():
                 ks = str(k)
-                if ks in payload or ks in _RESERVED_RECORD_KEYS or ks.startswith("_"):
+                if ks in payload or ks.startswith("_"):
                     continue
                 payload[ks] = redact_value(ks, v)
 
-        # Include extras as top-level fields
+        # Include extras as top-level keys.
         for k, v in record.__dict__.items():
-            if k in _RESERVED_RECORD_KEYS or k.startswith("_") or k in payload:
+            if k in _RESERVED_LOGRECORD_KEYS or k.startswith("_") or k in payload:
                 continue
             payload[str(k)] = redact_value(str(k), v)
 
@@ -787,7 +750,7 @@ class JsonFormatter(logging.Formatter):
 
 
 class TextFormatter(logging.Formatter):
-    def __init__(self, use_utc: bool = True) -> None:
+    def __init__(self, *, use_utc: bool) -> None:
         super().__init__(fmt="%(asctime)s %(levelname)s %(name)s: %(message)s")
         self.use_utc = bool(use_utc)
 
@@ -806,7 +769,6 @@ class TextFormatter(logging.Formatter):
             raw_msg = "<log_message_format_failed>"
 
         record.message = _truncate_str(_sanitize_text(raw_msg))
-
         if self.usesTime():
             record.asctime = self.formatTime(record, self.datefmt)
 
@@ -843,7 +805,7 @@ _EVERY: dict[tuple[str, str], _EveryState] = {}
 _EVERY_MAX_KEYS = 50_000
 
 _ONCE_LOCK = threading.Lock()
-_ONCE: set[tuple[str, str]] = set()
+_ONCE: dict[tuple[str, str], float] = {}  # key -> first_seen_ts
 
 
 def _every_key(logger: logging.Logger, name: str) -> tuple[str, str]:
@@ -956,11 +918,19 @@ def _logger_once(
     level: str | int = logging.INFO,
     **fields: Any,
 ) -> bool:
+    now = time.time()
     key = (self.name, name)
+
     with _ONCE_LOCK:
-        if key in _ONCE:
-            return False
-        _ONCE.add(key)
+        last = _ONCE.get(key)
+        if last is not None:
+            # Optional windowing: if dedupe window is 0, it's "once per process".
+            if _DEFAULTS.dedupe_window_sec <= 0:
+                return False
+            if now - last < _DEFAULTS.dedupe_window_sec:
+                return False
+        _ONCE[key] = now
+
     _logger_event(self, name, msg=msg, level=level, **fields)
     return True
 
@@ -1106,8 +1076,10 @@ def bump(name: str, by: int = 1, **tags: Any) -> None:
     with _METRICS_LOCK:
         _METRICS[name] = _METRICS.get(name, 0) + inc
 
-    if _env_bool("LOG_BUMP_DEBUG", False):
-        get_logger("metrics").debug("bump %s +%s tags=%s", name, inc, safe_repr(tags))
+    # Optional debug via standard logger level; no new env keys.
+    with suppress(Exception):
+        if tags:
+            get_logger("metrics").debug("bump %s +%s tags=%s", name, inc, safe_repr(tags))
 
 
 def metrics_snapshot() -> dict[str, int]:
@@ -1127,13 +1099,68 @@ def reset_metrics() -> None:
 _CONFIG_LOCK = threading.Lock()
 _CONFIGURED = False
 
-
-# Owned handler tracking: avoids adding dynamic attributes to stdlib Handler (mypy-safe).
+# Owned handler tracking: avoids mutating pytest capture handlers.
 _OWNED_HANDLERS: "weakref.WeakSet[logging.Handler]" = weakref.WeakSet()
 
 
-def _set_noisy_lib_levels() -> None:
-    noisy_level = _parse_level(_DEFAULTS.noisy_min_level)
+def _running_under_pytest() -> bool:
+    return bool(os.getenv("PYTEST_CURRENT_TEST"))
+
+
+def _choose_stream(stream_name: str) -> Any:
+    if _running_under_pytest():
+        # Keep pytest capture happy: use current sys streams.
+        return sys.stdout if stream_name == "stdout" else sys.stderr
+    return _BASE_STDOUT if stream_name == "stdout" else _BASE_STDERR
+
+
+def _handler_set_formatter(handler: logging.Handler, *, json_logs: bool, use_utc: bool) -> None:
+    handler.setFormatter(
+        JsonFormatter(use_utc=use_utc) if json_logs else TextFormatter(use_utc=use_utc)
+    )
+
+
+def _ensure_filters(
+    handler: logging.Handler, *, include_src: bool, include_process: bool, include_host: bool
+) -> None:
+    # Context
+    has_ctx = any(isinstance(f, ContextFilter) for f in getattr(handler, "filters", []))
+    if not has_ctx:
+        with suppress(Exception):
+            handler.addFilter(
+                ContextFilter(
+                    include_src=bool(include_src),
+                    include_process=bool(include_process),
+                    include_host=bool(include_host),
+                )
+            )
+    else:
+        for f in list(getattr(handler, "filters", [])):
+            if isinstance(f, ContextFilter):
+                f.include_src = bool(include_src)
+                f.include_process = bool(include_process)
+                f.include_host = bool(include_host)
+
+    # Redaction filter (from utils_pkg.log_redaction)
+    has_redact = any(isinstance(f, RedactionFilter) for f in getattr(handler, "filters", []))
+    if not has_redact:
+        with suppress(Exception):
+            handler.addFilter(RedactionFilter())
+
+
+def _is_owned_handler(h: logging.Handler) -> bool:
+    try:
+        return h in _OWNED_HANDLERS
+    except Exception:
+        return False
+
+
+def _mark_owned_handler(h: logging.Handler) -> None:
+    with suppress(Exception):
+        _OWNED_HANDLERS.add(h)
+
+
+def _set_noisy_lib_levels(noisy_level: int) -> None:
     for name in (
         "asyncio",
         "urllib3",
@@ -1148,94 +1175,14 @@ def _set_noisy_lib_levels() -> None:
         logging.getLogger(name).setLevel(noisy_level)
 
 
-def _normalize_third_party_loggers() -> None:
-    for lname in (
-        "uvicorn",
-        "uvicorn.error",
-        "uvicorn.access",
-        "gunicorn",
-        "gunicorn.error",
-        "gunicorn.access",
-    ):
-        lg = logging.getLogger(lname)
-        lg.propagate = True
-        with suppress(Exception):
-            if lg.handlers:
-                lg.handlers.clear()
-
-
-def _running_under_pytest() -> bool:
-    return bool(os.getenv("PYTEST_CURRENT_TEST"))
-
-
-def _choose_stream() -> Any:
-    if _running_under_pytest():
-        target = sys.stdout if _DEFAULTS.stream == "stdout" else sys.stderr
-        if isinstance(target, _StreamToLogger):
-            return _BASE_STDOUT if _DEFAULTS.stream == "stdout" else _BASE_STDERR
-        return target
-    return _BASE_STDOUT if _DEFAULTS.stream == "stdout" else _BASE_STDERR
-
-
-def _handler_set_formatter(handler: logging.Handler, *, json_logs: bool, use_utc: bool) -> None:
-    handler.setFormatter(
-        JsonFormatter(use_utc=use_utc) if json_logs else TextFormatter(use_utc=use_utc)
-    )
-
-
-def _ensure_filters(handler: logging.Handler, *, include_src: bool) -> None:
-    try:
-        filters = list(getattr(handler, "filters", []))
-    except Exception:
-        filters = []
-
-    has_ctx = any(isinstance(f, ContextFilter) for f in filters)
-    if not has_ctx:
-        with suppress(Exception):
-            handler.addFilter(ContextFilter(include_src=bool(include_src)))
-    else:
-        for f in filters:
-            if isinstance(f, ContextFilter):
-                f.include_src = bool(include_src)
-
-    has_redact = any(isinstance(f, RedactionFilter) for f in filters)
-    if not has_redact:
-        with suppress(Exception):
-            handler.addFilter(RedactionFilter())
-
-
-def _is_owned_handler(h: logging.Handler) -> bool:
-    """True iff handler was created/managed by this logging module.
-
-    We prefer WeakSet tracking (mypy-safe). We also accept the legacy attribute
-    marker for backward compatibility in case an older build tagged it.
-    """
-    try:
-        if h in _OWNED_HANDLERS:
-            return True
-    except Exception:
-        pass
-    return bool(getattr(h, "_sniper_owned", False))
-
-
-def _mark_owned_handler(h: logging.Handler) -> None:
-    """Mark handler as owned by this module (mypy-safe, ruff-safe)."""
-    try:
-        _OWNED_HANDLERS.add(h)
-        return
-    except Exception:
-        # Extremely defensive fallback: some exotic handler implementations may not be weakref-able.
-        # Avoid setattr(..., "_sniper_owned", ...) to satisfy Ruff B010, and avoid direct assignment for mypy.
-        with suppress(Exception):
-            object.__setattr__(h, "_sniper_owned", True)
-
-
 def configure_logging(
     *,
     level: str | int | None = None,
     json_logs: bool | None = None,
     use_utc: bool | None = None,
     include_src: bool | None = None,
+    include_process: bool | None = None,
+    include_host: bool | None = None,
     stream: str | None = None,
     service: str | None = None,
     version: str | None = None,
@@ -1243,22 +1190,18 @@ def configure_logging(
     force: bool = False,
     capture_warnings: bool = True,
 ) -> None:
-    global _CONFIGURED, _RUNTIME, _DEFAULTS
+    global _CONFIGURED, _DEFAULTS, _RUNTIME
 
     _install_logger_extras()
 
     _DEFAULTS = _read_env_defaults()
     _refresh_secret_values()
 
-    if _DEFAULTS.force_reset:
-        force = True
-
+    # Apply overrides
     if stream is not None:
         st = str(stream).strip().lower()
         if st in ("stderr", "stdout"):
             _DEFAULTS = _LogDefaults(**{**_DEFAULTS.__dict__, "stream": st})
-
-    lvl = _parse_level(level if level is not None else _DEFAULTS.level)
 
     if json_logs is None:
         json_logs = _DEFAULTS.json_logs
@@ -1266,6 +1209,12 @@ def configure_logging(
         use_utc = _DEFAULTS.use_utc
     if include_src is None:
         include_src = _DEFAULTS.include_src
+    if include_process is None:
+        include_process = _DEFAULTS.include_process
+    if include_host is None:
+        include_host = _DEFAULTS.include_host
+
+    lvl = _parse_level(level if level is not None else _DEFAULTS.level)
 
     with _CONFIG_LOCK:
         _RUNTIME = _RuntimeMeta(
@@ -1277,22 +1226,27 @@ def configure_logging(
         )
 
         root = logging.getLogger()
+        root.setLevel(lvl)
 
+        # Only mutate handlers we own; do not disrupt pytest capture.
         if force:
             for h in list(root.handlers):
                 with suppress(Exception):
                     root.removeHandler(h)
 
-        root.setLevel(lvl)
-
         owned = [h for h in list(root.handlers) if _is_owned_handler(h)]
 
         if not owned:
-            handler = logging.StreamHandler(stream=_choose_stream())
+            handler = logging.StreamHandler(stream=_choose_stream(_DEFAULTS.stream))
             _mark_owned_handler(handler)
             handler.setLevel(lvl)
             _handler_set_formatter(handler, json_logs=bool(json_logs), use_utc=bool(use_utc))
-            _ensure_filters(handler, include_src=bool(include_src))
+            _ensure_filters(
+                handler,
+                include_src=bool(include_src),
+                include_process=bool(include_process),
+                include_host=bool(include_host),
+            )
             root.addHandler(handler)
             owned = [handler]
 
@@ -1301,14 +1255,21 @@ def configure_logging(
                 h.setLevel(lvl)
             with suppress(Exception):
                 if isinstance(h, logging.StreamHandler):
-                    h.stream = _choose_stream()
+                    h.stream = _choose_stream(_DEFAULTS.stream)
             with suppress(Exception):
                 _handler_set_formatter(h, json_logs=bool(json_logs), use_utc=bool(use_utc))
-            _ensure_filters(h, include_src=bool(include_src))
+            _ensure_filters(
+                h,
+                include_src=bool(include_src),
+                include_process=bool(include_process),
+                include_host=bool(include_host),
+            )
 
         logging.captureWarnings(bool(capture_warnings))
-        _set_noisy_lib_levels()
-        _normalize_third_party_loggers()
+
+        noisy_level = _parse_level(_DEFAULTS.noisy_min_level)
+        _set_noisy_lib_levels(noisy_level)
+
         _CONFIGURED = True
 
 
@@ -1326,6 +1287,8 @@ def get_logger(
     json_logs: bool | None = None,
     use_utc: bool | None = None,
     include_src: bool | None = None,
+    include_process: bool | None = None,
+    include_host: bool | None = None,
     stream: str | None = None,
     force: bool = False,
 ) -> EventLogger:
@@ -1333,39 +1296,49 @@ def get_logger(
 
     needs_config = (not _CONFIGURED) or any(
         x is not None
-        for x in (service, version, env, level, json_logs, use_utc, include_src, stream)
+        for x in (
+            service,
+            version,
+            env,
+            level,
+            json_logs,
+            use_utc,
+            include_src,
+            include_process,
+            include_host,
+            stream,
+        )
     )
     if needs_config:
-        try:
+        with suppress(Exception):
             configure_logging(
                 level=level,
                 json_logs=json_logs,
                 use_utc=use_utc,
                 include_src=include_src,
+                include_process=include_process,
+                include_host=include_host,
                 stream=stream,
                 service=service,
                 version=version,
                 env=env,
                 force=force,
             )
-        except Exception:
-            logging.basicConfig(level=_parse_level(level))
 
     target = name if name else (service or _DEFAULTS.service or "sniper")
     return cast(EventLogger, logging.getLogger(target))
 
 
 def get_event_logger(name: str | None = None, **kwargs: Any) -> EventLogger:
-    # Alias used by some modules during migration.
     return get_logger(name, **kwargs)
 
 
 # -----------------------------------------------------------------------------
-# StdIO hook (hook_stdio / unhook_stdio) — recursion-safe
+# StdIO hook (hook_stdio / unhook_stdio)
 # -----------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class _StdIoHookState:
     orig_stdout: Any
     orig_stderr: Any
@@ -1376,20 +1349,26 @@ _STDIO_STATE: _StdIoHookState | None = None
 
 
 class _StreamToLogger(io.TextIOBase):
+    # Match TextIOBase typing: encoding is an attribute (not a read-only @property).
+    encoding: str
+
     def __init__(self, logger: EventLogger, level: int, tee: Any) -> None:
         super().__init__()
         self._logger = logger
         self._level = int(level)
         self._tee = tee
         self._local = threading.local()
-        # TextIOBase.encoding is a read-only property in typeshed; we still set it at runtime.
-        self.encoding = getattr(self._tee, "encoding", "utf-8")  # type: ignore[assignment]
+
+        # Keep the "looks like a text stream" contract for callers that inspect encoding.
+        # TextIOBase typing expects this to be an attribute.
+        enc = getattr(self._tee, "encoding", None)
+        self.encoding = str(enc) if enc else "utf-8"
 
     def writable(self) -> bool:  # pragma: no cover
         return True
 
     def _buf(self) -> str:
-        return getattr(self._local, "buf", "")
+        return cast(str, getattr(self._local, "buf", ""))
 
     def _set_buf(self, s: str) -> None:
         self._local.buf = s
@@ -1407,10 +1386,9 @@ class _StreamToLogger(io.TextIOBase):
             return 0
 
         if getattr(self._local, "in_write", False):
-            try:
+            with suppress(Exception):
                 return int(self._tee.write(s))
-            except Exception:
-                return len(str(s))
+            return len(str(s))
 
         self._local.in_write = True
         try:
@@ -1483,7 +1461,7 @@ def unhook_stdio() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Excepthook
+# Excepthook (process + threading)
 # -----------------------------------------------------------------------------
 
 _EXC_LOCK = threading.Lock()
@@ -1537,20 +1515,14 @@ def install_excepthook(logger: EventLogger | None = None) -> None:
                         ev_obj = getattr(args, "exc_value", None)
                         tb_obj = getattr(args, "exc_traceback", None)
 
-                        if isinstance(et_obj, type) and issubclass(et_obj, BaseException):
-                            et: type[BaseException] = et_obj
-                        else:
-                            et = Exception
-
-                        if isinstance(ev_obj, BaseException):
-                            ev: BaseException = ev_obj
-                        else:
-                            ev = (
-                                Exception(str(ev_obj))
-                                if ev_obj is not None
-                                else Exception("thread exception")
+                        et: type[BaseException] = et_obj if isinstance(et_obj, type) else Exception
+                        ev: BaseException = (
+                            ev_obj
+                            if isinstance(ev_obj, BaseException)
+                            else Exception(
+                                str(ev_obj) if ev_obj is not None else "thread exception"
                             )
-
+                        )
                         tb2: TracebackType | None = (
                             tb_obj if isinstance(tb_obj, TracebackType) else None
                         )
@@ -1562,7 +1534,7 @@ def install_excepthook(logger: EventLogger | None = None) -> None:
                             "THREAD_UNCAUGHT_EXCEPTION",
                             exc_info=(et, ev, tb2),
                             extra=_sanitize_extra(
-                                {"event": "THREAD_UNCAUGHT_EXCEPTION", "thread_uncaught": tname}
+                                {"event": "THREAD_UNCAUGHT_EXCEPTION", "thread": tname}
                             ),
                         )
                     except Exception:
@@ -1614,14 +1586,11 @@ def start_global_heartbeat(
     interval_sec: float = 30.0,
     logger_name: str = "heartbeat",
     event_name: str = "HEARTBEAT",
-    enabled: bool | None = None,
+    enabled: bool = True,
     include_metrics: bool = True,
     include_runtime: bool = True,
 ) -> bool:
     global _HEARTBEAT_STOP, _HEARTBEAT_THREAD
-
-    if enabled is None:
-        enabled = _env_bool("LOG_HEARTBEAT", True)
 
     try:
         interval = float(interval_sec)
@@ -1643,9 +1612,6 @@ def start_global_heartbeat(
             with suppress(Exception):
                 configure_logging()
 
-            with suppress(Exception):
-                time.sleep(min(1.0, interval / 10))
-
             while not stop_ev.is_set():
                 extra: dict[str, Any] = {"event": event_name}
 
@@ -1655,10 +1621,12 @@ def start_global_heartbeat(
                             "runtime_service": _RUNTIME.service,
                             "runtime_version": _RUNTIME.version,
                             "runtime_env": _RUNTIME.env,
-                            "runtime_host": _RUNTIME.host,
-                            "runtime_pid": _RUNTIME.pid,
                         }
                     )
+                    if _DEFAULTS.include_host:
+                        extra["runtime_host"] = _RUNTIME.host
+                    if _DEFAULTS.include_process:
+                        extra["runtime_pid"] = _RUNTIME.pid
 
                 if include_metrics:
                     snap = metrics_snapshot()
@@ -1745,15 +1713,17 @@ def reset_logging_state() -> None:
         json_logs=True,
         use_utc=True,
         include_src=False,
+        include_process=True,
+        include_host=True,
         stream="stderr",
         exc_max_chars=8000,
         stack_max_chars=8000,
         value_max_chars=4096,
         noisy_min_level="INFO",
         every_default_sec=30.0,
+        redact_enabled=True,
         redact_key_fragments=set(_DEFAULT_REDACT_KEY_FRAGMENTS),
-        redact_secret_values=True,
-        force_reset=False,
+        dedupe_window_sec=0.0,
     )
     _RUNTIME = _RuntimeMeta(
         service=_DEFAULTS.service,

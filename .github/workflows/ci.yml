@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
   pull_request:
     branches: ["**"]
   workflow_dispatch:
@@ -34,7 +33,7 @@ env:
   NO_NETWORK_POLICY: "1"
   PROBES_ENABLED: "0"
 
-  # Preflight + router contracts
+  # Preflight + router contracts (kept for consistency with scripts)
   PREFLIGHT: "1"
   PREFLIGHT_JSON_ONLY: "1"
   PREFLIGHT_STEP_TIMEOUT_S: "60"
@@ -77,10 +76,12 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
 
+          # Runtime deps
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
           fi
 
+          # Dev deps
           if [ -f requirements-dev.txt ]; then
             python -m pip install -r requirements-dev.txt
           elif [ -f pyproject.toml ]; then
@@ -89,7 +90,7 @@ jobs:
           fi
 
           # Ensure CI tools exist even if project install didn't provide them.
-          python -m pip install -U ruff pytest pytest-asyncio
+          python -m pip install -U ruff
 
           python -m pip check || true
           python -c "import sys; print('python', sys.version)"
@@ -109,8 +110,74 @@ jobs:
           set -euo pipefail
           python -m compileall -q -f .
 
+  smoke:
+    name: Smoke (no-network spine + init)
+    runs-on: ubuntu-latest
+    needs: quality
+    timeout-minutes: 15
+
+    # Hard no-network for this job (stable CI).
+    env:
+      NO_NETWORK: "1"
+      DISABLE_NETWORK: "1"
+      NO_NETWORK_POLICY: "1"
+      PROBES_ENABLED: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python (3.13)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install deps (runtime + dev)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip wheel setuptools
+
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
+
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          elif [ -f pyproject.toml ]; then
+            python -m pip install -e ".[dev]" || true
+          fi
+
+          python -m pip install -U pytest pytest-asyncio
+
+          python -m pip check || true
+          python -c "import sys; print('python', sys.version)"
+
+      - name: Prepare artifacts dir
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+
+      - name: CI smoke (hard no-network spine imports)
+        run: |
+          set -euo pipefail
+          python -m scripts.ci_smoke | tee artifacts/ci_smoke.txt
+
+      - name: smoke_init (json-only, probes disabled)
+        run: |
+          set -euo pipefail
+          python -m scripts.smoke_init --json-only | tee artifacts/smoke_init.json
+
+      - name: Upload artifacts (smoke)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-artifacts
+          path: artifacts
+          if-no-files-found: ignore
+
   typecheck:
-    name: Typecheck (mypy, gated)
+    name: Typecheck (mypy, config-gated)
     runs-on: ubuntu-latest
     needs: quality
     timeout-minutes: 15
@@ -159,66 +226,19 @@ jobs:
             echo "No mypy config found (pyproject [tool.mypy] / mypy.ini / setup.cfg). Skipping mypy."
           fi
 
-  smoke:
-    name: Smoke (no-network spine + init)
-    runs-on: ubuntu-latest
-    needs: quality
-    timeout-minutes: 15
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python (3.13)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-          cache: pip
-
-      - name: Install deps (runtime + dev)
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip wheel setuptools
-
-          if [ -f requirements.txt ]; then
-            python -m pip install -r requirements.txt
-          fi
-          if [ -f requirements-dev.txt ]; then
-            python -m pip install -r requirements-dev.txt
-          elif [ -f pyproject.toml ]; then
-            python -m pip install -e ".[dev]" || true
-          fi
-
-          python -m pip install -U pytest pytest-asyncio
-
-      - name: Prepare artifacts dir
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-
-      - name: CI smoke (hard no-network spine imports)
-        run: |
-          set -euo pipefail
-          python -m scripts.ci_smoke | tee artifacts/ci_smoke.txt
-
-      - name: smoke_init (json-only, probes disabled)
-        run: |
-          set -euo pipefail
-          python -m scripts.smoke_init --json-only | tee artifacts/smoke_init.json
-
-      - name: Upload artifacts (smoke)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: smoke-artifacts
-          path: artifacts
-          if-no-files-found: ignore
-
   preflight:
     name: Preflight (deploy profile, deterministic)
     runs-on: ubuntu-latest
     needs: smoke
     timeout-minutes: 20
+
+    # Keep preflight deterministic in CI (offline by default).
+    # Online probes are handled by the optional job below.
+    env:
+      NO_NETWORK: "1"
+      DISABLE_NETWORK: "1"
+      NO_NETWORK_POLICY: "1"
+      PROBES_ENABLED: "0"
 
     steps:
       - name: Checkout
@@ -269,6 +289,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: preflight
     timeout-minutes: 30
+
+    # Hard no-network for the test suite.
+    env:
+      NO_NETWORK: "1"
+      DISABLE_NETWORK: "1"
+      NO_NETWORK_POLICY: "1"
+      PROBES_ENABLED: "0"
 
     steps:
       - name: Checkout

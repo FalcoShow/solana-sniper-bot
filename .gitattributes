@@ -1,9 +1,10 @@
 # =============================================================================
 # .gitattributes — God-Tier repo hygiene (Windows dev + Render/Linux deploy)
-# Goal:
-#   - No CRLF/LF churn
-#   - Render/Linux scripts always LF
-#   - Windows scripts keep CRLF
+#
+# Goals:
+#   - No CRLF/LF churn in diffs
+#   - Render/Linux runtime files are ALWAYS LF
+#   - Windows scripts stay CRLF (better local UX)
 #   - True binaries never get EOL conversion
 # =============================================================================
 
@@ -34,14 +35,11 @@
 *.example   text eol=lf
 *.lock      text eol=lf
 *.xml       text eol=lf
-
-# -----------------------------------------------------------------------------
-# Shell scripts (Render/Linux): MUST be LF
-# -----------------------------------------------------------------------------
+*.graphql   text eol=lf
+*.proto     text eol=lf
 *.sh        text eol=lf
 *.bash      text eol=lf
 *.zsh       text eol=lf
-start.sh    text eol=lf
 
 # -----------------------------------------------------------------------------
 # Windows scripts: keep CRLF
@@ -51,47 +49,48 @@ start.sh    text eol=lf
 *.ps1       text eol=crlf
 
 # -----------------------------------------------------------------------------
-# Git/CI/deploy files: LF
+# CI / deploy / repo meta: LF
 # -----------------------------------------------------------------------------
-.gitattributes          text eol=lf
-.gitignore              text eol=lf
-.renderignore           text eol=lf
-render.yaml             text eol=lf
-Procfile                text eol=lf
-Dockerfile              text eol=lf
-.github/workflows/*.yml text eol=lf
-.github/workflows/*.yaml text eol=lf
+.gitattributes              text eol=lf
+.gitignore                  text eol=lf
+.renderignore               text eol=lf
+Procfile                    text eol=lf
+Dockerfile                  text eol=lf
+docker-compose.yml          text eol=lf
+render.yaml                 text eol=lf
+.github/workflows/*.yml     text eol=lf
+.github/workflows/*.yaml    text eol=lf
 
 # -----------------------------------------------------------------------------
 # Jupyter notebooks are JSON; keep LF for stable diffs
 # -----------------------------------------------------------------------------
-*.ipynb    text eol=lf
+*.ipynb     text eol=lf
 
 # -----------------------------------------------------------------------------
 # Binaries: never apply EOL conversion
 # -----------------------------------------------------------------------------
-*.png      binary
-*.jpg      binary
-*.jpeg     binary
-*.gif      binary
-*.webp     binary
-*.ico      binary
-*.pdf      binary
+*.png       -text
+*.jpg       -text
+*.jpeg      -text
+*.gif       -text
+*.webp      -text
+*.ico       -text
+*.pdf       -text
 
-*.zip      binary
-*.7z       binary
-*.gz       binary
-*.tgz      binary
-*.bz2      binary
+*.zip       -text
+*.7z        -text
+*.gz        -text
+*.tgz       -text
+*.bz2       -text
 
-*.whl      binary
-*.pyd      binary
-*.so       binary
-*.dll      binary
-*.exe      binary
+*.whl       -text
+*.pyd       -text
+*.so        -text
+*.dll       -text
+*.exe       -text
 
-# Keys/certs should never be line-ending rewritten by accident
-*.pem      binary
-*.crt      binary
-*.cer      binary
-*.key      binary
+# Keys/certs: avoid accidental normalization
+*.pem       -text
+*.crt       -text
+*.cer       -text
+*.key       -text

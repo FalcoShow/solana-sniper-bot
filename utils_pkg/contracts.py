@@ -106,6 +106,7 @@ class EnvVar:
       - required: whether required in STRICT mode (production gates / contract tests)
       - secret: should be redacted in logs
       - description: short note
+      - aliases: additional accepted keys (informational)
 
     Back-compat constructor aliases supported:
       - name -> key
@@ -119,7 +120,7 @@ class EnvVar:
     required: bool
     secret: bool
     description: str
-    aliases: tuple[str, ...]  # additional accepted keys (informational)
+    aliases: tuple[str, ...]
 
     def __init__(
         self,
@@ -166,7 +167,6 @@ class EnvVar:
         if not d and desc:
             d = str(desc).strip()
 
-        # default selection order (explicit default wins)
         dv = default
         if dv is None and example is not None:
             dv = str(example)
@@ -530,9 +530,6 @@ def _env_section(_title: str, vars_: list[EnvVar]) -> list[EnvVar]:
 
 CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
     [
-        # ---------------------------------------------------------------------
-        # [A] APP IDENTITY / MODE
-        # ---------------------------------------------------------------------
         *_env_section(
             "APP IDENTITY / MODE",
             [
@@ -1386,6 +1383,7 @@ def _augment_canonical_with_env_example(
         return list(base)
 
     keys_in_order, defaults, comments = _parse_env_example(path)
+
     # Case-insensitive map: prevents env.example case-variants from becoming new canonical keys
     base_upper: dict[str, EnvVar] = {ev.key.upper(): ev for ev in base}
 
@@ -1395,7 +1393,7 @@ def _augment_canonical_with_env_example(
         if not kk:
             continue
 
-        # If only case differs (e.g., no_proxy vs NO_PROXY), treat as already covered.
+        # If only case differs, treat as already covered.
         if kk.upper() in base_upper:
             continue
 
@@ -1444,10 +1442,7 @@ def env_example_diff(repo_root: Path | None = None) -> dict[str, list[str]]:
     """
     Compare canonical ENV_KEYS vs `.env.example`.
     Returns:
-      {
-        "missing_in_env_example": [...],
-        "extra_in_env_example": [...],
-      }
+      {"missing_in_env_example": [...], "extra_in_env_example": [...]}
     """
     root = repo_root or _repo_root_from_here()
     path = root / ENV_EXAMPLE_FILENAME
@@ -1478,7 +1473,6 @@ def env_example_required_hint_diff(repo_root: Path | None = None) -> dict[str, l
 
     _, _, comments = _parse_env_example(path)
 
-    # If there are no 'required' hints anywhere, do not enforce required-hint consistency.
     has_any_required_hint = any("required" in (c or "").lower() for c in comments.values())
     if not has_any_required_hint:
         return {"missing_required_hints": []}
@@ -1771,10 +1765,6 @@ class ContractBase:
 # =============================================================================
 # CORE CONTRACTS
 # =============================================================================
-
-# ---- (Everything below stays feature-identical to your current schemas) ----
-# NOTE: the following classes are copied from your file with only minimal typing-safe
-# adjustments (no feature removals). Keep them as-is unless tests demand new shims.
 
 
 @dataclass(slots=True)
@@ -2325,10 +2315,7 @@ class EventEnvelope(ContractBase):
 
 
 def _coerce_to_dict(position: Any, *, kwargs_fallback: dict[str, Any]) -> dict[str, Any]:
-    """
-    Coerce arbitrary input into a dict[str, Any] without creating mypy "unreachable"
-    branches or ambiguous asdict typing.
-    """
+    """Coerce arbitrary input into a dict[str, Any]."""
     if position is None:
         return dict(kwargs_fallback) if kwargs_fallback else {}
 
@@ -2377,11 +2364,9 @@ def normalize_position(
 
     out = _coerce_to_dict(position, kwargs_fallback=dict(kwargs))
 
-    # ensure required schema keys exist
     out.setdefault("schema_version", CONTRACTS_VERSION)
     out.setdefault("schema_rev", SCHEMA_REV)
 
-    # ctx time normalization (supports now_ms/ts_ms/now_ts/ts)
     ctxd = dict(ctx or {})
     now_ms_val = safe_int(ctxd.get("now_ms", ctxd.get("ts_ms", 0)), 0)
     now_ts_val = safe_int(ctxd.get("now_ts", ctxd.get("ts", 0)), 0)

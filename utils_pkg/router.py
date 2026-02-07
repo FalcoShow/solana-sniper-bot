@@ -1886,13 +1886,18 @@ async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
             "router_only_direct": bool(only_direct),
         }
 
-    # cache used only for real http (no test sessions)
+    # Cache is a production optimization ONLY:
+    # - never used under pytest
+    # - never used when a caller provides a session (tests/capturing)
+    # - never used when capturing session is present
+    explicit_session = sess_in is not None
     use_cache = (
         bool(_net_allowed())
         and (not _is_pytest_runtime())
         and (not capturing)
-        and (resolved is None)
+        and (not explicit_session)
     )
+
     key = _qkey(input_mint, output_mint, int(amt), int(slippage_bps), only_direct)
 
     if use_cache:

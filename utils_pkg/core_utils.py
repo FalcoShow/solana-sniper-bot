@@ -1781,7 +1781,6 @@ def transfer_to_savings_sync(*args: Any, **kwargs: Any) -> tuple[bool, str]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Notion logging shim (mypy-safe, import-safe, best-effort)
 # ──────────────────────────────────────────────────────────────────────────────
-
 _NotionLogFn = Callable[..., Any]
 _NOTION_LOG_IMPL: _NotionLogFn | None = None
 _NOTION_LOG_TRIED = False

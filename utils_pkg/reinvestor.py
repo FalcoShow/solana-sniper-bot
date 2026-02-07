@@ -1,4 +1,3 @@
-# utils_pkg/reinvestor.py
 from __future__ import annotations
 
 """
@@ -38,14 +37,13 @@ Public API
 
 Design notes (mypy/CI)
 ----------------------
-This file intentionally avoids widespread "# type: ignore" comments because many repos run
-mypy with warn_unused_ignores enabled. Instead, optional integrations are loaded via
-importlib at runtime (lazy), eliminating import-stub errors and unused-ignore failures
-while preserving all features and compatibility.
+- No merge markers (this file must be clean).
+- Optional integrations are loaded lazily via importlib at runtime (signature drift tolerant).
+- Avoids widespread "# type: ignore" to play nice with warn_unused_ignores.
 
 Env keys
 --------
-This rewrite preserves the exact env key names/usage patterns from your current module.
+This rewrite preserves the existing env key names/usage patterns from your module.
 Do not add new env keys here; contract tests depend on stable key usage.
 """
 
@@ -63,17 +61,15 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import lru_cache
-from typing import Any, Callable, Coroutine, TypeAlias, Union, cast
+from typing import Any, Callable, TypeAlias, cast
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Types
 # ──────────────────────────────────────────────────────────────────────────────
-JSONLike: TypeAlias = Union[dict[str, Any], list[Any], str, int, float, bool, None]
+JSONLike: TypeAlias = dict[str, Any] | list[Any] | str | int | float | bool | None
 Meta: TypeAlias = dict[str, Any]
 RedisClient: TypeAlias = Any
-
-AsyncAnyFn: TypeAlias = Callable[..., Coroutine[Any, Any, Any]]
-SyncAnyFn: TypeAlias = Callable[..., Any]
+SavePosFn: TypeAlias = Callable[[str, dict[str, Any]], Any]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -243,7 +239,7 @@ def _json_dumps(obj: Any, **kwargs: Any) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Lazy import helpers (avoid mypy import-stub errors + unused-ignore issues)
+# Lazy import helpers (avoid mypy stub/import errors + keep optional deps optional)
 # ──────────────────────────────────────────────────────────────────────────────
 @lru_cache(maxsize=256)
 def _import_module(name: str) -> Any | None:
@@ -269,28 +265,18 @@ def normalize_mint(x: str) -> str:
     return (x or "").strip()
 
 
-# Optional mint guard
-_mint_guard_allowed: Callable[[str], bool] | None
-_fn_guard = _import_attr("utils_pkg.mint_guard", "is_mint_allowed")
-_mint_guard_allowed = cast(Callable[[str], bool], _fn_guard) if callable(_fn_guard) else None
+@lru_cache(maxsize=1)
+def _mint_guard_fn() -> Callable[[str], bool] | None:
+    fn = _import_attr("utils_pkg.mint_guard", "is_mint_allowed")
+    return cast(Callable[[str], bool], fn) if callable(fn) else None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Redis helpers
+# core_utils (lazy)
 # ──────────────────────────────────────────────────────────────────────────────
-async def _redis_call(redis: RedisClient, fn_name: str, *args: Any, **kwargs: Any) -> Any:
-    fn = getattr(redis, fn_name, None)
-    if not callable(fn):
-        raise AttributeError(fn_name)
-    try:
-        out = fn(*args, **kwargs)
-    except TypeError:
-        out = fn(*args)
-    return await _maybe_await(out)
-
-
+@lru_cache(maxsize=1)
 def _core_mod() -> Any | None:
-    # Keep consistent with the rest of the repo: utils_pkg.core_utils is the canonical location.
+    # Canonical location in your repo
     return _import_module("utils_pkg.core_utils")
 
 
@@ -316,6 +302,20 @@ def _shared_redis_from_core() -> RedisClient | None:
     if mod is None:
         return None
     return getattr(mod, "redis", None)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Redis helpers
+# ──────────────────────────────────────────────────────────────────────────────
+async def _redis_call(redis: RedisClient, fn_name: str, *args: Any, **kwargs: Any) -> Any:
+    fn = getattr(redis, fn_name, None)
+    if not callable(fn):
+        raise AttributeError(fn_name)
+    try:
+        out = fn(*args, **kwargs)
+    except TypeError:
+        out = fn(*args)
+    return await _maybe_await(out)
 
 
 async def _get_redis(url: str | None = None) -> RedisClient | None:
@@ -381,9 +381,6 @@ async def _log_event_safe(*args: Any, **kwargs: Any) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Position persistence — prefer SoT store if present
 # ──────────────────────────────────────────────────────────────────────────────
-SavePosFn: TypeAlias = Callable[[str, dict[str, Any]], Any]
-
-
 @lru_cache(maxsize=1)
 def _load_save_position() -> SavePosFn | None:
     fn1 = _import_attr("utils_pkg.positions", "save_position")
@@ -421,7 +418,7 @@ async def _save_position(mint: str, data: dict[str, Any]) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Optional modules — always call via wrappers (signature drift tolerant)
+# Optional modules — always called via wrappers (signature drift tolerant)
 # ──────────────────────────────────────────────────────────────────────────────
 async def infra_features(redis: RedisClient | None = None) -> dict[str, float]:
     fn = _import_attr("utils_pkg.infra_guard", "infra_features")
@@ -569,23 +566,17 @@ async def note_spend(redis: RedisClient | None, usd: float, **kw: Any) -> None:
             await _call_maybe_async(fn, redis, usd)
 
 
-# smart_wallets picker
 def _pick_reinvestment_target_fn() -> Any | None:
     fn = _import_attr("utils_pkg.smart_wallets", "pick_reinvestment_target")
-    if callable(fn):
-        return fn
-    return None
+    return fn if callable(fn) else None
 
 
-# find_reinvestment_token (prefer utils_pkg)
 def _find_reinvestment_token_fn() -> Any | None:
     fn = _import_attr("utils_pkg.find_reinvestment_token", "find_reinvestment_token")
     if callable(fn):
         return fn
     fn2 = _import_attr("find_reinvestment_token", "find_reinvestment_token")
-    if callable(fn2):
-        return fn2
-    return None
+    return fn2 if callable(fn2) else None
 
 
 async def find_reinvestment_token(
@@ -606,7 +597,6 @@ async def find_reinvestment_token(
     return out if isinstance(out, str) else None
 
 
-# Post-buy hooks (soft)
 def _sell_schedule_after_buy_fn() -> Any | None:
     fn = _import_attr("utils_pkg.ai_sell_logic", "schedule_after_buy")
     return fn if callable(fn) else None
@@ -1037,9 +1027,10 @@ def _mint_allowed(mint: str) -> bool:
         return False
     if CFG.allow_mints and m not in CFG.allow_mints:
         return False
-    if callable(_mint_guard_allowed):
+    guard = _mint_guard_fn()
+    if callable(guard):
         with contextlib.suppress(Exception):
-            if not bool(_mint_guard_allowed(m)):
+            if not bool(guard(m)):
                 return False
     return True
 
@@ -1056,7 +1047,6 @@ async def _pick_target_mint(
             raw={"forced": True},
         )
 
-    # Prefer smart_wallets picker
     picker = _pick_reinvestment_target_fn()
     if callable(picker):
         out: Any = None
@@ -1254,7 +1244,6 @@ async def _build_context(
     proceeds_sol2 = float(proceeds_sol or 0.0)
     proceeds_usd = await _sol_to_usd(proceeds_sol2)
 
-    # risk ctx
     try:
         risk_ctx0 = await risk_capacity_snapshot(redis, source="reinvestor")
     except TypeError:
@@ -1624,7 +1613,7 @@ async def _persist_decision(redis: RedisClient | None, decision_doc: dict[str, A
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Scales / effective % (logic preserved)
+# Scales / effective %
 # ──────────────────────────────────────────────────────────────────────────────
 def _kelly_scale(ctx: ReinvestContext) -> float:
     kelly = max(0.0, ctx.kelly_suggestion)
@@ -1913,9 +1902,9 @@ async def _evaluate_gates(ctx: ReinvestContext, redis: RedisClient | None) -> tu
         if any(tag in ("reinvestor_soft_off", "cooldown_reinvestor") for tag in ctx.risk_tags):
             return False, "risk_tag_soft_halt"
 
-    if (
-        ctx.daily_trades_cap > 0 and ctx.daily_trades_count >= ctx.daily_trades_cap
-    ) and not force_anyway:
+    if (ctx.daily_trades_cap > 0 and ctx.daily_trades_count >= ctx.daily_trades_cap) and (
+        not force_anyway
+    ):
         return False, "daily_trades_cap_reached"
 
     if ctx.spend_budget_block and not force_anyway:
@@ -1930,9 +1919,9 @@ async def _evaluate_gates(ctx: ReinvestContext, redis: RedisClient | None) -> tu
     except Exception:
         allow_entry = True
 
-    if (
-        (not allow_entry) or ctx.risk_capacity < CFG.min_capacity or ctx.risk_mode == 0
-    ) and not force_anyway:
+    if ((not allow_entry) or ctx.risk_capacity < CFG.min_capacity or ctx.risk_mode == 0) and (
+        not force_anyway
+    ):
         return False, "risk_blocked"
     if ctx.risk_mode == 3 and ctx.risk_capacity < CFG.defensive_capacity and not force_anyway:
         return False, "defensive_capacity_low"
@@ -2110,13 +2099,11 @@ async def reinvest(
 
     t0 = time.monotonic()
 
-    # Idempotency
     if redis and not await _idempotency_claim(redis, meta2):
         log.info("[REINVEST] Idempotency: already processed. job_id=%s", meta2.get("job_id"))
         await _journal_skip("idempotency_already_processed", None, meta2, redis=redis)
         return None
 
-    # Lock
     lock_token: str | None = None
     lk = _lock_key(meta2)
     if redis and CFG.lock_enabled:
@@ -2142,7 +2129,6 @@ async def reinvest(
         reinvest_sol = proceeds_sol2 * (eff_pct / 100.0)
         savings_sol = max(0.0, proceeds_sol2 - reinvest_sol)
 
-        # Budget fraction cap
         if CFG.max_budget_fraction > 0 and ctx.spend_remaining_usd > 0:
             cap_usd = float(CFG.max_budget_fraction) * float(ctx.spend_remaining_usd)
             if cap_usd > 0:
@@ -2222,14 +2208,12 @@ async def reinvest(
             redis=redis,
         )
 
-        # Risk cap by equity
         if ctx.equity_sol > 0 and ctx.max_risk_per_trade > 0:
             cap_sol = float(ctx.max_risk_per_trade) * float(ctx.equity_sol)
             if reinvest_sol > cap_sol:
                 reinvest_sol = cap_sol
                 savings_sol = max(0.0, proceeds_sol2 - reinvest_sol)
 
-        # USD hard cap
         if CFG.max_single_usd > 0:
             usd_full = await _sol_to_usd(reinvest_sol)
             if usd_full > CFG.max_single_usd and usd_full > 0:
@@ -2250,7 +2234,6 @@ async def reinvest(
             )
             return None
 
-        # Optional min SOL reserve gate
         get_wallet_balance_sol = _core_opt("get_wallet_balance_sol")
         if callable(get_wallet_balance_sol) and not meta2.get("ignore_balance_gate"):
             with contextlib.suppress(Exception):
@@ -2270,7 +2253,6 @@ async def reinvest(
                     )
                     return None
 
-        # Dry run
         if meta2.get("dry_run"):
             await _update_reinvest_health(
                 redis,
@@ -2282,7 +2264,6 @@ async def reinvest(
             )
             return None
 
-        # Pick target
         pick = await _pick_target_mint(reinvest_sol, meta=meta2, redis=redis)
         if not pick:
             await _safe_tg(
@@ -2310,7 +2291,6 @@ async def reinvest(
             )
             return None
 
-        # Require price (optional)
         if CFG.require_price and not meta2.get("ignore_price_gate"):
             px_sol = await _token_price_in_sol(pick.mint)
             if px_sol <= 0:
@@ -2328,7 +2308,6 @@ async def reinvest(
                 )
                 return None
 
-        # Savings before swap if configured
         if savings_sol > 0 and (not CFG.savings_after_swap):
             await _send_to_savings(savings_sol, redis=redis)
 
@@ -2364,11 +2343,9 @@ async def reinvest(
             )
             return None
 
-        # Savings after swap (default)
         if savings_sol > 0 and CFG.savings_after_swap:
             await _send_to_savings(savings_sol, redis=redis)
 
-        # Persist position (+ hooks)
         buy_price_sol = await _token_price_in_sol(pick.mint)
         trailing_stop = (
             (buy_price_sol * (1.0 - (ctx.stop_loss_percent / 100.0))) if buy_price_sol > 0 else 0.0
@@ -2430,7 +2407,6 @@ async def reinvest(
         }
         await _save_position(pick.mint, position_payload)
 
-        # Hooks (optional)
         with contextlib.suppress(Exception):
             fn = _exit_register_after_buy_fn()
             if callable(fn):
@@ -2469,7 +2445,6 @@ async def reinvest(
             redis=redis,
         )
 
-        # Notion logging (signature drift tolerant)
         with contextlib.suppress(Exception):
             log_to_notion = _core_attr("log_to_notion")
             try:
@@ -2658,9 +2633,10 @@ async def run_reinvest_worker(
                 if not raw:
                     break
 
-                try:
-                    _, payload_any = raw
-                except Exception:
+                payload_any: Any
+                if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+                    payload_any = raw[1]
+                else:
                     payload_any = raw
 
                 payload_decoded = _maybe_decode(payload_any)
@@ -2671,24 +2647,24 @@ async def run_reinvest_worker(
                 )
 
                 try:
-                    job = json.loads(payload)
+                    job_any = json.loads(payload)
                 except Exception:
                     log.warning("[REINVEST] Invalid job payload: %s", str(payload)[:240])
                     await _push_dlq(redis, str(payload)[:2000], "invalid_json")
                     continue
 
-                if not isinstance(job, dict):
+                if not isinstance(job_any, dict):
                     await _push_dlq(redis, payload[:2000], "invalid_job_shape")
                     continue
 
                 if CFG.queue_max_age_s > 0:
-                    enq = _safe_float(job.get("enqueued_ts"), 0.0)
+                    enq = _safe_float(job_any.get("enqueued_ts"), 0.0)
                     if enq and (_utc_ts() - enq) > float(CFG.queue_max_age_s):
                         await _push_dlq(redis, payload[:4000], "stale_job_drop")
                         continue
 
-                amt = float(job.get("proceeds_sol", 0.0) or 0.0)
-                meta_obj = job.get("meta") or {}
+                amt = float(job_any.get("proceeds_sol", 0.0) or 0.0)
+                meta_obj = job_any.get("meta") or {}
                 meta2: Meta = meta_obj if isinstance(meta_obj, dict) else {"meta_raw": meta_obj}
 
                 if amt > 0:
