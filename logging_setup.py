@@ -213,12 +213,10 @@ _LEVEL_ALIASES: dict[str, str] = {
     "TRACE": "DEBUG",
 }
 
-# Collision-safe extra handling: logging rejects overwriting LogRecord core keys.
 _RESERVED_LOGRECORD_KEYS: set[str] = set(logging.makeLogRecord({}).__dict__.keys()) | {
     "message",
     "asctime",
 }
-
 
 # -----------------------------------------------------------------------------
 # Env parsing helpers (ONLY keys already in env contract)
@@ -253,18 +251,15 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _infer_env_name() -> str:
-    # Prefer explicit logging env.
     v = (os.getenv("LOG_ENV", "") or "").strip()
     if v:
         return v
 
-    # Standard env contract keys you already use.
     for k in ("APP_ENV", "ENV"):
         vv = (os.getenv(k, "") or "").strip()
         if vv:
             return vv
 
-    # Render presence => prod-ish
     if (os.getenv("RENDER", "") or "").strip() not in ("", "0", "false", "False"):
         return "prod"
     if (os.getenv("RENDER_SERVICE_ID", "") or "").strip():
@@ -291,7 +286,6 @@ def _read_env_defaults() -> _LogDefaults:
     if stream not in ("stderr", "stdout"):
         stream = "stderr"
 
-    # Keep these as in-code knobs (no new env keys).
     exc_max_chars = int(_DEFAULTS.exc_max_chars)
     stack_max_chars = int(_DEFAULTS.stack_max_chars)
     value_max_chars = int(_DEFAULTS.value_max_chars)
@@ -303,7 +297,6 @@ def _read_env_defaults() -> _LogDefaults:
     )
     every_default_sec = float(_DEFAULTS.every_default_sec)
 
-    # Redaction is controlled by your contract key LOG_REDACT plus fragments key.
     redact_enabled = _env_bool("LOG_REDACT", _DEFAULTS.redact_enabled)
 
     extra = os.getenv("LOG_REDACT_KEYS", "") or ""
@@ -430,10 +423,10 @@ def _collect_secret_values(redaction_enabled: bool) -> list[str]:
     return out[:300]
 
 
-def _refresh_secret_values() -> None:
+def _refresh_secret_values(redaction_enabled: bool) -> None:
     global _SECRET_VALUES
     with _SECRET_VALUES_LOCK:
-        _SECRET_VALUES = _collect_secret_values(_DEFAULTS.redact_enabled)
+        _SECRET_VALUES = _collect_secret_values(bool(redaction_enabled))
 
 
 def _sanitize_text(text: Any) -> str:
@@ -520,7 +513,7 @@ def _sanitize_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]:
             while f"{base}_{i}" in out:
                 i += 1
             nk = f"{base}_{i}"
-        out[nk] = v
+        out[nk] = redact_value(nk, v)
     return out
 
 
@@ -711,7 +704,6 @@ class JsonFormatter(logging.Formatter):
                 }
             )
 
-        # Flatten adapter-style fields if present.
         fields_obj = getattr(record, "fields", None)
         if isinstance(fields_obj, dict):
             for k, v in fields_obj.items():
@@ -720,7 +712,6 @@ class JsonFormatter(logging.Formatter):
                     continue
                 payload[ks] = redact_value(ks, v)
 
-        # Include extras as top-level keys.
         for k, v in record.__dict__.items():
             if k in _RESERVED_LOGRECORD_KEYS or k.startswith("_") or k in payload:
                 continue
@@ -805,7 +796,7 @@ _EVERY: dict[tuple[str, str], _EveryState] = {}
 _EVERY_MAX_KEYS = 50_000
 
 _ONCE_LOCK = threading.Lock()
-_ONCE: dict[tuple[str, str], float] = {}  # key -> first_seen_ts
+_ONCE: dict[tuple[str, str], float] = {}
 
 
 def _every_key(logger: logging.Logger, name: str) -> tuple[str, str]:
@@ -924,7 +915,6 @@ def _logger_once(
     with _ONCE_LOCK:
         last = _ONCE.get(key)
         if last is not None:
-            # Optional windowing: if dedupe window is 0, it's "once per process".
             if _DEFAULTS.dedupe_window_sec <= 0:
                 return False
             if now - last < _DEFAULTS.dedupe_window_sec:
@@ -965,11 +955,14 @@ class BoundLogger:
     def logger(self) -> EventLogger:
         return self._logger
 
-    def _merge_extra(self, extra: Mapping[str, Any] | None) -> dict[str, Any]:
+    def _merge_fields(self, fields: Mapping[str, Any] | None) -> dict[str, Any]:
         out = dict(self._bound)
-        if extra:
-            out.update(extra)
-        return _sanitize_extra(out)
+        if fields:
+            out.update(fields)
+        return out
+
+    def _merge_extra(self, extra: Mapping[str, Any] | None) -> dict[str, Any]:
+        return _sanitize_extra(self._merge_fields(extra))
 
     def log(
         self,
@@ -1017,7 +1010,8 @@ class BoundLogger:
     def event(
         self, name: str, /, msg: str | None = None, level: str | int = logging.INFO, **fields: Any
     ) -> None:
-        self._logger.event(name, msg=msg, level=level, **fields)
+        merged = self._merge_fields(fields)
+        self._logger.event(name, msg=msg, level=level, **merged)
 
     def every(
         self,
@@ -1028,14 +1022,16 @@ class BoundLogger:
         msg: str | None = None,
         **fields: Any,
     ) -> bool:
+        merged = self._merge_fields(fields)
         return bool(
-            self._logger.every(name, *args, every_sec=every_sec, level=level, msg=msg, **fields)
+            self._logger.every(name, *args, every_sec=every_sec, level=level, msg=msg, **merged)
         )
 
     def once(
         self, name: str, /, msg: str | None = None, level: str | int = logging.INFO, **fields: Any
     ) -> bool:
-        return bool(self._logger.once(name, msg=msg, level=level, **fields))
+        merged = self._merge_fields(fields)
+        return bool(self._logger.once(name, msg=msg, level=level, **merged))
 
     def bind(self, /, **fields: Any) -> "BoundLogger":
         merged = dict(self._bound)
@@ -1076,7 +1072,6 @@ def bump(name: str, by: int = 1, **tags: Any) -> None:
     with _METRICS_LOCK:
         _METRICS[name] = _METRICS.get(name, 0) + inc
 
-    # Optional debug via standard logger level; no new env keys.
     with suppress(Exception):
         if tags:
             get_logger("metrics").debug("bump %s +%s tags=%s", name, inc, safe_repr(tags))
@@ -1099,7 +1094,6 @@ def reset_metrics() -> None:
 _CONFIG_LOCK = threading.Lock()
 _CONFIGURED = False
 
-# Owned handler tracking: avoids mutating pytest capture handlers.
 _OWNED_HANDLERS: "weakref.WeakSet[logging.Handler]" = weakref.WeakSet()
 
 
@@ -1109,7 +1103,6 @@ def _running_under_pytest() -> bool:
 
 def _choose_stream(stream_name: str) -> Any:
     if _running_under_pytest():
-        # Keep pytest capture happy: use current sys streams.
         return sys.stdout if stream_name == "stdout" else sys.stderr
     return _BASE_STDOUT if stream_name == "stdout" else _BASE_STDERR
 
@@ -1123,7 +1116,6 @@ def _handler_set_formatter(handler: logging.Handler, *, json_logs: bool, use_utc
 def _ensure_filters(
     handler: logging.Handler, *, include_src: bool, include_process: bool, include_host: bool
 ) -> None:
-    # Context
     has_ctx = any(isinstance(f, ContextFilter) for f in getattr(handler, "filters", []))
     if not has_ctx:
         with suppress(Exception):
@@ -1141,7 +1133,6 @@ def _ensure_filters(
                 f.include_process = bool(include_process)
                 f.include_host = bool(include_host)
 
-    # Redaction filter (from utils_pkg.log_redaction)
     has_redact = any(isinstance(f, RedactionFilter) for f in getattr(handler, "filters", []))
     if not has_redact:
         with suppress(Exception):
@@ -1194,29 +1185,28 @@ def configure_logging(
 
     _install_logger_extras()
 
-    _DEFAULTS = _read_env_defaults()
-    _refresh_secret_values()
-
-    # Apply overrides
-    if stream is not None:
-        st = str(stream).strip().lower()
-        if st in ("stderr", "stdout"):
-            _DEFAULTS = _LogDefaults(**{**_DEFAULTS.__dict__, "stream": st})
-
-    if json_logs is None:
-        json_logs = _DEFAULTS.json_logs
-    if use_utc is None:
-        use_utc = _DEFAULTS.use_utc
-    if include_src is None:
-        include_src = _DEFAULTS.include_src
-    if include_process is None:
-        include_process = _DEFAULTS.include_process
-    if include_host is None:
-        include_host = _DEFAULTS.include_host
-
-    lvl = _parse_level(level if level is not None else _DEFAULTS.level)
-
     with _CONFIG_LOCK:
+        _DEFAULTS = _read_env_defaults()
+        _refresh_secret_values(_DEFAULTS.redact_enabled)
+
+        if stream is not None:
+            st = str(stream).strip().lower()
+            if st in ("stderr", "stdout"):
+                _DEFAULTS = _LogDefaults(**{**_DEFAULTS.__dict__, "stream": st})
+
+        if json_logs is None:
+            json_logs = _DEFAULTS.json_logs
+        if use_utc is None:
+            use_utc = _DEFAULTS.use_utc
+        if include_src is None:
+            include_src = _DEFAULTS.include_src
+        if include_process is None:
+            include_process = _DEFAULTS.include_process
+        if include_host is None:
+            include_host = _DEFAULTS.include_host
+
+        lvl = _parse_level(level if level is not None else _DEFAULTS.level)
+
         _RUNTIME = _RuntimeMeta(
             service=(service or _DEFAULTS.service or _RUNTIME.service).strip() or "sniper",
             version=(version or _DEFAULTS.version or _RUNTIME.version).strip() or "v1",
@@ -1228,11 +1218,12 @@ def configure_logging(
         root = logging.getLogger()
         root.setLevel(lvl)
 
-        # Only mutate handlers we own; do not disrupt pytest capture.
+        # Pytest-safe: only remove handlers we own (even if force=True)
         if force:
             for h in list(root.handlers):
-                with suppress(Exception):
-                    root.removeHandler(h)
+                if _is_owned_handler(h):
+                    with suppress(Exception):
+                        root.removeHandler(h)
 
         owned = [h for h in list(root.handlers) if _is_owned_handler(h)]
 
@@ -1309,6 +1300,7 @@ def get_logger(
             stream,
         )
     )
+
     if needs_config:
         with suppress(Exception):
             configure_logging(
@@ -1349,7 +1341,6 @@ _STDIO_STATE: _StdIoHookState | None = None
 
 
 class _StreamToLogger(io.TextIOBase):
-    # Match TextIOBase typing: encoding is an attribute (not a read-only @property).
     encoding: str
 
     def __init__(self, logger: EventLogger, level: int, tee: Any) -> None:
@@ -1358,9 +1349,6 @@ class _StreamToLogger(io.TextIOBase):
         self._level = int(level)
         self._tee = tee
         self._local = threading.local()
-
-        # Keep the "looks like a text stream" contract for callers that inspect encoding.
-        # TextIOBase typing expects this to be an attribute.
         enc = getattr(self._tee, "encoding", None)
         self.encoding = str(enc) if enc else "utf-8"
 
@@ -1385,9 +1373,11 @@ class _StreamToLogger(io.TextIOBase):
         if not s:
             return 0
 
+        # Tee to original stream (best local UX)
+        with suppress(Exception):
+            self._tee.write(s)
+
         if getattr(self._local, "in_write", False):
-            with suppress(Exception):
-                return int(self._tee.write(s))
             return len(str(s))
 
         self._local.in_write = True
@@ -1688,8 +1678,9 @@ def reset_logging_state() -> None:
     with suppress(Exception):
         root = logging.getLogger()
         for h in list(root.handlers):
-            with suppress(Exception):
-                root.removeHandler(h)
+            if _is_owned_handler(h):
+                with suppress(Exception):
+                    root.removeHandler(h)
 
     with suppress(Exception):
         logging.captureWarnings(False)
@@ -1733,5 +1724,5 @@ def reset_logging_state() -> None:
         pid=os.getpid(),
     )
     with suppress(Exception):
-        _refresh_secret_values()
+        _refresh_secret_values(_DEFAULTS.redact_enabled)
     _CONFIGURED = False
