@@ -30,6 +30,7 @@ IMPORTANT:
 import argparse
 import asyncio
 import contextlib
+import importlib
 import json
 import logging
 import os
@@ -48,10 +49,9 @@ LOG = logging.getLogger("playbook")
 # -----------------------------------------------------------------------------
 # Optional third-party imports (kept lightweight + mypy-safe)
 # -----------------------------------------------------------------------------
-# Optional third-party imports (kept lightweight + mypy-safe)
 redis_async: Any | None
 try:
-    import redis.asyncio as redis_async  # type: ignore[import-not-found]
+    redis_async = importlib.import_module("redis.asyncio")
 except Exception:  # pragma: no cover
     redis_async = None
 

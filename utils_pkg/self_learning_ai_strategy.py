@@ -83,6 +83,7 @@ Notes
 
 import asyncio
 import contextlib
+import importlib
 import inspect
 import json
 import logging
@@ -183,7 +184,7 @@ def _now() -> float:
 
 _redis_async: Any | None
 try:
-    import redis.asyncio as _redis_async  # type: ignore[import-not-found]
+    _redis_async = importlib.import_module("redis.asyncio")
 except Exception:  # pragma: no cover
     _redis_async = None
 

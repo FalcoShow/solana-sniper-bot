@@ -66,14 +66,14 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 # -----------------------------------------------------------------------------
 # Optional redis asyncio (redis-py)
 # -----------------------------------------------------------------------------
-_redis_async: Any | None
+# Optional redis asyncio (redis-py). Keep Optional + mypy-safe even if redis has no stubs.
+redis_async: Any | None = None
 try:  # pragma: no cover
-    import redis.asyncio as _redis_async  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover
-    _redis_async = None
+    import redis.asyncio as _redis_asyncio  # type: ignore[import-not-found, import-untyped]
 
-# IMPORTANT: keep Optional typing so mypy doesn't mark None-guard branches unreachable.
-redis_async: Any | None = _redis_async
+    redis_async = _redis_asyncio  # type: ignore[assignment]
+except Exception:  # pragma: no cover
+    redis_async = None
 
 # -----------------------------------------------------------------------------
 # Core deps (required)
@@ -543,6 +543,10 @@ async def _get_redis(url: str | None = None) -> RedisLike | None:
     Never raises (risk_manager must degrade safely).
     """
     global _redis_singleton
+
+    # Contract / no-IO mode: never create new clients.
+    if _contract_no_io():
+        return None
 
     # 1) Shared instance from core_utils (if present)
     shared = getattr(cu, "redis", None)
