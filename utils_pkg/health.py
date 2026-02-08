@@ -6,25 +6,30 @@ utils_pkg/health.py
 God-Tier Health Snapshot (P0) — deterministic, bounded, never-hangs
 ==================================================================
 
-Goals
------
-- ONE canonical async health_snapshot() used by:
-  - Render health endpoint
-  - auto_exit_worker
-  - CLI health scripts/tests
-- Health must never hang.
-- Health must never raise (returns ok=False with error details instead).
-- Uses strict timeouts and a short cache TTL to avoid flapping/connection storms.
-- Import-safe: NO network connects on import.
-- Pytest-safe: DO NOT reconfigure logging or mutate handler streams at import time.
-
-Design
-------
+Source of truth health model
+----------------------------
+This module defines the ONE canonical health model used everywhere:
 - health_snapshot(): async → dict payload (JSON-serializable)
-- health_snapshot_sync(): sync helper for scripts/tests
-- Per-check timeouts + total timeout guard
-- Optional DB check that uses direct asyncpg connect (strict timeout); SSL inference via utils_pkg.ai_db when available
-- Cache TTL + per-loop lock to avoid thundering herds
+- health_snapshot_sync(): sync wrapper for scripts/tests
+
+Tri-state model (no false greens)
+---------------------------------
+- status="ok"        → ok=True  (READY)
+- status="degraded"  → ok=False (NOT READY; optional issues / partial dependency failures)
+- status="fail"      → ok=False (NOT READY; required check(s) failed)
+
+Rules:
+- Any REQUIRED check failing => status="fail"
+- Otherwise, any OPTIONAL check failing => status="degraded"
+- Otherwise => status="ok"
+
+Hard requirements
+-----------------
+- Never hangs: bounded by HEALTH_TOTAL_TIMEOUT_S (and per-check timeouts).
+- Never raises: returns ok=False with error details.
+- Import-safe: NO network connects on import.
+- Pytest-safe: no logging reconfiguration / handler mutation on import.
+- Short cache TTL to avoid flapping / storms.
 
 Env keys used (must exist in canonical contract + .env.example)
 --------------------------------------------------------------
@@ -35,6 +40,9 @@ HEALTH_DB_TIMEOUT_S
 HEALTH_DB_STATEMENT_TIMEOUT_MS
 HEALTH_REQUIRE_DB_IF_ENABLED
 HEALTH_INCLUDE_SYSTEM
+
+Also reads (debug/system only):
+APP_ENV
 """
 
 import asyncio
@@ -48,9 +56,12 @@ import weakref
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 log = logging.getLogger("health")
+
+HealthStatus = Literal["ok", "degraded", "fail"]
+
 
 # -----------------------------------------------------------------------------
 # Small env helpers (strict + deterministic)
@@ -116,6 +127,17 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return float(max(lo, min(hi, x)))
 
 
+def _json_safe(v: Any) -> Any:
+    # Keep payload JSON-serializable without raising.
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    if isinstance(v, (list, tuple)):
+        return [_json_safe(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _json_safe(val) for k, val in v.items()}
+    return str(v)
+
+
 # -----------------------------------------------------------------------------
 # Config (loaded per-call so tests can tweak env without reimport)
 # -----------------------------------------------------------------------------
@@ -162,19 +184,13 @@ def _load_config() -> HealthConfig:
 _LAST_SNAPSHOT: dict[str, Any] | None = None
 _LAST_SNAPSHOT_AT_MONO: float = 0.0
 
-# Per-loop lock registry (asyncio.run creates new loops in tests)
 _LOCKS_BY_LOOP_ID: dict[int, asyncio.Lock] = {}
 _LOOP_REFS: dict[int, weakref.ref[Any]] = {}
 
 
 def _get_loop_lock() -> asyncio.Lock:
-    """
-    Return a lock scoped to the running event loop to avoid cross-loop reuse issues.
-    Uses weakref cleanup when possible.
-    """
     loop = asyncio.get_running_loop()
     lid = id(loop)
-
     lock = _LOCKS_BY_LOOP_ID.get(lid)
     if lock is not None:
         return lock
@@ -182,7 +198,6 @@ def _get_loop_lock() -> asyncio.Lock:
     lock = asyncio.Lock()
     _LOCKS_BY_LOOP_ID[lid] = lock
 
-    # Best-effort cleanup when loop is GC'd
     try:
 
         def _cleanup(_ref: Any, _lid: int = lid) -> None:
@@ -191,7 +206,6 @@ def _get_loop_lock() -> asyncio.Lock:
 
         _LOOP_REFS[lid] = weakref.ref(loop, _cleanup)
     except Exception:
-        # If loop isn't weakrefable, keep the lock; it’s still correct.
         pass
 
     return lock
@@ -199,13 +213,10 @@ def _get_loop_lock() -> asyncio.Lock:
 
 def _cache_get_if_fresh(cfg: HealthConfig) -> dict[str, Any] | None:
     global _LAST_SNAPSHOT, _LAST_SNAPSHOT_AT_MONO
-    if _LAST_SNAPSHOT is None:
-        return None
-    if cfg.cache_ttl_s <= 0:
+    if _LAST_SNAPSHOT is None or cfg.cache_ttl_s <= 0:
         return None
     age = time.monotonic() - _LAST_SNAPSHOT_AT_MONO
     if age <= cfg.cache_ttl_s:
-        # Return a shallow copy so callers don't mutate cached dict accidentally.
         return dict(_LAST_SNAPSHOT)
     return None
 
@@ -229,15 +240,19 @@ async def _run_check(
     required: bool,
 ) -> dict[str, Any]:
     t0 = time.monotonic()
-    check: dict[str, Any] = {"name": name, "required": bool(required), "ok": False, "ms": 0}
+    check: dict[str, Any] = {
+        "name": str(name),
+        "required": bool(required),
+        "ok": False,
+        "ms": 0,
+    }
     try:
         res = await asyncio.wait_for(fn(), timeout=float(timeout_s))
         if isinstance(res, dict):
-            # Do not allow caller to stomp identity fields
             res = dict(res)
             res.pop("name", None)
             res.pop("required", None)
-            check.update(res)
+            check.update(_json_safe(res))
         check["ok"] = bool(check.get("ok", False))
     except asyncio.TimeoutError:
         check["ok"] = False
@@ -250,6 +265,16 @@ async def _run_check(
     return check
 
 
+def _compute_status(checks: list[dict[str, Any]]) -> HealthStatus:
+    required_failed = [c for c in checks if c.get("required") and not c.get("ok")]
+    if required_failed:
+        return "fail"
+    optional_failed = [c for c in checks if not c.get("required") and not c.get("ok")]
+    if optional_failed:
+        return "degraded"
+    return "ok"
+
+
 # -----------------------------------------------------------------------------
 # Individual checks (import-safe; no network on import)
 # -----------------------------------------------------------------------------
@@ -259,7 +284,10 @@ async def _check_runtime() -> dict[str, Any]:
     return {"ok": True, "detail": "runtime_ok", "ts": _utcnow_iso()}
 
 
-_DSN_PASS_RE = re.compile(r"(?P<prefix>://[^:/?#]+:)(?P<pw>[^@/?#]+)(?P<suffix>@)", re.IGNORECASE)
+_DSN_PASS_RE = re.compile(
+    r"(?P<prefix>://[^:/?#]+:)(?P<pw>[^@/?#]+)(?P<suffix>@)",
+    re.IGNORECASE,
+)
 
 
 def _redact_dsn(dsn: str) -> str:
@@ -269,7 +297,7 @@ def _redact_dsn(dsn: str) -> str:
 
 
 def _ai_db_enabled_fallback() -> bool:
-    # Conservative fallback if ai_db does not expose AI_DB_ENABLED
+    # Conservative fallback (do not break if older env name used).
     return _env_bool("AI_DB_ENABLED", False) or _env_bool("AIDB_ENABLED", False)
 
 
@@ -281,18 +309,13 @@ async def _check_ai_db(cfg: HealthConfig) -> dict[str, Any]:
     Never raises.
     """
     try:
-        from utils_pkg import ai_db  # local import; must be import-safe by design
+        from utils_pkg import ai_db  # type: ignore
     except Exception as e:
-        # If we can't even import ai_db, treat as unhealthy only if enabled is implied by env.
         if _ai_db_enabled_fallback():
             return {"ok": False, "detail": "ai_db_import_failed", "err": f"{type(e).__name__}: {e}"}
         return {"ok": True, "detail": "ai_db_disabled"}
 
-    enabled = bool(getattr(ai_db, "AI_DB_ENABLED", False))
-    if not enabled:
-        # Some builds may rely on env fallback
-        enabled = _ai_db_enabled_fallback()
-
+    enabled = bool(getattr(ai_db, "AI_DB_ENABLED", False)) or _ai_db_enabled_fallback()
     if not enabled:
         return {"ok": True, "detail": "ai_db_disabled"}
 
@@ -306,7 +329,6 @@ async def _check_ai_db(cfg: HealthConfig) -> dict[str, Any]:
     sslmode: Any = None
     host: Any = None
 
-    # Prefer ai_db helpers if present
     try:
         if hasattr(ai_db, "resolve_dsn_info"):
             info = ai_db.resolve_dsn_info()
@@ -324,7 +346,6 @@ async def _check_ai_db(cfg: HealthConfig) -> dict[str, Any]:
             if hasattr(ai_db, "ssl_context_for_dsn"):
                 ssl_ctx = ai_db.ssl_context_for_dsn(dsn)
         else:
-            # Last resort: try DATABASE_URL / POSTGRES_DSN envs without breaking determinism
             dsn = (
                 _env_str("DATABASE_URL", "")
                 or _env_str("POSTGRES_DSN", "")
@@ -338,13 +359,12 @@ async def _check_ai_db(cfg: HealthConfig) -> dict[str, Any]:
         return {"ok": False, "detail": "dsn_empty"}
 
     server_settings: dict[str, str] = {
-        "application_name": getattr(ai_db, "AI_DB_APP_NAME", "health"),
+        "application_name": str(getattr(ai_db, "AI_DB_APP_NAME", "health")),
         "timezone": "UTC",
     }
     if cfg.db_statement_timeout_ms > 0:
         server_settings["statement_timeout"] = str(int(cfg.db_statement_timeout_ms))
 
-    # Safe debug DSN (should never contain password)
     try:
         if hasattr(ai_db, "get_normalized_dsn_for_debug"):
             dsn_dbg = str(ai_db.get_normalized_dsn_for_debug())
@@ -367,8 +387,8 @@ async def _check_ai_db(cfg: HealthConfig) -> dict[str, Any]:
             "ok": ok,
             "detail": "select_1_ok" if ok else "select_1_bad",
             "dsn": dsn_dbg,
-            "sslmode": sslmode,
-            "host": host,
+            "sslmode": str(sslmode) if sslmode is not None else "",
+            "host": str(host) if host is not None else "",
         }
     except asyncio.TimeoutError:
         return {"ok": False, "detail": "db_timeout", "dsn": dsn_dbg}
@@ -416,15 +436,14 @@ async def health_snapshot(
                 if cached2 is not None:
                     return cached2
 
-            # Bound per-check timeouts to the total timeout to prevent runaway.
             per_check = float(min(cfg.check_timeout_s, cfg.total_timeout_s))
-
             checks: list[dict[str, Any]] = []
+
             checks.append(
                 await _run_check("runtime", _check_runtime, timeout_s=per_check, required=True)
             )
 
-            # Decide whether DB is "required" for overall ok.
+            # Decide whether DB is REQUIRED for overall readiness.
             db_required = False
             try:
                 from utils_pkg import ai_db  # type: ignore
@@ -433,7 +452,6 @@ async def health_snapshot(
                 if enabled and cfg.require_db_if_enabled:
                     db_required = True
             except Exception:
-                # If we can't import ai_db, only treat as required in deep mode w/ require flag.
                 db_required = bool(deep and cfg.require_db_if_enabled)
 
             checks.append(
@@ -445,18 +463,18 @@ async def health_snapshot(
                 )
             )
 
-            required_failed = [c for c in checks if c.get("required") and not c.get("ok")]
-            ok = len(required_failed) == 0
+            status: HealthStatus = _compute_status(checks)
+            ok = bool(status == "ok")
 
             payload: dict[str, Any] = {
                 "ts": _utcnow_iso(),
-                "ok": bool(ok),
+                "status": status,
+                "ok": ok,
                 "ms": _ms_since(started),
                 "checks": checks,
             }
 
             if include_system:
-                # Keep lightweight; no psutil, no disk scans, no network.
                 payload["system"] = {
                     "python": sys.version.split()[0],
                     "platform": platform.platform(),
@@ -474,17 +492,18 @@ async def health_snapshot(
     except asyncio.TimeoutError:
         return {
             "ts": _utcnow_iso(),
+            "status": "fail",
             "ok": False,
             "ms": int(float(cfg.total_timeout_s) * 1000),
             "checks": [],
             "err": "health_snapshot_total_timeout",
         }
     except Exception as e:
-        # Never raise from health endpoint; keep it deterministic.
         with suppress(Exception):
             log.debug("health_snapshot failed", exc_info=True)
         return {
             "ts": _utcnow_iso(),
+            "status": "fail",
             "ok": False,
             "ms": 0,
             "checks": [],
@@ -499,13 +518,14 @@ def health_snapshot_sync(
     Sync wrapper for scripts/tests.
     Never raises.
 
-    Note: If called from within an already-running event loop,
+    If called from within an already-running event loop,
     return a safe error payload (caller should `await health_snapshot()` instead).
     """
     try:
         asyncio.get_running_loop()
         return {
             "ts": _utcnow_iso(),
+            "status": "fail",
             "ok": False,
             "ms": 0,
             "checks": [],
@@ -519,6 +539,7 @@ def health_snapshot_sync(
     except Exception as e:
         return {
             "ts": _utcnow_iso(),
+            "status": "fail",
             "ok": False,
             "ms": 0,
             "checks": [],

@@ -574,8 +574,9 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 EnvVar(
                     "ENV_STRICT",
                     default="0",
+                    required=True,
                     kind="bool",
-                    description="Legacy alias for STRICT_ENV",
+                    description="0=warn, 1=hard fail on missing required vars",
                 ),
                 EnvVar(
                     "MAIN_FAST_FAIL_EARLY",
@@ -677,6 +678,12 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                     default="1",
                     kind="bool",
                     description="Allow dotenv side effects (set 0 in tests)",
+                ),
+                EnvVar(
+                    "MAIN_SAFE_MODE_ENABLE_SCANNERS",
+                    default="0",
+                    kind="bool",
+                    description="In SAFE_MODE, allow scanners to run (0=disabled default, 1=enable).",
                 ),
             ],
         ),
@@ -1248,6 +1255,97 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                     default="0",
                     kind="bool",
                     description="Contract test guard",
+                ),
+            ],
+        ),
+        *_env_section(
+            "WATCHDOG (deploy_tools/watchdog.py)",
+            [
+                EnvVar(
+                    "WATCHDOG_DRYRUN",
+                    default="",
+                    kind="bool",
+                    description="Watchdog dry-run (no destructive actions)",
+                ),
+                EnvVar(
+                    "WATCHDOG_LOGFILE",
+                    default="",
+                    description="Watchdog logfile path",
+                ),
+                EnvVar(
+                    "WATCHDOG_LOGLEVEL",
+                    default="",
+                    description="Watchdog log level override",
+                ),
+                EnvVar(
+                    "WATCHDOG_PIDFILE",
+                    default="",
+                    description="Watchdog pidfile path",
+                ),
+                EnvVar(
+                    "WATCHDOG_OUTFILE",
+                    default="",
+                    description="Watchdog stdout/stderr capture path",
+                ),
+                EnvVar(
+                    "WATCHDOG_POLL_S",
+                    default="",
+                    kind="int",
+                    description="Watchdog poll interval seconds",
+                ),
+                EnvVar(
+                    "WATCHDOG_COOLDOWN_S",
+                    default="",
+                    kind="int",
+                    description="Watchdog cooldown seconds between actions",
+                ),
+                EnvVar(
+                    "WATCHDOG_MAX_ACTIONS",
+                    default="",
+                    kind="int",
+                    description="Watchdog max actions per window",
+                ),
+                EnvVar(
+                    "WATCHDOG_MAX_ACTIONS_WINDOW_S",
+                    default="",
+                    kind="int",
+                    description="Watchdog actions window seconds",
+                ),
+                EnvVar(
+                    "WATCHDOG_ERROR_RULES",
+                    default="",
+                    description="Watchdog error rules (json/string)",
+                ),
+                EnvVar(
+                    "WATCHDOG_PROGRESS_REGEX",
+                    default="",
+                    description="Watchdog progress regex",
+                ),
+                EnvVar(
+                    "WATCHDOG_BACKUP",
+                    default="",
+                    description="Watchdog backup flag/mode",
+                ),
+                EnvVar(
+                    "WATCHDOG_ROLLBACK_SH",
+                    default="",
+                    description="Watchdog rollback script path",
+                ),
+                EnvVar(
+                    "WATCHDOG_START_CMD",
+                    default="",
+                    description="Watchdog start command override",
+                ),
+                EnvVar(
+                    "WATCHDOG_START_SH",
+                    default="",
+                    description="Watchdog start script path",
+                ),
+                EnvVar(
+                    "WATCHDOG_STALL_S",
+                    default="",
+                    kind="int",
+                    description="Watchdog stall threshold seconds",
                 ),
             ],
         ),

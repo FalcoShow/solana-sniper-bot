@@ -1,4 +1,4 @@
-# scripts/smoke_init.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
@@ -46,6 +46,7 @@ import asyncio
 import contextlib
 import importlib
 import inspect
+import io
 import json
 import os
 import platform
@@ -55,39 +56,41 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Final, Mapping
 
 # =============================================================================
 # Exit codes (match preflight expectations)
 # =============================================================================
-RC_OK = 0
-RC_FAIL = 2
-RC_CTRL_C = 130
+RC_OK: Final[int] = 0
+RC_FAIL: Final[int] = 2
+RC_CTRL_C: Final[int] = 130
 
-SCRIPT_ID = "scripts.smoke_init"
-VERSION = "v5"
+SCRIPT_ID: Final[str] = "scripts.smoke_init"
+VERSION: Final[str] = "v6"
 
-_TRUE = {"1", "true", "yes", "y", "on", "t"}
-_FALSE = {"0", "false", "no", "n", "off", "f"}
+_TRUE: Final[set[str]] = {"1", "true", "yes", "y", "on", "t"}
+_FALSE: Final[set[str]] = {"0", "false", "no", "n", "off", "f"}
 
 # Hard timeouts (seconds) — prevents hangs
-DEFAULT_INIT_MIN_TIMEOUT_S = 5.0
-DEFAULT_CLOSE_TIMEOUT_S = 10.0
-DEFAULT_PROBE_TIMEOUT_S = 4.0
+DEFAULT_INIT_MIN_TIMEOUT_S: Final[float] = 5.0
+DEFAULT_CLOSE_TIMEOUT_S: Final[float] = 10.0
+DEFAULT_PROBE_TIMEOUT_S: Final[float] = 4.0
 
 # =============================================================================
 # Regex / redaction primitives
 # =============================================================================
-_URL_CRED_RE = re.compile(r"(://)([^/@\s]+)@")  # scheme://userinfo@
-_APIKEY_HDR_RE = re.compile(r"(?i)(x-api-key:\s*)([^\s]+)")
-_BEARER_HDR_RE = re.compile(r"(?i)(authorization:\s*bearer\s+)([^\s]+)")
-_KV_SECRET_RE = re.compile(
+_URL_CRED_RE: Final[re.Pattern[str]] = re.compile(r"(://)([^/@\s]+)@")  # scheme://userinfo@
+_APIKEY_HDR_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(x-api-key:\s*)([^\s]+)")
+_BEARER_HDR_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(authorization:\s*bearer\s+)([^\s]+)")
+_KV_SECRET_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)\b(api[_-]?key|token|secret|password|passwd|pass)\b(\s*[:=]\s*)([^\s,;]+)"
 )
-_QP_SECRET_RE = re.compile(r"(?i)(password|pass|token|api_key|apikey|secret)=([^&\s]+)")
-_LONG_TOKENISH_RE = re.compile(r"\b[A-Za-z0-9_\-]{28,}\b")
+_QP_SECRET_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(password|pass|token|api_key|apikey|secret)=([^&\s]+)"
+)
+_LONG_TOKENISH_RE: Final[re.Pattern[str]] = re.compile(r"\b[A-Za-z0-9_\-]{28,}\b")
 
-_BASE58_ALPH = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+_BASE58_ALPH: Final[set[str]] = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
 
 # =============================================================================
@@ -180,6 +183,21 @@ def _hlog(msg: str, *, json_only: bool) -> None:
     if json_only:
         return
     _safe_write_line(sys.stderr, f"[smoke_init] {_ts()} {msg}")
+
+
+@contextlib.contextmanager
+def _capture_stdio(enabled: bool):
+    """
+    When --json-only is used, prevent stray prints from breaking "only JSON output".
+    We discard captured output (do not echo), keeping behavior deterministic.
+    """
+    if not enabled:
+        yield None
+        return
+    buf_out = io.StringIO()
+    buf_err = io.StringIO()
+    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+        yield (buf_out, buf_err)
 
 
 # =============================================================================
@@ -320,7 +338,6 @@ def _redact_keys() -> list[str]:
         if kk and kk not in seen:
             out.append(kk)
             seen.add(kk)
-    # Also redact anything that looks sensitive by name (keys only; values handled separately)
     for k in os.environ.keys():
         if _sensitive_key_name(k) and k not in seen:
             out.append(k)
@@ -330,12 +347,10 @@ def _redact_keys() -> list[str]:
 
 def _collect_secret_values(redact_keys: list[str]) -> list[str]:
     vals: list[str] = []
-    # direct known keys
     for k in redact_keys:
         v = _strip_wrapping_quotes(os.getenv(k, "") or "")
         if v and len(v) >= 6:
             vals.append(v)
-    # heuristics: any env where key name looks sensitive
     for k, v in os.environ.items():
         if not v:
             continue
@@ -343,13 +358,10 @@ def _collect_secret_values(redact_keys: list[str]) -> list[str]:
             vv = _strip_wrapping_quotes(v)
             if vv and len(vv) >= 6:
                 vals.append(vv)
-    # unique, longest first for best replacement
-    uniq = sorted(set(vals), key=lambda s: (-len(s), s))
-    return uniq
+    return sorted(set(vals), key=lambda s: (-len(s), s))
 
 
 def _mask_long_tokens_enabled() -> bool:
-    # Use SMOKE_INIT_MASK_LONG_TOKENS if set; else inherit PREFLIGHT_MASK_LONG_TOKENS; else default True.
     if "SMOKE_INIT_MASK_LONG_TOKENS" in os.environ:
         return _envb("SMOKE_INIT_MASK_LONG_TOKENS", True)
     if "PREFLIGHT_MASK_LONG_TOKENS" in os.environ:
@@ -357,9 +369,8 @@ def _mask_long_tokens_enabled() -> bool:
     return True
 
 
-def _mask_tokenish_match(m: re.Match) -> str:
+def _mask_tokenish_match(m: re.Match[str]) -> str:
     tok = m.group(0)
-    # Preserve base58 pubkeys/mints
     if _looks_like_base58_pubkey(tok):
         return tok
     return "***"
@@ -404,7 +415,6 @@ def _dedupe(xs: list[str], cap: int) -> list[str]:
 # policy: network allowed?
 # =============================================================================
 def _network_allowed() -> bool:
-    # Explicit override from preflight
     if "PREFLIGHT_NETWORK_ALLOWED" in os.environ and not _envb("PREFLIGHT_NETWORK_ALLOWED", True):
         return False
     if _envb("SMOKE_INIT_NO_NETWORK", False):
@@ -438,14 +448,11 @@ def _looks_like_git_for_windows_opt_path(p: str) -> bool:
 
 def _ensure_repo_sqlite_path(repo_root: str, checks: list[dict[str, Any]]) -> dict[str, Any]:
     repo = Path(repo_root or os.getcwd())
-    try:
+    with contextlib.suppress(Exception):
         repo = repo.resolve()
-    except Exception:
-        repo = Path(repo_root or os.getcwd())
 
     state_dir = repo / ".state"
     sqlite_path = state_dir / "state.sqlite3"
-
     patched = False
     reason = ""
 
@@ -460,11 +467,11 @@ def _ensure_repo_sqlite_path(repo_root: str, checks: list[dict[str, Any]]) -> di
     if not cur:
         os.environ["SQLITE_DB_PATH"] = str(sqlite_path)
         patched = True
-        reason = "unset"
+        reason = reason or "unset"
     elif _looks_like_git_for_windows_opt_path(cur):
         os.environ["SQLITE_DB_PATH"] = str(sqlite_path)
         patched = True
-        reason = "git_opt_landmine"
+        reason = reason or "git_opt_landmine"
 
     checks.append(
         {
@@ -725,7 +732,7 @@ def _as_json(res: SmokeResult) -> dict[str, Any]:
 # CLI
 # =============================================================================
 class _ArgParser(argparse.ArgumentParser):
-    def error(self, message: str) -> None:  # noqa: D401
+    def error(self, message: str) -> None:
         raise ValueError(message)
 
 
@@ -773,10 +780,10 @@ async def _run(args: argparse.Namespace) -> SmokeResult:
     os.environ.setdefault("DISABLE_SCANNERS", os.getenv("DISABLE_SCANNERS", "1"))
 
     repo_root = _bootstrap_repo_root()
-
     dotenv_loaded = _maybe_load_dotenv(
         disabled=bool(args.no_dotenv or _envb("SMOKE_INIT_NO_DOTENV", False))
     )
+
     json_only = bool(
         args.json_only
         or _envb("SMOKE_INIT_JSON_ONLY", False)
@@ -852,14 +859,18 @@ async def _run(args: argparse.Namespace) -> SmokeResult:
             json_only=json_only,
         )
 
-        await _with_timeout(_call_maybe_async(cu.init_resources), timeout_s=init_timeout)
+        # If json_only, suppress stray stdout/stderr from imports and init wiring.
+        with _capture_stdio(enabled=json_only):
+            await _with_timeout(_call_maybe_async(cu.init_resources), timeout_s=init_timeout)
+
         checks.append({"name": "init_resources", "ok": True})
 
         if probes_on:
             try:
-                r_ok, r_msg = await _with_timeout(
-                    _probe_redis(cu, secret_values=secret_values), timeout_s=probe_timeout
-                )
+                with _capture_stdio(enabled=json_only):
+                    r_ok, r_msg = await _with_timeout(
+                        _probe_redis(cu, secret_values=secret_values), timeout_s=probe_timeout
+                    )
             except Exception as e:
                 r_ok, r_msg = False, f"redis_probe_timeout_or_err:{type(e).__name__}"
             checks.append(
@@ -873,9 +884,10 @@ async def _run(args: argparse.Namespace) -> SmokeResult:
                 warnings.append("Redis probe failed (resources may be partially healthy).")
 
             try:
-                p_ok, p_msg = await _with_timeout(
-                    _probe_pg(cu, secret_values=secret_values), timeout_s=probe_timeout
-                )
+                with _capture_stdio(enabled=json_only):
+                    p_ok, p_msg = await _with_timeout(
+                        _probe_pg(cu, secret_values=secret_values), timeout_s=probe_timeout
+                    )
             except Exception as e:
                 p_ok, p_msg = False, f"pg_probe_timeout_or_err:{type(e).__name__}"
             checks.append(
@@ -922,9 +934,10 @@ async def _run(args: argparse.Namespace) -> SmokeResult:
                     cu = importlib.import_module("utils_pkg.core_utils")
                 if cu is not None and hasattr(cu, "close_resources"):
                     try:
-                        await _with_timeout(
-                            _call_maybe_async(cu.close_resources), timeout_s=close_timeout
-                        )
+                        with _capture_stdio(enabled=json_only):
+                            await _with_timeout(
+                                _call_maybe_async(cu.close_resources), timeout_s=close_timeout
+                            )
                         checks.append({"name": "close_resources", "ok": True})
                     except Exception as e:
                         checks.append(
@@ -991,6 +1004,7 @@ def cli(argv: list[str] | None = None) -> int:
         emit_json = (
             _envb("SMOKE_INIT_JSON", False) or _envb("PREFLIGHT_JSON", False) or bool(json_only)
         )
+
         redact_keys = _redact_keys()
         secret_values = _collect_secret_values(redact_keys)
         msg = _sanitize(str(e), secret_values=secret_values)

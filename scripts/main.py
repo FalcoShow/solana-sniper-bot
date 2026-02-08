@@ -28,6 +28,18 @@ Back-compat:
 - Exports `Strategy` (some harnesses expect scripts.main.Strategy)
 - Exports handler aliases on Strategy
 - Exports module-level helper aliases (tests expect these to exist)
+
+Important runtime detail:
+- If MAIN_HTTP_EARLY_START=1, the HTTP server is started *before* preflight/bootstrap
+  to satisfy Render health checks. This file guarantees the HTTP server references the
+  SAME queues/state used by the supervisor runtime (no double-init).
+
+Run mode (optional, canonical):
+- RUN_MODE=safe   -> SAFE_MODE=1, DRYRUN=1, DISABLE_BUYS=1, DISABLE_SELLS=1 (scanners optional)
+- RUN_MODE=paper  -> DRYRUN=1 (buys allowed if executor supports dryrun)
+- RUN_MODE=live   -> DRYRUN=0 (normal behavior)
+
+Defaults are unchanged unless RUN_MODE is set.
 """
 
 __all__ = [
@@ -210,8 +222,83 @@ def _jitter_disabled() -> bool:
 
 
 # =============================================================================
+# Canonical run-mode (optional; defaults unchanged unless RUN_MODE set)
+# =============================================================================
+def _run_mode() -> str:
+    # Accept a few aliases but only RUN_MODE is canonical.
+    raw = (_envs("RUN_MODE", "") or _envs("TRADE_MODE", "") or _envs("MODE", "")).strip().lower()
+    if raw in {"safe", "paper", "live"}:
+        return raw
+    return ""
+
+
+def _apply_run_mode_defaults() -> str:
+    """
+    If RUN_MODE is set, enforce minimal, deterministic env defaults.
+    If RUN_MODE is not set, DO NOT change behavior.
+    """
+    mode = _run_mode()
+    if not mode:
+        return ""
+
+    if mode == "safe":
+        os.environ.setdefault("SAFE_MODE", "1")
+        os.environ.setdefault("DRYRUN", "1")
+        os.environ.setdefault("DRY_RUN", "1")
+        os.environ.setdefault("DISABLE_BUYS", "1")
+        os.environ.setdefault("DISABLE_SELLS", "1")
+        # scanners optional in safe mode; default OFF unless explicitly enabled
+        if os.getenv("MAIN_SAFE_MODE_ENABLE_SCANNERS") is None:
+            os.environ.setdefault("DISABLE_SCANNERS", "1")
+        return "safe"
+
+    if mode == "paper":
+        os.environ.setdefault("DRYRUN", "1")
+        os.environ.setdefault("DRY_RUN", "1")
+        # do not force-disable buys; executor should honor dryrun.
+        return "paper"
+
+    if mode == "live":
+        # ensure dryrun is not implicitly on
+        if os.getenv("DRYRUN") is None and os.getenv("DRY_RUN") is None:
+            os.environ.setdefault("DRYRUN", "0")
+        return "live"
+
+    return ""
+
+
+# =============================================================================
 # Logging shims (stdlib-only)
 # =============================================================================
+_REDACT_KEYS = (
+    "token",
+    "secret",
+    "api_key",
+    "apikey",
+    "private",
+    "seed",
+    "mnemonic",
+    "pass",
+    "password",
+    "auth",
+    "bearer",
+    "signature",
+)
+
+
+def _redact_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    if not fields:
+        return fields
+    out: dict[str, Any] = {}
+    for k, v in fields.items():
+        lk = str(k).lower()
+        if any(x in lk for x in _REDACT_KEYS):
+            out[k] = "***REDACTED***"
+        else:
+            out[k] = v
+    return out
+
+
 def install_stdlib_event(force: bool | None = None) -> None:
     """
     Install safe Logger.event / Logger.every / Logger.once shims.
@@ -235,9 +322,8 @@ def install_stdlib_event(force: bool | None = None) -> None:
         return
 
     def _event(self: logging.Logger, name: str, **fields: Any) -> None:
-        # Always use positional "%s" formatting so stray '%' in payload can never explode formatting.
         with contextlib.suppress(Exception):
-            self.info("%s %s", name, fields)
+            self.info("%s %s", name, _redact_fields(fields))
 
     def _every(
         self: logging.Logger,
@@ -257,7 +343,7 @@ def install_stdlib_event(force: bool | None = None) -> None:
                 store[key] = now_m
                 self._pf_every_store = store
                 if level is not None:
-                    self.log(int(level), "%s %s", (msg or key), fields)
+                    self.log(int(level), "%s %s", (msg or key), _redact_fields(fields))
                 else:
                     self.event(msg or key, **fields)  # type: ignore[attr-defined]
         except Exception:
@@ -273,7 +359,6 @@ def install_stdlib_event(force: bool | None = None) -> None:
     ) -> None:
         return _every(self, key, sec=ttl, msg=msg, level=level, **fields)
 
-    # mark shims so we can detect them later
     _event._pf_shim = True  # type: ignore[attr-defined]
     _every._pf_shim = True  # type: ignore[attr-defined]
     _once._pf_shim = True  # type: ignore[attr-defined]
@@ -292,7 +377,7 @@ def ensure_event(logger: Any) -> Any:
 
         def _event(name: str, **fields: Any) -> None:
             with contextlib.suppress(Exception):
-                logger.info("%s %s", name, fields)
+                logger.info("%s %s", name, _redact_fields(fields))
 
         logger.event = _event  # type: ignore[attr-defined]
 
@@ -314,7 +399,7 @@ def ensure_event(logger: Any) -> Any:
                     _every._store = store  # type: ignore[attr-defined]
                     with contextlib.suppress(Exception):
                         if level is not None:
-                            logger.log(int(level), "%s %s", (msg or key), fields)
+                            logger.log(int(level), "%s %s", (msg or key), _redact_fields(fields))
                         else:
                             logger.event(msg or key, **fields)  # type: ignore[attr-defined]
             except Exception:
@@ -325,7 +410,11 @@ def ensure_event(logger: Any) -> Any:
     if not hasattr(logger, "once"):
 
         def _once(
-            key: str, ttl: int = 60, msg: str | None = None, level: int | None = None, **fields: Any
+            key: str,
+            ttl: int = 60,
+            msg: str | None = None,
+            level: int | None = None,
+            **fields: Any,
         ) -> None:
             return logger.every(key, sec=ttl, msg=msg, level=level, **fields)  # type: ignore[attr-defined]
 
@@ -647,12 +736,14 @@ def _snapshot_state(
     task_view: JSONDict | None = None,
 ) -> JSONDict:
     dryrun_flag = _envb("DRYRUN", _envb("DRY_RUN", False))
+    mode = _run_mode() or ""
     return {
         "version": MAIN_VERSION,
         "build": MAIN_BUILD,
         "run_id": st.run_id,
         "up_sec": int(_now() - st.started_at),
         "phase": _phase(),
+        "run_mode": mode,
         "queues": {
             "cand_q": int(cand_q.qsize()),
             "tick_q": int(tick_q.qsize()),
@@ -1758,25 +1849,25 @@ _BUY_WARMUP_SEC = float(_envf("BUY_WARMUP_SEC", 0.0))
 
 
 def _buy_inflight_ok(mint: str) -> bool:
-    now = _now()
-    cutoff = now - float(_BUY_INFLIGHT_TTL)
+    now_ts = _now()
+    cutoff = now_ts - float(_BUY_INFLIGHT_TTL)
     for k, ts in list(_BUY_INFLIGHT.items()):
         if ts < cutoff:
             _BUY_INFLIGHT.pop(k, None)
     if mint in _BUY_INFLIGHT:
         return False
-    _BUY_INFLIGHT[mint] = now
+    _BUY_INFLIGHT[mint] = now_ts
     return True
 
 
 def _buy_cooldown_ok(mint: str) -> bool:
     if _BUY_COOLDOWN_SEC <= 0:
         return True
-    now = _now()
+    now_ts = _now()
     last = float(_LAST_BUY_ATTEMPT.get(mint, 0.0))
-    if last and (now - last) < float(_BUY_COOLDOWN_SEC):
+    if last and (now_ts - last) < float(_BUY_COOLDOWN_SEC):
         return False
-    _LAST_BUY_ATTEMPT[mint] = now
+    _LAST_BUY_ATTEMPT[mint] = now_ts
     return True
 
 
@@ -2107,11 +2198,11 @@ def _install_signal_handlers(stop_evt: asyncio.Event, run_id: str) -> None:
         signal.signal(signal.SIGTERM, lambda *_: _ask_stop())
 
     with contextlib.suppress(Exception):
-        loop = asyncio.get_running_loop()
+        loop_ = asyncio.get_running_loop()
         with contextlib.suppress(Exception):
-            loop.add_signal_handler(signal.SIGINT, _ask_stop)  # type: ignore[arg-type]
+            loop_.add_signal_handler(signal.SIGINT, _ask_stop)  # type: ignore[arg-type]
         with contextlib.suppress(Exception):
-            loop.add_signal_handler(signal.SIGTERM, _ask_stop)  # type: ignore[arg-type]
+            loop_.add_signal_handler(signal.SIGTERM, _ask_stop)  # type: ignore[arg-type]
 
 
 # =============================================================================
@@ -2141,7 +2232,6 @@ def _http_port() -> int:
         p = int(_envi("MAIN_HTTP_PORT", 0))
         if p > 0:
             return p
-        # If MAIN_HTTP_PORT is set but 0/invalid, do NOT block Render PORT fallback.
 
     if os.getenv("PORT") is not None:
         p = int(_envi("PORT", 0))
@@ -2205,10 +2295,8 @@ async def _http_server(
         except Exception:
             path = "/"
 
-        # defaults
         ctype = "application/json"
 
-        # /livez must stay cheap and never block
         if path in {"/live", "/livez"}:
             body = _json_dumps(
                 {"ok": True, "run_id": st.run_id, "version": MAIN_VERSION, "build": MAIN_BUILD}
@@ -2216,7 +2304,6 @@ async def _http_server(
             await _write_resp(writer, 200, body, ctype)
             return
 
-        # /readyz can be strict (optionally uses health_snapshot)
         if path in {"/ready", "/readyz"}:
             if stop_evt.is_set() or _kill_active():
                 body = _json_dumps({"ok": False, "reason": "stopping_or_kill", "run_id": st.run_id})
@@ -2293,11 +2380,19 @@ async def _http_server(
             await _write_resp(writer, 200, body, ctype)
             return
 
-        # default plain
         ctype = "text/plain"
         await _write_resp(writer, 200, "ok\n", ctype)
 
-    server = await asyncio.start_server(_handle, host=host, port=port)
+    try:
+        server = await asyncio.start_server(_handle, host=host, port=port)
+    except OSError as e:
+        log.event(
+            "HTTP_SERVER_BIND_FAIL", run_id=st.run_id, host=host, port=port, err=_short_exc(e)
+        )
+        if _fast_fail():
+            raise
+        return
+
     log.event("HTTP_SERVER_STARTED", run_id=st.run_id, host=host, port=port)
 
     try:
@@ -2365,27 +2460,27 @@ async def _runtime_watchdog(
             stop_evt.set()
             return
 
-        now = _now()
-        if st.last_candidate_at > 0 and (now - st.last_candidate_at) > starvation_warn:
+        now_ts = _now()
+        if st.last_candidate_at > 0 and (now_ts - st.last_candidate_at) > starvation_warn:
             log.every(
                 "WATCHDOG_NO_CANDIDATES",
                 30,
                 run_id=st.run_id,
-                sec_since_last=int(now - st.last_candidate_at),
+                sec_since_last=int(now_ts - st.last_candidate_at),
                 cand_q=cand_q.qsize(),
             )
 
-        if st.last_buy_action_at > 0 and (now - st.last_buy_action_at) > no_buy_warn:
+        if st.last_buy_action_at > 0 and (now_ts - st.last_buy_action_at) > no_buy_warn:
             log.every(
                 "WATCHDOG_NO_BUY_ACTION",
                 30,
                 run_id=st.run_id,
-                sec_since_last=int(now - st.last_buy_action_at),
+                sec_since_last=int(now_ts - st.last_buy_action_at),
                 cand_q=cand_q.qsize(),
             )
 
-        if (now - st.last_health_at) >= float(health_sec):
-            st.last_health_at = now
+        if (now_ts - st.last_health_at) >= float(health_sec):
+            st.last_health_at = now_ts
             snap = _snapshot_state(M, st, cand_q=cand_q, tick_q=tick_q, task_view=task_view_fn())
             log.event("HEALTH", **snap, queue_policy=_DROP_POLICY, loop_lag_ms=int(st.loop_lag_ms))
 
@@ -2566,6 +2661,9 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
     _refresh_config()
     refresh_runtime_constants()
 
+    # Apply canonical run mode only if explicitly set
+    applied_mode = _apply_run_mode_defaults()
+
     if not RUN_ID or _envb("MAIN_FORCE_NEW_RUN_ID", True):
         base = f"{time.time()}|{os.getpid()}|{socket.gethostname()}|{random.random()}"
         RUN_ID = (os.getenv("RUN_ID", "") or _hash_prefix(base, 10)).strip()
@@ -2579,12 +2677,7 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
     _install_signal_handlers(stop_evt, RUN_ID)
     _apply_disable_sells_to_env()
 
-    # -------------------------------------------------------------------------
-    # EARLY HTTP START (Render healthchecks):
-    # Bring up /livez immediately, even while preflight/bootstrap is running.
-    # -------------------------------------------------------------------------
-    phase_ = _phase()
-
+    # Create runtime queues/state ONCE (shared by early HTTP + supervisor runtime).
     qmax = _envi("CANDIDATE_QUEUE_MAX", int(getattr(C, "CANDIDATE_QUEUE_MAX", 2500) or 2500))
     tqmax = _envi("TICK_QUEUE_MAX", int(getattr(C, "TICK_QUEUE_MAX", 5000) or 5000))
     qmax = max(50, min(250_000, qmax))
@@ -2594,255 +2687,313 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
     tick_q: asyncio.Queue[JSONDict] = asyncio.Queue(maxsize=tqmax)
     st = RuntimeState(run_id=RUN_ID)
 
-    # Start HTTP server outside supervisor so it can bind BEFORE preflight.
+    # Task view function can be updated after supervisor exists.
+    task_view_holder: dict[str, Callable[[], JSONDict]] = {"fn": (lambda: {})}
+
+    # Start early HTTP server if enabled (Render healthchecks). Uses same queues/state.
     http_task: asyncio.Task[None] | None = None
-    if _http_port() > 0 and _envb("MAIN_HTTP_EARLY_START", True):
-        # placeholder modules snapshot; we'll fill it after real module resolution
+    early_http = bool(_http_port() > 0 and _envb("MAIN_HTTP_EARLY_START", True))
+    if early_http:
         M = Modules(normalize_mint=_resolve_normalize_mint())
         http_task = asyncio.create_task(
-            _http_server(M, st, cand_q, tick_q, stop_evt, lambda: {}),
+            _http_server(M, st, cand_q, tick_q, stop_evt, lambda: task_view_holder["fn"]()),
             name="main::http_server",
         )
     else:
-        M = _resolve_modules()  # will be overwritten below anyway
+        M = _resolve_modules()
 
-    if _envb("PANIC_STOP", False):
-        log.event("PANIC_STOP_SET", run_id=RUN_ID)
-        stop_evt.set()
+    try:
+        if _envb("PANIC_STOP", False):
+            log.event("PANIC_STOP_SET", run_id=RUN_ID)
+            stop_evt.set()
 
-    await _run_preflight_if_enabled(RUN_ID)
-    with contextlib.suppress(Exception):
-        await _core_bootstrap_best_effort(RUN_ID)
-    with contextlib.suppress(Exception):
-        await _ai_db_bootstrap_best_effort(RUN_ID)
+        await _run_preflight_if_enabled(RUN_ID)
+        with contextlib.suppress(Exception):
+            await _core_bootstrap_best_effort(RUN_ID)
+        with contextlib.suppress(Exception):
+            await _ai_db_bootstrap_best_effort(RUN_ID)
 
-    resolved = _resolve_modules()
-    # If we started early HTTP with a placeholder Modules(), populate it in-place.
-    if isinstance(M, Modules):
-        for attr in (
-            "normalize_mint",
-            "maybe_buy",
-            "buys_allowed",
-            "scoring_mod",
-            "scoring_fn",
-            "scoring_enabled",
-            "ai_risk_mod",
-            "ai_overlay_fn",
-            "ai_risk_score_fn",
-            "ai_risk_gate_fn",
-            "ai_risk_enabled",
-            "infra_guard_mod",
-            "circuit_breakers_mod",
-            "ai_pass_gate",
-            "ai_candidate_cls",
-            "routeguard_mod",
-            "risk_mod",
-            "exit_mod",
-            "auto_exit_worker_mod",
-            "auto_exit_worker_loop",
-            "reinvest_mod",
-            "smart_mod",
-            "data_logger_mod",
+        resolved = _resolve_modules()
+        # If we started early HTTP with a placeholder Modules(), populate it in-place.
+        if isinstance(M, Modules):
+            for attr in (
+                "normalize_mint",
+                "maybe_buy",
+                "buys_allowed",
+                "scoring_mod",
+                "scoring_fn",
+                "scoring_enabled",
+                "ai_risk_mod",
+                "ai_overlay_fn",
+                "ai_risk_score_fn",
+                "ai_risk_gate_fn",
+                "ai_risk_enabled",
+                "infra_guard_mod",
+                "circuit_breakers_mod",
+                "ai_pass_gate",
+                "ai_candidate_cls",
+                "routeguard_mod",
+                "risk_mod",
+                "exit_mod",
+                "auto_exit_worker_mod",
+                "auto_exit_worker_loop",
+                "reinvest_mod",
+                "smart_mod",
+                "data_logger_mod",
+            ):
+                with contextlib.suppress(Exception):
+                    setattr(M, attr, getattr(resolved, attr))
+        else:
+            M = resolved
+
+        phase_ = _phase()
+        disable_sells = _sells_disabled()
+
+        max_concurrent_buys = max(1, _envi("MAX_CONCURRENT_BUYS", _envi("MAX_CONCURRENCY", 3)))
+        buy_sema = asyncio.Semaphore(max_concurrent_buys)
+
+        max_uptime_sec = max(0.0, float(_envf("MAIN_MAX_UPTIME_SEC", 0.0)))
+
+        log.event(
+            "MAIN_BOOT",
+            run_id=RUN_ID,
+            version=MAIN_VERSION,
+            build=MAIN_BUILD,
+            phase=phase_,
+            run_mode=applied_mode or (_run_mode() or ""),
+            py=sys.version.split()[0],
+            pid=os.getpid(),
+            buy_executor=int(M.maybe_buy is not None),
+            scoring_service=int(M.scoring_fn is not None and M.scoring_enabled),
+            ai_risk_model=int(
+                M.ai_risk_enabled and M.ai_risk_gate_fn is not None and M.ai_overlay_fn is not None
+            ),
+            infra_guard=int(M.infra_guard_mod is not None),
+            circuit_breakers=int(M.circuit_breakers_mod is not None),
+            ai_gate_legacy=int(M.ai_pass_gate is not None),
+            exit_engine=int(M.exit_mod is not None),
+            auto_exit_worker=int(M.auto_exit_worker_loop is not None),
+            reinvestor=int(M.reinvest_mod is not None),
+            smart_wallets=int(M.smart_mod is not None),
+            routeguard=int(M.routeguard_mod is not None),
+            risk_manager=int(M.risk_mod is not None),
+            queue_policy=_DROP_POLICY,
+            max_concurrent_buys=max_concurrent_buys,
+            buy_exec_timeout_s=_BUY_EXEC_TIMEOUT_S,
+            kill_switch=int(_kill_active()),
+            disable_buys=int(_buys_disabled()),
+            disable_sells=int(disable_sells),
+            disable_scanners=int(_scanners_disabled()),
+            dryrun=int(_envb("DRYRUN", _envb("DRY_RUN", False))),
+            threadify_sync_modules=int(_threadify_sync_modules_enabled()),
+            fast_fail=int(_fast_fail()),
+            jitter_disabled=int(_jitter_disabled()),
+            max_uptime_sec=int(max_uptime_sec),
+            auto_exit_enabled=int(_auto_exit_enabled()),
+            http_port=int(_http_port()),
+            early_http=int(early_http),
+        )
+
+        if phase_ <= 0:
+            log.event("MAIN_PHASE0_IDLE", run_id=RUN_ID)
+            await stop_evt.wait()
+            return
+
+        sup_mod = _soft_import("utils_pkg.task_supervisor", critical=False)
+        if not sup_mod:
+            if _fast_fail():
+                raise RuntimeError("utils_pkg.task_supervisor missing")
+            log.event("TASK_SUPERVISOR_MISSING_FALLBACK", run_id=RUN_ID)
+            await stop_evt.wait()
+            return
+
+        TaskSupervisor = getattr(sup_mod, "TaskSupervisor", None)
+        TS_TaskSpec = getattr(sup_mod, "TaskSpec", None)
+        RestartPolicy = getattr(sup_mod, "RestartPolicy", None)
+        RestartConfig = getattr(sup_mod, "RestartConfig", None)
+        install_sig = getattr(sup_mod, "install_signal_handlers", None)
+
+        if (
+            (not callable(TaskSupervisor))
+            or (not callable(TS_TaskSpec))
+            or RestartPolicy is None
+            or RestartConfig is None
         ):
-            with contextlib.suppress(Exception):
-                setattr(M, attr, getattr(resolved, attr))
-    else:
-        M = resolved
+            if _fast_fail():
+                raise RuntimeError("task_supervisor API mismatch")
+            log.event("TASK_SUPERVISOR_API_MISMATCH", run_id=RUN_ID)
+            await stop_evt.wait()
+            return
 
-    phase_ = _phase()
-    disable_sells = _sells_disabled()
-
-    max_concurrent_buys = max(1, _envi("MAX_CONCURRENT_BUYS", _envi("MAX_CONCURRENCY", 3)))
-    buy_sema = asyncio.Semaphore(max_concurrent_buys)
-
-    max_uptime_sec = max(0.0, float(_envf("MAIN_MAX_UPTIME_SEC", 0.0)))
-
-    log.event(
-        "MAIN_BOOT",
-        run_id=RUN_ID,
-        version=MAIN_VERSION,
-        build=MAIN_BUILD,
-        phase=phase_,
-        py=sys.version.split()[0],
-        pid=os.getpid(),
-        buy_executor=int(M.maybe_buy is not None),
-        scoring_service=int(M.scoring_fn is not None and M.scoring_enabled),
-        ai_risk_model=int(
-            M.ai_risk_enabled and M.ai_risk_gate_fn is not None and M.ai_overlay_fn is not None
-        ),
-        infra_guard=int(M.infra_guard_mod is not None),
-        circuit_breakers=int(M.circuit_breakers_mod is not None),
-        ai_gate_legacy=int(M.ai_pass_gate is not None),
-        exit_engine=int(M.exit_mod is not None),
-        auto_exit_worker=int(M.auto_exit_worker_loop is not None),
-        reinvestor=int(M.reinvest_mod is not None),
-        smart_wallets=int(M.smart_mod is not None),
-        routeguard=int(M.routeguard_mod is not None),
-        risk_manager=int(M.risk_mod is not None),
-        queue_policy=_DROP_POLICY,
-        max_concurrent_buys=max_concurrent_buys,
-        buy_exec_timeout_s=_BUY_EXEC_TIMEOUT_S,
-        kill_switch=int(_kill_active()),
-        disable_buys=int(_buys_disabled()),
-        disable_sells=int(disable_sells),
-        disable_scanners=int(_scanners_disabled()),
-        dryrun=int(_envb("DRYRUN", _envb("DRY_RUN", False))),
-        threadify_sync_modules=int(_threadify_sync_modules_enabled()),
-        fast_fail=int(_fast_fail()),
-        jitter_disabled=int(_jitter_disabled()),
-        max_uptime_sec=int(max_uptime_sec),
-        auto_exit_enabled=int(_auto_exit_enabled()),
-        http_port=int(_http_port()),
-    )
-
-    if phase_ <= 0:
-        log.event("MAIN_PHASE0_IDLE", run_id=RUN_ID)
-        await stop_evt.wait()
-        return
-
-    qmax = _envi("CANDIDATE_QUEUE_MAX", int(getattr(C, "CANDIDATE_QUEUE_MAX", 2500) or 2500))
-    tqmax = _envi("TICK_QUEUE_MAX", int(getattr(C, "TICK_QUEUE_MAX", 5000) or 5000))
-    qmax = max(50, min(250_000, qmax))
-    tqmax = max(50, min(500_000, tqmax))
-
-    cand_q: asyncio.Queue[CandidateMsg] = asyncio.Queue(maxsize=qmax)
-    tick_q: asyncio.Queue[JSONDict] = asyncio.Queue(maxsize=tqmax)
-    st = RuntimeState(run_id=RUN_ID)
-
-    sup_mod = _soft_import("utils_pkg.task_supervisor", critical=False)
-    if not sup_mod:
-        if _fast_fail():
-            raise RuntimeError("utils_pkg.task_supervisor missing")
-        log.event("TASK_SUPERVISOR_MISSING_FALLBACK", run_id=RUN_ID)
-        await stop_evt.wait()
-        return
-
-    TaskSupervisor = getattr(sup_mod, "TaskSupervisor", None)
-    TS_TaskSpec = getattr(sup_mod, "TaskSpec", None)
-    RestartPolicy = getattr(sup_mod, "RestartPolicy", None)
-    RestartConfig = getattr(sup_mod, "RestartConfig", None)
-    install_sig = getattr(sup_mod, "install_signal_handlers", None)
-
-    if (
-        (not callable(TaskSupervisor))
-        or (not callable(TS_TaskSpec))
-        or RestartPolicy is None
-        or RestartConfig is None
-    ):
-        if _fast_fail():
-            raise RuntimeError("task_supervisor API mismatch")
-        log.event("TASK_SUPERVISOR_API_MISMATCH", run_id=RUN_ID)
-        await stop_evt.wait()
-        return
-
-    sup = TaskSupervisor(
-        stop_event=stop_evt, logger=_base_logger("sniper.supervisor"), name="main_supervisor"
-    )
-
-    with contextlib.suppress(Exception):
-        if callable(install_sig):
-            loop_ = asyncio.get_running_loop()
-            install_sig(loop_, sup)
-
-    restart_cfg_unlimited = RestartConfig(max_restarts=None)
-
-    def add_task(
-        name: str,
-        coro_factory: Callable[[], Awaitable[None]],
-        *,
-        essential: bool,
-        restart_policy: str,
-        tags: JSONDict | None = None,
-        shutdown_timeout_s: float = 15.0,
-    ) -> None:
-        spec = TS_TaskSpec(
-            name=name,
-            coro_factory=coro_factory,
-            restart_policy=restart_policy,
-            restart=restart_cfg_unlimited,
-            essential=essential,
-            shutdown_timeout_s=float(shutdown_timeout_s),
-            tags=tags or {},
-        )
-        sup.add(spec)
-
-    def task_view_fn() -> JSONDict:
-        return _task_view_from_supervisor(sup)
-
-    # HTTP server:
-    # If we early-started it (to satisfy Render healthchecks), do NOT bind a 2nd copy.
-    if not (_envb("MAIN_HTTP_EARLY_START", True) and _http_port() > 0):
-        add_task(
-            "http_server",
-            lambda: _http_server(M, st, cand_q, tick_q, stop_evt, task_view_fn),
-            essential=False,
-            restart_policy=RestartPolicy.ON_FAILURE,
-            tags={"svc": "http"},
-            shutdown_timeout_s=5.0,
+        sup = TaskSupervisor(
+            stop_event=stop_evt, logger=_base_logger("sniper.supervisor"), name="main_supervisor"
         )
 
-    # scanners
-    if phase_ >= 1:
-        mods = _scanner_modules_from_env() or _default_scanner_modules()
-        log.event("SCANNERS_SELECTED", run_id=RUN_ID, modules=",".join(mods) if mods else "")
-        for mod_name in mods or []:
-            crit = _envb(f"SCANNER_CRITICAL__{mod_name.replace('.', '_').upper()}", True)
+        with contextlib.suppress(Exception):
+            if callable(install_sig):
+                loop_ = asyncio.get_running_loop()
+                install_sig(loop_, sup)
+
+        restart_cfg_unlimited = RestartConfig(max_restarts=None)
+
+        def add_task(
+            name: str,
+            coro_factory: Callable[[], Awaitable[None]],
+            *,
+            essential: bool,
+            restart_policy: str,
+            tags: JSONDict | None = None,
+            shutdown_timeout_s: float = 15.0,
+        ) -> None:
+            spec = TS_TaskSpec(
+                name=name,
+                coro_factory=coro_factory,
+                restart_policy=restart_policy,
+                restart=restart_cfg_unlimited,
+                essential=essential,
+                shutdown_timeout_s=float(shutdown_timeout_s),
+                tags=tags or {},
+            )
+            sup.add(spec)
+
+        def task_view_fn() -> JSONDict:
+            return _task_view_from_supervisor(sup)
+
+        # Promote task view into the early HTTP closure (so /state shows tasks once supervisor exists).
+        task_view_holder["fn"] = task_view_fn
+
+        # HTTP server: if we early-started it, do NOT bind a 2nd copy.
+        if not early_http:
             add_task(
-                f"scanner::{mod_name}",
-                lambda m=mod_name: _scanner_run_module(M, m, cand_q, tick_q, stop_evt, st),
-                essential=bool(crit),
+                "http_server",
+                lambda: _http_server(M, st, cand_q, tick_q, stop_evt, task_view_fn),
+                essential=False,
                 restart_policy=RestartPolicy.ON_FAILURE,
-                tags={"svc": "scanner", "module": mod_name},
+                tags={"svc": "http"},
+                shutdown_timeout_s=5.0,
+            )
+
+        # scanners
+        if phase_ >= 1:
+            mods = _scanner_modules_from_env() or _default_scanner_modules()
+            log.event("SCANNERS_SELECTED", run_id=RUN_ID, modules=",".join(mods) if mods else "")
+            for mod_name in mods or []:
+                crit = _envb(f"SCANNER_CRITICAL__{mod_name.replace('.', '_').upper()}", True)
+                add_task(
+                    f"scanner::{mod_name}",
+                    lambda m=mod_name: _scanner_run_module(M, m, cand_q, tick_q, stop_evt, st),
+                    essential=bool(crit),
+                    restart_policy=RestartPolicy.ON_FAILURE,
+                    tags={"svc": "scanner", "module": mod_name},
+                    shutdown_timeout_s=10.0,
+                )
+
+        # entry workers OR candidate sink
+        entry_workers_started = 0
+        if phase_ >= 2:
+            nworkers = int(getattr(C, "ENTRY_WORKERS", 2) or 2)
+            nworkers = max(1, min(32, _envi("ENTRY_WORKERS", nworkers)))
+            if M.maybe_buy is not None:
+                for wid in range(nworkers):
+                    add_task(
+                        f"entry_worker_{wid}",
+                        lambda wid=wid: _entry_worker(M, wid, cand_q, stop_evt, st, buy_sema),
+                        essential=True,
+                        restart_policy=RestartPolicy.ON_FAILURE,
+                        tags={"svc": "entry", "wid": wid},
+                        shutdown_timeout_s=15.0,
+                    )
+                entry_workers_started = nworkers
+                log.event("ENTRY_WORKERS_STARTED", run_id=RUN_ID, n=nworkers)
+            else:
+                log.event(
+                    "ENTRY_WORKERS_SKIPPED_NO_BUY_EXECUTOR", run_id=RUN_ID, requested=nworkers
+                )
+                if _fast_fail():
+                    raise RuntimeError("No buy executor; cannot run entry workers")
+
+        if phase_ >= 1 and entry_workers_started <= 0:
+            add_task(
+                "candidate_sink",
+                lambda: _candidate_sink(cand_q, stop_evt, st),
+                essential=False,
+                restart_policy=RestartPolicy.ON_FAILURE,
+                tags={"svc": "sink", "kind": "candidate"},
                 shutdown_timeout_s=10.0,
             )
 
-    # entry workers OR candidate sink
-    entry_workers_started = 0
-    if phase_ >= 2:
-        nworkers = int(getattr(C, "ENTRY_WORKERS", 2) or 2)
-        nworkers = max(1, min(32, _envi("ENTRY_WORKERS", nworkers)))
-        if M.maybe_buy is not None:
-            for wid in range(nworkers):
+        # tick + exit wiring
+        if phase_ >= 3:
+            add_task(
+                "tick_router",
+                lambda: _tick_router(M, tick_q, stop_evt, st),
+                essential=True,
+                restart_policy=RestartPolicy.ON_FAILURE,
+                tags={"svc": "tick"},
+                shutdown_timeout_s=10.0,
+            )
+
+            if M.exit_mod is not None and _envb("EXIT_ENGINE_WORKER_ENABLED", True):
+
+                async def _run_exit_engine() -> None:
+                    mod = M.exit_mod
+                    for nm in ("run_worker", "worker_loop", "loop", "run", "main"):
+                        fn = getattr(mod, nm, None)
+                        if callable(fn):
+                            kw = _filter_kwargs(
+                                fn, {"stop_evt": stop_evt, "stop_event": stop_evt, "stop": stop_evt}
+                            )
+                            if kw:
+                                return await _call_possibly_blocking(fn, **kw)
+                            with contextlib.suppress(TypeError):
+                                return await _call_possibly_blocking(fn, stop_evt)
+                            return await _call_possibly_blocking(fn)
+                    await stop_evt.wait()
+
                 add_task(
-                    f"entry_worker_{wid}",
-                    lambda wid=wid: _entry_worker(M, wid, cand_q, stop_evt, st, buy_sema),
-                    essential=True,
+                    "exit_engine",
+                    _run_exit_engine,
+                    essential=False,
                     restart_policy=RestartPolicy.ON_FAILURE,
-                    tags={"svc": "entry", "wid": wid},
+                    tags={"svc": "exit"},
                     shutdown_timeout_s=15.0,
                 )
-            entry_workers_started = nworkers
-            log.event("ENTRY_WORKERS_STARTED", run_id=RUN_ID, n=nworkers)
+
+            if (not disable_sells) and _auto_exit_enabled() and M.auto_exit_worker_loop is not None:
+                add_task(
+                    "auto_exit_worker",
+                    lambda: _run_loop_until_stop(
+                        M.auto_exit_worker_loop, stop_evt, name="auto_exit_worker"
+                    ),
+                    essential=False,
+                    restart_policy=RestartPolicy.ON_FAILURE,
+                    tags={"svc": "auto_exit"},
+                    shutdown_timeout_s=15.0,
+                )
+            elif disable_sells:
+                log.event("AUTO_EXIT_WORKER_SKIPPED_DISABLE_SELLS", run_id=RUN_ID)
+            else:
+                log.event(
+                    "AUTO_EXIT_WORKER_NOT_AVAILABLE",
+                    run_id=RUN_ID,
+                    enabled=int(_auto_exit_enabled()),
+                )
         else:
-            log.event("ENTRY_WORKERS_SKIPPED_NO_BUY_EXECUTOR", run_id=RUN_ID, requested=nworkers)
-            if _fast_fail():
-                raise RuntimeError("No buy executor; cannot run entry workers")
+            if _envb("FORWARD_TICKS_FROM_SCANNERS", False):
+                add_task(
+                    "tick_sink",
+                    lambda: _tick_sink(tick_q, stop_evt, st),
+                    essential=False,
+                    restart_policy=RestartPolicy.ON_FAILURE,
+                    tags={"svc": "sink", "kind": "tick"},
+                    shutdown_timeout_s=10.0,
+                )
 
-    if phase_ >= 1 and entry_workers_started <= 0:
-        add_task(
-            "candidate_sink",
-            lambda: _candidate_sink(cand_q, stop_evt, st),
-            essential=False,
-            restart_policy=RestartPolicy.ON_FAILURE,
-            tags={"svc": "sink", "kind": "candidate"},
-            shutdown_timeout_s=10.0,
-        )
+        # optional services
+        if phase_ >= 4 and M.reinvest_mod is not None and _envb("REINVESTOR_ENABLED", True):
 
-    # tick + exit wiring
-    if phase_ >= 3:
-        add_task(
-            "tick_router",
-            lambda: _tick_router(M, tick_q, stop_evt, st),
-            essential=True,
-            restart_policy=RestartPolicy.ON_FAILURE,
-            tags={"svc": "tick"},
-            shutdown_timeout_s=10.0,
-        )
-
-        if M.exit_mod is not None and _envb("EXIT_ENGINE_WORKER_ENABLED", True):
-
-            async def _run_exit_engine() -> None:
-                mod = M.exit_mod
+            async def _run_reinvestor() -> None:
+                mod = M.reinvest_mod
                 for nm in ("run_worker", "worker_loop", "loop", "run", "main"):
                     fn = getattr(mod, nm, None)
                     if callable(fn):
@@ -2857,143 +3008,95 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
                 await stop_evt.wait()
 
             add_task(
-                "exit_engine",
-                _run_exit_engine,
+                "reinvestor",
+                _run_reinvestor,
                 essential=False,
                 restart_policy=RestartPolicy.ON_FAILURE,
-                tags={"svc": "exit"},
+                tags={"svc": "reinvestor"},
                 shutdown_timeout_s=15.0,
             )
 
-        if (not disable_sells) and _auto_exit_enabled() and M.auto_exit_worker_loop is not None:
+        if phase_ >= 5 and M.smart_mod is not None and _envb("SMART_WALLETS_ENABLED", True):
+
+            async def _run_smart_wallets() -> None:
+                mod = M.smart_mod
+                for nm in ("run_worker", "worker_loop", "loop", "run", "main"):
+                    fn = getattr(mod, nm, None)
+                    if callable(fn):
+                        kw = _filter_kwargs(
+                            fn, {"stop_evt": stop_evt, "stop_event": stop_evt, "stop": stop_evt}
+                        )
+                        if kw:
+                            return await _call_possibly_blocking(fn, **kw)
+                        with contextlib.suppress(TypeError):
+                            return await _call_possibly_blocking(fn, stop_evt)
+                        return await _call_possibly_blocking(fn)
+                await stop_evt.wait()
+
             add_task(
-                "auto_exit_worker",
-                lambda: _run_loop_until_stop(
-                    M.auto_exit_worker_loop, stop_evt, name="auto_exit_worker"
-                ),
+                "smart_wallets",
+                _run_smart_wallets,
                 essential=False,
                 restart_policy=RestartPolicy.ON_FAILURE,
-                tags={"svc": "auto_exit"},
+                tags={"svc": "smart_wallets"},
                 shutdown_timeout_s=15.0,
             )
-        elif disable_sells:
-            log.event("AUTO_EXIT_WORKER_SKIPPED_DISABLE_SELLS", run_id=RUN_ID)
-        else:
-            log.event(
-                "AUTO_EXIT_WORKER_NOT_AVAILABLE", run_id=RUN_ID, enabled=int(_auto_exit_enabled())
-            )
-    else:
-        if _envb("FORWARD_TICKS_FROM_SCANNERS", False):
+
+        # watchdogs
+        if _envb("MAIN_WATCHDOG_ENABLED", True):
             add_task(
-                "tick_sink",
-                lambda: _tick_sink(tick_q, stop_evt, st),
-                essential=False,
+                "runtime_watchdog",
+                lambda: _runtime_watchdog(
+                    M,
+                    st,
+                    cand_q=cand_q,
+                    tick_q=tick_q,
+                    stop_evt=stop_evt,
+                    task_view_fn=task_view_fn,
+                ),
+                essential=True,
                 restart_policy=RestartPolicy.ON_FAILURE,
-                tags={"svc": "sink", "kind": "tick"},
+                tags={"svc": "watchdog"},
                 shutdown_timeout_s=10.0,
             )
 
-    # optional services
-    if phase_ >= 4 and M.reinvest_mod is not None and _envb("REINVESTOR_ENABLED", True):
-
-        async def _run_reinvestor() -> None:
-            mod = M.reinvest_mod
-            for nm in ("run_worker", "worker_loop", "loop", "run", "main"):
-                fn = getattr(mod, nm, None)
-                if callable(fn):
-                    kw = _filter_kwargs(
-                        fn, {"stop_evt": stop_evt, "stop_event": stop_evt, "stop": stop_evt}
-                    )
-                    if kw:
-                        return await _call_possibly_blocking(fn, **kw)
-                    with contextlib.suppress(TypeError):
-                        return await _call_possibly_blocking(fn, stop_evt)
-                    return await _call_possibly_blocking(fn)
-            await stop_evt.wait()
-
         add_task(
-            "reinvestor",
-            _run_reinvestor,
-            essential=False,
-            restart_policy=RestartPolicy.ON_FAILURE,
-            tags={"svc": "reinvestor"},
-            shutdown_timeout_s=15.0,
-        )
-
-    if phase_ >= 5 and M.smart_mod is not None and _envb("SMART_WALLETS_ENABLED", True):
-
-        async def _run_smart_wallets() -> None:
-            mod = M.smart_mod
-            for nm in ("run_worker", "worker_loop", "loop", "run", "main"):
-                fn = getattr(mod, nm, None)
-                if callable(fn):
-                    kw = _filter_kwargs(
-                        fn, {"stop_evt": stop_evt, "stop_event": stop_evt, "stop": stop_evt}
-                    )
-                    if kw:
-                        return await _call_possibly_blocking(fn, **kw)
-                    with contextlib.suppress(TypeError):
-                        return await _call_possibly_blocking(fn, stop_evt)
-                    return await _call_possibly_blocking(fn)
-            await stop_evt.wait()
-
-        add_task(
-            "smart_wallets",
-            _run_smart_wallets,
-            essential=False,
-            restart_policy=RestartPolicy.ON_FAILURE,
-            tags={"svc": "smart_wallets"},
-            shutdown_timeout_s=15.0,
-        )
-
-    # watchdogs
-    if _envb("MAIN_WATCHDOG_ENABLED", True):
-        add_task(
-            "runtime_watchdog",
-            lambda: _runtime_watchdog(
-                M, st, cand_q=cand_q, tick_q=tick_q, stop_evt=stop_evt, task_view_fn=task_view_fn
-            ),
+            "kill_watchdog",
+            lambda: _kill_watchdog(stop_evt, st),
             essential=True,
             restart_policy=RestartPolicy.ON_FAILURE,
-            tags={"svc": "watchdog"},
-            shutdown_timeout_s=10.0,
+            tags={"svc": "kill"},
+            shutdown_timeout_s=5.0,
         )
 
-    add_task(
-        "kill_watchdog",
-        lambda: _kill_watchdog(stop_evt, st),
-        essential=True,
-        restart_policy=RestartPolicy.ON_FAILURE,
-        tags={"svc": "kill"},
-        shutdown_timeout_s=5.0,
-    )
+        if max_uptime_sec > 0:
+            add_task(
+                "uptime_monitor",
+                lambda: _uptime_monitor(stop_evt, st, max_uptime_sec),
+                essential=False,
+                restart_policy=RestartPolicy.ON_FAILURE,
+                tags={"svc": "uptime"},
+                shutdown_timeout_s=3.0,
+            )
 
-    if max_uptime_sec > 0:
-        add_task(
-            "uptime_monitor",
-            lambda: _uptime_monitor(stop_evt, st, max_uptime_sec),
-            essential=False,
-            restart_policy=RestartPolicy.ON_FAILURE,
-            tags={"svc": "uptime"},
-            shutdown_timeout_s=3.0,
+        log.event(
+            "MAIN_STARTED",
+            run_id=RUN_ID,
+            phase=phase_,
+            tasks=len(getattr(sup, "_runtimes", {}) or {}),
+            cand_q_max=qmax,
+            tick_q_max=tqmax,
         )
 
-    log.event(
-        "MAIN_STARTED",
-        run_id=RUN_ID,
-        phase=phase_,
-        tasks=len(getattr(sup, "_runtimes", {}) or {}),
-        cand_q_max=qmax,
-        tick_q_max=tqmax,
-    )
+        try:
+            await sup.run()
+        finally:
+            log.event("MAIN_SHUTDOWN_BEGIN", run_id=RUN_ID)
+            stop_evt.set()
+            await _shutdown_best_effort(stop_evt, reason="main_shutdown", run_id=RUN_ID)
+            log.event("MAIN_SHUTDOWN_DONE", run_id=RUN_ID)
 
-    try:
-        await sup.run()
     finally:
-        log.event("MAIN_SHUTDOWN_BEGIN", run_id=RUN_ID)
-        stop_evt.set()
-        await _shutdown_best_effort(stop_evt, reason="main_shutdown", run_id=RUN_ID)
-        log.event("MAIN_SHUTDOWN_DONE", run_id=RUN_ID)
         if http_task is not None:
             http_task.cancel()
             with contextlib.suppress(Exception):
