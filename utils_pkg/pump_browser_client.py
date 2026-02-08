@@ -3,70 +3,31 @@ from __future__ import annotations
 """
 utils_pkg/pump_browser_client.py
 
-Pump.fun browser fallback client (Cloudflare / tRPC resilient) — V3+++
-====================================================================
+Pump.fun browser fallback client (tRPC resilient) — V3+++
+========================================================
 
 Purpose
 -------
-When direct HTTP calls to Pump.fun’s frontend API are blocked/ratelimited by CF,
-this module provides a *single, persistent Playwright Chromium context* that
-can execute POSTs using cookies/session state.
+When direct HTTP calls are blocked/ratelimited, this module provides a *single,
+persistent Playwright Chromium context* that can execute POSTs using cookies /
+session state.
 
-This is a *fallback* path (your utils_pkg/pump_client.py should try direct HTTP first).
+This is a fallback path (your direct HTTP client should try first).
 
 Hard requirements
 -----------------
 - No network work at import time
 - Safe to call concurrently (single shared browser context + semaphore)
-- Persistent profile so CF cookies survive between calls
+- Persistent profile so session cookies can survive between calls
 - Render-friendly defaults (headless, no-sandbox flags)
 - Bounded retries + exponential backoff + jitter
-- Circuit breaker on repeated 530-like failures
+- Circuit breaker on repeated 53x-like failures
 - Optional self-heal installer for Playwright Chromium (disabled by default)
 
 Public API (LOCK-IN)
 --------------------
 - async pump_post_via_browser(path_or_url: str, json_body: dict, timeout_ms: int = 90_000) -> str
 - async close_browser_client() -> None
-
-Env contract (compatible + extended)
-------------------------------------
-Core:
-- PUMPFUN_API_BASES             CSV list of API bases (default: https://frontend-api.pump.fun)
-- PF_CHROME_PROFILE / PUMP_USER_DATA_DIR
-                               persistent profile dir (default: /opt/render/project/src/.pw-profile)
-- PLAYWRIGHT_HEADLESS / PF_HEADLESS
-                               (default: 1 / True)
-- CHROMIUM_FLAGS                (default: "--no-sandbox --disable-dev-shm-usage")
-- PUMPFUN_UA                     (default: reasonable Linux Chrome UA)
-
-Retries / breaker:
-- PUMPFUN_RETRY_MAX              (default: 4)
-- PUMPFUN_RETRY_BASE_MS          (default: 800)
-- PUMPFUN_RETRY_JITTER           (default: 0.25)
-- PUMPFUN_BREAKER_FAILS          (default: 6)
-- PUMPFUN_BREAKER_COOL_MS        (default: 120000)
-
-Warm-up:
-- PF_WARM_SITE_SEC               (default: 2.0)
-- PF_WARM_API_SEC                (default: 6.0)
-
-Fallback control:
-- PUMPFUN_DISABLE_PAGE_FETCH     (default: 0)  # if 1, never use page-evaluate fetch()
-
-Autoinstall (OFF by default; prefer build-time install):
-- PUMP_BROWSER_AUTOINSTALL       (default: 0)  # if 1, attempt `python -m playwright install chromium`
-- PLAYWRIGHT_BROWSERS_PATH       (optional)    # where to install browsers
-- PUMP_BROWSER_AUTOINSTALL_COOLDOWN_S (default: 3600)
-
-Logging:
-- PF_DEBUG / PUMP_DEBUG          (default: 0)
-- PUMPFUN_LOG_ERRORS_ONLY        (default: 0)
-
-Notes
------
-- Uses BrowserContext.request.post (cookie-aware).
-- Optional last-ditch page.evaluate(fetch) path (can be disabled).
 """
 
 import asyncio
@@ -81,32 +42,43 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
-
-from playwright.async_api import BrowserContext, Playwright, async_playwright
+from typing import TYPE_CHECKING, Any, Mapping, cast
 
 # -----------------------------------------------------------------------------
-# Logging (prefer canonical logging_setup)
+# Typing-only imports (runtime is lazy)
 # -----------------------------------------------------------------------------
-try:
-    from utils_pkg.logging_setup import get_logger as _get_logger  # preferred
-except Exception:  # pragma: no cover
-    try:
-        from logging_setup import get_logger as _get_logger  # root shim
-    except Exception:  # pragma: no cover
-        _get_logger = None  # type: ignore
+if TYPE_CHECKING:  # pragma: no cover
+    from playwright.async_api import (  # type: ignore
+        APIRequestContext,
+        BrowserContext,
+        Playwright,
+        async_playwright,
+    )
+else:  # pragma: no cover
+    APIRequestContext = Any  # type: ignore
+    BrowserContext = Any  # type: ignore
+    Playwright = Any  # type: ignore
+    async_playwright = None  # type: ignore
 
-if _get_logger:
-    try:
-        LOG = _get_logger("utils.pump_browser")  # type: ignore[misc]
-    except TypeError:  # pragma: no cover
-        LOG = _get_logger()  # type: ignore[misc]
-else:
+
+# -----------------------------------------------------------------------------
+# Logging (prefer repo compat)
+# -----------------------------------------------------------------------------
+def _get_logger() -> Any:
+    with contextlib.suppress(Exception):
+        from utils_pkg.log_compat import get_logger as gl  # type: ignore
+
+        return gl(__name__)
+    with contextlib.suppress(Exception):
+        from utils_pkg.logging_setup import get_logger as gl2  # type: ignore
+
+        return gl2(__name__)
     import logging
 
-    LOG = logging.getLogger("utils.pump_browser")
-    if not LOG.handlers:
-        logging.basicConfig(level=logging.INFO)
+    return logging.getLogger(__name__)
+
+
+LOG: Any = _get_logger()
 
 
 # -----------------------------------------------------------------------------
@@ -122,16 +94,20 @@ def _envs(k: str, d: str = "") -> str:
 
 def _envi(k: str, d: int) -> int:
     v = os.getenv(k)
+    if v is None or v == "":
+        return d
     try:
-        return int(float(v)) if v not in (None, "") else d
+        return int(float(v))
     except Exception:
         return d
 
 
 def _envf(k: str, d: float) -> float:
     v = os.getenv(k)
+    if v is None or v == "":
+        return d
     try:
-        return float(v) if v not in (None, "") else d
+        return float(v)
     except Exception:
         return d
 
@@ -165,24 +141,28 @@ def _log_info(msg: str) -> None:
     if _errors_only():
         return
     if _debug_enabled():
-        LOG.info(msg)
+        with contextlib.suppress(Exception):
+            LOG.info(msg)
 
 
 def _log_warn(msg: str) -> None:
-    LOG.warning(msg)
+    with contextlib.suppress(Exception):
+        LOG.warning(msg)
 
 
 def _log_err(msg: str) -> None:
-    LOG.error(msg)
+    with contextlib.suppress(Exception):
+        LOG.error(msg)
 
 
 # -----------------------------------------------------------------------------
 # Defaults / knobs
 # -----------------------------------------------------------------------------
 _DEFAULT_API_BASES = "https://frontend-api.pump.fun"
-_DEFAULT_CHANNEL = "chromium"  # IMPORTANT: not "chrome" (requires system chrome)
+_DEFAULT_CHANNEL = "chromium"  # IMPORTANT: not "chrome" (system chrome)
 _DEFAULT_PROFILE_DIR = _envs(
-    "PF_CHROME_PROFILE", _envs("PUMP_USER_DATA_DIR", "/opt/render/project/src/.pw-profile")
+    "PF_CHROME_PROFILE",
+    _envs("PUMP_USER_DATA_DIR", "/opt/render/project/src/.pw-profile"),
 )
 _DEFAULT_UA = _envs(
     "PUMPFUN_UA",
@@ -220,7 +200,7 @@ _AUTOINSTALL_COOLDOWN_S = max(60, _envi("PUMP_BROWSER_AUTOINSTALL_COOLDOWN_S", 3
 
 
 # -----------------------------------------------------------------------------
-# Self-heal helpers (Chromium install discovery)
+# Self-heal helpers (browser install discovery)
 # -----------------------------------------------------------------------------
 def _candidate_browser_roots() -> list[str]:
     roots: list[str] = []
@@ -235,8 +215,8 @@ def _candidate_browser_roots() -> list[str]:
             os.path.expanduser("~/.cache/ms-playwright"),
         ]
     )
-    # de-dup
-    seen = set()
+
+    seen: set[str] = set()
     out: list[str] = []
     for r in roots:
         if r and r not in seen:
@@ -266,7 +246,7 @@ def _maybe_autoinstall() -> None:
     """
     Optional: run `python -m playwright install chromium`.
 
-    Default is OFF because best practice is to do this in build.
+    Default is OFF (prefer build-time install).
     If enabled, we cooldown to avoid repeated installs on crash loops.
     """
     global _LAST_AUTOINSTALL_TS
@@ -286,31 +266,32 @@ def _maybe_autoinstall() -> None:
 
     cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
     _log_warn(
-        f"pump-browser autoinstall enabled; running: {' '.join(cmd)} (PLAYWRIGHT_BROWSERS_PATH={target_root})"
+        "pump-browser autoinstall enabled; running: "
+        f"{' '.join(cmd)} (PLAYWRIGHT_BROWSERS_PATH={target_root})"
     )
     subprocess.run(cmd, check=True, env=env, capture_output=True)
 
 
 # -----------------------------------------------------------------------------
-# Manager (singleton browser + context)
+# Breaker + manager
 # -----------------------------------------------------------------------------
 @dataclass
 class _BreakerState:
-    fails_530: int = 0
+    fails_53x: int = 0
     open_until_ts: float = 0.0
 
     def allow(self) -> bool:
         return time.time() >= self.open_until_ts
 
-    def note_530(self) -> None:
-        self.fails_530 += 1
-        if self.fails_530 >= _BREAKER_FAILS:
+    def note_53x(self) -> None:
+        self.fails_53x += 1
+        if self.fails_53x >= _BREAKER_FAILS:
             cool_s = float(_BREAKER_COOL_MS) / 1000.0
             self.open_until_ts = time.time() + cool_s
-            self.fails_530 = 0  # half-open after cooldown
+            self.fails_53x = 0  # half-open after cooldown
 
     def reset(self) -> None:
-        self.fails_530 = 0
+        self.fails_53x = 0
         self.open_until_ts = 0.0
 
 
@@ -322,7 +303,23 @@ class _BrowserManager:
         self._ctx: BrowserContext | None = None
         self._ua: str = _DEFAULT_UA
         self._breaker = _BreakerState()
-        self._created_profile_dir: str | None = None
+        self._profile_dir: str | None = None
+
+    async def acquire(self) -> None:
+        await self._sema.acquire()
+
+    def release(self) -> None:
+        with contextlib.suppress(Exception):
+            self._sema.release()
+
+    def breaker_allow(self) -> bool:
+        return self._breaker.allow()
+
+    def breaker_note(self) -> None:
+        self._breaker.note_53x()
+
+    def breaker_reset(self) -> None:
+        self._breaker.reset()
 
     async def close(self) -> None:
         async with self._lock:
@@ -331,7 +328,7 @@ class _BrowserManager:
             self._ctx = None
             self._pw = None
             self._ua = _DEFAULT_UA
-            self._created_profile_dir = None
+            self._profile_dir = None
             self._breaker.reset()
 
         if ctx is not None:
@@ -343,22 +340,18 @@ class _BrowserManager:
 
     def _compute_profile_dir(self) -> str:
         """
-        Avoid ProcessSingleton profile locks by using a per-process/run subdir.
-        Keeps persistence *within* a single long-running process.
+        Avoid profile-lock issues by using a per-process/run subdir if needed.
+        Persistence remains within a single long-running process.
         """
         base = pathlib.Path(_DEFAULT_PROFILE_DIR)
         base.mkdir(parents=True, exist_ok=True)
 
-        # If caller provided an explicit stable dir and it's not locked, use it.
-        # Otherwise create a per-process subdir under base.
-        stable = base
         lock_files = ["SingletonLock", "SingletonCookie", "SingletonSocket"]
-        if any((stable / lf).exists() for lf in lock_files):
-            # locked => create unique run dir
+        if any((base / lf).exists() for lf in lock_files):
             run_dir = base / f"run-{os.getpid()}-{uuid.uuid4().hex[:8]}"
             run_dir.mkdir(parents=True, exist_ok=True)
             return str(run_dir)
-        return str(stable)
+        return str(base)
 
     async def ensure(self) -> tuple[BrowserContext, str]:
         """
@@ -369,26 +362,34 @@ class _BrowserManager:
             if self._ctx is not None and self._pw is not None:
                 return self._ctx, self._ua
 
-            # Start Playwright
-            self._pw = await async_playwright().start()
+            # Lazy import Playwright runtime
+            try:
+                from playwright.async_api import async_playwright as _apw  # type: ignore
+            except Exception as e:
+                raise RuntimeError(
+                    "Playwright is required for pump_browser_client but is not available. "
+                    "Install it (and browsers) or disable this fallback path."
+                ) from e
 
-            # Resolve launch config
+            self._pw = await _apw().start()
+
             headless = _envb("PLAYWRIGHT_HEADLESS", _envb("PF_HEADLESS", True))
             channel = _envs("PUMP_BROWSER_CHANNEL", _DEFAULT_CHANNEL) or _DEFAULT_CHANNEL
             explicit_exe = _envs("PUMP_BROWSER_EXECUTABLE_PATH", "").strip() or None
-            chromium_args = _envs("CHROMIUM_FLAGS", "--no-sandbox --disable-dev-shm-usage").split()
+            chromium_args = _envs(
+                "CHROMIUM_FLAGS",
+                "--no-sandbox --disable-dev-shm-usage",
+            ).split()
 
             exe = explicit_exe or _find_chromium_exe()
             if exe is None:
                 # optional self-heal
-                try:
+                with contextlib.suppress(Exception):
                     _maybe_autoinstall()
-                except Exception as e:
-                    _log_err(f"pump-browser autoinstall failed: {e}")
                 exe = explicit_exe or _find_chromium_exe()
 
             profile_dir = self._compute_profile_dir()
-            self._created_profile_dir = profile_dir
+            self._profile_dir = profile_dir
 
             launch_kwargs: dict[str, Any] = dict(
                 user_data_dir=profile_dir,
@@ -401,21 +402,23 @@ class _BrowserManager:
             if exe:
                 launch_kwargs["executable_path"] = exe
             else:
-                # let Playwright resolve via channel
                 launch_kwargs["channel"] = channel
 
             _log_info(
                 f"pump-browser launching persistent context (headless={headless}, profile={profile_dir})"
             )
 
+            pw = self._pw
+            assert pw is not None  # for mypy narrowing
+
             try:
-                self._ctx = await self._pw.chromium.launch_persistent_context(  # type: ignore[attr-defined]
+                self._ctx = await pw.chromium.launch_persistent_context(  # type: ignore[attr-defined]
                     **launch_kwargs,
                     timeout=_LAUNCH_TIMEOUT_MS,
                 )
             except Exception as e:
-                # If profile locked, create a new run dir and retry once
                 msg = str(e)
+                # retry once with a unique run dir if profile is locked
                 if "ProcessSingleton" in msg or "SingletonLock" in msg:
                     alt = (
                         pathlib.Path(_DEFAULT_PROFILE_DIR)
@@ -424,20 +427,20 @@ class _BrowserManager:
                     alt.mkdir(parents=True, exist_ok=True)
                     launch_kwargs["user_data_dir"] = str(alt)
                     _log_warn(f"pump-browser profile locked; retrying with {alt}")
-                    self._ctx = await self._pw.chromium.launch_persistent_context(  # type: ignore[attr-defined]
+                    self._ctx = await pw.chromium.launch_persistent_context(  # type: ignore[attr-defined]
                         **launch_kwargs,
                         timeout=_LAUNCH_TIMEOUT_MS,
                     )
-                    self._created_profile_dir = str(alt)
+                    self._profile_dir = str(alt)
                 else:
                     raise
 
-            # Warm-up
-            await self._warm(self._ctx)
+            ctx = self._ctx
+            assert ctx is not None
 
-            # Resolve UA from actual runtime
-            self._ua = await self._resolve_ua(self._ctx) or _DEFAULT_UA
-            return self._ctx, self._ua
+            await self._warm(ctx)
+            self._ua = await self._resolve_ua(ctx) or _DEFAULT_UA
+            return ctx, self._ua
 
     async def _resolve_ua(self, ctx: BrowserContext) -> str | None:
         page = None
@@ -446,7 +449,8 @@ class _BrowserManager:
             await page.goto(
                 "https://pump.fun/", wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
             )
-            return await page.evaluate("() => navigator.userAgent")
+            out = await page.evaluate("() => navigator.userAgent")
+            return str(out) if out else None
         except Exception:
             return None
         finally:
@@ -456,7 +460,7 @@ class _BrowserManager:
 
     async def _warm(self, ctx: BrowserContext) -> None:
         """
-        Warm CF cookies by visiting pump.fun and one API base.
+        Warm session cookies by visiting the site and one API base.
         Best-effort only.
         """
         bases = _csv("PUMPFUN_API_BASES", _DEFAULT_API_BASES)
@@ -465,44 +469,32 @@ class _BrowserManager:
         page = None
         try:
             page = await ctx.new_page()
+
             with contextlib.suppress(Exception):
                 await page.goto(
                     "https://pump.fun/", wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
                 )
                 await page.wait_for_timeout(int(_WARM_SITE_SEC * 1000))
+
+            # Optional trace endpoints (best-effort)
             with contextlib.suppress(Exception):
                 await page.goto(
                     "https://pump.fun/cdn-cgi/trace", wait_until="domcontentloaded", timeout=60_000
                 )
+
             with contextlib.suppress(Exception):
                 await page.goto(api_origin, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
                 await page.wait_for_timeout(int(_WARM_API_SEC * 1000))
+
             with contextlib.suppress(Exception):
                 await page.goto(
                     api_origin + "/cdn-cgi/trace", wait_until="domcontentloaded", timeout=60_000
                 )
+
         finally:
             if page is not None:
                 with contextlib.suppress(Exception):
                     await page.close()
-
-    # ---- breaker helpers ----
-    def breaker_allow(self) -> bool:
-        return self._breaker.allow()
-
-    def breaker_note_530(self) -> None:
-        self._breaker.note_530()
-
-    def breaker_reset(self) -> None:
-        self._breaker.reset()
-
-    # ---- concurrency guard ----
-    async def __aenter_sema(self):
-        await self._sema.acquire()
-
-    def __exit_sema(self):
-        with contextlib.suppress(Exception):
-            self._sema.release()
 
 
 _MGR = _BrowserManager()
@@ -511,10 +503,32 @@ _MGR = _BrowserManager()
 # -----------------------------------------------------------------------------
 # Low-level POST implementations
 # -----------------------------------------------------------------------------
+def _join(base: str, path_or_url: str) -> str:
+    s = (path_or_url or "").strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    if not s.startswith("/"):
+        s = "/" + s
+    return base.rstrip("/") + s
+
+
+def _is_53xish(status: int, text: str) -> bool:
+    if status in {530, 503, 502, 504}:
+        return True
+    t = (text or "").lower()
+    return ("origin dns error" in t) or ("cloudflare" in t and "53" in t)
+
+
+def _sleep_backoff(attempt: int) -> float:
+    base = _RETRY_BASE_MS * (2 ** max(0, attempt))
+    jitter = 1.0 + (random.random() * _RETRY_JITTER)
+    return min(_MAX_SLEEP_S, (base * jitter) / 1000.0)
+
+
 async def _post_via_context_request(
     ctx: BrowserContext,
     full_url: str,
-    json_body: dict,
+    json_body: Mapping[str, Any],
     timeout_ms: int,
     user_agent: str,
 ) -> tuple[int, str, dict[str, str]]:
@@ -522,16 +536,13 @@ async def _post_via_context_request(
     POST via BrowserContext.request (cookie-aware).
     Returns (status, text, headers_lower_dict).
     """
-    # BrowserContext.request exists in modern Playwright; if missing, raise clearly.
     req = getattr(ctx, "request", None)
     if req is None:
-        raise RuntimeError(
-            "Playwright BrowserContext.request is unavailable in this Playwright version"
-        )
+        raise RuntimeError("Playwright BrowserContext.request is unavailable")
 
     resp = await req.post(
         full_url,
-        data=json.dumps(json_body),
+        data=json.dumps(dict(json_body)),
         headers={
             "content-type": "application/json",
             "accept": "*/*",
@@ -543,14 +554,14 @@ async def _post_via_context_request(
         timeout=timeout_ms,
     )
     text = await resp.text()
-    headers = {k.lower(): v for k, v in (resp.headers or {}).items()}
+    headers = {str(k).lower(): str(v) for k, v in (resp.headers or {}).items()}
     return int(resp.status), text, headers
 
 
 async def _post_via_page_fetch(
     ctx: BrowserContext,
     full_url: str,
-    json_body: dict,
+    json_body: Mapping[str, Any],
     timeout_ms: int,
 ) -> tuple[int, str, str]:
     """
@@ -559,7 +570,6 @@ async def _post_via_page_fetch(
     """
     page = await ctx.new_page()
     try:
-        # Make sure we have a first-party origin loaded
         with contextlib.suppress(Exception):
             await page.goto(
                 "https://pump.fun/",
@@ -590,7 +600,11 @@ async def _post_via_page_fetch(
             }
           }
         """
-        out = await page.evaluate(js, {"url": full_url, "body": json_body, "timeoutMs": timeout_ms})
+        out_any = await page.evaluate(
+            js,
+            {"url": full_url, "body": dict(json_body), "timeoutMs": int(timeout_ms)},
+        )
+        out = cast(dict[str, Any], out_any if isinstance(out_any, dict) else {})
         status = int(out.get("status", 0) or 0)
         text = str(out.get("text") or "")
         cf_ray = str(out.get("cfRay") or "")
@@ -600,37 +614,14 @@ async def _post_via_page_fetch(
             await page.close()
 
 
-def _join(base: str, path_or_url: str) -> str:
-    s = (path_or_url or "").strip()
-    if s.startswith("http://") or s.startswith("https://"):
-        return s
-    if not s.startswith("/"):
-        s = "/" + s
-    return base.rstrip("/") + s
-
-
-def _is_530ish(status: int, text: str) -> bool:
-    if status == 530:
-        return True
-    t = (text or "").lower()
-    return "origin dns error" in t or ("cloudflare" in t and "530" in t)
-
-
-def _sleep_backoff(attempt: int) -> float:
-    # attempt: 0..N
-    base = _RETRY_BASE_MS * (2 ** max(0, attempt))
-    jitter = 1.0 + (random.random() * _RETRY_JITTER)
-    return min(_MAX_SLEEP_S, (base * jitter) / 1000.0)
-
-
 # -----------------------------------------------------------------------------
 # Public API
 # -----------------------------------------------------------------------------
 async def pump_post_via_browser(path_or_url: str, json_body: dict, timeout_ms: int = 90_000) -> str:
     """
-    Robust CF-aware POST. Tries each base in PUMPFUN_API_BASES with retries/backoff.
+    Robust session-aware POST.
 
-    Returns: response text (str)
+    Returns: response text
     Raises: RuntimeError on final failure
     """
     if not isinstance(json_body, dict):
@@ -641,73 +632,77 @@ async def pump_post_via_browser(path_or_url: str, json_body: dict, timeout_ms: i
         raise RuntimeError("PUMPFUN_API_BASES is empty")
 
     if not _MGR.breaker_allow():
-        # breaker open
         raise RuntimeError("pump-browser circuit breaker open (cooldown active)")
 
-    # serialize heavy browser work with semaphore
-    await _MGR.__aenter_sema()
+    await _MGR.acquire()
     try:
         ctx, ua = await _MGR.ensure()
 
         last_err: Exception | None = None
-        last_http: tuple[int, str, str] | None = None  # status, cf-ray, snippet
+        last_http: tuple[int, str, str] | None = None  # status, marker, snippet
 
         for attempt in range(_RETRY_MAX + 1):
             for base in bases:
                 full_url = _join(base, path_or_url)
                 try:
                     status, text, headers = await _post_via_context_request(
-                        ctx, full_url, json_body, timeout_ms, ua
+                        ctx=ctx,
+                        full_url=full_url,
+                        json_body=json_body,
+                        timeout_ms=int(timeout_ms),
+                        user_agent=ua,
                     )
+
                     if status == 200:
                         _MGR.breaker_reset()
                         return text
 
-                    cf_ray = headers.get("cf-ray", "")
+                    marker = headers.get("cf-ray", "") or headers.get("x-request-id", "") or ""
                     snippet = (text or "")[:350].replace("\n", " ")
-                    last_http = (status, cf_ray, snippet)
+                    last_http = (status, marker, snippet)
 
-                    # 404 is usually "wrong path" => do not waste retries across bases
+                    # wrong path => fail fast
                     if status == 404:
-                        raise RuntimeError(f"{full_url} -> 404 (cf-ray={cf_ray}): {snippet}")
+                        raise RuntimeError(f"{full_url} -> 404 marker={marker}: {snippet}")
 
-                    # breaker accounting
-                    if _is_530ish(status, text):
-                        _MGR.breaker_note_530()
+                    if _is_53xish(status, text):
+                        _MGR.breaker_note()
 
-                    # optional page fallback for 5xx-ish
+                    # optional page-evaluate fetch fallback for 5xx
                     if (not _DISABLE_PAGE_FETCH) and (500 <= status <= 599):
                         try:
-                            st2, tx2, ray2 = await _post_via_page_fetch(
-                                ctx, full_url, json_body, timeout_ms
+                            st2, tx2, mk2 = await _post_via_page_fetch(
+                                ctx=ctx,
+                                full_url=full_url,
+                                json_body=json_body,
+                                timeout_ms=int(timeout_ms),
                             )
                             if st2 == 200:
                                 _MGR.breaker_reset()
                                 return tx2
                             snippet2 = (tx2 or "")[:350].replace("\n", " ")
-                            last_http = (st2, ray2, snippet2)
-                            if _is_530ish(st2, tx2):
-                                _MGR.breaker_note_530()
+                            last_http = (st2, mk2, snippet2)
+                            if _is_53xish(st2, tx2):
+                                _MGR.breaker_note()
                         except Exception as e2:
                             last_err = e2
 
                 except Exception as e:
                     last_err = e
 
-            # backoff between attempts
             if attempt < _RETRY_MAX:
                 await asyncio.sleep(_sleep_backoff(attempt))
 
-        # final failure
         if last_http is not None:
-            st, ray, snip = last_http
+            st, mk, snip = last_http
             raise RuntimeError(
-                f"pump-browser POST failed: last_status={st} cf-ray={ray} body={snip}"
+                f"pump-browser POST failed: last_status={st} marker={mk} body={snip}"
             )
+
         raise RuntimeError(f"pump-browser POST failed: {last_err or 'unknown error'}")
 
     finally:
-        _MGR.__exit_sema()
+        _MGR.release()
 
 
 async def close_browser_client() -> None:

@@ -47,24 +47,61 @@ import asyncio
 import contextlib
 import os
 import time
-from typing import Any
+from typing import Any, Coroutine, Literal, Optional, TypedDict, TypeVar, cast
 
-# safe logger
-try:  # pragma: no cover
-    from logging_setup import get_logger  # type: ignore
-except Exception:  # pragma: no cover
+T = TypeVar("T")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging (safe, no side-effects)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _get_logger() -> Any:
+    """
+    Prefer repo's compat logger; fallback to stdlib logging.
+    Must not crash at import time.
+    """
+    # 1) preferred compat layer (already used elsewhere in repo)
+    with contextlib.suppress(Exception):
+        from utils_pkg.log_compat import get_logger as gl  # type: ignore
+
+        return gl(__name__)
+
+    # 2) internal logging_setup module (package-qualified)
+    with contextlib.suppress(Exception):
+        from utils_pkg.logging_setup import get_logger as gl2  # type: ignore
+
+        return gl2(__name__)
+
+    # 3) last resort: stdlib logger
     import logging
 
-    def get_logger(name: str | None = None):  # type: ignore
-        return logging.getLogger(name or "positions")
+    return logging.getLogger(__name__)
 
 
-log = get_logger(__name__)
+log: Any = _get_logger()
+
+
+def _log_event(name: str, **fields: Any) -> None:
+    """
+    Emit structured events if log.event exists, else log.info.
+    Never raise.
+    """
+    try:
+        evt = getattr(log, "event", None)
+        if callable(evt):
+            evt(name, **fields)
+        else:
+            log.info(name, extra=fields)
+    except Exception:
+        return
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# small helpers
+# Helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 def _truthy(x: Any) -> bool:
     return str(x or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -73,17 +110,18 @@ def _safe_int(x: Any, default: int = 0) -> int:
     try:
         return int(float(x))
     except Exception:
-        return default
+        return int(default)
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
         v = float(x)
-        if v != v:  # NaN
-            return default
+        # NaN guard
+        if v != v:
+            return float(default)
         return v
     except Exception:
-        return default
+        return float(default)
 
 
 def _now_ts() -> int:
@@ -91,6 +129,9 @@ def _now_ts() -> int:
 
 
 def _get_config_attr(name: str) -> Any:
+    """
+    Lazy config import. Never raises.
+    """
     try:
         import config as C  # type: ignore
 
@@ -121,7 +162,7 @@ def _default_wallet() -> str:
     )
 
 
-def _backend_mode() -> str:
+def _backend_mode() -> Literal["store", "pg"]:
     cfg = _get_config_attr
     mode = _first_nonempty(
         os.getenv("POSITIONS_BACKEND"),
@@ -138,16 +179,6 @@ def _pg_fallback_enabled() -> bool:
     )
 
 
-def _log_event(name: str, **fields: Any) -> None:
-    try:
-        if hasattr(log, "event") and callable(log.event):
-            log.event(name, **fields)  # type: ignore
-        else:
-            log.info(name, extra=fields)
-    except Exception:
-        return
-
-
 def _qty_ui(qty_raw: int, decimals: int) -> float:
     try:
         d = int(decimals)
@@ -155,14 +186,100 @@ def _qty_ui(qty_raw: int, decimals: int) -> float:
             d = 0
         if d > 18:
             d = 18
-        return float(qty_raw) / (10**d)
+        return float(int(qty_raw)) / (10**d)
     except Exception:
         return 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Legacy schema (best-effort) typing
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class LegacyPositionDict(TypedDict, total=False):
+    wallet: str
+    mint: str
+    pool: str | None
+    symbol: str | None
+    qty_raw: int
+    qty_ui: float
+    decimals: int
+    token_program: str | None
+    owner_ata: str | None
+    avg_cost_sol: float
+    opened_at: float
+    last_sig: str
+    status: Any
+    updated_ts: int
+    meta: dict[str, Any]
+
+
+def _pos_to_legacy_dict(p: Any) -> LegacyPositionDict:
+    """
+    Convert PositionStore.Position -> legacy dict schema (best effort).
+    Never raises.
+    """
+    meta: dict[str, Any] = {}
+    try:
+        raw_meta = getattr(p, "meta", None)
+        if isinstance(raw_meta, dict):
+            meta = raw_meta
+        elif raw_meta:
+            # if it's some mapping-like, try dict()
+            with contextlib.suppress(Exception):
+                meta = dict(raw_meta)
+    except Exception:
+        meta = {}
+
+    decimals = _safe_int(meta.get("decimals"), 0)
+    token_program = cast(Optional[str], meta.get("token_program"))
+    owner_ata = cast(
+        Optional[str], meta.get("owner_ata") or meta.get("ata") or meta.get("ownerAta")
+    )
+
+    status_obj = getattr(p, "status", "")
+    status_val: Any = getattr(status_obj, "value", status_obj)
+
+    return LegacyPositionDict(
+        wallet=str(getattr(p, "wallet", "") or ""),
+        mint=str(getattr(p, "mint", "") or ""),
+        pool=cast(Optional[str], getattr(p, "pool", None)),
+        symbol=cast(Optional[str], getattr(p, "symbol", None)),
+        qty_raw=_safe_int(getattr(p, "amount_raw", 0), 0),
+        qty_ui=_safe_float(getattr(p, "amount_ui", 0.0), 0.0),
+        decimals=int(decimals),
+        token_program=token_program,
+        owner_ata=owner_ata,
+        # legacy arg was SOL per token; we map to entry_price in same unit
+        avg_cost_sol=_safe_float(getattr(p, "entry_price", 0.0), 0.0),
+        opened_at=_safe_float(getattr(p, "opened_ts", 0), 0.0),
+        last_sig=str(getattr(p, "buy_sig", "") or meta.get("last_buy_sig") or ""),
+        status=status_val,
+        updated_ts=_safe_int(getattr(p, "updated_ts", 0), 0),
+        meta=meta,
+    )
+
+
+def _set_meta(obj: Any, meta: dict[str, Any]) -> None:
+    """
+    Helper to apply meta without assuming .set_meta exists.
+    """
+    try:
+        fn = getattr(obj, "set_meta", None)
+        if callable(fn):
+            fn(meta)
+            return
+        # fallback: assign attribute
+        obj.meta = meta
+    except Exception:
+        return
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # PositionStore bridge (async)
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 async def _store_list_open(wallet: str) -> list[Any]:
     from . import position_store as ps  # local import (avoids cycles)
 
@@ -170,19 +287,22 @@ async def _store_list_open(wallet: str) -> list[Any]:
 
 
 async def _store_find_open_for_mint(wallet: str, mint: str, pool: str | None = None) -> Any | None:
-    mint = str(mint or "").strip()
-    if not mint:
+    mm = str(mint or "").strip()
+    if not mm:
         return None
-    ps = await _store_list_open(wallet)
-    cand = [p for p in ps if getattr(p, "mint", "") == mint]
+
+    positions = await _store_list_open(wallet)
+    cand = [p for p in positions if str(getattr(p, "mint", "") or "") == mm]
+
     if pool:
         pool_s = str(pool).strip()
-        cand2 = [p for p in cand if getattr(p, "pool", "") == pool_s]
-        if cand2:
-            cand = cand2
+        filtered = [p for p in cand if str(getattr(p, "pool", "") or "") == pool_s]
+        if filtered:
+            cand = filtered
+
     if not cand:
         return None
-    # newest first
+
     cand.sort(
         key=lambda x: int(getattr(x, "opened_ts", 0) or getattr(x, "created_ts", 0) or 0),
         reverse=True,
@@ -190,46 +310,7 @@ async def _store_find_open_for_mint(wallet: str, mint: str, pool: str | None = N
     return cand[0]
 
 
-def _pos_to_legacy_dict(p: Any) -> dict[str, Any]:
-    """
-    Convert PositionStore.Position -> legacy dict schema (best effort).
-    """
-    meta = {}
-    try:
-        meta = (
-            p.meta
-            if isinstance(getattr(p, "meta", None), dict)
-            else (getattr(p, "meta", None) or {})
-        )
-    except Exception:
-        meta = {}
-
-    decimals = _safe_int(meta.get("decimals"), 0)
-    token_program = meta.get("token_program")
-    owner_ata = meta.get("owner_ata") or meta.get("ata") or meta.get("ownerAta")
-
-    # Keep naming consistent with older positions_pg/sqlite style:
-    return {
-        "wallet": getattr(p, "wallet", ""),
-        "mint": getattr(p, "mint", ""),
-        "pool": getattr(p, "pool", None),
-        "symbol": getattr(p, "symbol", None),
-        "qty_raw": _safe_int(getattr(p, "amount_raw", 0), 0),
-        "qty_ui": _safe_float(getattr(p, "amount_ui", 0.0), 0.0),
-        "decimals": decimals,
-        "token_program": token_program,
-        "owner_ata": owner_ata,
-        # old schema used avg_cost_sol; we map to entry_price when price unit is sol_per_token
-        "avg_cost_sol": _safe_float(getattr(p, "entry_price", 0.0), 0.0),
-        "opened_at": _safe_float(getattr(p, "opened_ts", 0), 0.0),
-        "last_sig": getattr(p, "buy_sig", "") or meta.get("last_buy_sig") or "",
-        "status": getattr(getattr(p, "status", None), "value", getattr(p, "status", "")),
-        "updated_ts": _safe_int(getattr(p, "updated_ts", 0), 0),
-        "meta": meta,
-    }
-
-
-async def async_all(wallet: str | None = None) -> list[dict[str, Any]]:
+async def async_all(wallet: str | None = None) -> list[LegacyPositionDict]:
     """
     Async canonical: list open positions from PositionStore (legacy dict form).
     """
@@ -238,11 +319,12 @@ async def async_all(wallet: str | None = None) -> list[dict[str, Any]]:
         ps = await _store_list_open(w)
         return [_pos_to_legacy_dict(p) for p in ps]
     except Exception as e:
-        log.warning("POSITIONS_ASYNC_ALL_FAIL", extra={"err": str(e)[:200]})
+        with contextlib.suppress(Exception):
+            log.warning("POSITIONS_ASYNC_ALL_FAIL", extra={"err": str(e)[:200]})
         return []
 
 
-async def async_get(mint: str, wallet: str | None = None) -> dict[str, Any] | None:
+async def async_get(mint: str, wallet: str | None = None) -> LegacyPositionDict | None:
     """
     Async canonical: get newest open position for mint from PositionStore (legacy dict form).
     """
@@ -254,7 +336,8 @@ async def async_get(mint: str, wallet: str | None = None) -> dict[str, Any] | No
         p = await _store_find_open_for_mint(w, m, pool=None)
         return _pos_to_legacy_dict(p) if p else None
     except Exception as e:
-        log.warning("POSITIONS_ASYNC_GET_FAIL", extra={"err": str(e)[:200]})
+        with contextlib.suppress(Exception):
+            log.warning("POSITIONS_ASYNC_GET_FAIL", extra={"err": str(e)[:200]})
         return None
 
 
@@ -272,23 +355,24 @@ async def async_record_buy(
     wallet: str | None = None,
 ) -> None:
     """
-    Async canonical best-effort mapping of legacy "record_buy" onto PositionStore.
+    Async canonical mapping of legacy record_buy -> PositionStore.
 
     Supports:
     - first buy: NEW -> BOUGHT
     - additional buys (DCA) while BOUGHT/MANAGED: upsert aggregate qty + weighted avg entry_price
 
     Notes:
-    - We treat entry_price as SOL per token (same as legacy args).
-    - We accumulate size_sol as estimated SOL cost (price_per_token_sol * qty_ui).
+    - entry_price is SOL per token
+    - size_sol accumulates estimated SOL cost (px * qty_ui)
     """
     from . import position_store as ps  # local import
 
     w = str(wallet or _default_wallet()).strip()
     m = str(mint or "").strip()
-    p = str(pool or "unknown_pool").strip()
     if not m:
         return
+
+    p = str(pool or "unknown_pool").strip()
 
     q_raw = _safe_int(qty_raw, 0)
     if q_raw <= 0:
@@ -303,12 +387,13 @@ async def async_record_buy(
         "price_unit": "sol_per_token",
         "decimals": dec,
         "token_program": token_program,
-        "owner_ata": owner_ata or None,
-        "last_buy_sig": sig or None,
+        "owner_ata": (owner_ata or None),
+        "last_buy_sig": (sig or None),
         "buy_px_sol_per_token": px,
+        "ts": _now_ts(),
     }
 
-    # ensure exists
+    # Ensure existence (idempotent). Do not fail hard.
     with contextlib.suppress(Exception):
         await ps.register_new(
             wallet=w,
@@ -321,11 +406,13 @@ async def async_record_buy(
 
     cur = await ps.get_position(w, m, p)
 
-    # first buy: attempt transition NEW->BOUGHT
-    if (
-        cur is None
-        or getattr(getattr(cur, "status", None), "value", getattr(cur, "status", "")) == "NEW"
-    ):
+    # First buy attempt: NEW->BOUGHT
+    try:
+        cur_status = getattr(getattr(cur, "status", None), "value", getattr(cur, "status", "NEW"))
+    except Exception:
+        cur_status = "NEW"
+
+    if cur is None or str(cur_status) == "NEW":
         try:
             await ps.mark_bought(
                 wallet=w,
@@ -345,10 +432,10 @@ async def async_record_buy(
             # fall through to aggregate upsert
             cur = await ps.get_position(w, m, p)
 
-    # aggregate add-on for BOUGHT/MANAGED
     if cur is None:
         return
 
+    # Aggregate add-on for existing open position
     try:
         old_raw = _safe_int(getattr(cur, "amount_raw", 0), 0)
         old_ui = _safe_float(getattr(cur, "amount_ui", 0.0), 0.0)
@@ -357,37 +444,35 @@ async def async_record_buy(
 
         new_raw = old_raw + q_raw
         new_ui = old_ui + q_ui
-        if new_ui > 0:
-            new_px = (
-                ((old_px * old_ui) + (px * q_ui)) / new_ui
-                if (old_ui > 0 and q_ui > 0)
-                else (px or old_px)
-            )
+
+        if new_ui > 0.0 and old_ui > 0.0 and q_ui > 0.0:
+            new_px = ((old_px * old_ui) + (px * q_ui)) / new_ui
         else:
             new_px = px or old_px
 
         # merge meta
-        merged = {}
-        try:
-            merged = cur.meta if isinstance(getattr(cur, "meta", None), dict) else {}
-        except Exception:
-            merged = {}
+        merged: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            raw_meta = getattr(cur, "meta", None)
+            if isinstance(raw_meta, dict):
+                merged = dict(raw_meta)
         merged.update(meta_patch)
 
-        # update in-place + upsert (no status change)
-        cur.amount_raw = new_raw
-        cur.amount_ui = new_ui
-        cur.entry_price = new_px
-        cur.size_sol = old_sol + est_sol_cost
-        if symbol:
-            cur.symbol = symbol
-        cur.set_meta(merged)  # type: ignore
+        # update fields
+        with contextlib.suppress(Exception):
+            cur.amount_raw = new_raw
+            cur.amount_ui = new_ui
+            cur.entry_price = new_px
+            cur.size_sol = old_sol + est_sol_cost
+            if symbol:
+                cur.symbol = symbol
+            _set_meta(cur, merged)
 
-        await ps.get_store()  # ensures singleton exists
-        s = await ps.get_store()
-        await s.upsert(cur, ttl_sec=None)
+        store = await ps.get_store()
+        await store.upsert(cur, ttl_sec=None)
     except Exception as e:
-        log.warning("POSITIONS_ASYNC_RECORD_BUY_FAIL", extra={"err": str(e)[:200], "mint": m})
+        with contextlib.suppress(Exception):
+            log.warning("POSITIONS_ASYNC_RECORD_BUY_FAIL", extra={"err": str(e)[:200], "mint": m})
         return
 
 
@@ -401,9 +486,9 @@ async def async_update_after_sell(
     pool: str | None = None,
 ) -> None:
     """
-    Async canonical best-effort mapping of legacy "update_after_sell" onto PositionStore.
+    Async canonical mapping of legacy update_after_sell -> PositionStore.
     - If closed=True or remaining <= 0: mark_sold(...)
-    - Else: decrement aggregate qty and upsert (status unchanged)
+    - Else: decrement qty and upsert (status unchanged)
     """
     from . import position_store as ps  # local import
 
@@ -416,36 +501,34 @@ async def async_update_after_sell(
     if s_raw <= 0:
         return
 
-    # If pool provided, use it; else pick newest open position for mint.
     pos = await _store_find_open_for_mint(w, m, pool=pool)
     if pos is None:
         return
 
-    p = getattr(pos, "pool", "unknown_pool")
+    p = str(getattr(pos, "pool", "unknown_pool") or "unknown_pool")
+
     try:
         old_raw = _safe_int(getattr(pos, "amount_raw", 0), 0)
         old_ui = _safe_float(getattr(pos, "amount_ui", 0.0), 0.0)
 
-        # derive ui decrement using stored decimals if present
-        meta = {}
-        try:
-            meta = pos.meta if isinstance(getattr(pos, "meta", None), dict) else {}
-        except Exception:
-            meta = {}
+        meta: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            raw_meta = getattr(pos, "meta", None)
+            if isinstance(raw_meta, dict):
+                meta = dict(raw_meta)
+
         dec = max(0, min(18, _safe_int(meta.get("decimals"), 0)))
         sold_ui = _qty_ui(s_raw, dec)
 
         new_raw = max(0, old_raw - s_raw)
         new_ui = max(0.0, old_ui - sold_ui)
 
-        # merge meta
-        meta = dict(meta or {})
         meta["last_sell_sig"] = tx_sig or None
         meta["last_sell_raw"] = s_raw
         meta["last_sell_ui"] = sold_ui
+        meta["ts"] = _now_ts()
 
         if closed or new_raw <= 0:
-            # close it (pnl unknown here; exit_engine/ledger handles pnl truth)
             await ps.mark_sold(
                 wallet=w,
                 mint=m,
@@ -460,25 +543,30 @@ async def async_update_after_sell(
             )
             return
 
-        # partial: decrement + upsert without status change
-        pos.amount_raw = new_raw
-        pos.amount_ui = new_ui
-        pos.sell_sig = tx_sig or getattr(pos, "sell_sig", "")
-        pos.set_meta(meta)  # type: ignore
+        # partial: decrement & upsert without status change
+        with contextlib.suppress(Exception):
+            pos.amount_raw = new_raw
+            pos.amount_ui = new_ui
+            if tx_sig:
+                pos.sell_sig = tx_sig
+            _set_meta(pos, meta)
 
-        s = await ps.get_store()
-        await s.upsert(pos, ttl_sec=None)
+        store = await ps.get_store()
+        await store.upsert(pos, ttl_sec=None)
     except Exception as e:
-        log.warning(
-            "POSITIONS_ASYNC_UPDATE_AFTER_SELL_FAIL", extra={"err": str(e)[:200], "mint": m}
-        )
+        with contextlib.suppress(Exception):
+            log.warning(
+                "POSITIONS_ASYNC_UPDATE_AFTER_SELL_FAIL", extra={"err": str(e)[:200], "mint": m}
+            )
         return
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PG fallback (sync, legacy)
 # ──────────────────────────────────────────────────────────────────────────────
-def _import_pg():
+
+
+def _import_pg() -> Any:
     """
     Lazy import to avoid import-time DSN failures.
     """
@@ -495,21 +583,26 @@ def _in_running_loop() -> bool:
         return False
 
 
-def _run_sync(coro):
+_IN_LOOP = object()
+
+
+def _run_sync(coro: Coroutine[Any, Any, T]) -> T | object:
     """
     Run an async coroutine from sync legacy calls.
     - If no running loop: asyncio.run (safe)
-    - If running loop: return sentinel ("__IN_LOOP__") so callers can fallback safely
+    - If running loop: return sentinel so callers can fallback safely
     """
     if _in_running_loop():
-        return "__IN_LOOP__"
+        return _IN_LOOP
     return asyncio.run(coro)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Legacy API (sync) — do not use in new code
 # ──────────────────────────────────────────────────────────────────────────────
-def all() -> list[dict[str, Any]]:
+
+
+def all() -> list[LegacyPositionDict]:
     """
     Legacy sync: list open positions.
 
@@ -521,24 +614,24 @@ def all() -> list[dict[str, Any]]:
 
     if mode == "store":
         res = _run_sync(async_all())
-        if res != "__IN_LOOP__" and isinstance(res, list):
-            return res
+        if res is not _IN_LOOP:
+            return cast(list[LegacyPositionDict], res)
         # running loop → fallback
         if _pg_fallback_enabled():
             try:
-                return list(_import_pg().all())  # type: ignore
+                return list(_import_pg().all())  # type: ignore[misc]
             except Exception:
                 return []
         return []
 
     # mode == "pg"
     try:
-        return list(_import_pg().all())  # type: ignore
+        return list(_import_pg().all())  # type: ignore[misc]
     except Exception:
         return []
 
 
-def get(mint: str) -> dict[str, Any] | None:
+def get(mint: str) -> LegacyPositionDict | None:
     """
     Legacy sync: get newest open position for mint.
     """
@@ -549,17 +642,17 @@ def get(mint: str) -> dict[str, Any] | None:
     mode = _backend_mode()
     if mode == "store":
         res = _run_sync(async_get(m))
-        if res != "__IN_LOOP__" and isinstance(res, dict):
-            return res
+        if res is not _IN_LOOP:
+            return cast(Optional[LegacyPositionDict], res)
         if _pg_fallback_enabled():
             try:
-                return _import_pg().get(m)  # type: ignore
+                return cast(Optional[LegacyPositionDict], _import_pg().get(m))  # type: ignore[misc]
             except Exception:
                 return None
         return None
 
     try:
-        return _import_pg().get(m)  # type: ignore
+        return cast(Optional[LegacyPositionDict], _import_pg().get(m))  # type: ignore[misc]
     except Exception:
         return None
 
@@ -578,37 +671,38 @@ def remove(mint: str) -> None:
     mode = _backend_mode()
     if mode == "store":
 
-        async def _c():
+        async def _c() -> None:
             from . import position_store as ps  # local import
 
             w = _default_wallet()
             opens = await _store_list_open(w)
-            matches = [p for p in opens if getattr(p, "mint", "") == m]
+            matches = [p for p in opens if str(getattr(p, "mint", "") or "") == m]
             for p in matches:
                 try:
                     await ps.mark_failed(
                         wallet=w,
                         mint=m,
-                        pool=getattr(p, "pool", "unknown_pool"),
+                        pool=str(getattr(p, "pool", "unknown_pool") or "unknown_pool"),
                         fail_reason="LEGACY_REMOVE",
-                        meta={"removed": True},
+                        meta={"removed": True, "ts": _now_ts()},
                         ttl_closed_sec=60 * 60 * 24,
                     )
                 except Exception:
                     continue
 
-        res = _run_sync(_c())
-        if res == "__IN_LOOP__":
-            # best effort: schedule (side effect ok)
+        coro = _c()
+        res = _run_sync(coro)
+        if res is _IN_LOOP:
+            # best-effort: schedule task
             try:
-                asyncio.get_running_loop().create_task(_c())  # type: ignore
+                asyncio.get_running_loop().create_task(coro)
             except Exception:
                 pass
         return
 
     # pg mode
     try:
-        _import_pg().remove(m)  # type: ignore
+        _import_pg().remove(m)  # type: ignore[misc]
     except Exception:
         return
 
@@ -634,20 +728,26 @@ def update_after_sell(*, mint: str, sold_raw: int, tx_sig: str | None, closed: b
     mode = _backend_mode()
     if mode == "store":
         coro = async_update_after_sell(
-            mint=m, sold_raw=int(sold_raw or 0), tx_sig=tx_sig, closed=bool(closed)
+            mint=m,
+            sold_raw=int(sold_raw or 0),
+            tx_sig=tx_sig,
+            closed=bool(closed),
         )
         res = _run_sync(coro)
-        if res == "__IN_LOOP__":
+        if res is _IN_LOOP:
             try:
-                asyncio.get_running_loop().create_task(coro)  # type: ignore
+                asyncio.get_running_loop().create_task(coro)
             except Exception:
                 pass
         return
 
     try:
         _import_pg().update_after_sell(
-            mint=m, sold_raw=int(sold_raw or 0), tx_sig=tx_sig, closed=bool(closed)
-        )  # type: ignore
+            mint=m,
+            sold_raw=int(sold_raw or 0),
+            tx_sig=tx_sig,
+            closed=bool(closed),
+        )  # type: ignore[misc]
     except Exception:
         return
 
@@ -689,31 +789,31 @@ def record_buy(
             price_per_token_sol=float(price_per_token_sol or 0.0),
             decimals=int(decimals or 0),
             token_program=token_program,
-            owner_ata=owner_ata or "",
+            owner_ata=(owner_ata or ""),
             symbol=symbol,
             pool=pool,
             sig=sig,
         )
         res = _run_sync(coro)
-        if res == "__IN_LOOP__":
+        if res is _IN_LOOP:
             try:
-                asyncio.get_running_loop().create_task(coro)  # type: ignore
+                asyncio.get_running_loop().create_task(coro)
             except Exception:
                 pass
         return
 
     try:
-        _import_pg().record_buy(  # type: ignore
+        _import_pg().record_buy(
             mint=m,
             qty_raw=int(qty_raw or 0),
             price_per_token_sol=float(price_per_token_sol or 0.0),
             decimals=int(decimals or 0),
             token_program=token_program,
-            owner_ata=owner_ata or "",
+            owner_ata=(owner_ata or ""),
             symbol=symbol,
             pool=pool,
             sig=sig,
-        )
+        )  # type: ignore[misc]
     except Exception:
         return
 
@@ -721,15 +821,15 @@ def record_buy(
 __all__ = [
     # legacy sync API (do not use in new code)
     "all",
+    "get",
+    "remove",
+    "record_buy",
+    "record_sell",
+    "decrement_qty",
+    "update_after_sell",
     # new async helpers for migration
     "async_all",
     "async_get",
     "async_record_buy",
     "async_update_after_sell",
-    "decrement_qty",
-    "get",
-    "record_buy",
-    "record_sell",
-    "remove",
-    "update_after_sell",
 ]

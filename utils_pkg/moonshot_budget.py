@@ -1,3 +1,4 @@
+# utils_pkg/moonshot_budget.py
 from __future__ import annotations
 
 """
@@ -26,39 +27,35 @@ What this is / isn't
 - It is NOT your position source-of-truth (position_store/ledger will be canonical).
 - It is safe to use even before position_store is rewritten.
 
-Integration points
-------------------
-- risk_manager: you can pass equity_usd / desired_usd from risk_manager outputs.
-- budget.py: separate concern (RPC/Jupiter rate/cost); do not mix responsibilities here.
-
 Environment contract (key knobs)
 --------------------------------
 Enable:
   - MOONSHOT_ENABLED (default 1)
 
 Sleeve sizing:
-  - MOONSHOT_SLEEVE_MAX_PCT (default 0.10)         # sleeve cap as % of equity
-  - MOONSHOT_PER_TRADE_PCT  (default 0.03)         # per-trade cap as % of equity
-  - MOONSHOT_SLEEVE_MAX_USD (optional, default 0)  # absolute sleeve cap (0 disables)
-  - MOONSHOT_PER_TRADE_MAX_USD (optional, default 0) # absolute per-trade cap
+  - MOONSHOT_SLEEVE_MAX_PCT (default 0.10)           # sleeve cap as % of equity
+  - MOONSHOT_PER_TRADE_PCT  (default 0.03)           # per-trade cap as % of equity
+  - MOONSHOT_SLEEVE_MAX_USD (optional, default 0)    # absolute sleeve cap (0 disables)
+  - MOONSHOT_PER_TRADE_MAX_USD (optional, default 0) # absolute per-trade cap (0 disables)
 
 Min trade:
-  - MOONSHOT_MIN_TRADE_USD (default 0)             # ignore tiny reserves if desired
+  - MOONSHOT_MIN_TRADE_USD (default 0)               # ignore tiny reserves if desired
 
 Reservations:
-  - MOONSHOT_RESERVE_TTL_SEC (default 900)         # auto-expire reservations (seconds)
-  - MOONSHOT_PRUNE_MAX (default 100)               # max expired reservations pruned per op
+  - MOONSHOT_RESERVE_TTL_SEC (default 900)           # auto-expire reservations (seconds)
+  - MOONSHOT_PRUNE_MAX (default 100)                 # max expired reservations pruned per op
   - MOONSHOT_NAMESPACE (default SERVICE_NAME or "sniper")
-  - MOONSHOT_FAIL_CLOSED_ON_STORE_ERRORS (default 0)  # if 1, block when store fails
+  - MOONSHOT_FAIL_CLOSED_ON_STORE_ERRORS (default 0) # if 1, block when store fails
 
 Store:
-  - REDIS_URL or REDIS_TLS_URL                      # preferred
+  - REDIS_URL or REDIS_TLS_URL                       # preferred
   - REDIS_FORCE_TLS (default 0)                      # upgrade redis:// -> rediss://
   - MOONSHOT_FORCE_FILE (default 0)
   - MOONSHOT_STATE_FILE (default /var/data/moonshot_budget.json)
   - MOONSHOT_REDIS_VALIDATE (default 0)              # ping on first use (runtime only)
   - MOONSHOT_REDIS_SOCKET_TIMEOUT_SEC (default 1.5)
   - MOONSHOT_REDIS_CONNECT_TIMEOUT_SEC (default 1.5)
+  - MOONSHOT_REFRESH_SEC (default 2.0)               # hot config reload TTL
 
 Public API (stable)
 -------------------
@@ -114,32 +111,6 @@ except Exception:  # pragma: no cover
 
 log = get_logger(__name__)
 
-if not hasattr(log, "event"):
-
-    def _event(name: str, **kw: Any) -> None:  # pragma: no cover
-        with contextlib.suppress(Exception):
-            log.info("%s %s", name, kw)
-
-    log.event = _event
-
-if not hasattr(log, "every"):
-
-    def _every(
-        key: str, n: int = 10, msg: str | None = None, **kw: Any
-    ) -> None:  # pragma: no cover
-        try:
-            now = time.monotonic()
-            store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
-            last = float(store.get(key, 0.0))
-            if (now - last) >= float(max(1, int(n))):
-                store[key] = now
-                _every._store = store  # type: ignore[attr-defined]
-                log.event(msg or key, **kw)
-        except Exception:
-            return None
-
-    log.every = _every
-
 
 def _short(x: Any, n: int = 240) -> str:
     try:
@@ -147,6 +118,43 @@ def _short(x: Any, n: int = 240) -> str:
         return s if len(s) <= n else (s[:n] + "…")
     except Exception:
         return "<?>"
+
+
+def _log_event(name: str, **kw: Any) -> None:
+    """
+    Never monkey-patch the logger object (Phase 2).
+    If structured methods exist, use them; otherwise fallback to .info.
+    """
+    try:
+        fn = getattr(log, "event", None)
+        if callable(fn):
+            fn(name, **kw)
+            return
+    except Exception:
+        pass
+    with contextlib.suppress(Exception):
+        log.info("%s %s", name, kw)
+
+
+_EVERY_LOCK = threading.Lock()
+_EVERY_STORE: dict[str, float] = {}
+
+
+def _log_every(key: str, n: int = 10, msg: str | None = None, **kw: Any) -> None:
+    """
+    Throttle logs per-process: at most once every n seconds per key.
+    """
+    try:
+        gap = float(max(1, int(n)))
+    except Exception:
+        gap = 10.0
+    now = time.monotonic()
+    with _EVERY_LOCK:
+        last = float(_EVERY_STORE.get(key, 0.0))
+        if (now - last) < gap:
+            return
+        _EVERY_STORE[key] = now
+    _log_event(msg or key, **kw)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -201,12 +209,9 @@ def moonshot_limits() -> tuple[float, float]:
     """
     Back-compat: returns (sleeve_max_pct, per_trade_pct).
     """
-    sleeve_max = float(_envf("MOONSHOT_SLEEVE_MAX_PCT", 0.10))
-    per_trade = float(_envf("MOONSHOT_PER_TRADE_PCT", 0.03))
-    # sane clamps
-    sleeve_max = _clamp(sleeve_max, 0.0, 1.0)
-    per_trade = _clamp(per_trade, 0.0, 1.0)
-    return sleeve_max, per_trade
+    sleeve_max = _clamp(_envf("MOONSHOT_SLEEVE_MAX_PCT", 0.10), 0.0, 1.0)
+    per_trade = _clamp(_envf("MOONSHOT_PER_TRADE_PCT", 0.03), 0.0, 1.0)
+    return float(sleeve_max), float(per_trade)
 
 
 def can_allocate(equity_usd: float, current_moonshot_alloc_usd: float, desired_usd: float) -> bool:
@@ -214,30 +219,30 @@ def can_allocate(equity_usd: float, current_moonshot_alloc_usd: float, desired_u
     Back-compat: stateless check against pct caps.
     NOTE: This does NOT reserve; use reserve()/async_reserve() for multi-dyno safety.
     """
-    sleeve_max_pct, per_trade_pct = moonshot_limits()
     eq = max(0.0, float(equity_usd or 0.0))
     cur = max(0.0, float(current_moonshot_alloc_usd or 0.0))
     des = max(0.0, float(desired_usd or 0.0))
 
-    # Optional absolute caps
+    sleeve_max_pct, per_trade_pct = moonshot_limits()
+
     sleeve_abs = max(0.0, float(_envf("MOONSHOT_SLEEVE_MAX_USD", 0.0)))
     per_abs = max(0.0, float(_envf("MOONSHOT_PER_TRADE_MAX_USD", 0.0)))
 
-    # pct caps converted to USD
-    sleeve_cap = sleeve_max_pct * eq
-    per_cap = per_trade_pct * eq
+    sleeve_cap = float(sleeve_max_pct) * eq
+    per_cap = float(per_trade_pct) * eq
 
-    # apply absolute caps if enabled
     if sleeve_abs > 0.0:
         sleeve_cap = min(sleeve_cap, sleeve_abs) if sleeve_cap > 0 else sleeve_abs
     if per_abs > 0.0:
         per_cap = min(per_cap, per_abs) if per_cap > 0 else per_abs
 
-    if des <= 0:
+    if des <= 0.0:
         return True
-    if per_cap > 0 and des > per_cap:
+    if per_cap > 0.0 and des > per_cap:
         return False
-    return not (sleeve_cap > 0 and cur + des > sleeve_cap)
+    if sleeve_cap > 0.0 and (cur + des) > sleeve_cap:
+        return False
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -273,7 +278,6 @@ class MoonshotPolicy:
                 min(per_cap, self.per_trade_max_usd) if per_cap > 0 else self.per_trade_max_usd
             )
 
-        # If equity unknown/zero, absolute caps (if provided) are the only usable caps.
         return float(sleeve_cap), float(per_cap)
 
 
@@ -316,7 +320,7 @@ class MoonshotReservation:
 # Config (hot reload)
 # ──────────────────────────────────────────────────────────────────────────────
 _CFG_LOCK = threading.Lock()
-_CFG_TTL_SEC = max(0.25, _envf("MOONSHOT_REFRESH_SEC", 2.0))
+_CFG_TTL_SEC = max(0.25, float(_envf("MOONSHOT_REFRESH_SEC", 2.0)))
 _cfg_at: float = 0.0
 _cfg_cache: MoonshotPolicy | None = None
 
@@ -333,13 +337,13 @@ def _policy() -> MoonshotPolicy:
         sleeve_pct = _clamp(_envf("MOONSHOT_SLEEVE_MAX_PCT", 0.10), 0.0, 1.0)
         per_pct = _clamp(_envf("MOONSHOT_PER_TRADE_PCT", 0.03), 0.0, 1.0)
 
-        sleeve_abs = max(0.0, _envf("MOONSHOT_SLEEVE_MAX_USD", 0.0))
-        per_abs = max(0.0, _envf("MOONSHOT_PER_TRADE_MAX_USD", 0.0))
+        sleeve_abs = max(0.0, float(_envf("MOONSHOT_SLEEVE_MAX_USD", 0.0)))
+        per_abs = max(0.0, float(_envf("MOONSHOT_PER_TRADE_MAX_USD", 0.0)))
 
-        min_trade = max(0.0, _envf("MOONSHOT_MIN_TRADE_USD", 0.0))
+        min_trade = max(0.0, float(_envf("MOONSHOT_MIN_TRADE_USD", 0.0)))
 
-        ttl = max(60, _envi("MOONSHOT_RESERVE_TTL_SEC", 900))
-        prune_max = max(10, _envi("MOONSHOT_PRUNE_MAX", 100))
+        ttl = max(60, int(_envi("MOONSHOT_RESERVE_TTL_SEC", 900)))
+        prune_max = max(10, int(_envi("MOONSHOT_PRUNE_MAX", 100)))
 
         ns = _envs("MOONSHOT_NAMESPACE", "") or _envs("SERVICE_NAME", "") or "sniper"
         fail_closed = _envb("MOONSHOT_FAIL_CLOSED_ON_STORE_ERRORS", False)
@@ -365,7 +369,7 @@ def _policy() -> MoonshotPolicy:
 # ──────────────────────────────────────────────────────────────────────────────
 def _looks_like_upstash(host: str) -> bool:
     h = (host or "").lower()
-    return h.endswith(".upstash.io") or "upstash" in h
+    return h.endswith(".upstash.io") or ("upstash" in h)
 
 
 def _effective_redis_url() -> str:
@@ -485,11 +489,14 @@ class _FileStore:
         self._lock = threading.Lock()
         self._state = self._load()
 
+    def _ensure_dir(self) -> None:
+        d = os.path.dirname(self.path)
+        if d and not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+
     def _load(self) -> dict[str, Any]:
         try:
-            d = os.path.dirname(self.path)
-            if d and not os.path.exists(d):
-                os.makedirs(d, exist_ok=True)
+            self._ensure_dir()
             if os.path.exists(self.path):
                 with open(self.path, encoding="utf-8") as f:
                     data = json.load(f)
@@ -503,14 +510,17 @@ class _FileStore:
 
     def _save(self) -> None:
         try:
-            with open(self.path, "w", encoding="utf-8") as f:
+            self._ensure_dir()
+            tmp = f"{self.path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._state, f)
+            os.replace(tmp, self.path)
         except Exception:
             pass
 
     def _prune(self, prune_max: int) -> float:
         now = int(time.time())
-        res: dict[str, Any] = self._state.get("reservations", {})
+        res = self._state.get("reservations", {})
         if not isinstance(res, dict):
             self._state["reservations"] = {}
             return 0.0
@@ -553,10 +563,12 @@ class _FileStore:
         with self._lock:
             self._prune(prune_max)
             used = max(0.0, float(self._state.get("used_usd", 0.0) or 0.0))
-            res: dict[str, Any] = self._state.setdefault("reservations", {})
+            res = self._state.setdefault("reservations", {})
+            if not isinstance(res, dict):
+                res = {}
+                self._state["reservations"] = res
             if rid in res:
-                # idempotent-ish: do nothing
-                return used
+                return used  # idempotent-ish
             exp = int(time.time()) + int(ttl_sec)
             res[rid] = {"amt": float(amount), "exp": exp}
             used2 = used + max(0.0, float(amount))
@@ -568,7 +580,7 @@ class _FileStore:
         with self._lock:
             self._prune(prune_max)
             used = max(0.0, float(self._state.get("used_usd", 0.0) or 0.0))
-            res: dict[str, Any] = self._state.get("reservations", {})
+            res = self._state.get("reservations", {})
             amt = 0.0
             if isinstance(res, dict) and rid in res:
                 try:
@@ -583,48 +595,82 @@ class _FileStore:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Store singleton
+# Store singleton + best-effort used cache (for sync-in-loop snapshot)
 # ──────────────────────────────────────────────────────────────────────────────
 _STORE_LOCK = threading.Lock()
-_STORE: Any = None  # _AsyncRedisStore or _FileStore
+_STORE: "_AsyncRedisStore | _FileStore | None" = None
+
+_USED_CACHE_LOCK = threading.Lock()
+_USED_CACHE: dict[str, tuple[float, float]] = {}  # ns -> (used_usd, monotonic_ts)
+_USED_CACHE_TTL = 2.0  # keep tight; policy already reloads
 
 
-def _get_store() -> Any:
+def _cache_set_used(ns: str, used: float) -> None:
+    with _USED_CACHE_LOCK:
+        _USED_CACHE[str(ns)] = (max(0.0, float(used)), time.monotonic())
+
+
+def _cache_get_used(ns: str) -> float | None:
+    with _USED_CACHE_LOCK:
+        v = _USED_CACHE.get(str(ns))
+    if not v:
+        return None
+    used, ts = v
+    if (time.monotonic() - float(ts)) > float(_USED_CACHE_TTL):
+        return None
+    return float(used)
+
+
+def _get_store() -> "_AsyncRedisStore | _FileStore":
     global _STORE
-    if _STORE is not None:
-        return _STORE
+
+    st0 = _STORE
+    if st0 is not None:
+        return st0
 
     with _STORE_LOCK:
-        if _STORE is not None:
-            return _STORE
+        st1 = _STORE
+        if st1 is not None:
+            return st1
 
-        if _envb("MOONSHOT_FORCE_FILE", False) or (redis is None):
+        # Forced file store OR redis library unavailable
+        if _envb("MOONSHOT_FORCE_FILE", False) or redis is None:
             path = _envs("MOONSHOT_STATE_FILE", "/var/data/moonshot_budget.json")
-            _STORE = _FileStore(path)
-            log.every("MOONSHOT_FILESTORE_OK", n=20, msg="MOONSHOT_FILESTORE_OK", path=path)
-            return _STORE
+            fs = _FileStore(path)
+            _STORE = fs
+            _log_every("MOONSHOT_FILESTORE_OK", n=20, msg="MOONSHOT_FILESTORE_OK", path=path)
+            return fs
 
         url = _effective_redis_url()
         if not url:
             path = _envs("MOONSHOT_STATE_FILE", "/var/data/moonshot_budget.json")
-            _STORE = _FileStore(path)
-            log.every("MOONSHOT_FILESTORE_OK", n=20, msg="MOONSHOT_FILESTORE_OK", path=path)
-            return _STORE
+            fs = _FileStore(path)
+            _STORE = fs
+            _log_every("MOONSHOT_FILESTORE_OK", n=20, msg="MOONSHOT_FILESTORE_OK", path=path)
+            return fs
 
         try:
-            st = _AsyncRedisStore(url)
-            _STORE = st
+            rs = _AsyncRedisStore(url)
+            _STORE = rs
+
             if _envb("MOONSHOT_REDIS_VALIDATE", False):
+                # Never block a running event loop
                 try:
                     loop = asyncio.get_running_loop()
-                    loop.create_task(st.validate())
                 except Exception:
+                    loop = None
+
+                if loop is not None and loop.is_running():
+                    loop.create_task(rs.validate())
+                else:
                     with contextlib.suppress(Exception):
-                        asyncio.run(st.validate())
-            log.event("MOONSHOT_REDIS_OK", url_mask=st.url_mask)
-            return _STORE
+                        asyncio.run(rs.validate())
+
+            _log_event("MOONSHOT_REDIS_OK", url_mask=rs.url_mask)
+            return rs
+
         except Exception as e:
-            log.every(
+            _log_every(
                 "MOONSHOT_REDIS_FAIL",
                 n=10,
                 msg="MOONSHOT_REDIS_FAIL",
@@ -632,9 +678,10 @@ def _get_store() -> Any:
                 url_mask=_mask_url(_upgrade_to_tls_if_needed(url)),
             )
             path = _envs("MOONSHOT_STATE_FILE", "/var/data/moonshot_budget.json")
-            _STORE = _FileStore(path)
-            log.every("MOONSHOT_FILESTORE_OK", n=20, msg="MOONSHOT_FILESTORE_OK", path=path)
-            return _STORE
+            fs = _FileStore(path)
+            _STORE = fs
+            _log_every("MOONSHOT_FILESTORE_OK", n=20, msg="MOONSHOT_FILESTORE_OK", path=path)
+            return fs
 
 
 def _prefix(ns: str) -> str:
@@ -653,7 +700,6 @@ def _keys(ns: str) -> dict[str, str]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Redis scripts (atomic prune + op)
 # ──────────────────────────────────────────────────────────────────────────────
-# Return format for reserve: {ok_int, used_after, reason_str}
 _RESERVE_LUA = r"""
 local used_key = KEYS[1]
 local zexp_key = KEYS[2]
@@ -714,7 +760,6 @@ redis.call("ZADD", zexp_key, exp, rid)
 return {1, used, "ok"}
 """
 
-# Return format for release: {ok_int, used_after, reason_str}
 _RELEASE_LUA = r"""
 local used_key = KEYS[1]
 local zexp_key = KEYS[2]
@@ -759,7 +804,6 @@ redis.call("SET", used_key, tostring(used))
 return {1, used, "ok"}
 """
 
-# Return used after prune: used_float
 _SNAPSHOT_LUA = r"""
 local used_key = KEYS[1]
 local zexp_key = KEYS[2]
@@ -790,25 +834,37 @@ return used
 """
 
 
+def _parse_lua_triplet(out: Any) -> tuple[bool, float, str]:
+    try:
+        if isinstance(out, (list, tuple)):
+            ok = int(out[0] or 0) == 1 if len(out) > 0 else False
+            used = float(out[1] or 0.0) if len(out) > 1 else 0.0
+            reason = str(out[2] or "<?>") if len(out) > 2 else "<?>"
+            return bool(ok), max(0.0, float(used)), reason
+    except Exception:
+        pass
+    return False, 0.0, "bad_lua_return"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Core async operations
 # ──────────────────────────────────────────────────────────────────────────────
 async def _async_used_usd(ns: str, prune_max: int) -> float:
     st = _get_store()
     if isinstance(st, _FileStore):
-        return float(await asyncio.to_thread(st.snapshot_used, prune_max))
+        used = float(await asyncio.to_thread(st.snapshot_used, prune_max))
+        _cache_set_used(ns, used)
+        return used
 
     ks = _keys(ns)
-    try:
-        out = await st.eval(
-            _SNAPSHOT_LUA,
-            [ks["used"], ks["zexp"], ks["hamt"]],
-            [str(int(time.time())), str(int(prune_max))],
-        )
-        return max(0.0, float(out or 0.0))
-    except Exception as e:
-        log.every("MOONSHOT_SNAPSHOT_FAIL", n=8, msg="MOONSHOT_SNAPSHOT_FAIL", err=_short(e))
-        raise
+    out = await st.eval(
+        _SNAPSHOT_LUA,
+        [ks["used"], ks["zexp"], ks["hamt"]],
+        [str(int(time.time())), str(int(prune_max))],
+    )
+    used = max(0.0, float(out or 0.0))
+    _cache_set_used(ns, used)
+    return used
 
 
 async def async_snapshot(equity_usd: float) -> MoonshotSnapshot:
@@ -820,11 +876,11 @@ async def async_snapshot(equity_usd: float) -> MoonshotSnapshot:
     if pol.enabled:
         try:
             used = await _async_used_usd(ns, pol.prune_max)
-        except Exception:
+        except Exception as e:
+            _log_every("MOONSHOT_SNAPSHOT_FAIL", n=8, msg="MOONSHOT_SNAPSHOT_FAIL", err=_short(e))
             used = (sleeve_cap if sleeve_cap > 0 else 10**9) if pol.fail_closed else 0.0
 
     remaining = max(0.0, float(sleeve_cap) - float(used)) if sleeve_cap > 0 else float("inf")
-
     return MoonshotSnapshot(
         namespace=ns,
         equity_usd=max(0.0, float(equity_usd or 0.0)),
@@ -837,14 +893,18 @@ async def async_snapshot(equity_usd: float) -> MoonshotSnapshot:
 
 
 async def async_reserve(
-    equity_usd: float, amount_usd: float, *, label: str = ""
+    equity_usd: float,
+    amount_usd: float,
+    *,
+    label: str = "",
+    reservation_id: str | None = None,
 ) -> MoonshotReservation:
     pol = _policy()
     ns = pol.namespace
     amt = max(0.0, float(amount_usd or 0.0))
     sleeve_cap, per_cap = pol.caps_usd(equity_usd)
 
-    rid = f"ms_{uuid.uuid4().hex}"
+    rid = (reservation_id or "").strip() or f"ms_{uuid.uuid4().hex}"
     ttl = int(pol.reserve_ttl_sec)
 
     if not pol.enabled:
@@ -853,7 +913,6 @@ async def async_reserve(
     if amt <= 0.0 or (pol.min_trade_usd > 0.0 and amt < pol.min_trade_usd):
         return MoonshotReservation(True, rid, "below_min", amt, 0.0, sleeve_cap, per_cap, ttl, ns)
 
-    # Quick deterministic cap checks (avoid touching store if obviously too large)
     if per_cap > 0.0 and amt > per_cap:
         return MoonshotReservation(
             False, rid, "per_trade_cap", amt, 0.0, sleeve_cap, per_cap, ttl, ns
@@ -866,15 +925,17 @@ async def async_reserve(
     prune_max = int(pol.prune_max)
 
     if isinstance(st, _FileStore):
-        # file store is best-effort; still apply sleeve check using stored used
         try:
             used_before = float(await asyncio.to_thread(st.snapshot_used, prune_max))
             if sleeve_cap > 0.0 and (used_before + amt) > sleeve_cap:
+                _cache_set_used(ns, used_before)
                 return MoonshotReservation(
                     False, rid, "sleeve_cap", amt, used_before, sleeve_cap, per_cap, ttl, ns
                 )
+
             used_after = float(await asyncio.to_thread(st.reserve, rid, amt, ttl, prune_max))
-            log.every(
+            _cache_set_used(ns, used_after)
+            _log_every(
                 "MOONSHOT_RESERVE_OK",
                 n=12,
                 msg="MOONSHOT_RESERVE_OK",
@@ -888,7 +949,7 @@ async def async_reserve(
                 True, rid, "ok", amt, used_after, sleeve_cap, per_cap, ttl, ns
             )
         except Exception as e:
-            log.every("MOONSHOT_RESERVE_FAIL", n=8, msg="MOONSHOT_RESERVE_FAIL", err=_short(e))
+            _log_every("MOONSHOT_RESERVE_FAIL", n=8, msg="MOONSHOT_RESERVE_FAIL", err=_short(e))
             if pol.fail_closed:
                 return MoonshotReservation(
                     False, rid, "store_fail", amt, 0.0, sleeve_cap, per_cap, ttl, ns
@@ -904,7 +965,7 @@ async def async_reserve(
             [ks["used"], ks["zexp"], ks["hamt"]],
             [
                 str(int(time.time())),
-                str(prune_max),
+                str(int(prune_max)),
                 str(float(sleeve_cap)),
                 str(float(per_cap)),
                 str(float(amt)),
@@ -912,14 +973,12 @@ async def async_reserve(
                 str(int(exp)),
             ],
         )
-        ok = int((out[0] if isinstance(out, list | tuple) and len(out) > 0 else 0) or 0) == 1
-        used_after = float(
-            (out[1] if isinstance(out, list | tuple) and len(out) > 1 else 0.0) or 0.0
-        )
-        reason = str((out[2] if isinstance(out, list | tuple) and len(out) > 2 else "<?>") or "<?>")
+        ok, used_after, reason = _parse_lua_triplet(out)
+        if ok:
+            _cache_set_used(ns, used_after)
 
         if ok and reason in {"ok", "already_reserved"}:
-            log.every(
+            _log_every(
                 "MOONSHOT_RESERVE_OK",
                 n=12,
                 msg="MOONSHOT_RESERVE_OK",
@@ -930,7 +989,7 @@ async def async_reserve(
                 label=label[:120],
             )
         elif not ok:
-            log.every(
+            _log_every(
                 "MOONSHOT_RESERVE_BLOCK",
                 n=12,
                 msg="MOONSHOT_RESERVE_BLOCK",
@@ -943,7 +1002,7 @@ async def async_reserve(
 
         return MoonshotReservation(ok, rid, reason, amt, used_after, sleeve_cap, per_cap, ttl, ns)
     except Exception as e:
-        log.every("MOONSHOT_RESERVE_FAIL", n=8, msg="MOONSHOT_RESERVE_FAIL", err=_short(e))
+        _log_every("MOONSHOT_RESERVE_FAIL", n=8, msg="MOONSHOT_RESERVE_FAIL", err=_short(e))
         if pol.fail_closed:
             return MoonshotReservation(
                 False, rid, "store_fail", amt, 0.0, sleeve_cap, per_cap, ttl, ns
@@ -968,7 +1027,8 @@ async def async_release(reservation_id: str) -> bool:
     if isinstance(st, _FileStore):
         try:
             used_after = float(await asyncio.to_thread(st.release, rid, prune_max))
-            log.every(
+            _cache_set_used(ns, used_after)
+            _log_every(
                 "MOONSHOT_RELEASE_OK",
                 n=12,
                 msg="MOONSHOT_RELEASE_OK",
@@ -978,7 +1038,7 @@ async def async_release(reservation_id: str) -> bool:
             )
             return True
         except Exception as e:
-            log.every("MOONSHOT_RELEASE_FAIL", n=8, msg="MOONSHOT_RELEASE_FAIL", err=_short(e))
+            _log_every("MOONSHOT_RELEASE_FAIL", n=8, msg="MOONSHOT_RELEASE_FAIL", err=_short(e))
             return False
 
     ks = _keys(ns)
@@ -986,14 +1046,13 @@ async def async_release(reservation_id: str) -> bool:
         out = await st.eval(
             _RELEASE_LUA,
             [ks["used"], ks["zexp"], ks["hamt"]],
-            [rid, str(int(time.time())), str(prune_max)],
+            [rid, str(int(time.time())), str(int(prune_max))],
         )
-        ok = int((out[0] if isinstance(out, list | tuple) and len(out) > 0 else 0) or 0) == 1
-        used_after = float(
-            (out[1] if isinstance(out, list | tuple) and len(out) > 1 else 0.0) or 0.0
-        )
-        reason = str((out[2] if isinstance(out, list | tuple) and len(out) > 2 else "<?>") or "<?>")
-        log.every(
+        ok, used_after, reason = _parse_lua_triplet(out)
+        if ok:
+            _cache_set_used(ns, used_after)
+
+        _log_every(
             "MOONSHOT_RELEASE_OK" if ok else "MOONSHOT_RELEASE_MISS",
             n=12,
             msg="MOONSHOT_RELEASE_OK" if ok else "MOONSHOT_RELEASE_MISS",
@@ -1004,7 +1063,7 @@ async def async_release(reservation_id: str) -> bool:
         )
         return ok
     except Exception as e:
-        log.every("MOONSHOT_RELEASE_FAIL", n=8, msg="MOONSHOT_RELEASE_FAIL", err=_short(e))
+        _log_every("MOONSHOT_RELEASE_FAIL", n=8, msg="MOONSHOT_RELEASE_FAIL", err=_short(e))
         return False
 
 
@@ -1015,9 +1074,13 @@ def snapshot(equity_usd: float) -> MoonshotSnapshot:
     """
     Sync snapshot.
     - If not in an event loop: runs async_snapshot().
-    - If in a loop: returns a fast "best-effort" snapshot (async not awaited).
+    - If in a loop: returns best-effort snapshot without blocking:
+        uses cached used if available; else uses fail_closed/fail_open fallback.
       For strict correctness inside loops, use await async_snapshot().
     """
+    pol = _policy()
+    sleeve_cap, per_cap = pol.caps_usd(equity_usd)
+
     try:
         asyncio.get_running_loop()
         in_loop = True
@@ -1028,26 +1091,30 @@ def snapshot(equity_usd: float) -> MoonshotSnapshot:
         try:
             return asyncio.run(async_snapshot(equity_usd))
         except Exception:
-            pol = _policy()
-            sleeve_cap, per_cap = pol.caps_usd(equity_usd)
             used = (sleeve_cap if sleeve_cap > 0 else 10**9) if pol.fail_closed else 0.0
+            remaining = max(0.0, sleeve_cap - used) if sleeve_cap > 0 else float("inf")
             return MoonshotSnapshot(
                 pol.namespace,
                 float(equity_usd or 0.0),
                 used,
                 sleeve_cap,
                 per_cap,
-                max(0.0, sleeve_cap - used),
+                remaining,
                 pol.enabled,
             )
 
-    # In loop: do not block. Return computed caps with unknown used=0 (fail-open) or used=sleeve (fail-closed).
-    pol = _policy()
-    sleeve_cap, per_cap = pol.caps_usd(equity_usd)
-    used = sleeve_cap if pol.fail_closed and sleeve_cap > 0 else 0.0
-    remaining = max(0.0, sleeve_cap - used) if sleeve_cap > 0 else float("inf")
+    used_cached = _cache_get_used(pol.namespace)
+    if used_cached is None:
+        used_cached = sleeve_cap if (pol.fail_closed and sleeve_cap > 0.0) else 0.0
+    remaining = max(0.0, sleeve_cap - used_cached) if sleeve_cap > 0 else float("inf")
     return MoonshotSnapshot(
-        pol.namespace, float(equity_usd or 0.0), used, sleeve_cap, per_cap, remaining, pol.enabled
+        pol.namespace,
+        float(equity_usd or 0.0),
+        float(used_cached),
+        float(sleeve_cap),
+        float(per_cap),
+        float(remaining),
+        bool(pol.enabled),
     )
 
 
@@ -1055,12 +1122,17 @@ def reserve(equity_usd: float, amount_usd: float, *, label: str = "") -> Moonsho
     """
     Sync reserve.
     - If not in an event loop: blocks and returns actual result.
-    - If in a loop: schedules async_reserve and returns an immediate conservative answer:
-        * fail_closed -> blocks (ok=False)
-        * fail_open   -> ok=True with reason="scheduled"
+    - If in a loop: schedules async_reserve and returns immediate conservative answer:
+        * fail_closed -> ok=False
+        * fail_open   -> ok=True reason="scheduled"
+      IMPORTANT: reservation_id returned matches the scheduled async reservation.
       Prefer await async_reserve() in async code.
     """
     pol = _policy()
+    sleeve_cap, per_cap = pol.caps_usd(equity_usd)
+    amt = max(0.0, float(amount_usd or 0.0))
+    ttl = int(pol.reserve_ttl_sec)
+
     try:
         asyncio.get_running_loop()
         in_loop = True
@@ -1071,12 +1143,8 @@ def reserve(equity_usd: float, amount_usd: float, *, label: str = "") -> Moonsho
         return asyncio.run(async_reserve(equity_usd, amount_usd, label=label))
 
     rid = f"ms_{uuid.uuid4().hex}"
-    sleeve_cap, per_cap = pol.caps_usd(equity_usd)
-    amt = max(0.0, float(amount_usd or 0.0))
-    ttl = int(pol.reserve_ttl_sec)
-
     with contextlib.suppress(Exception):
-        asyncio.create_task(async_reserve(equity_usd, amount_usd, label=label))
+        asyncio.create_task(async_reserve(equity_usd, amount_usd, label=label, reservation_id=rid))
 
     if pol.fail_closed:
         return MoonshotReservation(
@@ -1112,16 +1180,13 @@ def release(reservation_id: str) -> bool:
 
 
 __all__ = [
-    # policy/snapshots
     "MoonshotPolicy",
     "MoonshotReservation",
     "MoonshotSnapshot",
     "async_release",
     "async_reserve",
-    # async
     "async_snapshot",
     "can_allocate",
-    # back-compat
     "moonshot_limits",
     "release",
     "reserve",

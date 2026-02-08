@@ -47,17 +47,28 @@ import random
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, TypeAlias, cast
+
+JsonDict: TypeAlias = dict[str, Any]
 
 # =============================================================================
 # Truthy / falsy parsing
 # =============================================================================
+
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
 _FALSE = {"0", "false", "f", "no", "n", "off"}
 
 
 def _in_pytest() -> bool:
     return bool(os.getenv("PYTEST_CURRENT_TEST"))
+
+
+def _truthy(x: Any) -> bool:
+    if x is None:
+        return False
+    if isinstance(x, bool):
+        return x
+    return str(x).strip().lower() in _TRUE
 
 
 def _contract_no_sleep() -> bool:
@@ -89,59 +100,145 @@ def _contract_no_sleep() -> bool:
 
 
 # =============================================================================
-# Logger (logging_setup compatible; safe fallback)
+# Phase A — Logging contract (EventLogger everywhere, safe fallback)
 # =============================================================================
-try:
-    from logging_setup import get_logger  # type: ignore
 
-    log = get_logger("auto_exit_worker.exit_engine")  # type: ignore
-except Exception:  # pragma: no cover
+
+class EventLogger(Protocol):
+    """
+    Minimal logging contract used across the bot.
+    This avoids Logger ↔ EventLogger incompatibilities and guarantees:
+      - .handlers exists
+      - .warning/.debug exist
+      - .event/.every exist (best-effort)
+    """
+
+    handlers: list[Any]
+
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def log(self, level: int, msg: str, *args: Any, **kwargs: Any) -> None: ...
+
+    def event(self, name: str, **kw: Any) -> None: ...
+    def every(self, key: str, n: int = 10, msg: str | None = None, **kw: Any) -> None: ...
+
+
+class _EventLoggerAdapter:
+    """
+    Adapter that always satisfies EventLogger.
+    Never monkey-patches the base logger.
+    """
+
+    def __init__(self, base: Any):
+        self._base = base
+        self.handlers: list[Any] = []
+        with contextlib.suppress(Exception):
+            h = getattr(base, "handlers", None)
+            if isinstance(h, list):
+                self.handlers = h
+        self._every_last: dict[str, float] = {}
+
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        cast(Any, self._base).debug(msg, *args, **kwargs)
+
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        cast(Any, self._base).info(msg, *args, **kwargs)
+
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        fn = getattr(self._base, "warning", None) or getattr(self._base, "warn", None)
+        if callable(fn):
+            fn(msg, *args, **kwargs)
+        else:
+            self.info(msg, *args, **kwargs)
+
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        cast(Any, self._base).error(msg, *args, **kwargs)
+
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        fn = getattr(self._base, "exception", None)
+        if callable(fn):
+            fn(msg, *args, **kwargs)
+        else:
+            self.error(msg, *args, **kwargs)
+
+    def log(self, level: int, msg: str, *args: Any, **kwargs: Any) -> None:
+        cast(Any, self._base).log(level, msg, *args, **kwargs)
+
+    def event(self, name: str, **kw: Any) -> None:
+        ev = getattr(self._base, "event", None)
+        if callable(ev):
+            with contextlib.suppress(Exception):
+                ev(str(name), **kw)
+                return
+        # fallback: structured-ish line
+        with contextlib.suppress(Exception):
+            self.info("%s %s", str(name), kw)
+
+    def every(self, key: str, n: int = 10, msg: str | None = None, **kw: Any) -> None:
+        """
+        Historically `n` is used as "seconds between emits".
+        """
+        every = max(1, int(n))
+        now = time.monotonic()
+        last = float(self._every_last.get(key, 0.0))
+        if (now - last) < float(every):
+            return
+        self._every_last[key] = now
+
+        base_every = getattr(self._base, "every", None)
+        if callable(base_every):
+            with contextlib.suppress(Exception):
+                base_every(key, n=every, msg=msg, **kw)
+                return
+        self.event(msg or key, **kw)
+
+
+def setup_logging(service: str | None = None) -> None:
+    """
+    Best-effort logging setup; never hard-fail.
+    """
+    with contextlib.suppress(Exception):
+        from utils_pkg.log_compat import setup_logging as _sl  # type: ignore
+
+        _sl(service=service)
+        return
+    _ = service
+
+
+def get_logger(name: str | None = None) -> EventLogger:
+    nm = (name or "auto_exit_worker.exit_engine").strip() or "auto_exit_worker.exit_engine"
+
+    # Preferred: log_compat EventLogger
+    with contextlib.suppress(Exception):
+        from utils_pkg.log_compat import get_event_logger as _gel  # type: ignore
+
+        return cast(EventLogger, _EventLoggerAdapter(_gel(nm)))
+
+    # Next: log_compat logger (may be Logger/EventLogger depending on build)
+    with contextlib.suppress(Exception):
+        from utils_pkg.log_compat import get_logger as _gl  # type: ignore
+
+        return cast(EventLogger, _EventLoggerAdapter(_gl(nm)))
+
+    # Next: local logging_setup
+    with contextlib.suppress(Exception):
+        from logging_setup import get_logger as _gl2  # type: ignore[import-not-found]
+
+        try:
+            return cast(EventLogger, _EventLoggerAdapter(_gl2(nm)))
+        except TypeError:
+            return cast(EventLogger, _EventLoggerAdapter(_gl2()))
+
+    # Last resort: stdlib logger
     import logging
 
-    log = logging.getLogger("auto_exit_worker.exit_engine")
-    if not log.handlers:
-        logging.basicConfig(level=logging.INFO)
+    return cast(EventLogger, _EventLoggerAdapter(logging.getLogger(nm)))
 
 
-def _install_log_shims() -> None:
-    if not hasattr(log, "event"):
-
-        def _event_fallback(name: str, **fields: Any) -> None:
-            with contextlib.suppress(Exception):
-                log.info("%s %s", name, fields)
-
-        log.event = _event_fallback  # type: ignore[attr-defined]
-
-    if not hasattr(log, "every"):
-
-        def _every_fallback(key: str, n: int = 60, **fields: Any) -> None:
-            now = time.time()
-            store = getattr(_every_fallback, "_store", {})  # type: ignore[attr-defined]
-            last = float(store.get(key, 0.0))
-            if now - last >= float(n):
-                store[key] = now
-                _every_fallback._store = store  # type: ignore[attr-defined]
-                with contextlib.suppress(Exception):
-                    log.event(key, **fields)  # type: ignore[attr-defined]
-
-        log.every = _every_fallback  # type: ignore[attr-defined]
-
-
-_install_log_shims()
-
-
-def _event(name: str, level: str = "info", **fields: Any) -> None:
-    with contextlib.suppress(Exception):
-        log.event(name, **fields)  # type: ignore[attr-defined]
-        return
-    msg = f"{name} {fields}"
-    with contextlib.suppress(Exception):
-        if level == "warning":
-            log.warning(msg)
-        elif level == "error":
-            log.error(msg)
-        else:
-            log.info(msg)
+LOG: EventLogger = get_logger("auto_exit_worker.exit_engine")
 
 
 def _short_exc(e: BaseException, n: int = 280) -> str:
@@ -149,9 +246,41 @@ def _short_exc(e: BaseException, n: int = 280) -> str:
     return (s[:n] + "…") if len(s) > n else s
 
 
+def _log_event(name: str, *, level: str = "info", **fields: Any) -> None:
+    """
+    Structured event logging (never throws).
+    We include level as a field to preserve intent even if the backend ignores it.
+    """
+    with contextlib.suppress(Exception):
+        LOG.event(str(name), level=str(level), **fields)
+        return
+
+    msg = f"{name} {fields}"
+    with contextlib.suppress(Exception):
+        if level == "warning":
+            LOG.warning(msg)
+        elif level == "error":
+            LOG.error(msg)
+        else:
+            LOG.info(msg)
+
+
+def _log_every(name: str, every_s: float, **fields: Any) -> None:
+    """
+    Rate-limited structured event logging.
+    """
+    n = int(max(1.0, float(every_s)))
+    with contextlib.suppress(Exception):
+        LOG.every(str(name), n=n, msg=str(name), **fields)
+        return
+    _log_event(name, **fields)
+
+
 # =============================================================================
-# Env helpers
+# Env helpers (DO NOT introduce new env keys)
 # =============================================================================
+
+
 def _env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
     if v is None:
@@ -187,8 +316,9 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 # =============================================================================
-# Config (computed once; safe defaults)
+# Config (computed once; safe defaults; keep same env keys)
 # =============================================================================
+
 EXIT_QUEUE_KEY = _env_str("EXIT_QUEUE_KEY", "exit_queue") or "exit_queue"
 EXIT_DATA_KEY = (
     _env_str("EXIT_QUEUE_DATA_KEY", f"{EXIT_QUEUE_KEY}:data") or f"{EXIT_QUEUE_KEY}:data"
@@ -253,8 +383,9 @@ _SOL_MINT = "So11111111111111111111111111111111111111112"
 
 
 # =============================================================================
-# Lazy import helper (avoid cycles)
+# Lazy import helper (avoid cycles / keep import-time light)
 # =============================================================================
+
 _MODS: dict[str, Any] = {}
 
 
@@ -272,83 +403,14 @@ def _get_mod(name: str) -> Any:
 
 
 # =============================================================================
-# JSON safety (decision objects always loggable)
+# Async helpers
 # =============================================================================
-def _jsonable(x: Any, *, depth: int = 6, max_items: int = 200) -> Any:
-    if depth <= 0:
-        return str(x)
-    if x is None or isinstance(x, str | int | float | bool):
-        return x
-    if isinstance(x, bytes | bytearray):
-        return x[:256].decode("utf-8", "ignore")
-    if isinstance(x, list | tuple | set):
-        seq = list(x)
-        out = [_jsonable(v, depth=depth - 1, max_items=max_items) for v in seq[:max_items]]
-        if len(seq) > max_items:
-            out.append(f"...(+{len(seq) - max_items} more)")
-        return out
-    if isinstance(x, dict):
-        items = list(x.items())
-        outd: dict[str, Any] = {}
-        for k, v in items[:max_items]:
-            outd[str(k)] = _jsonable(v, depth=depth - 1, max_items=max_items)
-        if len(items) > max_items:
-            outd["..."] = f"(+{len(items) - max_items} more)"
-        return outd
-    return str(x)
 
 
-def _json_dumps(payload: Any) -> str:
-    try:
-        return json.dumps(_jsonable(payload), separators=(",", ":"), ensure_ascii=False)
-    except Exception:
-        return json.dumps({"_": str(payload)}, separators=(",", ":"), ensure_ascii=False)
-
-
-def _json_loads_best(raw: str) -> Any:
-    try:
-        return json.loads(raw)
-    except Exception:
-        return None
-
-
-# =============================================================================
-# Core utils (redis, init, optional metrics)
-# =============================================================================
-cu = _get_mod("utils_pkg.core_utils")
-
-
-async def _maybe_await(x: Any) -> Any:
-    if asyncio.iscoroutine(x):
-        return await x
-    return x
-
-
-async def _get_redis() -> Any:
-    """
-    Best-effort redis getter:
-      - core_utils.get_redis_async()
-      - core_utils.get_redis()
-      - core_utils.redis
-    """
-    if not cu:
-        return None
-    for nm in ("get_redis_async", "get_redis"):
-        fn = getattr(cu, nm, None)
-        if callable(fn):
-            with contextlib.suppress(Exception):
-                out = fn()
-                return await _maybe_await(out)
-    return getattr(cu, "redis", None)
-
-
-async def _init_resources_best_effort() -> None:
-    if not cu:
-        return
-    fn = getattr(cu, "init_resources", None)
-    if callable(fn):
-        with contextlib.suppress(Exception):
-            await _maybe_await(fn())
+async def _maybe_await(v: Any) -> Any:
+    if inspect.isawaitable(v):
+        return await v
+    return v
 
 
 def _now_ms() -> int:
@@ -387,8 +449,13 @@ def _retry_delay_ms(attempts: int) -> int:
 
 
 def _filter_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """
+    Filter kwargs against fn signature to prevent regressions when signatures evolve.
+    """
     try:
         sig = inspect.signature(fn)
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            return kwargs
         allowed = set(sig.parameters.keys())
         return {k: v for k, v in kwargs.items() if k in allowed}
     except Exception:
@@ -396,8 +463,86 @@ def _filter_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 # =============================================================================
+# JSON safety (always loggable)
+# =============================================================================
+
+
+def _jsonable(x: Any, *, depth: int = 6, max_items: int = 200) -> Any:
+    if depth <= 0:
+        return str(x)
+    if x is None or isinstance(x, (str, int, float, bool)):
+        return x
+    if isinstance(x, (bytes, bytearray)):
+        return x[:256].decode("utf-8", "ignore")
+    if isinstance(x, (list, tuple, set)):
+        seq = list(x)
+        out = [_jsonable(v, depth=depth - 1, max_items=max_items) for v in seq[:max_items]]
+        if len(seq) > max_items:
+            out.append(f"...(+{len(seq) - max_items} more)")
+        return out
+    if isinstance(x, dict):
+        items = list(x.items())
+        outd: dict[str, Any] = {}
+        for k, v in items[:max_items]:
+            outd[str(k)] = _jsonable(v, depth=depth - 1, max_items=max_items)
+        if len(items) > max_items:
+            outd["..."] = f"(+{len(items) - max_items} more)"
+        return outd
+    return str(x)
+
+
+def _json_dumps(payload: Any) -> str:
+    try:
+        return json.dumps(_jsonable(payload), separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        return json.dumps({"_": str(payload)}, separators=(",", ":"), ensure_ascii=False)
+
+
+def _json_loads_best(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+# =============================================================================
+# core_utils integration (lazy)
+# =============================================================================
+
+
+async def _get_redis() -> Any:
+    """
+    Best-effort redis getter (lazy import):
+      - core_utils.get_redis_async()
+      - core_utils.get_redis()
+      - core_utils.redis
+    """
+    cu = _get_mod("utils_pkg.core_utils")
+    if not cu:
+        return None
+    for nm in ("get_redis_async", "get_redis"):
+        fn = getattr(cu, nm, None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                return await _maybe_await(fn())
+    return getattr(cu, "redis", None)
+
+
+async def _init_resources_best_effort() -> None:
+    cu = _get_mod("utils_pkg.core_utils")
+    if not cu:
+        return
+    fn = getattr(cu, "init_resources", None)
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            await _maybe_await(fn())
+
+
+# =============================================================================
 # Data model
 # =============================================================================
+
+
 @dataclass
 class ExitRequest:
     rid: str
@@ -463,8 +608,10 @@ class ExitRequest:
 # =============================================================================
 # Redis helpers (best-effort, never throw)
 # =============================================================================
+
+
 def _decode(x: Any) -> str:
-    if isinstance(x, bytes | bytearray):
+    if isinstance(x, (bytes, bytearray)):
         return x.decode("utf-8", "ignore")
     return str(x)
 
@@ -509,6 +656,21 @@ async def _zscore(r: Any, key: str, member: str) -> float | None:
         return None
 
 
+async def _zrange_withscores(r: Any, key: str, start: int, stop: int) -> tuple[str, float] | None:
+    """
+    Fallback for claim if EVAL isn't supported.
+    Returns (rid, score) for the top item, or None.
+    """
+    try:
+        res = await _maybe_await(r.zrange(key, start, stop, withscores=True))
+        if not res:
+            return None
+        rid, sc = res[0]
+        return _decode(rid), float(sc)
+    except Exception:
+        return None
+
+
 async def _zremrangebyscore(r: Any, key: str, min_s: str, max_s: int) -> int:
     try:
         n = await _maybe_await(r.zremrangebyscore(key, min_s, max_s))
@@ -518,8 +680,9 @@ async def _zremrangebyscore(r: Any, key: str, min_s: str, max_s: int) -> int:
 
 
 # =============================================================================
-# Atomic claim Lua (non-blocking)
+# Atomic claim (Lua if possible; fallback otherwise)
 # =============================================================================
+
 _CLAIM_LUA = r"""
 -- KEYS[1] = queue zset
 -- KEYS[2] = inflight zset
@@ -565,19 +728,37 @@ async def _claim_one(r: Any, now_ms: int) -> tuple[str, str | None, float | None
       ("not_due", None, next_score)
       ("claimed", rid, score)
     """
+    eval_fn = getattr(r, "eval", None)
+    if callable(eval_fn):
+        try:
+            res = await _maybe_await(
+                eval_fn(_CLAIM_LUA, 2, EXIT_QUEUE_KEY, EXIT_INFLIGHT_KEY, int(now_ms))
+            )
+            if res is None:
+                return "empty", None, None
+            if isinstance(res, (list, tuple)) and len(res) >= 2 and int(res[0]) == 0:
+                return "not_due", None, float(res[1])
+            if isinstance(res, (list, tuple)) and len(res) >= 3 and int(res[0]) == 1:
+                return "claimed", _decode(res[1]), float(res[2])
+        except Exception as e:
+            _log_event("EXIT_CLAIM_ERR", level="warning", err=_short_exc(e))
+
+    top = await _zrange_withscores(r, EXIT_QUEUE_KEY, 0, 0)
+    if not top:
+        return "empty", None, None
+
+    rid, sc = top
+    if sc > float(now_ms):
+        return "not_due", None, float(sc)
+
     try:
-        res = await _maybe_await(
-            r.eval(_CLAIM_LUA, 2, EXIT_QUEUE_KEY, EXIT_INFLIGHT_KEY, int(now_ms))
-        )
-        if res is None:
+        rem = await _maybe_await(r.zrem(EXIT_QUEUE_KEY, rid))
+        if int(rem or 0) <= 0:
             return "empty", None, None
-        if isinstance(res, list | tuple) and len(res) >= 2 and int(res[0]) == 0:
-            return "not_due", None, float(res[1])
-        if isinstance(res, list | tuple) and len(res) >= 3 and int(res[0]) == 1:
-            return "claimed", _decode(res[1]), float(res[2])
-    except Exception as e:
-        _event("EXIT_CLAIM_ERR", level="warning", err=_short_exc(e))
-    return "empty", None, None
+        await _zadd(r, EXIT_INFLIGHT_KEY, rid, float(now_ms))
+        return "claimed", rid, float(sc)
+    except Exception:
+        return "empty", None, None
 
 
 async def _is_done(r: Any, rid: str) -> bool:
@@ -598,7 +779,7 @@ async def _push_dlq(r: Any, req: ExitRequest, *, err: str) -> None:
     payload["dlq_ts_ms"] = _now_ms()
     with contextlib.suppress(Exception):
         await _maybe_await(r.rpush(EXIT_DLQ_KEY, _json_dumps(payload)))
-    _event("EXIT_TO_DLQ", level="warning", rid=req.rid, mint=req.mint, err=(err or "")[:240])
+    _log_event("EXIT_TO_DLQ", level="warning", rid=req.rid, mint=req.mint, err=(err or "")[:240])
 
 
 async def _load_req(r: Any, rid: str) -> ExitRequest | None:
@@ -617,11 +798,11 @@ async def _requeue(r: Any, req: ExitRequest, *, delay_ms: int) -> None:
     sc = _score(req.due_ms, req.priority, req.ts_ms)
     await _hset_str(r, EXIT_DATA_KEY, req.rid, req.to_json())
     await _zadd(r, EXIT_QUEUE_KEY, req.rid, sc)
-    _event(
+    _log_event(
         "EXIT_REENQUEUE",
         rid=req.rid,
         mint=req.mint,
-        attempts=req.attempts,
+        attempts=int(req.attempts),
         delay_ms=int(delay_ms),
         due_ms=req.due_ms,
     )
@@ -630,16 +811,36 @@ async def _requeue(r: Any, req: ExitRequest, *, delay_ms: int) -> None:
 # =============================================================================
 # Mint lock (prevents concurrent sells on same mint)
 # =============================================================================
+
+
 async def _acquire_mint_lock(r: Any, mint: str, rid: str) -> bool:
     """
     Fail-open: if Redis ops fail, do NOT block selling.
     """
     k = f"{EXIT_MINT_LOCK_PREFIX}:{mint}"
+
     try:
         ok = await _maybe_await(r.set(k, rid, nx=True, px=int(MINT_LOCK_TTL_MS)))
         return bool(ok)
     except Exception:
-        return True
+        pass
+
+    try:
+        setnx = getattr(r, "setnx", None)
+        if callable(setnx):
+            ok2 = await _maybe_await(setnx(k, rid))
+            if not ok2:
+                return False
+            pexpire = getattr(r, "pexpire", None)
+            if callable(pexpire):
+                await _maybe_await(pexpire(k, int(MINT_LOCK_TTL_MS)))
+            else:
+                await _maybe_await(r.expire(k, max(1, int(MINT_LOCK_TTL_MS / 1000))))
+            return True
+    except Exception:
+        return True  # fail-open
+
+    return True  # fail-open if unsupported
 
 
 async def _release_mint_lock(r: Any, mint: str, rid: str) -> None:
@@ -654,13 +855,18 @@ async def _release_mint_lock(r: Any, mint: str, rid: str) -> None:
 
 
 async def _mint_lock_keepalive_task(r: Any, mint: str, rid: str) -> None:
-    # Contract mode should not spawn sleepers
+    """
+    Extends lock TTL while a sell is in-progress.
+    NEVER runs in contract/offline mode.
+    """
     if _contract_no_sleep():
         return
     if not LOCK_KEEPALIVE:
         return
+
     k = f"{EXIT_MINT_LOCK_PREFIX}:{mint}"
     sleep_s = max(0.25, float(MINT_LOCK_TTL_MS) / 2000.0)  # ~half TTL
+
     while True:
         await asyncio.sleep(sleep_s)
         try:
@@ -668,8 +874,9 @@ async def _mint_lock_keepalive_task(r: Any, mint: str, rid: str) -> None:
             cur_s = _decode(cur) if cur is not None else ""
             if cur_s != rid:
                 return
-            if hasattr(r, "pexpire"):
-                await _maybe_await(r.pexpire(k, int(MINT_LOCK_TTL_MS)))
+            pexpire = getattr(r, "pexpire", None)
+            if callable(pexpire):
+                await _maybe_await(pexpire(k, int(MINT_LOCK_TTL_MS)))
             else:
                 await _maybe_await(r.expire(k, max(1, int(MINT_LOCK_TTL_MS / 1000))))
         except asyncio.CancelledError:
@@ -681,6 +888,8 @@ async def _mint_lock_keepalive_task(r: Any, mint: str, rid: str) -> None:
 # =============================================================================
 # Producer API (SIGNATURE-STABLE)
 # =============================================================================
+
+
 async def enqueue_exit_request(
     *,
     mint: str,
@@ -723,6 +932,8 @@ async def enqueue_exit_request(
         if k not in m:
             m[k] = v
     m_safe = _jsonable(m)
+    if not isinstance(m_safe, dict):
+        m_safe = {"meta": m_safe}
 
     req = ExitRequest(
         rid=rid,
@@ -735,18 +946,18 @@ async def enqueue_exit_request(
         symbol=str(symbol or ""),
         priority=int(priority),
         attempts=0,
-        meta=m_safe if isinstance(m_safe, dict) else {"meta": m_safe},
+        meta=cast(dict[str, Any], m_safe),
     )
 
     r = await _get_redis()
     if r is None:
-        _event("EXIT_ENQUEUE_NO_REDIS", level="warning", mint=mint_s, rid=rid)
+        _log_event("EXIT_ENQUEUE_NO_REDIS", level="warning", mint=mint_s, rid=rid)
         return None
 
     await _hset_str(r, EXIT_DATA_KEY, rid, req.to_json())
     await _zadd(r, EXIT_QUEUE_KEY, rid, _score(req.due_ms, req.priority, req.ts_ms))
 
-    _event(
+    _log_event(
         "EXIT_ENQUEUE_OK",
         rid=rid,
         mint=mint_s,
@@ -760,6 +971,8 @@ async def enqueue_exit_request(
 # =============================================================================
 # Execution path (sell)
 # =============================================================================
+
+
 def _should_apply_sell_pct(req: ExitRequest) -> bool:
     """
     Default: DO NOT scale amount_raw by sell_pct (amount_raw already exact).
@@ -796,7 +1009,7 @@ async def _sell_via_lightning(
         if not callable(fn):
             return False, "missing lightning_impl.sell_via_lightning"
         kwargs = _filter_kwargs(
-            fn, dict(mint=req.mint, amount_raw=int(amount_raw), slippage_bps=int(slippage_bps))
+            fn, {"mint": req.mint, "amount_raw": int(amount_raw), "slippage_bps": int(slippage_bps)}
         )
         sig = await _maybe_await(fn(**kwargs))
         if sig:
@@ -819,7 +1032,11 @@ async def _sell_via_router(
             if callable(fn):
                 kwargs = _filter_kwargs(
                     fn,
-                    dict(mint=req.mint, amount_raw=int(amount_raw), slippage_bps=int(slippage_bps)),
+                    {
+                        "mint": req.mint,
+                        "amount_raw": int(amount_raw),
+                        "slippage_bps": int(slippage_bps),
+                    },
                 )
                 sig = await _maybe_await(fn(**kwargs))
                 if sig:
@@ -827,17 +1044,17 @@ async def _sell_via_router(
 
         fn2 = getattr(router, "swap", None)
         if callable(fn2):
-            kwargs = dict(
-                input_mint=req.mint,
-                output_mint=_SOL_MINT,
-                amount_raw=int(amount_raw),
-                slippage_bps=int(slippage_bps),
-                side="sell",
-            )
-            kwargs = _filter_kwargs(fn2, kwargs)
-            sig = await _maybe_await(fn2(**kwargs))
-            if sig:
-                return True, str(sig)
+            kwargs2 = {
+                "input_mint": req.mint,
+                "output_mint": _SOL_MINT,
+                "amount_raw": int(amount_raw),
+                "slippage_bps": int(slippage_bps),
+                "side": "sell",
+            }
+            kwargs2 = _filter_kwargs(fn2, kwargs2)
+            sig2 = await _maybe_await(fn2(**kwargs2))
+            if sig2:
+                return True, str(sig2)
 
         return False, "router had no supported sell method / returned empty sig"
     except Exception as e:
@@ -856,7 +1073,11 @@ async def _sell_via_pump_trader(
             if callable(fn):
                 kwargs = _filter_kwargs(
                     fn,
-                    dict(mint=req.mint, amount_raw=int(amount_raw), slippage_bps=int(slippage_bps)),
+                    {
+                        "mint": req.mint,
+                        "amount_raw": int(amount_raw),
+                        "slippage_bps": int(slippage_bps),
+                    },
                 )
                 sig = await _maybe_await(fn(**kwargs))
                 if sig:
@@ -908,7 +1129,7 @@ async def _execute_exit(req: ExitRequest) -> tuple[bool, str]:
     if EXEC_TIMEOUT_S and EXEC_TIMEOUT_S > 0:
         try:
             return await asyncio.wait_for(_run_chain(), timeout=float(EXEC_TIMEOUT_S))
-        except TimeoutError:
+        except asyncio.TimeoutError:
             return False, f"execution timeout after {EXEC_TIMEOUT_S:.1f}s"
     return await _run_chain()
 
@@ -916,6 +1137,8 @@ async def _execute_exit(req: ExitRequest) -> tuple[bool, str]:
 # =============================================================================
 # Telemetry + callbacks (best-effort, never throw)
 # =============================================================================
+
+
 async def _notify_sell_filled(req: ExitRequest, sig: str) -> None:
     ev = {
         "mint": req.mint,
@@ -960,18 +1183,20 @@ async def _telemetry(req: ExitRequest, ok: bool, sig_or_err: str) -> None:
         "source": "auto_exit_worker",
     }
 
+    cu = _get_mod("utils_pkg.core_utils")
     if cu:
         fn = getattr(cu, "record_sell_result", None)
         if callable(fn):
             with contextlib.suppress(Exception):
-                out = fn(
-                    ok=bool(ok),
-                    reason=str(req.reason),
-                    mint=req.mint,
-                    sig=(sig_or_err if ok else None),
-                    meta=dict(payload),
+                await _maybe_await(
+                    fn(
+                        ok=bool(ok),
+                        reason=str(req.reason),
+                        mint=req.mint,
+                        sig=(sig_or_err if ok else None),
+                        meta=dict(payload),
+                    )
                 )
-                await _maybe_await(out)
 
         inc = (
             getattr(cu, "inc_counter", None)
@@ -986,24 +1211,26 @@ async def _telemetry(req: ExitRequest, ok: bool, sig_or_err: str) -> None:
         dl = _get_mod("utils_pkg.data_logger")
         if dl:
             for nm in ("log_exit_result", "log_sell_result", "log_event"):
-                fn = getattr(dl, nm, None)
-                if callable(fn):
-                    await _maybe_await(fn(dict(payload)))
+                fn2 = getattr(dl, nm, None)
+                if callable(fn2):
+                    await _maybe_await(fn2(dict(payload)))
                     break
 
     with contextlib.suppress(Exception):
         adb = _get_mod("utils_pkg.ai_db")
         if adb:
             for nm in ("log_event", "insert_event", "write_event"):
-                fn = getattr(adb, nm, None)
-                if callable(fn):
-                    await _maybe_await(fn(dict(payload)))
+                fn3 = getattr(adb, nm, None)
+                if callable(fn3):
+                    await _maybe_await(fn3(dict(payload)))
                     break
 
 
 # =============================================================================
 # Consumer: process one (testable)
 # =============================================================================
+
+
 async def process_one(*, worker_id: str = "w0") -> bool:
     """
     Claims exactly one due request and processes it.
@@ -1024,10 +1251,8 @@ async def process_one(*, worker_id: str = "w0") -> bool:
         return False
 
     if status == "not_due":
-        # ✅ CRITICAL FIX: never sleep in tests/contract/offline mode
         if _contract_no_sleep():
             return False
-
         if next_score is not None:
             wait_ms = max(1, int(float(next_score)) - int(now))
             await asyncio.sleep(min(MAX_SLEEP_S, max(0.001, wait_ms / 1000.0)))
@@ -1039,7 +1264,7 @@ async def process_one(*, worker_id: str = "w0") -> bool:
     req = await _load_req(r, rid)
     if req is None:
         await _ack_inflight(r, rid)
-        _event("EXIT_PAYLOAD_MISSING", level="warning", rid=rid, worker=worker_id)
+        _log_event("EXIT_PAYLOAD_MISSING", level="warning", rid=rid, worker=worker_id)
         return True
 
     req.mint = str(req.mint or "").strip()
@@ -1056,17 +1281,28 @@ async def process_one(*, worker_id: str = "w0") -> bool:
         await _ack_inflight(r, req.rid)
         if DELETE_DATA_ON_DONE:
             await _hdel(r, EXIT_DATA_KEY, req.rid)
-        _event("EXIT_SKIP_DONE", rid=req.rid, mint=req.mint, worker=worker_id)
+        _log_event("EXIT_SKIP_DONE", rid=req.rid, mint=req.mint, worker=worker_id)
+        return True
+
+    if KILL_SWITCH:
+        await _ack_inflight(r, req.rid)
+        await _requeue(r, req, delay_ms=500 + random.randint(0, 500))
+        _log_event(
+            "EXIT_KILL_SWITCH_REQUEUE",
+            level="warning",
+            rid=req.rid,
+            mint=req.mint,
+            worker=worker_id,
+        )
         return True
 
     got_lock = await _acquire_mint_lock(r, req.mint, req.rid)
     if not got_lock:
         await _ack_inflight(r, req.rid)
-        req.attempts = int(req.attempts or 0)
         await _requeue(r, req, delay_ms=200 + random.randint(0, 350))
         return True
 
-    _event(
+    _log_event(
         "EXIT_CLAIM_OK",
         rid=req.rid,
         mint=req.mint,
@@ -1077,12 +1313,11 @@ async def process_one(*, worker_id: str = "w0") -> bool:
         dryrun=int(bool(DRYRUN)),
     )
 
-    keepalive_task: asyncio.Task | None = None
+    keepalive_task: asyncio.Task[None] | None = None
     ok = False
     sig_or_err = ""
 
     try:
-        # Do not spawn sleepers in contract mode
         if LOCK_KEEPALIVE and not _contract_no_sleep():
             keepalive_task = asyncio.create_task(
                 _mint_lock_keepalive_task(r, req.mint, req.rid),
@@ -1118,7 +1353,7 @@ async def process_one(*, worker_id: str = "w0") -> bool:
 
         await _release_mint_lock(r, req.mint, req.rid)
 
-        _event(
+        _log_event(
             "EXIT_EXEC_OK", rid=req.rid, mint=req.mint, sig=str(sig_or_err)[:160], worker=worker_id
         )
 
@@ -1127,11 +1362,10 @@ async def process_one(*, worker_id: str = "w0") -> bool:
 
         return True
 
-    # failure
     req.attempts = int(req.attempts or 0) + 1
     err_str = str(sig_or_err or "unknown_error")[:900]
 
-    _event(
+    _log_event(
         "EXIT_EXEC_FAIL",
         level="warning",
         rid=req.rid,
@@ -1159,7 +1393,6 @@ async def process_one(*, worker_id: str = "w0") -> bool:
     return True
 
 
-# Compatibility aliases (some code/tests look for these names)
 async def run_once(*, worker_id: str = "w0") -> bool:
     return await process_one(worker_id=worker_id)
 
@@ -1171,6 +1404,8 @@ async def tick(*, worker_id: str = "w0") -> bool:
 # =============================================================================
 # Maintenance: reclaim stale inflight + prune done (crash safe)
 # =============================================================================
+
+
 async def reclaim_stale_inflight() -> int:
     r = await _get_redis()
     if r is None:
@@ -1197,22 +1432,27 @@ async def reclaim_stale_inflight() -> int:
                 continue
 
             req = await _load_req(r, rid)
-
             await _zrem(r, EXIT_INFLIGHT_KEY, rid)
 
             if req is None:
-                _event("EXIT_RECLAIM_MISSING_PAYLOAD", level="warning", rid=rid)
+                _log_event("EXIT_RECLAIM_MISSING_PAYLOAD", level="warning", rid=rid)
                 continue
 
             req.attempts = int(req.attempts or 0) + 1
+            if req.attempts >= int(MAX_ATTEMPTS):
+                await _push_dlq(r, req, err="reclaim_stale_exceeded_attempts")
+                await _hdel(r, EXIT_DATA_KEY, rid)
+                reclaimed += 1
+                continue
+
             delay = 250 + random.randint(0, 900)
             await _requeue(r, req, delay_ms=delay)
             reclaimed += 1
 
         if reclaimed:
-            _event("EXIT_RECLAIMED", level="warning", count=reclaimed, cutoff_ms=int(cutoff))
+            _log_event("EXIT_RECLAIMED", level="warning", count=reclaimed, cutoff_ms=int(cutoff))
     except Exception as e:
-        _event("EXIT_RECLAIM_ERR", level="warning", err=_short_exc(e))
+        _log_event("EXIT_RECLAIM_ERR", level="warning", err=_short_exc(e))
 
     return reclaimed
 
@@ -1229,8 +1469,9 @@ async def prune_done() -> int:
 # =============================================================================
 # Worker loops
 # =============================================================================
+
+
 async def _runner_loop(worker_id: str) -> None:
-    # In contract mode we never run infinite loops; process_one should be called directly.
     if _contract_no_sleep():
         return
 
@@ -1246,7 +1487,7 @@ async def _runner_loop(worker_id: str) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            _event("EXIT_RUNNER_ERR", level="warning", err=_short_exc(e), worker=worker_id)
+            _log_event("EXIT_RUNNER_ERR", level="warning", err=_short_exc(e), worker=worker_id)
             await asyncio.sleep(ERR_SLEEP_S)
 
 
@@ -1269,13 +1510,13 @@ async def _maintenance_loop() -> None:
                 with contextlib.suppress(Exception):
                     n = await prune_done()
                     if n:
-                        _event("EXIT_DONE_PRUNED", count=int(n))
+                        _log_event("EXIT_DONE_PRUNED", count=int(n))
 
             await asyncio.sleep(0.25)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            _event("EXIT_MAINT_ERR", level="warning", err=_short_exc(e))
+            _log_event("EXIT_MAINT_ERR", level="warning", err=_short_exc(e))
             await asyncio.sleep(ERR_SLEEP_S)
 
 
@@ -1288,10 +1529,9 @@ async def worker_loop() -> None:
         We do a single maintenance tick + single process_one and return.
     """
     if KILL_SWITCH:
-        _event("EXIT_WORKER_KILL_SWITCH", level="warning")
+        _log_event("EXIT_WORKER_KILL_SWITCH", level="warning")
         return
 
-    # Contract/test mode: never infinite loop
     if _contract_no_sleep():
         with contextlib.suppress(Exception):
             await reclaim_stale_inflight()
@@ -1302,10 +1542,10 @@ async def worker_loop() -> None:
         return
 
     if not AUTO_EXIT_WORKER_ENABLED:
-        _event("EXIT_WORKER_DISABLED", key=EXIT_QUEUE_KEY)
+        _log_event("EXIT_WORKER_DISABLED", key=EXIT_QUEUE_KEY)
         return
 
-    _event(
+    _log_event(
         "EXIT_WORKER_START",
         key=EXIT_QUEUE_KEY,
         inflight=EXIT_INFLIGHT_KEY,
@@ -1331,7 +1571,7 @@ async def worker_loop() -> None:
 
     try:
         while True:
-            log.every(  # type: ignore[attr-defined]
+            _log_every(
                 "EXIT_WORKER_HEARTBEAT",
                 30,
                 enabled=int(bool(AUTO_EXIT_WORKER_ENABLED)),
@@ -1353,12 +1593,15 @@ async def worker_loop() -> None:
 
 
 __all__ = [
+    "EventLogger",
     "ExitRequest",
     "enqueue_exit_request",
+    "get_logger",
     "process_one",
     "prune_done",
     "reclaim_stale_inflight",
     "run_once",
+    "setup_logging",
     "tick",
     "worker_loop",
 ]

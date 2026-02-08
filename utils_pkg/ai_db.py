@@ -1,23 +1,24 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
 utils_pkg/ai_db.py
 
-God-Tier AI DB brain (V3+++ / quant-grade)
-==========================================
+God-Tier AI DB brain (Production / Quant-grade)
+==============================================
 
 Central Postgres utility for ALL persistent AI / quant data.
 
 Hard guarantees
 ---------------
 - Import-safe: NO network connects on import.
-- Stable DSN resolution + normalization (Render external + internal).
+- DSN resolution + normalization (Render internal/external + local).
 - Correct TLS behavior for asyncpg via explicit SSLContext when needed.
-- Safe, idempotent migrations (never bricks the bot).
+- Idempotent migrations (won't brick deploys).
 - Soft-fail reads/writes (configurable) so trading never stops due to DB.
 - Narrow public helpers: no ad-hoc SQL scattered elsewhere.
 - Optional asyncpg pool (off by default).
-- Includes schema tables that support entry/exit training + execution logs.
+- Schema supports entry/exit training + execution logs + dashboards.
 
 Env (key)
 ---------
@@ -96,21 +97,22 @@ import re
 import shlex
 import ssl
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections import defaultdict
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from functools import wraps
-from typing import Any, cast
+from typing import Any, ParamSpec, Protocol, TypeVar, cast
 
 # -----------------------------------------------------------------------------
-# Logging (robust import)
+# Logging (robust import; never fails import)
 # -----------------------------------------------------------------------------
 try:
-    from logging_setup import get_logger
+    from utils_pkg.logging_setup import get_logger
 except Exception:  # pragma: no cover
     try:
-        from utils_pkg.logging_setup import get_logger  # type: ignore
+        from logging_setup import get_logger  # type: ignore
     except Exception:  # pragma: no cover
         import logging
 
@@ -118,13 +120,103 @@ except Exception:  # pragma: no cover
             return logging.getLogger("ai_db")
 
 
-log = get_logger()
+class _LoggerBase(Protocol):
+    def debug(self, msg: str, *args: object, **kwargs: object) -> None: ...
+    def info(self, msg: str, *args: object, **kwargs: object) -> None: ...
+    def warning(self, msg: str, *args: object, **kwargs: object) -> None: ...
+    def error(self, msg: str, *args: object, **kwargs: object) -> None: ...
+    def exception(self, msg: str, *args: object, **kwargs: object) -> None: ...
+
+
+class _LoggerLike(_LoggerBase, Protocol):
+    # repo-wide throttle helper
+    def every(self, key: str, n: int = 1000) -> bool: ...
+
+
+class _LoggerShim:
+    """
+    Wrap any logger-like object and guarantee `.every(key, n)` exists,
+    WITHOUT monkeypatching methods (keeps mypy happy).
+
+    If the underlying logger already implements `.every`, we delegate to it.
+    Otherwise we provide a deterministic throttle:
+      - returns True on the 1st call for a key
+      - then True every n calls (n<=0 => always True)
+    """
+
+    __slots__ = ("_base", "_base_every", "_counts")
+
+    def __init__(self, base: _LoggerBase) -> None:
+        self._base = base
+        maybe = getattr(base, "every", None)
+        self._base_every: Callable[[str, int], bool] | None = (
+            cast(Callable[[str, int], bool], maybe) if callable(maybe) else None
+        )
+        self._counts: dict[str, int] = defaultdict(int)
+
+    # Delegate standard logger methods
+    def debug(self, msg: str, *args: object, **kwargs: object) -> None:
+        self._base.debug(msg, *args, **kwargs)
+
+    def info(self, msg: str, *args: object, **kwargs: object) -> None:
+        self._base.info(msg, *args, **kwargs)
+
+    def warning(self, msg: str, *args: object, **kwargs: object) -> None:
+        self._base.warning(msg, *args, **kwargs)
+
+    def error(self, msg: str, *args: object, **kwargs: object) -> None:
+        self._base.error(msg, *args, **kwargs)
+
+    def exception(self, msg: str, *args: object, **kwargs: object) -> None:
+        self._base.exception(msg, *args, **kwargs)
+
+    def every(self, key: str, n: int = 1000) -> bool:
+        if self._base_every is not None:
+            try:
+                return bool(self._base_every(key, n))
+            except Exception:
+                # fall through to shim behavior
+                pass
+
+        if n <= 0:
+            return True
+        k = str(key)
+        self._counts[k] += 1
+        c = self._counts[k]
+        return c == 1 or (c % int(n) == 1)
+
+
+log = cast(_LoggerLike, _LoggerShim(cast(_LoggerBase, get_logger())))
+
 
 # -----------------------------------------------------------------------------
-# Contract DB schema surface (tests look for these)
+# DB protocol surface (mypy-stable across psycopg2/psycopg3)
+# -----------------------------------------------------------------------------
+class _CursorLike(Protocol):
+    rowcount: int
+    itersize: int
+
+    def execute(self, query: Any, params: Any = ...) -> Any: ...
+    def executemany(self, query: Any, params: Any) -> Any: ...
+    def fetchone(self) -> Any: ...
+    def fetchall(self) -> Any: ...
+    def fetchmany(self, size: int) -> Any: ...
+    def close(self) -> Any: ...
+    def __iter__(self) -> Iterator[Any]: ...
+
+
+class _ConnLike(Protocol):
+    def cursor(self, *args: Any, **kwargs: Any) -> _CursorLike: ...
+    def commit(self) -> Any: ...
+    def rollback(self) -> Any: ...
+    def close(self) -> Any: ...
+
+
+# -----------------------------------------------------------------------------
+# Contract DB schema surface (tests may look for these)
 # -----------------------------------------------------------------------------
 LEGACY_SCHEMA_VERSION: int = 1
-SCHEMA_VERSION: int = 4  # canonical “current” schema version
+SCHEMA_VERSION: int = 4  # canonical current schema version
 
 
 @dataclass(frozen=True)
@@ -179,20 +271,11 @@ MIGRATION_PLAN: list[Migration] = [
                 extra JSONB DEFAULT '{}'::jsonb
             );
             """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_ai_candidates_ts ON ai_candidates(ts);
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_ai_trades_ts ON ai_trades(ts);
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_ai_positions_ts ON ai_positions(ts);
-            """,
+            "CREATE INDEX IF NOT EXISTS idx_ai_candidates_ts ON ai_candidates(ts);",
+            "CREATE INDEX IF NOT EXISTS idx_ai_trades_ts ON ai_trades(ts);",
+            "CREATE INDEX IF NOT EXISTS idx_ai_positions_ts ON ai_positions(ts);",
         ),
     ),
-]
-
-(
     Migration(
         from_version=LEGACY_SCHEMA_VERSION,
         to_version=SCHEMA_VERSION,
@@ -388,49 +471,35 @@ MIGRATION_PLAN: list[Migration] = [
         """,
         ),
     ),
-)
+]
 
-# ✅ This is what contract tests typically want: a list[str] of SQL blobs
-MIGRATIONS: list[str] = [_migration_sql(m) for m in MIGRATION_PLAN if _migration_sql(m)]
-
-
-# -----------------------------------------------------------------------------
-# log.every shim (so we can always throttle spam)
-# -----------------------------------------------------------------------------
-if not hasattr(log, "every"):
-
-    def _every(_key: str, n: int = 1000) -> bool:  # pragma: no cover
-        _ = n
-        return True
-
-    log.every = _every  # type: ignore[attr-defined]
-
+# Contract tests often want: list[str] SQL blobs
+MIGRATIONS: list[str] = []
+for _m in MIGRATION_PLAN:
+    _sql_blob = _migration_sql(_m)
+    if _sql_blob:
+        MIGRATIONS.append(_sql_blob)
 
 Row = dict[str, Any]
 
 # =============================================================================
-# Optional imports (graceful) — psycopg2 OR psycopg3
+# Optional imports (graceful) — psycopg2 OR psycopg3 OR asyncpg
 # =============================================================================
 _PG_DRIVER: str = "none"
-
 _PSYCOPG2_OK = False
 _PSYCOPG3_OK = False
 
-psycopg2 = None  # type: ignore
-RealDictCursor = Any  # type: ignore
-_execute_values = None  # type: ignore
-register_default_json = None  # type: ignore
-register_default_jsonb = None  # type: ignore
+psycopg2: Any | None = None
+RealDictCursor: Any | None = None
+_execute_values: Callable[..., Any] | None = None
+register_default_json: Callable[..., Any] | None = None
+register_default_jsonb: Callable[..., Any] | None = None
 
-psycopg = None  # type: ignore
-dict_row = None  # type: ignore
-
-_PGConn = Any  # type: ignore
-_PGCursor = Any  # type: ignore
+psycopg: Any | None = None
+dict_row: Any | None = None
 
 try:
     import psycopg2  # type: ignore
-    from psycopg2.extensions import connection as _PGConn, cursor as _PGCursor  # type: ignore
     from psycopg2.extras import (  # type: ignore
         RealDictCursor,
         execute_values as _execute_values,
@@ -466,7 +535,7 @@ def _sync_pg_ok() -> bool:
 
 
 # =============================================================================
-# Env helpers
+# Env helpers (never raise)
 # =============================================================================
 def _env_str(key: str, default: str = "") -> str:
     v = os.getenv(key)
@@ -506,7 +575,7 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(UTC)
+    return datetime.now(timezone.utc)
 
 
 def _json_dumps(o: Any) -> str:
@@ -514,12 +583,12 @@ def _json_dumps(o: Any) -> str:
 
 
 def _ensure_obj(v: Any) -> Any:
-    """Normalize json/jsonb field to dict/list when possible."""
+    """Normalize json/jsonb-ish values to dict/list when possible. Never raises."""
     if v is None:
         return {}
-    if isinstance(v, dict | list):
+    if isinstance(v, (dict, list)):
         return v
-    if isinstance(v, bytes | bytearray | memoryview):
+    if isinstance(v, (bytes, bytearray, memoryview)):
         try:
             v = bytes(v).decode("utf-8", "ignore")
         except Exception:
@@ -533,6 +602,44 @@ def _ensure_obj(v: Any) -> Any:
         except Exception:
             return {}
     return v
+
+
+def _as_json_object(v: Any, *, default: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+    """Best-effort coercion to Mapping[str, Any] for jsonb inserts. Never raises."""
+    if default is None:
+        default = {}
+    if v is None:
+        return default
+    if isinstance(v, Mapping):
+        return v
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        try:
+            s = bytes(v).decode("utf-8", "ignore").strip()
+            if not s:
+                return default
+            parsed = json.loads(s)
+            return cast(Mapping[str, Any], parsed) if isinstance(parsed, Mapping) else default
+        except Exception:
+            return default
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return default
+        try:
+            parsed = json.loads(s)
+            return cast(Mapping[str, Any], parsed) if isinstance(parsed, Mapping) else default
+        except Exception:
+            return default
+    return default
+
+
+def _as_json_map(val: Any) -> dict[str, Any]:
+    """Coerce unknown input into a JSON-serializable dict."""
+    if val is None:
+        return {}
+    if isinstance(val, Mapping):
+        return dict(_as_json_object(val))
+    return {}
 
 
 # =============================================================================
@@ -669,7 +776,6 @@ def _load_cfg() -> _DBCfg:
         5, min(_env_int("AI_DB_ASYNCPG_POOL_MAX_INACTIVE_S", 60), 3600)
     )
 
-    # Auto-disable if enabled but no DSN provided
     if enabled and autodisable_if_no_dsn and not _has_any_dsn_env():
         if log.every("ai_db_no_dsn_autodisable", 1_000_000):
             log.warning(
@@ -678,7 +784,6 @@ def _load_cfg() -> _DBCfg:
             )
         enabled = False
 
-    # Auto-disable if no drivers
     if enabled and autodisable_if_no_driver and (not _sync_pg_ok()) and (not _ASYNCPG_OK):
         if log.every("ai_db_no_driver_autodisable", 1_000_000):
             log.warning(
@@ -804,7 +909,6 @@ def _looks_like_internal_render_host(host: str | None) -> bool:
     if not host:
         return False
     h = host.lower()
-    # Internal Render often uses short hostnames or ".internal"
     return (h.startswith("dpg-") and "." not in h) or (".internal" in h) or h.endswith(".internal")
 
 
@@ -819,6 +923,23 @@ def _drop_query_key(q: str, key: str) -> str:
     q2 = re.sub(rf"(^|&){re.escape(key)}=[^&]*", "", q).strip("&")
     q2 = re.sub(r"&&+", "&", q2).strip("&")
     return q2
+
+
+def _parse_kv_dsn(raw: str) -> dict[str, str]:
+    s = (raw or "").strip()
+    if not s:
+        return {}
+    parts = shlex.split(s)
+    out: dict[str, str] = {}
+    for token in parts:
+        if "=" not in token:
+            continue
+        k, v = token.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if k:
+            out[k] = v
+    return out
 
 
 def _mask_dsn(raw: str) -> str:
@@ -844,23 +965,6 @@ def _mask_dsn(raw: str) -> str:
         return f"{host}{port}/{db}"
     except Exception:
         return "<dsn>"
-
-
-def _parse_kv_dsn(raw: str) -> dict[str, str]:
-    s = (raw or "").strip()
-    if not s:
-        return {}
-    parts = shlex.split(s)
-    out: dict[str, str] = {}
-    for token in parts:
-        if "=" not in token:
-            continue
-        k, v = token.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-        if k:
-            out[k] = v
-    return out
 
 
 def _kv_to_url(kv: Mapping[str, str]) -> str:
@@ -1020,13 +1124,12 @@ def _normalize_dsn(raw: str) -> DSNInfo:
         )
 
     libpq_url, host, db, sslmode, is_ext, is_int = _normalize_url_dsn(raw)
-    asyncpg_url = libpq_url
     normalized_sqlalchemy = libpq_url.replace("postgresql://", "postgresql+asyncpg://", 1)
     return DSNInfo(
         source="<url>",
         raw=raw,
         normalized_libpq=libpq_url,
-        normalized_asyncpg=asyncpg_url,
+        normalized_asyncpg=libpq_url,
         normalized_sqlalchemy_async=normalized_sqlalchemy,
         host=host,
         db=db,
@@ -1037,10 +1140,6 @@ def _normalize_dsn(raw: str) -> DSNInfo:
 
 
 def _is_render_runtime() -> bool:
-    """
-    True when running inside Render.
-    We look for multiple env vars because Render setups vary.
-    """
     v = os.getenv("RENDER")
     if v and str(v).strip().lower() in ("1", "true", "yes", "y", "on"):
         return True
@@ -1075,7 +1174,6 @@ def _peek_host_from_dsn(raw: str) -> str | None:
 
 
 def _resolve_raw_dsn() -> tuple[str, str]:
-    # Collect all present candidates in declared priority order
     candidates: list[tuple[str, str]] = []
     for key in _DSN_ENV_CANDIDATES:
         v = os.environ.get(key)
@@ -1092,7 +1190,6 @@ def _resolve_raw_dsn() -> tuple[str, str]:
 
     on_render = _is_render_runtime()
 
-    # On Render: prefer an internal DSN if any exists (best latency + routing)
     if on_render:
         for key, raw in candidates:
             host = _peek_host_from_dsn(raw)
@@ -1100,8 +1197,6 @@ def _resolve_raw_dsn() -> tuple[str, str]:
                 return raw, key
         return candidates[0][1], candidates[0][0]
 
-    # Local (Windows or any non-Render runtime):
-    # Avoid Render *internal* hostnames if any non-internal DSN exists.
     first_internal: tuple[str, str] | None = None
     for key, raw in candidates:
         host = _peek_host_from_dsn(raw)
@@ -1109,10 +1204,8 @@ def _resolve_raw_dsn() -> tuple[str, str]:
             if first_internal is None:
                 first_internal = (key, raw)
             continue
-        # Found a non-internal DSN (external Render or any normal hostname)
         return raw, key
 
-    # Only internal DSNs exist -> return the first internal (will fail locally, but gives a clear hint)
     if first_internal is not None:
         return first_internal[1], first_internal[0]
 
@@ -1150,15 +1243,16 @@ def get_normalized_dsn_for_debug() -> str:
 
 def describe_dsn_sources() -> dict[str, Any]:
     candidates: dict[str, str] = {}
-    for key in _DSN_ENV_CANDIDATES + (["SNIPER_DB_DSN_FALLBACK"] if DB_URL_FALLBACK else []):
+    keys = _DSN_ENV_CANDIDATES + (["SNIPER_DB_DSN_FALLBACK"] if DB_URL_FALLBACK else [])
+    for key in keys:
         raw = os.environ.get(key) if key != "SNIPER_DB_DSN_FALLBACK" else DB_URL_FALLBACK
         if raw and str(raw).strip():
             candidates[key] = _mask_dsn(str(raw).strip())
 
     selected = "<unresolved>"
-    selected_source = None
-    sslmode = None
-    host = None
+    selected_source: str | None = None
+    sslmode: str | None = None
+    host: str | None = None
     try:
         info = resolve_dsn_info()
         selected = _mask_dsn(info.normalized_libpq)
@@ -1215,7 +1309,6 @@ def ssl_context_for_dsn(dsn: str | None = None) -> ssl.SSLContext | None:
             log.warning("ai_db: failed to load AI_DB_SSL_CA_FILE=%r: %s", AI_DB_SSL_CA_FILE, e)
 
     if AI_DB_SSL_INSECURE:
-        # DEBUG ONLY
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
@@ -1334,31 +1427,36 @@ def _require_sync_pg() -> None:
     )
 
 
-def _sync_connect(conninfo: str) -> _PGConn:
+def _sync_connect(conninfo: str) -> _ConnLike:
     _require_sync_pg()
     if _PG_DRIVER == "psycopg2":
-        return cast(_PGConn, psycopg2.connect(conninfo))  # type: ignore[union-attr]
+        return cast(_ConnLike, psycopg2.connect(conninfo))  # type: ignore[union-attr]
     if _PG_DRIVER == "psycopg3":
-        return cast(_PGConn, psycopg.connect(conninfo))  # type: ignore[union-attr]
+        return cast(_ConnLike, psycopg.connect(conninfo))  # type: ignore[union-attr]
     raise RuntimeError("No sync Postgres driver configured")
 
 
-def _apply_session_settings(conn: _PGConn) -> None:
+def _apply_session_settings(conn: _ConnLike) -> None:
+    cur: _CursorLike | None = None
     try:
-        with conn.cursor() as cur:
-            cur.execute("SET application_name = %s", (AI_DB_APP_NAME,))
-            cur.execute("SET TIME ZONE 'UTC'")
-            if AI_DB_STATEMENT_TIMEOUT_MS > 0:
-                cur.execute("SET statement_timeout = %s", (int(AI_DB_STATEMENT_TIMEOUT_MS),))
-            if AI_DB_IDLE_IN_TX_TIMEOUT_MS > 0:
-                cur.execute(
-                    "SET idle_in_transaction_session_timeout = %s",
-                    (int(AI_DB_IDLE_IN_TX_TIMEOUT_MS),),
-                )
-            if AI_DB_LOCK_TIMEOUT_MS > 0:
-                cur.execute("SET lock_timeout = %s", (int(AI_DB_LOCK_TIMEOUT_MS),))
+        cur = conn.cursor()
+        cur.execute("SET application_name = %s", (AI_DB_APP_NAME,))
+        cur.execute("SET TIME ZONE 'UTC'")
+        if AI_DB_STATEMENT_TIMEOUT_MS > 0:
+            cur.execute("SET statement_timeout = %s", (int(AI_DB_STATEMENT_TIMEOUT_MS),))
+        if AI_DB_IDLE_IN_TX_TIMEOUT_MS > 0:
+            cur.execute(
+                "SET idle_in_transaction_session_timeout = %s",
+                (int(AI_DB_IDLE_IN_TX_TIMEOUT_MS),),
+            )
+        if AI_DB_LOCK_TIMEOUT_MS > 0:
+            cur.execute("SET lock_timeout = %s", (int(AI_DB_LOCK_TIMEOUT_MS),))
     except Exception:
         log.exception("ai_db: failed to apply session settings")
+    finally:
+        with suppress(Exception):
+            if cur is not None:
+                cur.close()
 
 
 def _sleep_backoff(attempt: int) -> None:
@@ -1369,7 +1467,7 @@ def _sleep_backoff(attempt: int) -> None:
     time.sleep(delay)
 
 
-def _connect_once() -> _PGConn:
+def _connect_once() -> _ConnLike:
     if not AI_DB_ENABLED:
         raise RuntimeError("AI DB disabled (AI_DB_ENABLED=0)")
     _require_sync_pg()
@@ -1377,7 +1475,6 @@ def _connect_once() -> _PGConn:
     info = resolve_dsn_info()
     conn = _sync_connect(info.normalized_libpq)
 
-    # psycopg2: register JSON loaders (optional)
     if _PG_DRIVER == "psycopg2":
         try:
             if register_default_json is not None:
@@ -1391,7 +1488,7 @@ def _connect_once() -> _PGConn:
     return conn
 
 
-def _connect() -> _PGConn:
+def _connect() -> _ConnLike:
     last_err: BaseException | None = None
     attempts = 1 + int(AI_DB_CONNECT_RETRIES)
     for i in range(1, attempts + 1):
@@ -1409,11 +1506,12 @@ def _connect() -> _PGConn:
 
 
 @contextmanager
-def conn_cursor() -> Iterator[tuple[_PGConn, _PGCursor]]:
+def conn_cursor() -> Iterator[tuple[_ConnLike, _CursorLike]]:
     conn = _connect()
+    cur: _CursorLike | None = None
     try:
-        with conn.cursor() as cur:
-            yield conn, cur
+        cur = conn.cursor()
+        yield conn, cur
         conn.commit()
     except Exception:
         with suppress(Exception):
@@ -1422,20 +1520,24 @@ def conn_cursor() -> Iterator[tuple[_PGConn, _PGCursor]]:
         raise
     finally:
         with suppress(Exception):
+            if cur is not None:
+                cur.close()
+        with suppress(Exception):
             conn.close()
 
 
 @contextmanager
-def conn_dict_cursor() -> Iterator[tuple[_PGConn, Any]]:
+def conn_dict_cursor() -> Iterator[tuple[_ConnLike, Any]]:
     conn = _connect()
+    cur: Any = None
     try:
-        if _PG_DRIVER == "psycopg2":
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:  # type: ignore[arg-type]
-                yield conn, cur
+        if _PG_DRIVER == "psycopg2" and RealDictCursor is not None:
+            cur = conn.cursor(cursor_factory=RealDictCursor)  # type: ignore[arg-type]
+        elif _PG_DRIVER == "psycopg3" and dict_row is not None:
+            cur = conn.cursor(row_factory=dict_row)  # type: ignore[misc]
         else:
-            # psycopg3
-            with conn.cursor(row_factory=dict_row) as cur:  # type: ignore[misc]
-                yield conn, cur
+            cur = conn.cursor()
+        yield conn, cur
         conn.commit()
     except Exception:
         with suppress(Exception):
@@ -1444,11 +1546,14 @@ def conn_dict_cursor() -> Iterator[tuple[_PGConn, Any]]:
         raise
     finally:
         with suppress(Exception):
+            if cur is not None:
+                cur.close()
+        with suppress(Exception):
             conn.close()
 
 
 @contextmanager
-def cursor_only() -> Iterator[_PGCursor]:
+def cursor_only() -> Iterator[_CursorLike]:
     with conn_cursor() as (_c, cur):
         yield cur
 
@@ -1462,26 +1567,31 @@ def dict_cursor_only() -> Iterator[Any]:
 # =============================================================================
 # Soft-fail decorators
 # =============================================================================
-def _default_copy(v: Any) -> Any:
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def _default_copy(v: object) -> object:
+    """Deepcopy if possible, otherwise return the same object. Never raises."""
     try:
         return copy.deepcopy(v)
     except Exception:
         return v
 
 
-def _softfail_write(default: Any):
-    def deco(fn):
+def _softfail_write(default: object) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    def deco(fn: Callable[P, R]) -> Callable[P, R]:
         @wraps(fn)
-        def wrapper(*args, **kwargs):
-            if not AI_DB_ENABLED or AI_DB_READ_ONLY:
-                return _default_copy(default)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            if (not AI_DB_ENABLED) or AI_DB_READ_ONLY:
+                return cast(R, _default_copy(default))
             try:
                 return fn(*args, **kwargs)
             except Exception:
                 if AI_DB_SOFT_FAIL_WRITES:
                     if log.every("ai_db_write_fail", 50):
                         log.exception("ai_db: write failed in %s (soft-fail)", fn.__name__)
-                    return _default_copy(default)
+                    return cast(R, _default_copy(default))
                 raise
 
         return wrapper
@@ -1489,19 +1599,19 @@ def _softfail_write(default: Any):
     return deco
 
 
-def _softfail_read(default: Any):
-    def deco(fn):
+def _softfail_read(default: object) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    def deco(fn: Callable[P, R]) -> Callable[P, R]:
         @wraps(fn)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             if not AI_DB_ENABLED:
-                return _default_copy(default)
+                return cast(R, _default_copy(default))
             try:
                 return fn(*args, **kwargs)
             except Exception:
                 if AI_DB_SOFT_FAIL_READS:
                     if log.every("ai_db_read_fail", 50):
                         log.exception("ai_db: read failed in %s (soft-fail)", fn.__name__)
-                    return _default_copy(default)
+                    return cast(R, _default_copy(default))
                 raise
 
         return wrapper
@@ -1513,8 +1623,7 @@ def _softfail_read(default: Any):
 # Migration lock + safe SQL helpers
 # =============================================================================
 @contextmanager
-def _migration_lock(cur: _PGCursor) -> Iterator[None]:
-    """Advisory lock to prevent concurrent migrations (best-effort)."""
+def _migration_lock(cur: _CursorLike) -> Iterator[None]:
     if not AI_DB_USE_MIGRATION_LOCK:
         yield
         return
@@ -1527,8 +1636,11 @@ def _migration_lock(cur: _PGCursor) -> Iterator[None]:
         while time.time() < deadline:
             cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_id,))
             row = cur.fetchone()
-            if row and bool(row[0]):
-                got = True
+            try:
+                got = bool(row and bool(row[0]))
+            except Exception:
+                got = False
+            if got:
                 break
             time.sleep(0.25)
 
@@ -1546,8 +1658,10 @@ _NUMERIC_RE_SQL = r"^-?[0-9]+([.][0-9]+)?$"
 
 
 def _sql_safe_float(text_expr: str) -> str:
-    """Safely cast text -> float only if numeric-looking; otherwise NULL."""
-    return f"(CASE WHEN ({text_expr}) ~ '{_NUMERIC_RE_SQL}' THEN ({text_expr})::double precision ELSE NULL END)"
+    return (
+        f"(CASE WHEN ({text_expr}) ~ '{_NUMERIC_RE_SQL}' "
+        f"THEN ({text_expr})::double precision ELSE NULL END)"
+    )
 
 
 # =============================================================================
@@ -1597,6 +1711,13 @@ def describe_backend() -> str:
 AI_DB_SCHEMA_VERSION: int = SCHEMA_VERSION
 
 
+def _exec_sql_blob(cur: Any, sql_blob: str) -> None:
+    s = (sql_blob or "").strip()
+    if not s:
+        return
+    cur.execute(s)
+
+
 def ensure_ai_tables() -> None:
     """
     Create/upgrade schema idempotently.
@@ -1611,216 +1732,12 @@ def ensure_ai_tables() -> None:
         )
         return
 
-    decision_score_expr = _sql_safe_float("(raw->'_decision_meta'->>'decision_score')")
-    max_dd_expr = _sql_safe_float("(extra->>'max_dd_pct')")
-
     with conn_cursor() as (_conn, cur):
         with _migration_lock(cur):
-            # meta (FIXED: columns are k/v, not key/value)
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ai_schema_meta (
-                    k  TEXT PRIMARY KEY,
-                    v  TEXT,
-                    ts TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO ai_schema_meta (k, v)
-                VALUES ('schema_version', %s)
-                ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, ts = now();
-                """,
-                (str(SCHEMA_VERSION),),
-            )
+            for m in MIGRATION_PLAN:
+                _exec_sql_blob(cur, _migration_sql(m))
 
-            # training
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS entry_candidates (
-                    id              BIGSERIAL PRIMARY KEY,
-                    ts              TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    src             TEXT NOT NULL,
-                    mint            TEXT NOT NULL,
-                    symbol          TEXT,
-                    regime          TEXT,
-                    wallet_tag      TEXT,
-                    session_id      TEXT,
-                    feature_version INT NOT NULL,
-                    features        JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    raw             JSONB NOT NULL DEFAULT '{}'::jsonb
-                );
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS entry_outcomes (
-                    id           BIGSERIAL PRIMARY KEY,
-                    candidate_id BIGINT UNIQUE REFERENCES entry_candidates(id) ON DELETE CASCADE,
-                    label        TEXT NOT NULL,
-                    pnl_pct      DOUBLE PRECISION,
-                    hold_sec     INTEGER,
-                    notes        TEXT,
-                    extra        JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    ts           TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-                """
-            )
-
-            # executions / exits
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS trade_executions (
-                    id           BIGSERIAL PRIMARY KEY,
-                    ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    trade_id     TEXT NOT NULL,
-                    mint         TEXT NOT NULL,
-                    side         TEXT NOT NULL,
-                    qty_raw      NUMERIC,
-                    price_usd    DOUBLE PRECISION,
-                    slippage_bps DOUBLE PRECISION,
-                    fees_usd     DOUBLE PRECISION,
-                    tx_sig       TEXT,
-                    candidate_id BIGINT REFERENCES entry_candidates(id) ON DELETE SET NULL,
-                    session_id   TEXT,
-                    extra        JSONB NOT NULL DEFAULT '{}'::jsonb
-                );
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS exit_events (
-                    id           BIGSERIAL PRIMARY KEY,
-                    ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    event_key    TEXT UNIQUE,
-                    trade_id     TEXT,
-                    mint         TEXT NOT NULL,
-                    symbol       TEXT,
-                    action       TEXT,
-                    reason       TEXT,
-                    pnl_pct      DOUBLE PRECISION,
-                    pnl_usd      DOUBLE PRECISION,
-                    qty_raw      NUMERIC,
-                    price_usd    DOUBLE PRECISION,
-                    slippage_bps DOUBLE PRECISION,
-                    fees_usd     DOUBLE PRECISION,
-                    tx_sig       TEXT,
-                    candidate_id BIGINT REFERENCES entry_candidates(id) ON DELETE SET NULL,
-                    session_id   TEXT,
-                    extra        JSONB NOT NULL DEFAULT '{}'::jsonb
-                );
-                """
-            )
-
-            # positions
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS positions (
-                    id                 BIGSERIAL PRIMARY KEY,
-                    ts                 TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    position_id        TEXT,
-                    mint               TEXT NOT NULL,
-                    symbol             TEXT,
-                    status             TEXT NOT NULL DEFAULT 'OPEN',
-                    side               TEXT NOT NULL DEFAULT 'LONG',
-                    qty_raw            NUMERIC,
-                    entry_price_usd    DOUBLE PRECISION,
-                    entry_trade_id     TEXT,
-                    entry_tx_sig       TEXT,
-                    entry_candidate_id BIGINT REFERENCES entry_candidates(id) ON DELETE SET NULL,
-                    entry_ts           TIMESTAMPTZ,
-
-                    exit_price_usd     DOUBLE PRECISION,
-                    exit_trade_id      TEXT,
-                    exit_tx_sig        TEXT,
-                    exit_ts            TIMESTAMPTZ,
-
-                    pnl_pct            DOUBLE PRECISION,
-                    pnl_usd            DOUBLE PRECISION,
-
-                    session_id         TEXT,
-                    wallet_tag         TEXT,
-                    extra              JSONB NOT NULL DEFAULT '{}'::jsonb
-                );
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS position_events (
-                    id          BIGSERIAL PRIMARY KEY,
-                    ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    position_id TEXT,
-                    mint        TEXT NOT NULL,
-                    event_type  TEXT NOT NULL,
-                    payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    session_id  TEXT,
-                    extra       JSONB NOT NULL DEFAULT '{}'::jsonb
-                );
-                """
-            )
-
-            # regime & AI events
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS regime_snapshots (
-                    id         BIGSERIAL PRIMARY KEY,
-                    ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    regime     TEXT NOT NULL,
-                    state      JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    session_id TEXT,
-                    extra      JSONB NOT NULL DEFAULT '{}'::jsonb
-                );
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ai_events (
-                    id             BIGSERIAL PRIMARY KEY,
-                    ts             TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    event_type     TEXT NOT NULL,
-                    policy_version TEXT,
-                    experiment_tag TEXT,
-                    src            TEXT,
-                    regime         TEXT,
-                    payload        JSONB NOT NULL DEFAULT '{}'::jsonb
-                );
-                """
-            )
-
-            # future-proof knobs & risk
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS strategy_params (
-                    id         BIGSERIAL PRIMARY KEY,
-                    ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    key        TEXT NOT NULL,
-                    value      JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    src        TEXT,
-                    regime     TEXT,
-                    session_id TEXT,
-                    extra      JSONB NOT NULL DEFAULT '{}'::jsonb
-                );
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS risk_assessments (
-                    id         BIGSERIAL PRIMARY KEY,
-                    ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    mint       TEXT NOT NULL,
-                    symbol     TEXT,
-                    score      DOUBLE PRECISION,
-                    verdict    TEXT,
-                    details    JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    model_tag  TEXT,
-                    session_id TEXT,
-                    extra      JSONB NOT NULL DEFAULT '{}'::jsonb
-                );
-                """
-            )
-
-            # add-if-missing (defensive; ensure defaults for json columns)
+            # Defensive add-if-missing (legacy upgrades)
             cur.execute("ALTER TABLE entry_candidates ADD COLUMN IF NOT EXISTS session_id TEXT;")
             cur.execute("ALTER TABLE entry_candidates ADD COLUMN IF NOT EXISTS wallet_tag TEXT;")
 
@@ -1847,53 +1764,41 @@ def ensure_ai_tables() -> None:
                 "ALTER TABLE position_events ADD COLUMN IF NOT EXISTS extra JSONB NOT NULL DEFAULT '{}'::jsonb;"
             )
 
-            # indexes
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_ts ON entry_candidates (ts DESC);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_mint_ts ON entry_candidates (mint, ts DESC);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_src_regime_ts ON entry_candidates (src, regime, ts DESC);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_wallet_tag_ts ON entry_candidates (wallet_tag, ts DESC);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_session_ts ON entry_candidates (session_id, ts DESC);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_feature_version ON entry_candidates (feature_version);"
-            )
+            decision_score_expr = _sql_safe_float("(raw->'_decision_meta'->>'decision_score')")
+            max_dd_expr = _sql_safe_float("(extra->>'max_dd_pct')")
 
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_entry_outcomes_candidate_id ON entry_outcomes (candidate_id);"
+                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_src_regime_ts "
+                "ON entry_candidates (src, regime, ts DESC);"
             )
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_entry_outcomes_label_ts ON entry_outcomes (label, ts DESC);"
+                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_wallet_tag_ts "
+                "ON entry_candidates (wallet_tag, ts DESC);"
             )
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_entry_outcomes_ts ON entry_outcomes (ts DESC);"
-            )
-
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_trade_executions_ts ON trade_executions (ts DESC);"
+                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_session_ts "
+                "ON entry_candidates (session_id, ts DESC);"
             )
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_trade_executions_trade_id ON trade_executions (trade_id);"
+                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_feature_version "
+                "ON entry_candidates (feature_version);"
             )
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_trade_executions_candidate_id ON trade_executions (candidate_id);"
+                "CREATE INDEX IF NOT EXISTS idx_entry_outcomes_candidate_id "
+                "ON entry_outcomes (candidate_id);"
             )
             cur.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS uq_trade_executions_trade_side_mint
-                ON trade_executions (trade_id, side, mint);
-                """
+                "CREATE INDEX IF NOT EXISTS idx_entry_outcomes_label_ts "
+                "ON entry_outcomes (label, ts DESC);"
             )
-
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_exit_events_ts ON exit_events (ts DESC);")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trade_executions_trade_id "
+                "ON trade_executions (trade_id);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trade_executions_candidate_id "
+                "ON trade_executions (candidate_id);"
+            )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_exit_events_mint_ts ON exit_events (mint, ts DESC);"
             )
@@ -1901,84 +1806,48 @@ def ensure_ai_tables() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_exit_events_trade_id ON exit_events (trade_id);"
             )
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_exit_events_candidate_id ON exit_events (candidate_id);"
+                "CREATE INDEX IF NOT EXISTS idx_exit_events_candidate_id "
+                "ON exit_events (candidate_id);"
             )
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_exit_events_reason_ts ON exit_events (reason, ts DESC);"
+                "CREATE INDEX IF NOT EXISTS idx_exit_events_reason_ts "
+                "ON exit_events (reason, ts DESC);"
             )
             cur.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_exit_events_event_key ON exit_events (event_key);"
-            )
-
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_positions_ts ON positions (ts DESC);")
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_positions_mint_status_ts ON positions (mint, status, ts DESC);"
+                "CREATE INDEX IF NOT EXISTS idx_positions_mint_status_ts "
+                "ON positions (mint, status, ts DESC);"
             )
             cur.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_positions_position_id ON positions (position_id);"
-            )
-
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_position_events_ts ON position_events (ts DESC);"
+                "CREATE INDEX IF NOT EXISTS idx_position_events_mint_ts "
+                "ON position_events (mint, ts DESC);"
             )
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_position_events_mint_ts ON position_events (mint, ts DESC);"
-            )
-
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_regime_snapshots_ts ON regime_snapshots (ts DESC);"
+                "CREATE INDEX IF NOT EXISTS idx_regime_snapshots_regime_ts "
+                "ON regime_snapshots (regime, ts DESC);"
             )
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_regime_snapshots_regime_ts ON regime_snapshots (regime, ts DESC);"
-            )
-
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_events_ts ON ai_events (ts DESC);")
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ai_events_type_ts ON ai_events (event_type, ts DESC);"
-            )
-
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_entry_candidates_policy_version
-                ON entry_candidates ((raw->'_decision_meta'->>'ai_policy_version'));
-                """
+                "CREATE INDEX IF NOT EXISTS idx_ai_events_type_ts "
+                "ON ai_events (event_type, ts DESC);"
             )
             cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_entry_candidates_experiment_tag
-                ON entry_candidates ((raw->'_decision_meta'->>'ai_experiment_tag'));
-                """
+                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_policy_version "
+                "ON entry_candidates ((raw->'_decision_meta'->>'ai_policy_version'));"
             )
             cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_entry_candidates_decision
-                ON entry_candidates ((raw->'_decision_meta'->>'decision'));
-                """
+                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_experiment_tag "
+                "ON entry_candidates ((raw->'_decision_meta'->>'ai_experiment_tag'));"
             )
             cur.execute(
-                f"""
-                CREATE INDEX IF NOT EXISTS idx_entry_candidates_decision_score_safe
-                ON entry_candidates (({decision_score_expr}));
-                """
+                "CREATE INDEX IF NOT EXISTS idx_entry_candidates_decision "
+                "ON entry_candidates ((raw->'_decision_meta'->>'decision'));"
             )
             cur.execute(
-                f"""
-                CREATE INDEX IF NOT EXISTS idx_entry_outcomes_max_dd_pct_safe
-                ON entry_outcomes (({max_dd_expr}));
-                """
-            )
-
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_strategy_params_ts ON strategy_params (ts DESC);"
+                f"CREATE INDEX IF NOT EXISTS idx_entry_candidates_decision_score_safe "
+                f"ON entry_candidates (({decision_score_expr}));"
             )
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_strategy_params_key_ts ON strategy_params (key, ts DESC);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_risk_assessments_ts ON risk_assessments (ts DESC);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_risk_assessments_mint_ts ON risk_assessments (mint, ts DESC);"
+                f"CREATE INDEX IF NOT EXISTS idx_entry_outcomes_max_dd_pct_safe "
+                f"ON entry_outcomes (({max_dd_expr}));"
             )
 
     log.info("ai_db.ensure_ai_tables: schema ensured")
@@ -2006,6 +1875,18 @@ def bootstrap_ai_db() -> bool:
 # =============================================================================
 # Phase 2: entry_candidates (training inputs)
 # =============================================================================
+def _clamp_int(val: Any, lo: int, hi: int) -> int:
+    try:
+        x = int(val)
+    except Exception:
+        x = lo
+    return max(lo, min(x, hi))
+
+
+def _mk_where_sql(clauses: Sequence[str]) -> str:
+    return ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+
 @_softfail_write(0)
 def insert_entry_candidate(
     *,
@@ -2015,9 +1896,9 @@ def insert_entry_candidate(
     regime: str | None,
     wallet_tag: str | None,
     session_id: str | None = None,
-    feature_version: int,
-    features: Mapping[str, Any],
-    raw: Mapping[str, Any],
+    feature_version: int = 0,
+    features: Mapping[str, Any] | None = None,
+    raw: Mapping[str, Any] | None = None,
 ) -> int:
     with conn_cursor() as (_conn, cur):
         cur.execute(
@@ -2036,8 +1917,8 @@ def insert_entry_candidate(
                 wallet_tag,
                 session_id,
                 int(feature_version),
-                _json_dumps(dict(features or {})),
-                _json_dumps(dict(raw or {})),
+                _json_dumps(_as_json_map(features)),
+                _json_dumps(_as_json_map(raw)),
             ),
         )
         row = cur.fetchone()
@@ -2046,26 +1927,39 @@ def insert_entry_candidate(
 
 @_softfail_write(0)
 def insert_entry_candidates_bulk(rows: Sequence[Mapping[str, Any]]) -> int:
+    """
+    Bulk insert candidates.
+    Skips rows with missing/blank src or mint.
+    Returns number of rows attempted (post-skip).
+    """
     if not rows:
         return 0
 
     values: list[tuple[Any, ...]] = []
     for r in rows:
+        src_val = str(r.get("src") or "").strip()
+        mint_val = str(r.get("mint") or "").strip()
+        if not src_val or not mint_val:
+            continue
+
         values.append(
             (
-                str(r.get("src") or ""),
-                str(r.get("mint") or ""),
+                src_val,
+                mint_val,
                 r.get("symbol"),
                 r.get("regime"),
                 r.get("wallet_tag"),
                 r.get("session_id"),
                 int(r.get("feature_version") or 0),
-                _json_dumps(dict(cast(Mapping[str, Any], r.get("features") or {}))),
-                _json_dumps(dict(cast(Mapping[str, Any], r.get("raw") or {}))),
+                _json_dumps(_as_json_map(r.get("features"))),
+                _json_dumps(_as_json_map(r.get("raw"))),
             )
         )
 
-    if _execute_values is not None:
+    if not values:
+        return 0
+
+    if _execute_values is not None and _PG_DRIVER == "psycopg2":
         with conn_cursor() as (_conn, cur):
             _execute_values(
                 cur,
@@ -2080,7 +1974,6 @@ def insert_entry_candidates_bulk(rows: Sequence[Mapping[str, Any]]) -> int:
             )
         return len(values)
 
-    # psycopg3 or no execute_values: executemany
     with conn_cursor() as (_conn, cur):
         cur.executemany(
             """
@@ -2104,7 +1997,7 @@ def fetch_latest_candidates(
     session_id: str | None = None,
     min_feature_version: int | None = None,
 ) -> list[Row]:
-    limit = max(1, min(int(limit), 500))
+    limit_i = _clamp_int(limit, 1, 500)
     min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: list[str] = []
@@ -2126,15 +2019,20 @@ def fetch_latest_candidates(
         clauses.append("feature_version >= %s")
         params.append(int(min_feature_version))
 
-    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    sql = f"""
+    where_sql = _mk_where_sql(clauses)
+
+    sql = (
+        """
         SELECT id, ts, src, mint, symbol, regime, wallet_tag, session_id, feature_version, features, raw
         FROM entry_candidates
-        {where_sql}
+        """
+        + (where_sql + "\n" if where_sql else "")
+        + """
         ORDER BY ts DESC, id DESC
         LIMIT %s
-    """
-    params.append(limit)
+        """
+    )
+    params.append(limit_i)
 
     with dict_cursor_only() as cur:
         cur.execute(sql, params)
@@ -2163,8 +2061,10 @@ def fetch_candidate_by_id(candidate_id: int) -> Row | None:
             (int(candidate_id),),
         )
         row = cur.fetchone()
+
     if not row:
         return None
+
     r = dict(row)
     r["id"] = int(r.get("id") or 0)
     r["feature_version"] = int(r.get("feature_version") or 0)
@@ -2191,7 +2091,7 @@ def update_entry_decision(
     if extra_fields:
         patch_meta.update(extra_fields)
 
-    patch_json = _json_dumps({"_decision_meta": patch_meta})
+    patch_json = _json_dumps({"_decision_meta": dict(_as_json_object(patch_meta))})
 
     with conn_cursor() as (_conn, cur):
         cur.execute(
@@ -2235,7 +2135,7 @@ def insert_entry_outcome(
                 pnl_pct,
                 hold_sec,
                 notes,
-                _json_dumps(dict(extra or {})),
+                _json_dumps(_as_json_map(extra)),
             ),
         )
         row = cur.fetchone()
@@ -2275,7 +2175,7 @@ def mark_outcome_for_candidate(
                 pnl_pct,
                 hold_sec,
                 notes,
-                _json_dumps(dict(extra or {})),
+                _json_dumps(_as_json_map(extra)),
             ),
         )
         row = cur.fetchone()
@@ -2284,21 +2184,28 @@ def mark_outcome_for_candidate(
 
 @_softfail_read([])
 def fetch_recent_outcomes(*, limit: int = 100, since_candidate_id: int | None = None) -> list[Row]:
-    limit = max(1, min(int(limit), 1000))
+    limit_i = _clamp_int(limit, 1, 1000)
+
     clauses: list[str] = []
     params: list[Any] = []
     if since_candidate_id is not None:
         clauses.append("candidate_id > %s")
         params.append(int(since_candidate_id))
-    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    sql = f"""
+
+    where_sql = _mk_where_sql(clauses)
+
+    sql = (
+        """
         SELECT id, candidate_id, label, pnl_pct, hold_sec, notes, extra, ts
         FROM entry_outcomes
-        {where_sql}
+        """
+        + (where_sql + "\n" if where_sql else "")
+        + """
         ORDER BY ts DESC, id DESC
         LIMIT %s
-    """
-    params.append(limit)
+        """
+    )
+    params.append(limit_i)
 
     with dict_cursor_only() as cur:
         cur.execute(sql, params)
@@ -2325,7 +2232,7 @@ def fetch_unlabeled_candidates(
     wallet_tag: str | None = None,
     session_id: str | None = None,
 ) -> list[Row]:
-    limit = max(1, min(int(limit), 5000))
+    limit_i = _clamp_int(limit, 1, 5000)
     min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: list[str] = []
@@ -2346,28 +2253,34 @@ def fetch_unlabeled_candidates(
     if min_feature_version is not None:
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
-    if min_age_seconds is not None and int(min_age_seconds) > 0:
-        clauses.append("c.ts <= now() - (%s::interval)")
-        params.append(f"{int(min_age_seconds)} seconds")
+    if min_age_seconds is not None:
+        try:
+            age_i = int(min_age_seconds)
+        except Exception:
+            age_i = 0
+        if age_i > 0:
+            clauses.append("c.ts <= now() - (%s::interval)")
+            params.append(f"{age_i} seconds")
 
-    where_sql = (
-        ("WHERE " + " AND ".join(clauses) + " AND o.candidate_id IS NULL")
-        if clauses
-        else "WHERE o.candidate_id IS NULL"
-    )
+    clauses.append("o.candidate_id IS NULL")
+    where_sql = _mk_where_sql(clauses)
 
-    sql = f"""
+    sql = (
+        """
         SELECT
             c.id, c.ts, c.src, c.mint, c.symbol, c.regime, c.wallet_tag, c.session_id,
             c.feature_version, c.features, c.raw
         FROM entry_candidates c
         LEFT JOIN entry_outcomes o
           ON o.candidate_id = c.id
-        {where_sql}
+        """
+        + (where_sql + "\n" if where_sql else "")
+        + """
         ORDER BY c.ts DESC, c.id DESC
         LIMIT %s
-    """
-    params.append(limit)
+        """
+    )
+    params.append(limit_i)
 
     with dict_cursor_only() as cur:
         cur.execute(sql, params)
@@ -2392,7 +2305,7 @@ def insert_trade_execution(
     *,
     trade_id: str,
     mint: str,
-    side: str,  # "BUY" / "SELL"
+    side: str,
     qty_raw: int,
     price_usd: float,
     slippage_bps: float | None = None,
@@ -2427,7 +2340,7 @@ def insert_trade_execution(
                 tx_sig,
                 int(candidate_id) if candidate_id is not None else None,
                 session_id,
-                _json_dumps(dict(extra or {})),
+                _json_dumps(_as_json_map(extra)),
             ),
         )
         row = cur.fetchone()
@@ -2523,7 +2436,7 @@ def insert_exit_event(
                 tx_sig,
                 int(candidate_id) if candidate_id is not None else None,
                 session_id,
-                _json_dumps(dict(extra or {})),
+                _json_dumps(_as_json_map(extra)),
             ),
         )
         row = cur.fetchone()
@@ -2538,9 +2451,11 @@ def fetch_recent_exit_events(
     trade_id: str | None = None,
     candidate_id: int | None = None,
 ) -> list[Row]:
-    limit = max(1, min(int(limit), 2000))
+    limit_i = _clamp_int(limit, 1, 2000)
+
     clauses: list[str] = []
     params: list[Any] = []
+
     if mint:
         clauses.append("mint = %s")
         params.append(mint)
@@ -2550,17 +2465,23 @@ def fetch_recent_exit_events(
     if candidate_id is not None:
         clauses.append("candidate_id = %s")
         params.append(int(candidate_id))
-    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    sql = f"""
+
+    where_sql = _mk_where_sql(clauses)
+
+    sql = (
+        """
         SELECT id, ts, event_key, trade_id, mint, symbol, action, reason,
                pnl_pct, pnl_usd, qty_raw, price_usd, slippage_bps, fees_usd, tx_sig,
                candidate_id, session_id, extra
         FROM exit_events
-        {where_sql}
+        """
+        + (where_sql + "\n" if where_sql else "")
+        + """
         ORDER BY ts DESC, id DESC
         LIMIT %s
-    """
-    params.append(limit)
+        """
+    )
+    params.append(limit_i)
 
     with dict_cursor_only() as cur:
         cur.execute(sql, params)
@@ -2582,7 +2503,7 @@ def fetch_recent_trade_executions(
     trade_id: str | None = None,
     candidate_id: int | None = None,
 ) -> list[Row]:
-    limit = max(1, min(int(limit), 2000))
+    limit_i = _clamp_int(limit, 1, 2000)
 
     clauses: list[str] = []
     params: list[Any] = []
@@ -2594,16 +2515,21 @@ def fetch_recent_trade_executions(
         clauses.append("candidate_id = %s")
         params.append(int(candidate_id))
 
-    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    sql = f"""
+    where_sql = _mk_where_sql(clauses)
+
+    sql = (
+        """
         SELECT id, ts, trade_id, mint, side, qty_raw, price_usd,
                slippage_bps, fees_usd, tx_sig, candidate_id, session_id, extra
         FROM trade_executions
-        {where_sql}
+        """
+        + (where_sql + "\n" if where_sql else "")
+        + """
         ORDER BY ts DESC, id DESC
         LIMIT %s
-    """
-    params.append(limit)
+        """
+    )
+    params.append(limit_i)
 
     with dict_cursor_only() as cur:
         cur.execute(sql, params)
@@ -2639,9 +2565,9 @@ def insert_regime_snapshot(
             (
                 ts,
                 str(regime),
-                _json_dumps(dict(state or {})),
+                _json_dumps(_as_json_map(state)),
                 session_id,
-                _json_dumps(dict(extra or {})),
+                _json_dumps(_as_json_map(extra)),
             ),
         )
         row = cur.fetchone()
@@ -2650,21 +2576,28 @@ def insert_regime_snapshot(
 
 @_softfail_read([])
 def fetch_recent_regime_snapshots(*, limit: int = 200, regime: str | None = None) -> list[Row]:
-    limit = max(1, min(int(limit), 2000))
+    limit_i = _clamp_int(limit, 1, 2000)
+
     clauses: list[str] = []
     params: list[Any] = []
     if regime:
         clauses.append("regime = %s")
         params.append(regime)
-    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    sql = f"""
+
+    where_sql = _mk_where_sql(clauses)
+
+    sql = (
+        """
         SELECT id, ts, regime, state, session_id, extra
         FROM regime_snapshots
-        {where_sql}
+        """
+        + (where_sql + "\n" if where_sql else "")
+        + """
         ORDER BY ts DESC, id DESC
         LIMIT %s
-    """
-    params.append(limit)
+        """
+    )
+    params.append(limit_i)
 
     with dict_cursor_only() as cur:
         cur.execute(sql, params)
@@ -2705,7 +2638,7 @@ def log_ai_event(
                 experiment_tag,
                 src,
                 regime,
-                _json_dumps(dict(payload or {})),
+                _json_dumps(_as_json_map(payload)),
             ),
         )
         row = cur.fetchone()
@@ -2718,27 +2651,33 @@ def fetch_ai_event_summary(
     days_back: int = 30,
     event_types: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
-    days_back = max(1, min(int(days_back), 365))
+    days_i = _clamp_int(days_back, 1, 365)
 
     clauses: list[str] = ["ts >= now() - (%s::interval)"]
-    params: list[Any] = [f"{days_back} days"]
+    params: list[Any] = [f"{days_i} days"]
     if event_types:
         clauses.append("event_type = ANY(%s)")
         params.append(list(event_types))
 
-    where_sql = "WHERE " + " AND ".join(clauses)
-    sql = f"""
+    where_sql = _mk_where_sql(clauses)
+
+    sql = (
+        """
         SELECT event_type, count(*) AS n_events, min(ts) AS first_ts, max(ts) AS last_ts
         FROM ai_events
-        {where_sql}
+        """
+        + (where_sql + "\n" if where_sql else "")
+        + """
         GROUP BY event_type
         ORDER BY event_type
-    """
+        """
+    )
 
     out: list[dict[str, Any]] = []
     with cursor_only() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall() or []
+
     for event_type, n_events, first_ts, last_ts in rows:
         out.append(
             {
@@ -2775,11 +2714,11 @@ def insert_strategy_param(
             """,
             (
                 str(key),
-                _json_dumps(dict(value or {})),
+                _json_dumps(_as_json_map(value)),
                 src,
                 regime,
                 session_id,
-                _json_dumps(dict(extra or {})),
+                _json_dumps(_as_json_map(extra)),
             ),
         )
         row = cur.fetchone()
@@ -2788,24 +2727,33 @@ def insert_strategy_param(
 
 @_softfail_read([])
 def fetch_latest_strategy_params(*, key: str | None = None, limit: int = 50) -> list[Row]:
-    limit = max(1, min(int(limit), 500))
+    limit_i = _clamp_int(limit, 1, 500)
+
     clauses: list[str] = []
     params: list[Any] = []
     if key:
         clauses.append("key = %s")
         params.append(str(key))
-    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    sql = f"""
+
+    where_sql = _mk_where_sql(clauses)
+
+    sql = (
+        """
         SELECT id, ts, key, value, src, regime, session_id, extra
         FROM strategy_params
-        {where_sql}
+        """
+        + (where_sql + "\n" if where_sql else "")
+        + """
         ORDER BY ts DESC, id DESC
         LIMIT %s
-    """
-    params.append(limit)
+        """
+    )
+    params.append(limit_i)
+
     with dict_cursor_only() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall() or []
+
     out: list[Row] = []
     for r in rows:
         rr = dict(r)
@@ -2840,10 +2788,10 @@ def insert_risk_assessment(
                 symbol,
                 score,
                 verdict,
-                _json_dumps(dict(details or {})),
+                _json_dumps(_as_json_map(details)),
                 model_tag,
                 session_id,
-                _json_dumps(dict(extra or {})),
+                _json_dumps(_as_json_map(extra)),
             ),
         )
         row = cur.fetchone()
@@ -2852,24 +2800,33 @@ def insert_risk_assessment(
 
 @_softfail_read([])
 def fetch_latest_risk_assessments(*, mint: str | None = None, limit: int = 100) -> list[Row]:
-    limit = max(1, min(int(limit), 1000))
+    limit_i = _clamp_int(limit, 1, 1000)
+
     clauses: list[str] = []
     params: list[Any] = []
     if mint:
         clauses.append("mint = %s")
         params.append(str(mint))
-    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    sql = f"""
+
+    where_sql = _mk_where_sql(clauses)
+
+    sql = (
+        """
         SELECT id, ts, mint, symbol, score, verdict, details, model_tag, session_id, extra
         FROM risk_assessments
-        {where_sql}
+        """
+        + (where_sql + "\n" if where_sql else "")
+        + """
         ORDER BY ts DESC, id DESC
         LIMIT %s
-    """
-    params.append(limit)
+        """
+    )
+    params.append(limit_i)
+
     with dict_cursor_only() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall() or []
+
     out: list[Row] = []
     for r in rows:
         rr = dict(r)
@@ -3007,7 +2964,7 @@ def fetch_training_rows(
     wallet_tag: str | None = None,
     session_id: str | None = None,
 ) -> list[Row]:
-    limit = max(1, min(int(limit), 10_000))
+    limit_i = _clamp_int(limit, 1, 10_000)
     min_feature_version = _effective_min_feature_version(min_feature_version)
 
     join_type = "JOIN" if require_outcome else "LEFT JOIN"
@@ -3039,10 +2996,11 @@ def fetch_training_rows(
         clauses.append("o.label = ANY(%s)")
         params.append(list(label_in))
 
-    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    where_sql = _mk_where_sql(clauses)
     max_dd_expr = _sql_safe_float("(o.extra->>'max_dd_pct')")
 
-    sql = f"""
+    sql = (
+        f"""
         SELECT
             c.id AS id,
             c.ts AS ts,
@@ -3062,11 +3020,14 @@ def fetch_training_rows(
         FROM entry_candidates c
         {join_type} entry_outcomes o
           ON o.candidate_id = c.id
-        {where_sql}
+        """
+        + (where_sql + "\n" if where_sql else "")
+        + """
         ORDER BY c.ts DESC, c.id DESC
         LIMIT %s
-    """
-    params.append(limit)
+        """
+    )
+    params.append(limit_i)
 
     with dict_cursor_only() as cur:
         cur.execute(sql, params)
@@ -3192,10 +3153,11 @@ def iter_backtest_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
         except Exception:
             pass
 
-    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    where_sql = _mk_where_sql(clauses)
     max_dd_expr = _sql_safe_float("(o.extra->>'max_dd_pct')")
 
-    sql = f"""
+    sql = (
+        f"""
         SELECT
             c.id,
             c.ts,
@@ -3215,24 +3177,32 @@ def iter_backtest_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
         FROM entry_candidates c
         {join_type} entry_outcomes o
           ON o.candidate_id = c.id
-        {where_sql}
+        """
+        + (where_sql + "\n" if where_sql else "")
+        + """
         ORDER BY c.ts ASC, c.id ASC
         LIMIT %s
-    """
+        """
+    )
     params2 = [*list(params), limit]
 
     def _gen() -> Iterator[Mapping[str, Any]]:
-        conn: _PGConn | None = None
+        conn: _ConnLike | None = None
         cur: Any | None = None
         try:
             conn = _connect()
 
+            iterator: Iterator[Any]
+
             if _PG_DRIVER == "psycopg2":
                 cur_name = f"ai_db_backtest_cursor_{os.getpid()}"
                 cur = conn.cursor(name=cur_name)
-                cur.itersize = 2000
+                try:
+                    cur.itersize = 2000
+                except Exception:
+                    pass
                 cur.execute(sql, params2)
-                iterator = cur
+                iterator = iter(cur)
             else:
                 cur = conn.cursor()
                 cur.execute(sql, params2)
@@ -3250,7 +3220,7 @@ def iter_backtest_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
             for r in iterator:
                 (
                     cid,
-                    ts,
+                    ts_val,
                     src_val,
                     mint_val,
                     symbol_val,
@@ -3267,8 +3237,8 @@ def iter_backtest_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
                 ) = r
                 yield {
                     "id": int(cid),
-                    "created_at": ts,
-                    "ts": ts,
+                    "created_at": ts_val,
+                    "ts": ts_val,
                     "src": src_val,
                     "mint": mint_val,
                     "symbol": symbol_val,
@@ -3280,29 +3250,25 @@ def iter_backtest_rows(config: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]
                     "raw": _ensure_obj(raw_json),
                     "label": label,
                     "pnl_pct": float(pnl_pct) if pnl_pct is not None else None,
-                    "hold_sec": float(hold_sec) if hold_sec is not None else None,
+                    "hold_sec": int(hold_sec) if hold_sec is not None else None,
                     "max_dd_pct": float(max_dd_pct) if max_dd_pct is not None else None,
                 }
         except Exception:
             log.exception("iter_backtest_rows failed")
             return
         finally:
-            try:
+            with suppress(Exception):
                 if cur is not None:
                     cur.close()
-            except Exception:
-                pass
-            try:
+            with suppress(Exception):
                 if conn is not None:
                     conn.close()
-            except Exception:
-                pass
 
     return _gen()
 
 
 def iter_training_rows(config: Mapping[str, Any]) -> Iterator[Row]:
-    rows = fetch_training_rows(
+    rows: list[Row] = fetch_training_rows(
         limit=int(config.get("limit") or 2000),
         require_outcome=bool(config.get("require_outcome", True)),
         min_feature_version=config.get("min_feature_version"),
@@ -3363,11 +3329,11 @@ def fetch_basic_stats(
     wallet_tag: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
-    days_back = max(1, min(int(days_back), 365))
+    days_i = _clamp_int(days_back, 1, 365)
     min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: list[str] = ["o.ts >= now() - (%s::interval)"]
-    params: list[Any] = [f"{days_back} days"]
+    params: list[Any] = [f"{days_i} days"]
 
     if src:
         clauses.append("c.src = %s")
@@ -3385,10 +3351,10 @@ def fetch_basic_stats(
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
 
-    where_sql = "WHERE " + " AND ".join(clauses)
-    win_labels = list(WIN_LABELS)
+    where_sql = _mk_where_sql(clauses)
+    win_labels = [str(x).lower() for x in WIN_LABELS]
 
-    sql = f"""
+    sql = """
         SELECT
             count(*) AS n_total,
             count(*) FILTER (WHERE o.label IS NOT NULL) AS n_labeled,
@@ -3398,8 +3364,7 @@ def fetch_basic_stats(
             avg(o.hold_sec) AS avg_hold_sec
         FROM entry_outcomes o
         JOIN entry_candidates c ON c.id = o.candidate_id
-        {where_sql}
-    """
+        """ + (where_sql + "\n" if where_sql else "")
 
     with cursor_only() as cur:
         cur.execute(sql, [win_labels, *params])
@@ -3436,11 +3401,11 @@ def fetch_label_distribution(
     wallet_tag: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, int]:
-    days_back = max(1, min(int(days_back), 365))
+    days_i = _clamp_int(days_back, 1, 365)
     min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: list[str] = ["o.ts >= now() - (%s::interval)"]
-    params: list[Any] = [f"{days_back} days"]
+    params: list[Any] = [f"{days_i} days"]
 
     if src:
         clauses.append("c.src = %s")
@@ -3458,14 +3423,19 @@ def fetch_label_distribution(
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
 
-    where_sql = "WHERE " + " AND ".join(clauses)
-    sql = f"""
+    where_sql = _mk_where_sql(clauses)
+
+    sql = (
+        """
         SELECT o.label, count(*) AS n
         FROM entry_outcomes o
         JOIN entry_candidates c ON c.id = o.candidate_id
-        {where_sql}
+        """
+        + (where_sql + "\n" if where_sql else "")
+        + """
         GROUP BY o.label
-    """
+        """
+    )
 
     out: dict[str, int] = {}
     with cursor_only() as cur:
@@ -3486,11 +3456,11 @@ def fetch_outcome_coverage(
     wallet_tag: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
-    days_back = max(1, min(int(days_back), 365))
+    days_i = _clamp_int(days_back, 1, 365)
     min_feature_version = _effective_min_feature_version(min_feature_version)
 
     clauses: list[str] = ["c.ts >= now() - (%s::interval)"]
-    params: list[Any] = [f"{days_back} days"]
+    params: list[Any] = [f"{days_i} days"]
 
     if src:
         clauses.append("c.src = %s")
@@ -3508,13 +3478,13 @@ def fetch_outcome_coverage(
         clauses.append("c.feature_version >= %s")
         params.append(int(min_feature_version))
 
-    where_sql = "WHERE " + " AND ".join(clauses)
-    sql = f"""
+    where_sql = _mk_where_sql(clauses)
+
+    sql = """
         SELECT count(*) AS n_candidates, count(o.id) AS n_labeled
         FROM entry_candidates c
         LEFT JOIN entry_outcomes o ON o.candidate_id = c.id
-        {where_sql}
-    """
+        """ + (where_sql + "\n" if where_sql else "")
 
     with cursor_only() as cur:
         cur.execute(sql, params)
@@ -3527,7 +3497,7 @@ def fetch_outcome_coverage(
     n_labeled_i = int(n_labeled or 0)
     coverage = float(n_labeled_i) / float(n_candidates_i) if n_candidates_i else 0.0
     return {
-        "days_back": days_back,
+        "days_back": days_i,
         "n_candidates": n_candidates_i,
         "n_labeled": n_labeled_i,
         "coverage": coverage,
@@ -3536,7 +3506,7 @@ def fetch_outcome_coverage(
 
 @_softfail_read({"days_back": 30, "n_exit_events": 0, "sell_like": 0, "stop_like": 0})
 def fetch_exit_event_stats(*, days_back: int = 30) -> dict[str, Any]:
-    days_back = max(1, min(int(days_back), 365))
+    days_i = _clamp_int(days_back, 1, 365)
     sql = """
         SELECT
             count(*) AS n,
@@ -3548,13 +3518,13 @@ def fetch_exit_event_stats(*, days_back: int = 30) -> dict[str, Any]:
         WHERE ts >= now() - (%s::interval)
     """
     with cursor_only() as cur:
-        cur.execute(sql, (f"{days_back} days",))
+        cur.execute(sql, (f"{days_i} days",))
         row = cur.fetchone()
     if not row:
         raise RuntimeError("fetch_exit_event_stats: no row")
     n, sell_like, stop_like = row
     return {
-        "days_back": days_back,
+        "days_back": days_i,
         "n_exit_events": int(n or 0),
         "sell_like": int(sell_like or 0),
         "stop_like": int(stop_like or 0),
@@ -3620,7 +3590,7 @@ def get_env_scoped_dashboard() -> dict[str, Any]:
 # =============================================================================
 @_softfail_write(0)
 def prune_old_ai_data(*, max_age_days: int = 365) -> int:
-    max_age_days = max(1, int(max_age_days))
+    max_age_days_i = max(1, int(max_age_days))
     sql = """
         WITH deleted AS (
             DELETE FROM entry_candidates
@@ -3630,31 +3600,66 @@ def prune_old_ai_data(*, max_age_days: int = 365) -> int:
         SELECT count(*) FROM deleted
     """
     with cursor_only() as cur:
-        cur.execute(sql, (f"{max_age_days} days",))
+        cur.execute(sql, (f"{max_age_days_i} days",))
         row = cur.fetchone()
     return int(row[0] or 0) if row else 0
 
 
+_PRUNE_TABLES: tuple[str, ...] = (
+    "ai_events",
+    "exit_events",
+    "position_events",
+    "regime_snapshots",
+    "trade_executions",
+    "strategy_params",
+    "risk_assessments",
+)
+
+
+def _delete_older_than(cur: Any, table: str, age_days: int) -> int:
+    """Delete from a whitelisted table name; uses identifier-safe composition when available."""
+    if table not in _PRUNE_TABLES:
+        return 0
+
+    interval_val = f"{max(1, int(age_days))} days"
+
+    try:
+        from psycopg2 import sql as _sql  # type: ignore
+
+        stmt = _sql.SQL("DELETE FROM {} WHERE ts < now() - (%s::interval)").format(
+            _sql.Identifier(table)
+        )
+        cur.execute(stmt, (interval_val,))
+        return int(cur.rowcount or 0)
+    except Exception:
+        pass
+
+    try:
+        from psycopg import sql as _sql3  # type: ignore
+
+        stmt = _sql3.SQL("DELETE FROM {} WHERE ts < now() - (%s::interval)").format(
+            _sql3.Identifier(table)
+        )
+        cur.execute(stmt, (interval_val,))
+        return int(cur.rowcount or 0)
+    except Exception:
+        pass
+
+    cur.execute(  # noqa: S608
+        "DELETE FROM " + table + " WHERE ts < now() - (%s::interval)",
+        (interval_val,),
+    )
+    return int(cur.rowcount or 0)
+
+
 @_softfail_write(0)
 def prune_old_events(*, max_age_days: int = 365) -> int:
-    max_age_days = max(1, int(max_age_days))
+    max_age_days_i = max(1, int(max_age_days))
     total = 0
     with conn_cursor() as (_conn, cur):
-        for tbl in (
-            "ai_events",
-            "exit_events",
-            "position_events",
-            "regime_snapshots",
-            "trade_executions",
-            "strategy_params",
-            "risk_assessments",
-        ):
-            cur.execute(
-                f"DELETE FROM {tbl} WHERE ts < now() - (%s::interval)",
-                (f"{max_age_days} days",),
-            )
+        for tbl in _PRUNE_TABLES:
             with suppress(Exception):
-                total += int(cur.rowcount or 0)
+                total += _delete_older_than(cur, tbl, max_age_days_i)
     return int(total)
 
 

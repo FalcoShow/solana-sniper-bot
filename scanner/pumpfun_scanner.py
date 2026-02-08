@@ -1,4 +1,3 @@
-# scanner/pumpfun_scanner.py
 from __future__ import annotations
 
 """
@@ -16,63 +15,14 @@ Hard requirements
 ✅ No silent no-buy: reject buckets + periodic summaries
 ✅ Candidate dict output compatible with downstream entry pipeline
 ✅ Backwards-compatible API: scan_pumpfun / scan_once / scan_loop / shutdown
+✅ Cancellation-safe: never swallow asyncio.CancelledError
 
-Canonical candidate shape
--------------------------
-We emit a dict that is compatible with typical downstream expectations AND can be
-adapted to scanner/registry.py Candidate later without drift.
-
-At minimum we emit:
+Canonical candidate shape (minimum)
+-----------------------------------
   - chain, dex, mint, symbol, pair_url, scan_ts, source, scanner, scanner_version
   - liq_usd, mcap_usd, token_age_min
   - vol_5m_usd, buys_5m, sells_5m, txns_5m
   - price_usd, price_change_5m_pct
-
-Env (high impact)
------------------
-PUMPFUN_ENABLED=1
-PUMPFUN_MODE=off|simple|alpha|full       (default: full)
-PUMP_PROVIDER=auto|pumpportal|http       (default: auto)
-PUMP_WS_URL=wss://pumpportal.fun/api/data
-
-Scoring gates
--------------
-PUMPFUN_SCORING_ENABLED=1
-PUMPFUN_SCORING_MAX_PER_SCAN=80
-PUMPFUN_SCORING_CONCURRENCY=6
-PUMPFUN_SCORING_MIN_COMBINED=55
-PUMPFUN_SCORING_MIN_LABEL=YELLOW|GREEN|RED
-
-Runner limits / dedupe
-----------------------
-PUMPFUN_MAX_RUNNERS=25
-PUMPFUN_RUNNER_DEDUP_ENABLED=1
-PUMPFUN_RUNNER_DEDUP_SEC=180
-PUMPFUN_REDIS_PREFIX=pumpfun
-
-Optional enrichers
-------------------
-PUMPFUN_AI_RUG_ENABLED=0/1
-PUMPFUN_AI_RUG_MAX_PER_SCAN=20
-PUMPFUN_MAX_AI_RUG=0.88
-PUMPFUN_SMART_WALLETS_ENRICH=1
-PUMPFUN_SMART_WALLETS_MAX_PER_SCAN=80
-
-HTTP fallback (OFF unless configured)
--------------------------------------
-PUMPFUN_HTTP_BASE_URLS=https://your-service.example.com
-(then scanner will call {base}/candidates returning list[dict])
-
-Additional reliability knobs (optional)
----------------------------------------
-PUMPPORTAL_RECEIVE_TIMEOUT_S=30
-PUMPPORTAL_MAX_MSG_SIZE_BYTES=8388608
-PUMPFUN_WHALE_MIN_SOL=3.0
-
-Notes
------
-- This module intentionally never hard-depends on optional utilities.
-- If scoring_service is missing, we fall back to pair_filters; then to a heuristic picker.
 """
 
 import asyncio
@@ -85,56 +35,79 @@ import re
 import ssl
 import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from math import log1p
-from typing import Any
+from typing import Any, Protocol, TypedDict, cast
 
 import aiohttp
 import certifi
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Logger (safe)
-# ──────────────────────────────────────────────────────────────────────────────
-try:
-    from logging_setup import get_logger  # type: ignore
-
-    _log = get_logger("scanner.pumpfun")
-except Exception:  # pragma: no cover
-    _log = logging.getLogger("scanner.pumpfun")
-    if not _log.handlers:
-        logging.basicConfig(level=logging.INFO)
+# =============================================================================
+# Logging (NO monkey-patching)
+# =============================================================================
 
 
-def _ensure_logger_helpers() -> None:
-    # Provide event/every shims if your logger doesn't implement them
-    if not hasattr(_log, "event"):
-
-        def _event(name: str, **kw: Any) -> None:  # pragma: no cover
-            with contextlib.suppress(Exception):
-                _log.info("%s %s", name, kw)
-
-        _log.event = _event  # type: ignore[attr-defined]
-
-    if not hasattr(_log, "every"):
-
-        def _every(
-            key: str, n: int = 60, msg: str | None = None, **kw: Any
-        ) -> None:  # pragma: no cover
-            now = time.time()
-            store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
-            last = float(store.get(key, 0.0))
-            if (now - last) >= float(n):
-                store[key] = now
-                _every._store = store  # type: ignore[attr-defined]
-                with contextlib.suppress(Exception):
-                    _log.event(msg or key, **kw)  # type: ignore[attr-defined]
-
-        _log.every = _every  # type: ignore[attr-defined]
+class _BaseLogger(Protocol):
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
 
 
-_ensure_logger_helpers()
+class EventLogger:
+    """
+    Wrapper that provides .event() and .every() WITHOUT mutating the underlying logger.
+
+    This avoids Phase-2 "logger monkey patch hotspots" while preserving the same call-site API.
+    """
+
+    __slots__ = ("_log", "_every_store")
+
+    def __init__(self, base: _BaseLogger) -> None:
+        self._log = base
+        self._every_store: dict[str, float] = {}
+
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._log.info(msg, *args, **kwargs)
+
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._log.warning(msg, *args, **kwargs)
+
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._log.error(msg, *args, **kwargs)
+
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._log.exception(msg, *args, **kwargs)
+
+    def event(self, name: str, **kw: Any) -> None:
+        # Compact structured log without requiring custom logger methods.
+        with contextlib.suppress(Exception):
+            self._log.info("%s %s", name, kw)
+
+    def every(self, key: str, n: float = 60.0, msg: str | None = None, **kw: Any) -> None:
+        now = time.time()
+        last = float(self._every_store.get(key, 0.0))
+        if (now - last) >= float(n):
+            self._every_store[key] = now
+            self.event(msg or key, **kw)
+
+
+def _make_logger(name: str) -> EventLogger:
+    base: _BaseLogger
+    try:
+        from logging_setup import get_logger  # type: ignore
+
+        base = cast(_BaseLogger, get_logger(name))
+    except Exception:  # pragma: no cover
+        base = logging.getLogger(name)
+        if not getattr(base, "handlers", None):
+            logging.basicConfig(level=logging.INFO)
+    return EventLogger(base)
+
+
+LOG = _make_logger("scanner.pumpfun")
 
 
 def _short(x: Any, n: int = 240) -> str:
@@ -145,9 +118,9 @@ def _short(x: Any, n: int = 240) -> str:
         return "<?>"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Safe config import (NO side effects required)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 try:
     import config as C  # type: ignore
 except Exception:  # pragma: no cover
@@ -158,13 +131,16 @@ except Exception:  # pragma: no cover
     C = _C()  # type: ignore
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Optional modules (soft imports)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+alert_manager_cls: type[Any] | None = None
 try:
-    from utils_pkg.alert_manager import AlertManager  # type: ignore
+    from utils_pkg.alert_manager import AlertManager as _AlertManager  # type: ignore
 except Exception:  # pragma: no cover
-    AlertManager = None  # type: ignore
+    pass
+else:
+    alert_manager_cls = _AlertManager
 
 try:
     from utils_pkg.pair_filters import (  # type: ignore
@@ -187,17 +163,17 @@ except Exception:  # pragma: no cover
 try:
     from utils_pkg.scoring_service import score_candidate  # type: ignore
 except Exception:  # pragma: no cover
-    score_candidate = None  # type: ignore
+    score_candidate = None  # type: ignore[assignment]
 
 try:
     from utils_pkg import data_logger  # type: ignore
 except Exception:  # pragma: no cover
-    data_logger = None  # type: ignore
+    data_logger = None  # type: ignore[assignment]
 
 try:
     from utils_pkg.data_logger import log_event as _log_event  # type: ignore
 except Exception:  # pragma: no cover
-    _log_event = None  # type: ignore
+    _log_event = None  # type: ignore[assignment]
 
 try:
     from utils_pkg.regime import regime_state  # type: ignore
@@ -219,40 +195,46 @@ except Exception:  # pragma: no cover
                 "regime_label": "unknown",
             }
 
-    regime_state = _DummyRegimeState()  # type: ignore
+    regime_state = _DummyRegimeState()  # type: ignore[assignment]
+
 
 try:
     from utils_pkg.risk_manager import risk_capacity_snapshot  # type: ignore
 except Exception:  # pragma: no cover
 
-    async def risk_capacity_snapshot(_redis=None) -> dict[str, Any]:  # type: ignore
+    async def risk_capacity_snapshot(_redis: Any = None) -> dict[str, Any]:  # type: ignore
         return {"risk_capacity": 1.0, "risk_shutdown": False, "risk_mode": "normal"}
 
 
 try:
     from utils_pkg import smart_wallets as SW  # type: ignore
 except Exception:  # pragma: no cover
-    SW = None  # type: ignore
+    SW = None  # type: ignore[assignment]
 
+AiFraudScoreFn = Callable[..., Any]
+
+ai_fraud_score: AiFraudScoreFn | None = None
 try:
-    from utils_pkg.core_utils import ai_fraud_score  # type: ignore
+    from utils_pkg.core_utils import ai_fraud_score as _ai_fraud_score  # type: ignore
 except Exception:  # pragma: no cover
-    ai_fraud_score = None  # type: ignore
+    pass
+else:
+    ai_fraud_score = _ai_fraud_score
 
 try:
     from utils_pkg import core_utils as _cu  # type: ignore
 except Exception:  # pragma: no cover
-    _cu = None  # type: ignore
+    _cu = None  # type: ignore[assignment]
 
 try:
     from utils_pkg.mints import normalize_mint as _normalize_mint  # type: ignore
 except Exception:  # pragma: no cover
-    _normalize_mint = None  # type: ignore
+    _normalize_mint = None  # type: ignore[assignment]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Env helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
 
 
@@ -270,18 +252,26 @@ def _s(name: str, default: str = "") -> str:
 
 def _i(name: str, default: int) -> int:
     v = os.getenv(name)
-    try:
-        return int(v) if v not in (None, "") else default
-    except Exception:
+    if v is None:
         return default
+    vv = v.strip()
+    if not vv:
+        return default
+    with contextlib.suppress(Exception):
+        return int(vv)
+    return default
 
 
 def _f(name: str, default: float) -> float:
     v = os.getenv(name)
-    try:
-        return float(v) if v not in (None, "") else default
-    except Exception:
+    if v is None:
         return default
+    vv = v.strip()
+    if not vv:
+        return default
+    with contextlib.suppress(Exception):
+        return float(vv)
+    return default
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -291,16 +281,15 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 def _nz(x: Any, d: float = 0.0) -> float:
     try:
         v = float(x)
-        return d if v != v else v  # NaN check
+        return d if v != v else v  # NaN -> default
     except Exception:
         return d
 
 
 def _safe_int(x: Any, d: int = 0) -> int:
-    try:
+    with contextlib.suppress(Exception):
         return int(x)
-    except Exception:
-        return d
+    return d
 
 
 async def _maybe_await(x: Any) -> Any:
@@ -309,8 +298,8 @@ async def _maybe_await(x: Any) -> Any:
 
 async def _call_maybe_async(fn: Any, *a: Any, **k: Any) -> Any:
     """
-    Calls fn whether it's sync or async; returns None on exception.
-    NOTE: Cancellation is respected (we do NOT swallow CancelledError).
+    Call fn whether it's sync or async; return None on exception.
+    Cancellation is respected (we do NOT swallow CancelledError).
     """
     if fn is None:
         return None
@@ -324,25 +313,43 @@ async def _call_maybe_async(fn: Any, *a: Any, **k: Any) -> Any:
         return None
 
 
+async def _gather_no_cancel(tasks: list[asyncio.Task[Any]]) -> None:
+    """
+    Gather tasks but NEVER swallow CancelledError.
+    Other exceptions are allowed (fail-open enrichment/scoring).
+    """
+    if not tasks:
+        return
+    res = await asyncio.gather(*tasks, return_exceptions=True)
+    for r in res:
+        if isinstance(r, asyncio.CancelledError):
+            raise r
+
+
 @lru_cache(maxsize=1)
 def _sslctx() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=certifi.where())
 
 
+# =============================================================================
+# Identity / schema
+# =============================================================================
 BASE58_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Identity / schema
-# ──────────────────────────────────────────────────────────────────────────────
 SCANNER_NAME = "pumpfun_scanner"
 SCANNER_VERSION = "v3+++_pumpportal_lockin"
 CANDIDATE_SCHEMA = "CandidateSnapshot.v1"
 
+_OFFLINE_ENV_KEYS = ("SAFE_MODE", "OFFLINE_MODE", "NO_NETWORK", "DRY_RUN")
 
-# ──────────────────────────────────────────────────────────────────────────────
+
+def _offline_mode() -> bool:
+    return any(_b(k, False) for k in _OFFLINE_ENV_KEYS)
+
+
+# =============================================================================
 # Config
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 @dataclass(frozen=True)
 class PumpfunScannerConfig:
     enabled: bool
@@ -352,7 +359,6 @@ class PumpfunScannerConfig:
     ws_url: str
     sub_migrations: bool
 
-    # WS state bounds
     snap_max: int
     max_tokens: int
     max_trades_per_token: int
@@ -363,29 +369,24 @@ class PumpfunScannerConfig:
 
     receive_timeout_s: float
     max_msg_size_bytes: int
-
     user_agent: str
 
-    # soft filters (don’t kill unknowns)
     soft_min_liq_usd: float
     soft_min_mcap_usd: float
     soft_max_age_min: float
     hard_max_age_min: float
 
-    # heuristic fallback gates
     fb_min_buys_5m: int
     fb_min_vol5_usd: float
     fb_max_runners: int
     fb_max_impact_1k_bps: float
 
-    # scoring service
     scoring_enabled: bool
     scoring_max_per_scan: int
     scoring_concurrency: int
     scoring_min_combined: float
     scoring_min_label: str
 
-    # enrichers
     ai_rug_enabled: bool
     ai_rug_max_per_scan: int
     max_ai_rug: float
@@ -393,23 +394,19 @@ class PumpfunScannerConfig:
     smart_wallets_enrich: bool
     smart_wallets_max_per_scan: int
 
-    # runner limit + dedupe
     max_runners: int
     runner_dedupe_enabled: bool
     runner_dedupe_sec: int
     redis_prefix: str
 
-    # alerts
     send_momo_alerts: bool
     max_alerts_per_scan: int
     alert_dedupe_sec: float
 
-    # debug/telemetry
     debug_meta_sample: bool
     debug_result: bool
     log_scan_summary: bool
 
-    # http fallback
     http_base_urls: tuple[str, ...]
     http_timeout_s: float
     http_retries: int
@@ -417,10 +414,7 @@ class PumpfunScannerConfig:
     http_conn_limit: int
     http_trust_env: bool
 
-    # phase
     phase: int
-
-    # whale thresholds
     whale_min_sol: float
 
     @staticmethod
@@ -435,7 +429,6 @@ class PumpfunScannerConfig:
         if provider not in {"auto", "pumpportal", "http"}:
             provider = "auto"
 
-        # legacy C defaults (if present)
         pf_min_liq = float(getattr(C, "PF_SCAN_MIN_LIQ_USD", 2500.0) or 2500.0)
         pf_min_mcap = float(getattr(C, "PF_SCAN_MIN_MCAP_USD", 0.0) or 0.0)
         pf_max_age = float(getattr(C, "PF_SCAN_MAX_TOKEN_AGE_MIN", 0.0) or 0.0)
@@ -453,6 +446,9 @@ class PumpfunScannerConfig:
         whale_default = float(getattr(C, "PF_SCAN_MIN_WHALE_SIZE_SOL", 3.0) or 3.0)
         whale_min_sol = max(0.0, _f("PUMPFUN_WHALE_MIN_SOL", whale_default))
 
+        max_msg_default = 8 * 1024 * 1024
+        max_msg_size = _i("PUMPPORTAL_MAX_MSG_SIZE_BYTES", max_msg_default)
+
         return PumpfunScannerConfig(
             enabled=enabled,
             mode=mode,
@@ -467,12 +463,13 @@ class PumpfunScannerConfig:
             connect_timeout_s=max(2.0, _f("PUMPPORTAL_CONNECT_TIMEOUT_S", 8.0)),
             heartbeat_s=max(10.0, _f("PUMPPORTAL_HEARTBEAT_S", 25.0)),
             receive_timeout_s=max(5.0, _f("PUMPPORTAL_RECEIVE_TIMEOUT_S", 30.0)),
-            max_msg_size_bytes=max(64 * 1024, _i("PUMPPORTAL_MAX_MSG_SIZE_BYTES", 8 * 1024 * 1024)),
+            max_msg_size_bytes=max(64 * 1024, max_msg_size),
             user_agent=_s("PUMPFUN_UA", "pnlsniper"),
             soft_min_liq_usd=_f("PUMPFUN_SOFT_MIN_LIQ_USD", max(0.0, pf_min_liq * 0.4)),
             soft_min_mcap_usd=_f("PUMPFUN_SOFT_MIN_MCAP_USD", max(0.0, pf_min_mcap * 0.4)),
             soft_max_age_min=_f(
-                "PUMPFUN_SOFT_MAX_AGE_MIN", pf_max_age * 1.2 if pf_max_age > 0 else 0.0
+                "PUMPFUN_SOFT_MAX_AGE_MIN",
+                (pf_max_age * 1.2) if pf_max_age > 0 else 0.0,
             ),
             hard_max_age_min=_f("PUMPFUN_HARD_MAX_AGE_MIN", 0.0),
             fb_min_buys_5m=max(0, _i("PUMPFUN_FB_MIN_BUYS_5M", 1)),
@@ -516,12 +513,19 @@ _LABEL_LEVEL = {"RED": 0, "YELLOW": 1, "GREEN": 2}
 _REQUIRED_LABEL_LEVEL = _LABEL_LEVEL.get(CFG.scoring_min_label, 0)
 
 _recent_alert_ts: dict[str, float] = {}
-_recent_alert_lock = asyncio.Lock()
+_recent_alert_lock: asyncio.Lock | None = None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+def _alert_lock() -> asyncio.Lock:
+    global _recent_alert_lock
+    if _recent_alert_lock is None:
+        _recent_alert_lock = asyncio.Lock()
+    return _recent_alert_lock
+
+
+# =============================================================================
 # Reject buckets (kill silent no-buy)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 @dataclass
 class RejectBuckets:
     counts: dict[str, int] = field(default_factory=dict)
@@ -530,13 +534,14 @@ class RejectBuckets:
     def inc(self, reason: str, mint: str | None = None) -> None:
         r = (reason or "UNKNOWN").strip()
         self.counts[r] = int(self.counts.get(r, 0)) + 1
-        if mint:
-            arr = self.samples.get(r)
-            if arr is None:
-                arr = []
-                self.samples[r] = arr
-            if len(arr) < 4 and mint not in arr:
-                arr.append(mint)
+        if not mint:
+            return
+        arr = self.samples.get(r)
+        if arr is None:
+            arr = []
+            self.samples[r] = arr
+        if len(arr) < 4 and mint not in arr:
+            arr.append(mint)
 
 
 @dataclass
@@ -557,9 +562,9 @@ class ScanStats:
     rejects: RejectBuckets = field(default_factory=RejectBuckets)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Redis helpers (optional sync/async clients)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 async def _redis_get(redis: Any, key: str) -> str | None:
     if redis is None:
         return None
@@ -592,9 +597,9 @@ async def _redis_setex(redis: Any, key: str, ttl: int, value: str) -> None:
         return
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Regime + SOL price (best effort)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 async def _regime_snapshot() -> dict[str, Any]:
     try:
         feats = await _call_maybe_async(getattr(regime_state, "features", None))
@@ -613,7 +618,11 @@ async def _regime_snapshot() -> dict[str, Any]:
         pass
 
     with contextlib.suppress(Exception):
-        return {"label": regime_state.get(), "label_numeric": 0.0, "manipulation_risk": 0.0}
+        return {
+            "label": str(regime_state.get()),
+            "label_numeric": 0.0,
+            "manipulation_risk": 0.0,
+        }
 
     return {"label": "unknown", "label_numeric": 0.0, "manipulation_risk": 0.0}
 
@@ -628,12 +637,10 @@ async def _sol_usd() -> float:
             fn = getattr(_cu, name, None)
             if callable(fn):
                 out = await _call_maybe_async(fn)
-                try:
+                with contextlib.suppress(Exception):
                     p = float(out)
                     if p > 0:
                         return p
-                except Exception:
-                    pass
     return 0.0
 
 
@@ -660,10 +667,10 @@ def _dynamic_min_combined(base: float, regime: dict[str, Any], risk_capacity: fl
     return float(_clamp(base + delta, 0.0, 100.0))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # PumpPortal WS client (single conn; bounded state)
-# ──────────────────────────────────────────────────────────────────────────────
-@dataclass
+# =============================================================================
+@dataclass(frozen=True)
 class Trade:
     ts: float
     side: str  # buy|sell|?
@@ -694,9 +701,9 @@ class TokenState:
 class PumpPortalClient:
     """
     Dedicated background WS loop. Safe to call ensure_started() many times.
-    snapshot() is lock-protected to avoid races with the WS update loop.
+    snapshot() returns copies to avoid iterating over mutable state mid-update.
 
-    LOCK-IN: close() awaits task cancellation and guarantees ws+session closure.
+    LOCK-IN: close() cancels task and guarantees ws+session closure.
     """
 
     def __init__(self) -> None:
@@ -718,21 +725,19 @@ class PumpPortalClient:
         self._last_connect_ts: float = 0.0
 
     async def ensure_started(self) -> None:
+        if _offline_mode():
+            return
         async with self._start_lock:
             if self._task and not self._task.done():
                 return
             self._stop.clear()
             self._ready.clear()
             self._task = asyncio.create_task(self._run_loop(), name="pumpportal_ws")
-
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(self._ready.wait(), timeout=CFG.connect_timeout_s)
+            await asyncio.wait_for(self._ready.wait(), timeout=float(CFG.connect_timeout_s))
 
     async def close(self) -> None:
-        """
-        Full shutdown: stop loop, cancel task, close ws+session, clear state.
-        Safe to call multiple times.
-        """
+        """Full shutdown: stop loop, cancel task, close ws+session, clear state."""
         self._stop.set()
 
         async with self._start_lock:
@@ -779,32 +784,38 @@ class PumpPortalClient:
         }
 
     async def snapshot(self, *, max_items: int) -> list[TokenState]:
+        """
+        Return copies of newest token states to avoid races with the WS loop.
+        """
         async with self._state_lock:
             mints = list(self._order)[-max_items:]
             out: list[TokenState] = []
             for mint in reversed(mints):
                 st = self._tokens.get(mint)
-                if st is not None:
-                    out.append(st)
+                if st is None:
+                    continue
+                out.append(
+                    TokenState(
+                        mint=st.mint,
+                        symbol=st.symbol,
+                        name=st.name,
+                        created_ts=st.created_ts,
+                        last_ts=st.last_ts,
+                        mcap_usd=st.mcap_usd,
+                        liq_usd=st.liq_usd,
+                        price_usd=st.price_usd,
+                        trades=deque(list(st.trades)),
+                    )
+                )
             return out
-
-    def _norm_mint(self, s: str) -> str:
-        v = (s or "").strip().replace(" ", "")
-        if _normalize_mint is not None:
-            with contextlib.suppress(Exception):
-                nn = _normalize_mint(v)
-                if isinstance(nn, str) and nn:
-                    return nn
-        m = BASE58_RE.search(v)
-        return m.group(0) if m else ""
 
     def _extract_mint(self, msg: dict[str, Any]) -> str:
         for k in ("mint", "mintAddress", "tokenMint", "token", "tokenAddress", "publicKey"):
             v = msg.get(k)
             if isinstance(v, str):
-                m = BASE58_RE.search(v.strip())
-                if m:
-                    return self._norm_mint(m.group(0))
+                mm = BASE58_RE.search(v.strip())
+                if mm:
+                    return mm.group(0)
 
         for k in ("data", "token", "coin", "meta"):
             v = msg.get(k)
@@ -812,14 +823,18 @@ class PumpPortalClient:
                 for kk in ("mint", "mintAddress", "tokenMint", "tokenAddress", "publicKey"):
                     vv = v.get(kk)
                     if isinstance(vv, str):
-                        m = BASE58_RE.search(vv.strip())
-                        if m:
-                            return self._norm_mint(m.group(0))
-
+                        mm = BASE58_RE.search(vv.strip())
+                        if mm:
+                            return mm.group(0)
         return ""
 
     async def _touch(
-        self, mint: str, *, symbol: str = "", name: str = "", created_ts: float = 0.0
+        self,
+        mint: str,
+        *,
+        symbol: str = "",
+        name: str = "",
+        created_ts: float = 0.0,
     ) -> TokenState:
         async with self._state_lock:
             st = self._tokens.get(mint)
@@ -874,8 +889,7 @@ class PumpPortalClient:
         await self._ws_send({"method": "subscribeTokenTrade", "keys": keys})
 
         async with self._state_lock:
-            for m in keys:
-                self._subscribed_trades.add(m)
+            self._subscribed_trades.update(keys)
 
     def _is_trade(self, msg: dict[str, Any]) -> bool:
         tx = msg.get("txType") or msg.get("side") or msg.get("type")
@@ -958,25 +972,27 @@ class PumpPortalClient:
         while not self._stop.is_set():
             ws: aiohttp.ClientWebSocketResponse | None = None
             try:
-                sess = await self._ensure_session()
+                if _offline_mode():
+                    await asyncio.sleep(1.0)
+                    continue
 
-                # ws_connect can raise before entering the context manager; keep ws local.
+                sess = await self._ensure_session()
                 self._last_err = None
                 self._last_connect_ts = time.time()
 
                 ws = await sess.ws_connect(
                     CFG.ws_url,
-                    heartbeat=CFG.heartbeat_s,
+                    heartbeat=float(CFG.heartbeat_s),
                     ssl=_sslctx(),
-                    max_msg_size=CFG.max_msg_size_bytes,
-                    timeout=CFG.connect_timeout_s,
+                    max_msg_size=int(CFG.max_msg_size_bytes),
+                    timeout=float(CFG.connect_timeout_s),
                 )
                 self._ws = ws
                 backoff = 0.8
 
                 await self._subscribe_basics()
                 self._ready.set()
-                _log.every("PUMPPORTAL_WS_CONNECTED", n=10, url=CFG.ws_url)
+                LOG.every("PUMPPORTAL_WS_CONNECTED", n=10, url=CFG.ws_url)
 
                 while not self._stop.is_set():
                     now = time.time()
@@ -1032,20 +1048,19 @@ class PumpPortalClient:
                     if self._is_trade(data):
                         t = self._parse_trade(data)
                         async with self._state_lock:
-                            st.push_trade(t, max_trades=CFG.max_trades_per_token)
+                            st.push_trade(t, max_trades=int(CFG.max_trades_per_token))
 
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self._ready.clear()
                 self._last_err = f"{type(e).__name__}:{_short(e)}"
-                _log.every(
+                LOG.every(
                     "PUMPPORTAL_WS_RECONNECT", n=5, err=_short(type(e).__name__), detail=_short(e)
                 )
                 await asyncio.sleep(backoff * (0.85 + 0.3 * random.random()))
                 backoff = min(25.0, backoff * 1.6)
             finally:
-                # LOCK-IN: always close ws for this iteration and clear pointer.
                 self._ready.clear()
                 if ws is not None:
                     with contextlib.suppress(Exception):
@@ -1072,9 +1087,31 @@ def pumpfun_scanner_health() -> dict[str, Any]:
     return {"pumpportal": (_PUMPPORTAL.stats() if _PUMPPORTAL else {"ready": False, "tokens": 0})}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Metrics + candidate normalization
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+class ExtractedMetrics(TypedDict):
+    liq_usd: float
+    mcap_usd: float
+    token_age_min: float
+    vol_5m_usd: float
+    vol_1h_usd: float
+    vol_24h_usd: float
+    buys_5m: int
+    sells_5m: int
+    txns_5m: int
+    price_usd: float
+    price_change_5m_pct: float
+    price_change_1h_pct: float
+    price_change_24h_pct: float
+    impact_1k_bps: float
+    whales_5m: int
+    largest_buy_5m_sol: float
+    buy_ratio_5m: float
+    vol_to_liq_5m: float
+    momo_hint: float
+
+
 def _age_min(ts: float | None) -> float | None:
     try:
         if ts is None or ts <= 0:
@@ -1095,7 +1132,8 @@ def _buy_ratio(buys: int, sells: int) -> float:
 def _trade_window_metrics(
     trades: Iterable[Trade], *, now: float, wsec: float, sol_usd: float
 ) -> dict[str, Any]:
-    buys = sells = 0
+    buys = 0
+    sells = 0
     vol_sol = 0.0
     prices: list[float] = []
     cutoff = now - wsec
@@ -1153,7 +1191,7 @@ def _state_to_obj(
     mcap_unknown = mcap_usd <= 0.0
 
     price_usd = float(st.price_usd or 0.0)
-    if price_usd <= 0 and m5["price_usd"] > 0:
+    if price_usd <= 0 and float(m5["price_usd"]) > 0:
         price_usd = float(m5["price_usd"])
 
     buy_ratio_5m = _buy_ratio(int(m5["buys"]), int(m5["sells"]))
@@ -1186,7 +1224,7 @@ def _state_to_obj(
     }
 
 
-def _extract_metrics(obj: dict[str, Any]) -> dict[str, Any]:
+def _extract_metrics(obj: dict[str, Any]) -> ExtractedMetrics:
     liq_usd = _nz(obj.get("liquidityUsd") or obj.get("liqUsd") or obj.get("liq_usd") or 0.0, 0.0)
     mcap_usd = _nz(
         obj.get("marketCapUsd") or obj.get("mcap_usd") or obj.get("marketCap") or 0.0, 0.0
@@ -1260,13 +1298,14 @@ def _map_obj_to_candidate(
         or ""
     )
     mint = ""
+
     if isinstance(raw_mint, str) and raw_mint:
         if _normalize_mint is not None:
             with contextlib.suppress(Exception):
                 mint = str(_normalize_mint(raw_mint))
         if not mint:
-            m = BASE58_RE.search(raw_mint.strip())
-            mint = m.group(0) if m else ""
+            mm = BASE58_RE.search(raw_mint.strip())
+            mint = mm.group(0) if mm else ""
 
     if not mint:
         stats.rejects.inc("REJ_NO_MINT")
@@ -1275,22 +1314,26 @@ def _map_obj_to_candidate(
     symbol = (obj.get("symbol") or obj.get("tokenSymbol") or obj.get("name") or mint[:6]) or mint[
         :6
     ]
-    m = _extract_metrics(obj)
+    metrics = _extract_metrics(obj)
 
     liq_unknown = bool(obj.get("liq_unknown", False))
     mcap_unknown = bool(obj.get("mcap_unknown", False))
 
     # soft filters: do not kill unknown metrics
-    if CFG.soft_min_liq_usd > 0 and (not liq_unknown) and m["liq_usd"] < CFG.soft_min_liq_usd:
+    if CFG.soft_min_liq_usd > 0 and (not liq_unknown) and metrics["liq_usd"] < CFG.soft_min_liq_usd:
         stats.rejects.inc("REJ_SOFT_LIQ", mint)
         return None
-    if CFG.soft_min_mcap_usd > 0 and (not mcap_unknown) and m["mcap_usd"] < CFG.soft_min_mcap_usd:
+    if (
+        CFG.soft_min_mcap_usd > 0
+        and (not mcap_unknown)
+        and metrics["mcap_usd"] < CFG.soft_min_mcap_usd
+    ):
         stats.rejects.inc("REJ_SOFT_MCAP", mint)
         return None
-    if CFG.soft_max_age_min > 0 and m["token_age_min"] > CFG.soft_max_age_min:
+    if CFG.soft_max_age_min > 0 and metrics["token_age_min"] > CFG.soft_max_age_min:
         stats.rejects.inc("REJ_SOFT_AGE", mint)
         return None
-    if CFG.hard_max_age_min > 0 and m["token_age_min"] > float(CFG.hard_max_age_min):
+    if CFG.hard_max_age_min > 0 and metrics["token_age_min"] > float(CFG.hard_max_age_min):
         stats.rejects.inc("REJ_HARD_AGE", mint)
         return None
 
@@ -1309,7 +1352,7 @@ def _map_obj_to_candidate(
         "regime_numeric": float(regime.get("label_numeric", 0.0)),
         "regime_manipulation": float(regime.get("manipulation_risk", 0.0)),
         "regime_ctx": dict(regime),
-        **m,
+        **metrics,
         "liq_unknown": bool(liq_unknown),
         "mcap_unknown": bool(mcap_unknown),
         # optional enrichers
@@ -1325,30 +1368,30 @@ def _map_obj_to_candidate(
         "score_reasons": None,
         "score_is_trade_viable": True,
         "score_trade_gate_reason": None,
-        # legacy aliases (avoid downstream KeyError)
-        "age_min": m["token_age_min"],
-        "chg5": m["price_change_5m_pct"],
-        "buys5": m["buys_5m"],
-        "sells5": m["sells_5m"],
-        "vol5": m["vol_5m_usd"],
-        "liq": m["liq_usd"],
+        # legacy aliases
+        "age_min": metrics["token_age_min"],
+        "chg5": metrics["price_change_5m_pct"],
+        "buys5": metrics["buys_5m"],
+        "sells5": metrics["sells_5m"],
+        "vol5": metrics["vol_5m_usd"],
+        "liq": metrics["liq_usd"],
     }
 
 
 def _dedupe_best_by_mint(metas: list[dict[str, Any]]) -> list[dict[str, Any]]:
     best: dict[str, dict[str, Any]] = {}
-    for m in metas:
-        mint = m.get("mint")
+    for meta in metas:
+        mint = meta.get("mint")
         if not isinstance(mint, str) or not mint:
             continue
         cur = best.get(mint)
         if cur is None:
-            best[mint] = m
+            best[mint] = meta
             continue
         a = (
-            float(m.get("vol_5m_usd") or 0.0),
-            int(m.get("buys_5m") or 0),
-            float(m.get("liq_usd") or 0.0),
+            float(meta.get("vol_5m_usd") or 0.0),
+            int(meta.get("buys_5m") or 0),
+            float(meta.get("liq_usd") or 0.0),
         )
         b = (
             float(cur.get("vol_5m_usd") or 0.0),
@@ -1356,22 +1399,20 @@ def _dedupe_best_by_mint(metas: list[dict[str, Any]]) -> list[dict[str, Any]]:
             float(cur.get("liq_usd") or 0.0),
         )
         if a > b:
-            best[mint] = m
+            best[mint] = meta
     return list(best.values())
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Optional enrichment (AI rug + smart wallets)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 async def _enrich_optional(metas: list[dict[str, Any]], stats: ScanStats) -> None:
     if not metas:
         return
 
     sem = asyncio.Semaphore(max(1, _i("PUMPFUN_ENRICH_CONCURRENCY", 8)))
 
-    rug_targets = (
-        metas[: CFG.ai_rug_max_per_scan] if (CFG.ai_rug_enabled and ai_fraud_score) else []
-    )
+    rug_targets = metas[: CFG.ai_rug_max_per_scan] if CFG.ai_rug_enabled else []
     rug_mints = {str(m.get("mint") or "") for m in rug_targets if str(m.get("mint") or "")}
 
     sw_tracker = None
@@ -1380,22 +1421,25 @@ async def _enrich_optional(metas: list[dict[str, Any]], stats: ScanStats) -> Non
     sw_targets = metas[: CFG.smart_wallets_max_per_scan] if sw_tracker is not None else []
     sw_mints = {str(m.get("mint") or "") for m in sw_targets if str(m.get("mint") or "")}
 
-    async def _one(m: dict[str, Any]) -> None:
-        mint = str(m.get("mint") or "")
+    async def _one(meta: dict[str, Any]) -> None:
+        mint = str(meta.get("mint") or "")
         if not mint:
             return
         async with sem:
-            if mint in rug_mints and ai_fraud_score:
-                s01 = await _call_maybe_async(ai_fraud_score, mint)
+            if mint in rug_mints and ai_fraud_score is not None:
+                # Prefer snapshot-style API, fallback to mint-style API
+                s01 = await _call_maybe_async(ai_fraud_score, dict(meta))
+                if s01 is None:
+                    s01 = await _call_maybe_async(ai_fraud_score, mint)
                 if s01 is not None:
-                    m["ai_rug_score"] = _clamp(float(s01), 0.0, 1.0)
+                    meta["ai_rug_score"] = _clamp(float(s01), 0.0, 1.0)
 
             if mint in sw_mints and sw_tracker is not None:
                 bf = getattr(sw_tracker, "build_features", None)
                 if callable(bf):
                     feats = await _call_maybe_async(bf, mint)
                     if isinstance(feats, dict):
-                        m["smart_wallet_features"] = feats
+                        meta["smart_wallet_features"] = feats
                         for k in (
                             "smart_wallet_score",
                             "smart_signal_confidence",
@@ -1406,16 +1450,15 @@ async def _enrich_optional(metas: list[dict[str, Any]], stats: ScanStats) -> Non
                             "smart_tradeable_flag",
                         ):
                             if k in feats:
-                                m[k] = feats.get(k)
+                                meta[k] = feats.get(k)
 
     tasks = [asyncio.create_task(_one(m)) for m in metas]
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    await _gather_no_cancel(tasks)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Scoring service (preferred)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 async def _score_with_service(
     metas: list[dict[str, Any]],
     *,
@@ -1427,25 +1470,27 @@ async def _score_with_service(
         return []
 
     pre: list[dict[str, Any]] = []
-    for m in metas:
-        mint = str(m.get("mint") or "")
+    for meta in metas:
+        mint = str(meta.get("mint") or "")
         try:
-            if CFG.ai_rug_enabled and float(m.get("ai_rug_score") or 0.0) >= float(CFG.max_ai_rug):
+            if CFG.ai_rug_enabled and float(meta.get("ai_rug_score") or 0.0) >= float(
+                CFG.max_ai_rug
+            ):
                 stats.rejects.inc("REJ_AI_RUG", mint)
                 continue
-            if not is_viable_pair(m):
+            if not is_viable_pair(meta):
                 stats.rejects.inc("REJ_LEGACY_VIABLE_FALSE", mint)
                 continue
-            pre.append(m)
+            pre.append(meta)
         except Exception:
-            pre.append(m)
+            pre.append(meta)
 
     pre.sort(
         key=lambda x: (float(x.get("vol_5m_usd") or 0.0), int(x.get("buys_5m") or 0)), reverse=True
     )
     targets = pre[: CFG.scoring_max_per_scan]
 
-    sem = asyncio.Semaphore(CFG.scoring_concurrency)
+    sem = asyncio.Semaphore(int(CFG.scoring_concurrency))
     out: list[dict[str, Any]] = []
 
     def _get(obj: Any, k: str, default: Any = None) -> Any:
@@ -1477,7 +1522,7 @@ async def _score_with_service(
                 raise
             except Exception as e:
                 stats.rejects.inc("REJ_SCORE_EXCEPTION", mint)
-                _log.every("PUMP_SCORE_FAIL", n=10, mint=mint, err=_short(e))
+                LOG.every("PUMP_SCORE_FAIL", n=10, mint=mint, err=_short(e))
                 return
 
         try:
@@ -1503,8 +1548,7 @@ async def _score_with_service(
             stats.rejects.inc("REJ_SCORE_MAP_FAIL", mint)
 
     tasks = [asyncio.create_task(_one(m)) for m in targets]
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    await _gather_no_cancel(tasks)
 
     return out
 
@@ -1516,12 +1560,12 @@ def _select_from_scored(
         return []
     runners: list[dict[str, Any]] = []
 
-    for m in scored:
-        mint = str(m.get("mint") or "")
+    for meta in scored:
+        mint = str(meta.get("mint") or "")
         try:
-            label = str(m.get("score_label") or "").upper() or "YELLOW"
-            combined = float(m.get("score_combined") or 0.0)
-            trade_ok = bool(m.get("score_is_trade_viable", True))
+            label = str(meta.get("score_label") or "").upper() or "YELLOW"
+            combined = float(meta.get("score_combined") or 0.0)
+            trade_ok = bool(meta.get("score_is_trade_viable", True))
 
             if not trade_ok:
                 stats.rejects.inc("REJ_TRADE_NOT_VIABLE", mint)
@@ -1532,11 +1576,13 @@ def _select_from_scored(
             if _LABEL_LEVEL.get(label, 0) < _REQUIRED_LABEL_LEVEL:
                 stats.rejects.inc("REJ_LABEL_TOO_LOW", mint)
                 continue
-            if CFG.ai_rug_enabled and float(m.get("ai_rug_score") or 0.0) >= float(CFG.max_ai_rug):
+            if CFG.ai_rug_enabled and float(meta.get("ai_rug_score") or 0.0) >= float(
+                CFG.max_ai_rug
+            ):
                 stats.rejects.inc("REJ_AI_RUG", mint)
                 continue
 
-            runners.append(m)
+            runners.append(meta)
         except Exception:
             stats.rejects.inc("REJ_SELECT_EXCEPTION", mint)
 
@@ -1544,9 +1590,9 @@ def _select_from_scored(
     return runners[: CFG.max_runners]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Legacy + heuristic fallbacks
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def _legacy_rank(metas: list[dict[str, Any]], stats: ScanStats) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for meta in metas:
@@ -1569,11 +1615,11 @@ def _legacy_rank(metas: list[dict[str, Any]], stats: ScanStats) -> list[dict[str
             rank = final + 0.2 * momentum + (0.15 if whales > 0 else 0.0)
             rank *= max(1.0, log1p(max(vol5, 1.0)) / 5.0)
 
-            m = dict(meta)
-            m["final_score"] = final
-            m["momentum_score"] = momentum
-            m["rank_score"] = float(rank)
-            out.append(m)
+            m2 = dict(meta)
+            m2["final_score"] = final
+            m2["momentum_score"] = momentum
+            m2["rank_score"] = float(rank)
+            out.append(m2)
         except Exception:
             stats.rejects.inc("REJ_LEGACY_EXCEPTION", mint)
 
@@ -1583,13 +1629,13 @@ def _legacy_rank(metas: list[dict[str, Any]], stats: ScanStats) -> list[dict[str
 
 def _fallback_pick(metas: list[dict[str, Any]], stats: ScanStats) -> list[dict[str, Any]]:
     cands: list[dict[str, Any]] = []
-    for m in metas:
-        mint = str(m.get("mint") or "")
+    for meta in metas:
+        mint = str(meta.get("mint") or "")
         try:
-            buys5 = int(m.get("buys_5m") or 0)
-            vol5 = float(m.get("vol_5m_usd") or 0.0)
-            impact = float(m.get("impact_1k_bps") or 0.0)
-            rug = float(m.get("ai_rug_score") or 0.0)
+            buys5 = int(meta.get("buys_5m") or 0)
+            vol5 = float(meta.get("vol_5m_usd") or 0.0)
+            impact = float(meta.get("impact_1k_bps") or 0.0)
+            rug = float(meta.get("ai_rug_score") or 0.0)
 
             if buys5 < CFG.fb_min_buys_5m:
                 stats.rejects.inc("REJ_FB_MIN_BUYS", mint)
@@ -1604,9 +1650,9 @@ def _fallback_pick(metas: list[dict[str, Any]], stats: ScanStats) -> list[dict[s
                 stats.rejects.inc("REJ_AI_RUG", mint)
                 continue
 
-            mm = dict(m)
-            mm.setdefault("rank_score", float(mm.get("momo_hint") or mm.get("vol_5m_usd") or 0.0))
-            cands.append(mm)
+            m2 = dict(meta)
+            m2.setdefault("rank_score", float(m2.get("momo_hint") or m2.get("vol_5m_usd") or 0.0))
+            cands.append(m2)
         except Exception:
             stats.rejects.inc("REJ_FB_EXCEPTION", mint)
 
@@ -1621,12 +1667,16 @@ def _fallback_pick(metas: list[dict[str, Any]], stats: ScanStats) -> list[dict[s
     return cands[: CFG.fb_max_runners]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Provider collectors
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 async def _collect_from_pumpportal(
     *, regime: dict[str, Any], stats: ScanStats
 ) -> tuple[list[dict[str, Any]], str]:
+    if _offline_mode():
+        stats.rejects.inc("REJ_OFFLINE_MODE")
+        return [], "pumpportal:offline"
+
     client = await _pumpportal_client()
     st = client.stats()
     if not st.get("ready", False):
@@ -1637,7 +1687,7 @@ async def _collect_from_pumpportal(
     sol_usd = await _sol_usd()
     whale_min_sol = float(CFG.whale_min_sol)
 
-    states = await client.snapshot(max_items=CFG.snap_max)
+    states = await client.snapshot(max_items=int(CFG.snap_max))
     objs = [_state_to_obj(s, sol_usd=sol_usd, now=now, whale_min_sol=whale_min_sol) for s in states]
 
     metas: list[dict[str, Any]] = []
@@ -1659,17 +1709,20 @@ async def _collect_from_http(
     regime: dict[str, Any],
     stats: ScanStats,
 ) -> tuple[list[dict[str, Any]], str]:
+    if _offline_mode():
+        stats.rejects.inc("REJ_OFFLINE_MODE")
+        return [], "http:offline"
     if not CFG.http_base_urls:
         stats.rejects.inc("REJ_HTTP_DISABLED")
         return [], "http:disabled"
 
-    timeout = aiohttp.ClientTimeout(total=CFG.http_timeout_s)
+    timeout = aiohttp.ClientTimeout(total=float(CFG.http_timeout_s))
     metas: list[dict[str, Any]] = []
 
     async def _try_one(base: str) -> None:
         nonlocal metas
         url = base.rstrip("/") + "/candidates"
-        for attempt in range(CFG.http_retries):
+        for attempt in range(int(CFG.http_retries)):
             try:
                 async with session.get(url, timeout=timeout, ssl=_sslctx()) as r:
                     if r.status >= 400:
@@ -1691,10 +1744,10 @@ async def _collect_from_http(
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                if attempt + 1 >= CFG.http_retries:
-                    _log.every("PUMPFUN_HTTP_FAIL", n=10, base=base, err=_short(e))
+                if attempt + 1 >= int(CFG.http_retries):
+                    LOG.every("PUMPFUN_HTTP_FAIL", n=10, base=base, err=_short(e))
                     return
-                await asyncio.sleep(CFG.http_backoff_s * (1.1 + 0.4 * random.random()))
+                await asyncio.sleep(float(CFG.http_backoff_s) * (1.1 + 0.4 * random.random()))
 
     for base in CFG.http_base_urls:
         await _try_one(base)
@@ -1705,21 +1758,22 @@ async def _collect_from_http(
     return metas, ("http" if metas else "http:empty")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Alerts + training logs
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 async def _send_momo(runners: list[dict[str, Any]]) -> None:
-    if not CFG.send_momo_alerts or not runners or AlertManager is None:
+    if not CFG.send_momo_alerts or not runners or alert_manager_cls is None:
         return
     try:
-        am = AlertManager()
+        am = alert_manager_cls()
     except Exception as e:
-        _log.every("PUMP_ALERT_INIT_FAIL", n=30, err=_short(e))
+        LOG.every("PUMP_ALERT_INIT_FAIL", n=30, err=_short(e))
         return
 
-    max_n = max(0, min(CFG.max_alerts_per_scan, len(runners)))
+    max_n = max(0, min(int(CFG.max_alerts_per_scan), len(runners)))
 
-    async with _recent_alert_lock:
+    lock = _alert_lock()
+    async with lock:
         now = time.time()
         cutoff = now - float(CFG.alert_dedupe_sec)
         for k in list(_recent_alert_ts.keys()):
@@ -1731,7 +1785,7 @@ async def _send_momo(runners: list[dict[str, Any]]) -> None:
         if not mint:
             continue
 
-        async with _recent_alert_lock:
+        async with lock:
             now = time.time()
             last = _recent_alert_ts.get(mint, 0.0)
             if now - last < float(CFG.alert_dedupe_sec):
@@ -1762,7 +1816,7 @@ async def _send_momo(runners: list[dict[str, Any]]) -> None:
             }
             await _call_maybe_async(getattr(am, "send_momo_event", None), "MOMO_OK", ctx)
         except Exception as e:
-            _log.every("PUMP_MOMO_FAIL", n=10, mint=mint, err=_short(e))
+            LOG.every("PUMP_MOMO_FAIL", n=10, mint=mint, err=_short(e))
 
 
 def _log_candidates_for_training(runners: list[dict[str, Any]], regime: dict[str, Any]) -> None:
@@ -1785,20 +1839,20 @@ def _log_candidates_for_training(runners: list[dict[str, Any]], regime: dict[str
                     regime=str(regime.get("label") or "unknown"),
                 )  # type: ignore[misc]
             elif callable(log_entry):
-                log_entry(  # type: ignore[misc]
+                log_entry(
                     src="pumpfun",
                     mint=mint,
                     symbol=symbol,
                     snapshot=snapshot,
                     regime=str(regime.get("label") or "unknown"),
-                )
+                )  # type: ignore[misc]
         except Exception:
             continue
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Public entrypoint
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 async def scan_pumpfun(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
     """
     Backwards compatible call patterns:
@@ -1810,6 +1864,8 @@ async def scan_pumpfun(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
     Returns: runners (list of candidate dicts)
     """
     if not CFG.enabled or CFG.mode == "off":
+        return []
+    if _offline_mode():
         return []
 
     redis = kwargs.get("redis")
@@ -1841,7 +1897,7 @@ async def scan_pumpfun(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
     stats.risk_capacity, stats.risk_mode = risk_capacity, risk_mode
     if risk_shutdown or risk_capacity <= 0.0:
         stats.rejects.inc("REJ_RISK_SHUTDOWN")
-        _log.every(
+        LOG.every(
             "PUMP_RISK_SHUTDOWN",
             n=10,
             risk_shutdown=int(risk_shutdown),
@@ -1857,7 +1913,7 @@ async def scan_pumpfun(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
 
     min_combined = _dynamic_min_combined(CFG.scoring_min_combined, regime, risk_capacity)
 
-    _log.every(
+    LOG.every(
         "PUMP_SCAN_START",
         n=5,
         phase=CFG.phase,
@@ -1888,7 +1944,7 @@ async def scan_pumpfun(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
 
         if (not metas) and (CFG.provider in {"auto", "http"}) and CFG.http_base_urls:
             if session is None:
-                conn = aiohttp.TCPConnector(limit=CFG.http_conn_limit, ssl=_sslctx())
+                conn = aiohttp.TCPConnector(limit=int(CFG.http_conn_limit), ssl=_sslctx())
                 session = aiohttp.ClientSession(
                     headers={"User-Agent": CFG.user_agent},
                     trust_env=CFG.http_trust_env,
@@ -1919,7 +1975,7 @@ async def scan_pumpfun(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
                 }
                 for m in metas[:5]
             ]
-            _log.every("PUMP_META_SAMPLE", n=10, source=source, count=len(metas), first=sample)
+            LOG.every("PUMP_META_SAMPLE", n=10, source=source, count=len(metas), first=sample)
 
         if not metas:
             return []
@@ -1953,6 +2009,7 @@ async def scan_pumpfun(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         )
         runners = runners[: CFG.max_runners]
 
+        # Redis dedupe
         if (
             redis is not None
             and CFG.runner_dedupe_enabled
@@ -1960,6 +2017,7 @@ async def scan_pumpfun(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
             and runners
         ):
             filtered: list[dict[str, Any]] = []
+            ttl = int(CFG.runner_dedupe_sec)
             for r in runners:
                 mint = str(r.get("mint") or "")
                 if not mint:
@@ -1969,16 +2027,14 @@ async def scan_pumpfun(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
                 if seen:
                     stats.rejects.inc("REJ_REDIS_DEDUP", mint)
                     continue
-                await _redis_setex(
-                    redis, int(CFG.runner_dedupe_sec) and k, int(CFG.runner_dedupe_sec), "1"
-                )  # type: ignore[arg-type]
+                await _redis_setex(redis, k, ttl, "1")
                 filtered.append(r)
             runners = filtered or runners
 
         stats.runners = len(runners)
 
         if CFG.debug_result:
-            _log.every(
+            LOG.every(
                 "PUMP_RESULT",
                 n=10,
                 source=source,
@@ -2022,11 +2078,11 @@ async def scan_pumpfun(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         raise
     except Exception as e:
         stats.rejects.inc("REJ_SCAN_EXCEPTION")
-        _log.every("PUMP_SCAN_FAIL", n=5, err=_short(e))
+        LOG.every("PUMP_SCAN_FAIL", n=5, err=_short(e))
         return []
     finally:
         if stats.rejects.counts:
-            _log.every(
+            LOG.every(
                 "PUMP_REJECT_BUCKETS",
                 n=10,
                 source=stats.source,
@@ -2046,7 +2102,11 @@ async def scan_once(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
 
 
 async def scan_loop(
-    *, redis: Any = None, poll_s: float = 6.0, jitter_s: float = 1.5, on_runners: Any | None = None
+    *,
+    redis: Any = None,
+    poll_s: float = 6.0,
+    jitter_s: float = 1.5,
+    on_runners: Any | None = None,
 ) -> None:
     """
     Lightweight loop if you ever want pumpfun as its own worker.
@@ -2065,7 +2125,7 @@ async def scan_loop(
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            _log.every("PUMP_LOOP_ERR", n=5, err=_short(e))
+            LOG.every("PUMP_LOOP_ERR", n=5, err=_short(e))
         await asyncio.sleep(poll_s + (random.random() * jitter_s))
 
 
@@ -2078,11 +2138,17 @@ async def shutdown_pumpfun_scanner() -> None:
     _PUMPPORTAL = None
 
 
+# Common alias for registries that expect `shutdown`
+async def shutdown() -> None:
+    await shutdown_pumpfun_scanner()
+
+
 __all__ = [
     "pumpfun_scanner_health",
     "scan_loop",
     "scan_once",
     "scan_pumpfun",
+    "shutdown",
     "shutdown_pumpfun_scanner",
 ]
 

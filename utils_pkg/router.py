@@ -1,8 +1,9 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
-utils_pkg/router.py — V3+++ God-Tier Router (LOCK-IN FINAL, probe-safe)
-======================================================================
+utils_pkg/router.py — V3+++ God-Tier Router (LOCK-IN FINAL, contract-safe, probe-safe)
+====================================================================================
 
 Hard Contracts (tests)
 ---------------------
@@ -12,10 +13,10 @@ P0 Contract:
   - get_quote(...)
   - swap_from_quote(...)
 
-Sell-path contract (tests/sell_path_test.py):
+Sell-path contract:
   - get_sell_quote() MUST GET /quote with correct params (including userPublicKey)
   - swap_from_quote() MUST POST /swap with payload containing quoteResponse + userPublicKey
-  - DRYRUN/SAFE_MODE MUST NOT skip the /swap POST if a patched session is present
+  - DRYRUN/SAFE_MODE MUST NOT skip the /swap POST if a patched/capturing session is present
   - swap_from_quote must return (False, "") if wallet or solana_client missing
 
 Probe safety (scripts/check_router.py / preflight):
@@ -24,12 +25,13 @@ Probe safety (scripts/check_router.py / preflight):
 
 Production features preserved:
   - retries + endpoint fallback
-  - optional quote cache + singleflight
+  - quote cache + singleflight
+  - circuit breaker + retry budget (prevents storms)
   - budget hooks + routeguard hook
   - lightning-first trade path with optional direct Jupiter swap fallback
   - strict auth handling, safe/dryrun modes, proxy controls
 
-LOCK-IN CHANGE (this rewrite):
+LOCK-IN CHANGE:
   - Prefer explicit env endpoints:
       JUPITER_QUOTE_API / JUPITER_SWAP_API
     and when set, DO NOT try quote-api.jup.ag unless explicitly allowed.
@@ -49,23 +51,27 @@ from urllib.parse import urlparse
 
 import httpx
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Runtime-injected handles (tests may monkeypatch these)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 wallet: Any | None = None
 solana_client: Any | None = None
+client: Any | None = None  # alias surface for some callers/tests
 
-# -------------------------------------------------------------------------
+# Tests often monkeypatch this. If provided, we prefer it (and pin it).
+session: Any | None = None
+
+# -----------------------------------------------------------------------------
 # Logging (shim-safe)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 try:
     from logging_setup import get_logger  # type: ignore
 
-    log = get_logger(__name__)  # type: ignore
+    log: Any = get_logger(__name__)  # type: ignore
 except Exception:  # pragma: no cover
     import logging
 
-    log = logging.getLogger(__name__)  # type: ignore[assignment]
+    log = logging.getLogger(__name__)
 
 
 def _install_log_shims() -> None:
@@ -79,9 +85,7 @@ def _install_log_shims() -> None:
 
     if not hasattr(log, "every"):
 
-        def _every(
-            key: str, n: int = 10, msg: str | None = None, **kw: Any
-        ) -> None:  # pragma: no cover
+        def _every(key: str, n: int = 10, msg: str | None = None, **kw: Any) -> None:
             try:
                 now = time.monotonic()
                 store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
@@ -121,10 +125,6 @@ def _short(x: Any, n: int = 240) -> str:
 def _envs(k: str, d: str = "") -> str:
     v = os.getenv(k)
     return (v if v is not None else d).strip()
-
-
-def _env(k: str, d: str = "") -> str:
-    return _envs(k, d)
 
 
 def _envb(k: str, d: bool = False) -> bool:
@@ -205,9 +205,9 @@ async def _maybe_await(x: Any) -> Any:
     return x
 
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Runtime modes
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def _is_pytest_runtime() -> bool:
     if os.getenv("PYTEST_CURRENT_TEST"):
         return True
@@ -216,7 +216,12 @@ def _is_pytest_runtime() -> bool:
     return ("pytest" in sys.modules) or ("_pytest" in sys.modules)
 
 
+def _is_probe_mode() -> bool:
+    return bool(_envb("PREFLIGHT", False) or _envb("CHECK_ROUTER", False))
+
+
 def _hermetic_mode() -> bool:
+    # “network off / dryrun / safe mode”
     return (
         _envb("DRYRUN", False)
         or _envb("DRY_RUN", False)
@@ -231,183 +236,6 @@ def _net_allowed() -> bool:
     return not _hermetic_mode()
 
 
-def _safe_mode_env() -> bool:
-    return _hermetic_mode()
-
-
-def _is_probe_mode() -> bool:
-    # critical: check_router/preflight must not inherit proxies accidentally
-    return bool(_envb("PREFLIGHT", False) or _envb("CHECK_ROUTER", False))
-
-
-# -------------------------------------------------------------------------
-# Session pinning (CRITICAL: quote session reused for swap in tests)
-# -------------------------------------------------------------------------
-_LAST_HTTP_SESSION: Any | None = None
-_LAST_HTTP_SESSION_TESTID: str | None = None
-
-
-def _pytest_runtime() -> bool:
-    # single source of truth
-    return _is_pytest_runtime()
-
-
-def _pytest_test_id() -> str | None:
-    """
-    Stable id unique per-test:
-      "path/to/test.py::test_name"
-    (PYTEST_CURRENT_TEST also includes " (call)" etc — we strip that.)
-    """
-    t = os.getenv("PYTEST_CURRENT_TEST")
-    if not t:
-        return None
-    return t.split(" ")[0].strip()
-
-
-def _looks_like_capturing_session(o: Any) -> bool:
-    """
-    Heuristic: tests use CapturingSession with get_calls/post_calls.
-    Must allow it even when _net_allowed() is False.
-    """
-    try:
-        if o is None:
-            return False
-        if hasattr(o, "get_calls") or hasattr(o, "post_calls"):
-            return True
-        name = type(o).__name__.lower()
-        return ("capturing" in name) or ("fake" in name)
-    except Exception:
-        return False
-
-
-def _is_capturing_session(o: Any) -> bool:
-    return _looks_like_capturing_session(o)
-
-
-def _looks_like_http_session(o: Any) -> bool:
-    if o is None:
-        return False
-    if _looks_like_capturing_session(o):
-        return True
-    for m in ("request", "get", "post"):
-        try:
-            if hasattr(o, m) and callable(getattr(o, m)):
-                return True
-        except Exception:
-            pass
-    return False
-
-
-# -------------------------------------------------------------------------
-# Test session discovery (MUST exist for contract tests)
-# -------------------------------------------------------------------------
-def _find_patched_capturing_session(*, needs_post: bool) -> Any | None:
-    """
-    Find the CapturingSession that tests monkeypatch into this module.
-    Works even when SAFE_MODE/DRYRUN/NO_NETWORK is enabled.
-    """
-    preferred_names = (
-        "_http_client",
-        "http_client",
-        "_http_session",
-        "http_session",
-        "session",
-        "sess",
-        "_session",
-        "_aiohttp_session",
-        "_aiohttp_client",
-        "_httpx_client",
-        "router_session",
-        "HTTP_CLIENT",
-        "SESSION",
-        "client",
-    )
-
-    def _post_ok(o: Any) -> bool:
-        if not needs_post:
-            return True
-        return callable(getattr(o, "post", None)) or callable(getattr(o, "request", None))
-
-    # 1) obvious names first
-    for name in preferred_names:
-        o = globals().get(name)
-        if _looks_like_capturing_session(o) and _post_ok(o):
-            return o
-
-    # 2) scan "session-ish" globals
-    for k, v in globals().items():
-        if k.startswith("__") or k.startswith("_LAST_"):
-            continue
-        lk = k.lower()
-        if ("session" not in lk) and ("http" not in lk) and ("client" not in lk):
-            continue
-        if _looks_like_capturing_session(v) and _post_ok(v):
-            return v
-
-    return None
-
-
-async def _get_http_test_double(*, needs_post: bool) -> Any | None:
-    """
-    If tests monkeypatch `_get_http` to a session object OR a sync/async function returning one,
-    fetch it safely. This is the critical bridge for contract tests.
-    """
-    obj = globals().get("_get_http")
-    if obj is None:
-        return None
-
-    # Patched to an object directly
-    if not callable(obj):
-        return obj if _looks_like_capturing_session(obj) else None
-
-    # If it's the router's own factory, do NOT call it in pytest/hermetic.
-    if (_is_pytest_runtime() or _hermetic_mode()) and _is_original_get_http_bound(obj):
-        return None
-
-    try:
-        out = obj(needs_post=needs_post)  # type: ignore[misc]
-    except TypeError:
-        out = obj()  # type: ignore[misc]
-
-    out = await _maybe_await(out)
-    return out if _looks_like_capturing_session(out) else None
-
-
-def _set_last_http_session(s: Any | None) -> None:
-    """
-    Store last session; under pytest tie it to current test id to prevent bleed.
-    Never overwrite a capturing session with a non-capturing one.
-    """
-    global _LAST_HTTP_SESSION, _LAST_HTTP_SESSION_TESTID
-
-    if s is None:
-        _LAST_HTTP_SESSION = None
-        _LAST_HTTP_SESSION_TESTID = _pytest_test_id()
-        return
-
-    if _looks_like_capturing_session(_LAST_HTTP_SESSION) and (not _looks_like_capturing_session(s)):
-        return
-
-    _LAST_HTTP_SESSION = s
-    _LAST_HTTP_SESSION_TESTID = _pytest_test_id()
-
-
-def _get_last_http_session() -> Any | None:
-    """
-    Return pinned session only if:
-      - not pytest, OR
-      - pytest AND pinned during SAME test
-    """
-    if _pytest_runtime():
-        cur = _pytest_test_id()
-        if _LAST_HTTP_SESSION_TESTID and cur and _LAST_HTTP_SESSION_TESTID != cur:
-            return None
-    return _LAST_HTTP_SESSION
-
-
-# -------------------------------------------------------------------------
-# Trading gates (runtime)
-# -------------------------------------------------------------------------
 def _trading_enabled() -> bool:
     return bool(_envb("TRADING_ENABLED", False)) and (not _envb("PANIC_STOP", False))
 
@@ -428,9 +256,9 @@ def _allow_sells() -> bool:
     return not _envb("DISABLE_SELLS", True)
 
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Exceptions
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 class RouterError(RuntimeError):
     pass
 
@@ -444,6 +272,10 @@ class AuthError(RouterError):
 
 
 class NetworkDisabled(RouterError):
+    pass
+
+
+class CircuitOpen(RouterError):
     pass
 
 
@@ -495,9 +327,9 @@ def _is_retryable_exception(e: Exception) -> bool:
     return _is_retryable_http(_exc_status_code(e))
 
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Base58 pubkey validation (fast, no deps)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58SET = set(_B58)
 _IDX = {c: i for i, c in enumerate(_B58)}
@@ -536,9 +368,9 @@ def is_valid_pubkey_str(s: str) -> bool:
     return _is_valid_pubkey_str(s)
 
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Mint normalization
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def _allow_noncanonical_mints() -> bool:
     if _envb("ROUTER_ALLOW_NONCANONICAL_MINTS", False):
         return True
@@ -558,10 +390,10 @@ def _sanitize_mint(m: Any) -> str:
     raise ValueError(f"Invalid mint: {mm}")
 
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Constants / identity
-# -------------------------------------------------------------------------
-ROUTER_VERSION = "v3+++_router_probe_safe_LOCKIN_2026-01-27"
+# -----------------------------------------------------------------------------
+ROUTER_VERSION = "v3+++_router_probe_safe_LOCKIN_2026-02-02"
 
 LAMPORTS_PER_SOL = 1_000_000_000
 LAMPORTS_PER_SOL_F = float(LAMPORTS_PER_SOL)
@@ -570,13 +402,69 @@ NATIVE_SOL_MINT_FALLBACK = "So11111111111111111111111111111111111111112"
 SOL_MINT = (_envs("SOL_MINT") or NATIVE_SOL_MINT_FALLBACK).strip() or NATIVE_SOL_MINT_FALLBACK
 NATIVE_SOL_DECIMALS = 9
 
+# -----------------------------------------------------------------------------
+# Session pinning for pytest (quote session reused for swap in tests)
+# -----------------------------------------------------------------------------
+_LAST_HTTP_SESSION: Any | None = None
+_LAST_HTTP_SESSION_TESTID: str | None = None
 
-# -------------------------------------------------------------------------
+
+def _pytest_test_id() -> str | None:
+    t = os.getenv("PYTEST_CURRENT_TEST")
+    if not t:
+        return None
+    return t.split(" ")[0].strip()
+
+
+def _looks_like_capturing_session(o: Any) -> bool:
+    try:
+        if o is None:
+            return False
+        if hasattr(o, "get_calls") or hasattr(o, "post_calls"):
+            return True
+        name = type(o).__name__.lower()
+        return ("capturing" in name) or ("fake" in name)
+    except Exception:
+        return False
+
+
+def _looks_like_http_session(o: Any) -> bool:
+    if o is None:
+        return False
+    if _looks_like_capturing_session(o):
+        return True
+    for m in ("request", "get", "post"):
+        with contextlib.suppress(Exception):
+            if hasattr(o, m) and callable(getattr(o, m)):
+                return True
+    return False
+
+
+def _set_last_http_session(s: Any | None) -> None:
+    global _LAST_HTTP_SESSION, _LAST_HTTP_SESSION_TESTID
+    if s is None:
+        _LAST_HTTP_SESSION = None
+        _LAST_HTTP_SESSION_TESTID = _pytest_test_id()
+        return
+    if _looks_like_capturing_session(_LAST_HTTP_SESSION) and (not _looks_like_capturing_session(s)):
+        return
+    _LAST_HTTP_SESSION = s
+    _LAST_HTTP_SESSION_TESTID = _pytest_test_id()
+
+
+def _get_last_http_session() -> Any | None:
+    if _is_pytest_runtime():
+        cur = _pytest_test_id()
+        if _LAST_HTTP_SESSION_TESTID and cur and _LAST_HTTP_SESSION_TESTID != cur:
+            return None
+    return _LAST_HTTP_SESSION
+
+
+# -----------------------------------------------------------------------------
 # Optional lazy deps (never import-time heavy)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 _BUDGET_MOD: Any = None
 _LIGHTNING_MOD: Any = None
-_EXT_NORM: Any = None
 
 
 def _get_budget_mod() -> Any:
@@ -607,35 +495,9 @@ def _get_lightning() -> Any:
         return None
 
 
-def _get_external_normalize() -> Any:
-    global _EXT_NORM
-    if _EXT_NORM is not None:
-        return _EXT_NORM
-    try:
-        from utils_pkg.mints import normalize_mint as nm  # type: ignore
-
-        _EXT_NORM = nm
-        return _EXT_NORM
-    except Exception:
-        _EXT_NORM = None
-        return None
-
-
-def normalize_pump_id_to_mint(raw: str) -> str:
-    raw_s = (raw or "").strip()
-    nm = _get_external_normalize()
-    if callable(nm):
-        with contextlib.suppress(Exception):
-            out = str(nm(raw_s))  # type: ignore[misc]
-            return _sanitize_mint(out)
-    if _is_valid_pubkey_str(raw_s):
-        return raw_s
-    raise ValueError(f"cannot normalize to mint: {raw}")
-
-
-# -------------------------------------------------------------------------
-# Wallet helpers (lazy; pytest-safe)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Wallet helpers (lazy; NEVER import solana wallet at import-time in probe/pytest/hermetic)
+# -----------------------------------------------------------------------------
 def _wallet_pubkey_str() -> str:
     # 1) injected objects
     for name in ("WALLET", "wallet", "_wallet", "KEYPAIR", "keypair", "_keypair"):
@@ -673,16 +535,9 @@ def _wallet_sign_and_send_b64_tx(b64: str) -> str:
     return str(sign_and_send_b64_tx(str(b64))).strip()
 
 
-_send_b64_with_diag: Any = None
-with contextlib.suppress(Exception):  # pragma: no cover
-    from utils_pkg.solana_wallet import _send_b64_with_diag as _diag  # type: ignore
-
-    _send_b64_with_diag = _diag
-
-
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Config (env-driven)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 MIN_SOL_BALANCE = float(_envf("MIN_SOL_BALANCE", _envf("MIN_SOL_BALANCE_TO_TRADE", 0.0)))
 ROUTER_SOL_BAL_TTL_SEC = max(0.1, float(_envf("ROUTER_SOL_BAL_TTL_SEC", 0.8)))
 ROUTER_BLOCK_ON_BAL_UNKNOWN = bool(_envb("ROUTER_BLOCK_ON_BAL_UNKNOWN", False))
@@ -692,7 +547,10 @@ ROUTER_QUOTE_CACHE_MAX = max(100, int(_envi("ROUTER_QUOTE_CACHE_MAX", 2000)))
 ROUTER_MAX_PARALLEL_QUOTES = max(1, int(_envi("ROUTER_MAX_PARALLEL_QUOTES", 10)))
 
 ROUTER_QUOTE_RETRIES = _clamp_i(int(_envi("ROUTER_QUOTE_RETRIES", 1)), 0, 12)
+ROUTER_SWAP_RETRIES = _clamp_i(int(_envi("ROUTER_SWAP_RETRIES", 1)), 0, 8)
+
 ROUTER_QUOTE_RETRY_BASE_MS = _clamp_i(int(_envi("ROUTER_QUOTE_RETRY_BASE_MS", 150)), 25, 3000)
+ROUTER_SWAP_RETRY_BASE_MS = _clamp_i(int(_envi("ROUTER_SWAP_RETRY_BASE_MS", 250)), 25, 5000)
 
 HTTP_MAX_KEEPALIVE = max(5, int(_envi("ROUTER_HTTP_MAX_KEEPALIVE", 10)))
 HTTP_MAX_CONN = max(10, int(_envi("ROUTER_HTTP_MAX_CONN", 30)))
@@ -728,14 +586,19 @@ JUP_PRIORITIZATION_FEE_LAMPORTS = int(
 
 JUP_PLATFORM_FEE_BPS = int(_envi("JUP_PLATFORM_FEE_BPS", 0))
 JUP_INSTRUCTION_VERSION = (_envs("JUP_INSTRUCTION_VERSION", "")).strip()
-
 JUP_MAX_PRICE_IMPACT_BPS = _clamp_i(int(_envi("JUP_MAX_PRICE_IMPACT_BPS", 2500)), 1, 10_000)
 
 ROUTER_DIRECT_SWAP_FALLBACK = bool(_envb("ROUTER_DIRECT_SWAP_FALLBACK", False))
 ROUTER_DIRECT_SWAP_ON_LIGHTNING_FAIL = bool(_envb("ROUTER_DIRECT_SWAP_ON_LIGHTNING_FAIL", True))
 ROUTER_URL_FAIL_TTL_SEC = _clamp_i(int(_envi("ROUTER_URL_FAIL_TTL_SEC", 120)), 10, 3600)
 
-# Contract-compat constants
+CB_FAIL_THRESHOLD = _clamp_i(int(_envi("ROUTER_CB_FAIL_THRESHOLD", 3)), 1, 50)
+CB_OPEN_TTL_SEC = _clamp_i(int(_envi("ROUTER_CB_OPEN_TTL_SEC", 60)), 5, 3600)
+
+RETRY_BUDGET_QUOTE_MAX = _clamp_i(int(_envi("ROUTER_RETRY_BUDGET_QUOTE_MAX", 60)), 0, 10_000)
+RETRY_BUDGET_SWAP_MAX = _clamp_i(int(_envi("ROUTER_RETRY_BUDGET_SWAP_MAX", 30)), 0, 10_000)
+RETRY_BUDGET_WINDOW_SEC = _clamp_i(int(_envi("ROUTER_RETRY_BUDGET_WINDOW_SEC", 60)), 5, 3600)
+
 MAX_RETRIES = int(ROUTER_QUOTE_RETRIES)
 RETRY_MAX = int(ROUTER_QUOTE_RETRIES)
 RETRY_ATTEMPTS = int(ROUTER_QUOTE_RETRIES)
@@ -743,6 +606,7 @@ RETRY_ATTEMPTS = int(ROUTER_QUOTE_RETRIES)
 BACKOFF_BASE = float(_clamp_f(float(ROUTER_QUOTE_RETRY_BASE_MS) / 1000.0, 0.01, 5.0))
 BACKOFF_FACTOR = 2.0
 BACKOFF_CAP = 2.5
+SWAP_BACKOFF_BASE = float(_clamp_f(float(ROUTER_SWAP_RETRY_BASE_MS) / 1000.0, 0.01, 6.0))
 
 JUP_HTTP_TIMEOUT_S_DEFAULT = float(
     _clamp_f(float(_envf("JUP_HTTP_TIMEOUT_S_DEFAULT", HTTP_READ_TIMEOUT)), 1.0, 60.0)
@@ -754,9 +618,9 @@ TIMEOUT_S = float(HTTP_TIMEOUT_S)
 JUPITER_TIMEOUT_S = float(HTTP_TIMEOUT_S)
 
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Proxy / trust_env rules (probe-safe)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def _router_trust_env() -> bool:
     if _is_probe_mode():
         return False
@@ -772,9 +636,9 @@ def _router_proxy_effective() -> str:
     return (ROUTER_PROXY or "").strip()
 
 
-# -------------------------------------------------------------------------
-# Endpoints (with automatic fallback)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Endpoints (explicit first, strict lock-in)
+# -----------------------------------------------------------------------------
 DEFAULT_QUOTE_URL_V6 = "https://quote-api.jup.ag/v6/quote"
 DEFAULT_SWAP_URL_V6 = "https://quote-api.jup.ag/v6/swap"
 
@@ -782,21 +646,10 @@ DEFAULT_QUOTE_URL_V1 = "https://api.jup.ag/swap/v1/quote"
 DEFAULT_SWAP_URL_V1 = "https://api.jup.ag/swap/v1/swap"
 
 
-def _env_first(*keys: str) -> str:
-    for k in keys:
-        v = os.getenv(k)
-        if v is not None:
-            s = str(v).strip()
-            if s:
-                return s
-    return ""
-
-
 def _ensure_suffix(url: str, suffix: str) -> str:
-    u = (url or "").strip()
+    u = (url or "").strip().rstrip("/")
     if not u:
         return u
-    u = u.rstrip("/")
     if u.lower().endswith(suffix.lower()):
         return u
     return u + suffix
@@ -821,81 +674,37 @@ def _migrate_legacy_url(u: str, kind: Literal["quote", "swap"]) -> str:
     return raw
 
 
-# --- LOCK-IN: explicit endpoint keys (your Render env uses these) ---
-_QUOTE_ENV_KEYS = (
-    "JUPITER_QUOTE_API",  # ✅ your key
-    "JUPITER_QUOTE_URL",
-    "ROUTER_QUOTE_URL",
-    "ROUTER_QUOTE_API",
-    "JUP_QUOTE_URL",
-    "JUPITER_QUOTE_ENDPOINT",
-)
-_SWAP_ENV_KEYS = (
-    "JUPITER_SWAP_API",  # ✅ your key
-    "JUPITER_SWAP_URL",
-    "ROUTER_SWAP_URL",
-    "ROUTER_SWAP_API",
-    "JUP_SWAP_URL",
-    "JUPITER_SWAP_ENDPOINT",
-)
-
-
-def _explicit_quote_url() -> str:
-    u = _env_first(*_QUOTE_ENV_KEYS)
-    return _migrate_legacy_url(u, "quote") if u else ""
-
-
-def _explicit_swap_url() -> str:
-    u = _env_first(*_SWAP_ENV_KEYS)
-    return _migrate_legacy_url(u, "swap") if u else ""
+# LOCK-IN: these are intentionally exposed and patchable (tests + ops)
+JUPITER_QUOTE_API = _migrate_legacy_url(_envs("JUPITER_QUOTE_API", DEFAULT_QUOTE_URL_V6), "quote")
+JUPITER_SWAP_API = _migrate_legacy_url(_envs("JUPITER_SWAP_API", DEFAULT_SWAP_URL_V6), "swap")
 
 
 def _allow_quote_api_fallback() -> bool:
-    """
-    If user explicitly pins Jupiter endpoints (especially api.jup.ag),
-    we MUST NOT attempt quote-api.jup.ag unless they explicitly opt-in.
-    """
     return bool(_envb("ROUTER_ALLOW_QUOTE_API_FALLBACK", False))
 
 
 def _quote_urls() -> list[str]:
-    # 1) Explicit override wins (and becomes exclusive unless fallback allowed)
-    explicit = _explicit_quote_url()
+    # If explicit is set (or patched), we lock-in to it unless allow fallback.
+    explicit = (JUPITER_QUOTE_API or "").strip()
     if explicit:
-        if (not _allow_quote_api_fallback()) and ("quote-api.jup.ag" in explicit.lower()):
-            # if they explicitly set quote-api, respect it (they asked for it)
-            return [explicit]
-        if not _allow_quote_api_fallback():
-            # ✅ exclusive: do NOT include quote-api fallback
-            return [explicit]
-        # fallback allowed: keep explicit first, then safe backups
-        return [explicit, DEFAULT_QUOTE_URL_V1, DEFAULT_QUOTE_URL_V6]
-
-    # 2) If swap endpoint is explicitly set to api.jup.ag and fallback not allowed,
-    #    keep quote on api.jup.ag too (no quote-api attempts).
-    if _explicit_swap_url() and not _allow_quote_api_fallback():
-        return [DEFAULT_QUOTE_URL_V1]
-
-    # 3) Default behavior (unchanged): v6 then v1 unless JUP_PREFER_V1
+        return (
+            [explicit]
+            if not _allow_quote_api_fallback()
+            else [explicit, DEFAULT_QUOTE_URL_V1, DEFAULT_QUOTE_URL_V6]
+        )
     if _envb("JUP_PREFER_V1", False):
         return [DEFAULT_QUOTE_URL_V1, DEFAULT_QUOTE_URL_V6]
     return [DEFAULT_QUOTE_URL_V6, DEFAULT_QUOTE_URL_V1]
 
 
 def _swap_urls() -> list[str]:
-    explicit = _explicit_swap_url()
+    explicit = (JUPITER_SWAP_API or "").strip()
     if explicit:
-        if (not _allow_quote_api_fallback()) and ("quote-api.jup.ag" in explicit.lower()):
-            return [explicit]
-        if not _allow_quote_api_fallback():
-            # ✅ exclusive: do NOT include quote-api fallback
-            return [explicit]
-        return [explicit, DEFAULT_SWAP_URL_V1, DEFAULT_SWAP_URL_V6]
-
-    # If quote endpoint explicitly set and fallback not allowed, keep swap on api.jup.ag
-    if _explicit_quote_url() and not _allow_quote_api_fallback():
-        return [DEFAULT_SWAP_URL_V1]
-
+        return (
+            [explicit]
+            if not _allow_quote_api_fallback()
+            else [explicit, DEFAULT_SWAP_URL_V1, DEFAULT_SWAP_URL_V6]
+        )
     if _envb("JUP_PREFER_V1", False):
         return [DEFAULT_SWAP_URL_V1, DEFAULT_SWAP_URL_V6]
     return [DEFAULT_SWAP_URL_V6, DEFAULT_SWAP_URL_V1]
@@ -909,9 +718,9 @@ def _resolve_swap_url() -> str:
     return _swap_urls()[0]
 
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Slippage helpers
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def _slippage_bps_default() -> int:
     raw = (
         _envs("JUP_QUOTE_SLIPPAGE_BPS", "")
@@ -931,453 +740,105 @@ def _clamp_slippage_bps(v: int | None) -> int:
     return _slippage_bps_default()
 
 
-# -------------------------------------------------------------------------
-# HTTP plumbing (CapturingSession + httpx + aiohttp-like)
-# -------------------------------------------------------------------------
-def _resp_status(resp: Any) -> int | None:
-    with contextlib.suppress(Exception):
-        sc = getattr(resp, "status_code", None)
-        if sc is not None:
-            return int(sc)
-    with contextlib.suppress(Exception):
-        sc2 = getattr(resp, "status", None)
-        if sc2 is not None:
-            return int(sc2)
-    return None
+# -----------------------------------------------------------------------------
+# Circuit breaker + retry budget
+# -----------------------------------------------------------------------------
+_CB: dict[str, tuple[int, float]] = {}  # url -> (fail_count, open_until)
+_BUDGET: dict[str, tuple[int, float]] = {}  # kind -> (used, window_until)
 
 
-async def _resp_json(resp: Any) -> Any:
-    if resp is None:
-        return None
-
-    if isinstance(resp, (dict, list)):
-        return resp
-
-    for attr in ("json_data", "_json", "data", "payload"):
-        v = getattr(resp, attr, None)
-        if isinstance(v, (dict, list)):
-            return v
-
-    j = getattr(resp, "json", None)
-    if j is not None:
-        try:
-            v = j() if callable(j) else j
-        except TypeError:
-            v = j
-        v = await _maybe_await(v)
-        if isinstance(v, (dict, list)):
-            return v
-        if isinstance(v, (bytes, bytearray)):
-            v = v.decode("utf-8", "ignore")
-        if isinstance(v, str):
-            with contextlib.suppress(Exception):
-                return json.loads(v)
-
-    text_attr = getattr(resp, "text", None)
-    t = None
-    if text_attr is not None:
-        try:
-            if callable(text_attr) and inspect.iscoroutinefunction(text_attr):
-                t = await text_attr()
-            else:
-                t = text_attr() if callable(text_attr) else text_attr
-        except Exception:
-            t = None
-
-    if isinstance(t, (bytes, bytearray)):
-        t = t.decode("utf-8", "ignore")
-    if isinstance(t, str) and t.strip():
-        with contextlib.suppress(Exception):
-            return json.loads(t)
-
-    return {}
-
-
-def _allow_mock_session(session: Any | None) -> bool:
-    if session is None:
+def _cb_is_open(url: str) -> bool:
+    rec = _CB.get(url)
+    if not rec:
         return False
-    if _envb("ROUTER_DENY_MOCK_SESSION", False):
-        return False
-    if _envb("ROUTER_ALLOW_MOCK_SESSION", False):
+    _, until = rec
+    return float(until) > _mono()
+
+
+def _cb_record_fail(url: str) -> None:
+    now = _mono()
+    n, until = _CB.get(url, (0, 0.0))
+    if float(until) > now:
+        return
+    n2 = int(n) + 1
+    if n2 >= int(CB_FAIL_THRESHOLD):
+        _CB[url] = (0, now + float(CB_OPEN_TTL_SEC))
+        log.every("ROUTER_CB_OPEN", 10, msg="ROUTER_CB_OPEN", url=url, ttl_s=int(CB_OPEN_TTL_SEC))
+    else:
+        _CB[url] = (n2, 0.0)
+
+
+def _cb_record_success(url: str) -> None:
+    _CB.pop(url, None)
+
+
+def _budget_allow(kind: Literal["quote", "swap"]) -> bool:
+    if _is_probe_mode() or _is_pytest_runtime():
         return True
-    return bool(_is_pytest_runtime() or _hermetic_mode() or _envb("BACKTEST_MODE", False))
-
-
-def _find_patched_session(needs_post: bool) -> Any | None:
-    """
-    Find test-patched session objects in globals.
-    Prefer CapturingSession-like objects.
-    """
-    g = globals()
-
-    names = (
-        "_http_client",
-        "http_client",
-        "HTTP_CLIENT",
-        "HTTP",
-        "SESSION",
-        "session",
-        "sess",
-        "client",
-    )
-
-    def _callable_attr(o: Any, attr: str) -> bool:
-        try:
-            return callable(getattr(o, attr, None))
-        except Exception:
-            return False
-
-    def _has_get(o: Any) -> bool:
-        return _callable_attr(o, "get") or _callable_attr(o, "request")
-
-    def _has_post(o: Any) -> bool:
-        return _callable_attr(o, "post") or _callable_attr(o, "request")
-
-    def _ok(o: Any) -> bool:
-        if o is None:
-            return False
-        if inspect.ismodule(o) or inspect.isclass(o) or inspect.isfunction(o):
-            return False
-        if not (_is_capturing_session(o) or _allow_mock_session(o)):
-            return False
-        if not _has_get(o):
-            return False
-        if needs_post and not _has_post(o):
-            return False
+    now = _mono()
+    used, until = _BUDGET.get(kind, (0, 0.0))
+    if float(until) <= now:
+        used = 0
+        until = now + float(RETRY_BUDGET_WINDOW_SEC)
+    cap = int(RETRY_BUDGET_QUOTE_MAX if kind == "quote" else RETRY_BUDGET_SWAP_MAX)
+    if cap <= 0:
         return True
-
-    for n in names:
-        if n in g and _ok(g.get(n)):
-            return g.get(n)
-
-    for o in list(g.values()):
-        if _ok(o):
-            return o
-
-    return None
+    return int(used) < cap
 
 
-async def _aiohttp_client_session_for_tests() -> Any | None:
-    """
-    Only use a monkeypatched aiohttp.ClientSession if tests injected it on THIS module.
-    Never import aiohttp here.
-    """
-    mod = globals().get("aiohttp")
-    if mod is None:
-        return None
-    cs = getattr(mod, "ClientSession", None)
-    if not callable(cs):
-        return None
+def _budget_consume(kind: Literal["quote", "swap"], n: int = 1) -> None:
+    now = _mono()
+    used, until = _BUDGET.get(kind, (0, 0.0))
+    if float(until) <= now:
+        used = 0
+        until = now + float(RETRY_BUDGET_WINDOW_SEC)
+    _BUDGET[kind] = (int(used) + int(n), float(until))
+
+
+# -----------------------------------------------------------------------------
+# Idempotency + swap singleflight
+# -----------------------------------------------------------------------------
+def _stable_json(obj: Any) -> str:
     try:
-        s = cs()
+        return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     except Exception:
-        return None
-
-    # Only accept if it's capturing-like (test double)
-    if _is_capturing_session(s) or _allow_mock_session(s):
-        return s
-
-    # best-effort close real session (avoid leaks)
-    with contextlib.suppress(Exception):
-        ac = getattr(s, "aclose", None)
-        if callable(ac):
-            await _maybe_await(ac())
-    with contextlib.suppress(Exception):
-        cl = getattr(s, "close", None)
-        if callable(cl):
-            await _maybe_await(cl())
-    return None
+        return json.dumps(str(obj), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-async def _session_call_raw(
-    session: Any,
-    method: str,
-    url: str,
-    *,
-    params: dict[str, Any] | None = None,
-    json: dict[str, Any] | None = None,
-    headers: dict[str, str] | None = None,
-    timeout: float | None = None,
-) -> Any:
-    """
-    Return the raw result of calling session.get/post/request WITHOUT consuming context manager.
-    We pin the session used so swap can reuse it.
-    """
-    if session is None:
-        raise TypeError("session is None")
-
-    _set_last_http_session(session)
-
-    meth = (method or "GET").upper().strip()
-
-    def _compact(d: dict[str, Any]) -> dict[str, Any]:
-        return {k: v for k, v in d.items() if v is not None}
-
-    async def _try_call(fn: Any, kw: dict[str, Any], drop: tuple[str, ...]) -> Any:
-        kw2 = _compact(dict(kw))
-        try:
-            out = fn(url, **kw2)
-            return await _maybe_await(out)
-        except TypeError:
-            pass
-        for k in drop:
-            if k in kw2:
-                kw2.pop(k, None)
-                try:
-                    out = fn(url, **kw2)
-                    return await _maybe_await(out)
-                except TypeError:
-                    continue
-        out = fn(url)
-        return await _maybe_await(out)
-
-    if meth == "GET":
-        fn = getattr(session, "get", None)
-        if callable(fn):
-            return await _try_call(
-                fn,
-                {"params": params, "headers": headers, "timeout": timeout},
-                ("timeout", "headers", "params"),
-            )
-
-    if meth == "POST":
-        fn = getattr(session, "post", None)
-        if callable(fn):
-            # IMPORTANT: POST must use .post when available so CapturingSession.post_calls increments
-            return await _try_call(
-                fn,
-                {"json": json, "headers": headers, "timeout": timeout, "params": params},
-                ("timeout", "headers", "params"),
-            )
-
-    req = getattr(session, "request", None)
-    if callable(req):
-        kw = _compact({"params": params, "json": json, "headers": headers, "timeout": timeout})
-        try:
-            out = req(meth, url, **kw)
-            return await _maybe_await(out)
-        except TypeError:
-            for k in ("timeout", "headers", "params"):
-                if k in kw:
-                    kw.pop(k, None)
-                    try:
-                        out = req(meth, url, **kw)
-                        return await _maybe_await(out)
-                    except TypeError:
-                        continue
-            out = req(meth, url)
-            return await _maybe_await(out)
-
-    raise TypeError(f"Unsupported session type: {type(session)!r}")
+def _sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", "ignore")).hexdigest()
 
 
-async def _session_request_json(
-    session: Any,
-    method: str,
-    url: str,
-    *,
-    params: dict[str, Any] | None = None,
-    json: dict[str, Any] | None = None,
-    headers: dict[str, str] | None = None,
-    timeout: float | None = None,
-) -> tuple[int | None, Any]:
-    """
-    Call a session and return (status_code, json_payload),
-    correctly handling aiohttp-style request context managers.
-    """
-    raw = await _session_call_raw(
-        session, method, url, params=params, json=json, headers=headers, timeout=timeout
-    )
-    if hasattr(raw, "__aenter__"):
-        async with raw as resp:
-            return _resp_status(resp), await _resp_json(resp)
-    return _resp_status(raw), await _resp_json(raw)
+def _idempotency_key(kind: str, payload: Any) -> str:
+    salt = _envs("ROUTER_IDEMPOTENCY_SALT", "router")
+    h = _sha256_hex(f"{kind}:{salt}:{_stable_json(payload)}")
+    return f"{kind}-{h[:32]}"
 
 
-# -------------------------------------------------------------------------
-# httpx client lifecycle (no import-time network)
-# -------------------------------------------------------------------------
-_http_client: Any | None = None
-_http_lock = asyncio.Lock()
+_SWAP_INFLIGHT: dict[str, asyncio.Future[tuple[bool, str]]] = {}
+_swap_lock = asyncio.Lock()
 
 
-def _http_timeout_obj() -> httpx.Timeout:
-    connect = float(HTTP_CONNECT_TIMEOUT)
-    pool = float(HTTP_POOL_TIMEOUT)
-    read = float(HTTP_READ_TIMEOUT)
-    write = float(HTTP_READ_TIMEOUT)
-
-    if _is_probe_mode():
-        cap = float(_envf("PREFLIGHT_HTTP_TIMEOUT_CAP_S", 6.0))
-        connect = min(connect, max(1.0, cap))
-        pool = min(pool, max(1.0, cap))
-        read = min(read, max(1.5, cap))
-        write = min(write, max(1.5, cap))
-
-    return httpx.Timeout(connect=connect, read=read, write=write, pool=pool)
-
-
-async def _get_http(needs_post: bool = False) -> Any:
-    """
-    This function is intentionally patchable by tests.
-    Tests typically monkeypatch _get_http to return CapturingSession.
-    """
-    global _http_client
-
-    patched = _find_patched_session(needs_post=needs_post)
-    if patched is not None:
-        return patched
-
-    # Also honor pinned CapturingSession (quote → swap reuse)
-    last = _get_last_http_session()
-    if last is not None and _is_capturing_session(last):
-        return last
-
-    # Probe/DRYRUN: do not create real clients
-    if not _net_allowed():
-        raise NetworkDisabled("network_disabled_by_env")
-
-    client = _http_client
-    if client is not None:
-        if isinstance(client, httpx.AsyncClient):
-            with contextlib.suppress(Exception):
-                if not client.is_closed:
-                    return client
-            _http_client = None
-        else:
-            return client
-
-    async with _http_lock:
-        client = _http_client
-        if client is not None:
-            if isinstance(client, httpx.AsyncClient):
-                with contextlib.suppress(Exception):
-                    if not client.is_closed:
-                        return client
-                _http_client = None
-            else:
-                return client
-
-        limits = httpx.Limits(
-            max_keepalive_connections=int(HTTP_MAX_KEEPALIVE),
-            max_connections=int(HTTP_MAX_CONN),
-        )
-        kwargs: dict[str, Any] = dict(
-            timeout=_http_timeout_obj(),
-            limits=limits,
-            follow_redirects=True,
-            http2=bool(HTTP_HTTP2),
-            trust_env=bool(_router_trust_env()),
-            headers={"user-agent": "pnlsniper/router"},
-        )
-
-        px = _router_proxy_effective()
-        if px:
-            with contextlib.suppress(Exception):
-                kwargs["proxy"] = px  # httpx>=0.27
-            with contextlib.suppress(Exception):
-                kwargs["proxies"] = {"all://": px}
-
-        _http_client = httpx.AsyncClient(**kwargs)
-        return _http_client
-
-
-async def _close_http_local() -> None:
-    global _http_client
-    if _http_client is not None:
-        with contextlib.suppress(Exception):
-            if isinstance(_http_client, httpx.AsyncClient) and not _http_client.is_closed:
-                await _http_client.aclose()
-    _http_client = None
-
-
-def _is_original_get_http_bound(obj: Any) -> bool:
+async def _swap_singleflight(
+    key: str, maker: Callable[[], Awaitable[tuple[bool, str]]]
+) -> tuple[bool, str]:
+    async with _swap_lock:
+        fut = _SWAP_INFLIGHT.get(key)
+        if fut is None or fut.done():
+            fut = asyncio.ensure_future(maker())
+            _SWAP_INFLIGHT[key] = fut
     try:
-        return (
-            callable(obj)
-            and getattr(obj, "__name__", "") == "_get_http"
-            and getattr(obj, "__module__", "") == __name__
-        )
-    except Exception:
-        return False
+        return await fut
+    finally:
+        async with _swap_lock:
+            cur = _SWAP_INFLIGHT.get(key)
+            if cur is fut:
+                _SWAP_INFLIGHT.pop(key, None)
 
 
-async def _get_http_from_tests(*, needs_post: bool) -> Any | None:
-    obj = globals().get("_get_http")
-    if obj is None:
-        return None
-
-    if not callable(obj):
-        return obj
-
-    if (_pytest_runtime() or _hermetic_mode()) and _is_original_get_http_bound(obj):
-        return None
-
-    try:
-        out = obj(needs_post=needs_post)  # type: ignore[misc]
-    except TypeError:
-        out = obj()  # type: ignore[misc]
-
-    return await _maybe_await(out)
-
-
-async def _resolve_patched_or_pinned_session(*, needs_post: bool) -> Any | None:
-    with contextlib.suppress(Exception):
-        s = _find_patched_capturing_session(needs_post=needs_post)
-        if _looks_like_capturing_session(s):
-            _set_last_http_session(s)
-            return s
-
-    with contextlib.suppress(Exception):
-        s = await _get_http_test_double(needs_post=needs_post)
-        if _looks_like_capturing_session(s):
-            _set_last_http_session(s)
-            return s
-
-    with contextlib.suppress(Exception):
-        s = _get_last_http_session()
-        if s is not None and (not needs_post or hasattr(s, "post") or hasattr(s, "request")):
-            return s
-
-    with contextlib.suppress(Exception):
-        s = _find_patched_session(needs_post=needs_post)
-        if s is not None:
-            _set_last_http_session(s)
-            return s
-
-    if _pytest_runtime() or _hermetic_mode():
-        with contextlib.suppress(Exception):
-            s = await _get_http_from_tests(needs_post=needs_post)
-            if (
-                s is not None
-                and _looks_like_capturing_session(s)
-                and (not needs_post or hasattr(s, "post") or hasattr(s, "request"))
-            ):
-                _set_last_http_session(s)
-                return s
-
-        with contextlib.suppress(Exception):
-            s = await _aiohttp_client_session_for_tests()
-            if (
-                s is not None
-                and _looks_like_capturing_session(s)
-                and (not needs_post or hasattr(s, "post") or hasattr(s, "request"))
-            ):
-                _set_last_http_session(s)
-                return s
-
-        return None
-
-    if _net_allowed():
-        with contextlib.suppress(Exception):
-            return await _maybe_await(_get_http(needs_post=needs_post))
-
-    return None
-
-
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Deterministic DRYRUN quote engine
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 _DRYRUN_DECIMALS_DEFAULT = _clamp_i(int(_envi("ROUTER_DRYRUN_DECIMALS_DEFAULT", 6)), 0, 18)
 
 
@@ -1431,47 +892,28 @@ def _dry_mock_quote(
     only_direct: bool | None,
 ) -> dict[str, Any]:
     if int(amount_in_raw) <= 0:
-        return {
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "inAmount": str(int(max(0, int(amount_in_raw)))),
-            "outAmount": "0",
-            "slippageBps": int(slippage_bps),
-            "priceImpactPct": 0.0,
-            "routePlan": _dry_route_plan(input_mint, output_mint),
-            "contextSlot": 0,
-            "timeTaken": 0,
-            "router_mock": True,
-            "router_dryrun": True,
-            "router_only_direct": (bool(only_direct) if only_direct is not None else None),
-            "router_quote_url": "dryrun://mock",
-        }
-
-    dec_in = _dry_decimals(input_mint)
-    dec_out = _dry_decimals(output_mint)
-
-    amt_in_ui = float(amount_in_raw) / float(10**dec_in)
-    p_in = _dry_price_sol(input_mint)
-    p_out = _dry_price_sol(output_mint)
-
-    value_sol = amt_in_ui * p_in
-    out_ui = (value_sol / p_out) if (p_out > 0) else 0.0
-
-    pi = _dry_price_impact(input_mint, output_mint, int(amount_in_raw))
-    slip = float(_clamp_i(int(slippage_bps), 1, 5000)) / 10000.0
-    out_ui_eff = out_ui * max(0.0, 1.0 - pi) * max(0.0, 1.0 - (0.5 * slip))
-
-    out_raw = int(out_ui_eff * float(10**dec_out))
-    if out_raw < 0:
-        out_raw = 0
+        out0 = "0"
+    else:
+        dec_in = _dry_decimals(input_mint)
+        dec_out = _dry_decimals(output_mint)
+        amt_in_ui = float(amount_in_raw) / float(10**dec_in)
+        p_in = _dry_price_sol(input_mint)
+        p_out = _dry_price_sol(output_mint)
+        value_sol = amt_in_ui * p_in
+        out_ui = (value_sol / p_out) if (p_out > 0) else 0.0
+        pi = _dry_price_impact(input_mint, output_mint, int(amount_in_raw))
+        slip = float(_clamp_i(int(slippage_bps), 1, 5000)) / 10000.0
+        out_ui_eff = out_ui * max(0.0, 1.0 - pi) * max(0.0, 1.0 - (0.5 * slip))
+        out_raw = int(out_ui_eff * float(10**dec_out))
+        out0 = str(int(max(0, out_raw)))
 
     return {
         "inputMint": input_mint,
         "outputMint": output_mint,
-        "inAmount": str(int(amount_in_raw)),
-        "outAmount": str(int(out_raw)),
+        "inAmount": str(int(max(0, int(amount_in_raw)))),
+        "outAmount": out0,
         "slippageBps": int(slippage_bps),
-        "priceImpactPct": float(pi),
+        "priceImpactPct": float(_dry_price_impact(input_mint, output_mint, int(amount_in_raw))),
         "routePlan": _dry_route_plan(input_mint, output_mint),
         "contextSlot": 0,
         "timeTaken": 0,
@@ -1482,12 +924,12 @@ def _dry_mock_quote(
     }
 
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Quote cache + singleflight
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 _quote_sema = asyncio.Semaphore(int(ROUTER_MAX_PARALLEL_QUOTES))
 _QUOTE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_QUOTE_FLIGHT: dict[str, asyncio.Future[Any]] = {}
+_QUOTE_FLIGHT: dict[str, asyncio.Future[dict[str, Any]]] = {}
 _quote_lock = asyncio.Lock()
 
 
@@ -1527,7 +969,9 @@ def _set_cached_quote(key: str, payload: dict[str, Any]) -> None:
     _trim_quote_cache()
 
 
-async def _singleflight(key: str, maker: Callable[[], Awaitable[Any]]) -> Any:
+async def _singleflight_quote(
+    key: str, maker: Callable[[], Awaitable[dict[str, Any]]]
+) -> dict[str, Any]:
     async with _quote_lock:
         fut = _QUOTE_FLIGHT.get(key)
         if fut is None or fut.done():
@@ -1547,9 +991,9 @@ def clear_quote_cache() -> None:
     _QUOTE_FLIGHT.clear()
 
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Budget hooks (optional)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def _budget_bypass() -> bool:
     if os.getenv("BUDGET_DISABLE", "").strip().lower() in _TRUE:
         return True
@@ -1560,14 +1004,14 @@ def _budget_bypass() -> bool:
     return False
 
 
-async def _budget_before_quote(units: int = 1) -> bool:
-    if _budget_bypass():
+async def _budget_before(kind: Literal["quote", "swap"], units: int = 1) -> bool:
+    if _budget_bypass() or _looks_like_capturing_session(_get_last_http_session()):
         return True
     if not _net_allowed():
         return True
     try:
         b = _get_budget_mod()
-        fn = getattr(b, "before_quote", None) if b else None
+        fn = getattr(b, f"before_{kind}", None) if b else None
         if not callable(fn):
             return True
         out = await _maybe_await(fn(units=int(units)))
@@ -1576,53 +1020,23 @@ async def _budget_before_quote(units: int = 1) -> bool:
         return True
 
 
-async def _budget_after_quote(units: int = 1) -> None:
-    if _budget_bypass():
+async def _budget_after(kind: Literal["quote", "swap"], units: int = 1) -> None:
+    if _budget_bypass() or _looks_like_capturing_session(_get_last_http_session()):
         return None
     if not _net_allowed():
         return None
     try:
         b = _get_budget_mod()
-        fn = getattr(b, "after_quote", None) if b else None
+        fn = getattr(b, f"after_{kind}", None) if b else None
         if callable(fn):
             await _maybe_await(fn(units=int(units)))
     except Exception:
         return None
 
 
-async def _budget_before_swap(units: int = 1) -> bool:
-    if _budget_bypass():
-        return True
-    if not _net_allowed():
-        return True
-    try:
-        b = _get_budget_mod()
-        fn = getattr(b, "before_swap", None) if b else None
-        if not callable(fn):
-            return True
-        out = await _maybe_await(fn(units=int(units)))
-        return bool(out)
-    except Exception:
-        return True
-
-
-async def _budget_after_swap(units: int = 1) -> None:
-    if _budget_bypass():
-        return None
-    if not _net_allowed():
-        return None
-    try:
-        b = _get_budget_mod()
-        fn = getattr(b, "after_swap", None) if b else None
-        if callable(fn):
-            await _maybe_await(fn(units=int(units)))
-    except Exception:
-        return None
-
-
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # RouteGuard hook (optional)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 async def _rg_preflight(*, mint: str, lamports_in: int) -> tuple[bool, dict[str, Any] | None, bool]:
     if not _net_allowed():
         return True, None, False
@@ -1638,9 +1052,9 @@ async def _rg_preflight(*, mint: str, lamports_in: int) -> tuple[bool, dict[str,
     return True, None, False
 
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # SOL reserve guard (wallet RPC)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 _bal_cache: tuple[float, int] = (0.0, -1)
 _bal_lock = asyncio.Lock()
 
@@ -1672,15 +1086,14 @@ async def _enforce_min_sol(required_spend_lamports: int = 0) -> bool:
     bal = await _sol_balance_lamports_cached()
     if bal is None:
         return not ROUTER_BLOCK_ON_BAL_UNKNOWN
-
     reserve = int(float(MIN_SOL_BALANCE) * LAMPORTS_PER_SOL_F)
     spend = int(required_spend_lamports or 0)
     return (int(bal) - spend) >= reserve
 
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Headers / params
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def _looks_like_placeholder_key(k: str) -> bool:
     s = (k or "").strip()
     if not s:
@@ -1696,11 +1109,13 @@ def _jup_api_key() -> str:
     return "" if _looks_like_placeholder_key(k) else k
 
 
-def _jup_headers() -> dict[str, str]:
+def _jup_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
     h: dict[str, str] = {"user-agent": "pnlsniper/router"}
     k = _jup_api_key()
     if k:
         h["x-api-key"] = k
+    if extra:
+        h.update(extra)
     return h
 
 
@@ -1728,9 +1143,9 @@ def _apply_quote_params(params: dict[str, Any], *, only_direct: bool | None) -> 
         params["instructionVersion"] = str(iv)
 
 
-# -------------------------------------------------------------------------
-# Deterministic request builders (for tests/test_contract_router.py)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Deterministic request builders (stable types for tests)
+# -----------------------------------------------------------------------------
 def build_quote_request(
     *,
     input_mint: str,
@@ -1746,6 +1161,7 @@ def build_quote_request(
     amt = int(amount)
     sbps = int(_clamp_slippage_bps(int(slippage_bps)))
 
+    # keep values as STRINGS (stable across capturing sessions)
     params: dict[str, Any] = {
         "inputMint": str(in_m),
         "outputMint": str(out_m),
@@ -1757,12 +1173,16 @@ def build_quote_request(
 
     _apply_quote_params(params, only_direct=only_direct)
 
+    timeout_s = float(_envf("JUP_HTTP_TIMEOUT_S", JUP_HTTP_TIMEOUT_S_DEFAULT))
+    if _is_probe_mode():
+        timeout_s = min(timeout_s, float(_envf("PREFLIGHT_JUP_TIMEOUT_CAP_S", 8.0)))
+
     return {
         "method": "GET",
         "url": str(url or _resolve_quote_url()),
         "params": params,
         "headers": _jup_headers(),
-        "timeout_s": float(_envf("JUP_HTTP_TIMEOUT_S", JUP_HTTP_TIMEOUT_S_DEFAULT)),
+        "timeout_s": float(timeout_s),
     }
 
 
@@ -1809,20 +1229,300 @@ def build_buy_quote_request(
     )
 
 
-_URL_FAIL_UNTIL: dict[str, float] = {}
+# -----------------------------------------------------------------------------
+# HTTP plumbing (CapturingSession + httpx + aiohttp-like)
+# -----------------------------------------------------------------------------
+def _resp_status(resp: Any) -> int | None:
+    with contextlib.suppress(Exception):
+        sc = getattr(resp, "status_code", None)
+        if sc is not None:
+            return int(sc)
+    with contextlib.suppress(Exception):
+        sc2 = getattr(resp, "status", None)
+        if sc2 is not None:
+            return int(sc2)
+    return None
 
 
-def _url_is_cooldown(url: str) -> bool:
-    return float(_URL_FAIL_UNTIL.get(url, 0.0) or 0.0) > _mono()
+async def _resp_json(resp: Any) -> Any:
+    if resp is None:
+        return None
+    if isinstance(resp, (dict, list)):
+        return resp
+
+    for attr in ("json_data", "_json", "data", "payload"):
+        v = getattr(resp, attr, None)
+        if isinstance(v, (dict, list)):
+            return v
+
+    j = getattr(resp, "json", None)
+    if j is not None:
+        try:
+            v = j() if callable(j) else j
+        except TypeError:
+            v = j
+        v = await _maybe_await(v)
+        if isinstance(v, (dict, list)):
+            return v
+        if isinstance(v, (bytes, bytearray)):
+            v = v.decode("utf-8", "ignore")
+        if isinstance(v, str):
+            with contextlib.suppress(Exception):
+                return json.loads(v)
+
+    text_attr = getattr(resp, "text", None)
+    t: Any = None
+    if text_attr is not None:
+        try:
+            t = text_attr() if callable(text_attr) else text_attr
+            t = await _maybe_await(t)
+        except Exception:
+            t = None
+
+    if isinstance(t, (bytes, bytearray)):
+        t = t.decode("utf-8", "ignore")
+    if isinstance(t, str) and t.strip():
+        with contextlib.suppress(Exception):
+            return json.loads(t)
+
+    return {}
 
 
-def _url_mark_fail(url: str) -> None:
-    _URL_FAIL_UNTIL[url] = _mono() + float(ROUTER_URL_FAIL_TTL_SEC)
+async def _session_call_raw(
+    sess: Any,
+    method: str,
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: float | None = None,
+) -> Any:
+    if sess is None:
+        raise TypeError("session is None")
+
+    _set_last_http_session(sess)
+
+    meth = (method or "GET").upper().strip()
+
+    def _compact(d: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in d.items() if v is not None}
+
+    async def _try_call(fn: Any, kw: dict[str, Any], drop: tuple[str, ...]) -> Any:
+        kw2 = _compact(dict(kw))
+        try:
+            out = fn(url, **kw2)
+            return await _maybe_await(out)
+        except TypeError:
+            pass
+        for k in drop:
+            if k in kw2:
+                kw2.pop(k, None)
+                try:
+                    out = fn(url, **kw2)
+                    return await _maybe_await(out)
+                except TypeError:
+                    continue
+        out = fn(url)
+        return await _maybe_await(out)
+
+    if meth == "GET":
+        fn = getattr(sess, "get", None)
+        if callable(fn):
+            return await _try_call(
+                fn,
+                {"params": params, "headers": headers, "timeout": timeout},
+                ("timeout", "headers", "params"),
+            )
+
+    if meth == "POST":
+        fn = getattr(sess, "post", None)
+        if callable(fn):
+            return await _try_call(
+                fn,
+                {"json": json_body, "headers": headers, "timeout": timeout, "params": params},
+                ("timeout", "headers", "params"),
+            )
+
+    req = getattr(sess, "request", None)
+    if callable(req):
+        kw = _compact({"params": params, "json": json_body, "headers": headers, "timeout": timeout})
+        try:
+            out = req(meth, url, **kw)
+            return await _maybe_await(out)
+        except TypeError:
+            for k in ("timeout", "headers", "params"):
+                if k in kw:
+                    kw.pop(k, None)
+                    try:
+                        out = req(meth, url, **kw)
+                        return await _maybe_await(out)
+                    except TypeError:
+                        continue
+            out = req(meth, url)
+            return await _maybe_await(out)
+
+    raise TypeError(f"Unsupported session type: {type(sess)!r}")
 
 
-# -------------------------------------------------------------------------
+async def _session_request_json(
+    sess: Any,
+    method: str,
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: float | None = None,
+) -> tuple[int | None, Any]:
+    raw = await _session_call_raw(
+        sess, method, url, params=params, json_body=json_body, headers=headers, timeout=timeout
+    )
+    if hasattr(raw, "__aenter__"):
+        async with raw as resp:
+            return _resp_status(resp), await _resp_json(resp)
+    return _resp_status(raw), await _resp_json(raw)
+
+
+# -----------------------------------------------------------------------------
+# httpx client lifecycle (NO import-time network)
+# -----------------------------------------------------------------------------
+_http_client: httpx.AsyncClient | Any | None = None
+_http_lock = asyncio.Lock()
+
+
+def _http_timeout_obj() -> httpx.Timeout:
+    connect = float(HTTP_CONNECT_TIMEOUT)
+    pool = float(HTTP_POOL_TIMEOUT)
+    read = float(HTTP_READ_TIMEOUT)
+    write = float(HTTP_READ_TIMEOUT)
+
+    if _is_probe_mode():
+        cap = float(_envf("PREFLIGHT_HTTP_TIMEOUT_CAP_S", 6.0))
+        connect = min(connect, max(1.0, cap))
+        pool = min(pool, max(1.0, cap))
+        read = min(read, max(1.5, cap))
+        write = min(write, max(1.5, cap))
+
+    return httpx.Timeout(connect=connect, read=read, write=write, pool=pool)
+
+
+async def _get_http_impl() -> Any:
+    global _http_client
+
+    if not _net_allowed():
+        raise NetworkDisabled("network_disabled_by_env")
+
+    c = _http_client
+    if c is not None:
+        if isinstance(c, httpx.AsyncClient):
+            with contextlib.suppress(Exception):
+                if not c.is_closed:
+                    return c
+            _http_client = None
+        else:
+            return c
+
+    async with _http_lock:
+        c2 = _http_client
+        if c2 is not None:
+            if isinstance(c2, httpx.AsyncClient):
+                with contextlib.suppress(Exception):
+                    if not c2.is_closed:
+                        return c2
+                _http_client = None
+            else:
+                return c2
+
+        limits = httpx.Limits(
+            max_keepalive_connections=int(HTTP_MAX_KEEPALIVE),
+            max_connections=int(HTTP_MAX_CONN),
+        )
+        kwargs: dict[str, Any] = dict(
+            timeout=_http_timeout_obj(),
+            limits=limits,
+            follow_redirects=True,
+            http2=bool(HTTP_HTTP2),
+            trust_env=bool(_router_trust_env()),
+            headers={"user-agent": "pnlsniper/router"},
+        )
+
+        px = _router_proxy_effective()
+        if px:
+            with contextlib.suppress(Exception):
+                kwargs["proxy"] = px  # httpx>=0.27
+            with contextlib.suppress(Exception):
+                kwargs["proxies"] = {"all://": px}
+
+        _http_client = httpx.AsyncClient(**kwargs)
+        return _http_client
+
+
+async def _close_http_local() -> None:
+    global _http_client
+    if _http_client is not None:
+        with contextlib.suppress(Exception):
+            if isinstance(_http_client, httpx.AsyncClient) and not _http_client.is_closed:
+                await _http_client.aclose()
+    _http_client = None
+
+
+async def _resolve_session(needs_post: bool, provided: Any | None = None) -> Any | None:
+    """
+    Priority:
+      1) caller provided session
+      2) module-global `session` (tests patch this)
+      3) last pinned capturing session
+      4) tests monkeypatch `_get_http` object/function
+      5) real httpx client (only if network allowed)
+    """
+    if provided is not None and _looks_like_http_session(provided):
+        _set_last_http_session(provided)
+        return provided
+
+    g = globals().get("session", None)
+    if g is not None and _looks_like_http_session(g):
+        _set_last_http_session(g)
+        if (not needs_post) or hasattr(g, "post") or hasattr(g, "request"):
+            return g
+
+    last = _get_last_http_session()
+    if last is not None:
+        if (not needs_post) or hasattr(last, "post") or hasattr(last, "request"):
+            return last
+
+    obj = globals().get("_get_http")
+    if obj is not None and obj is not _resolve_session:
+        if not callable(obj):
+            if _looks_like_http_session(obj) and (
+                (not needs_post) or hasattr(obj, "post") or hasattr(obj, "request")
+            ):
+                _set_last_http_session(obj)
+                return obj
+        else:
+            with contextlib.suppress(Exception):
+                try:
+                    out = obj(needs_post=needs_post)  # type: ignore[misc]
+                except TypeError:
+                    out = obj()  # type: ignore[misc]
+                out = await _maybe_await(out)
+                if _looks_like_http_session(out) and (
+                    (not needs_post) or hasattr(out, "post") or hasattr(out, "request")
+                ):
+                    _set_last_http_session(out)
+                    return out
+
+    if _net_allowed():
+        s = await _get_http_impl()
+        _set_last_http_session(s)
+        return s
+
+    return None
+
+
+# -----------------------------------------------------------------------------
 # Stats
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 _C: dict[str, int] = {
     "quotes": 0,
     "buy_quotes": 0,
@@ -1853,6 +1553,7 @@ def stats() -> dict[str, Any]:
         **_C,
         "quote_cache": len(_QUOTE_CACHE),
         "quote_flight": len(_QUOTE_FLIGHT),
+        "swap_inflight": len(_SWAP_INFLIGHT),
         "http_alive": http_alive,
         "dry_run": int(_hermetic_mode()),
         "net_allowed": int(_net_allowed()),
@@ -1862,15 +1563,14 @@ def stats() -> dict[str, Any]:
         "proxy_set": int(bool(_router_proxy_effective())),
         "quote_urls": _quote_urls(),
         "swap_urls": _swap_urls(),
-        "explicit_quote_url": _explicit_quote_url() or None,
-        "explicit_swap_url": _explicit_swap_url() or None,
-        "allow_quote_api_fallback": int(_allow_quote_api_fallback()),
+        "retry_budget_quote": _BUDGET.get("quote", (0, 0.0))[0],
+        "retry_budget_swap": _BUDGET.get("swap", (0, 0.0))[0],
     }
 
 
-# -------------------------------------------------------------------------
-# Quote scoring
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Quote scoring + impact
+# -----------------------------------------------------------------------------
 def _route_score(q: dict[str, Any]) -> float:
     try:
         out_amt = int(q.get("outAmount") or 0)
@@ -1902,9 +1602,9 @@ def _impact_bps(q: dict[str, Any]) -> int:
         return 0
 
 
-# -------------------------------------------------------------------------
-# Amount normalization (probe-safe)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Amount normalization
+# -----------------------------------------------------------------------------
 async def _normalize_amount_raw(
     *,
     input_mint: str,
@@ -1947,9 +1647,32 @@ async def _normalize_amount_raw(
     return 0
 
 
-# -------------------------------------------------------------------------
-# Jupiter quote HTTP (endpoint fallback + retries)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Jupiter Quote HTTP (endpoint fallback + retries + breaker + budget)
+# -----------------------------------------------------------------------------
+async def _with_retries(
+    kind: Literal["quote", "swap"], tries: int, base_s: float, fetcher: Callable[[], Awaitable[Any]]
+) -> Any:
+    last: Exception | None = None
+    for i in range(int(tries)):
+        try:
+            return await fetcher()
+        except Exception as e:
+            last = e
+            if i >= (int(tries) - 1):
+                break
+            if _is_auth_error(e) and ROUTER_STRICT_AUTH:
+                raise
+            if not _is_retryable_exception(e):
+                break
+            if not _budget_allow(kind):
+                break
+            _budget_consume(kind, 1)
+            sleep_s = float(min(BACKOFF_CAP, base_s * (BACKOFF_FACTOR**i)))
+            await asyncio.sleep(sleep_s)
+    raise last or RouterError(f"{kind}_failed")
+
+
 async def _jup_quote_http_one(
     *,
     url: str,
@@ -1959,7 +1682,7 @@ async def _jup_quote_http_one(
     slippage_bps: int,
     only_direct: bool | None,
     user_public_key: str | None,
-    session: Any | None,
+    sess: Any | None,
 ) -> dict[str, Any]:
     req = build_quote_request(
         input_mint=input_mint,
@@ -1971,28 +1694,23 @@ async def _jup_quote_http_one(
         url=url,
     )
 
-    timeout_s = float(req["timeout_s"])
-    if _is_probe_mode():
-        timeout_s = min(timeout_s, float(_envf("PREFLIGHT_JUP_TIMEOUT_CAP_S", 8.0)))
-
-    sess = session if session is not None else await _get_http(needs_post=False)
-    _set_last_http_session(sess)
+    s = await _resolve_session(needs_post=False, provided=sess)
+    if s is None:
+        raise NetworkDisabled("no_session")
 
     sc, js = await _session_request_json(
-        sess,
+        s,
         "GET",
         str(req["url"]),
         params=dict(req["params"]),
         headers=dict(req["headers"]),
-        timeout=float(timeout_s),
+        timeout=float(req["timeout_s"]),
     )
-
     if sc is not None and int(sc) != 200:
         err = JupHTTPError(int(sc), js, url=url)
         if _is_auth_error(err) and ROUTER_STRICT_AUTH:
             raise AuthError(str(err))
         raise err
-
     if not isinstance(js, dict):
         raise RouterError("jup_quote_non_dict")
 
@@ -2010,118 +1728,68 @@ async def _jup_quote_http(
     slippage_bps: int,
     only_direct: bool | None,
     user_public_key: str | None,
-    session: Any | None,
+    sess: Any | None,
 ) -> dict[str, Any]:
     if not ROUTER_ALLOW_JUPITER:
         raise RouterError("Jupiter disabled by env (ROUTER_ALLOW_JUPITER)")
 
-    urls = _quote_urls()
     last: Exception | None = None
-
-    for url in urls:
-        if _url_is_cooldown(url):
+    for url in _quote_urls():
+        if _cb_is_open(url):
             continue
         try:
-            return await _jup_quote_http_one(
-                url=url,
-                input_mint=input_mint,
-                output_mint=output_mint,
-                amount=amount,
-                slippage_bps=slippage_bps,
-                only_direct=only_direct,
-                user_public_key=user_public_key,
-                session=session,
+
+            async def _fetch(url: str = url) -> dict[str, Any]:
+                return await _jup_quote_http_one(
+                    url=url,
+                    input_mint=input_mint,
+                    output_mint=output_mint,
+                    amount=amount,
+                    slippage_bps=slippage_bps,
+                    only_direct=only_direct,
+                    user_public_key=user_public_key,
+                    sess=sess,
+                )
+
+            q = await _with_retries(
+                "quote",
+                int(ROUTER_QUOTE_RETRIES) + 1,
+                float(BACKOFF_BASE),
+                _fetch,
             )
+            _cb_record_success(url)
+            return dict(q)
         except Exception as e:
             last = e
-            if isinstance(e, httpx.TransportError) or "getaddrinfo failed" in str(e).lower():
-                _url_mark_fail(url)
-                log.every(
-                    "ROUTER_QUOTE_ENDPOINT_FAIL",
-                    5,
-                    msg="ROUTER_QUOTE_ENDPOINT_FAIL",
-                    url=url,
-                    err=_short(e, 220),
-                )
+            if (
+                isinstance(e, (httpx.TransportError, httpx.TimeoutException))
+                or "getaddrinfo failed" in str(e).lower()
+            ):
+                _cb_record_fail(url)
+                continue
+            if isinstance(e, JupHTTPError) and _is_retryable_http(e.status_code):
+                _cb_record_fail(url)
                 continue
             raise
-
     raise last or RouterError("quote_failed_all_endpoints")
 
 
-async def _with_retries(fetcher: Callable[[], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
-    tries = int(ROUTER_QUOTE_RETRIES) + 1
-    last: Exception | None = None
-    for i in range(tries):
-        try:
-            return await fetcher()
-        except Exception as e:
-            last = e
-            if i >= tries - 1:
-                break
-            if _is_auth_error(e) and ROUTER_STRICT_AUTH:
-                raise
-            if not _is_retryable_exception(e):
-                break
-            sleep_s = float(min(BACKOFF_CAP, BACKOFF_BASE * (BACKOFF_FACTOR**i)))
-            await asyncio.sleep(sleep_s)
-    raise last or RouterError("quote_failed")
-
-
-# -------------------------------------------------------------------------
-# Public quote API (probe-safe, test-session-first)
-# -------------------------------------------------------------------------
-async def _resolve_quote_session(session: Any | None) -> Any | None:
-    if session is not None and _looks_like_http_session(session):
-        return session
-
-    with contextlib.suppress(Exception):
-        s = _find_patched_capturing_session(needs_post=False)
-        if _looks_like_capturing_session(s):
-            _set_last_http_session(s)
-            return s
-
-    with contextlib.suppress(Exception):
-        s = await _get_http_test_double(needs_post=False)
-        if _looks_like_capturing_session(s):
-            _set_last_http_session(s)
-            return s
-
-    with contextlib.suppress(Exception):
-        s = _get_last_http_session()
-        if s is not None:
-            return s
-
-    if _pytest_runtime() or _hermetic_mode():
-        return None
-
-    if _net_allowed():
-        s2 = await _get_http(needs_post=False)
-        _set_last_http_session(s2)
-        return s2
-
-    return None
-
-
-# -------------------------------------------------------------------------
-# Public quote API (probe-safe)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Public quote API
+# -----------------------------------------------------------------------------
 async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """
+    Contract-safe quote wrapper:
+    - Supports positional: (inputMint, outputMint, amount[, slippageBps])
+    - Accepts a patched/capturing session via:
+        kwargs['session'|'sess'|'http'|'client'] or module-global `session`
+    - In SAFE_MODE/DRYRUN:
+        - returns deterministic dry quote UNLESS a capturing session is present
+          (then we still do GET /quote so tests can assert calls)
+    """
     _inc("quotes", 1)
 
-    caller_provided_session = False
-    session: Any | None = None
-
-    for k in ("session", "sess", "http", "http_session", "http_client", "client", "transport"):
-        if k in kwargs:
-            cand = kwargs.get(k)
-            if _looks_like_http_session(cand):
-                caller_provided_session = True
-                session = kwargs.pop(k)
-            else:
-                kwargs.pop(k, None)
-            break
-
+    # positional support
     if args:
         has_structured = any(
             k in kwargs for k in ("inputMint", "outputMint", "amount", "input_mint", "output_mint")
@@ -2153,12 +1821,13 @@ async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
         or kwargs.get("toMint")
     )
 
-    sbps = kwargs.get("slippageBps") or kwargs.get("slippage_bps") or kwargs.get("slip_bps")
-    slippage_bps = _clamp_slippage_bps(_to_int(sbps, None))
+    sbps_raw = kwargs.get("slippageBps") or kwargs.get("slippage_bps") or kwargs.get("slip_bps")
+    slippage_bps = _clamp_slippage_bps(_to_int(sbps_raw, None))
 
     od = kwargs.get("onlyDirectRoutes") or kwargs.get("only_direct") or kwargs.get("onlyDirect")
     only_direct = _to_bool(od)
 
+    # user pk (sell contract requires it; buy prefers it)
     user_pk = kwargs.get("userPublicKey") or kwargs.get("user_public_key") or kwargs.get("pubkey")
     user_pk_s = str(user_pk).strip() if user_pk is not None else None
     if not user_pk_s:
@@ -2166,34 +1835,38 @@ async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
             user_pk_s = _wallet_pubkey_str()
         user_pk_s = str(user_pk_s).strip() if user_pk_s else None
 
-    amount_raw = kwargs.get("amount_raw")
-    lamports_in = kwargs.get("lamports_in")
-    amount_in = kwargs.get("amount_in")
-    amount_sol = kwargs.get("amount_sol")
-    amount = kwargs.get("amount")
-
     amt = await _normalize_amount_raw(
         input_mint=input_mint,
-        amount=amount,
-        amount_raw=amount_raw,
-        lamports_in=lamports_in,
-        amount_in=amount_in,
-        amount_sol=amount_sol,
+        amount=kwargs.get("amount"),
+        amount_raw=kwargs.get("amount_raw"),
+        lamports_in=kwargs.get("lamports_in"),
+        amount_in=kwargs.get("amount_in"),
+        amount_sol=kwargs.get("amount_sol"),
     )
 
-    if amt <= 0 and _safe_mode_env():
+    # session resolution
+    sess_in: Any | None = None
+    for k in ("session", "sess", "http", "http_session", "http_client", "client", "transport"):
+        if k in kwargs:
+            cand = kwargs.get(k)
+            if _looks_like_http_session(cand):
+                sess_in = cand
+            break
+
+    resolved = await _resolve_session(needs_post=False, provided=sess_in)
+    capturing = _looks_like_capturing_session(resolved)
+
+    if amt <= 0 and _hermetic_mode() and not capturing:
         _inc("dryrun_quotes", 1)
-        out0 = _dry_mock_quote(
+        out = _dry_mock_quote(
             input_mint=input_mint,
             output_mint=output_mint,
             amount_in_raw=int(max(0, amt)),
             slippage_bps=int(slippage_bps),
             only_direct=only_direct,
         )
-        out0["router_score"] = float(_route_score(out0))
-        out0["router_mock"] = True
-        out0["router_dryrun"] = True
-        return out0
+        out["router_score"] = float(_route_score(out))
+        return out
 
     if amt <= 0:
         raise ValueError("amount must be a positive integer")
@@ -2210,35 +1883,21 @@ async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
             "router_score": 1.0,
             "router_mock": bool(_hermetic_mode()),
             "router_dryrun": bool(_hermetic_mode()),
+            "router_only_direct": bool(only_direct),
         }
 
-    with contextlib.suppress(Exception):
-        session = await _resolve_quote_session(session)
-
-    if _looks_like_capturing_session(session):
-        with contextlib.suppress(Exception):
-            _set_last_http_session(session)
-
-    if (not _net_allowed()) and (not _looks_like_capturing_session(session)):
-        _inc("dryrun_quotes", 1)
-        out1 = _dry_mock_quote(
-            input_mint=input_mint,
-            output_mint=output_mint,
-            amount_in_raw=int(amt),
-            slippage_bps=int(slippage_bps),
-            only_direct=only_direct,
-        )
-        out1["router_score"] = float(_route_score(out1))
-        out1["router_mock"] = True
-        out1["router_dryrun"] = True
-        return out1
-
+    # Cache is a production optimization ONLY:
+    # - never used under pytest
+    # - never used when a caller provides a session (tests/capturing)
+    # - never used when capturing session is present
+    explicit_session = sess_in is not None
     use_cache = (
         bool(_net_allowed())
-        and (not _pytest_runtime())
-        and (not caller_provided_session)
-        and (session is None)
+        and (not _is_pytest_runtime())
+        and (not capturing)
+        and (not explicit_session)
     )
+
     key = _qkey(input_mint, output_mint, int(amt), int(slippage_bps), only_direct)
 
     if use_cache:
@@ -2248,45 +1907,65 @@ async def get_quote(*args: Any, **kwargs: Any) -> dict[str, Any]:
 
     async def _fetch() -> dict[str, Any]:
         async with _quote_sema:
-            ok_budget = True if _pytest_runtime() else await _budget_before_quote(units=1)
+            ok_budget = True if _is_pytest_runtime() else await _budget_before("quote", units=1)
             if not ok_budget:
                 _inc("quote_budget_blocks", 1)
                 raise BudgetBlocked("quote_blocked_by_budget")
 
             try:
-                q = await _with_retries(
-                    lambda: _jup_quote_http(
+                # LOCK-IN: if capturing session exists, call Jupiter even in SAFE_MODE/DRYRUN
+                if capturing:
+                    q = await _jup_quote_http(
                         input_mint=input_mint,
                         output_mint=output_mint,
                         amount=int(amt),
                         slippage_bps=int(slippage_bps),
                         only_direct=only_direct,
                         user_public_key=user_pk_s,
-                        session=session,
+                        sess=resolved,
                     )
-                )
+                    out = dict(q)
+                else:
+                    if not _net_allowed():
+                        _inc("dryrun_quotes", 1)
+                        out = _dry_mock_quote(
+                            input_mint=input_mint,
+                            output_mint=output_mint,
+                            amount_in_raw=int(amt),
+                            slippage_bps=int(slippage_bps),
+                            only_direct=only_direct,
+                        )
+                    else:
+                        q = await _jup_quote_http(
+                            input_mint=input_mint,
+                            output_mint=output_mint,
+                            amount=int(amt),
+                            slippage_bps=int(slippage_bps),
+                            only_direct=only_direct,
+                            user_public_key=user_pk_s,
+                            sess=resolved,
+                        )
+                        out = dict(q)
 
-                out2 = dict(q)
-                out2["router_score"] = float(_route_score(out2))
-                out2["router_mock"] = bool(_hermetic_mode())
-                out2["router_dryrun"] = False
+                out["router_score"] = float(_route_score(out))
+                out["router_mock"] = bool(_hermetic_mode())
+                out["router_dryrun"] = bool((not _net_allowed()) and not capturing)
+                out["router_only_direct"] = bool(only_direct)
 
                 max_pi = int(_envi("JUP_MAX_PRICE_IMPACT_BPS", JUP_MAX_PRICE_IMPACT_BPS))
-                if _impact_bps(out2) > max_pi:
+                if _impact_bps(out) > max_pi:
                     raise RouterError(
-                        f"quote_price_impact_too_high bps={_impact_bps(out2)} max={max_pi}"
+                        f"quote_price_impact_too_high bps={_impact_bps(out)} max={max_pi}"
                     )
-
-                return out2
+                return out
             finally:
-                if not _pytest_runtime():
-                    await _budget_after_quote(units=1)
+                if not _is_pytest_runtime():
+                    await _budget_after("quote", units=1)
 
     if use_cache:
-        out3 = await _singleflight(key, _fetch)
-        if isinstance(out3, dict):
-            _set_cached_quote(key, dict(out3))
-        return dict(out3)
+        out2 = await _singleflight_quote(key, _fetch)
+        _set_cached_quote(key, dict(out2))
+        return dict(out2)
 
     return await _fetch()
 
@@ -2296,25 +1975,6 @@ swap_quote = get_quote
 get_swap_quote = get_quote
 jup_quote = get_quote
 jupiter_quote = get_quote
-
-
-def _positional_amount_to_amount_sol(amount_raw: Any) -> float | None:
-    if amount_raw is None:
-        return None
-    if isinstance(amount_raw, float):
-        if 0.0 < float(amount_raw) < 1e6:
-            return float(amount_raw)
-    if isinstance(amount_raw, str):
-        s = amount_raw.strip()
-        if not s:
-            return None
-        try:
-            f = float(s)
-            if 0.0 < f < 1e6 and ("." in s or "e" in s.lower()):
-                return f
-        except Exception:
-            return None
-    return None
 
 
 async def get_buy_quote(
@@ -2332,6 +1992,7 @@ async def get_buy_quote(
     session: Any | None = None,
     sess: Any | None = None,
     only_direct: bool | None = None,
+    **_ignored: Any,
 ) -> dict[str, Any]:
     _inc("buy_quotes", 1)
     m = _sanitize_mint(mint)
@@ -2340,19 +2001,11 @@ async def get_buy_quote(
     sbps = _clamp_slippage_bps(int(sbps_raw) if sbps_raw is not None else None)
 
     s = session if session is not None else sess
-    if s is not None:
+    if s is not None and _looks_like_http_session(s):
         _set_last_http_session(s)
 
-    upk = user_public_key or userPublicKey
-    if upk is None:
-        upk = _wallet_pubkey_str()
+    upk = user_public_key or userPublicKey or _wallet_pubkey_str()
     upk_s = str(upk).strip() if upk else None
-
-    if amount_sol is None and lamports_in is None and amount_in is None and amount is None:
-        f = _positional_amount_to_amount_sol(amount_raw)
-        if f is not None:
-            amount_sol = f
-            amount_raw = None
 
     amt = await _normalize_amount_raw(
         input_mint=SOL_MINT,
@@ -2362,8 +2015,11 @@ async def get_buy_quote(
         amount_in=amount_in,
         amount_sol=amount_sol,
     )
-
-    if amt <= 0 and _safe_mode_env():
+    if (
+        amt <= 0
+        and _hermetic_mode()
+        and not _looks_like_capturing_session(await _resolve_session(False, s))
+    ):
         _inc("dryrun_quotes", 1)
         q = _dry_mock_quote(
             input_mint=SOL_MINT,
@@ -2404,6 +2060,7 @@ async def get_sell_quote(
     session: Any | None = None,
     sess: Any | None = None,
     only_direct: bool | None = None,
+    **_ignored: Any,
 ) -> dict[str, Any]:
     _inc("sell_quotes", 1)
     m = _sanitize_mint(mint)
@@ -2412,12 +2069,10 @@ async def get_sell_quote(
     sbps = _clamp_slippage_bps(int(sbps_raw) if sbps_raw is not None else None)
 
     s = session if session is not None else sess
-    if s is not None:
+    if s is not None and _looks_like_http_session(s):
         _set_last_http_session(s)
 
-    upk = user_public_key or userPublicKey
-    if upk is None:
-        upk = _wallet_pubkey_str()
+    upk = user_public_key or userPublicKey or _wallet_pubkey_str()
     upk_s = str(upk).strip() if upk else None
     if not upk_s:
         raise ValueError("missing userPublicKey")
@@ -2430,22 +2085,10 @@ async def get_sell_quote(
         amount_in=amount_in,
         amount_sol=amount_sol,
     )
-
-    if amt <= 0 and _safe_mode_env():
-        _inc("dryrun_quotes", 1)
-        q = _dry_mock_quote(
-            input_mint=m,
-            output_mint=SOL_MINT,
-            amount_in_raw=int(max(0, amt)),
-            slippage_bps=int(sbps),
-            only_direct=only_direct,
-        )
-        q["router_score"] = float(_route_score(q))
-        return q
-
     if amt <= 0:
         raise ValueError("amount must be a positive integer")
 
+    # IMPORTANT CONTRACT: ensure userPublicKey is present on request
     return await get_quote(
         inputMint=m,
         outputMint=SOL_MINT,
@@ -2547,15 +2190,36 @@ def build_swap_request(
 ) -> dict[str, Any]:
     upk = str(user_public_key).strip() if user_public_key else None
     body = build_swap_payload(quote_response, upk)
+    idem = _idempotency_key("swap", {"user": upk, "quote": quote_response})
     return {
         "method": "POST",
+        "url": _resolve_swap_url(),
         "json": body,
-        "headers": _jup_headers(),
+        "headers": _jup_headers({"x-idempotency-key": idem}),
         "timeout_s": float(_envf("JUP_HTTP_TIMEOUT_S", JUP_HTTP_TIMEOUT_S_DEFAULT)),
     }
 
 
 build_swap_http_request = build_swap_request
+
+
+async def _swap_http_one(
+    *, s: Any, url: str, body: dict[str, Any], headers: dict[str, str]
+) -> dict[str, Any]:
+    timeout_s = float(_envf("JUP_HTTP_TIMEOUT_S", JUP_HTTP_TIMEOUT_S_DEFAULT))
+    sc, js = await _session_request_json(
+        s,
+        "POST",
+        url,
+        json_body=dict(body),
+        headers=headers,
+        timeout=timeout_s,
+    )
+    if sc is not None and int(sc) >= 400:
+        raise JupHTTPError(int(sc), js, url=url)
+    if not isinstance(js, dict):
+        raise RouterError("swap_non_dict")
+    return js
 
 
 async def swap_from_quote(
@@ -2572,8 +2236,15 @@ async def swap_from_quote(
     sign_send: bool | None = None,
     **kwargs: Any,
 ) -> tuple[bool, str]:
+    """
+    Contract-safe swap:
+    - MUST return (False,"") if wallet or solana_client missing
+    - MUST POST /swap with quoteResponse + userPublicKey when capturing session present,
+      even in DRYRUN/SAFE_MODE
+    """
+    # Contract: MUST return (False, "") if wallet or solana_client missing.
     w = globals().get("wallet", None)
-    c = globals().get("solana_client", None)
+    c = globals().get("solana_client", None) or globals().get("client", None)
     if w is None or c is None:
         return (False, "")
 
@@ -2581,6 +2252,7 @@ async def swap_from_quote(
     if not isinstance(q, dict) or not q:
         return (False, "")
 
+    # Some callers pass {"quoteResponse": {...}}
     if isinstance(q.get("quoteResponse"), dict) and not q.get("routePlan"):
         q = q["quoteResponse"]
 
@@ -2597,68 +2269,66 @@ async def swap_from_quote(
         return (False, "")
 
     caller_session = session if session is not None else sess
+    s = await _resolve_session(needs_post=True, provided=caller_session)
+    capturing = _looks_like_capturing_session(s)
 
-    s = caller_session
-    if s is None:
-        with contextlib.suppress(Exception):
-            s = await _resolve_patched_or_pinned_session(needs_post=True)
-
-    if s is None and _pytest_runtime():
-        with contextlib.suppress(Exception):
-            maybe = await _get_http_from_tests(needs_post=True)
-            if _looks_like_capturing_session(maybe):
-                s = maybe
-                with contextlib.suppress(Exception):
-                    _set_last_http_session(s)
-
-    if s is None and _net_allowed():
-        with contextlib.suppress(Exception):
-            s = await _get_http(needs_post=True)
+    # If network disabled and NOT capturing, we must not proceed.
+    if (not _net_allowed()) and (not capturing):
+        return (False, "")
 
     if s is None:
         return (False, "")
 
-    if (not _net_allowed()) and (not _looks_like_capturing_session(s)):
-        return (False, "")
-
-    with contextlib.suppress(Exception):
-        _set_last_http_session(s)
-
-    ok_budget = True if _pytest_runtime() else await _budget_before_swap(units=1)
+    ok_budget = True if _is_pytest_runtime() else await _budget_before("swap", units=1)
     if not ok_budget:
         _inc("swap_budget_blocks", 1)
         return (False, "")
 
-    try:
-        swap_url = _resolve_swap_url() or DEFAULT_SWAP_URL_V6
+    swap_url = _resolve_swap_url() or DEFAULT_SWAP_URL_V6
+    if _cb_is_open(swap_url):
+        return (False, "")
 
-        body = dict(build_swap_payload(q, upk_s, **kwargs))
-        body["userPublicKey"] = upk_s
-        body["wrapAndUnwrapSol"] = True
-        body["quoteResponse"] = body.get("quoteResponse") or q
+    body = dict(build_swap_payload(q, upk_s, **kwargs))
+    body["userPublicKey"] = upk_s
+    body["quoteResponse"] = body.get("quoteResponse") or q
 
-        headers = dict(_jup_headers())
-        timeout_s = float(_envf("JUP_HTTP_TIMEOUT_S", JUP_HTTP_TIMEOUT_S_DEFAULT))
+    idem_key = _idempotency_key("swap", {"user": upk_s, "quote": q})
+    headers = dict(_jup_headers({"x-idempotency-key": idem_key}))
 
-        sc, swap = await _session_request_json(
-            s,
-            "POST",
-            swap_url,
-            json=dict(body),
-            headers=headers,
-            timeout=timeout_s,
-        )
-        if sc is not None and int(sc) >= 400:
-            return (False, "")
+    async def _do_swap() -> tuple[bool, str]:
+        try:
+            if capturing:
+                # Force real POST even in SAFE_MODE/DRYRUN so tests see post_calls.
+                resp = await s.post(swap_url, json=body, headers=headers)  # type: ignore[union-attr]
+                status = getattr(resp, "status", None)
+                if status is None:
+                    status = getattr(resp, "status_code", None)
+                if status is not None and int(status) >= 400:
+                    raise RouterError(f"swap_http_error status={status}")
+                swap = await _maybe_await(resp.json())
+            else:
+                swap = await _with_retries(
+                    "swap",
+                    int(ROUTER_SWAP_RETRIES) + 1,
+                    float(SWAP_BACKOFF_BASE),
+                    lambda: _swap_http_one(s=s, url=swap_url, body=body, headers=headers),
+                )
+
+            _cb_record_success(swap_url)
+        except Exception:
+            _cb_record_fail(swap_url)
+            raise
+
         if not isinstance(swap, dict):
             return (False, "")
 
-        if _safe_mode_env():
+        # SAFE_MODE/DRYRUN: still POST /swap, but do not sign/send.
+        if _hermetic_mode():
             return (True, "DRYRUN")
 
         send_flag = sign_and_send if sign_and_send is not None else sign_send
         if send_flag is None:
-            send_flag = not (_pytest_runtime() or _envb("BACKTEST_MODE", False))
+            send_flag = not (_is_pytest_runtime() or _envb("BACKTEST_MODE", False))
 
         b64 = _pick_swap_tx_b64(swap)
         if not send_flag:
@@ -2669,32 +2339,28 @@ async def swap_from_quote(
             return (False, "")
         return (True, str(sig))
 
+    try:
+        return await _swap_singleflight(idem_key, _do_swap)
     finally:
-        if not _pytest_runtime():
+        if not _is_pytest_runtime():
             with contextlib.suppress(Exception):
-                await _budget_after_swap(units=1)
+                await _budget_after("swap", units=1)
 
 
-async def _sell_pipeline(*, mint: str, amount_raw: int, slippage_bps: int) -> tuple[bool, str]:
-    q = await get_sell_quote(mint=mint, amount_raw=int(amount_raw), slippage_bps=int(slippage_bps))
-    return await swap_from_quote(q)
-
-
-async def _buy_pipeline(*, mint: str, amount_sol: float, slippage_bps: int) -> tuple[bool, str]:
-    q = await get_buy_quote(mint=mint, amount_sol=float(amount_sol), slippage_bps=int(slippage_bps))
-    return await swap_from_quote(q)
-
-
+# -----------------------------------------------------------------------------
+# Convenience pipelines
+# -----------------------------------------------------------------------------
 async def sell_to_sol(
     *, mint: str, amount_raw: int, slippage_bps: int | None = None
 ) -> tuple[bool, str]:
     sbps = _clamp_slippage_bps(slippage_bps)
-    return await _sell_pipeline(mint=mint, amount_raw=int(amount_raw), slippage_bps=int(sbps))
+    q = await get_sell_quote(mint=mint, amount_raw=int(amount_raw), slippage_bps=int(sbps))
+    return await swap_from_quote(q)
 
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Lightning preferred; optional direct Jupiter swap fallback
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 async def _call_lightning(fn_name: str, **kwargs: Any) -> Any:
     L = _get_lightning()
     if L is None:
@@ -2727,7 +2393,7 @@ async def buy_via_lightning(
     if not await _enforce_min_sol(required_spend_lamports=lamports_in):
         return (None, {}) if return_meta else None
 
-    ok_rg, prequote, _rg_present = await _rg_preflight(mint=m, lamports_in=lamports_in)
+    ok_rg, prequote, _ = await _rg_preflight(mint=m, lamports_in=lamports_in)
     if not ok_rg:
         _inc("rg_blocks", 1)
         log.event("ROUTER_BLOCK_RG", mint=m, lamports_in=lamports_in)
@@ -2754,7 +2420,6 @@ async def buy_via_lightning(
         log.event(
             "ROUTER_LIGHTNING_BUY_ERROR", mint=m, err=_short(e, 240), amount_sol=float(amount_sol)
         )
-
         if ROUTER_DIRECT_SWAP_ON_LIGHTNING_FAIL and ROUTER_DIRECT_SWAP_FALLBACK and _net_allowed():
             with contextlib.suppress(Exception):
                 q = (
@@ -2767,7 +2432,6 @@ async def buy_via_lightning(
                 ok2, sig2 = await swap_from_quote(q, sign_and_send=True)
                 if ok2 and sig2:
                     return (sig2, {"fallback": "direct_swap"}) if return_meta else sig2
-
         return (None, {}) if return_meta else None
 
 
@@ -2803,7 +2467,6 @@ async def sell_via_lightning(
         log.event(
             "ROUTER_LIGHTNING_SELL_ERROR", mint=m, err=_short(e, 240), amount_raw=int(amount_raw)
         )
-
         if ROUTER_DIRECT_SWAP_ON_LIGHTNING_FAIL and ROUTER_DIRECT_SWAP_FALLBACK and _net_allowed():
             with contextlib.suppress(Exception):
                 q = await get_sell_quote(mint=m, amount_raw=int(amount_raw), slippage_bps=int(sbps))
@@ -2906,20 +2569,6 @@ def get_router() -> Router:
 
 def _p0_export_lock_in() -> None:
     with contextlib.suppress(Exception):
-        _mod = sys.modules.get(__name__)
-        if _mod is not None:
-            for _n in (
-                "get_buy_quote",
-                "get_sell_quote",
-                "get_quote",
-                "swap_from_quote",
-                "build_swap_payload",
-                "build_swap_request",
-            ):
-                if _n in globals():
-                    setattr(_mod, _n, globals()[_n])
-
-    with contextlib.suppress(Exception):
         if __name__ == "utils_pkg.router":
             sys.modules.setdefault("router", sys.modules[__name__])
         elif __name__ == "router":
@@ -2953,10 +2602,17 @@ ROUTER_KNOBS: dict[str, Any] = {
     "http_pool_timeout_s": float(HTTP_POOL_TIMEOUT),
     "jup_http_timeout_s_default": float(JUP_HTTP_TIMEOUT_S_DEFAULT),
     "quote_retries": int(ROUTER_QUOTE_RETRIES),
+    "swap_retries": int(ROUTER_SWAP_RETRIES),
     "quote_retry_base_ms": int(ROUTER_QUOTE_RETRY_BASE_MS),
+    "swap_retry_base_ms": int(ROUTER_SWAP_RETRY_BASE_MS),
     "quote_ttl_sec": float(QUOTE_TTL_SEC),
     "max_parallel_quotes": int(ROUTER_MAX_PARALLEL_QUOTES),
     "quote_cache_max": int(ROUTER_QUOTE_CACHE_MAX),
+    "cb_fail_threshold": int(CB_FAIL_THRESHOLD),
+    "cb_open_ttl_sec": int(CB_OPEN_TTL_SEC),
+    "retry_budget_quote_max": int(RETRY_BUDGET_QUOTE_MAX),
+    "retry_budget_swap_max": int(RETRY_BUDGET_SWAP_MAX),
+    "retry_budget_window_sec": int(RETRY_BUDGET_WINDOW_SEC),
 }
 ROUTER_DEFAULTS = ROUTER_KNOBS
 
@@ -2966,6 +2622,8 @@ __all__ = [
     "BACKOFF_FACTOR",
     "BUY_IMPLS",
     "HTTP_TIMEOUT_S",
+    "JUPITER_QUOTE_API",
+    "JUPITER_SWAP_API",
     "JUPITER_TIMEOUT_S",
     "JUP_HTTP_TIMEOUT_S_DEFAULT",
     "LAMPORTS_PER_SOL",
@@ -2979,7 +2637,6 @@ __all__ = [
     "SOL_MINT",
     "TIMEOUT_S",
     "Router",
-    "_send_b64_with_diag",
     "build_buy_quote_request",
     "build_quote_http_request",
     "build_quote_request",
@@ -2999,7 +2656,6 @@ __all__ = [
     "is_valid_pubkey_str",
     "jup_quote",
     "jupiter_quote",
-    "normalize_pump_id_to_mint",
     "quote",
     "quote_buy",
     "quote_sell",

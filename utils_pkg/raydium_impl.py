@@ -47,52 +47,65 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, cast
 
 import httpx
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Logging shim (no hard dependency)
-# ──────────────────────────────────────────────────────────────────────────────
-try:
-    from logging_setup import get_logger  # type: ignore
 
-    log = get_logger(__name__)  # type: ignore
-except Exception:  # pragma: no cover
+# -----------------------------------------------------------------------------
+# Logging (no monkey-patching; repo-compatible; never required)
+# -----------------------------------------------------------------------------
+class _LogLike(Protocol):
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> Any: ...
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> Any: ...
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> Any: ...
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> Any: ...
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> Any: ...
+
+
+def _maybe_import_attr(module_name: str, attr: str) -> Any | None:
+    try:
+        import importlib
+
+        mod = importlib.import_module(module_name)
+        return getattr(mod, attr, None)
+    except Exception:
+        return None
+
+
+def _build_logger() -> _LogLike:
     import logging
 
-    log = logging.getLogger(__name__)  # type: ignore[assignment]
+    base: Any = logging.getLogger("utils.raydium_impl")
 
-
-def _ensure_logger_helpers() -> None:
-    if not hasattr(log, "event"):
-
-        def _event(name: str, **kw: Any) -> None:  # pragma: no cover
-            with contextlib.suppress(Exception):
-                log.info("%s %s", name, kw)
-
-        log.event = _event  # type: ignore[attr-defined]
-
-    if not hasattr(log, "every"):
-
-        def _every(
-            key: str, n: int = 30, msg: str | None = None, **kw: Any
-        ) -> None:  # pragma: no cover
+    # Prefer project logger shims if present
+    for mod_name in ("utils_pkg.log_compat", "utils_pkg.logging_setup", "logging_setup"):
+        get_logger = _maybe_import_attr(mod_name, "get_logger")
+        if callable(get_logger):
             try:
-                now = time.monotonic()
-                store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
-                last = float(store.get(key, 0.0))
-                if (now - last) >= float(max(1, int(n))):
-                    store[key] = now
-                    _every._store = store  # type: ignore[attr-defined]
-                    log.event(msg or key, **kw)
+                base = get_logger("utils.raydium_impl")
+                break
             except Exception:
-                return None
+                base = logging.getLogger("utils.raydium_impl")
 
-        log.every = _every  # type: ignore[attr-defined]
+    # Optional EventLogger wrapper (if available)
+    get_event_logger = _maybe_import_attr("utils_pkg.event_logger", "get_event_logger")
+    if callable(get_event_logger):
+        try:
+            wrapped = get_event_logger(base)
+            return cast(_LogLike, wrapped)
+        except Exception:
+            return cast(_LogLike, base)
+
+    return cast(_LogLike, base)
 
 
-_ensure_logger_helpers()
+LOG: _LogLike = _build_logger()
+_EVERY_STORE: dict[str, float] = {}
+
+
+def _mono() -> float:
+    return time.monotonic()
 
 
 def _short(x: Any, n: int = 280) -> str:
@@ -103,59 +116,100 @@ def _short(x: Any, n: int = 280) -> str:
         return "<?>"
 
 
-def _warn(name: str, **kw: Any) -> None:
+def _log_event(name: str, **kw: Any) -> None:
+    """
+    Prefer EventLogger .event() if present; else log.info.
+    Never raises.
+    """
     try:
-        log.event(name, **kw)
-    except Exception:  # pragma: no cover
-        with contextlib.suppress(Exception):
-            log.warning("%s %s", name, kw)  # type: ignore[attr-defined]
+        ev = getattr(LOG, "event", None)
+        if callable(ev):
+            ev(name, **kw)
+            return
+    except Exception:
+        pass
+    try:
+        LOG.info("%s %s", name, kw)
+    except Exception:
+        return
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+def _every(key: str, n: int = 30, msg: str | None = None, **kw: Any) -> None:
+    """
+    Rate-limited event emission without monkey patching the logger.
+    """
+    try:
+        now = _mono()
+        last = float(_EVERY_STORE.get(key, 0.0))
+        if (now - last) >= float(max(1, int(n))):
+            _EVERY_STORE[key] = now
+            _log_event(msg or key, **kw)
+    except Exception:
+        return
+
+
+def _warn(name: str, **kw: Any) -> None:
+    _log_event(name, **kw)
+
+
+# -----------------------------------------------------------------------------
 # Optional budget hooks (HTTP/RPC throttling)
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+class _BudgetLike(Protocol):
+    def before_quote(self, units: int = 1) -> bool: ...
+    def after_quote(self, units: int = 1) -> None: ...
+    def before_rpc(self, method: str, *, weight: int | None = None) -> bool: ...
+    def after_rpc(self, method: str, *, weight: int | None = None) -> None: ...
+
+
+class _BudgetNoop:
+    def before_quote(self, units: int = 1) -> bool:
+        return True
+
+    def after_quote(self, units: int = 1) -> None:
+        return None
+
+    def before_rpc(self, method: str, *, weight: int | None = None) -> bool:
+        return True
+
+    def after_rpc(self, method: str, *, weight: int | None = None) -> None:
+        return None
+
+
+# IMPORTANT: keep `budget` typed as _BudgetLike, never as a Module.
 try:
-    from utils_pkg import budget  # type: ignore
+    from utils_pkg import budget as _budget_mod  # type: ignore
+
+    budget: _BudgetLike = cast(_BudgetLike, _budget_mod)
 except Exception:  # pragma: no cover
-
-    class _BudgetNoop:
-        def before_quote(self, units: int = 1) -> bool:
-            return True
-
-        def after_quote(self, units: int = 1) -> None:
-            return None
-
-        def before_rpc(self, method: str, *, weight: int | None = None) -> bool:
-            return True
-
-        def after_rpc(self, method: str, *, weight: int | None = None) -> None:
-            return None
-
-    budget = _BudgetNoop()  # type: ignore
+    budget = _BudgetNoop()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Imports (no network at import time)
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Mint normalization (optional)
+# -----------------------------------------------------------------------------
 try:
-    from utils_pkg.mints import normalize_mint  # type: ignore
+    from utils_pkg.mints import normalize_mint as normalize_mint  # type: ignore
 except Exception:  # pragma: no cover
 
     def normalize_mint(x: str) -> str:  # type: ignore
         return (x or "").strip()
 
 
+# -----------------------------------------------------------------------------
+# Solana wallet utilities (expected to exist in-repo)
+# -----------------------------------------------------------------------------
 from utils_pkg.solana_wallet import get_pubkey_str, load_keypair, sign_and_send_b64_tx
 
 try:  # pragma: no cover
-    from utils_pkg.solana_wallet import _send_b64_with_diag  # type: ignore
+    from utils_pkg.solana_wallet import _send_b64_with_diag as _send_b64_with_diag  # type: ignore
 except Exception:  # pragma: no cover
     _send_b64_with_diag = None  # type: ignore
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Env helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
 _FALSE = {"0", "false", "f", "no", "n", "off"}
 
@@ -195,30 +249,24 @@ def _clamp_i(x: int, lo: int, hi: int) -> int:
     return lo if x < lo else hi if x > hi else x
 
 
-def _clamp_f(x: float, lo: float, hi: float) -> float:
-    return lo if x < lo else hi if x > hi else x
-
-
 async def _maybe_await(x: Any) -> Any:
     if inspect.isawaitable(x):
         return await x
     return x
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Config
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 LAMPORTS_PER_SOL = 1_000_000_000
 
 SOL_MINT = _env_str("SOL_MINT", "So11111111111111111111111111111111111111112")
 USDC_MINT = _env_str("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 
-# Raydium API v3 (priority fee, etc.)
 RAY_BASE_HOST = (
     _env_str("RAY_BASE_HOST", _env_str("RAYDIUM_BASE_HOST", "https://api-v3.raydium.io"))
 ).rstrip("/")
 
-# Raydium Trade API (compute + build tx)
 RAY_SWAP_HOST = (
     _env_str("RAY_SWAP_HOST", _env_str("RAYDIUM_SWAP_HOST", "https://transaction-v1.raydium.io"))
 ).rstrip("/")
@@ -228,76 +276,62 @@ _RAY_HOSTS = [RAY_SWAP_HOST] + [
     for u in (RAY_ALT_SWAP_HOSTS_RAW.split(",") if RAY_ALT_SWAP_HOSTS_RAW else [])
     if u.strip()
 ]
-# de-dupe while preserving order
-RAY_SWAP_HOSTS: list[str] = list(dict.fromkeys(_RAY_HOSTS))
+RAY_SWAP_HOSTS: list[str] = list(dict.fromkeys([h for h in _RAY_HOSTS if h])) or [RAY_SWAP_HOST]
 
-# Swap mode (compute/build endpoints)
 RAY_SWAP_MODE = _env_str("RAY_SWAP_MODE", "base_in").lower().strip()
 if RAY_SWAP_MODE not in ("base_in", "base_out"):
     RAY_SWAP_MODE = "base_in"
 
-# Tx version: "V0" or "LEGACY"
 RAY_TX_VERSION = _env_str("RAY_TX_VERSION", "V0").upper().strip()
 if RAY_TX_VERSION not in ("V0", "LEGACY"):
     RAY_TX_VERSION = "V0"
 
-# Slippage bps
 DEFAULT_SLIPPAGE_BPS = _clamp_i(_env_int("PF_SLIPPAGE_BPS", _env_int("SLIPPAGE_BPS", 30)), 1, 5000)
 
-# Priority fee micro-lamports (string required by API)
 RAY_CU_PRICE_MICRO = _env_str("RAY_CU_PRICE_MICRO", _env_str("PF_COMPUTE_UNIT_PRICE_MICRO", ""))
-RAY_PRIORITY_TIER = _env_str("RAY_PRIORITY_TIER", "h").lower().strip()  # "vh"|"h"|"m"
+RAY_PRIORITY_TIER = _env_str("RAY_PRIORITY_TIER", "h").lower().strip()
 
-# Reliability (HTTP)
 HTTP_TIMEOUT_SEC = max(5.0, _env_float("RAY_HTTP_TIMEOUT_SEC", 20.0))
 HTTP_RETRY_MAX = max(0, _env_int("RAY_HTTP_RETRY_MAX", 2))
 HTTP_RETRY_BACKOFF_SEC = max(0.05, _env_float("RAY_HTTP_RETRY_BACKOFF_SEC", 0.8))
 HTTP_RETRY_JITTER_SEC = max(0.0, _env_float("RAY_HTTP_RETRY_JITTER_SEC", 0.25))
 
-# QPS gate (shared across compute/build)
 RAY_MAX_QPS = max(1, _env_int("RAY_MAX_QPS", 2))
 _RAY_MIN_INTERVAL = 1.0 / float(RAY_MAX_QPS)
 _RATE_LOCK = asyncio.Lock()
 _LAST_MONO: float = 0.0
 
-# Concurrency guard (avoid stampeding endpoints)
 _RAY_HTTP_CONCURRENCY = _clamp_i(_env_int("RAY_HTTP_CONCURRENCY", 8), 1, 64)
 _HTTP_SEMA = asyncio.Semaphore(_RAY_HTTP_CONCURRENCY)
 
-# Behavior flags
 DRY_RUN = _env_bool("DRYRUN", False) or _env_bool("DRY_RUN", False) or _env_bool("IS_DRYRUN", False)
 RAY_RETURN_RECEIPTS = _env_bool("RAY_RETURN_RECEIPTS", False)
 RAY_INCLUDE_SWAP_RESPONSE = _env_bool("RAY_INCLUDE_SWAP_RESPONSE", True)
 RAY_DRYRUN_BUILD_TX = _env_bool("RAY_DRYRUN_BUILD_TX", False)
 
-# Hard stops
 DISABLE_BUYS = _env_bool("DISABLE_BUYS", False)
 DISABLE_SELLS = _env_bool("DISABLE_SELLS", False)
 KILL_SWITCH = _env_bool("KILL_SWITCH", False)
 
-# Solana send knobs
 SEND_SKIP_PREFLIGHT = _env_bool("SOLANA_SKIP_PREFLIGHT", True)
 
-# Token account resolution
 SOLANA_RPC_URL = _env_str(
     "SOLANA_RPC_URL", _env_str("SOL_RPC_URL", _env_str("RPC_URL", _env_str("SOLANA_RPC", "")))
 )
 RAY_INPUT_ACCOUNT_OVERRIDE = _env_str("RAY_INPUT_ACCOUNT", "")
 RAY_ATA_VERIFY_EXISTS = _env_bool("RAY_ATA_VERIFY_EXISTS", False)
 
-# Priority cache
 _PRIORITY_CACHE_TTL = max(5.0, _env_float("RAY_PRIORITY_CACHE_TTL_SEC", 20.0))
-_priority_cache: tuple[float, str | None] = (0.0, None)  # (exp_mono, micro_str)
+_priority_cache: tuple[float, str | None] = (0.0, None)
 
-# RPC retry knobs (token account resolution)
 RPC_TIMEOUT_SEC = max(3.0, _env_float("RAY_RPC_TIMEOUT_SEC", 12.0))
 RPC_RETRY_MAX = max(0, _env_int("RAY_RPC_RETRY_MAX", 1))
 RPC_RETRY_BACKOFF_SEC = max(0.05, _env_float("RAY_RPC_RETRY_BACKOFF_SEC", 0.6))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # HTTP clients (lazy singletons, race-safe)
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 _client: httpx.AsyncClient | None = None
 _rpc_client: httpx.AsyncClient | None = None
 _client_lock = asyncio.Lock()
@@ -352,9 +386,9 @@ async def close_http() -> None:
     _rpc_client = None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Host failover (soft circuit breaker)
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 @dataclass
 class _HostState:
     fails: int = 0
@@ -363,10 +397,6 @@ class _HostState:
 
 _HOST_STATE: dict[str, _HostState] = {}
 _HOST_LOCK = asyncio.Lock()
-
-
-def _mono() -> float:
-    return time.monotonic()
 
 
 async def _host_is_banned(host: str) -> bool:
@@ -388,23 +418,23 @@ async def _host_mark_ok(host: str) -> None:
 
 
 async def _host_mark_fail(host: str, *, why: str = "") -> None:
+    ban: float
+    fails: int
     async with _HOST_LOCK:
         st = _HOST_STATE.get(host)
         if not st:
             st = _HostState()
             _HOST_STATE[host] = st
         st.fails = int(st.fails) + 1
-        # exponential backoff ban, capped
         ban = min(60.0, 1.5 * (2.0 ** min(6, st.fails)))
         st.banned_until_mono = _mono() + ban
-    log.every(
-        "RAY_HOST_BAN", n=10, msg="RAY_HOST_BAN", host=host, fails=st.fails, ban_s=ban, why=why
-    )
+        fails = st.fails
+    _every("RAY_HOST_BAN", n=10, msg="RAY_HOST_BAN", host=host, fails=fails, ban_s=ban, why=why)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Rate limiting + retry helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 async def _qps_gate() -> None:
     global _LAST_MONO
     async with _RATE_LOCK:
@@ -443,12 +473,6 @@ async def _http_json(
     params: dict[str, Any] | None = None,
     json_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """
-    Shared HTTP JSON helper:
-      - QPS gate
-      - concurrency guard
-      - transient retries
-    """
     await _qps_gate()
     c = await _get_client()
 
@@ -494,15 +518,15 @@ async def _http_json(
     raise RuntimeError("ray_http_failed")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Keypair cache
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 _KP_LOCK = asyncio.Lock()
-_KP = None
+_KP: Any | None = None
 _PUBKEY_STR: str | None = None
 
 
-async def _get_keypair_cached():
+async def _get_keypair_cached() -> tuple[Any, str]:
     global _KP, _PUBKEY_STR
     if _KP is not None and _PUBKEY_STR:
         return _KP, _PUBKEY_STR
@@ -514,15 +538,10 @@ async def _get_keypair_cached():
         return _KP, _PUBKEY_STR
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Response-shape normalizers (robust across Raydium variants)
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def _unwrap_data(js: dict[str, Any]) -> dict[str, Any]:
-    """
-    Common wraps:
-      - {"success":true,"data":{...}}
-      - {"data":{...}}
-    """
     data = js.get("data")
     if isinstance(data, dict):
         return data
@@ -535,21 +554,13 @@ def _extract_swap_response(compute_js: dict[str, Any]) -> dict[str, Any]:
     Some compute responses are already the swapResponse; some wrap under data/swapResponse.
     """
     inner = _unwrap_data(compute_js)
-    if isinstance(inner, dict):
-        sr = inner.get("swapResponse")
-        if isinstance(sr, dict):
-            return sr
-        return inner
-    return compute_js
+    sr = inner.get("swapResponse")
+    if isinstance(sr, dict):
+        return sr
+    return inner
 
 
 def _extract_txs(build_js: dict[str, Any]) -> list[str]:
-    """
-    Expected shapes:
-      - {"success":true,"data":[{"transaction":"<b64>"}, ...]}
-      - {"data":[{"transaction":"<b64>"}]}
-      - {"transactions":[...]}
-    """
     data = build_js.get("data")
     if isinstance(data, list):
         out: list[str] = []
@@ -579,16 +590,10 @@ def _extract_txs(build_js: dict[str, Any]) -> list[str]:
     raise RuntimeError(f"ray_build_missing_txs: {_short(build_js, 520)}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Priority fee (optional helper)
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 async def _fetch_priority_fee_micro() -> str | None:
-    """
-    Returns micro-lamports price as string suitable for computeUnitPriceMicroLamports.
-
-    Uses env override first; else hits Raydium /priority-fee endpoint (cached).
-    Never throws to callers (best-effort).
-    """
     global _priority_cache
 
     if RAY_CU_PRICE_MICRO:
@@ -622,10 +627,10 @@ async def _fetch_priority_fee_micro() -> str | None:
     return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # RPC helpers (token account resolution for SELL)
-# ──────────────────────────────────────────────────────────────────────────────
-async def _rpc(method: str, params: list) -> Any:
+# -----------------------------------------------------------------------------
+async def _rpc(method: str, params: list[Any]) -> Any:
     if not SOLANA_RPC_URL:
         raise RuntimeError("missing_SOLANA_RPC_URL")
 
@@ -646,7 +651,6 @@ async def _rpc(method: str, params: list) -> Any:
                         attempt, base=RPC_RETRY_BACKOFF_SEC, jitter=HTTP_RETRY_JITTER_SEC
                     )
                     continue
-                # B904: explicit chaining distinguishes transport error from except-clause errors
                 raise RuntimeError(f"rpc_transport: {_short(err, 220)}") from err
 
             js = _safe_json(r)
@@ -654,7 +658,6 @@ async def _rpc(method: str, params: list) -> Any:
                 raise RuntimeError("rpc_bad_json")
 
             if js.get("error"):
-                # keep simple; callers treat as fatal (account resolution)
                 raise RuntimeError(f"rpc_error: {_short(js.get('error'), 520)}")
 
             ok = True
@@ -668,21 +671,19 @@ async def _rpc(method: str, params: list) -> Any:
 
 
 def _try_derive_ata(owner: str, mint: str) -> str | None:
-    """
-    Best-effort ATA derivation using solders if present.
-    """
     try:
         from solders.pubkey import Pubkey  # type: ignore
 
-        ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string(
+        associated_token_program_id = Pubkey.from_string(
             "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
         )
-        TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        token_program_id = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
         owner_pk = Pubkey.from_string(owner)
         mint_pk = Pubkey.from_string(mint)
+
         ata, _bump = Pubkey.find_program_address(
-            [bytes(owner_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pk)],
-            ASSOCIATED_TOKEN_PROGRAM_ID,
+            [bytes(owner_pk), bytes(token_program_id), bytes(mint_pk)],
+            associated_token_program_id,
         )
         return str(ata)
     except Exception:
@@ -700,13 +701,6 @@ async def _rpc_account_exists(pubkey: str) -> bool:
 
 
 async def _resolve_input_token_account(owner: str, mint: str) -> str:
-    """
-    Raydium Trade API requires inputAccount when inputMint != SOL.
-    We try:
-      1) env override
-      2) derive ATA (optional verify exists)
-      3) RPC getTokenAccountsByOwner (first match)
-    """
     if RAY_INPUT_ACCOUNT_OVERRIDE:
         return RAY_INPUT_ACCOUNT_OVERRIDE
 
@@ -719,11 +713,7 @@ async def _resolve_input_token_account(owner: str, mint: str) -> str:
 
     res = await _rpc(
         "getTokenAccountsByOwner",
-        [
-            owner,
-            {"mint": mint},
-            {"encoding": "jsonParsed"},
-        ],
+        [owner, {"mint": mint}, {"encoding": "jsonParsed"}],
     )
     value = (res or {}).get("value") if isinstance(res, dict) else None
     if isinstance(value, list) and value:
@@ -734,9 +724,9 @@ async def _resolve_input_token_account(owner: str, mint: str) -> str:
     raise RuntimeError("could_not_resolve_input_account")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Trade API endpoints
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def _compute_path() -> str:
     return "swap-base-in" if RAY_SWAP_MODE == "base_in" else "swap-base-out"
 
@@ -795,14 +785,10 @@ async def _build_swap_txs(
     return js, txs
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Send helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 async def _send_tx_b64(tx_b64: str) -> str:
-    """
-    Send base64 tx via diagnostic sender if available; else sign locally.
-    Signature-drift tolerant for diag sender args.
-    """
     if _send_b64_with_diag is not None:
         fn = _send_b64_with_diag
         for kwargs in (
@@ -817,15 +803,16 @@ async def _send_tx_b64(tx_b64: str) -> str:
                 continue
             except Exception:
                 break
+
     kp, _ = await _get_keypair_cached()
     return str(
         await _maybe_await(sign_and_send_b64_tx(tx_b64, kp, skip_preflight=SEND_SKIP_PREFLIGHT))
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Receipts / meta
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def _mk_receipt(
     *,
     ok: bool,
@@ -893,16 +880,12 @@ def _variant_flags() -> dict[str, Any]:
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Router-friendly quote helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 async def get_buy_quote(
     *, mint: str, lamports_in: int, slippage_bps: int = DEFAULT_SLIPPAGE_BPS
 ) -> dict[str, Any]:
-    """
-    SOL -> mint compute response (Raydium Trade API).
-    Returns the (possibly wrapped) compute dict from the API.
-    """
     sbps = _clamp_i(int(slippage_bps), 1, 5000)
     m = normalize_mint(mint)
 
@@ -913,7 +896,7 @@ async def get_buy_quote(
         raise RuntimeError("quote blocked by budget")
 
     try:
-        last_err: BaseException | None = None
+        last_err: Exception | None = None
         for host in RAY_SWAP_HOSTS:
             if await _host_is_banned(host):
                 continue
@@ -928,7 +911,7 @@ async def get_buy_quote(
                 )
                 await _host_mark_ok(host)
                 return js
-            except BaseException as e:
+            except Exception as e:
                 last_err = e
                 await _host_mark_fail(host, why=_short(e, 180))
                 continue
@@ -941,9 +924,6 @@ async def get_buy_quote(
 async def get_sell_quote(
     *, mint: str, amount_raw: int, slippage_bps: int = DEFAULT_SLIPPAGE_BPS
 ) -> dict[str, Any]:
-    """
-    mint -> SOL compute response (Raydium Trade API).
-    """
     sbps = _clamp_i(int(slippage_bps), 1, 5000)
     m = normalize_mint(mint)
 
@@ -954,7 +934,7 @@ async def get_sell_quote(
         raise RuntimeError("quote blocked by budget")
 
     try:
-        last_err: BaseException | None = None
+        last_err: Exception | None = None
         for host in RAY_SWAP_HOSTS:
             if await _host_is_banned(host):
                 continue
@@ -969,7 +949,7 @@ async def get_sell_quote(
                 )
                 await _host_mark_ok(host)
                 return js
-            except BaseException as e:
+            except Exception as e:
                 last_err = e
                 await _host_mark_fail(host, why=_short(e, 180))
                 continue
@@ -979,30 +959,21 @@ async def get_sell_quote(
             budget.after_quote(units=1)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Public API (router-compatible)
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 async def buy_via_raydium(
     *,
     mint: str,
     amount_sol: float,
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
-    return_meta: bool = False,  # compatibility (router may pass)
+    return_meta: bool = False,
     return_receipt: bool = False,
-    # router-fed prequote aliases:
     prequote: dict[str, Any] | None = None,
     quote: dict[str, Any] | None = None,
     prefetched_quote: dict[str, Any] | None = None,
     **_ignored: Any,
 ) -> str | None | tuple[str | None, dict[str, Any]] | dict[str, Any]:
-    """
-    SOL -> mint using Raydium Trade API.
-
-    Return types:
-      - default: Optional[str] (last tx signature)
-      - if return_meta=True: (Optional[str], meta_dict)
-      - if return_receipt=True or RAY_RETURN_RECEIPTS=1: receipt dict
-    """
     if KILL_SWITCH or DISABLE_BUYS:
         rec = _mk_receipt(
             ok=False,
@@ -1023,12 +994,14 @@ async def buy_via_raydium(
 
     sbps = _clamp_i(int(slippage_bps), 1, 5000)
     amt_sol = float(amount_sol)
+    m = normalize_mint(mint)
+
     if not math.isfinite(amt_sol) or amt_sol <= 0.0:
         rec = _mk_receipt(
             ok=False,
             side="BUY",
             input_mint=SOL_MINT,
-            output_mint=str(mint),
+            output_mint=m,
             amount_in=0,
             slippage_bps=sbps,
             tx_version=RAY_TX_VERSION,
@@ -1042,7 +1015,6 @@ async def buy_via_raydium(
         return None
 
     lamports_in = max(1, int(amt_sol * float(LAMPORTS_PER_SOL)))
-    m = normalize_mint(mint)
 
     supplied = prequote or quote or prefetched_quote
     compute_resp: dict[str, Any] | None = (
@@ -1054,9 +1026,8 @@ async def buy_via_raydium(
     try:
         _kp, owner = await _get_keypair_cached()
 
-        # DRYRUN (no build)
         if DRY_RUN and not RAY_DRYRUN_BUILD_TX:
-            log.every(
+            _every(
                 "RAY_ENTRY_DRYRUN",
                 n=15,
                 msg="RAY_ENTRY_DRYRUN",
@@ -1087,7 +1058,7 @@ async def buy_via_raydium(
             micro = "0"
         meta["cu_price_micro"] = micro
 
-        last_err: BaseException | None = None
+        last_err: Exception | None = None
 
         for host in RAY_SWAP_HOSTS:
             if await _host_is_banned(host):
@@ -1095,7 +1066,6 @@ async def buy_via_raydium(
             try:
                 t0 = _mono()
 
-                # compute
                 if compute_resp is None:
                     compute_resp = await _compute_swap(
                         host=host,
@@ -1106,7 +1076,6 @@ async def buy_via_raydium(
                         tx_version=RAY_TX_VERSION,
                     )
 
-                # build
                 build_js, txs = await _build_swap_txs(
                     host=host,
                     compute_response=compute_resp,
@@ -1120,7 +1089,7 @@ async def buy_via_raydium(
                 )
 
                 if DRY_RUN:
-                    log.every(
+                    _every(
                         "RAY_ENTRY_DRYRUN_BUILT",
                         n=15,
                         msg="RAY_ENTRY_DRYRUN_BUILT",
@@ -1154,7 +1123,6 @@ async def buy_via_raydium(
                         }
                     return None
 
-                # send sequentially
                 sigs: list[str] = []
                 for tx_b64 in txs:
                     sigs.append(await _send_tx_b64(tx_b64))
@@ -1162,7 +1130,7 @@ async def buy_via_raydium(
                 dt_ms = int(1000.0 * (_mono() - t0))
                 await _host_mark_ok(host)
 
-                log.event(
+                _log_event(
                     "RAY_ENTRY_OK",
                     mint=m,
                     sig=sigs[-1],
@@ -1194,10 +1162,10 @@ async def buy_via_raydium(
 
                 return sigs[-1]
 
-            except BaseException as e:
+            except Exception as e:
                 last_err = e
                 await _host_mark_fail(host, why=_short(e, 180))
-                compute_resp = None  # recompute on next host
+                compute_resp = None
                 continue
 
         raise last_err or RuntimeError("ray_buy_failed_all_hosts")
@@ -1227,23 +1195,15 @@ async def buy_via_raydium(
 async def sell_via_raydium(
     *,
     mint: str,
-    token_program: str | None = None,  # compatibility (unused)
+    token_program: str | None = None,
     amount_raw: int,
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
     return_receipt: bool = False,
-    # router-fed prequote aliases:
     prequote: dict[str, Any] | None = None,
     quote: dict[str, Any] | None = None,
     prefetched_quote: dict[str, Any] | None = None,
     **_ignored: Any,
 ) -> str | None | dict[str, Any]:
-    """
-    mint -> SOL using Raydium Trade API.
-
-    Return types:
-      - default: Optional[str] (last tx signature)
-      - if return_receipt=True or RAY_RETURN_RECEIPTS=1: receipt dict
-    """
     del token_program
 
     if KILL_SWITCH or DISABLE_SELLS:
@@ -1288,9 +1248,8 @@ async def sell_via_raydium(
     try:
         _kp, owner = await _get_keypair_cached()
 
-        # DRYRUN (no build)
         if DRY_RUN and not RAY_DRYRUN_BUILD_TX:
-            log.every(
+            _every(
                 "RAY_EXIT_DRYRUN", n=15, msg="RAY_EXIT_DRYRUN", mint=m, amount_raw=amt, sbps=sbps
             )
             rec = _mk_receipt(
@@ -1315,7 +1274,7 @@ async def sell_via_raydium(
         input_acc = await _resolve_input_token_account(owner=owner, mint=m)
         meta["inputAccount"] = input_acc
 
-        last_err: BaseException | None = None
+        last_err: Exception | None = None
 
         for host in RAY_SWAP_HOSTS:
             if await _host_is_banned(host):
@@ -1341,12 +1300,12 @@ async def sell_via_raydium(
                     compute_unit_price_micro=micro,
                     wrap_sol=False,
                     unwrap_sol=True,
-                    input_account=input_acc,  # REQUIRED when input != SOL
+                    input_account=input_acc,
                     output_account=None,
                 )
 
                 if DRY_RUN:
-                    log.every(
+                    _every(
                         "RAY_EXIT_DRYRUN_BUILT",
                         n=15,
                         msg="RAY_EXIT_DRYRUN_BUILT",
@@ -1377,7 +1336,7 @@ async def sell_via_raydium(
                 dt_ms = int(1000.0 * (_mono() - t0))
                 await _host_mark_ok(host)
 
-                log.event(
+                _log_event(
                     "RAY_EXIT_OK",
                     mint=m,
                     sig=sigs[-1],
@@ -1406,7 +1365,7 @@ async def sell_via_raydium(
 
                 return sigs[-1]
 
-            except BaseException as e:
+            except Exception as e:
                 last_err = e
                 await _host_mark_fail(host, why=_short(e, 180))
                 compute_resp = None
@@ -1432,9 +1391,9 @@ async def sell_via_raydium(
         return rec if (return_receipt or RAY_RETURN_RECEIPTS) else None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Debug helpers (Render shell smoke tests)
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 async def debug_compute_sol_to_usdc(
     amount_sol: float = 0.002, slippage_bps: int = DEFAULT_SLIPPAGE_BPS
 ) -> dict[str, Any]:

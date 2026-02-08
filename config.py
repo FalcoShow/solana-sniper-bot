@@ -55,7 +55,7 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Iterator, Mapping as AbcMapping
+from collections.abc import ItemsView, Iterator, KeysView, Mapping as AbcMapping, ValuesView
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Iterable, Mapping, Sequence
@@ -1575,14 +1575,26 @@ class Config(AbcMapping[str, Any]):
         k = self._resolve_key(key)
         return bool(k) and (k in self._field_names())
 
-    def keys(self) -> list[str]:
-        return list(self._field_names())
+    # NOTE: Mapping protocol requires view-returning methods.
+    # Keep list-returning compatibility via *_list helpers below.
+    def keys(self) -> KeysView[str]:
+        return AbcMapping.keys(self)
 
-    def items(self) -> list[tuple[str, Any]]:
-        return [(k, getattr(self, k)) for k in self._field_names()]
+    def items(self) -> ItemsView[str, Any]:
+        return AbcMapping.items(self)
 
-    def values(self) -> list[Any]:
-        return [getattr(self, k) for k in self._field_names()]
+    def values(self) -> ValuesView[Any]:
+        return AbcMapping.values(self)
+
+    # Backward-compat helpers (old behavior)
+    def keys_list(self) -> list[str]:
+        return list(self.keys())
+
+    def items_list(self) -> list[tuple[str, Any]]:
+        return list(self.items())
+
+    def values_list(self) -> list[Any]:
+        return list(self.values())
 
     def to_dict(self, *, redact_secrets: bool = False) -> dict[str, Any]:
         """

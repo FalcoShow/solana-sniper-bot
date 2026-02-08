@@ -2,13 +2,13 @@
 # =============================================================================
 # start.sh — Canonical Bootstrap Spine (P0 LOCK-IN / God-Tier)
 #
-# Hard guarantees:
-#   - Render fail-closed: gates MUST pass or EXIT 1 (no broken boots)
+# Guarantees:
+#   - Deterministic boot (local == Render) via the same gates and same launch path
+#   - Render fail-closed by default: gates MUST pass or EXIT 1
 #   - No secret leaks in logs (even on ERR traps)
-#   - Deterministic env + path + DSN normalization + wallet materialization
-#   - Safe dotenv loading (no eval; source only if explicitly allowed)
-#   - One canonical Python module launch + crash supervisor (restart/backoff)
-#   - Optional health gating (readiness) + safe shutdown (signal forwarding)
+#   - Import-safe: no network on import, no eval-dotenv unless explicitly allowed
+#   - Canonical Python module launch + crash supervisor (restart/backoff)
+#   - Optional health gating using canonical scripts.healthcheck (JSON-robust)
 #
 # Subcommands:
 #   ./start.sh help
@@ -21,7 +21,7 @@
 #   ./start.sh compileall
 #   ./start.sh check-router [args...]
 #   ./start.sh check-jupiter [args...]
-#   ./start.sh healthcheck   (probe health URL if configured)
+#   ./start.sh healthcheck [args...]
 #
 # Default run:
 #   ./start.sh
@@ -52,15 +52,6 @@ _log()  { printf '[start] %s %s\n' "$(_ts)" "$*" >&2; }
 _warn() { printf '[start] %s WARN: %s\n' "$(_ts)" "$*" >&2; }
 _die()  { printf '[start] %s FATAL: %s\n' "$(_ts)" "$*" >&2; exit 1; }
 
-_on_err() {
-  local rc="${1:-1}" line="${2:-0}"
-  # DO NOT print $BASH_COMMAND (could contain secrets)
-  _log "ERROR rc=${rc} line=${line}"
-  exit "${rc}"
-}
-trap '_on_err "$?" "$LINENO"' ERR
-trap 'rc=$?; _log "EXIT rc=$rc"' EXIT
-
 _is_true() {
   case "${1:-}" in
     1|true|TRUE|yes|YES|y|Y|on|ON|t|T) return 0 ;;
@@ -69,7 +60,7 @@ _is_true() {
 }
 
 _mask_url() {
-  # Masks userinfo in scheme://userinfo@host and strips querystring
+  # Masks scheme://userinfo@host and strips querystring
   local u="${1:-}"
   [[ -z "$u" ]] && { printf '%s' ""; return 0; }
 
@@ -99,6 +90,15 @@ _join_by() {
   done
   printf '%s' "$out"
 }
+
+_on_err() {
+  local rc="${1:-1}" line="${2:-0}"
+  # DO NOT print $BASH_COMMAND (could contain secrets)
+  _log "ERROR rc=${rc} line=${line}"
+  exit "${rc}"
+}
+trap '_on_err "$?" "$LINENO"' ERR
+trap 'rc=$?; _log "EXIT rc=$rc"' EXIT
 
 # -----------------------------------------------------------------------------
 # 0) Repo root + Render detect + CRLF guard
@@ -143,7 +143,6 @@ fi
 
 # Render fail-closed policy (forced ON unless START_ALLOW_UNSAFE_RENDER=1)
 : "${START_ALLOW_UNSAFE_RENDER:=0}"
-
 if [[ "$IS_RENDER" == "1" ]] && ! _is_true "${START_ALLOW_UNSAFE_RENDER}"; then
   START_STRICT=1
   START_PRECHECKS=1
@@ -194,28 +193,31 @@ fi
 : "${MAIN_NO_RESTART_EXIT_CODES:=130,143}"
 : "${MAIN_USE_SETSID:=1}"
 
-# Crash-loop protection (hard stop if too many crashes in a window)
-: "${MAIN_CRASH_WINDOW_S:=300}"          # 5 minutes
-: "${MAIN_CRASH_MAX_IN_WINDOW:=6}"       # stop if >=6 crashes within window
+# Crash-loop protection
+: "${MAIN_CRASH_WINDOW_S:=300}"
+: "${MAIN_CRASH_MAX_IN_WINDOW:=6}"
 
-# Safe shutdown policy
-: "${STOP_GRACE_S:=25}"                  # seconds to wait before SIGKILL
+# Safe shutdown
+: "${STOP_GRACE_S:=25}"
 
-# Preflight behavior (hard gate defaults)
+# Preflight behavior
 : "${START_PREFLIGHT_FORCE:=1}"
 : "${START_PREFLIGHT_JSON_ONLY:=1}"
 : "${START_PREFLIGHT_PROFILE:=deploy}"
 
-# Health gating (optional but bulletproof when configured)
-# If enabled and health never becomes OK, we fail the deploy.
-: "${START_HEALTH_GATING:=}"             # set to 1/0 to force
-: "${START_HEALTH_GATING_AUTO:=1}"       # if 1, auto-enable when URL can be inferred on Render
-: "${HEALTHCHECK_URL:=}"                 # override full URL
-: "${HEALTHCHECK_PATH:=/health}"         # used to infer URL if none provided
+# Health gating (optional; uses canonical scripts.healthcheck)
+: "${START_HEALTH_GATING:=}"               # set to 1/0 to force
+: "${START_HEALTH_GATING_AUTO:=1}"         # if 1, auto-enable on Render when URL inferrable
 : "${START_HEALTH_GATING_TIMEOUT_S:=75}"
 : "${START_HEALTH_GATING_INTERVAL_S:=2}"
-: "${START_HEALTH_GATING_REQUIRE_200:=0}" # if 1 require exact 200; else accept any 2xx
-: "${READY_FILE:=}"                      # if set, touch when healthy
+: "${START_HEALTH_GATING_MODE:=http}"      # http|local (local for non-web workers if you want)
+: "${START_HEALTH_GATING_DEEP:=0}"
+
+# Canonical endpoint alignment (defaults to /readyz)
+: "${HEALTHCHECK_URL:=}"
+: "${HEALTHCHECK_HTTP_PATH:=/readyz}"      # canonical
+: "${HEALTHCHECK_PATH:=}"                  # legacy alias (if set, wins)
+: "${READY_FILE:=}"
 
 # export contract vars used by Python gatekeepers
 export RUN_MODE RUN_MODULE_OVERRIDE
@@ -501,7 +503,7 @@ case "${cmd}" in
   ./start.sh bash-syntax
   ./start.sh check-router [args...]
   ./start.sh check-jupiter [args...]
-  ./start.sh healthcheck
+  ./start.sh healthcheck [args...]
 TXT
     exit 0
     ;;
@@ -560,7 +562,7 @@ PY
     ;;
   healthcheck)
     shift || true
-    # Probe only (does not start child)
+    exec "$PYTHON" -m scripts.healthcheck "$@"
     ;;
 esac
 
@@ -610,7 +612,6 @@ fi
 # 8) Wallet materialization (safe)
 # -----------------------------------------------------------------------------
 WALLET_PATH="${SECRETS_DIR%/}/wallet.json"
-b64_val=""
 
 _write_wallet_file() {
   local content="${1:-}"
@@ -709,8 +710,14 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 9) DB DSN normalization/export (no secret printing)
+# 9) DB DSN mapping + normalization/export (no secret printing)
 # -----------------------------------------------------------------------------
+# IMPORTANT: your ai_db is using SNIPER_DB_DSN; map it into the canonical DSN vars
+if [[ -n "${SNIPER_DB_DSN:-}" ]]; then
+  [[ -z "${POSTGRES_DSN:-}" ]] && export POSTGRES_DSN="${SNIPER_DB_DSN}"
+  [[ -z "${DATABASE_URL:-}" ]] && export DATABASE_URL="${SNIPER_DB_DSN}"
+fi
+
 if _is_true "${START_NORMALIZE_DSN}"; then
   while IFS= read -r -d '' k; do
     IFS= read -r -d '' v || v=""
@@ -724,7 +731,7 @@ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 def strip_quotes(s: str) -> str:
     s = (s or "").strip()
     if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        return s[1:-1].strip()
+        s = s[1:-1].strip()
     return s
 
 def base_scheme(scheme: str) -> str:
@@ -764,8 +771,17 @@ PG_DSN           = strip_quotes(os.getenv("PG_DSN", ""))
 PG_DSN_INTERNAL  = strip_quotes(os.getenv("PG_DSN_INTERNAL", ""))
 PG_DSN_EXTERNAL  = strip_quotes(os.getenv("PG_DSN_EXTERNAL", ""))
 PNL_DSN          = strip_quotes(os.getenv("PNL_DSN", ""))
+SNIPER_DB_DSN    = strip_quotes(os.getenv("SNIPER_DB_DSN", ""))
 
-POSTGRES = POSTGRES_DSN or DATABASE_URL or PG_DSN_INTERNAL or PG_DSN_EXTERNAL or PNL_DSN or PG_DSN
+POSTGRES = (
+    POSTGRES_DSN
+    or DATABASE_URL
+    or SNIPER_DB_DSN
+    or PG_DSN_INTERNAL
+    or PG_DSN_EXTERNAL
+    or PNL_DSN
+    or PG_DSN
+)
 
 def normalize_postgres(dsn: str) -> str:
     if not dsn: return dsn
@@ -804,6 +820,7 @@ def normalize_asyncpg(dsn: str) -> str:
 POSTGRES_N = normalize_postgres(POSTGRES)
 DATABASE_N = normalize_postgres(DATABASE_URL) if DATABASE_URL else ""
 POSTGRES_DSN_N = normalize_postgres(POSTGRES_DSN) if POSTGRES_DSN else ""
+SNIPER_DSN_N = normalize_postgres(SNIPER_DB_DSN) if SNIPER_DB_DSN else ""
 PG_DSN_N = normalize_asyncpg(PG_DSN) if PG_DSN else normalize_asyncpg(POSTGRES_N)
 
 out = sys.stdout.buffer
@@ -811,15 +828,25 @@ def emit(k: str, v: str):
     out.write(k.encode("utf-8") + b"\x00")
     out.write((v or "").encode("utf-8") + b"\x00")
 
+# Canonical mapping back
+if SNIPER_DB_DSN and SNIPER_DSN_N and (SNIPER_DSN_N != SNIPER_DB_DSN):
+    emit("SNIPER_DB_DSN", SNIPER_DSN_N)
+
 if POSTGRES_N:
     if DATABASE_URL and DATABASE_N and (DATABASE_N != DATABASE_URL):
         emit("DATABASE_URL", DATABASE_N)
     if POSTGRES_DSN and POSTGRES_DSN_N and (POSTGRES_DSN_N != POSTGRES_DSN):
         emit("POSTGRES_DSN", POSTGRES_DSN_N)
+
+    if SNIPER_DB_DSN and (not POSTGRES_DSN):
+        emit("POSTGRES_DSN", SNIPER_DSN_N or SNIPER_DB_DSN)
+    if SNIPER_DB_DSN and (not DATABASE_URL):
+        emit("DATABASE_URL", SNIPER_DSN_N or SNIPER_DB_DSN)
+
     if DATABASE_URL and not POSTGRES_DSN:
-        emit("POSTGRES_DSN", DATABASE_N)
+        emit("POSTGRES_DSN", DATABASE_N or DATABASE_URL)
     if POSTGRES_DSN and not DATABASE_URL:
-        emit("DATABASE_URL", POSTGRES_DSN_N)
+        emit("DATABASE_URL", POSTGRES_DSN_N or POSTGRES_DSN)
 
 if PG_DSN_N and (PG_DSN_N != PG_DSN):
     emit("PG_DSN", PG_DSN_N)
@@ -828,14 +855,15 @@ PY
 fi
 
 if _is_true "${START_STRICT}" && ! _is_true "${SKIP_DSN_REQUIRED}"; then
-  if [[ -z "${PG_DSN_INTERNAL:-}" && -z "${PG_DSN_EXTERNAL:-}" && -z "${POSTGRES_DSN:-}" && -z "${DATABASE_URL:-}" && -z "${PG_DSN:-}" && -z "${PNL_DSN:-}" ]]; then
-    _die "Missing DB DSN. Set PG_DSN_INTERNAL/PG_DSN_EXTERNAL or POSTGRES_DSN/DATABASE_URL (or PG_DSN)."
+  if [[ -z "${PG_DSN_INTERNAL:-}" && -z "${PG_DSN_EXTERNAL:-}" && -z "${POSTGRES_DSN:-}" && -z "${DATABASE_URL:-}" && -z "${PG_DSN:-}" && -z "${PNL_DSN:-}" && -z "${SNIPER_DB_DSN:-}" ]]; then
+    _die "Missing DB DSN. Set PG_DSN_INTERNAL/PG_DSN_EXTERNAL or POSTGRES_DSN/DATABASE_URL (or PG_DSN / SNIPER_DB_DSN)."
   fi
 fi
 
 [[ -n "${POSTGRES_DSN:-}" ]] && _log "DB SQLA        : $(_mask_url "${POSTGRES_DSN}")"
 [[ -n "${DATABASE_URL:-}" ]] && _log "DB DATABASE_URL: $(_mask_url "${DATABASE_URL}")"
 [[ -n "${PG_DSN:-}" ]]       && _log "DB asyncpg     : $(_mask_url "${PG_DSN}")"
+[[ -n "${SNIPER_DB_DSN:-}" ]] && _log "DB SNIPER_DB_DSN: $(_mask_url "${SNIPER_DB_DSN}")"
 
 # -----------------------------------------------------------------------------
 # 10) Gates: check_env + preflight + optional ci_smoke
@@ -1001,8 +1029,17 @@ PY
 fi
 
 # -----------------------------------------------------------------------------
-# 13) Health gating (optional, bulletproof when configured)
+# 13) Health gating (optional; canonical scripts.healthcheck; log-safe parsing)
 # -----------------------------------------------------------------------------
+_health_path() {
+  # Legacy HEALTHCHECK_PATH wins if set; else HEALTHCHECK_HTTP_PATH
+  if [[ -n "${HEALTHCHECK_PATH:-}" ]]; then
+    printf '%s' "${HEALTHCHECK_PATH}"
+    return 0
+  fi
+  printf '%s' "${HEALTHCHECK_HTTP_PATH:-/readyz}"
+}
+
 _health_infer_url() {
   local url="${HEALTHCHECK_URL:-}"
   if [[ -n "$url" ]]; then
@@ -1010,15 +1047,20 @@ _health_infer_url() {
     return 0
   fi
 
-  # Prefer explicit external URL when available (Render)
-  if [[ -n "${RENDER_EXTERNAL_URL:-}" ]]; then
-    printf '%s' "${RENDER_EXTERNAL_URL%/}${HEALTHCHECK_PATH}"
+  local path
+  path="$(_health_path)"
+  [[ -z "$path" ]] && path="/readyz"
+  [[ "${path:0:1}" != "/" ]] && path="/${path}"
+
+  # Prefer localhost:PORT for deterministic in-container checks
+  if [[ -n "${PORT:-}" ]]; then
+    printf '%s' "http://127.0.0.1:${PORT}${path}"
     return 0
   fi
 
-  # Fall back to localhost:PORT if a web server is expected
-  if [[ -n "${PORT:-}" ]]; then
-    printf '%s' "http://127.0.0.1:${PORT}${HEALTHCHECK_PATH}"
+  # Fallback to external URL if present
+  if [[ -n "${RENDER_EXTERNAL_URL:-}" ]]; then
+    printf '%s' "${RENDER_EXTERNAL_URL%/}${path}"
     return 0
   fi
 
@@ -1026,40 +1068,59 @@ _health_infer_url() {
   return 0
 }
 
-_http_status_python() {
-  local url="${1:-}"
-  "$PYTHON" - "$url" "${START_HEALTH_GATING_INTERVAL_S:-2}" <<'PY'
-import sys, ssl, urllib.request
-url = sys.argv[1]
-timeout = float(sys.argv[2]) if len(sys.argv) > 2 else 2.0
-ctx = ssl.create_default_context()
-try:
-    req = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-        code = getattr(r, "status", None) or r.getcode()
-        print(int(code))
-        raise SystemExit(0)
-except Exception:
-    print(0)
-    raise SystemExit(0)
-PY
+_extract_last_json_line() {
+  # Reads stdin, returns the last line that looks like JSON object.
+  # This makes us immune to stray log lines before JSON.
+  awk '
+    /^[[:space:]]*\{.*\}[[:space:]]*$/ { last=$0 }
+    END { if (length(last)>0) print last }
+  '
 }
 
-_health_ok() {
-  local code="${1:-0}"
-  if _is_true "${START_HEALTH_GATING_REQUIRE_200:-0}"; then
-    [[ "$code" == "200" ]] && return 0
-    return 1
+_healthcheck_ok() {
+  # Returns 0 if healthcheck JSON says ok:true, else 1
+  local mode="${1:-http}"
+  local url="${2:-}"
+  local deep="${3:-0}"
+
+  _py_has_module "scripts.healthcheck" || return 1
+
+  # Enforce deterministic semantics for gating:
+  # - mode=http => do NOT fallback to local snapshot; we want actual readiness endpoint
+  # - json-only, short timeout; retries handled by the script via env/defaults
+  local out json
+  if [[ "$mode" == "http" ]]; then
+    out="$(
+      HEALTHCHECK_MODE="http" \
+      HEALTHCHECK_ALLOW_LOCAL_FALLBACK="0" \
+      HEALTHCHECK_JSON_ONLY="1" \
+      "$PYTHON" -m scripts.healthcheck --mode http --url "${url}" --json-only 2>&1 || true
+    )"
+  else
+    out="$(
+      HEALTHCHECK_MODE="local" \
+      HEALTHCHECK_JSON_ONLY="1" \
+      HEALTHCHECK_DEEP="${deep}" \
+      "$PYTHON" -m scripts.healthcheck --mode local --json-only 2>&1 || true
+    )"
   fi
-  # accept any 2xx
-  [[ "$code" =~ ^2[0-9][0-9]$ ]] && return 0
-  return 1
+
+  json="$(printf '%s\n' "$out" | _extract_last_json_line || true)"
+  [[ -z "$json" ]] && return 1
+
+  "$PYTHON" - "$json" >/dev/null 2>&1 <<'PY'
+import json, sys
+try:
+    obj = json.loads(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if (isinstance(obj, dict) and obj.get("ok") is True) else 2)
+PY
 }
 
 # Decide whether health gating is on
 if [[ -z "${START_HEALTH_GATING:-}" ]]; then
   if [[ "$IS_RENDER" == "1" ]] && _is_true "${START_HEALTH_GATING_AUTO:-1}"; then
-    # auto-enable only if we can infer a URL
     _u="$(_health_infer_url)"
     if [[ -n "$_u" ]]; then
       START_HEALTH_GATING="1"
@@ -1072,6 +1133,53 @@ if [[ -z "${START_HEALTH_GATING:-}" ]]; then
 fi
 
 HEALTH_URL="$(_health_infer_url)"
+
+_wait_health_or_fail() {
+  local mode="${1:-http}"
+  local url="${2:-}"
+  local timeout="${START_HEALTH_GATING_TIMEOUT_S:-75}"
+  local interval="${START_HEALTH_GATING_INTERVAL_S:-2}"
+  local deep="${START_HEALTH_GATING_DEEP:-0}"
+
+  [[ -z "$mode" ]] && mode="http"
+  if [[ "$mode" == "http" && -z "$url" ]]; then
+    _warn "Health gating: mode=http but no URL available"
+    return 1
+  fi
+
+  _log "Health gating: mode=${mode} url=$(_mask_url "${url}") timeout=${timeout}s interval=${interval}s"
+
+  local start now elapsed
+  start="$(date +%s 2>/dev/null || echo 0)"
+
+  while true; do
+    # If process died during boot, fail immediately
+    if [[ -n "${child_pid:-}" ]] && ! kill -0 "${child_pid}" 2>/dev/null; then
+      _warn "Health gating: child exited before ready"
+      return 1
+    fi
+
+    if _healthcheck_ok "$mode" "$url" "$deep"; then
+      _log "Health gating: OK"
+      if [[ -n "${READY_FILE:-}" ]]; then
+        mkdir -p "$(dirname "${READY_FILE}")" 2>/dev/null || true
+        printf '%s\n' "ready $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >"${READY_FILE}" 2>/dev/null || true
+      fi
+      return 0
+    fi
+
+    now="$(date +%s 2>/dev/null || echo 0)"
+    if [[ "$start" != "0" && "$now" != "0" ]]; then
+      elapsed=$((now - start))
+      if [[ "$elapsed" -ge "$timeout" ]]; then
+        _warn "Health gating: TIMEOUT"
+        return 1
+      fi
+    fi
+
+    sleep "$interval"
+  done
+}
 
 # -----------------------------------------------------------------------------
 # 14) Supervisor launch (signal forwarding + safe shutdown + restart policy)
@@ -1157,53 +1265,9 @@ _start_child() {
   child_pgid="$(_get_pgid "$child_pid" || true)"
 }
 
-_wait_health_or_fail() {
-  # Only used when START_HEALTH_GATING=1 and HEALTH_URL is non-empty.
-  local url="${1:-}"
-  local timeout="${START_HEALTH_GATING_TIMEOUT_S:-75}"
-  local interval="${START_HEALTH_GATING_INTERVAL_S:-2}"
-
-  [[ -z "$url" ]] && return 0
-
-  _log "Health gating: url=$(_mask_url "$url") timeout=${timeout}s interval=${interval}s"
-
-  local start
-  start="$(date +%s 2>/dev/null || echo 0)"
-
-  while true; do
-    # If process died during boot, fail immediately.
-    if [[ -n "${child_pid:-}" ]] && ! kill -0 "${child_pid}" 2>/dev/null; then
-      _warn "Health gating: child exited before ready"
-      return 1
-    fi
-
-    code="$(_http_status_python "$url" 2>/dev/null | tail -n 1 || echo 0)"
-    if _health_ok "$code"; then
-      _log "Health gating: OK (status=${code})"
-      if [[ -n "${READY_FILE:-}" ]]; then
-        mkdir -p "$(dirname "${READY_FILE}")" 2>/dev/null || true
-        printf '%s\n' "ready $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >"${READY_FILE}" 2>/dev/null || true
-      fi
-      return 0
-    fi
-
-    now="$(date +%s 2>/dev/null || echo 0)"
-    if [[ "$start" != "0" && "$now" != "0" ]]; then
-      elapsed=$((now - start))
-      if [[ "$elapsed" -ge "$timeout" ]]; then
-        _warn "Health gating: TIMEOUT (last_status=${code})"
-        return 1
-      fi
-    fi
-
-    sleep "$interval"
-  done
-}
-
 _log "Launch: module=${RUN_MODULE} args=${#run_argv[@]} restart=${MAIN_RESTART_ON_CRASH} health_gate=${START_HEALTH_GATING}"
 
 if ! _is_true "${MAIN_RESTART_ON_CRASH}"; then
-  # no supervisor: exec
   exec "${PYTHON}" -m "${RUN_MODULE}" "${run_argv[@]}"
 fi
 
@@ -1216,12 +1280,26 @@ while true; do
   rc=0
   _start_child
 
-  # Health gating (only if enabled AND URL available)
-  if _is_true "${START_HEALTH_GATING}" && [[ -n "${HEALTH_URL:-}" ]]; then
-    if ! _wait_health_or_fail "${HEALTH_URL}"; then
-      _warn "Health gating failed; stopping child and failing deploy"
-      _graceful_stop "TERM" || true
-      exit 1
+  # Health gating only if enabled
+  if _is_true "${START_HEALTH_GATING}"; then
+    if [[ "${START_HEALTH_GATING_MODE}" == "http" ]]; then
+      if [[ -z "${HEALTH_URL:-}" ]]; then
+        _warn "Health gating enabled but no HEALTH_URL inferred; failing deploy"
+        _graceful_stop "TERM" || true
+        exit 1
+      fi
+      if ! _wait_health_or_fail "http" "${HEALTH_URL}"; then
+        _warn "Health gating failed; stopping child and failing deploy"
+        _graceful_stop "TERM" || true
+        exit 1
+      fi
+    else
+      # local mode (no HTTP required)
+      if ! _wait_health_or_fail "local" "" "${START_HEALTH_GATING_TIMEOUT_S}" "${START_HEALTH_GATING_INTERVAL_S}" "${START_HEALTH_GATING_DEEP}"; then
+        _warn "Health gating (local) failed; stopping child and failing deploy"
+        _graceful_stop "TERM" || true
+        exit 1
+      fi
     fi
   fi
 
@@ -1240,7 +1318,6 @@ while true; do
     exit "$rc"
   fi
 
-  # crash-loop protection window
   now_epoch="$(date +%s 2>/dev/null || echo 0)"
   if [[ "$crash_window_start" == "0" || "$now_epoch" == "0" ]]; then
     crash_window_start="$now_epoch"

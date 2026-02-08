@@ -1,25 +1,18 @@
 # =============================================================================
 # .gitattributes — God-Tier repo hygiene (Windows dev + Render/Linux deploy)
-# Goal:
-#   - No CRLF/LF churn
-#   - Render/Linux scripts always LF
-#   - Windows scripts keep CRLF
+#
+# Goals:
+#   - No CRLF/LF churn in diffs
+#   - Render/Linux runtime files are ALWAYS LF
+#   - Windows scripts stay CRLF (better local UX)
 #   - True binaries never get EOL conversion
 # =============================================================================
 
-# -----------------------------------------------------------------------------
 # Default: normalize text to LF (prevents deploy issues on Linux/Render)
-# Purpose: consistent line endings, correct binary handling, stable diffs.
-# =============================================================================
-
-# -----------------------------------------------------------------------------
-# Default: treat files as text when Git can detect it, and normalize to LF.
-# This prevents CRLF/LF churn and “works on my machine” deploy issues.
-# -----------------------------------------------------------------------------
 * text=auto eol=lf
 
 # -----------------------------------------------------------------------------
-# Source / config files: force LF
+# Source / config / docs: force LF
 # -----------------------------------------------------------------------------
 *.py        text eol=lf
 *.pyi       text eol=lf
@@ -33,21 +26,24 @@
 *.yaml      text eol=lf
 *.yml       text eol=lf
 *.json      text eol=lf
+*.ndjson    text eol=lf
 *.csv       text eol=lf
 *.tsv       text eol=lf
 *.sql       text eol=lf
+*.xml       text eol=lf
+*.svg       text eol=lf
+*.graphql   text eol=lf
+*.proto     text eol=lf
+*.lock      text eol=lf
 *.env       text eol=lf
 *.example   text eol=lf
-*.lock      text eol=lf
-*.xml       text eol=lf
+*.diff      text eol=lf
+*.patch     text eol=lf
 
-# -----------------------------------------------------------------------------
-# Shell scripts (Render/Linux): MUST be LF
-# -----------------------------------------------------------------------------
+# Shell scripts MUST be LF (even on Windows) for CI/Render
 *.sh        text eol=lf
 *.bash      text eol=lf
 *.zsh       text eol=lf
-start.sh    text eol=lf
 
 # -----------------------------------------------------------------------------
 # Windows scripts: keep CRLF
@@ -55,126 +51,54 @@ start.sh    text eol=lf
 *.bat       text eol=crlf
 *.cmd       text eol=crlf
 *.ps1       text eol=crlf
+*.psm1      text eol=crlf
 
 # -----------------------------------------------------------------------------
-# Git/CI/deploy files: LF
+# CI / deploy / repo meta: LF
 # -----------------------------------------------------------------------------
-.gitattributes          text eol=lf
-.gitignore              text eol=lf
-.renderignore           text eol=lf
-render.yaml             text eol=lf
-Procfile                text eol=lf
-Dockerfile              text eol=lf
-.github/workflows/*.yml text eol=lf
-.github/workflows/*.yaml text eol=lf
+.gitattributes               text eol=lf
+.gitignore                   text eol=lf
+.renderignore                text eol=lf
+Procfile                     text eol=lf
+Dockerfile                   text eol=lf
+docker-compose.yml           text eol=lf
+render.yaml                  text eol=lf
+.github/workflows/*.yml      text eol=lf
+.github/workflows/*.yaml     text eol=lf
 
-# -----------------------------------------------------------------------------
 # Jupyter notebooks are JSON; keep LF for stable diffs
-# -----------------------------------------------------------------------------
-*.ipynb    text eol=lf
+*.ipynb      text eol=lf
 
 # -----------------------------------------------------------------------------
-# Binaries: never apply EOL conversion
+# Binaries: never apply EOL conversion (binary = -text -diff)
 # -----------------------------------------------------------------------------
-*.png      binary
-*.jpg      binary
-*.jpeg     binary
-*.gif      binary
-*.webp     binary
-*.ico      binary
-*.pdf      binary
+*.png        binary
+*.jpg        binary
+*.jpeg       binary
+*.gif        binary
+*.webp       binary
+*.ico        binary
+*.pdf        binary
 
-*.zip      binary
-*.7z       binary
-*.gz       binary
-*.tgz      binary
-*.bz2      binary
+*.zip        binary
+*.7z         binary
+*.gz         binary
+*.tgz        binary
+*.bz2        binary
 
-*.whl      binary
-*.pyd      binary
-*.so       binary
-*.dll      binary
-*.exe      binary
+*.whl        binary
+*.pyd        binary
+*.so         binary
+*.dll        binary
+*.exe        binary
 
-# Keys/certs should never be line-ending rewritten by accident
-*.pem      binary
-*.crt      binary
-*.cer      binary
-*.key      binary
+# Data/binaries that should never be normalized (even if accidentally tracked)
+*.sqlite     binary
+*.sqlite3    binary
+*.db         binary
 
-# Explicit text file types (force LF)
-# -----------------------------------------------------------------------------
-*.py     text eol=lf
-*.pyi    text eol=lf
-*.pyx    text eol=lf
-*.md     text eol=lf
-*.txt    text eol=lf
-*.rst    text eol=lf
-*.toml   text eol=lf
-*.ini    text eol=lf
-*.cfg    text eol=lf
-*.yaml   text eol=lf
-*.yml    text eol=lf
-*.json   text eol=lf
-*.csv    text eol=lf
-*.tsv    text eol=lf
-*.sql    text eol=lf
-*.env    text eol=lf
-*.example text eol=lf
-*.lock   text eol=lf
-*.xml    text eol=lf
-
-# -----------------------------------------------------------------------------
-# Shell scripts used on Render/Linux: MUST be LF
-# -----------------------------------------------------------------------------
-*.sh     text eol=lf
-*.bash   text eol=lf
-*.zsh    text eol=lf
-
-# -----------------------------------------------------------------------------
-# Windows command scripts (keep CRLF to reduce local friction)
-# -----------------------------------------------------------------------------
-*.bat    text eol=crlf
-*.cmd    text eol=crlf
-*.ps1    text eol=crlf
-
-# -----------------------------------------------------------------------------
-# Git / CI / deploy files (LF)
-# -----------------------------------------------------------------------------
-.gitattributes text eol=lf
-.gitignore     text eol=lf
-.renderignore  text eol=lf
-render.yaml    text eol=lf
-Procfile       text eol=lf
-Dockerfile     text eol=lf
-*.service      text eol=lf
-*.timer        text eol=lf
-*.conf         text eol=lf
-
-# -----------------------------------------------------------------------------
-# Treat these as binary (never line-end convert)
-# -----------------------------------------------------------------------------
-*.png   -text
-*.jpg   -text
-*.jpeg  -text
-*.gif   -text
-*.webp  -text
-*.ico   -text
-*.pdf   -text
-
-*.zip   -text
-*.7z    -text
-*.gz    -text
-*.tgz   -text
-*.bz2   -text
-
-*.whl   -text
-*.pyd   -text
-*.so    -text
-*.dll   -text
-*.exe   -text
-
-# -----------------------------------------------------------------------------
-# Optional: Jupyter notebooks are JSON; keep LF and keep diffs readable.
-# -----------------------------------------------------------------------------
-*.ipynb text eol=lf
+# Keys/certs: avoid accidental normalization/diffing
+*.pem        binary
+*.crt        binary
+*.cer        binary
+*.key        binary

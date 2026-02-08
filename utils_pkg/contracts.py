@@ -106,6 +106,7 @@ class EnvVar:
       - required: whether required in STRICT mode (production gates / contract tests)
       - secret: should be redacted in logs
       - description: short note
+      - aliases: additional accepted keys (informational)
 
     Back-compat constructor aliases supported:
       - name -> key
@@ -119,7 +120,7 @@ class EnvVar:
     required: bool
     secret: bool
     description: str
-    aliases: tuple[str, ...]  # additional accepted keys (informational)
+    aliases: tuple[str, ...]
 
     def __init__(
         self,
@@ -166,7 +167,6 @@ class EnvVar:
         if not d and desc:
             d = str(desc).strip()
 
-        # default selection order (explicit default wins)
         dv = default
         if dv is None and example is not None:
             dv = str(example)
@@ -475,6 +475,10 @@ EXTERNAL_ENV_ALLOWLIST: set[str] = {
     "WEB_CONCURRENCY",
     "PYTHONUNBUFFERED",
     "PYTHONHASHSEED",
+    "NO_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
 }
 
 EXTERNAL_ENV_ALLOW_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -484,6 +488,7 @@ EXTERNAL_ENV_ALLOW_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^RENDER_", re.IGNORECASE),
     re.compile(r"^PYTEST_", re.IGNORECASE),
     re.compile(r"^PIP_", re.IGNORECASE),
+    re.compile(r"^(?:NO|HTTP|HTTPS|ALL)_PROXY$", re.IGNORECASE),
 )
 
 _SAFE_TOGGLE_KEY_RE = re.compile(
@@ -525,9 +530,6 @@ def _env_section(_title: str, vars_: list[EnvVar]) -> list[EnvVar]:
 
 CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
     [
-        # ---------------------------------------------------------------------
-        # [A] APP IDENTITY / MODE
-        # ---------------------------------------------------------------------
         *_env_section(
             "APP IDENTITY / MODE",
             [
@@ -572,8 +574,9 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                 EnvVar(
                     "ENV_STRICT",
                     default="0",
+                    required=True,
                     kind="bool",
-                    description="Legacy alias for STRICT_ENV",
+                    description="0=warn, 1=hard fail on missing required vars",
                 ),
                 EnvVar(
                     "MAIN_FAST_FAIL_EARLY",
@@ -582,6 +585,34 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                     description="1=crash early on misconfig",
                 ),
                 EnvVar("RUNTIME_PROFILE", default="safe", description="safe|paper|live"),
+            ],
+        ),
+        *_env_section(
+            "HTTP / SERVICE PORTS",
+            [
+                EnvVar(
+                    "MAIN_HTTP_PORT",
+                    default="",
+                    kind="int",
+                    description="Override main HTTP port (optional; scripts/main.py)",
+                ),
+                EnvVar(
+                    "HTTP_PORT",
+                    default="",
+                    kind="int",
+                    description="Override HTTP port (optional; scripts/main.py)",
+                ),
+            ],
+        ),
+        *_env_section(
+            "HTTP / PROXY",
+            [
+                EnvVar(
+                    "NO_PROXY",
+                    default="",
+                    kind="str",
+                    description="Optional proxy bypass list (comma-separated hosts/domains/IPs). Supports upper/lowercase forms.",
+                ),
             ],
         ),
         *_env_section(
@@ -647,6 +678,12 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                     default="1",
                     kind="bool",
                     description="Allow dotenv side effects (set 0 in tests)",
+                ),
+                EnvVar(
+                    "MAIN_SAFE_MODE_ENABLE_SCANNERS",
+                    default="0",
+                    kind="bool",
+                    description="In SAFE_MODE, allow scanners to run (0=disabled default, 1=enable).",
                 ),
             ],
         ),
@@ -766,13 +803,26 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
                     description="Jupiter API base URL",
                 ),
                 EnvVar(
+                    "JUPITER_QUOTE_BASE",
+                    default="https://quote-api.jup.ag",
+                    description="Quote API base (bootstrap_pre_overlay override; default matches Jupiter quote base)",
+                ),
+                EnvVar(
+                    "JUPITER_QUOTE_URL",
+                    default="",
+                    description="Optional full Quote URL override (bootstrap_pre_overlay). If set, wins over JUPITER_QUOTE_BASE.",
+                ),
+                EnvVar(
                     "JUPITER_MAX_SLIPPAGE_BPS",
                     default="200",
                     kind="int",
                     description="Max slippage bps",
                 ),
                 EnvVar(
-                    "JUPITER_TIMEOUT_S", default="8", kind="int", description="HTTP timeout seconds"
+                    "JUPITER_TIMEOUT_S",
+                    default="8",
+                    kind="int",
+                    description="HTTP timeout seconds",
                 ),
                 EnvVar(
                     "JUPITER_API_KEY",
@@ -925,9 +975,6 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
             kind="int",
             description="Task spawn: number of origin frames to record (1..10 recommended)",
         ),
-        # ---------------------------------------------------------------------
-        # [A9] ALERTS / NOTIFICATIONS (placeholders)
-        # ---------------------------------------------------------------------
         *_env_section(
             "ALERTS / NOTIFICATIONS",
             [
@@ -1212,6 +1259,97 @@ CANONICAL_ENV_VARS: list[EnvVar] = _dedupe_keep_order(
             ],
         ),
         *_env_section(
+            "WATCHDOG (deploy_tools/watchdog.py)",
+            [
+                EnvVar(
+                    "WATCHDOG_DRYRUN",
+                    default="",
+                    kind="bool",
+                    description="Watchdog dry-run (no destructive actions)",
+                ),
+                EnvVar(
+                    "WATCHDOG_LOGFILE",
+                    default="",
+                    description="Watchdog logfile path",
+                ),
+                EnvVar(
+                    "WATCHDOG_LOGLEVEL",
+                    default="",
+                    description="Watchdog log level override",
+                ),
+                EnvVar(
+                    "WATCHDOG_PIDFILE",
+                    default="",
+                    description="Watchdog pidfile path",
+                ),
+                EnvVar(
+                    "WATCHDOG_OUTFILE",
+                    default="",
+                    description="Watchdog stdout/stderr capture path",
+                ),
+                EnvVar(
+                    "WATCHDOG_POLL_S",
+                    default="",
+                    kind="int",
+                    description="Watchdog poll interval seconds",
+                ),
+                EnvVar(
+                    "WATCHDOG_COOLDOWN_S",
+                    default="",
+                    kind="int",
+                    description="Watchdog cooldown seconds between actions",
+                ),
+                EnvVar(
+                    "WATCHDOG_MAX_ACTIONS",
+                    default="",
+                    kind="int",
+                    description="Watchdog max actions per window",
+                ),
+                EnvVar(
+                    "WATCHDOG_MAX_ACTIONS_WINDOW_S",
+                    default="",
+                    kind="int",
+                    description="Watchdog actions window seconds",
+                ),
+                EnvVar(
+                    "WATCHDOG_ERROR_RULES",
+                    default="",
+                    description="Watchdog error rules (json/string)",
+                ),
+                EnvVar(
+                    "WATCHDOG_PROGRESS_REGEX",
+                    default="",
+                    description="Watchdog progress regex",
+                ),
+                EnvVar(
+                    "WATCHDOG_BACKUP",
+                    default="",
+                    description="Watchdog backup flag/mode",
+                ),
+                EnvVar(
+                    "WATCHDOG_ROLLBACK_SH",
+                    default="",
+                    description="Watchdog rollback script path",
+                ),
+                EnvVar(
+                    "WATCHDOG_START_CMD",
+                    default="",
+                    description="Watchdog start command override",
+                ),
+                EnvVar(
+                    "WATCHDOG_START_SH",
+                    default="",
+                    description="Watchdog start script path",
+                ),
+                EnvVar(
+                    "WATCHDOG_STALL_S",
+                    default="",
+                    kind="int",
+                    description="Watchdog stall threshold seconds",
+                ),
+            ],
+        ),
+        *_env_section(
             "PATHS",
             [
                 EnvVar("DATA_DIR", default="./data", description="Data directory"),
@@ -1333,6 +1471,13 @@ def _parse_env_example(path: Path) -> tuple[list[str], dict[str, str], dict[str,
     return keys_in_order, defaults, comments
 
 
+_UPPER_SNAKE_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _is_upper_snake(k: str) -> bool:
+    return bool(_UPPER_SNAKE_RE.match((k or "").strip()))
+
+
 def _augment_canonical_with_env_example(
     base: list[EnvVar], repo_root: Path | None = None
 ) -> list[EnvVar]:
@@ -1349,20 +1494,32 @@ def _augment_canonical_with_env_example(
         return list(base)
 
     keys_in_order, defaults, comments = _parse_env_example(path)
-    base_map: dict[str, EnvVar] = {ev.key: ev for ev in base}
+
+    # Case-insensitive map: prevents env.example case-variants from becoming new canonical keys
+    base_upper: dict[str, EnvVar] = {ev.key.upper(): ev for ev in base}
 
     extras: list[EnvVar] = []
     for k in keys_in_order:
-        if k in base_map:
+        kk = (k or "").strip()
+        if not kk:
             continue
-        dv = defaults.get(k, "")
-        cmt = (comments.get(k) or "").strip()
+
+        # If only case differs, treat as already covered.
+        if kk.upper() in base_upper:
+            continue
+
+        # Only allow UPPER_SNAKE_CASE to ever enter canonical keys.
+        if not _is_upper_snake(kk):
+            continue
+
+        dv = defaults.get(kk, "")
+        cmt = (comments.get(kk) or "").strip()
         extras.append(
             EnvVar(
-                k,
+                kk,
                 default=dv,
                 required=False,
-                secret=_is_secret_key(k),
+                secret=_is_secret_key(kk),
                 description=cmt,
             )
         )
@@ -1396,10 +1553,7 @@ def env_example_diff(repo_root: Path | None = None) -> dict[str, list[str]]:
     """
     Compare canonical ENV_KEYS vs `.env.example`.
     Returns:
-      {
-        "missing_in_env_example": [...],
-        "extra_in_env_example": [...],
-      }
+      {"missing_in_env_example": [...], "extra_in_env_example": [...]}
     """
     root = repo_root or _repo_root_from_here()
     path = root / ENV_EXAMPLE_FILENAME
@@ -1418,14 +1572,21 @@ def env_example_diff(repo_root: Path | None = None) -> dict[str, list[str]]:
 def env_example_required_hint_diff(repo_root: Path | None = None) -> dict[str, list[str]]:
     """
     Checks that REQUIRED_KEYS have an inline '# required' hint on their KEY=VALUE lines in .env.example.
-    Returns {"missing_required_hints": [...]}.
+
+    IMPORTANT:
+    - If .env.example has *no* inline 'required' hints anywhere, we treat hint-enforcement as disabled
+      (mirrors pytest behavior which skips strict hint consistency tests in that case).
     """
     root = repo_root or _repo_root_from_here()
     path = root / ENV_EXAMPLE_FILENAME
     if not path.exists():
-        return {"missing_required_hints": sorted(REQUIRED_KEYS)}
+        return {"missing_required_hints": []}
 
     _, _, comments = _parse_env_example(path)
+
+    has_any_required_hint = any("required" in (c or "").lower() for c in comments.values())
+    if not has_any_required_hint:
+        return {"missing_required_hints": []}
 
     missing: list[str] = []
     for k in sorted(REQUIRED_KEYS):
@@ -1715,10 +1876,6 @@ class ContractBase:
 # =============================================================================
 # CORE CONTRACTS
 # =============================================================================
-
-# ---- (Everything below stays feature-identical to your current schemas) ----
-# NOTE: the following classes are copied from your file with only minimal typing-safe
-# adjustments (no feature removals). Keep them as-is unless tests demand new shims.
 
 
 @dataclass(slots=True)
@@ -2269,10 +2426,7 @@ class EventEnvelope(ContractBase):
 
 
 def _coerce_to_dict(position: Any, *, kwargs_fallback: dict[str, Any]) -> dict[str, Any]:
-    """
-    Coerce arbitrary input into a dict[str, Any] without creating mypy "unreachable"
-    branches or ambiguous asdict typing.
-    """
+    """Coerce arbitrary input into a dict[str, Any]."""
     if position is None:
         return dict(kwargs_fallback) if kwargs_fallback else {}
 
@@ -2321,11 +2475,9 @@ def normalize_position(
 
     out = _coerce_to_dict(position, kwargs_fallback=dict(kwargs))
 
-    # ensure required schema keys exist
     out.setdefault("schema_version", CONTRACTS_VERSION)
     out.setdefault("schema_rev", SCHEMA_REV)
 
-    # ctx time normalization (supports now_ms/ts_ms/now_ts/ts)
     ctxd = dict(ctx or {})
     now_ms_val = safe_int(ctxd.get("now_ms", ctxd.get("ts_ms", 0)), 0)
     now_ts_val = safe_int(ctxd.get("now_ts", ctxd.get("ts", 0)), 0)

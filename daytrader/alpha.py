@@ -5,42 +5,38 @@ from __future__ import annotations
 daytrader.alpha
 ---------------
 
-Ensemble alpha signal generator for the OPTIONAL "daytrader" sleeve (P2 cleanup area).
-This module MUST NOT silently compete with the canonical sniper path.
+Ensemble alpha signal generator for the OPTIONAL "daytrader" sleeve.
 
-Role
-----
-Given OHLCV bars, output a single actionable signal:
+Hard constraints (must remain true):
+- Deterministic, pure functions: no network I/O, no wallet usage, no state writes.
+- Safe under bad inputs: NaN/inf/missing keys/small samples -> HOLD with reasons.
+- Must NOT silently compete with the canonical sniper path: this is a sleeve-only signal.
 
-    (action, score_0_100, features_dict, reasons_list)
+API
+---
+generate_signal(mint, symbol, bars, min_liq_usd=None) -> (action, score_0_100, features, reasons)
 
 Actions:
-    "BUY" | "SELL" | "HOLD"
+  "BUY" | "SELL" | "HOLD"
 
-Design goals
-------------
-- Deterministic and safe: handles NaN/inf, missing keys, small sample sizes.
-- No network I/O, no wallet usage, no side effects.
-- Optional gates (AI / whale) are OFF by default and must be explicitly enabled.
-- Robust internal feature fallbacks even if daytrader.features changes.
-
-Bars format
-----------
-bars: list[dict] chronological order, each dict has keys:
+Bars format (chronological order):
+  Each bar is a dict-like with keys:
     {"t","o","h","l","c","v"}  (t optional)
+  Also accepts aliases:
+    open/o, high/h, low/l, close/c, volume/v
 
 Env tuning (safe defaults)
 --------------------------
 Core guards:
   DT_MIN_BARS=60
   DT_MIN_LIQ_USD=500
-  DT_MAX_ATR_PCT=0.30                # 0.30 = 30% (very hot)
-  DT_EXTREME_ATR_PCT=0.55            # above this, we refuse BUY
+  DT_MAX_ATR_PCT=0.30
+  DT_EXTREME_ATR_PCT=0.55
 
 Signal thresholds:
   DT_SIGNAL_BUY_THR=65
   DT_SIGNAL_SELL_THR=65
-  DT_RAW_BUY_MIN=0.30                # raw score in [-1..1]
+  DT_RAW_BUY_MIN=0.30          # raw score in [-1..1]
   DT_RAW_SELL_MIN=0.30
 
 Feature windows:
@@ -53,7 +49,7 @@ Feature windows:
   DT_VOL_BURST_N=20
 
 Regime:
-  DT_REGIME_TREND_THR=0.55           # 0..1 score: >= means trending
+  DT_REGIME_TREND_THR=0.55     # 0..1 score: >= means trending
 
 Weights (regime-aware base):
   DT_W_TREND=0.45
@@ -61,7 +57,7 @@ Weights (regime-aware base):
   DT_W_MEANREV=0.10
   DT_W_VWAP=0.10
 
-In ranging regime, weights are swapped toward mean-reversion:
+In ranging regime:
   DT_W_TREND_R=0.20
   DT_W_BREAKOUT_R=0.20
   DT_W_MEANREV_R=0.45
@@ -69,18 +65,16 @@ In ranging regime, weights are swapped toward mean-reversion:
 
 Optional gates (OFF by default):
   DT_AI_GATE_ENABLED=0|1
-  DT_AI_GATE_STRICT=0|1              # if 1, blocks BUY hard; if 0, just penalizes
-  DT_AI_GATE_MIN_SCORE=0.55          # if strict: must be >= this to allow BUY
+  DT_AI_GATE_STRICT=0|1
+  DT_AI_GATE_MIN_SCORE=0.55
 """
 
 import math
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 Signal = str  # "BUY" | "SELL" | "HOLD"
-
-
 _Bar = dict[str, float]
 
 
@@ -122,6 +116,10 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return x
 
 
+def _safe_div(num: float, den: float, eps: float = 1e-12) -> float:
+    return num / (den if abs(den) > eps else (eps if den >= 0 else -eps))
+
+
 def _finite_float(val: Any) -> float | None:
     try:
         x = float(val)
@@ -130,30 +128,31 @@ def _finite_float(val: Any) -> float | None:
     return x if math.isfinite(x) else None
 
 
-def _first_float(bar: dict[str, Any], *keys: str) -> float | None:
-    for key in keys:
-        if key in bar:
-            x = _finite_float(bar.get(key))
+def _get_first_float(d: Mapping[str, Any], *keys: str) -> float | None:
+    for k in keys:
+        if k in d:
+            x = _finite_float(d.get(k))
             if x is not None:
                 return x
     return None
 
 
-def _dedupe_reasons(reasons: list[str]) -> list[str]:
+def _dedupe_reasons(reasons: list[str], *, max_items: int = 12) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for r in reasons:
-        if not r:
+        r2 = (r or "").strip()
+        if not r2 or r2 in seen:
             continue
-        if r in seen:
-            continue
-        seen.add(r)
-        out.append(r)
+        seen.add(r2)
+        out.append(r2)
+        if len(out) >= max_items:
+            break
     return out
 
 
 # -----------------------------------------------------------------------------
-# Config (single place for all knobs)
+# Config
 # -----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class AlphaConfig:
@@ -189,7 +188,7 @@ class AlphaConfig:
     w_meanrev_r: float = 0.45
     w_vwap_r: float = 0.15
 
-    # AI gate
+    # AI gate (optional)
     ai_gate_enabled: bool = False
     ai_gate_strict: bool = False
     ai_gate_min_score: float = 0.55
@@ -270,12 +269,13 @@ class AlphaConfig:
 
 
 # -----------------------------------------------------------------------------
-# Sanitization / extraction
+# Bars sanitization
 # -----------------------------------------------------------------------------
 def _sanitize_bars(bars: list[dict[str, Any]]) -> list[_Bar]:
     """
-    Convert to list of float dicts, drop invalid rows,
-    enforce high>=max(open,close,low), low<=min(open,close,high).
+    Convert to list of float dicts, drop invalid rows, enforce:
+      high >= max(open, close, low)
+      low  <= min(open, close, high)
     """
     out: list[_Bar] = []
     if not bars:
@@ -285,11 +285,11 @@ def _sanitize_bars(bars: list[dict[str, Any]]) -> list[_Bar]:
         if not isinstance(bar, dict):
             continue
 
-        open_px = _first_float(bar, "o", "open")
-        high_px = _first_float(bar, "h", "high")
-        low_px = _first_float(bar, "l", "low")  # canonical key is "l" (ell)
-        close_px = _first_float(bar, "c", "close")
-        vol_px = _first_float(bar, "v", "volume")
+        open_px = _get_first_float(bar, "o", "open")
+        high_px = _get_first_float(bar, "h", "high")
+        low_px = _get_first_float(bar, "l", "low")  # key alias is "l" (ell), not a variable name
+        close_px = _get_first_float(bar, "c", "close")
+        vol_px = _get_first_float(bar, "v", "volume")
 
         if (
             open_px is None
@@ -300,8 +300,9 @@ def _sanitize_bars(bars: list[dict[str, Any]]) -> list[_Bar]:
         ):
             continue
 
+        # Normalize OHLC consistency
         high_norm = max(high_px, open_px, close_px, low_px)
-        low_norm = min(low_px, open_px, close_px, high_px)
+        low_norm = min(low_px, open_px, close_px, high_norm)
 
         if high_norm <= 0.0 or low_norm <= 0.0 or close_px <= 0.0:
             continue
@@ -322,7 +323,7 @@ def _sanitize_bars(bars: list[dict[str, Any]]) -> list[_Bar]:
 
 
 # -----------------------------------------------------------------------------
-# Lightweight internal indicators (no deps, deterministic)
+# Indicators (deterministic, dependency-free)
 # -----------------------------------------------------------------------------
 def _ema_last(values: list[float], n: int) -> float:
     if n <= 1 or len(values) < n:
@@ -337,20 +338,18 @@ def _ema_last(values: list[float], n: int) -> float:
 def _rsi_last(closes: list[float], n: int) -> float:
     if n <= 1 or len(closes) < n + 1:
         return float("nan")
-
     gains = 0.0
     losses = 0.0
+    # simple RSI over last n deltas (deterministic, stable)
     for i in range(-n, 0):
         delta = closes[i] - closes[i - 1]
         if delta >= 0:
             gains += delta
         else:
             losses -= delta
-
     if gains == 0.0 and losses == 0.0:
         return 50.0
-
-    rs = gains / (losses + 1e-12)
+    rs = _safe_div(gains, losses + 1e-12)
     return float(100.0 - (100.0 / (1.0 + rs)))
 
 
@@ -366,7 +365,7 @@ def _atr_pct(bars: list[_Bar], n: int) -> float:
         trs.append(tr)
     atr = sum(trs) / max(1, len(trs))
     last_close = bars[-1]["c"]
-    return float(atr / max(last_close, 1e-12))
+    return float(_safe_div(atr, max(last_close, 1e-12)))
 
 
 def _donchian(bars: list[_Bar], n: int) -> tuple[float, float]:
@@ -393,20 +392,20 @@ def _vwap(bars: list[_Bar], n: int) -> float:
 
 
 def _volume_burst(bars: list[_Bar], n: int) -> float:
-    """Burst = current volume / mean(prev n-1 volumes)."""
+    """Burst = last volume / mean(previous volumes)."""
     if n <= 2 or len(bars) < n:
         return float("nan")
     window = bars[-n:]
     v_last = window[-1]["v"]
-    base = [b["v"] for b in window[:-1]]
-    denom = (sum(base) / max(1, len(base))) + 1e-12
-    return float(v_last / denom)
+    base_vols = [b["v"] for b in window[:-1]]
+    denom = (sum(base_vols) / max(1, len(base_vols))) + 1e-12
+    return float(_safe_div(v_last, denom))
 
 
 def _regime_score(closes: list[float], n: int) -> float:
     """
-    0..1 score: higher => trending.
-    Uses normalized slope vs noise on recent closes.
+    0..1 trending score. Higher => more trend.
+    Uses normalized slope vs average absolute step noise.
     """
     if n <= 10 or len(closes) < n:
         return 0.0
@@ -421,12 +420,13 @@ def _regime_score(closes: list[float], n: int) -> float:
         dx = i - xm
         num += dx * (y - ym)
         den += dx * dx
-    slope = num / (den + 1e-12)
 
+    slope = _safe_div(num, den + 1e-12)
     diffs = [abs(w[i] - w[i - 1]) for i in range(1, n)]
     noise = (sum(diffs) / max(1, len(diffs))) + 1e-12
 
     strength = abs(slope) / noise
+    # map to 0..1
     return float(_clamp(strength / (strength + 1.0), 0.0, 1.0))
 
 
@@ -438,7 +438,7 @@ def _median(vals: list[float]) -> float:
 
 
 # -----------------------------------------------------------------------------
-# Optional AI gate (OFF by default)
+# Optional AI gate (BUY direction only; OFF by default)
 # -----------------------------------------------------------------------------
 def _maybe_ai_gate(
     *,
@@ -453,15 +453,11 @@ def _maybe_ai_gate(
     reasons: list[str],
     raw: float,
 ) -> float:
-    """
-    Applies AI gate for BUY direction only (raw>0).
-    Returns possibly adjusted raw score.
-    """
     if not enabled or raw <= 0.0:
         return raw
 
     try:
-        # Lazy import to keep daytrader sleeve optional and side-effect-free.
+        # Lazy import keeps this sleeve optional and side-effect-free.
         from utils_pkg.ai_buy_scoring import Candidate, pass_gate  # type: ignore
     except Exception:
         reasons.append("ai_gate unavailable (import)")
@@ -483,7 +479,6 @@ def _maybe_ai_gate(
         try:
             cand = Candidate(**cand_kwargs)  # type: ignore
         except TypeError:
-            # Fallback if Candidate has a smaller signature in your repo.
             cand = Candidate(mint=mint, symbol=symbol)  # type: ignore
 
         ok, gate_score, why = pass_gate(cand)  # type: ignore
@@ -533,9 +528,12 @@ def generate_signal(
     closes = [b["c"] for b in sbars]
     last_close = closes[-1]
 
-    # Core features
-    ema_fast = _ema_last(closes[-max(cfg.ema_fast_n * 3, cfg.ema_fast_n + 5) :], cfg.ema_fast_n)
-    ema_slow = _ema_last(closes[-max(cfg.ema_slow_n * 3, cfg.ema_slow_n + 5) :], cfg.ema_slow_n)
+    # Compute features with stable windows
+    ema_fast_win = closes[-max(cfg.ema_fast_n * 3, cfg.ema_fast_n + 5) :]
+    ema_slow_win = closes[-max(cfg.ema_slow_n * 3, cfg.ema_slow_n + 5) :]
+
+    ema_fast = _ema_last(ema_fast_win, cfg.ema_fast_n)
+    ema_slow = _ema_last(ema_slow_win, cfg.ema_slow_n)
     rsi_val = _rsi_last(closes, cfg.rsi_n)
     atrp = _atr_pct(sbars, cfg.atr_n)
     don_high, don_low = _donchian(sbars, cfg.donchian_n)
@@ -568,7 +566,7 @@ def generate_signal(
     if liq_usd < cfg.min_liq_usd:
         return "HOLD", 0.0, feats, [f"low liquidity {liq_usd:.2f} < {cfg.min_liq_usd:.2f}"]
 
-    # Volatility notes/guard
+    # Volatility notes/guards
     if math.isfinite(atrp) and atrp > cfg.max_atr_pct:
         reasons.append(f"atr% high {atrp:.3f} > {cfg.max_atr_pct:.3f}")
     if math.isfinite(atrp) and atrp > cfg.extreme_atr_pct:
@@ -582,6 +580,7 @@ def generate_signal(
     # -------------------------------------------------------------------------
     s_trend = 0.0
     if math.isfinite(ema_fast) and math.isfinite(ema_slow) and ema_slow > 0.0:
+        # Add a tiny deadband to avoid churn
         if ema_fast > ema_slow * 1.001:
             s_trend = +0.80
             reasons.append("trend up (ema_fast>ema_slow)")
@@ -651,7 +650,7 @@ def generate_signal(
         raw=raw,
     )
 
-    # Risk tempering (preserves prior behavior)
+    # Risk tempering (preserve intent: high ATR reduces confidence)
     if math.isfinite(atrp):
         if atrp > 0.10:
             raw *= 0.70

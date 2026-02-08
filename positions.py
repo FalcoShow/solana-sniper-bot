@@ -6,7 +6,7 @@ positions.py (ROOT)
 P0 LOCK-IN: ROOT POSITIONS MUST NOT COMPETE WITH utils_pkg.position_store
 =======================================================================
 
-This root module historically stored *exit-tracking state* (PositionState) in Redis/file.
+This root module historically stored *exit-tracking state* in Redis/file.
 Under the new contract:
 
 - Canonical position truth (open/closed positions, qty, entry, meta) lives in:
@@ -16,8 +16,7 @@ Under the new contract:
 
 So what is this file now?
 -------------------------
-A **thin compatibility adapter** for legacy call-sites (mostly execution/exits.py)
-that still expect:
+A **thin compatibility adapter** for legacy call-sites that still expect:
 
   - PositionState objects (entry_px, size_usd, peak_px, tp1_done, symbol)
   - async CRUD helpers + tiny sync shims
@@ -26,15 +25,15 @@ Where does it store that state?
 ------------------------------
 Inside PositionStore meta under a single key:
 
-    meta["exit_state"] = { entry_px, size_usd, peak_px, tp1_done, symbol, updated_at }
+    meta["exit_state"] = { entry_px, size_usd, peak_px, tp1_done, symbol, updated_at, ... }
 
 That means:
 - No competing “open-set” indexes at root.
 - No separate root schema drift.
 - One place to debug positions: PositionStore.
 
-Emergency fallback (optional)
------------------------------
+Crash-only file mirror (optional)
+---------------------------------
 If PositionStore/Redis is unavailable, we can optionally mirror to a local file for
 crash-only recovery. This is NOT a competing truth; it’s a last-resort mirror.
 
@@ -61,31 +60,151 @@ Optional sync shims:
 
 import asyncio
 import contextlib
+import inspect
 import json
+import logging
 import os
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Coroutine, Protocol, cast, overload
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Logger (safe import)
-# ──────────────────────────────────────────────────────────────────────────────
-try:  # pragma: no cover
-    from logging_setup import get_logger  # type: ignore
-except Exception:  # pragma: no cover
-    import logging
-
-    def get_logger(name: str | None = None):  # type: ignore
-        return logging.getLogger(name or "positions")
+# =============================================================================
+# Logging (Phase A: eliminate Logger ↔ EventLogger typing fallout)
+# =============================================================================
 
 
-log = get_logger(__name__)
+class LoggerLike(Protocol):
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+
+    def event(self, name: str, **kw: Any) -> None: ...
+    def every(self, key: str, n: int = 10, msg: str | None = None, **kw: Any) -> None: ...
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PositionState import (avoid circulars)
-# ──────────────────────────────────────────────────────────────────────────────
+class _LogAdapter:
+    """
+    Normalizes Logger/EventLogger differences *without mutating* the underlying object.
+
+    - Guarantees .debug/.info/.warning/.error/.exception
+    - Guarantees .event/.every (fallback implementations)
+    - Defends against signature mismatches (eg, log.warning(..., extra=...) not accepted)
+    """
+
+    __slots__ = ("_base", "_every_store")
+
+    def __init__(self, base: Any) -> None:
+        self._base = base
+        self._every_store: dict[str, float] = {}
+
+    def _call(self, method: str, msg: str, *args: Any, **kwargs: Any) -> None:
+        fn = getattr(self._base, method, None)
+        if callable(fn):
+            try:
+                fn(msg, *args, **kwargs)
+                return
+            except TypeError:
+                # Some custom loggers reject kwargs like "extra"
+                with contextlib.suppress(Exception):
+                    fn(msg, *args)
+                    return
+            except Exception:
+                # Never let logging crash the bot
+                return
+
+        # fallback to stdlib logger
+        std = logging.getLogger(__name__)
+        getattr(std, method, std.info)(msg, *args, **kwargs)
+
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._call("debug", msg, *args, **kwargs)
+
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._call("info", msg, *args, **kwargs)
+
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._call("warning", msg, *args, **kwargs)
+
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._call("error", msg, *args, **kwargs)
+
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        # Prefer underlying .exception if present; else emulate via error + exc_info
+        fn = getattr(self._base, "exception", None)
+        if callable(fn):
+            with contextlib.suppress(TypeError, Exception):
+                fn(msg, *args, **kwargs)
+                return
+        self._call("error", msg, *args, exc_info=True, **kwargs)
+
+    def event(self, name: str, **kw: Any) -> None:
+        fn = getattr(self._base, "event", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(name, **kw)
+                return
+        # Fallback: structured-ish one-liner
+        self.info("%s %s", name, kw)
+
+    def every(self, key: str, n: int = 10, msg: str | None = None, **kw: Any) -> None:
+        fn = getattr(self._base, "every", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(key, n=n, msg=msg, **kw)
+                return
+
+        # fallback: log at most once per `n` seconds per key
+        try:
+            now = float(asyncio.get_running_loop().time())
+        except Exception:
+            now = float(datetime.now(UTC).timestamp())
+
+        last = float(self._every_store.get(key, 0.0))
+        interval = float(max(1, int(n)))
+        if (now - last) >= interval:
+            self._every_store[key] = now
+            self.event(msg or key, **kw)
+
+
+def _fallback_get_logger(name: str | None = None) -> logging.Logger:
+    return logging.getLogger(name or "positions")
+
+
+def _resolve_get_logger() -> Callable[..., Any]:
+    try:  # pragma: no cover
+        from utils_pkg.log_compat import get_logger as gl  # type: ignore
+
+        return gl
+    except Exception:  # pragma: no cover
+        try:
+            from logging_setup import get_logger as gl  # type: ignore
+
+            return gl
+        except Exception:  # pragma: no cover
+            return _fallback_get_logger
+
+
+_GET_LOGGER = _resolve_get_logger()
+
+
+def _get_log(name: str) -> LoggerLike:
+    base: Any = None
+    with contextlib.suppress(Exception):
+        base = _GET_LOGGER(name)
+    if base is None:
+        base = _fallback_get_logger(name)
+    return cast(LoggerLike, _LogAdapter(base))
+
+
+log = _get_log(__name__)
+
+# =============================================================================
+# PositionState import (avoid circulars; provide fallback)
+# =============================================================================
+
 try:
     # Expected in your stack:
     # PositionState(mint, entry_px, size_usd); has .peak_px, .tp1_done, optional .symbol
@@ -102,15 +221,20 @@ except Exception:
             self.symbol: str | None = None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# Constants / env helpers
+# =============================================================================
+
+_EXIT_META_KEY = "exit_state"
+_FILE_LOCK = asyncio.Lock()
+
+
 def _truthy(x: Any) -> bool:
     return str(x or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _file_fallback_enabled() -> bool:
-    # Default ON for crash-only recovery (mirror), but tests can disable via env.
+    # Default ON for crash-only recovery mirror; tests can disable via env.
     return _truthy(os.getenv("POSITIONS_FILE_FALLBACK", "1"))
 
 
@@ -123,12 +247,6 @@ def _fallback_file() -> Path:
         os.getenv("POSITIONS_FILE_NAME", "positions_exit_state.json") or "positions_exit_state.json"
     )
     return _data_dir() / name
-
-
-def _ensure_data_dir() -> None:
-    # Only create on-demand (avoid import-time FS side effects).
-    with contextlib.suppress(Exception):
-        _data_dir().mkdir(parents=True, exist_ok=True)
 
 
 def _now_iso() -> str:
@@ -160,15 +278,16 @@ def _safe_bool(x: Any, default: bool = False) -> bool:
 
 
 def _get_config_attr(name: str) -> Any:
-    try:
+    # Avoid import-time coupling; best-effort lookup only.
+    with contextlib.suppress(Exception):
         import config as C  # type: ignore
 
         return getattr(C, name)
-    except Exception:
-        return None
+    return None
 
 
 def _default_wallet() -> str:
+    # Priority: explicit POSITIONS_DEFAULT_WALLET -> config -> env -> placeholder.
     return (
         (os.getenv("POSITIONS_DEFAULT_WALLET") or "").strip()
         or str(_get_config_attr("WALLET_ADDRESS") or "").strip()
@@ -181,16 +300,52 @@ def _default_wallet() -> str:
     )
 
 
-_FILE_LOCK = asyncio.Lock()
+# =============================================================================
+# Small async helpers
+# =============================================================================
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Utility conversions
-# ──────────────────────────────────────────────────────────────────────────────
-def _dataclass_to_dict(obj: Any) -> dict[str, Any]:
+async def _maybe_await(x: Any) -> Any:
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+
+async def _to_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
+def _pos_sort_ts(p: Any) -> int:
+    # Use opened_ts / created_ts if present, else 0
+    with contextlib.suppress(Exception):
+        v = getattr(p, "opened_ts", None)
+        if v is not None:
+            return int(v or 0)
+    with contextlib.suppress(Exception):
+        v = getattr(p, "created_ts", None)
+        if v is not None:
+            return int(v or 0)
+    return 0
+
+
+# =============================================================================
+# Forgiving conversions (legacy-friendly)
+# =============================================================================
+
+
+def _is_posstate_like(obj: Any) -> bool:
+    return (
+        obj is not None
+        and hasattr(obj, "mint")
+        and hasattr(obj, "entry_px")
+        and hasattr(obj, "size_usd")
+    )
+
+
+def _obj_to_dict(obj: Any) -> dict[str, Any]:
     """
-    Extract a minimal dict from a dataclass/instance/dict.
-    This is intentionally forgiving to support legacy call-sites.
+    Extract a forgiving dict from a dataclass/instance/dict.
+    Intentionally permissive to support legacy call-sites.
     """
     if obj is None:
         return {}
@@ -198,82 +353,150 @@ def _dataclass_to_dict(obj: Any) -> dict[str, Any]:
         return asdict(obj)  # type: ignore[arg-type]
     if isinstance(obj, dict):
         return dict(obj)
+
     out: dict[str, Any] = {}
-    for k in ("mint", "entry_px", "size_usd", "peak_px", "tp1_done", "symbol", "pool", "wallet"):
+    for k in (
+        "mint",
+        "token",
+        "token_address",
+        "entry_px",
+        "size_usd",
+        "peak_px",
+        "tp1_done",
+        "symbol",
+        "pool",
+        "wallet",
+    ):
         if hasattr(obj, k):
             out[k] = getattr(obj, k)
     return out
+
+
+def _construct_posstate(mint: str, entry_px: float, size_usd: float) -> PositionState:
+    # Try multiple construction styles safely.
+    with contextlib.suppress(Exception):
+        return PositionState(mint=mint, entry_px=entry_px, size_usd=size_usd)  # type: ignore[call-arg]
+    with contextlib.suppress(Exception):
+        return PositionState(mint, entry_px, size_usd)  # type: ignore[call-arg]
+    # Last resort: create then set attrs
+    pos = PositionState(mint, entry_px, size_usd)  # type: ignore[call-arg]
+    with contextlib.suppress(Exception):
+        pos.mint = mint
+        pos.entry_px = entry_px
+        pos.size_usd = size_usd
+    return pos
 
 
 def _dict_to_position(d: dict[str, Any]) -> PositionState:
     mint = str(d.get("mint") or d.get("token") or d.get("token_address") or "").strip() or "UNKNOWN"
     entry = _safe_float(d.get("entry_px", d.get("buy_price", 0.0)), 0.0)
     size_usd = _safe_float(d.get("size_usd", d.get("amount_invested", 0.0)), 0.0)
-    pos = PositionState(mint=mint, entry_px=entry, size_usd=size_usd)
+
+    pos = _construct_posstate(mint, entry, size_usd)
+
     with contextlib.suppress(Exception):
         if d.get("peak_px") is not None:
             pos.peak_px = _safe_float(d.get("peak_px"), entry)
+    with contextlib.suppress(Exception):
         if d.get("tp1_done") is not None:
             pos.tp1_done = _safe_bool(d.get("tp1_done"), False)
+    with contextlib.suppress(Exception):
         if d.get("symbol") is not None:
             sym = str(d.get("symbol") or "").strip()
             pos.symbol = sym or None
+
     return pos
 
 
-def _pos_to_exit_dict(p: PositionState) -> dict[str, Any]:
-    d = _dataclass_to_dict(p)
-    d["mint"] = str(getattr(p, "mint", "UNKNOWN"))
-    d["entry_px"] = _safe_float(getattr(p, "entry_px", 0.0), 0.0)
-    d["size_usd"] = _safe_float(getattr(p, "size_usd", 0.0), 0.0)
-    d["peak_px"] = _safe_float(getattr(p, "peak_px", d["entry_px"]), d["entry_px"])
-    d["tp1_done"] = bool(getattr(p, "tp1_done", False))
-    d["symbol"] = getattr(p, "symbol", None)
-    d["updated_at"] = _now_iso()
-    return d
+def _pos_to_exit_dict(p: Any) -> dict[str, Any]:
+    """
+    Convert a PositionState-like object into the canonical exit_state dict.
+    """
+    base = _obj_to_dict(p)
+    mint = str(getattr(p, "mint", base.get("mint", "UNKNOWN")) or "UNKNOWN")
+    entry = _safe_float(getattr(p, "entry_px", base.get("entry_px", 0.0)), 0.0)
+    size_usd = _safe_float(getattr(p, "size_usd", base.get("size_usd", 0.0)), 0.0)
+    peak = _safe_float(getattr(p, "peak_px", base.get("peak_px", entry)), entry)
+    tp1_done = bool(getattr(p, "tp1_done", base.get("tp1_done", False)))
+    symbol = getattr(p, "symbol", base.get("symbol", None))
+
+    out: dict[str, Any] = {
+        "mint": mint,
+        "entry_px": entry,
+        "size_usd": size_usd,
+        "peak_px": peak,
+        "tp1_done": tp1_done,
+        "symbol": symbol,
+        "updated_at": _now_iso(),
+    }
+
+    # Preserve extra keys (legacy-friendly) without overriding core fields.
+    for k, v in base.items():
+        if k not in out:
+            out[k] = v
+
+    return out
 
 
-def _merge_exit_state(existing_meta: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+def _merge_exit_state(
+    existing_meta: dict[str, Any], patch_exit_state: dict[str, Any]
+) -> dict[str, Any]:
     meta = dict(existing_meta or {})
-    cur = meta.get("exit_state")
+    cur = meta.get(_EXIT_META_KEY)
     if not isinstance(cur, dict):
         cur = {}
     nxt = dict(cur)
-    nxt.update({k: v for k, v in (patch or {}).items() if v is not None})
+    for k, v in (patch_exit_state or {}).items():
+        if v is not None:
+            nxt[k] = v
     nxt["updated_at"] = _now_iso()
-    meta["exit_state"] = nxt
+    meta[_EXIT_META_KEY] = nxt
     return meta
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# File fallback (mirror-only; never a competing truth)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# File mirror (crash-only fallback; never a competing truth)
+# =============================================================================
+
+
+def _ensure_data_dir_sync() -> None:
+    with contextlib.suppress(Exception):
+        _data_dir().mkdir(parents=True, exist_ok=True)
+
+
 async def _file_read_all() -> dict[str, dict[str, Any]]:
     if not _file_fallback_enabled():
         return {}
+
     path = _fallback_file()
     async with _FILE_LOCK:
         if not path.exists():
             return {}
+
         try:
-            txt = path.read_text(encoding="utf-8") or "{}"
-            obj = json.loads(txt)
+            txt = await _to_thread(path.read_text, encoding="utf-8")
+            obj = json.loads(txt or "{}")
             return obj if isinstance(obj, dict) else {}
         except Exception:
+            # Move corrupt file aside to avoid repeated parse failures (best effort)
             with contextlib.suppress(Exception):
-                path.rename(path.with_suffix(".corrupt.json"))
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+                await _to_thread(path.replace, path.with_suffix(f".corrupt.{stamp}.json"))
             return {}
 
 
 async def _file_write_all(mp: dict[str, dict[str, Any]]) -> None:
     if not _file_fallback_enabled():
         return
-    _ensure_data_dir()
+
+    _ensure_data_dir_sync()
     path = _fallback_file()
+    tmp = path.with_suffix(".tmp")
+    payload = json.dumps(mp, ensure_ascii=False, separators=(",", ":"))
+
     async with _FILE_LOCK:
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(mp, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        tmp.replace(path)
+        await _to_thread(tmp.write_text, payload, encoding="utf-8")
+        await _to_thread(tmp.replace, path)
 
 
 async def _file_set(mint: str, payload: dict[str, Any]) -> None:
@@ -288,74 +511,117 @@ async def _file_del(mint: str) -> None:
     if not _file_fallback_enabled():
         return
     mp = await _file_read_all()
-    if str(mint) in mp:
-        del mp[str(mint)]
+    key = str(mint)
+    if key in mp:
+        del mp[key]
         await _file_write_all(mp)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PositionStore bridge
-# ──────────────────────────────────────────────────────────────────────────────
-async def _find_open_pool(wallet: str, mint: str) -> str | None:
-    """If pool not specified, pick newest open position for mint."""
-    try:
+# =============================================================================
+# PositionStore bridge (best-effort, defensive against shape changes)
+# =============================================================================
+
+
+def _import_position_store() -> Any:
+    with contextlib.suppress(Exception):
         from utils_pkg import position_store as ps  # type: ignore
 
-        opens = await ps.list_open_positions(wallet)
-        cand = [p for p in opens if getattr(p, "mint", "") == mint]
-        if not cand:
-            return None
-        cand.sort(
-            key=lambda x: int(getattr(x, "opened_ts", 0) or getattr(x, "created_ts", 0) or 0),
-            reverse=True,
-        )
-        pool = str(getattr(cand[0], "pool", "") or "").strip()
-        return pool or None
+        return ps
+    return None
+
+
+async def _list_open_positions_store(wallet: str) -> list[Any]:
+    ps = _import_position_store()
+    if ps is None:
+        return []
+    try:
+        res = await _maybe_await(ps.list_open_positions(wallet))  # type: ignore[attr-defined]
+        return list(res or [])
     except Exception:
+        return []
+
+
+async def _find_open_pool(wallet: str, mint: str) -> str | None:
+    opens = await _list_open_positions_store(wallet)
+    if not opens:
         return None
+    m = str(mint)
+    cand = [p for p in opens if str(getattr(p, "mint", "")) == m]
+    if not cand:
+        return None
+    cand.sort(key=_pos_sort_ts, reverse=True)
+    pool = str(getattr(cand[0], "pool", "") or "").strip()
+    return pool or None
 
 
 async def _upsert_exit_state_into_store(
-    *,
-    wallet: str,
-    mint: str,
-    pool: str,
-    patch_exit_state: dict[str, Any],
+    *, wallet: str, mint: str, pool: str, exit_state: dict[str, Any]
 ) -> bool:
-    """Return True if write succeeded."""
-    try:
-        from utils_pkg import position_store as ps  # type: ignore
+    ps = _import_position_store()
+    if ps is None:
+        return False
 
-        with contextlib.suppress(Exception):
-            await ps.register_new(
-                wallet=wallet,
-                mint=mint,
-                pool=pool,
-                symbol=str(patch_exit_state.get("symbol") or ""),
-                reason="EXIT_STATE",
-                meta={},
+    # Optional: ensure a position exists if the store supports it
+    with contextlib.suppress(Exception):
+        reg = getattr(ps, "register_new", None)
+        if callable(reg):
+            await _maybe_await(
+                reg(
+                    wallet=wallet,
+                    mint=mint,
+                    pool=pool,
+                    symbol=str(exit_state.get("symbol") or ""),
+                    reason="EXIT_STATE",
+                    meta={},
+                )
             )
 
-        pos = await ps.get_position(wallet, mint, pool)
-        if pos is None:
-            return False
+    try:
+        pos = await _maybe_await(ps.get_position(wallet, mint, pool))  # type: ignore[attr-defined]
+    except Exception:
+        pos = None
+    if pos is None:
+        return False
 
-        try:
-            meta = pos.meta if isinstance(getattr(pos, "meta", None), dict) else {}
-        except Exception:
-            meta = {}
-        meta = _merge_exit_state(meta, patch_exit_state)
+    try:
+        meta_obj = getattr(pos, "meta", None)
+        meta = meta_obj if isinstance(meta_obj, dict) else {}
+    except Exception:
+        meta = {}
 
-        with contextlib.suppress(Exception):
-            pos.set_meta(meta)  # type: ignore[attr-defined]
-        with contextlib.suppress(Exception):
+    meta = _merge_exit_state(meta, exit_state)
+
+    with contextlib.suppress(Exception):
+        setter = getattr(pos, "set_meta", None)
+        if callable(setter):
+            setter(meta)
+        else:
             pos.meta = meta  # type: ignore[attr-defined]
 
-        s = await ps.get_store()
-        await s.upsert(pos, ttl_sec=None)
-        return True
+    # Resolve store handle
+    store: Any = None
+    with contextlib.suppress(Exception):
+        getter = getattr(ps, "get_store", None)
+        if callable(getter):
+            store = await _maybe_await(getter())
+    if store is None:
+        with contextlib.suppress(Exception):
+            store = getattr(ps, "STORE", None)
+        with contextlib.suppress(Exception):
+            store = getattr(ps, "store", store)
+
+    if store is None:
+        return False
+
+    try:
+        upsert = getattr(store, "upsert", None)
+        if callable(upsert):
+            await _maybe_await(upsert(pos, ttl_sec=None))
+            return True
     except Exception:
         return False
+
+    return False
 
 
 async def _read_exit_state_from_store(
@@ -364,36 +630,46 @@ async def _read_exit_state_from_store(
     """
     Returns (pool, exit_state_dict) for the newest open position that has exit_state, else None.
     """
-    try:
-        from utils_pkg import position_store as ps  # type: ignore
-
-        opens = await ps.list_open_positions(wallet)
-        cand = [p for p in opens if getattr(p, "mint", "") == mint]
-        if not cand:
-            return None
-        cand.sort(
-            key=lambda x: int(getattr(x, "opened_ts", 0) or getattr(x, "created_ts", 0) or 0),
-            reverse=True,
-        )
-        for p in cand:
-            try:
-                meta = p.meta if isinstance(getattr(p, "meta", None), dict) else {}
-            except Exception:
-                meta = {}
-            es = meta.get("exit_state")
-            if isinstance(es, dict):
-                pool = str(getattr(p, "pool", "") or "unknown_pool")
-                return (pool, dict(es))
-        return None
-    except Exception:
+    opens = await _list_open_positions_store(wallet)
+    if not opens:
         return None
 
+    m = str(mint)
+    cand = [p for p in opens if str(getattr(p, "mint", "")) == m]
+    if not cand:
+        return None
 
-# ──────────────────────────────────────────────────────────────────────────────
+    cand.sort(key=_pos_sort_ts, reverse=True)
+    for p in cand:
+        try:
+            meta_obj = getattr(p, "meta", None)
+            meta = meta_obj if isinstance(meta_obj, dict) else {}
+        except Exception:
+            meta = {}
+
+        es = meta.get(_EXIT_META_KEY)
+        if isinstance(es, dict):
+            pool = str(getattr(p, "pool", "") or "unknown_pool")
+            return pool, dict(es)
+
+    return None
+
+
+# =============================================================================
 # Public async API
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+
+
+@overload
+async def save_position(mint: str, data: dict[str, Any] | PositionState) -> None: ...
+
+
+@overload
+async def save_position(pos_or_dict: dict[str, Any] | PositionState, /) -> None: ...
+
+
 async def save_position(
-    arg1: str | dict[str, Any] | PositionState,
+    mint: str | dict[str, Any] | PositionState,
     data: dict[str, Any] | PositionState | None = None,
 ) -> None:
     """
@@ -406,60 +682,52 @@ async def save_position(
       await save_position(PositionState(...))         # single-arg PositionState form
     """
     payload: dict[str, Any]
-    if isinstance(arg1, str):
-        mint = str(arg1).strip()
-        payload = _dataclass_to_dict(data)
-        payload["mint"] = mint
+    mint_str: str
+    pos_obj: Any
+
+    if isinstance(mint, str):
+        mint_str = mint.strip()
+        payload = _obj_to_dict(data)
+        payload["mint"] = mint_str
+        pos_obj = data
     else:
-        payload = _dataclass_to_dict(arg1)
-        mint = str(
+        payload = _obj_to_dict(mint)
+        mint_str = str(
             payload.get("mint") or payload.get("token") or payload.get("token_address") or ""
         ).strip()
+        pos_obj = mint
 
-    if not mint:
+    if not mint_str:
         raise ValueError("save_position: mint not provided")
 
-    pos_obj = arg1 if isinstance(arg1, PositionState) else _dict_to_position(payload)
-    exit_dict = _pos_to_exit_dict(pos_obj)
+    pos_state = pos_obj if _is_posstate_like(pos_obj) else _dict_to_position(payload)
+    exit_dict = _pos_to_exit_dict(pos_state)
 
     wallet = str(payload.get("wallet") or _default_wallet()).strip()
-    pool = str(payload.get("pool") or "").strip()
-    if not pool:
-        pool = (await _find_open_pool(wallet, mint)) or "unknown_pool"
-
-    ok = await _upsert_exit_state_into_store(
-        wallet=wallet, mint=mint, pool=pool, patch_exit_state=exit_dict
+    pool = (
+        str(payload.get("pool") or "").strip()
+        or (await _find_open_pool(wallet, mint_str))
+        or "unknown_pool"
     )
 
+    ok = await _upsert_exit_state_into_store(
+        wallet=wallet, mint=mint_str, pool=pool, exit_state=exit_dict
+    )
+
+    # Crash-only file mirror
     if _file_fallback_enabled():
         await _file_set(
-            mint, {**exit_dict, "wallet": wallet, "pool": pool, "mirrored_at": _now_iso()}
+            mint_str,
+            {**exit_dict, "wallet": wallet, "pool": pool, "mirrored_at": _now_iso()},
         )
 
     if not ok:
-        with contextlib.suppress(Exception):
-            log.warning(
-                "EXIT_STATE_SAVE_STORE_FAIL", extra={"mint": mint, "wallet": wallet, "pool": pool}
-            )
-
-
-async def update_position(mint: str, patch: dict[str, Any]) -> None:
-    """Merge patch into existing exit_state (no-op if missing)."""
-    m = str(mint or "").strip()
-    if not m:
-        return
-    cur = await load_position(m)
-    if not cur:
-        return
-
-    d = _pos_to_exit_dict(cur)
-    d.update({k: v for k, v in (patch or {}).items() if v is not None})
-    d["mint"] = m
-    await save_position(m, d)
+        log.warning(
+            "EXIT_STATE_SAVE_STORE_FAIL", extra={"mint": mint_str, "wallet": wallet, "pool": pool}
+        )
 
 
 async def load_position(mint: str) -> PositionState | None:
-    """Load exit_state as PositionState, or None if not present."""
     m = str(mint or "").strip()
     if not m:
         return None
@@ -469,51 +737,139 @@ async def load_position(mint: str) -> PositionState | None:
     got = await _read_exit_state_from_store(wallet=wallet, mint=m)
     if got:
         _pool, es = got
-        dd = dict(es)
-        dd["mint"] = m
-        return _dict_to_position(dd)
+        d = dict(es)
+        d["mint"] = m
+        return _dict_to_position(d)
 
     if _file_fallback_enabled():
         mp = await _file_read_all()
         if m in mp and isinstance(mp[m], dict):
-            dd = dict(mp[m])
-            dd["mint"] = m
-            return _dict_to_position(dd)
+            d = dict(mp[m])
+            d["mint"] = m
+            return _dict_to_position(d)
 
     return None
 
 
 async def list_open_positions() -> list[PositionState]:
-    """Return PositionState list for open positions that have exit_state stored in meta."""
     wallet = _default_wallet()
     out: list[PositionState] = []
 
-    with contextlib.suppress(Exception):
-        from utils_pkg import position_store as ps  # type: ignore
-
-        opens = await ps.list_open_positions(wallet)
+    opens = await _list_open_positions_store(wallet)
+    if opens:
         for p in opens:
             try:
-                meta = p.meta if isinstance(getattr(p, "meta", None), dict) else {}
+                meta_obj = getattr(p, "meta", None)
+                meta = meta_obj if isinstance(meta_obj, dict) else {}
             except Exception:
                 meta = {}
-            es = meta.get("exit_state")
-            if isinstance(es, dict):
-                dd = dict(es)
-                dd["mint"] = getattr(p, "mint", dd.get("mint", "UNKNOWN"))
-                if dd.get("symbol") is None:
-                    dd["symbol"] = getattr(p, "symbol", None)
-                out.append(_dict_to_position(dd))
+
+            es = meta.get(_EXIT_META_KEY)
+            if not isinstance(es, dict):
+                continue
+
+            d = dict(es)
+            d["mint"] = getattr(p, "mint", d.get("mint", "UNKNOWN"))
+            if d.get("symbol") is None:
+                d["symbol"] = getattr(p, "symbol", None)
+
+            out.append(_dict_to_position(d))
         return out
 
     if _file_fallback_enabled():
         mp = await _file_read_all()
-        for m, dd in mp.items():
-            if isinstance(dd, dict):
-                d2 = dict(dd)
+        for m, d in mp.items():
+            if isinstance(d, dict):
+                d2 = dict(d)
                 d2["mint"] = m
                 out.append(_dict_to_position(d2))
+
     return out
+
+
+async def load_positions_map() -> dict[str, dict[str, Any]]:
+    wallet = _default_wallet()
+    res: dict[str, dict[str, Any]] = {}
+
+    opens = await _list_open_positions_store(wallet)
+    if opens:
+        opens.sort(key=_pos_sort_ts, reverse=True)
+
+        for p in opens:
+            try:
+                meta_obj = getattr(p, "meta", None)
+                meta = meta_obj if isinstance(meta_obj, dict) else {}
+            except Exception:
+                meta = {}
+
+            es = meta.get(_EXIT_META_KEY)
+            if not isinstance(es, dict):
+                continue
+
+            mint = str(getattr(p, "mint", "") or es.get("mint") or "").strip()
+            if not mint or mint in res:
+                continue
+
+            d = dict(es)
+            d.setdefault("mint", mint)
+            d.setdefault("symbol", getattr(p, "symbol", None))
+            res[mint] = d
+
+        return res
+
+    if _file_fallback_enabled():
+        mp = await _file_read_all()
+        for m, d in mp.items():
+            if isinstance(d, dict):
+                d2 = dict(d)
+                d2.setdefault("mint", m)
+                res[m] = d2
+
+    return res
+
+
+async def update_position(mint: str, patch: dict[str, Any]) -> None:
+    m = str(mint or "").strip()
+    if not m:
+        return
+
+    patch = dict(patch or {})
+    wallet = str(patch.pop("wallet", "") or "").strip() or _default_wallet()
+    pool = str(patch.pop("pool", "") or "").strip()
+
+    current = await _read_exit_state_from_store(wallet=wallet, mint=m)
+    cur_pool: str | None = None
+    cur_dict: dict[str, Any] | None = None
+
+    if current:
+        cur_pool, cur_dict = current
+    elif _file_fallback_enabled():
+        mp = await _file_read_all()
+        if m in mp and isinstance(mp[m], dict):
+            cur_dict = dict(mp[m])
+
+    if not cur_dict:
+        return
+
+    merged = dict(cur_dict)
+    for k, v in patch.items():
+        if v is not None:
+            merged[k] = v
+    merged["mint"] = m
+    merged["updated_at"] = _now_iso()
+
+    if not pool:
+        pool = cur_pool or (await _find_open_pool(wallet, m)) or "unknown_pool"
+
+    ok = await _upsert_exit_state_into_store(wallet=wallet, mint=m, pool=pool, exit_state=merged)
+
+    if _file_fallback_enabled():
+        await _file_set(m, {**merged, "wallet": wallet, "pool": pool, "mirrored_at": _now_iso()})
+
+    if not ok:
+        log.warning(
+            "EXIT_STATE_UPDATE_STORE_FAIL", extra={"mint": m, "wallet": wallet, "pool": pool}
+        )
 
 
 async def close_position(mint: str) -> None:
@@ -526,72 +882,60 @@ async def close_position(mint: str) -> None:
         return
 
     wallet = _default_wallet()
+    ps = _import_position_store()
 
-    with contextlib.suppress(Exception):
-        from utils_pkg import position_store as ps  # type: ignore
+    if ps is not None:
+        opens = await _list_open_positions_store(wallet)
+        for p in opens:
+            if str(getattr(p, "mint", "")) != m:
+                continue
 
-        pool = (await _find_open_pool(wallet, m)) or "unknown_pool"
-        pos = await ps.get_position(wallet, m, pool)
-        if pos is not None:
             try:
-                meta = pos.meta if isinstance(getattr(pos, "meta", None), dict) else {}
+                meta_obj = getattr(p, "meta", None)
+                meta = meta_obj if isinstance(meta_obj, dict) else {}
             except Exception:
                 meta = {}
-            if isinstance(meta, dict) and "exit_state" in meta:
-                meta2 = dict(meta)
-                meta2.pop("exit_state", None)
 
-                with contextlib.suppress(Exception):
-                    pos.set_meta(meta2)  # type: ignore[attr-defined]
-                with contextlib.suppress(Exception):
-                    pos.meta = meta2  # type: ignore[attr-defined]
+            if not isinstance(meta, dict) or _EXIT_META_KEY not in meta:
+                continue
 
-                s = await ps.get_store()
-                await s.upsert(pos, ttl_sec=None)
+            meta2 = dict(meta)
+            meta2.pop(_EXIT_META_KEY, None)
+
+            with contextlib.suppress(Exception):
+                setter = getattr(p, "set_meta", None)
+                if callable(setter):
+                    setter(meta2)
+                else:
+                    p.meta = meta2  # type: ignore[attr-defined]
+
+            # Persist
+            store: Any = None
+            with contextlib.suppress(Exception):
+                getter = getattr(ps, "get_store", None)
+                if callable(getter):
+                    store = await _maybe_await(getter())
+            if store is None:
+                with contextlib.suppress(Exception):
+                    store = getattr(ps, "STORE", None)
+                with contextlib.suppress(Exception):
+                    store = getattr(ps, "store", store)
+
+            if store is not None:
+                with contextlib.suppress(Exception):
+                    upsert = getattr(store, "upsert", None)
+                    if callable(upsert):
+                        await _maybe_await(upsert(p, ttl_sec=None))
 
     await _file_del(m)
 
 
-async def load_positions_map() -> dict[str, dict[str, Any]]:
-    """Raw mapping mint -> exit_state dict (diagnostics/UI)."""
-    wallet = _default_wallet()
-    res: dict[str, dict[str, Any]] = {}
-
-    with contextlib.suppress(Exception):
-        from utils_pkg import position_store as ps  # type: ignore
-
-        opens = await ps.list_open_positions(wallet)
-        for p in opens:
-            try:
-                meta = p.meta if isinstance(getattr(p, "meta", None), dict) else {}
-            except Exception:
-                meta = {}
-            es = meta.get("exit_state")
-            if isinstance(es, dict):
-                mint = str(getattr(p, "mint", "") or es.get("mint") or "").strip()
-                if mint:
-                    d = dict(es)
-                    d.setdefault("mint", mint)
-                    d.setdefault("symbol", getattr(p, "symbol", None))
-                    res[mint] = d
-        return res
-
-    if _file_fallback_enabled():
-        mp = await _file_read_all()
-        for m, d in mp.items():
-            if isinstance(d, dict):
-                d2 = dict(d)
-                d2.setdefault("mint", m)
-                res[m] = d2
-    return res
-
-
 async def snapshot_summary() -> dict[str, Any]:
-    """Lightweight summary of exit-state tracking."""
     mp = await load_positions_map()
     total_usd = 0.0
     for d in mp.values():
         total_usd += _safe_float(d.get("size_usd", 0.0), 0.0)
+
     return {
         "count": len(mp),
         "capital_committed_usd": round(total_usd, 2),
@@ -603,15 +947,15 @@ async def snapshot_summary() -> dict[str, Any]:
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Sync shims (safe-ish)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# Sync shims (legacy)
+# =============================================================================
+
 _LEGACY_TASKS: set[asyncio.Task[Any]] = set()
 
 
 def _legacy_done_cb(task: asyncio.Task[Any]) -> None:
     _LEGACY_TASKS.discard(task)
-    # Force exception retrieval so it doesn't get dropped silently.
     with contextlib.suppress(asyncio.CancelledError, Exception):
         _ = task.exception()
 
@@ -624,9 +968,9 @@ def _in_running_loop() -> bool:
         return False
 
 
-def _schedule(coro: Any) -> None:
+def _schedule(coro: Coroutine[Any, Any, Any]) -> None:
     """
-    Best-effort "fire-and-forget" scheduling for legacy sync shims when already
+    Best-effort fire-and-forget scheduling for legacy sync shims when already
     inside an event loop. Prefer tracked helper if present; otherwise track locally.
     """
     with contextlib.suppress(Exception):
@@ -641,7 +985,7 @@ def _schedule(coro: Any) -> None:
         task.add_done_callback(_legacy_done_cb)
 
 
-def _run_sync(coro: Any) -> Any:
+def _run_sync(coro: Coroutine[Any, Any, Any]) -> Any:
     if _in_running_loop():
         _schedule(coro)
         return None
@@ -649,7 +993,7 @@ def _run_sync(coro: Any) -> Any:
 
 
 def save_position_sync(arg1: Any, data: dict[str, Any] | None = None) -> None:
-    _run_sync(save_position(arg1, data))
+    _run_sync(save_position(arg1, data))  # type: ignore[arg-type]
 
 
 def load_positions_sync() -> dict[str, dict[str, Any]]:

@@ -11,6 +11,7 @@ Production goals:
 - Quant-grade features for entry/exit IQ + regime/risk_manager
 - Bounded memory + per-mint caches
 - Safe, deterministic behavior (never blocks on I/O; no external deps)
+- Logging contract safe: no hard dependency on logging_setup; supports .event if available
 
 Primary consumers (expected):
 - utils_pkg/feature_builder.py (wallet_signals / flattened meta)
@@ -25,11 +26,57 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, cast
 
-from logging_setup import get_logger
+# =============================================================================
+# Logging (contract-safe, no hard import)
+# =============================================================================
 
-log = get_logger("sniper.smart_wallets")
+
+class _LogLike(Protocol):
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+
+    # optional structured logger hook used elsewhere in your repo
+    def event(self, name: str, **fields: Any) -> None: ...  # type: ignore[empty-body]
+
+
+def _maybe_import_attr(module_name: str, attr: str) -> Any | None:
+    try:
+        mod = __import__(module_name, fromlist=[attr])
+        return getattr(mod, attr, None)
+    except Exception:
+        return None
+
+
+def _build_logger() -> _LogLike:
+    import logging
+
+    base = logging.getLogger("sniper.smart_wallets")
+
+    # Prefer your repo’s compat shims if present, but never hard-fail.
+    for mod_name in ("utils_pkg.log_compat", "utils_pkg.logging_setup", "logging_setup"):
+        get_logger = _maybe_import_attr(mod_name, "get_logger")
+        if callable(get_logger):
+            try:
+                base = get_logger("sniper.smart_wallets")
+                break
+            except Exception:
+                base = logging.getLogger("sniper.smart_wallets")
+
+    # Optional structured wrapper (if your repo provides it)
+    get_event_logger = _maybe_import_attr("utils_pkg.event_logger", "get_event_logger")
+    if callable(get_event_logger):
+        with contextlib.suppress(Exception):
+            return cast(_LogLike, get_event_logger(base))
+
+    return cast(_LogLike, base)
+
+
+log = _build_logger()
 
 
 # =============================================================================
@@ -93,7 +140,8 @@ def _env_json(key: str) -> Any:
         return json.loads(raw)
     except Exception as e:
         if hasattr(log, "event"):
-            log.event("SMART_ENV_JSON_FAIL", key=key, error=str(e)[:200])
+            with contextlib.suppress(Exception):
+                log.event("SMART_ENV_JSON_FAIL", key=key, error=str(e)[:200])
         else:
             log.warning("SMART_ENV_JSON_FAIL key=%s error=%s", key, str(e)[:200])
         return None
@@ -139,6 +187,11 @@ def _net_minus_one_to_one(pos: float, neg: float) -> float:
     return float(_clamp((p - n) / denom, -1.0, 1.0))
 
 
+def _mono() -> float:
+    # monotonic for TTL checks (safe across clock shifts)
+    return time.monotonic()
+
+
 # =============================================================================
 # Phase-aware config snapshot (TTL)
 # =============================================================================
@@ -147,6 +200,7 @@ def _net_minus_one_to_one(pos: float, neg: float) -> float:
 @dataclass(frozen=True)
 class _Cfg:
     cfg_ttl_sec: float
+    registry_ttl_sec: float
 
     # phase/mode
     phase: int
@@ -215,6 +269,7 @@ class _Cfg:
     reinvest_max_panic: float
     reinvest_max_risk: float
     reinvest_max_conflict: float
+    reinvest_return_mint_only: bool
 
     # tradeable thresholds
     tradeable_min_conf: float
@@ -227,7 +282,7 @@ class _Cfg:
 
 
 _CFG: _Cfg | None = None
-_CFG_AT: float = 0.0
+_CFG_AT_M: float = 0.0
 
 # Back-compat globals (refreshed from cfg)
 MASTER_PHASE: int = 7
@@ -329,6 +384,7 @@ def _load_cfg() -> _Cfg:
     reinvest_max_panic = _env_float("SMART_WALLET_REINVEST_MAX_PANIC", 0.65)
     reinvest_max_risk = _env_float("SMART_WALLET_REINVEST_MAX_RISK", 0.70)
     reinvest_max_conflict = _env_float("SMART_WALLET_REINVEST_MAX_CONFLICT", 0.75)
+    reinvest_return_mint_only = _env_bool("SMART_WALLET_REINVEST_RETURN_MINT_ONLY", False)
 
     trade_min_conf = _env_float("SMART_WALLET_TRADEABLE_MIN_CONF", 0.25)
     trade_min_qual = _env_float("SMART_WALLET_TRADEABLE_MIN_QUALITY", 0.25)
@@ -337,9 +393,11 @@ def _load_cfg() -> _Cfg:
 
     debug_log = _env_bool("SMART_WALLET_DEBUG_LOG", False)
     cfg_ttl = _env_float("SMART_WALLET_CFG_TTL_SEC", 2.0)
+    registry_ttl = _env_float("SMART_WALLET_REGISTRY_TTL_SEC", 0.0)
 
     cfg = _Cfg(
         cfg_ttl_sec=max(0.0, float(cfg_ttl)),
+        registry_ttl_sec=max(0.0, float(registry_ttl)),
         phase=phase,
         mode=mode,
         enabled=bool(enabled),
@@ -347,7 +405,7 @@ def _load_cfg() -> _Cfg:
         breadth_enabled=bool(breadth_enabled),
         alpha_only=bool(alpha_only),
         min_score_for_rich_features=float(_clamp(min_score_for_rich, 0.0, 1.0)),
-        cluster_weights=cluster_weights,
+        cluster_weights=cast(dict[str, float], cluster_weights),
         profile_overrides=profile_overrides,
         alpha_clusters=alpha_clusters,
         smart_half_life_sec=max(1e-6, float(smart_half_life)),
@@ -384,6 +442,7 @@ def _load_cfg() -> _Cfg:
         reinvest_max_panic=float(_clamp(reinvest_max_panic, 0.0, 1.0)),
         reinvest_max_risk=float(_clamp(reinvest_max_risk, 0.0, 1.0)),
         reinvest_max_conflict=float(_clamp(reinvest_max_conflict, 0.0, 1.0)),
+        reinvest_return_mint_only=bool(reinvest_return_mint_only),
         tradeable_min_conf=float(_clamp(trade_min_conf, 0.0, 1.0)),
         tradeable_min_quality=float(_clamp(trade_min_qual, 0.0, 1.0)),
         tradeable_min_heat=float(_clamp(trade_min_heat, 0.0, 1.0)),
@@ -396,18 +455,18 @@ def _load_cfg() -> _Cfg:
 
 
 def _get_cfg() -> _Cfg:
-    global _CFG, _CFG_AT
-    now = time.time()
+    global _CFG, _CFG_AT_M
+    now_m = _mono()
     if _CFG is None:
         _CFG = _load_cfg()
-        _CFG_AT = now
+        _CFG_AT_M = now_m
         return _CFG
     if _CFG.cfg_ttl_sec <= 0.0:
         return _CFG
-    if (now - _CFG_AT) <= _CFG.cfg_ttl_sec:
+    if (now_m - _CFG_AT_M) <= _CFG.cfg_ttl_sec:
         return _CFG
     _CFG = _load_cfg()
-    _CFG_AT = now
+    _CFG_AT_M = now_m
     return _CFG
 
 
@@ -433,16 +492,30 @@ class SmartWalletRegistry:
       SMART_WALLET_LIST               comma/newline list of smart wallets
       SMART_WALLET_ANTI_CLUSTERS_JSON  JSON clusters of anti wallets
       SMART_WALLET_ANTI_LIST           list of anti wallets
+
+    Notes:
+    - No network calls, purely env-driven.
+    - Optional TTL-based refresh via SMART_WALLET_REGISTRY_TTL_SEC (seconds).
     """
 
     def __init__(self) -> None:
         self._by_addr: dict[str, SmartWalletMeta] = {}
+        self._loaded_at_m: float = 0.0
         self._load_from_env()
 
     @staticmethod
     def _normalize_addr(addr: str) -> str:
         # Do NOT lower-case (Solana base58 is case-sensitive)
         return (addr or "").strip()
+
+    def _maybe_refresh(self) -> None:
+        cfg = _get_cfg()
+        ttl = float(cfg.registry_ttl_sec)
+        if ttl <= 0.0:
+            return
+        now_m = _mono()
+        if self._loaded_at_m <= 0.0 or (now_m - self._loaded_at_m) >= ttl:
+            self._load_from_env()
 
     def _load_clusters_from_json(self, raw: Any, *, is_anti: bool, default_cluster: str) -> None:
         cfg = _get_cfg()
@@ -454,7 +527,8 @@ class SmartWalletRegistry:
                 continue
 
             addrs = spec.get("addresses") or spec.get("wallets") or []
-            if not isinstance(addrs, list | tuple):
+            # IMPORTANT: must be a tuple of types, not a union (runtime-safe)
+            if not isinstance(addrs, (list, tuple)):
                 continue
 
             cname = str(cluster_name or default_cluster).strip() or default_cluster
@@ -527,8 +601,11 @@ class SmartWalletRegistry:
                 anti_flat, is_anti=True, default_cluster="anti_default", weight=-1.0
             )
 
+        self._loaded_at_m = _mono()
+
         if hasattr(log, "event"):
-            log.event("SMART_REGISTRY_LOADED", count=len(self._by_addr))
+            with contextlib.suppress(Exception):
+                log.event("SMART_REGISTRY_LOADED", count=len(self._by_addr))
         else:
             log.info("SMART_REGISTRY_LOADED count=%d", len(self._by_addr))
 
@@ -560,9 +637,11 @@ class SmartWalletRegistry:
 
     @property
     def by_addr(self) -> dict[str, SmartWalletMeta]:
+        self._maybe_refresh()
         return self._by_addr
 
     def get_meta(self, address: str) -> SmartWalletMeta | None:
+        self._maybe_refresh()
         return self._by_addr.get(self._normalize_addr(address))
 
     def is_smart(self, address: str) -> bool:
@@ -881,9 +960,12 @@ class SmartWalletTracker:
                 d.pop(mint, None)
 
         if hasattr(log, "event"):
-            log.event(
-                "SMART_PRUNE_MINTS", pruned=len(stale), remaining=len(self._last_any_activity_ts)
-            )
+            with contextlib.suppress(Exception):
+                log.event(
+                    "SMART_PRUNE_MINTS",
+                    pruned=len(stale),
+                    remaining=len(self._last_any_activity_ts),
+                )
         else:
             log.info(
                 "SMART_PRUNE_MINTS pruned=%d remaining=%d",
@@ -1051,17 +1133,18 @@ class SmartWalletTracker:
                             self._prune_addr_map_locked(addr_map, now=now, cfg=cfg)
 
                         if cfg.debug_log and hasattr(log, "event"):
-                            log.event(
-                                "SMART_SWAP_OBSERVED",
-                                mint=mint,
-                                trader=trader,
-                                cluster=meta_for_use.cluster,
-                                weight=meta_for_use.weight,
-                                amt_usd=amt_usd,
-                                side=str(side),
-                                contrib=contrib,
-                                score=new_score,
-                            )
+                            with contextlib.suppress(Exception):
+                                log.event(
+                                    "SMART_SWAP_OBSERVED",
+                                    mint=mint,
+                                    trader=trader,
+                                    cluster=meta_for_use.cluster,
+                                    weight=meta_for_use.weight,
+                                    amt_usd=amt_usd,
+                                    side=str(side),
+                                    contrib=contrib,
+                                    score=new_score,
+                                )
 
             # ---------------------- WHALES ----------------------
             if cfg.whale_enabled and is_whale:
@@ -1135,8 +1218,19 @@ class SmartWalletTracker:
         if not mint or not trader:
             return
 
-        amt_usd = ev.get("amount_usd") or ev.get("size_usd") or ev.get("notional_usd")
-        amt_sol = ev.get("amount_sol") or ev.get("size_sol") or ev.get("notional_sol")
+        # use None-preserving reads (avoid treating 0.0 as missing)
+        amt_usd = ev.get("amount_usd")
+        if amt_usd is None:
+            amt_usd = ev.get("size_usd")
+        if amt_usd is None:
+            amt_usd = ev.get("notional_usd")
+
+        amt_sol = ev.get("amount_sol")
+        if amt_sol is None:
+            amt_sol = ev.get("size_sol")
+        if amt_sol is None:
+            amt_sol = ev.get("notional_sol")
+
         side = ev.get("side") or ev.get("direction") or "buy"
 
         try:
@@ -1230,7 +1324,7 @@ class SmartWalletTracker:
             or cfg.mode == "off"
             or (not cfg.enabled and not cfg.whale_enabled and not cfg.breadth_enabled)
         ):
-            feats = {
+            feats: dict[str, float] = {
                 "smart_wallet_score": 0.5,
                 "smart_flow_raw": 0.0,
                 "smart_last_buy_sec_ago": 1e9,
@@ -1529,7 +1623,7 @@ class SmartWalletTracker:
         )
         smart_tradeable_flag = 1.0 if is_tradeable else 0.0
 
-        feats: dict[str, float] = {
+        feats = {
             "smart_wallet_score": float(smart_01),
             "smart_flow_raw": float(raw_smart),
             "smart_last_buy_sec_ago": float(buy_ago),
@@ -1814,7 +1908,7 @@ async def pick_reinvestment_target(
     """
     Returns either:
       • dict: {"mint": <str>, "score": <float>, "features": {...}} (preferred)
-      • str:  <mint> (legacy compatibility)
+      • str:  <mint> (legacy compatibility; enable via SMART_WALLET_REINVEST_RETURN_MINT_ONLY=1)
     """
     cfg = _get_cfg()
     if not cfg.enabled or cfg.mode == "off":
@@ -1937,6 +2031,12 @@ async def pick_reinvestment_target(
                     "tradeable_flag": tradeable,
                 },
             }
+
+    if best_payload is None:
+        return None
+
+    if cfg.reinvest_return_mint_only:
+        return str(best_payload.get("mint", "")) or None
 
     return best_payload
 

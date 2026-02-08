@@ -6,66 +6,83 @@ utils_pkg/lightning_impl.py — Jupiter execution layer (V3+++ LOCK-IN)
 
 Execution engine behind utils_pkg/router.py.
 
-Key upgrades in this LOCK-IN rewrite
-------------------------------------
-1) Correct endpoint model (no more invalid URL combos):
-   - Supports Metis swap API:
-       https://api.jup.ag/swap/v1/quote
-       https://api.jup.ag/swap/v1/swap
-   - Supports Public v6 API:
-       https://quote-api.jup.ag/v6/quote
-       https://quote-api.jup.ag/v6/swap
-   - Uses env FIRST if provided (full URLs, comma-separated):
-       JUP_QUOTE_URL, JUP_SWAP_URL
-   - Otherwise falls back to:
-       JUP_BASE_URL (+ JUP_QUOTE_PATH/JUP_SWAP_PATH)
-
-2) Per-endpoint failover:
-   - cooldown + score per *endpoint URL* (not only base)
-   - last_good boosts the next choice
-
-3) Safe, production-friendly:
-   - no network at import time
-   - single lazy httpx.AsyncClient
-   - qps gate + concurrency guard
-   - breaker + retry with jitter
-   - DRYRUN semantics preserved
-
-4) Router compatibility:
-   - get_quote / quote
-   - get_buy_quote / get_sell_quote
-   - buy_via_lightning / sell_via_lightning
-   - close_http, stats, _variant_flags
-
-Notes
------
-- If quote-api.jup.ag DNS fails on your machine, keep Metis endpoints first
-  in JUP_QUOTE_URL/JUP_SWAP_URL, or remove quote-api from the list.
+Key goals:
+- No network at import time (safe for tests / contracts).
+- Router-compatible API:
+    - get_quote/quote
+    - get_buy_quote/get_sell_quote
+    - buy_via_lightning/sell_via_lightning
+    - close_http, stats, _variant_flags
+- Multi-endpoint support + per-endpoint cooldown scoring (quote + swap URLs).
+- Breaker + retry + jitter, QPS gate, concurrency guard.
+- Optional budget hooks (sync or async): utils_pkg.budget.
+- DRYRUN behavior preserved (optionally build tx in dryrun).
 """
 
 import asyncio
 import contextlib
+import importlib
 import importlib.util
 import inspect
+import logging
 import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Coroutine, TypeVar, cast
+from urllib.parse import urlsplit
 
 import httpx
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Logging shim (repo-compatible: log.event + log.every)
+# Logging (compat: log.event + log.every) — no side effects at import
 # ──────────────────────────────────────────────────────────────────────────────
-try:
-    from logging_setup import get_logger  # type: ignore
 
-    log = get_logger(__name__)  # type: ignore
-except Exception:  # pragma: no cover
-    import logging
 
-    log = logging.getLogger(__name__)  # type: ignore[assignment]
+class _CompatLog:
+    """
+    Provides .event() and .every() while delegating all other attributes to a
+    standard logging.Logger. Avoids monkeypatching the logger object.
+    """
+
+    _store: dict[str, float] = {}
+
+    def __init__(self, logger: logging.Logger):
+        self._l = logger
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._l, name)
+
+    def event(self, name: str, **kw: Any) -> None:
+        with contextlib.suppress(Exception):
+            self._l.info("%s %s", name, kw)
+
+    def every(self, key: str, n: int = 30, msg: str | None = None, **kw: Any) -> None:
+        try:
+            now = time.monotonic()
+            last = float(self._store.get(key, 0.0))
+            if (now - last) >= float(max(1, int(n))):
+                self._store[key] = now
+                self.event(msg or key, **kw)
+        except Exception:
+            return None
+
+
+def _get_base_logger() -> logging.Logger:
+    try:
+        # preferred compat layer in this repo
+        from utils_pkg.log_compat import get_logger as _get_logger  # type: ignore
+
+        lg = _get_logger(__name__)
+        if isinstance(lg, logging.Logger):
+            return lg
+        # Some repos wrap loggers; fallback to stdlib adapter if unknown.
+        return cast(logging.Logger, getattr(lg, "_logger", logging.getLogger(__name__)))
+    except Exception:
+        return logging.getLogger(__name__)
+
+
+log = _CompatLog(_get_base_logger())
 
 
 def _short(x: Any, n: int = 360) -> str:
@@ -76,34 +93,6 @@ def _short(x: Any, n: int = 360) -> str:
         return "<?>"
 
 
-if not hasattr(log, "event"):
-
-    def _event(name: str, **kw: Any) -> None:  # pragma: no cover
-        with contextlib.suppress(Exception):
-            log.info("%s %s", name, kw)
-
-    log.event = _event  # type: ignore[attr-defined]
-
-
-if not hasattr(log, "every"):
-
-    def _every(
-        key: str, n: int = 30, msg: str | None = None, **kw: Any
-    ) -> None:  # pragma: no cover
-        try:
-            now = time.monotonic()
-            store = getattr(_every, "_store", {})  # type: ignore[attr-defined]
-            last = float(store.get(key, 0.0))
-            if (now - last) >= float(max(1, int(n))):
-                store[key] = now
-                _every._store = store  # type: ignore[attr-defined]
-                log.event(msg or key, **kw)
-        except Exception:
-            return None
-
-    log.every = _every  # type: ignore[attr-defined]
-
-
 def _warn(name: str, **kw: Any) -> None:
     with contextlib.suppress(Exception):
         log.event(name, **kw)
@@ -112,6 +101,7 @@ def _warn(name: str, **kw: Any) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional budget hooks (sync OR async supported)
 # ──────────────────────────────────────────────────────────────────────────────
+
 try:
     from utils_pkg import budget  # type: ignore
 except Exception:  # pragma: no cover
@@ -145,56 +135,31 @@ async def _budget_call(fn: Any, *a: Any, **kw: Any) -> Any:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Wallet helpers (lazy)
+# Mint helpers (lazy normalize_mint import)
 # ──────────────────────────────────────────────────────────────────────────────
-try:
-    from utils_pkg.solana_wallet import (  # type: ignore
-        get_pubkey_str,
-        load_keypair,
-        sign_and_send_b64_tx,
-    )
 
-    try:
-        from utils_pkg.solana_wallet import _send_b64_with_diag  # type: ignore
-    except Exception:  # pragma: no cover
-        _send_b64_with_diag = None  # type: ignore
-except Exception:  # pragma: no cover
-    get_pubkey_str = None  # type: ignore
-    load_keypair = None  # type: ignore
-    sign_and_send_b64_tx = None  # type: ignore
-    _send_b64_with_diag = None  # type: ignore
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Mint helpers
-# ──────────────────────────────────────────────────────────────────────────────
 KNOWN_SOL_MINT = "So11111111111111111111111111111111111111112"
 KNOWN_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 KNOWN_BAD_USDC_TYPO = "EPjFWdd5AufqSSqeMzQ1NzxypaC8G4weEGKzwyTDt1v"
 
-try:
-    from utils_pkg.mints import (  # type: ignore
-        SOL_MINT as CANON_SOL_MINT,
-        USDC_MINT as CANON_USDC_MINT,
-        normalize_mint,
-    )
-except Exception:  # pragma: no cover
-
-    def normalize_mint(x: str) -> str:  # type: ignore
-        return (x or "").strip()
-
-    CANON_SOL_MINT = KNOWN_SOL_MINT
-    CANON_USDC_MINT = KNOWN_USDC_MINT
-
-
 _BASE58_ALPH = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
 
+def _normalize_mint(m: str) -> str:
+    # Lazy import to reduce import-time weight / side-effects
+    try:
+        from utils_pkg.mints import normalize_mint as _nm  # type: ignore
+
+        return str(_nm(m))
+    except Exception:
+        return (m or "").strip()
+
+
 def _looks_like_mint(s: str) -> bool:
-    s = (s or "").strip()
-    if not (32 <= len(s) <= 44):
+    ss = (s or "").strip()
+    if not (32 <= len(ss) <= 44):
         return False
-    return all(ch in _BASE58_ALPH for ch in s)
+    return all(ch in _BASE58_ALPH for ch in ss)
 
 
 def _fix_common_mint_typos(m: str) -> str:
@@ -206,7 +171,7 @@ def _fix_common_mint_typos(m: str) -> str:
 
 
 def _normalize_and_validate_mint(m: str, *, label: str) -> str:
-    mm = normalize_mint(m)
+    mm = _normalize_mint(m)
     mm = _fix_common_mint_typos(mm)
     if not _looks_like_mint(mm):
         raise ValueError(f"invalid_mint:{label}")
@@ -214,12 +179,13 @@ def _normalize_and_validate_mint(m: str, *, label: str) -> str:
 
 
 def _same_mint(a: str, b: str) -> bool:
-    return normalize_mint(a) == normalize_mint(b)
+    return _normalize_mint(a) == _normalize_mint(b)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Env helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
 _FALSE = {"0", "false", "f", "no", "n", "off"}
 
@@ -287,24 +253,25 @@ def _mono() -> float:
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP/2 detection (optional)
 # ──────────────────────────────────────────────────────────────────────────────
+
 _H2_AVAILABLE = importlib.util.find_spec("h2") is not None
 
 
 def _effective_http2() -> bool:
     req = _env_bool("JUP_HTTP2", False)
-    if not req:
-        return False
-    return _H2_AVAILABLE
+    return bool(req and _H2_AVAILABLE)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
-LAMPORTS_PER_SOL = 1_000_000_000
-LIGHTNING_VERSION = "v3+++_lockin_lightning_2026-01-05"
 
-SOL_MINT = _env_str("SOL_MINT", str(CANON_SOL_MINT or KNOWN_SOL_MINT))
-USDC_MINT = _env_str("USDC_MINT", str(CANON_USDC_MINT or KNOWN_USDC_MINT))
+LAMPORTS_PER_SOL = 1_000_000_000
+LIGHTNING_VERSION = "v3+++_lockin_lightning_2026-02-01"
+
+# Canonical mints may be set by env; otherwise defaults to known constants
+SOL_MINT = _env_str("SOL_MINT", KNOWN_SOL_MINT)
+USDC_MINT = _env_str("USDC_MINT", KNOWN_USDC_MINT)
 
 DEFAULT_METIS_BASE = "https://api.jup.ag"
 DEFAULT_PUBLIC_BASE = "https://quote-api.jup.ag"
@@ -316,12 +283,12 @@ DEFAULT_V6_SWAP_PATH = "/v6/swap"
 
 
 def _mask_key(k: str) -> str:
-    k = (k or "").strip()
-    if not k:
+    kk = (k or "").strip()
+    if not kk:
         return ""
-    if len(k) <= 8:
-        return "*" * len(k)
-    return k[:3] + ("*" * (len(k) - 6)) + k[-3:]
+    if len(kk) <= 8:
+        return "*" * len(kk)
+    return kk[:3] + ("*" * (len(kk) - 6)) + kk[-3:]
 
 
 def _parse_csv(val: str) -> list[str]:
@@ -341,28 +308,33 @@ def _join_url(base: str, path: str) -> str:
     return b + p
 
 
+def _url_origin(url: str) -> str:
+    try:
+        u = urlsplit(url)
+        if u.scheme and u.netloc:
+            return f"{u.scheme}://{u.netloc}"
+    except Exception:
+        return ""
+    return ""
+
+
 def _ensure_full_quote_url(s: str) -> str:
     """
-    Accepts either a full URL, or a base host. Converts base host into correct default:
+    Accepts either a full URL, or a base host. Converts base host into best default:
       - quote-api.* -> /v6/quote
       - api.jup.ag  -> /swap/v1/quote
     """
     t = (s or "").strip().rstrip("/")
     if not t:
         return ""
-    if t.startswith("http://") or t.startswith("https://"):
-        # If it's already a full endpoint URL (has /...), leave it.
-        # If it's only a base (no slash beyond scheme), append best default.
-        try:
-            after = t.split("://", 1)[1]
-            if "/" not in after:
-                if "quote-api" in after:
-                    return _join_url(t, DEFAULT_V6_QUOTE_PATH)
-                return _join_url(t, DEFAULT_METIS_QUOTE_PATH)
-        except Exception:
-            pass
+    if t.startswith(("http://", "https://")):
+        after = t.split("://", 1)[1]
+        if "/" not in after:
+            return _join_url(
+                t,
+                DEFAULT_V6_QUOTE_PATH if "quote-api" in after else DEFAULT_METIS_QUOTE_PATH,
+            )
         return t
-    # treat as host-ish
     if "quote-api" in t:
         return "https://" + t + DEFAULT_V6_QUOTE_PATH
     return "https://" + t + DEFAULT_METIS_QUOTE_PATH
@@ -372,15 +344,13 @@ def _ensure_full_swap_url(s: str) -> str:
     t = (s or "").strip().rstrip("/")
     if not t:
         return ""
-    if t.startswith("http://") or t.startswith("https://"):
-        try:
-            after = t.split("://", 1)[1]
-            if "/" not in after:
-                if "quote-api" in after:
-                    return _join_url(t, DEFAULT_V6_SWAP_PATH)
-                return _join_url(t, DEFAULT_METIS_SWAP_PATH)
-        except Exception:
-            pass
+    if t.startswith(("http://", "https://")):
+        after = t.split("://", 1)[1]
+        if "/" not in after:
+            return _join_url(
+                t,
+                DEFAULT_V6_SWAP_PATH if "quote-api" in after else DEFAULT_METIS_SWAP_PATH,
+            )
         return t
     if "quote-api" in t:
         return "https://" + t + DEFAULT_V6_SWAP_PATH
@@ -389,17 +359,14 @@ def _ensure_full_swap_url(s: str) -> str:
 
 @dataclass(frozen=True)
 class _Cfg:
-    # endpoint URLs (full)
     quote_urls: list[str]
     swap_urls: list[str]
 
-    # quote params
     only_direct: bool
     restrict_intermediate: bool
     default_slippage_bps: int
     as_legacy_tx: bool
 
-    # swap build options
     wrap_unwrap_sol: bool
     dynamic_slippage: bool
     skip_user_accounts_rpc_calls: bool
@@ -414,7 +381,6 @@ class _Cfg:
     tracking_account: str
     payer: str
 
-    # http
     timeout_sec: float
     connect_timeout: float
     pool_timeout: float
@@ -423,11 +389,9 @@ class _Cfg:
     tls_verify: bool
     http2_effective: bool
 
-    # rate
     max_qps: int
     max_concurrency: int
 
-    # retry + breaker
     retry_max: int
     backoff_sec: float
     jitter_sec: float
@@ -435,17 +399,14 @@ class _Cfg:
     fail_limit: int
     breaker_cooldown_sec: float
 
-    # per-endpoint cooldown
     endpoint_fail_limit: int
     endpoint_cooldown_sec: float
 
-    # misc
     unroutable_ttl_sec: int
     requote_bump_pct: int
     quote_ttl_sec: float
     strict_auth: bool
 
-    # dryrun + safety
     dry_run: bool
     dryrun_build_tx: bool
     disable_buys: bool
@@ -453,7 +414,6 @@ class _Cfg:
     kill_switch: bool
     skip_preflight: bool
 
-    # headers
     has_api_key: bool
     api_key_mask: str
 
@@ -496,8 +456,6 @@ def _load_cfg() -> _Cfg:
     quote_path = _env_str("JUP_QUOTE_PATH", "").strip()
     swap_path = _env_str("JUP_SWAP_PATH", "").strip()
 
-    # smart defaults if not specified
-    # if the base looks like quote-api => v6 defaults, else metis defaults
     def _default_qp(b: str) -> str:
         return DEFAULT_V6_QUOTE_PATH if "quote-api" in b else DEFAULT_METIS_QUOTE_PATH
 
@@ -510,20 +468,17 @@ def _load_cfg() -> _Cfg:
         if not swap_urls:
             swap_urls.append(_join_url(b, swap_path or _default_sp(b)))
 
-    # Always allow quote failover between “known good” defaults if env gave only one side
-    # (Keeps the bot alive if one domain is blocked)
-    if DEFAULT_METIS_BASE not in [u.split("/")[0] + "//" + u.split("/")[2] for u in quote_urls]:
-        # add metis quote as last resort
-        with contextlib.suppress(Exception):
-            u = _join_url(DEFAULT_METIS_BASE, DEFAULT_METIS_QUOTE_PATH)
-            if u not in quote_urls:
-                quote_urls.append(u)
+    # Always append Metis defaults as last-resort (domain blocks happen)
+    metis_q = _join_url(DEFAULT_METIS_BASE, DEFAULT_METIS_QUOTE_PATH)
+    metis_s = _join_url(DEFAULT_METIS_BASE, DEFAULT_METIS_SWAP_PATH)
 
-    if DEFAULT_METIS_BASE not in [u.split("/")[0] + "//" + u.split("/")[2] for u in swap_urls]:
-        with contextlib.suppress(Exception):
-            u = _join_url(DEFAULT_METIS_BASE, DEFAULT_METIS_SWAP_PATH)
-            if u not in swap_urls:
-                swap_urls.append(u)
+    origins_q = {_url_origin(u) for u in quote_urls if u}
+    origins_s = {_url_origin(u) for u in swap_urls if u}
+
+    if _url_origin(metis_q) not in origins_q and metis_q not in quote_urls:
+        quote_urls.append(metis_q)
+    if _url_origin(metis_s) not in origins_s and metis_s not in swap_urls:
+        swap_urls.append(metis_s)
 
     only_direct = _env_bool("JUP_ONLY_DIRECT", _env_bool("JUP_ONLY_DIRECT_ROUTES", False))
     restrict_intermediate = _env_bool("JUP_RESTRICT_INTERMEDIATE_TOKENS", True)
@@ -548,7 +503,8 @@ def _load_cfg() -> _Cfg:
     blockhash_slots_to_expiry = max(0, _env_int("JUP_BLOCKHASH_SLOTS_TO_EXPIRY", 0))
     compute_unit_limit = max(0, _env_int("PF_COMPUTE_UNIT_LIMIT", 0))
     compute_unit_price_micro = max(
-        0, _env_int("PF_COMPUTE_UNIT_PRICE_MICRO", _env_int("JUP_COMPUTE_UNIT_PRICE_MICRO", 0))
+        0,
+        _env_int("PF_COMPUTE_UNIT_PRICE_MICRO", _env_int("JUP_COMPUTE_UNIT_PRICE_MICRO", 0)),
     )
 
     platform_fee_bps = _clamp_i(_env_int("JUP_PLATFORM_FEE_BPS", 0), 0, 10_000)
@@ -652,8 +608,6 @@ def _load_cfg() -> _Cfg:
 
 def _cfg() -> _Cfg:
     global _CFG, _CFG_TS
-    # reload if env changes in-process (helps your PowerShell tests)
-    # You can tune by setting LIGHTNING_CFG_TTL_SEC if you want.
     ttl = max(0.0, float(_env_float("LIGHTNING_CFG_TTL_SEC", 0.0)))
     now = time.time()
     if _CFG is None or (ttl > 0 and (now - _CFG_TS) > ttl):
@@ -665,8 +619,12 @@ def _cfg() -> _Cfg:
 # ──────────────────────────────────────────────────────────────────────────────
 # Quote cache + singleflight
 # ──────────────────────────────────────────────────────────────────────────────
-_QUOTE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_QUOTE_FLIGHT: dict[str, asyncio.Future[Any]] = {}
+
+JSONDict = dict[str, Any]
+T = TypeVar("T")
+
+_QUOTE_CACHE: dict[str, tuple[float, JSONDict]] = {}
+_QUOTE_FLIGHT: dict[str, asyncio.Task[Any]] = {}
 _QUOTE_LOCK = asyncio.Lock()
 
 
@@ -676,7 +634,7 @@ def _qkey(inp: str, out: str, amount: int, sbps: int, only_direct: bool | None) 
     return f"{inp}:{out}:{int(amount)}:{int(sbps)}:{'D' if od else 'A'}"
 
 
-def _cache_get(key: str) -> dict[str, Any] | None:
+def _cache_get(key: str) -> JSONDict | None:
     ttl = float(_cfg().quote_ttl_sec)
     if ttl <= 0:
         return None
@@ -690,7 +648,7 @@ def _cache_get(key: str) -> dict[str, Any] | None:
     return None
 
 
-def _cache_set(key: str, payload: dict[str, Any]) -> None:
+def _cache_set(key: str, payload: JSONDict) -> None:
     ttl = float(_cfg().quote_ttl_sec)
     if ttl <= 0:
         return
@@ -702,14 +660,14 @@ def _cache_set(key: str, payload: dict[str, Any]) -> None:
             _QUOTE_CACHE.pop(k, None)
 
 
-async def _singleflight(key: str, maker) -> Any:
+async def _singleflight(key: str, maker: Callable[[], Coroutine[Any, Any, T]]) -> T:
     async with _QUOTE_LOCK:
         fut = _QUOTE_FLIGHT.get(key)
         if fut is None or fut.done():
             fut = asyncio.create_task(maker())
             _QUOTE_FLIGHT[key] = fut
     try:
-        return await fut
+        return cast(T, await fut)
     finally:
         async with _QUOTE_LOCK:
             cur = _QUOTE_FLIGHT.get(key)
@@ -720,6 +678,8 @@ async def _singleflight(key: str, maker) -> Any:
 # ──────────────────────────────────────────────────────────────────────────────
 # Response classifiers
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 def _route_not_found(body: Any) -> bool:
     try:
         if isinstance(body, dict):
@@ -783,6 +743,7 @@ def _is_transient_status(code: int) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 # Stats + breaker + endpoint scoring
 # ──────────────────────────────────────────────────────────────────────────────
+
 _STATS: dict[str, int] = {
     "quote_ok": 0,
     "quote_fail": 0,
@@ -820,13 +781,16 @@ _RATE_LOCK = asyncio.Lock()
 _LAST_TS: float = 0.0
 
 _CONCURRENCY: asyncio.Semaphore | None = None
+_CONCURRENCY_SIZE: int = 0
 
 
 def _sem() -> asyncio.Semaphore:
-    global _CONCURRENCY
+    global _CONCURRENCY, _CONCURRENCY_SIZE
     c = _cfg()
-    if _CONCURRENCY is None or _CONCURRENCY._value != int(c.max_concurrency):  # type: ignore[attr-defined]
-        _CONCURRENCY = asyncio.Semaphore(int(c.max_concurrency))
+    want = int(c.max_concurrency)
+    if _CONCURRENCY is None or _CONCURRENCY_SIZE != want:
+        _CONCURRENCY = asyncio.Semaphore(want)
+        _CONCURRENCY_SIZE = want
     return _CONCURRENCY
 
 
@@ -939,10 +903,10 @@ async def _mark_unroutable(inp: str, out: str, ttl: int | None = None) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP client (singleton, lazy)
 # ──────────────────────────────────────────────────────────────────────────────
+
 _client: httpx.AsyncClient | None = None
-_headers_snapshot: tuple[str, str, str, bool, bool] | None = (
-    None  # (api_key, bearer, ua, http2, verify)
-)
+_headers_snapshot: tuple[str, str, str, bool, bool] | None = None
+# snapshot = (api_key, bearer, ua, http2, verify)
 
 
 def _jup_headers() -> dict[str, str]:
@@ -982,7 +946,8 @@ def _get_client() -> httpx.AsyncClient:
     ):
         old = _client
         limits = httpx.Limits(
-            max_keepalive_connections=int(c.max_keepalive), max_connections=int(c.max_conn)
+            max_keepalive_connections=int(c.max_keepalive),
+            max_connections=int(c.max_conn),
         )
         timeout = httpx.Timeout(
             connect=float(c.connect_timeout),
@@ -1006,8 +971,12 @@ def _get_client() -> httpx.AsyncClient:
                 try:
                     loop = asyncio.get_running_loop()
                     loop.create_task(old.aclose())
-                except Exception:
-                    pass
+                except RuntimeError:
+                    # no running loop; close synchronously best-effort
+                    try:
+                        asyncio.run(old.aclose())
+                    except Exception:
+                        pass
     return _client
 
 
@@ -1023,7 +992,9 @@ async def close_http() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Budget wrapper + hardened request
 # ──────────────────────────────────────────────────────────────────────────────
-async def _budget_before(is_get: bool, units: int) -> bool:
+
+
+async def _budget_before(*, is_get: bool, units: int) -> bool:
     if is_get:
         ok = await _budget_call(getattr(budget, "before_quote", None), units=int(units))
         return bool(True if ok is None else ok)
@@ -1033,7 +1004,7 @@ async def _budget_before(is_get: bool, units: int) -> bool:
     return bool(True if ok2 is None else ok2)
 
 
-async def _budget_after(is_get: bool, units: int) -> None:
+async def _budget_after(*, is_get: bool, units: int) -> None:
     if is_get:
         await _budget_call(getattr(budget, "after_quote", None), units=int(units))
         return
@@ -1100,8 +1071,8 @@ async def _http_json(
                     _warn(
                         "JUP_HTTP_RETRY",
                         url=url[:140],
-                        status=r.status_code,
-                        attempt=attempt,
+                        status=int(r.status_code),
+                        attempt=int(attempt),
                         body=_short(body, 240),
                     )
                     await _sleep_backoff(attempt)
@@ -1110,9 +1081,9 @@ async def _http_json(
                 _breaker_fail(tag="")
                 raise httpx.HTTPStatusError("http", request=r.request, response=r)
 
-            except (httpx.TimeoutException, httpx.NetworkError) as e:
+            except (httpx.TimeoutException, httpx.TransportError) as e:
                 if attempt < int(c.retry_max):
-                    _warn("JUP_NET_RETRY", url=url[:140], attempt=attempt, err=_short(e, 220))
+                    _warn("JUP_NET_RETRY", url=url[:140], attempt=int(attempt), err=_short(e, 220))
                     await _sleep_backoff(attempt)
                     continue
                 _breaker_fail(tag="")
@@ -1129,6 +1100,7 @@ async def _http_json(
                     continue
                 raise
 
+        raise RuntimeError("jup_http_exhausted")
     finally:
         dt_ms = int((time.monotonic() - t0) * 1000)
         if dt_ms > 2500:
@@ -1141,8 +1113,10 @@ async def _http_json(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Quote params
+# Quote params + helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 def _quote_params(
     *,
     input_mint: str,
@@ -1165,7 +1139,7 @@ def _quote_params(
     }
 
 
-def _compact_route_summary(q: dict[str, Any]) -> dict[str, Any]:
+def _compact_route_summary(q: JSONDict) -> dict[str, Any]:
     out: dict[str, Any] = {
         "inAmount": q.get("inAmount"),
         "outAmount": q.get("outAmount"),
@@ -1185,6 +1159,8 @@ def _compact_route_summary(q: dict[str, Any]) -> dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Quote core (multi-url + requote bump + unroutable)
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 async def _get_quote_kwonly(
     *,
     input_mint: str,
@@ -1192,7 +1168,8 @@ async def _get_quote_kwonly(
     amount: int,
     slippage_bps: int,
     only_direct: bool | None = None,
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, JSONDict]:
+    global _LAST_GOOD_QUOTE_URL
     c = _cfg()
     if int(amount) <= 0:
         raise RuntimeError("amount<=0")
@@ -1231,9 +1208,9 @@ async def _get_quote_kwonly(
                 raise RuntimeError("jup_quote_non_dict")
             _STATS["quote_ok"] += 1
             _endpoint_note_ok(url)
-            globals()["_LAST_GOOD_QUOTE_URL"] = url
+            _LAST_GOOD_QUOTE_URL = url
             log.every("JUP_QUOTE_OK", n=40, msg="JUP_QUOTE_OK", url=url[:80], inp=inp, out=out)
-            return url, js
+            return url, cast(JSONDict, js)
 
         except RuntimeError as e:
             last_err = e
@@ -1261,11 +1238,11 @@ async def _get_quote_kwonly(
                         if isinstance(js2, dict):
                             _STATS["quote_ok"] += 1
                             _endpoint_note_ok(url)
-                            globals()["_LAST_GOOD_QUOTE_URL"] = url
+                            _LAST_GOOD_QUOTE_URL = url
                             log.every(
                                 "JUP_QUOTE_OK_BUMPED", n=25, msg="JUP_QUOTE_OK_BUMPED", url=url[:80]
                             )
-                            return url, js2
+                            return url, cast(JSONDict, js2)
                     except Exception:
                         pass
 
@@ -1285,7 +1262,7 @@ async def _get_quote_kwonly(
         except httpx.HTTPStatusError as e:
             last_err = e
             resp = e.response
-            body = None
+            body: Any = None
             with contextlib.suppress(Exception):
                 body = resp.json()
 
@@ -1297,7 +1274,7 @@ async def _get_quote_kwonly(
                     status=int(resp.status_code),
                     has_api_key=bool(_cfg().has_api_key),
                     api_key_mask=_cfg().api_key_mask,
-                    hint="Auth failed (401/403). If this is Metis /swap/v1, ensure JUP_API_KEY is valid.",
+                    hint="Auth failed (401/403). Ensure JUP_API_KEY/JUP_BEARER are correct for your upstream.",
                     body=_short(body, 240),
                 )
                 if _cfg().strict_auth:
@@ -1323,10 +1300,12 @@ async def _get_quote_kwonly(
         _STATS["no_route"] += 1
         raise RuntimeError("jup_no_route")
 
-    raise last_err or RuntimeError("jup_quote_failed")
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("jup_quote_failed")
 
 
-async def _get_quote(*args: Any, **kwargs: Any) -> tuple[str, dict[str, Any]]:
+async def _get_quote(*args: Any, **kwargs: Any) -> tuple[str, JSONDict]:
     if args and not kwargs and len(args) == 4:
         return await _get_quote_kwonly(
             input_mint=str(args[0]),
@@ -1340,13 +1319,15 @@ async def _get_quote(*args: Any, **kwargs: Any) -> tuple[str, dict[str, Any]]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Public quote functions (router expects these)
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 async def get_quote(
     input_mint: str,
     output_mint: str,
     amount: int,
     slippage_bps: int = 0,
     only_direct: bool | None = None,
-) -> dict[str, Any]:
+) -> JSONDict:
     c = _cfg()
     sbps = _clamp_i(int(slippage_bps or c.default_slippage_bps), 1, 5000)
     _, q = await _get_quote(
@@ -1370,7 +1351,7 @@ async def get_buy_quote(
     slippage_bps: int = 0,
     only_direct: bool | None = None,
     **_kw: Any,
-) -> dict[str, Any]:
+) -> JSONDict:
     c = _cfg()
     sbps = _clamp_i(int(slippage_bps or c.default_slippage_bps), 1, 5000)
     if lamports_in is None:
@@ -1383,7 +1364,7 @@ async def get_buy_quote(
     if cached is not None:
         return dict(cached)
 
-    async def _mk():
+    async def _mk() -> JSONDict:
         _, q = await _get_quote(
             input_mint=SOL_MINT,
             output_mint=m,
@@ -1391,8 +1372,7 @@ async def get_buy_quote(
             slippage_bps=sbps,
             only_direct=only_direct,
         )
-        if isinstance(q, dict):
-            _cache_set(key, q)
+        _cache_set(key, q)
         return q
 
     return await _singleflight(key, _mk)
@@ -1405,7 +1385,7 @@ async def get_sell_quote(
     slippage_bps: int = 0,
     only_direct: bool | None = None,
     **_kw: Any,
-) -> dict[str, Any]:
+) -> JSONDict:
     c = _cfg()
     sbps = _clamp_i(int(slippage_bps or c.default_slippage_bps), 1, 5000)
     m = _normalize_and_validate_mint(mint, label="mint")
@@ -1416,7 +1396,7 @@ async def get_sell_quote(
     if cached is not None:
         return dict(cached)
 
-    async def _mk():
+    async def _mk() -> JSONDict:
         _, q = await _get_quote(
             input_mint=m,
             output_mint=SOL_MINT,
@@ -1424,22 +1404,51 @@ async def get_sell_quote(
             slippage_bps=sbps,
             only_direct=only_direct,
         )
-        if isinstance(q, dict):
-            _cache_set(key, q)
+        _cache_set(key, q)
         return q
 
     return await _singleflight(key, _mk)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Swap build + send
+# Wallet helpers (lazy import; no wallet import at module import time)
 # ──────────────────────────────────────────────────────────────────────────────
+
 _KP_LOCK = asyncio.Lock()
-_KP = None
+_KP: Any | None = None
 _PUBKEY_STR: str | None = None
 
+_wallet_loaded: bool = False
+_load_keypair: Callable[[], Any] | None = None
+_get_pubkey_str: Callable[[Any], str] | None = None
+_sign_and_send_b64_tx: Callable[..., Any] | None = None
+_send_b64_with_diag: Callable[..., Any] | None = None
 
-async def _to_thread(fn, *a, **kw):
+
+def _wallet_lazy_load() -> None:
+    global \
+        _wallet_loaded, \
+        _load_keypair, \
+        _get_pubkey_str, \
+        _sign_and_send_b64_tx, \
+        _send_b64_with_diag
+    if _wallet_loaded:
+        return
+    _wallet_loaded = True
+    try:
+        mod = importlib.import_module("utils_pkg.solana_wallet")
+        _load_keypair = cast(Callable[[], Any], getattr(mod, "load_keypair", None))
+        _get_pubkey_str = cast(Callable[[Any], str], getattr(mod, "get_pubkey_str", None))
+        _sign_and_send_b64_tx = cast(Callable[..., Any], getattr(mod, "sign_and_send_b64_tx", None))
+        _send_b64_with_diag = cast(Callable[..., Any], getattr(mod, "_send_b64_with_diag", None))
+    except Exception:
+        _load_keypair = None
+        _get_pubkey_str = None
+        _sign_and_send_b64_tx = None
+        _send_b64_with_diag = None
+
+
+async def _to_thread(fn: Callable[..., T], *a: Any, **kw: Any) -> T:
     try:
         return await asyncio.to_thread(fn, *a, **kw)
     except AttributeError:  # pragma: no cover
@@ -1447,25 +1456,65 @@ async def _to_thread(fn, *a, **kw):
         return await loop.run_in_executor(None, lambda: fn(*a, **kw))
 
 
-async def _get_keypair_cached():
+async def _get_keypair_cached() -> tuple[Any, str]:
     global _KP, _PUBKEY_STR
     if _KP is not None and _PUBKEY_STR:
         return _KP, _PUBKEY_STR
-    if load_keypair is None or get_pubkey_str is None:
+
+    _wallet_lazy_load()
+    if _load_keypair is None or _get_pubkey_str is None:
         _STATS["wallet_missing"] += 1
         raise RuntimeError("wallet_layer_unavailable")
+
     async with _KP_LOCK:
         if _KP is not None and _PUBKEY_STR:
             return _KP, _PUBKEY_STR
-        kp = await _to_thread(load_keypair)
-        pk = await _to_thread(get_pubkey_str, kp)
+        kp = await _to_thread(_load_keypair)
+        pk = await _to_thread(_get_pubkey_str, kp)
         _KP = kp
         _PUBKEY_STR = str(pk)
         return _KP, _PUBKEY_STR
 
 
-def _prequote_matches(quote_obj: dict[str, Any], inp: str, out: str, amount: int) -> bool:
-    if not isinstance(quote_obj, dict) or not quote_obj:
+async def _send_tx_b64(tx_b64: str) -> str:
+    c = _cfg()
+    _wallet_lazy_load()
+
+    if _sign_and_send_b64_tx is None:
+        _STATS["wallet_missing"] += 1
+        raise RuntimeError("wallet_layer_unavailable")
+
+    # optional enhanced sender
+    if _send_b64_with_diag is not None:
+        with contextlib.suppress(Exception):
+            sig = _send_b64_with_diag(tx_b64, skip_preflight=bool(c.skip_preflight))
+            if inspect.isawaitable(sig):
+                sig = await sig
+            if sig:
+                _STATS["send_ok"] += 1
+                return str(sig)
+
+    kp, _ = await _get_keypair_cached()
+    try:
+        sig2 = _sign_and_send_b64_tx(tx_b64, kp, skip_preflight=bool(c.skip_preflight))
+        if inspect.isawaitable(sig2):
+            sig2 = await sig2
+    except TypeError:
+        sig2 = _sign_and_send_b64_tx(tx_b64, kp)
+        if inspect.isawaitable(sig2):
+            sig2 = await sig2
+
+    _STATS["send_ok"] += 1
+    return str(sig2)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Swap build + receipts
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _prequote_matches(quote_obj: JSONDict, inp: str, out: str, amount: int) -> bool:
+    if not quote_obj:
         return False
     q_in = str(quote_obj.get("inputMint") or quote_obj.get("inputMintAddress") or "").strip()
     q_out = str(quote_obj.get("outputMint") or quote_obj.get("outputMintAddress") or "").strip()
@@ -1481,14 +1530,14 @@ def _prequote_matches(quote_obj: dict[str, Any], inp: str, out: str, amount: int
     return True
 
 
-def _extract_prequote(*qs: dict[str, Any] | None) -> dict[str, Any] | None:
+def _extract_prequote(*qs: JSONDict | None) -> JSONDict | None:
     for q in qs:
         if isinstance(q, dict) and q:
             return q
     return None
 
 
-async def _build_swap_tx(*, swap_url: str, user_pubkey: str, quote_obj: dict[str, Any]) -> str:
+async def _build_swap_tx(*, swap_url: str, user_pubkey: str, quote_obj: JSONDict) -> str:
     c = _cfg()
     dynamic_cu = not (c.compute_unit_limit and c.compute_unit_limit > 0)
 
@@ -1529,46 +1578,15 @@ async def _build_swap_tx(*, swap_url: str, user_pubkey: str, quote_obj: dict[str
 
     _STATS["swap_build_ok"] += 1
     _endpoint_note_ok(swap_url)
-    globals()["_LAST_GOOD_SWAP_URL"] = swap_url
+    global _LAST_GOOD_SWAP_URL
+    _LAST_GOOD_SWAP_URL = swap_url
     log.every(
         "JUP_SWAP_BUILT", n=30, msg="JUP_SWAP_BUILT", url=swap_url[:80], legacy=int(c.as_legacy_tx)
     )
     return str(tx_b64)
 
 
-async def _send_tx_b64(tx_b64: str) -> str:
-    c = _cfg()
-    if sign_and_send_b64_tx is None:
-        _STATS["wallet_missing"] += 1
-        raise RuntimeError("wallet_layer_unavailable")
-
-    # optional enhanced sender
-    try:
-        if _send_b64_with_diag is not None:
-            with contextlib.suppress(Exception):
-                sig = _send_b64_with_diag(tx_b64, skip_preflight=bool(c.skip_preflight))  # type: ignore[misc]
-                if inspect.isawaitable(sig):
-                    sig = await sig
-                if sig:
-                    _STATS["send_ok"] += 1
-                    return str(sig)
-    except Exception:
-        pass
-
-    kp, _ = await _get_keypair_cached()
-    try:
-        sig2 = sign_and_send_b64_tx(tx_b64, kp, skip_preflight=bool(c.skip_preflight))
-        if inspect.isawaitable(sig2):
-            sig2 = await sig2
-    except TypeError:
-        sig2 = sign_and_send_b64_tx(tx_b64, kp)  # type: ignore[misc]
-        if inspect.isawaitable(sig2):
-            sig2 = await sig2
-    _STATS["send_ok"] += 1
-    return str(sig2)
-
-
-def _expected_out_sol(quote_obj: dict[str, Any] | None) -> tuple[int | None, float | None]:
+def _expected_out_sol(quote_obj: JSONDict | None) -> tuple[int | None, float | None]:
     if not isinstance(quote_obj, dict):
         return None, None
     out_raw = _intish(quote_obj.get("outAmount"), 0)
@@ -1586,15 +1604,15 @@ def _mk_receipt(
     input_mint: str,
     output_mint: str,
     slippage_bps: int,
-    quote_obj: dict[str, Any] | None = None,
+    quote_obj: JSONDict | None = None,
     sig: str | None = None,
     err: str | None = None,
     meta: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+) -> JSONDict:
     q = quote_obj or {}
     in_raw = _intish(q.get("inAmount"), 0) if isinstance(q, dict) else 0
     out_raw = _intish(q.get("outAmount"), 0) if isinstance(q, dict) else 0
-    receipt: dict[str, Any] = {
+    receipt: JSONDict = {
         "ok": bool(ok),
         "side": str(side).upper(),
         "sig": sig,
@@ -1615,14 +1633,13 @@ def _mk_receipt(
     }
     if meta is not None:
         receipt["meta"] = meta
-    # keep full quote optional (default on, but safe)
     if _env_bool("LIGHTNING_INCLUDE_FULL_QUOTE", True):
         receipt["quote"] = q
     return receipt
 
 
 async def _try_build_from_prequote_anywhere(
-    *, user_pk: str, quote_obj: dict[str, Any]
+    *, user_pk: str, quote_obj: JSONDict
 ) -> tuple[str, str]:
     c = _cfg()
     swap_urls = _prefer_order(c.swap_urls, _LAST_GOOD_SWAP_URL)
@@ -1637,12 +1654,19 @@ async def _try_build_from_prequote_anywhere(
             last_err = e
             _endpoint_note_fail(su)
             continue
-    raise last_err or RuntimeError("swap_build_failed_all")
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("swap_build_failed_all")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public swap API (router expects these)
 # ──────────────────────────────────────────────────────────────────────────────
+
+BuyReturn = str | None | tuple[str | None, dict[str, Any]] | JSONDict
+SellReturn = str | None | JSONDict
+
+
 async def buy_via_lightning(
     *,
     mint: str,
@@ -1650,18 +1674,17 @@ async def buy_via_lightning(
     slippage_bps: int = 0,
     return_meta: bool = False,
     return_receipt: bool = False,
-    prequote: dict[str, Any] | None = None,
-    quote: dict[str, Any] | None = None,
-    prefetched_quote: dict[str, Any] | None = None,
-    quoteResponse: dict[str, Any] | None = None,
+    prequote: JSONDict | None = None,
+    quote: JSONDict | None = None,
+    prefetched_quote: JSONDict | None = None,
+    quoteResponse: JSONDict | None = None,
     **_ignored: Any,
-) -> str | None | tuple[str | None, dict[str, Any]] | dict[str, Any]:
+) -> BuyReturn:
     c = _cfg()
     sbps = _clamp_i(int(slippage_bps or c.default_slippage_bps), 1, 5000)
     lamports_in = max(1, int(float(amount_sol) * float(LAMPORTS_PER_SOL)))
     m = _normalize_and_validate_mint(mint, label="mint")
 
-    # safety
     if _same_mint(m, SOL_MINT):
         _STATS["noop_same_mint"] += 1
         rec = _mk_receipt(
@@ -1684,7 +1707,11 @@ async def buy_via_lightning(
             err="noop_same_mint",
             meta={"mint": m, "in_amount_raw": lamports_in, "amount_raw": lamports_in},
         )
-        return rec if return_receipt else ((None, rec.get("meta", {})) if return_meta else None)
+        if return_receipt:
+            return rec
+        if return_meta:
+            return None, cast(dict[str, Any], rec.get("meta", {}))
+        return None
 
     if c.kill_switch or c.disable_buys:
         rec = _mk_receipt(
@@ -1699,14 +1726,17 @@ async def buy_via_lightning(
             sig=None,
             err="buys_disabled",
         )
-        return rec if return_receipt else ((None, {}) if return_meta else None)
+        if return_receipt:
+            return rec
+        if return_meta:
+            return None, {}
+        return None
 
-    # get or accept quote
     supplied = _extract_prequote(quoteResponse, prequote, quote, prefetched_quote)
 
     quote_url_used = c.quote_urls[0]
     swap_url_used = c.swap_urls[0]
-    q: dict[str, Any] = {}
+    q: JSONDict = {}
     meta: dict[str, Any] = {"mint": m, "in_amount_raw": lamports_in}
 
     try:
@@ -1723,7 +1753,6 @@ async def buy_via_lightning(
         meta["quote_url"] = quote_url_used
         meta["outAmount"] = _intish(q.get("outAmount"), 0)
 
-        # DRYRUN semantics
         if c.dry_run and not c.dryrun_build_tx:
             rec = _mk_receipt(
                 ok=True,
@@ -1738,7 +1767,11 @@ async def buy_via_lightning(
                 err=None,
                 meta=meta,
             )
-            return rec if return_receipt else ((None, meta) if return_meta else None)
+            if return_receipt:
+                return rec
+            if return_meta:
+                return None, meta
+            return None
 
         _, user_pk = await _get_keypair_cached()
 
@@ -1762,6 +1795,7 @@ async def buy_via_lightning(
             if not swap_urls:
                 raise RuntimeError("jup_all_endpoints_cooldown")
             last_build_err: BaseException | None = None
+            tx_b64 = ""
             for su in swap_urls:
                 try:
                     tx_b64 = await _build_swap_tx(swap_url=su, user_pubkey=user_pk, quote_obj=q)
@@ -1772,7 +1806,9 @@ async def buy_via_lightning(
                     _endpoint_note_fail(su)
                     continue
             else:
-                raise last_build_err or RuntimeError("swap_build_failed_all")
+                if last_build_err is not None:
+                    raise last_build_err
+                raise RuntimeError("swap_build_failed_all")
 
         meta["swap_url"] = swap_url_used
 
@@ -1790,7 +1826,11 @@ async def buy_via_lightning(
                 err=None,
                 meta=meta,
             )
-            return rec if return_receipt else ((None, meta) if return_meta else None)
+            if return_receipt:
+                return rec
+            if return_meta:
+                return None, meta
+            return None
 
         sig = await _send_tx_b64(tx_b64)
         log.event("ENTRY_TX_OK", sig=sig, mint=m, lamports_in=lamports_in, quote_url=quote_url_used)
@@ -1843,13 +1883,13 @@ async def sell_via_lightning(
     amount_raw: int,
     slippage_bps: int = 0,
     return_receipt: bool = False,
-    prequote: dict[str, Any] | None = None,
-    quote: dict[str, Any] | None = None,
-    prefetched_quote: dict[str, Any] | None = None,
-    quoteResponse: dict[str, Any] | None = None,
+    prequote: JSONDict | None = None,
+    quote: JSONDict | None = None,
+    prefetched_quote: JSONDict | None = None,
+    quoteResponse: JSONDict | None = None,
     **_ignored: Any,
-) -> str | None | dict[str, Any]:
-    del token_program
+) -> SellReturn:
+    del token_program  # keep signature compatibility
 
     c = _cfg()
     sbps = _clamp_i(int(slippage_bps or c.default_slippage_bps), 1, 5000)
@@ -1874,7 +1914,7 @@ async def sell_via_lightning(
     quote_url_used = c.quote_urls[0]
     swap_url_used = c.swap_urls[0]
     supplied = _extract_prequote(quoteResponse, prequote, quote, prefetched_quote)
-    q: dict[str, Any] = {}
+    q: JSONDict = {}
 
     try:
         if supplied is not None and not _prequote_matches(supplied, m, SOL_MINT, amt):
@@ -1916,6 +1956,7 @@ async def sell_via_lightning(
             if not swap_urls:
                 raise RuntimeError("jup_all_endpoints_cooldown")
             last_build_err: BaseException | None = None
+            tx_b64 = ""
             for su in swap_urls:
                 try:
                     tx_b64 = await _build_swap_tx(swap_url=su, user_pubkey=user_pk, quote_obj=q)
@@ -1926,7 +1967,9 @@ async def sell_via_lightning(
                     _endpoint_note_fail(su)
                     continue
             else:
-                raise last_build_err or RuntimeError("swap_build_failed_all")
+                if last_build_err is not None:
+                    raise last_build_err
+                raise RuntimeError("swap_build_failed_all")
 
         if c.dry_run:
             rec = _mk_receipt(
@@ -1990,9 +2033,9 @@ async def sell_via_lightning(
 # ──────────────────────────────────────────────────────────────────────────────
 # Debug + stats
 # ──────────────────────────────────────────────────────────────────────────────
-async def debug_get_quote_sol_to_usdc(
-    amount_sol: float = 0.002, slippage_bps: int = 0
-) -> dict[str, Any]:
+
+
+async def debug_get_quote_sol_to_usdc(amount_sol: float = 0.002, slippage_bps: int = 0) -> JSONDict:
     c = _cfg()
     lamports = max(1, int(float(amount_sol) * float(LAMPORTS_PER_SOL)))
     return await get_quote(

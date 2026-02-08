@@ -1,4 +1,3 @@
-# sniper/auto_sell.py
 from __future__ import annotations
 
 """
@@ -10,14 +9,14 @@ God-Tier Auto Sell Adapter — V3+++ LOCK-IN (production-first)
 DEDUP / CONTRACT (LOCKED)
 ------------------------
 - utils_pkg/exit_engine.py is the *canonical exit brain* (decision logic).
-- utils_pkg/auto_exit_worker/exit_engine.py is the *canonical executor* (SELL queue + crash-safe execution).
+- utils_pkg/auto_exit_worker.py is the *canonical executor* (SELL queue + crash-safe execution).
 - This module is ONLY a thin adapter:
     positions -> (price snapshot) -> exit_engine decision -> enqueue_exit_request
 
 ABSOLUTELY NO competing exit logic lives here:
 - no trailing stop math
 - no AI should_hold_token
-- no direct sell_via_lightning here
+- no direct sell execution here
 - no partial TP ladders here
 All of that belongs in utils_pkg/exit_engine.py.
 
@@ -30,7 +29,13 @@ This adapter runs as an asyncio loop (optional service) that:
 - calls utils_pkg.exit_engine (best-effort)
 - enqueues sell requests for the worker
 
-If exit_engine is missing / errors, we HOLD (safe default) and log.
+Safety defaults
+---------------
+- If exit_engine is missing/errors -> HOLD (safe default)
+- If price missing -> HOLD
+- If wallet balance is zero -> cleanup position best-effort
+- Never throws to caller (service loop resiliency)
+- No network I/O at import time (lazy imports)
 
 Environment (compat + new)
 --------------------------
@@ -44,38 +49,48 @@ Environment (compat + new)
 
 Notes
 -----
-- We intentionally compute amount_raw from *wallet balances* (authoritative),
-  not from stale position dicts.
-- We normalize Pump IDs -> real mint for pricing/decimals, but we preserve the
-  original mint key for position storage.
-
+- Amount_raw is computed from *wallet balances* (authoritative), not from positions.
+- We normalize Pump IDs -> real mint for pricing/decimals, but preserve the original
+  mint key for position storage.
 """
 
 import asyncio
 import contextlib
+import importlib
 import inspect
+import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-# -----------------------------------------------------------------------------
-# Logging (logging_setup compatible; safe fallback)
-# -----------------------------------------------------------------------------
-try:
-    from logging_setup import get_logger  # type: ignore
 
-    log = get_logger("sniper.auto_sell")  # type: ignore
-except Exception:  # pragma: no cover
-    import logging
-
-    log = logging.getLogger("sniper.auto_sell")
-    if not log.handlers:
+# =============================================================================
+# Logging (safe; compatible with logging_setup if present)
+# =============================================================================
+def _mk_logger() -> Any:
+    # Prefer project logger if available, but never break import.
+    for mod_name in ("utils_pkg.logging_setup", "logging_setup"):
+        with contextlib.suppress(Exception):
+            m = importlib.import_module(mod_name)
+            fn = getattr(m, "get_logger", None)
+            if callable(fn):
+                with contextlib.suppress(Exception):
+                    return fn("sniper.auto_sell")
+    lg = logging.getLogger("sniper.auto_sell")
+    if not lg.handlers:
         logging.basicConfig(level=logging.INFO)
+    return lg
+
+
+log = _mk_logger()
 
 
 def _log(name: str, level: str = "info", **fields: Any) -> None:
+    """
+    Log event-style if logger supports .event, otherwise standard logging.
+    """
     with contextlib.suppress(Exception):
         if hasattr(log, "event"):
             log.event(name, **fields)  # type: ignore[attr-defined]
@@ -95,9 +110,9 @@ def _short_exc(e: BaseException, n: int = 320) -> str:
     return (s[:n] + "…") if len(s) > n else s
 
 
-# -----------------------------------------------------------------------------
-# Env helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Env helpers (tiny + stable)
+# =============================================================================
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
 _FALSE = {"0", "false", "f", "no", "n", "off"}
 
@@ -128,13 +143,9 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
-def _now_utc() -> datetime:
-    return datetime.now(UTC)
-
-
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Config (module-level defaults; loop reads these)
+# =============================================================================
 AUTO_SELL_ENABLED = _env_bool("AUTO_SELL_ENABLED", True)
 
 # Legacy alias: POSITION_MONITOR_INTERVAL
@@ -148,63 +159,35 @@ AUTO_SELL_PRICE_TIMEOUT_S = max(1, _env_int("AUTO_SELL_PRICE_TIMEOUT_S", 6))
 WALLET_PUBKEY = (os.getenv("WALLET_PUBKEY") or os.getenv("WALLET_PUBLIC_KEY") or "").strip()
 
 
-# -----------------------------------------------------------------------------
-# Core utils + positions (best-effort imports)
-# -----------------------------------------------------------------------------
-try:
-    from utils_pkg import core_utils as cu  # type: ignore
-except Exception:  # pragma: no cover
-    cu = None  # type: ignore
-
-# positions: prefer services.*, fallback to project root
-try:  # pragma: no cover
-    from services.positions import load_positions, remove_position  # type: ignore
-except Exception:  # pragma: no cover
-    from positions import load_positions, remove_position  # type: ignore
-
-# Router: used ONLY for normalization/decimals/price snapshot (no sells here).
-try:
-    from utils_pkg.router import (  # type: ignore
-        get_decimals,
-        get_price_ui,
-        normalize_pump_id_to_mint,
-    )
-except Exception:  # pragma: no cover
-    normalize_pump_id_to_mint = None  # type: ignore
-    get_decimals = None  # type: ignore
-    get_price_ui = None  # type: ignore
-
-# Exit brain (canonical decisions)
-try:
-    from utils_pkg import exit_engine as exit_brain  # type: ignore
-except Exception:  # pragma: no cover
-    exit_brain = None  # type: ignore
-
-# Exit executor queue (canonical execution worker)
-try:
-    from utils_pkg.auto_exit_worker import enqueue_exit_request  # type: ignore
-except Exception:  # pragma: no cover
-    enqueue_exit_request = None  # type: ignore
-
-# optional: circuit breakers (we still allow exits; these are for telemetry only)
-try:
-    from utils_pkg.circuit_breakers import trading_halted  # type: ignore
-except Exception:  # pragma: no cover
-
-    async def trading_halted(*_a: Any, **_k: Any) -> bool:  # type: ignore
-        return False
+def _now_utc() -> datetime:
+    return datetime.now(UTC)
 
 
-# -----------------------------------------------------------------------------
-# Async helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Lazy imports (NO heavy imports at module import time)
+# =============================================================================
+_mod_cache: dict[str, Any] = {}
+
+
+def _import_optional(module: str) -> Any | None:
+    if module in _mod_cache:
+        return _mod_cache[module]
+    try:
+        m = importlib.import_module(module)
+    except Exception:
+        m = None
+    _mod_cache[module] = m
+    return m
+
+
 async def _maybe_await(x: Any) -> Any:
-    if asyncio.iscoroutine(x):
-        return await x
-    return x
+    return await x if asyncio.iscoroutine(x) else x
 
 
 def _filter_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """
+    Only pass kwargs accepted by fn signature (avoids TypeError across versions).
+    """
     try:
         sig = inspect.signature(fn)
         allowed = set(sig.parameters.keys())
@@ -213,108 +196,155 @@ def _filter_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
         return kwargs
 
 
+# =============================================================================
+# Positions access (services.positions preferred; fallback to positions; stub-safe)
+# =============================================================================
+async def _load_positions() -> dict[str, Any]:
+    m = _import_optional("services.positions") or _import_optional("positions")
+    if m is None:
+        return {}
+    fn = getattr(m, "load_positions", None)
+    if not callable(fn):
+        return {}
+    try:
+        out = await _maybe_await(fn())
+        return out if isinstance(out, dict) else {}
+    except Exception as e:
+        _log("AUTOSELL_LOAD_POS_ERR", level="warning", err=_short_exc(e))
+        return {}
+
+
+async def _remove_position(pos_key: str) -> None:
+    m = _import_optional("services.positions") or _import_optional("positions")
+    if m is None:
+        return
+    fn = getattr(m, "remove_position", None)
+    if not callable(fn):
+        return
+    with contextlib.suppress(Exception):
+        await _maybe_await(fn(pos_key))
+
+
+# =============================================================================
+# core_utils resources (best-effort)
+# =============================================================================
 async def _init_resources_best_effort() -> None:
+    cu = _import_optional("utils_pkg.core_utils")
     if cu is None:
         return
     fn = getattr(cu, "init_resources", None)
     if callable(fn):
         with contextlib.suppress(Exception):
-            out = fn()
-            if asyncio.iscoroutine(out):
-                await out
+            await _maybe_await(fn())
 
 
 async def _close_resources_best_effort() -> None:
+    cu = _import_optional("utils_pkg.core_utils")
     if cu is None:
         return
     fn = getattr(cu, "close_resources", None)
     if callable(fn):
         with contextlib.suppress(Exception):
-            out = fn()
-            if asyncio.iscoroutine(out):
-                await out
+            await _maybe_await(fn())
 
 
 async def _get_redis() -> Any:
+    cu = _import_optional("utils_pkg.core_utils")
     if cu is None:
         return None
     for nm in ("get_redis_async", "get_redis"):
         fn = getattr(cu, nm, None)
         if callable(fn):
             with contextlib.suppress(Exception):
-                out = fn()
-                if asyncio.iscoroutine(out):
-                    return await out
-                return out
+                return await _maybe_await(fn())
     return getattr(cu, "redis", None)
 
 
-# -----------------------------------------------------------------------------
-# Wallet / positions snapshots
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Wallet snapshot (authoritative sellable amounts)
+# =============================================================================
 async def _wallet_token_balances() -> dict[str, float]:
     """
     Returns mint -> ui balance (float). Best-effort.
     """
+    if not WALLET_PUBKEY:
+        return {}
+
+    cu = _import_optional("utils_pkg.core_utils")
     if cu is None:
         return {}
+
     fn = getattr(cu, "get_wallet_tokens", None)
-    if not callable(fn) or not WALLET_PUBKEY:
+    if not callable(fn):
         return {}
+
     try:
         toks = await _maybe_await(fn(WALLET_PUBKEY))
         out: dict[str, float] = {}
         for t in toks or []:
+            if not isinstance(t, dict):
+                continue
+            mint = str(t.get("mint") or "").strip()
+            if not mint:
+                continue
             try:
-                mint = str(t.get("mint") or "").strip()
                 bal = float(t.get("balance") or 0.0)
-                if mint:
-                    out[mint] = bal
             except Exception:
                 continue
+            out[mint] = bal
         return out
     except Exception as e:
         _log("AUTOSELL_WALLET_TOKENS_ERR", level="warning", err=_short_exc(e))
         return {}
 
 
-async def _price_ui(norm_mint: str) -> float:
-    """
-    Best-effort router price snapshot.
-    """
-    if not callable(get_price_ui):
-        return 0.0
-    try:
-        # timebox price retrieval (avoid stalling loop)
-        return float(
-            await asyncio.wait_for(
-                _maybe_await(get_price_ui(norm_mint)), timeout=float(AUTO_SELL_PRICE_TIMEOUT_S)
-            )
-            or 0.0
-        )
-    except Exception:
-        return 0.0
-
-
-async def _decimals(norm_mint: str) -> int:
-    if not callable(get_decimals):
-        return 9
-    try:
-        d = await _maybe_await(get_decimals(norm_mint))
-        d = int(d) if d is not None else 9
-        return max(0, min(18, d))
-    except Exception:
-        return 9
+# =============================================================================
+# Router helpers (normalize, decimals, price snapshot) — best-effort, timeboxed
+# =============================================================================
+def _router() -> Any | None:
+    return _import_optional("utils_pkg.router")
 
 
 def _normalize_mint(mint: str) -> str:
-    if callable(normalize_pump_id_to_mint):
+    m = str(mint or "").strip()
+    r = _router()
+    if r is None:
+        return m
+    fn = getattr(r, "normalize_pump_id_to_mint", None)
+    if callable(fn):
         with contextlib.suppress(Exception):
-            nm = normalize_pump_id_to_mint(mint)  # type: ignore[misc]
-            nm = str(nm or "").strip()
+            nm = str(fn(m) or "").strip()
             if nm:
                 return nm
-    return str(mint or "").strip()
+    return m
+
+
+async def _decimals(norm_mint: str) -> int:
+    r = _router()
+    fn = getattr(r, "get_decimals", None) if r is not None else None
+    if not callable(fn):
+        return 9
+    try:
+        d = await _maybe_await(fn(norm_mint))
+        d2 = int(d) if d is not None else 9
+        return max(0, min(18, d2))
+    except Exception:
+        return 9
+
+
+async def _price_ui(norm_mint: str) -> float:
+    r = _router()
+    fn = getattr(r, "get_price_ui", None) if r is not None else None
+    if not callable(fn):
+        return 0.0
+    try:
+        out = await asyncio.wait_for(
+            _maybe_await(fn(norm_mint)),
+            timeout=float(AUTO_SELL_PRICE_TIMEOUT_S),
+        )
+        return float(out or 0.0)
+    except Exception:
+        return 0.0
 
 
 def _position_symbol(pos: dict[str, Any], mint: str) -> str:
@@ -322,10 +352,48 @@ def _position_symbol(pos: dict[str, Any], mint: str) -> str:
     return sym or mint[:6]
 
 
-# -----------------------------------------------------------------------------
-# Exit decision plumbing (thin adapter)
-# -----------------------------------------------------------------------------
-@dataclass
+def _parse_buy_time(pos: dict[str, Any]) -> datetime | None:
+    """
+    Best-effort parse of timestamp fields. Accepts ISO strings with optional 'Z'.
+    """
+    ts = pos.get("timestamp") or pos.get("ts")
+    if not ts:
+        return None
+    s = str(ts).strip()
+    if not s:
+        return None
+    # normalize trailing Z -> +00:00 for fromisoformat
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    with contextlib.suppress(Exception):
+        dtv = datetime.fromisoformat(s)
+        return dtv if dtv.tzinfo else dtv.replace(tzinfo=UTC)
+    return None
+
+
+def _parse_entry_price(pos: dict[str, Any]) -> float | None:
+    v = pos.get("buy_price")
+    if isinstance(v, (int, float)) and float(v) > 0:
+        return float(v)
+
+    if v is None:
+        return None
+
+    with contextlib.suppress(Exception):
+        # Coerce through str to avoid mypy "Any|None" arg-type complaint.
+        s = str(v).strip()
+        if not s:
+            return None
+        f = float(s)
+        return f if f > 0 else None
+
+    return None
+
+
+# =============================================================================
+# Exit decision plumbing (thin adapter only)
+# =============================================================================
+@dataclass(frozen=True)
 class ExitAction:
     mint: str
     amount_raw: int
@@ -333,7 +401,7 @@ class ExitAction:
     sell_pct: float = 1.0
     symbol: str = ""
     priority: int = 5
-    meta: dict[str, Any] = None  # type: ignore[assignment]
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 def _as_float(x: Any, default: float = 0.0) -> float:
@@ -350,6 +418,14 @@ def _as_int(x: Any, default: int = 0) -> int:
         return default
 
 
+def _clamp01(x: float) -> float:
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
 def _parse_exit_actions(
     decision: Any,
     *,
@@ -364,21 +440,21 @@ def _parse_exit_actions(
     if decision is None:
         return []
 
-    # Common pattern: (should_exit, reason, sell_pct, meta?)
+    # tuple: (should_exit, reason, sell_pct?, meta?)
     if isinstance(decision, tuple) and len(decision) >= 2:
         try:
             should_exit = bool(decision[0])
             if not should_exit:
                 return []
             reason = str(decision[1] or "exit")
-            sell_pct = _as_float(decision[2], 1.0) if len(decision) >= 3 else 1.0
+            sell_pct = _clamp01(_as_float(decision[2], 1.0)) if len(decision) >= 3 else 1.0
             meta = dict(decision[3] or {}) if len(decision) >= 4 else {}
             return [
                 ExitAction(
                     mint=mint,
                     amount_raw=int(amount_raw),
                     reason=reason,
-                    sell_pct=max(0.0, min(1.0, float(sell_pct))),
+                    sell_pct=sell_pct,
                     symbol=symbol,
                     priority=_as_int(meta.get("priority"), 5),
                     meta=meta,
@@ -387,15 +463,16 @@ def _parse_exit_actions(
         except Exception:
             return []
 
-    # Dict decision
+    # dict decisions: {"actions":[...]} or {"action":"sell", ...} or {"should_exit":True, ...}
     if isinstance(decision, dict):
-        # either: {"action":"sell", ...} or {"sell": {...}} or {"actions":[...]}
-        if isinstance(decision.get("actions"), list):
+        actions_obj = decision.get("actions")
+        if isinstance(actions_obj, list):
             out: list[ExitAction] = []
-            for a in decision["actions"]:
+            for a in actions_obj:
                 if not isinstance(a, dict):
                     continue
-                if str(a.get("type") or a.get("action") or "").lower() not in {"sell", "exit"}:
+                act = str(a.get("type") or a.get("action") or "").lower()
+                if act not in {"sell", "exit"}:
                     continue
                 amt = _as_int(a.get("amount_raw"), 0) or int(amount_raw)
                 if amt <= 0:
@@ -403,9 +480,9 @@ def _parse_exit_actions(
                 out.append(
                     ExitAction(
                         mint=mint,
-                        amount_raw=amt,
+                        amount_raw=int(amt),
                         reason=str(a.get("reason") or "exit"),
-                        sell_pct=max(0.0, min(1.0, _as_float(a.get("sell_pct"), 1.0))),
+                        sell_pct=_clamp01(_as_float(a.get("sell_pct"), 1.0)),
                         symbol=str(a.get("symbol") or symbol),
                         priority=_as_int(a.get("priority"), 5),
                         meta=dict(a.get("meta") or {}),
@@ -413,26 +490,25 @@ def _parse_exit_actions(
                 )
             return out
 
-        act = str(decision.get("action") or decision.get("type") or "").lower()
-        if act in {"sell", "exit"} or decision.get("should_exit") is True:
-            amt = _as_int(decision.get("amount_raw"), 0) or int(amount_raw)
-            if amt <= 0:
+        act2 = str(decision.get("action") or decision.get("type") or "").lower()
+        if act2 in {"sell", "exit"} or decision.get("should_exit") is True:
+            amt2 = _as_int(decision.get("amount_raw"), 0) or int(amount_raw)
+            if amt2 <= 0:
                 return []
             return [
                 ExitAction(
                     mint=mint,
-                    amount_raw=amt,
+                    amount_raw=int(amt2),
                     reason=str(decision.get("reason") or "exit"),
-                    sell_pct=max(0.0, min(1.0, _as_float(decision.get("sell_pct"), 1.0))),
+                    sell_pct=_clamp01(_as_float(decision.get("sell_pct"), 1.0)),
                     symbol=str(decision.get("symbol") or symbol),
                     priority=_as_int(decision.get("priority"), 5),
                     meta=dict(decision.get("meta") or {}),
                 )
             ]
-
         return []
 
-    # Boolean decision
+    # bool decisions: True => sell 100%
     if isinstance(decision, bool):
         if not decision:
             return []
@@ -468,7 +544,8 @@ async def _call_exit_brain(
     """
     Calls utils_pkg.exit_engine via best-effort function detection.
     """
-    if exit_brain is None:
+    brain = _import_optional("utils_pkg.exit_engine")
+    if brain is None:
         return []
 
     # Candidate function names (ordered)
@@ -484,7 +561,7 @@ async def _call_exit_brain(
 
     fn = None
     for name in candidates:
-        f = getattr(exit_brain, name, None)
+        f = getattr(brain, name, None)
         if callable(f):
             fn = f
             break
@@ -527,9 +604,25 @@ async def _call_exit_brain(
         return []
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Enqueue plumbing (signature-filtered to avoid drift across executor versions)
+# =============================================================================
+def _enqueuer() -> Any | None:
+    m = _import_optional("utils_pkg.auto_exit_worker")
+    if m is None:
+        return None
+    fn = getattr(m, "enqueue_exit_request", None)
+    return fn if callable(fn) else None
+
+
+async def _enqueue_exit_request_safe(fn: Any, kwargs: dict[str, Any]) -> Any:
+    kw = _filter_kwargs(fn, kwargs)
+    return await _maybe_await(fn(**kw))
+
+
+# =============================================================================
 # Queue spam guard
-# -----------------------------------------------------------------------------
+# =============================================================================
 async def _mint_queue_guard(redis: Any, mint: str) -> bool:
     """
     Returns True if allowed to enqueue now, False if recently queued.
@@ -539,14 +632,31 @@ async def _mint_queue_guard(redis: Any, mint: str) -> bool:
     key = f"autosell:queued:{mint}"
     try:
         ok = await _maybe_await(redis.set(key, "1", nx=True, ex=int(AUTO_SELL_QUEUE_COOLDOWN_S)))
+        # redis can return True/False, "OK", or None depending on client
         return bool(ok)
     except Exception:
         return True
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Circuit breaker visibility (telemetry only; exits still allowed)
+# =============================================================================
+async def _log_halt_state_best_effort() -> None:
+    cb = _import_optional("utils_pkg.circuit_breakers")
+    if cb is None:
+        return
+    fn = getattr(cb, "should_halt", None)
+    if not callable(fn):
+        return
+    with contextlib.suppress(Exception):
+        halt, reason, _snap = fn()
+        if bool(halt):
+            _log("AUTOSELL_TRADING_HALTED", level="warning", reason=str(reason)[:160])
+
+
+# =============================================================================
 # Main sweep loop
-# -----------------------------------------------------------------------------
+# =============================================================================
 async def sweep_once() -> int:
     """
     One sweep pass. Returns number of enqueue actions performed.
@@ -555,83 +665,53 @@ async def sweep_once() -> int:
         return 0
 
     await _init_resources_best_effort()
-    r = await _get_redis()
+    redis = await _get_redis()
 
-    # We still allow exits even if halted; this is for visibility.
-    with contextlib.suppress(Exception):
-        halted = await _maybe_await(trading_halted(r))
-        if halted:
-            _log("AUTOSELL_TRADING_HALTED", level="warning")
+    # Telemetry only (we still allow exits)
+    await _log_halt_state_best_effort()
 
-    # Load positions
-    try:
-        positions = await _maybe_await(load_positions()) or {}
-        if not isinstance(positions, dict):
-            positions = {}
-    except Exception as e:
-        _log("AUTOSELL_LOAD_POS_ERR", level="warning", err=_short_exc(e))
-        return 0
-
+    positions = await _load_positions()
     if not positions:
         return 0
 
-    # Wallet balances (authoritative)
     wallet_map = await _wallet_token_balances()
 
-    # Parallelize per-mint work, bounded
     sem = asyncio.Semaphore(int(AUTO_SELL_MAX_PARALLEL))
     enqueued = 0
 
     async def _handle_one(mint_key: str, pos: dict[str, Any]) -> int:
-        nonlocal r
+        nonlocal redis
         async with sem:
-            mint_key = str(mint_key or "").strip()
-            if not mint_key:
+            mk = str(mint_key or "").strip()
+            if not mk or not isinstance(pos, dict):
                 return 0
 
-            symbol = _position_symbol(pos, mint_key)
+            symbol = _position_symbol(pos, mk)
+            norm_mint = _normalize_mint(mk)
 
-            # Determine mint used for wallet & router
-            norm_mint = _normalize_mint(mint_key)
-
-            # Get wallet balance using normalized mint first, fallback to key
-            bal_ui = float(wallet_map.get(norm_mint, wallet_map.get(mint_key, 0.0)) or 0.0)
+            bal_ui = float(wallet_map.get(norm_mint, wallet_map.get(mk, 0.0)) or 0.0)
             if bal_ui <= 0:
                 # Position no longer in wallet; cleanup best-effort
-                with contextlib.suppress(Exception):
-                    await _maybe_await(remove_position(mint_key))
-                _log("AUTOSELL_POSITION_CLEANUP", mint=mint_key, symbol=symbol)
+                await _remove_position(mk)
+                _log("AUTOSELL_POSITION_CLEANUP", mint=mk, symbol=symbol)
                 return 0
 
-            # Price snapshot (best-effort)
             px = await _price_ui(norm_mint)
             if px <= 0:
-                _log("AUTOSELL_PRICE_MISSING", level="warning", mint=mint_key, symbol=symbol)
+                _log("AUTOSELL_PRICE_MISSING", level="warning", mint=mk, symbol=symbol)
                 return 0
 
-            # Entry/buy_time are optional hints for the brain; it may ignore.
-            entry_price = None
-            with contextlib.suppress(Exception):
-                v = pos.get("buy_price") if isinstance(pos, dict) else None
-                if isinstance(v, int | float) and float(v) > 0:
-                    entry_price = float(v)
-
-            buy_time = None
-            with contextlib.suppress(Exception):
-                ts = pos.get("timestamp") or pos.get("ts")
-                if ts:
-                    dt = datetime.fromisoformat(str(ts))
-                    buy_time = dt if dt.tzinfo else dt.replace(tzinfo=UTC)
-
             dec = await _decimals(norm_mint)
+            # floor to avoid overselling due to float rounding
             amount_raw = int(max(0.0, bal_ui) * (10 ** int(dec)))
-
             if amount_raw <= 0:
                 return 0
 
-            # Ask exit brain for actions
+            entry_price = _parse_entry_price(pos)
+            buy_time = _parse_buy_time(pos)
+
             actions = await _call_exit_brain(
-                mint=mint_key,
+                mint=mk,
                 norm_mint=norm_mint,
                 symbol=symbol,
                 pos=pos,
@@ -641,19 +721,19 @@ async def sweep_once() -> int:
                 balance_ui=bal_ui,
                 amount_raw=amount_raw,
                 decimals=dec,
-                redis=r,
+                redis=redis,
             )
             if not actions:
                 return 0
 
-            if enqueue_exit_request is None:
-                _log("AUTOSELL_NO_ENQUEUE_FN", level="error", mint=mint_key, symbol=symbol)
+            fn_enq = _enqueuer()
+            if fn_enq is None:
+                _log("AUTOSELL_NO_ENQUEUE_FN", level="error", mint=mk, symbol=symbol)
                 return 0
 
             did = 0
             for a in actions:
-                # spam guard per mint per interval
-                if not await _mint_queue_guard(r, mint_key):
+                if not await _mint_queue_guard(redis, mk):
                     continue
 
                 meta = dict(a.meta or {})
@@ -668,27 +748,27 @@ async def sweep_once() -> int:
                     }
                 )
 
-                # enqueue
+                # Build kwargs and signature-filter to avoid executor drift.
+                req = {
+                    "mint": norm_mint,  # executor should trade real mint
+                    "amount_raw": int(a.amount_raw),
+                    "reason": str(a.reason or "exit"),
+                    "sell_pct": float(a.sell_pct or 1.0),
+                    "symbol": str(a.symbol or symbol),
+                    "priority": int(a.priority or 5),
+                    "meta": meta,
+                    # keep original key for bookkeeping/debug when supported
+                    "pos_key": mk,
+                }
+
                 try:
-                    rid = await _maybe_await(
-                        enqueue_exit_request(
-                            mint=norm_mint,  # executor should trade real mint
-                            amount_raw=int(a.amount_raw),
-                            reason=str(a.reason or "exit"),
-                            sell_pct=float(a.sell_pct or 1.0),
-                            symbol=str(a.symbol or symbol),
-                            priority=int(a.priority or 5),
-                            meta=meta,
-                            # keep original key for bookkeeping/debug
-                            pos_key=mint_key,
-                        )
-                    )
+                    rid = await _enqueue_exit_request_safe(fn_enq, req)
                     if rid:
                         did += 1
                         _log(
                             "AUTOSELL_ENQUEUED",
                             rid=str(rid),
-                            mint=mint_key,
+                            mint=mk,
                             norm_mint=norm_mint,
                             symbol=symbol,
                             reason=str(a.reason or "exit"),
@@ -696,24 +776,22 @@ async def sweep_once() -> int:
                             sell_pct=float(a.sell_pct or 1.0),
                         )
                 except Exception as e:
-                    _log("AUTOSELL_ENQUEUE_ERR", level="warning", mint=mint_key, err=_short_exc(e))
+                    _log("AUTOSELL_ENQUEUE_ERR", level="warning", mint=mk, err=_short_exc(e))
 
             return did
 
     tasks = [
-        asyncio.create_task(_handle_one(m, p), name=f"autosell_{m}")
+        asyncio.create_task(_handle_one(m, p), name=f"autosell_{str(m)[:24]}")
         for m, p in positions.items()
         if isinstance(p, dict)
     ]
     if tasks:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for x in results:
-            if isinstance(x, Exception):
+            # gather(..., return_exceptions=True) can return BaseException (not always Exception)
+            if isinstance(x, BaseException):
                 continue
-            try:
-                enqueued += int(x)
-            except Exception:
-                continue
+            enqueued += int(x)
 
     return enqueued
 
@@ -754,6 +832,9 @@ async def main() -> None:
         await sweep_loop()
     finally:
         await _close_resources_best_effort()
+
+
+__all__ = ["sweep_once", "sweep_loop", "main"]
 
 
 if __name__ == "__main__":

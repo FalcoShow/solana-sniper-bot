@@ -1,9 +1,19 @@
 ###############################################################################
 # God-Tier .gitignore (Render + Python + Windows) — NO SECRETS, NO TRASH
-# - Safe defaults for a production bot repo
-# - Avoids overly-broad globs that would hide real source/config files
-# - Keeps lint/config files tracked (ruff/pyproject/etc)
+#
+# Goals:
+# - Prevent secrets and key material from ever being committed
+# - Keep deploy context clean and deterministic (Render matches your repo)
+# - Avoid overly-broad globs that hide real source/config files
+# - Keep lint/config files tracked (pyproject, ruff, workflows, etc.)
 ###############################################################################
+
+# -----------------------------------------------------------------------------
+# Merge / scratch helpers (explicit)
+# -----------------------------------------------------------------------------
+_merge/
+.wip_local.patch
+mypy.out.txt
 
 # -----------------------------------------------------------------------------
 # Python bytecode / caches
@@ -19,9 +29,14 @@ __pycache__/
 .ruff_cache/
 .cache/
 .ipynb_checkpoints/
+
+# Editor / backup crumbs
 *.bak
 *.old
 *.orig
+*.tmp
+*.temp
+*~
 
 # -----------------------------------------------------------------------------
 # Virtual environments / Python tooling
@@ -31,11 +46,16 @@ venv/
 env/
 ENV/
 .conda/
-.python-version
 __pypackages__/
 .tox/
 .nox/
 .hypothesis/
+
+# NOTE:
+# We intentionally DO NOT ignore `.python-version` by default.
+# If you use it to pin Python for local parity, it should be tracked.
+# (If you personally want it ignored, add it here.)
+# .python-version
 
 # -----------------------------------------------------------------------------
 # Packaging / builds
@@ -61,7 +81,7 @@ test-results/
 junit*.xml
 
 # -----------------------------------------------------------------------------
-# Logs / runtime artifacts
+# Logs / runtime artifacts (local only)
 # -----------------------------------------------------------------------------
 *.log
 logs/
@@ -124,6 +144,8 @@ state.sqlite3-*
 *.sqlite
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 
 # Redis persistence files (if you ever run Redis locally)
 dump.rdb
@@ -132,6 +154,7 @@ appendonly.aof
 # -----------------------------------------------------------------------------
 # Local data outputs (keep repo clean; allow .gitkeep placeholders)
 # -----------------------------------------------------------------------------
+.state/
 state/
 runtime/
 run/
@@ -171,12 +194,18 @@ dev_notes/
 # -----------------------------------------------------------------------------
 # IDEs / editors
 # -----------------------------------------------------------------------------
-.vscode/
 .idea/
 *.iml
 *.swp
 *.swo
 *.swn
+
+# VS Code:
+# Ignore full workspace, but allow sharing recommended settings if you want.
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
 
 # -----------------------------------------------------------------------------
 # OS junk (Windows/macOS/Linux)
@@ -188,6 +217,7 @@ Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 ehthumbs.db
+*.stackdump
 
 # -----------------------------------------------------------------------------
 # Node / frontend (if present)
@@ -206,14 +236,14 @@ out/
 # - We do NOT ignore project wiring/audit docs
 ###############################################################################
 
-# If you specifically want this directory ignored, keep it here.
+# If you specifically want this directory ignored, keep it here:
 .reports/
+
+# Local Render export (never commit)
+render.env
 
 ###############################################################################
 # IMPORTANT:
 # Do NOT ignore lint/config files. These must remain tracked for CI parity.
-# (Intentionally NOT ignoring ruff.toml / .ruff.toml / pyproject.toml)
+# (Intentionally NOT ignoring ruff.toml / .ruff.toml / pyproject.toml / workflows)
 ###############################################################################
-
-# local render export
-render.env

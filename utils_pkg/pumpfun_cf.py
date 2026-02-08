@@ -8,10 +8,10 @@ Pump.fun cookie/session manager (production-safe)
 
 This module intentionally does NOT implement anti-bot or Cloudflare bypass.
 
-It provides a clean, deterministic way to:
-  - store per-host cookie strings (e.g., from env / file / your own authorized source)
-  - apply those cookies to aiohttp sessions
-  - track TTL / staleness and refresh in the background
+It provides a deterministic way to:
+  - store per-host cookie strings (env / cache file / authorized provider)
+  - apply those cookies to aiohttp sessions (cookie jar)
+  - track TTL / staleness and refresh in the background (optional)
 
 Hosts
 -----
@@ -44,56 +44,92 @@ Public API
 - set_cookie_for(host, cookie_str, ttl_sec=None, source="manual")
 - flag_cookie_bad(host=None)
 - apply_cookies_to_session(aiohttp_session)
-
-This module should remain lightweight; network calls are optional and only used
-for the provider refresh if configured.
+- cookie_status()
 """
 
 import asyncio
+import importlib
 import json
+import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, cast
 from urllib.parse import urlparse
 
 HOST_APEX = "pump.fun"
 HOST_API = "frontend-api.pump.fun"
-KNOWN_HOSTS = (HOST_APEX, HOST_API)
-
-# -----------------------------
-# Logging (canonical if present)
-# -----------------------------
-try:
-    from utils_pkg.logging_setup import get_logger as _get_logger
-except Exception:  # pragma: no cover
-    try:
-        from logging_setup import get_logger as _get_logger  # type: ignore
-    except Exception:  # pragma: no cover
-        _get_logger = None  # type: ignore
-
-if _get_logger:
-    try:
-        LOG = _get_logger("utils.pumpfun_cf")  # type: ignore[misc]
-    except TypeError:  # pragma: no cover
-        LOG = _get_logger()  # type: ignore[misc]
-else:
-    import logging
-
-    LOG = logging.getLogger("utils.pumpfun_cf")
-
+KNOWN_HOSTS: tuple[str, str] = (HOST_APEX, HOST_API)
 
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
 _FALSE = {"0", "false", "f", "no", "n", "off"}
 
 
+# -----------------------------------------------------------------------------
+# Logging (repo-compatible: EventLogger preferred, falls back to stdlib logger)
+# -----------------------------------------------------------------------------
+class _LogLike(Protocol):
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> Any: ...
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> Any: ...
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> Any: ...
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> Any: ...
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> Any: ...
+
+
+def _maybe_import_attr(module_name: str, attr: str) -> Any | None:
+    try:
+        mod = importlib.import_module(module_name)
+        return getattr(mod, attr, None)
+    except Exception:
+        return None
+
+
+def _build_logger() -> _LogLike:
+    """
+    Prefer repo logger if present; wrap with EventLogger if available.
+    Never throws at import time.
+    """
+    base: Any = logging.getLogger("utils.pumpfun_cf")
+
+    # Prefer the repo's logger factory (newer compat first).
+    for mod_name in ("utils_pkg.log_compat", "utils_pkg.logging_setup", "logging_setup"):
+        get_logger = _maybe_import_attr(mod_name, "get_logger")
+        if callable(get_logger):
+            try:
+                base = get_logger("utils.pumpfun_cf")
+                break
+            except Exception:
+                base = logging.getLogger("utils.pumpfun_cf")
+
+    # Wrap with EventLogger if present
+    get_event_logger = _maybe_import_attr("utils_pkg.event_logger", "get_event_logger")
+    if callable(get_event_logger):
+        try:
+            wrapped = get_event_logger(base)
+            return cast(_LogLike, wrapped)
+        except Exception:
+            return cast(_LogLike, base)
+
+    return cast(_LogLike, base)
+
+
+LOG: _LogLike = _build_logger()
+
+
+# -----------------------------------------------------------------------------
+# Env helpers
+# -----------------------------------------------------------------------------
 def _envs(k: str, d: str = "") -> str:
     return (os.getenv(k) or d).strip()
 
 
 def _envi(k: str, d: int) -> int:
+    v = os.getenv(k)
+    if v is None:
+        return d
     try:
-        return int(os.getenv(k, str(d)))
+        return int(float(str(v).strip()))
     except Exception:
         return d
 
@@ -114,6 +150,33 @@ def _now() -> float:
     return time.time()
 
 
+def _default_ttl_sec() -> int:
+    return max(60, _envi("PUMPFUN_COOKIE_TTL_SEC", 900))
+
+
+def _poll_sec() -> int:
+    return max(5, _envi("PUMPFUN_COOKIE_POLL_SEC", 30))
+
+
+def _cache_path() -> str:
+    return _envs("PUMPFUN_COOKIE_CACHE_PATH", "")
+
+
+def _auto_refresh() -> bool:
+    return _envb("PUMPFUN_COOKIE_AUTO_REFRESH", True)
+
+
+def _provider_url() -> str:
+    return _envs("PUMPFUN_COOKIE_PROVIDER_URL", "")
+
+
+def _provider_token() -> str:
+    return _envs("PUMPFUN_COOKIE_PROVIDER_TOKEN", "")
+
+
+# -----------------------------------------------------------------------------
+# Cookie parsing / host normalization
+# -----------------------------------------------------------------------------
 def _host_from_url_or_host(url_or_host: str) -> str:
     s = (url_or_host or "").strip()
     if not s:
@@ -128,27 +191,57 @@ def _host_from_url_or_host(url_or_host: str) -> str:
     return s.lower()
 
 
-def _mask_cookie(ck: str) -> str:
-    if not ck:
+def _normalize_host(host: str) -> str:
+    h = (host or "").strip().lower()
+    if not h:
         return ""
-    return f"<cookie len={len(ck)}>"
+    # Accept subdomains, but normalize to our canonical hosts.
+    if h == HOST_API or h.endswith(f".{HOST_API}"):
+        return HOST_API
+    if h == HOST_APEX or h.endswith(f".{HOST_APEX}"):
+        return HOST_APEX
+    if h.endswith(HOST_API):
+        return HOST_API
+    if h.endswith(HOST_APEX):
+        return HOST_APEX
+    return h
+
+
+def _mask_cookie(ck: str) -> str:
+    ck_s = (ck or "").strip()
+    return f"<cookie len={len(ck_s)}>" if ck_s else ""
+
+
+def _strip_cookie_prefix(s: str) -> str:
+    x = (s or "").strip()
+    if x.lower().startswith("cookie:"):
+        return x.split(":", 1)[1].strip()
+    return x
 
 
 def _parse_cookie_string(s: str) -> dict[str, str]:
+    """
+    Parse "k=v; a=b" into {"k":"v","a":"b"}.
+    Ignores invalid segments.
+    """
     out: dict[str, str] = {}
-    for part in (s or "").split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
+    raw = _strip_cookie_prefix(s)
+    for part in raw.split(";"):
+        p = part.strip()
+        if not p or "=" not in p:
             continue
-        k, v = part.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-        if k:
-            out[k] = v
+        k, v = p.split("=", 1)
+        k_s = k.strip()
+        v_s = v.strip()
+        if k_s:
+            out[k_s] = v_s
     return out
 
 
-@dataclass
+# -----------------------------------------------------------------------------
+# State
+# -----------------------------------------------------------------------------
+@dataclass(slots=True)
 class CookieEntry:
     cookie: str
     updated_ts: float
@@ -156,215 +249,331 @@ class CookieEntry:
     source: str
 
     def is_valid(self) -> bool:
-        return bool(self.cookie) and _now() < self.exp_ts
+        return bool(self.cookie) and _now() < float(self.exp_ts)
 
     def is_stale(self) -> bool:
-        # stale == expired or forced refresh
-        return (not self.cookie) or (_now() >= self.exp_ts)
+        return (not self.cookie) or (_now() >= float(self.exp_ts))
 
 
-# -----------------------------
-# State
-# -----------------------------
-_LOCK = asyncio.Lock()
+_STATE_LOCK = threading.RLock()
 _STORE: dict[str, CookieEntry] = {}
-_REFRESH_TASK: asyncio.Task | None = None
 
-DEFAULT_TTL_SEC = max(60, _envi("PUMPFUN_COOKIE_TTL_SEC", 900))
-CACHE_PATH = _envs("PUMPFUN_COOKIE_CACHE_PATH", "")
-AUTO_REFRESH = _envb("PUMPFUN_COOKIE_AUTO_REFRESH", True)
-POLL_SEC = max(5, _envi("PUMPFUN_COOKIE_POLL_SEC", 30))
+_REFRESH_TASK: asyncio.Task[None] | None = None
 
-PROVIDER_URL = _envs("PUMPFUN_COOKIE_PROVIDER_URL", "")
-PROVIDER_TOKEN = _envs("PUMPFUN_COOKIE_PROVIDER_TOKEN", "")
+# Provider singleflight (lazy-init lock to keep imports maximally safe)
+_PROVIDER_LOCK: asyncio.Lock | None = None
+_PROVIDER_INFLIGHT: asyncio.Task[dict[str, Any]] | None = None
 
 
-# -----------------------------
+def _provider_lock() -> asyncio.Lock:
+    global _PROVIDER_LOCK
+    if _PROVIDER_LOCK is None:
+        _PROVIDER_LOCK = asyncio.Lock()
+    return _PROVIDER_LOCK
+
+
+def _import_optional(module_name: str) -> Any | None:
+    """
+    Import optional deps without hard dependency / stub issues.
+    """
+    try:
+        return importlib.import_module(module_name)
+    except Exception:
+        return None
+
+
+# -----------------------------------------------------------------------------
 # Cache file helpers
-# -----------------------------
-def _load_cache_file() -> dict[str, Any]:
-    if not CACHE_PATH:
+# -----------------------------------------------------------------------------
+def _load_cache_file(path: str) -> dict[str, Any]:
+    if not path:
         return {}
     try:
-        with open(CACHE_PATH, encoding="utf-8") as f:
-            return json.load(f) or {}
+        with open(path, encoding="utf-8") as f:
+            obj = json.load(f)
+            return obj if isinstance(obj, dict) else {}
     except FileNotFoundError:
         return {}
     except Exception as e:
-        LOG.warning("cookie cache read failed (%s): %s", CACHE_PATH, e)
+        LOG.warning("cookie cache read failed (%s): %s", path, e)
         return {}
 
 
 def _atomic_write(path: str, data: dict[str, Any]) -> None:
+    d = os.path.dirname(path)
+    if d:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
     os.replace(tmp, path)
 
 
-def _save_cache_file() -> None:
-    if not CACHE_PATH:
+def _save_cache_file_unlocked(path: str) -> None:
+    if not path:
         return
     try:
-        payload: dict[str, Any] = {"version": 1, "saved_ts": _now(), "cookies": {}}
+        cookies: dict[str, Any] = {}
         for host, entry in _STORE.items():
-            payload["cookies"][host] = {
+            cookies[host] = {
                 "cookie": entry.cookie,
-                "updated_ts": entry.updated_ts,
-                "exp_ts": entry.exp_ts,
+                "updated_ts": float(entry.updated_ts),
+                "exp_ts": float(entry.exp_ts),
                 "source": entry.source,
             }
-        _atomic_write(CACHE_PATH, payload)
+        payload: dict[str, Any] = {"version": 1, "saved_ts": _now(), "cookies": cookies}
+        _atomic_write(path, payload)
     except Exception as e:
-        LOG.warning("cookie cache write failed (%s): %s", CACHE_PATH, e)
+        LOG.warning("cookie cache write failed (%s): %s", path, e)
 
 
 def _seed_from_env_unlocked(ttl_sec: int) -> int:
-    """
-    Seed store from env vars (unlocked). Returns number of updates applied.
-    """
     updates = 0
-    apex = _envs("PUMPFUN_COOKIE", "")
-    api = _envs("PUMPFUN_COOKIE_API", "")
-
     now = _now()
+
+    apex = _strip_cookie_prefix(_envs("PUMPFUN_COOKIE", ""))
+    api = _strip_cookie_prefix(_envs("PUMPFUN_COOKIE_API", ""))
+
     if apex:
         _STORE[HOST_APEX] = CookieEntry(
-            cookie=apex, updated_ts=now, exp_ts=now + ttl_sec, source="env"
+            cookie=apex, updated_ts=now, exp_ts=now + float(ttl_sec), source="env"
         )
         updates += 1
     if api:
         _STORE[HOST_API] = CookieEntry(
-            cookie=api, updated_ts=now, exp_ts=now + ttl_sec, source="env"
+            cookie=api, updated_ts=now, exp_ts=now + float(ttl_sec), source="env"
         )
         updates += 1
+
     return updates
 
 
-def _seed_from_cache_unlocked() -> int:
-    """
-    Seed store from cache file (unlocked). Returns number of updates applied.
-    """
-    if not CACHE_PATH:
+def _seed_from_cache_unlocked(path: str) -> int:
+    if not path:
         return 0
-    obj = _load_cache_file()
-    cookies = obj.get("cookies") if isinstance(obj, dict) else None
-    if not isinstance(cookies, dict):
+
+    obj = _load_cache_file(path)
+    cookies_raw = obj.get("cookies")
+    if not isinstance(cookies_raw, dict):
         return 0
 
     updates = 0
-    for host, rec in cookies.items():
+    for host, rec in cookies_raw.items():
         if not isinstance(host, str) or not isinstance(rec, dict):
             continue
+        h = _normalize_host(host)
+        if h not in KNOWN_HOSTS:
+            continue
+
         ck = rec.get("cookie")
         if not isinstance(ck, str) or not ck.strip():
             continue
-        updated_ts = float(rec.get("updated_ts") or _now())
-        exp_ts = float(rec.get("exp_ts") or (_now() + DEFAULT_TTL_SEC))
-        source = str(rec.get("source") or "cache")
-        # only accept known hosts (avoid poisoning)
-        h = host.strip().lower()
-        if h not in KNOWN_HOSTS:
+        ck_s = _strip_cookie_prefix(ck).strip()
+        if not ck_s:
             continue
-        # only load if not already newer
+
+        try:
+            updated_ts = float(rec.get("updated_ts") or _now())
+        except Exception:
+            updated_ts = _now()
+
+        try:
+            exp_ts = float(rec.get("exp_ts") or (_now() + float(_default_ttl_sec())))
+        except Exception:
+            exp_ts = _now() + float(_default_ttl_sec())
+
+        source = str(rec.get("source") or "cache")
+
         cur = _STORE.get(h)
-        if cur is None or updated_ts >= cur.updated_ts:
+        if cur is None or float(updated_ts) >= float(cur.updated_ts):
             _STORE[h] = CookieEntry(
-                cookie=ck.strip(), updated_ts=updated_ts, exp_ts=exp_ts, source=source
+                cookie=ck_s,
+                updated_ts=float(updated_ts),
+                exp_ts=float(exp_ts),
+                source=source,
             )
             updates += 1
+
     return updates
 
 
-async def _fetch_from_provider() -> dict[str, Any]:
+def _all_valid_unlocked() -> bool:
+    for h in KNOWN_HOSTS:
+        e = _STORE.get(h)
+        if e is None or not e.is_valid():
+            return False
+    return True
+
+
+def _any_stale_unlocked() -> bool:
+    for h in KNOWN_HOSTS:
+        e = _STORE.get(h)
+        if e is None or e.is_stale():
+            return True
+    return False
+
+
+# -----------------------------------------------------------------------------
+# Provider fetch (optional, authorized)
+# -----------------------------------------------------------------------------
+def _extract_provider_cookies(payload: dict[str, Any]) -> dict[str, str]:
     """
-    Optional external provider fetch.
-    Must be authorized and compliant with the upstream site's terms.
+    Accept either:
+      A) {"pump.fun": "...", "frontend-api.pump.fun": "...", ...}
+      B) {"cookies": {"pump.fun": "...", ...}, ...}
     """
-    if not PROVIDER_URL:
+    if not payload:
+        return {}
+    cookies_raw = payload.get("cookies")
+    if isinstance(cookies_raw, dict):
+        out: dict[str, str] = {}
+        for k, v in cookies_raw.items():
+            if isinstance(k, str) and isinstance(v, str):
+                out[k] = v
+        return out
+
+    out2: dict[str, str] = {}
+    for k, v in payload.items():
+        if isinstance(k, str) and isinstance(v, str):
+            out2[k] = v
+    return out2
+
+
+async def _fetch_from_provider(url: str, token: str) -> dict[str, Any]:
+    if not url:
         return {}
 
-    try:
-        import aiohttp  # local import to avoid hard dependency at import-time
-    except Exception:
+    aiohttp = _import_optional("aiohttp")
+    if aiohttp is None:
         LOG.warning("cookie provider configured but aiohttp not available")
         return {}
 
-    headers = {}
-    if PROVIDER_TOKEN:
-        headers["authorization"] = f"Bearer {PROVIDER_TOKEN}"
+    headers: dict[str, str] = {}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
 
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
-        async with s.get(PROVIDER_URL, headers=headers) as r:
-            if r.status != 200:
-                txt = await r.text()
-                LOG.warning("cookie provider HTTP %s: %s", r.status, (txt[:200] if txt else ""))
-                return {}
-            try:
-                return await r.json()
-            except Exception:
-                txt = await r.text()
-                try:
-                    return json.loads(txt)
-                except Exception:
+    ClientTimeout = getattr(aiohttp, "ClientTimeout", None)
+    ClientSession = getattr(aiohttp, "ClientSession", None)
+    if ClientTimeout is None or ClientSession is None:
+        LOG.warning("aiohttp missing ClientTimeout/ClientSession")
+        return {}
+
+    timeout = ClientTimeout(total=10)
+    try:
+        async with ClientSession(timeout=timeout) as s:
+            async with s.get(url, headers=headers) as r:
+                status = int(getattr(r, "status", 0) or 0)
+                if status != 200:
+                    try:
+                        txt = await r.text()
+                    except Exception:
+                        txt = ""
+                    LOG.warning(
+                        "cookie provider HTTP %s: %s",
+                        status,
+                        (txt[:200] if txt else ""),
+                    )
                     return {}
+
+                try:
+                    js = await r.json()
+                    return js if isinstance(js, dict) else {}
+                except Exception:
+                    try:
+                        txt = await r.text()
+                    except Exception:
+                        txt = ""
+                    try:
+                        obj = json.loads(txt) if txt else {}
+                        return obj if isinstance(obj, dict) else {}
+                    except Exception:
+                        return {}
+    except Exception as e:
+        LOG.warning("cookie provider request failed: %s", e)
+        return {}
+
+
+async def _provider_singleflight(url: str, token: str) -> dict[str, Any]:
+    """
+    Ensure only one provider fetch is inflight per process to avoid storms.
+    """
+    global _PROVIDER_INFLIGHT
+    lock = _provider_lock()
+
+    async with lock:
+        if _PROVIDER_INFLIGHT is None or _PROVIDER_INFLIGHT.done():
+            _PROVIDER_INFLIGHT = asyncio.create_task(_fetch_from_provider(url, token))
+        task = _PROVIDER_INFLIGHT
+
+    try:
+        return await task
+    except Exception:
+        return {}
 
 
 def _apply_provider_payload_unlocked(payload: dict[str, Any]) -> int:
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or not payload:
         return 0
 
-    ttl = payload.get("ttl_sec", DEFAULT_TTL_SEC)
+    ttl_raw = payload.get("ttl_sec", _default_ttl_sec())
     try:
-        ttl_sec = max(60, int(ttl))
+        ttl_sec = max(60, int(float(str(ttl_raw))))
     except Exception:
-        ttl_sec = DEFAULT_TTL_SEC
+        ttl_sec = _default_ttl_sec()
 
-    cookies = payload.get("cookies", payload)
-    if not isinstance(cookies, dict):
+    cookies_map = _extract_provider_cookies(payload)
+    if not cookies_map:
         return 0
 
     now = _now()
     updates = 0
     for host in KNOWN_HOSTS:
-        ck = cookies.get(host)
-        if isinstance(ck, str) and ck.strip():
-            _STORE[host] = CookieEntry(
-                cookie=ck.strip(), updated_ts=now, exp_ts=now + ttl_sec, source="provider"
-            )
-            updates += 1
-
+        ck = cookies_map.get(host)
+        if isinstance(ck, str):
+            ck_s = _strip_cookie_prefix(ck).strip()
+            if ck_s:
+                _STORE[host] = CookieEntry(
+                    cookie=ck_s,
+                    updated_ts=now,
+                    exp_ts=now + float(ttl_sec),
+                    source="provider",
+                )
+                updates += 1
     return updates
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Public API
-# -----------------------------
+# -----------------------------------------------------------------------------
 def ensure_cookie_refresher() -> None:
     """
-    Start the background refresher if enabled.
-    Safe to call multiple times.
+    Start the background refresher if enabled. Safe to call multiple times.
     """
     global _REFRESH_TASK
-    if not AUTO_REFRESH:
+
+    if not _auto_refresh():
         return
+
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        # called outside running loop; caller can call later once loop is running
+        # Called outside running loop; caller can call again once loop is running.
         LOG.warning("ensure_cookie_refresher() called without a running event loop")
         return
 
-    if _REFRESH_TASK and not _REFRESH_TASK.done():
+    if _REFRESH_TASK is not None and not _REFRESH_TASK.done():
         return
 
     _REFRESH_TASK = loop.create_task(_refresh_loop(), name="pumpfun_cookie_refresher")
     LOG.info(
         "pumpfun cookie refresher started (poll=%ss cache=%s provider=%s)",
-        POLL_SEC,
-        bool(CACHE_PATH),
-        bool(PROVIDER_URL),
+        _poll_sec(),
+        bool(_cache_path()),
+        bool(_provider_url()),
     )
 
 
@@ -373,82 +582,90 @@ async def refresh_now(*, force: bool = False) -> None:
     Refresh cookies from cache/env/provider (provider optional).
     If force=True, refresh even if existing cookies are still valid.
     """
-    async with _LOCK:
-        # if not forced and everything valid, no-op
-        if not force and all((_STORE.get(h) and _STORE[h].is_valid()) for h in KNOWN_HOSTS):
+    cache_path = _cache_path()
+    ttl = _default_ttl_sec()
+    url = _provider_url()
+    token = _provider_token()
+
+    need_provider = False
+    with _STATE_LOCK:
+        if not force and _all_valid_unlocked():
             return
 
         updates = 0
+        if cache_path:
+            updates += _seed_from_cache_unlocked(cache_path)
+        updates += _seed_from_env_unlocked(ttl)
 
-        # 1) cache file
-        updates += _seed_from_cache_unlocked()
+        need_provider = bool(url) and (force or _any_stale_unlocked())
 
-        # 2) env (wins if present)
-        updates += _seed_from_env_unlocked(DEFAULT_TTL_SEC)
+        if updates and cache_path:
+            _save_cache_file_unlocked(cache_path)
 
-        # 3) provider (optional)
-        if PROVIDER_URL:
-            # provider fetch outside lock would be better, but keep simple + consistent
-            # to avoid multi-fetch storms.
-            payload = await _fetch_from_provider()
-            updates += _apply_provider_payload_unlocked(payload)
+    # Provider fetch outside state lock (optional)
+    if url and need_provider:
+        payload = await _provider_singleflight(url, token)
+        if payload:
+            with _STATE_LOCK:
+                updates2 = _apply_provider_payload_unlocked(payload)
+                if updates2 and cache_path:
+                    _save_cache_file_unlocked(cache_path)
 
-        if updates:
-            _save_cache_file()
-            LOG.info(
-                "cookies refreshed: apex=%s api=%s",
-                _mask_cookie(_STORE.get(HOST_APEX).cookie if _STORE.get(HOST_APEX) else ""),
-                _mask_cookie(_STORE.get(HOST_API).cookie if _STORE.get(HOST_API) else ""),
-            )
+                if updates2:
+                    e_apex = _STORE.get(HOST_APEX)
+                    e_api = _STORE.get(HOST_API)
+                    LOG.info(
+                        "cookies refreshed (provider): apex=%s api=%s",
+                        _mask_cookie(e_apex.cookie if e_apex else ""),
+                        _mask_cookie(e_api.cookie if e_api else ""),
+                    )
 
 
 def get_cookie_for(url_or_host: str) -> str:
     """
-    Return cookie string for a URL/host, or "" if none.
+    Return cookie string for a URL/host, or "" if none/expired.
     """
-    host = _host_from_url_or_host(url_or_host)
-    if not host:
+    host = _normalize_host(_host_from_url_or_host(url_or_host))
+    if host not in KNOWN_HOSTS:
         return ""
-
-    # normalize subdomains
-    if host.endswith(HOST_API):
-        key = HOST_API
-    elif host.endswith(HOST_APEX):
-        key = HOST_APEX
-    else:
-        key = host
-
-    entry = _STORE.get(key)
-    if not entry:
-        return ""
-    return entry.cookie if entry.is_valid() else ""
+    with _STATE_LOCK:
+        entry = _STORE.get(host)
+        if not entry or not entry.is_valid():
+            return ""
+        return entry.cookie
 
 
 def set_cookie_for(
-    host: str, cookie_str: str, *, ttl_sec: int | None = None, source: str = "manual"
+    host: str,
+    cookie_str: str,
+    *,
+    ttl_sec: int | None = None,
+    source: str = "manual",
 ) -> None:
     """
     Set cookie string for a known host.
     """
-    h = (host or "").strip().lower()
+    h = _normalize_host(host)
     if h not in KNOWN_HOSTS:
         raise ValueError(f"unknown host: {host!r}")
 
-    ck = (cookie_str or "").strip()
+    ck = _strip_cookie_prefix(cookie_str).strip()
     if not ck:
         raise ValueError("cookie_str is empty")
 
-    ttl = DEFAULT_TTL_SEC if ttl_sec is None else max(60, int(ttl_sec))
+    ttl = _default_ttl_sec() if ttl_sec is None else max(60, int(ttl_sec))
     now = _now()
 
-    # no async here; keep it simple — called rarely
-    _STORE[h] = CookieEntry(cookie=ck, updated_ts=now, exp_ts=now + ttl, source=source)
-    _save_cache_file()
+    with _STATE_LOCK:
+        _STORE[h] = CookieEntry(cookie=ck, updated_ts=now, exp_ts=now + float(ttl), source=source)
+        path = _cache_path()
+        if path:
+            _save_cache_file_unlocked(path)
 
     # keep env consistent for other modules if they read it
     if h == HOST_APEX:
         os.environ["PUMPFUN_COOKIE"] = ck
-    if h == HOST_API:
+    elif h == HOST_API:
         os.environ["PUMPFUN_COOKIE_API"] = ck
 
     LOG.info("cookie set for %s (%s)", h, source)
@@ -459,37 +676,48 @@ def flag_cookie_bad(host: str | None = None) -> None:
     Mark cookies as stale so the refresher will try to refresh ASAP.
     If host is None, stale both known hosts.
     """
-    targets = KNOWN_HOSTS if host is None else ((host.strip().lower(),),)
-    for h in targets:
-        if h in _STORE:
-            e = _STORE[h]
-            _STORE[h] = CookieEntry(
-                cookie=e.cookie, updated_ts=e.updated_ts, exp_ts=0.0, source=e.source
-            )
-    # no logging spam; callers might invoke frequently
+    targets = KNOWN_HOSTS if host is None else (host,)
+    with _STATE_LOCK:
+        for h0 in targets:
+            h = _normalize_host(h0)
+            if h in _STORE:
+                e = _STORE[h]
+                _STORE[h] = CookieEntry(
+                    cookie=e.cookie,
+                    updated_ts=float(e.updated_ts),
+                    exp_ts=0.0,
+                    source=str(e.source),
+                )
 
 
 def apply_cookies_to_session(session: Any) -> None:
     """
     Apply cookies to an aiohttp.ClientSession cookie jar.
-    Safe no-op if aiohttp isn't present or session isn't compatible.
+    Safe no-op if aiohttp/yarl isn't present or session isn't compatible.
     """
-    try:
-        from aiohttp import client_reqrep  # type: ignore
-    except Exception:
-        return
-
     jar = getattr(session, "cookie_jar", None)
     if jar is None:
+        return
+
+    yarl = _import_optional("yarl")
+    if yarl is None:
+        return
+
+    URL = getattr(yarl, "URL", None)
+    if URL is None:
         return
 
     for host in KNOWN_HOSTS:
         ck = get_cookie_for(host)
         if not ck:
             continue
-        jar.update_cookies(
-            _parse_cookie_string(ck), response_url=client_reqrep.URL(f"https://{host}/")
-        )
+        cookies = _parse_cookie_string(ck)
+        if not cookies:
+            continue
+        try:
+            jar.update_cookies(cookies, response_url=URL(f"https://{host}/"))
+        except Exception:
+            continue
 
 
 def cookie_status() -> dict[str, Any]:
@@ -497,37 +725,38 @@ def cookie_status() -> dict[str, Any]:
     Debug/status snapshot (safe; masks cookie values).
     """
     out: dict[str, Any] = {}
-    for host in KNOWN_HOSTS:
-        e = _STORE.get(host)
-        out[host] = {
-            "present": bool(e and e.cookie),
-            "valid": bool(e and e.is_valid()),
-            "stale": bool(e and e.is_stale()) if e else True,
-            "source": e.source if e else "",
-            "updated_age_s": int(_now() - e.updated_ts) if e else None,
-            "expires_in_s": int(e.exp_ts - _now()) if e else None,
-            "cookie": _mask_cookie(e.cookie) if e else "",
-        }
+    now = _now()
+    with _STATE_LOCK:
+        for host in KNOWN_HOSTS:
+            e = _STORE.get(host)
+            out[host] = {
+                "present": bool(e and e.cookie),
+                "valid": bool(e and e.is_valid()),
+                "stale": bool(e.is_stale()) if e else True,
+                "source": e.source if e else "",
+                "updated_age_s": int(now - e.updated_ts) if e else None,
+                "expires_in_s": int(e.exp_ts - now) if e else None,
+                "cookie": _mask_cookie(e.cookie) if e else "",
+            }
     return out
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Background refresher
-# -----------------------------
+# -----------------------------------------------------------------------------
 async def _refresh_loop() -> None:
-    # One initial seed (cache/env)
+    # initial seed (cache/env)
     try:
-        async with _LOCK:
-            _seed_from_cache_unlocked()
-            _seed_from_env_unlocked(DEFAULT_TTL_SEC)
+        with _STATE_LOCK:
+            _seed_from_cache_unlocked(_cache_path())
+            _seed_from_env_unlocked(_default_ttl_sec())
     except Exception:
         pass
 
     while True:
         try:
-            # refresh if anything stale/missing
-            async with _LOCK:
-                need = any((_STORE.get(h) is None) or _STORE[h].is_stale() for h in KNOWN_HOSTS)
+            with _STATE_LOCK:
+                need = _any_stale_unlocked()
             if need:
                 await refresh_now(force=True)
         except asyncio.CancelledError:
@@ -535,12 +764,13 @@ async def _refresh_loop() -> None:
         except Exception as e:
             LOG.warning("cookie refresh loop error: %s", e)
 
-        await asyncio.sleep(float(POLL_SEC))
+        await asyncio.sleep(float(_poll_sec()))
 
 
 __all__ = [
     "HOST_APEX",
     "HOST_API",
+    "KNOWN_HOSTS",
     "apply_cookies_to_session",
     "cookie_status",
     "ensure_cookie_refresher",

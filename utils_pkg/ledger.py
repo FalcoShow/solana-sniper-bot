@@ -6,40 +6,26 @@ utils_pkg/ledger.py — Canonical Ledger + Realized PnL (V3+++ / God-Tier Overha
 
 Role
 ----
-This module is the ONE canonical trade ledger for fills + realized PnL, designed to be:
+ONE canonical trade ledger for fills + realized PnL.
 
-- Postgres-first (Render + local identical)
-- Deterministic & idempotent (dedupe_key; safe replays)
-- Async-friendly (no blocking I/O on hot path)
-- Import-safe (no network at import time; lazy init)
-- Backwards-compatible (best-effort sync wrappers)
-- Healthcheck-ready (structured ping; never randomly throws by default)
+Design goals
+------------
+- Postgres-first (Render + local identical) using asyncpg pool
+- Deterministic & idempotent (wallet + dedupe_key unique; safe replays)
+- Async-friendly (no blocking I/O on hot path; lazy pool + lazy schema)
+- Import-safe (no network at import time)
+- Backwards-compatible sync wrappers (best-effort; never crash bot by default)
+- Healthcheck-ready (structured result; strict mode optional)
 
-Contract
---------
-Primary storage: Postgres (JSONB meta support; proper lot matching)
-Legacy: SQLite allowed ONLY if LEDGER_ALLOW_SQLITE=1 (dev-only, not recommended)
+Primary storage (PG)
+--------------------
+ledger_fills   : raw fills (buy/sell) deduped via (wallet, dedupe_key)
+ledger_lots    : buy lots with remaining_qty_raw for FIFO matching
+ledger_matches : FIFO match rows that store realized pnl per matched qty (SOL)
 
-Core tables (PG)
----------------
-ledger_fills:
-  - raw fills (buy/sell), deduped via (wallet, dedupe_key)
-ledger_lots:
-  - buy lots with remaining_qty_raw for FIFO matching
-ledger_matches:
-  - FIFO match rows that store realized pnl per matched qty (SOL)
-
-Public API
-----------
-Async (preferred):
-  - await record_fill_async(...)
-  - await realized_pnl_range_async(...)
-  - await realized_pnl_today_async(...)
-  - await healthcheck(), await ping()
-
-Sync wrappers (best-effort):
-  - record_fill(...)
-  - realized_pnl_today(...)
+Legacy
+------
+SQLite supported only when LEDGER_ALLOW_SQLITE=1 (dev-only).
 
 Env
 ---
@@ -62,7 +48,7 @@ Legacy sqlite:
 
 Notes
 -----
-- Price unit: price_sol is SOL per token (UI token)
+- Price unit: price_sol is SOL per token (token UI unit)
 - qty_raw/decimals used to compute qty_ui
 - FIFO matching uses remaining_qty_raw in lots
 """
@@ -71,11 +57,12 @@ import asyncio
 import contextlib
 import hashlib
 import inspect
+import json
 import os
 import time
 from dataclasses import dataclass
 from decimal import Decimal, getcontext
-from typing import Any
+from typing import Any, Callable, Literal
 
 from utils_pkg.db_dsn import mask_dsn, pick_asyncpg_dsn
 
@@ -86,24 +73,44 @@ _TRUE = {"1", "true", "yes", "y", "on", "t"}
 
 
 # -----------------------------------------------------------------------------
-# Logging shim (never hard-fail)
+# Logging (canonical: utils_pkg.log_compat)
 # -----------------------------------------------------------------------------
-try:
-    from logging_setup import get_logger  # type: ignore
+def _get_logger() -> Any:
+    try:  # pragma: no cover
+        from utils_pkg.log_compat import get_logger as _gl  # type: ignore[import-not-found]
 
-    log = get_logger(__name__)  # type: ignore
-except Exception:  # pragma: no cover
+        return _gl(__name__)
+    except Exception:
+        pass
+
+    try:  # pragma: no cover
+        from logging_setup import get_logger as _gl2  # type: ignore[import-not-found]
+
+        return _gl2(__name__)
+    except Exception:
+        pass
+
     import logging
 
-    log = logging.getLogger(__name__)  # type: ignore
+    return logging.getLogger(__name__)
 
-if not hasattr(log, "event"):
 
-    def _event(name: str, **kw: Any) -> None:  # pragma: no cover
-        with contextlib.suppress(Exception):
+log: Any = _get_logger()
+
+
+def _log_event(name: str, **kw: Any) -> None:
+    """
+    Structured event shim:
+    - Uses log.event if present (canonical EventLogger)
+    - Otherwise falls back to log.info
+    Never raises.
+    """
+    with contextlib.suppress(Exception):
+        ev = getattr(log, "event", None)
+        if callable(ev):
+            ev(name, **kw)
+        else:
             log.info("%s %s", name, kw)
-
-    log.event = _event
 
 
 def _short_exc(e: BaseException, n: int = 240) -> str:
@@ -112,15 +119,26 @@ def _short_exc(e: BaseException, n: int = 240) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Soft wallet helpers (for default wallet)
+# Wallet helpers (best-effort)
 # -----------------------------------------------------------------------------
 _wallet_err: str | None = None
-try:
-    from utils_pkg.solana_wallet import get_pubkey_str, load_keypair  # type: ignore
+
+# Important for mypy: treat these as Optional callables, not “always callable”.
+load_keypair: Callable[[], Any] | None = None
+get_pubkey_str: Callable[[Any], str] | None = None
+
+try:  # pragma: no cover
+    from utils_pkg.solana_wallet import (  # type: ignore[import-not-found]
+        get_pubkey_str as _get_pubkey_str,
+        load_keypair as _load_keypair,
+    )
+
+    load_keypair = _load_keypair
+    get_pubkey_str = _get_pubkey_str
 except Exception as e:  # pragma: no cover
     _wallet_err = str(e)
-    get_pubkey_str = None  # type: ignore
-    load_keypair = None  # type: ignore
+    load_keypair = None
+    get_pubkey_str = None
 
 
 def _envs(k: str, d: str = "") -> str:
@@ -173,63 +191,71 @@ def _default_wallet() -> str:
     global _kp_cache, _owner_cache
     if _owner_cache:
         return _owner_cache
+
     envv = _default_wallet_from_env()
     if envv:
         _owner_cache = envv
         return _owner_cache
-    if callable(load_keypair) and callable(get_pubkey_str):
+
+    lk = load_keypair
+    gps = get_pubkey_str
+    if callable(lk) and callable(gps):
         try:
             if _kp_cache is None:
-                _kp_cache = load_keypair()  # type: ignore[misc]
-            _owner_cache = str(get_pubkey_str(_kp_cache))  # type: ignore[misc]
+                _kp_cache = lk()
+            _owner_cache = str(gps(_kp_cache))
             return _owner_cache
         except Exception:
             return ""
+
     return ""
 
 
 # -----------------------------------------------------------------------------
 # Backend selection
 # -----------------------------------------------------------------------------
-def _backend() -> str:
+LedgerBackend = Literal["pg", "sqlite"]
+
+
+def _backend() -> LedgerBackend:
     b = _envs("LEDGER_BACKEND", "pg").lower().strip()
     if b in {"postgres", "postgresql"}:
         b = "pg"
     if b not in {"pg", "sqlite"}:
         b = "pg"
     if b == "sqlite" and not _envb("LEDGER_ALLOW_SQLITE", False):
-        # hard contract: sqlite is dev-only unless explicitly allowed
         b = "pg"
-    return b
+    return "sqlite" if b == "sqlite" else "pg"
 
 
 # -----------------------------------------------------------------------------
-# Optional asyncpg (import-safe) + broken-wheel self-check
+# Optional asyncpg (import-safe) + self-check (no network)
 # -----------------------------------------------------------------------------
 _ASYNCPG_OK = True
 _ASYNCPG_IMPORT_ERR = ""
 _ASYNCPG_SELFTEST_DONE = False
 
 try:  # pragma: no cover
-    import asyncpg  # type: ignore
+    import asyncpg  # type: ignore[import-not-found]
 except Exception as err:  # pragma: no cover
-    asyncpg = None  # type: ignore
+    asyncpg = None  # type: ignore[assignment]
     _ASYNCPG_OK = False
     _ASYNCPG_IMPORT_ERR = str(err)
 
 
 def _asyncpg_selfcheck() -> tuple[bool, str]:
     """
-    Detect "broken asyncpg" installs that import but fail at runtime due to
-    missing compiled protocol modules or partial wheels.
+    Detect partial/broken asyncpg wheels where import succeeds but protocol is missing.
 
-    This does NOT open any network connections.
+    Does NOT open any network connections.
     """
     global _ASYNCPG_SELFTEST_DONE, _ASYNCPG_OK, _ASYNCPG_IMPORT_ERR
+
     if _ASYNCPG_SELFTEST_DONE:
         return _ASYNCPG_OK, _ASYNCPG_IMPORT_ERR
 
     _ASYNCPG_SELFTEST_DONE = True
+
     if asyncpg is None:
         _ASYNCPG_OK = False
         _ASYNCPG_IMPORT_ERR = _ASYNCPG_IMPORT_ERR or "asyncpg not installed"
@@ -256,7 +282,7 @@ def _can_use_asyncpg() -> bool:
 
 
 # -----------------------------------------------------------------------------
-# Decimal helpers
+# Decimal / dedupe helpers
 # -----------------------------------------------------------------------------
 def _d(x: Any, default: str = "0") -> Decimal:
     try:
@@ -286,7 +312,7 @@ def _compute_dedupe_key(
     mint: str,
     qty_raw: int,
     decimals: int,
-    price_sol: float | Decimal,
+    price_sol: Decimal,
     ts: int,
     sig: str | None,
     hint: str | None = None,
@@ -295,6 +321,14 @@ def _compute_dedupe_key(
         return f"sig:{sig}"
     base = f"{wallet}|{side}|{mint}|{qty_raw}|{decimals}|{price_sol}|{ts}|{hint or ''}"
     return "h:" + _hash_dedupe(base)
+
+
+def _json_dumps(obj: Any) -> str:
+    """Deterministic JSON for jsonb parameters."""
+    try:
+        return json.dumps(obj or {}, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return "{}"
 
 
 # -----------------------------------------------------------------------------
@@ -366,36 +400,54 @@ CREATE INDEX IF NOT EXISTS ix_ledger_matches_wallet_mint_ts ON ledger_matches(wa
 """
 
 
+def _split_sql(sql: str) -> list[str]:
+    """Minimal multi-statement splitter for schema scripts."""
+    out: list[str] = []
+    for part in sql.split(";"):
+        stmt = part.strip()
+        if stmt:
+            out.append(stmt)
+    return out
+
+
 # -----------------------------------------------------------------------------
 # DSN resolver (single source of truth): pick_asyncpg_dsn()
 # -----------------------------------------------------------------------------
 def _pick_dsn_flex(*, timeout_s: float | None, app_name: str | None) -> tuple[str, dict[str, Any]]:
     """
-    Call pick_asyncpg_dsn in a signature-flex way so we never break if the helper evolves.
+    Signature-flex wrapper for pick_asyncpg_dsn.
+
+    mypy note:
+      We treat the return as Any to avoid “unreachable” deductions when the helper
+      is typed as always returning a tuple.
     """
+    kw: dict[str, Any] = {}
     try:
         sig = inspect.signature(pick_asyncpg_dsn)
         allowed = set(sig.parameters.keys())
-        kw: dict[str, Any] = {}
         if "timeout_s" in allowed:
             kw["timeout_s"] = timeout_s
         if "app_name" in allowed:
             kw["app_name"] = app_name
-        out = pick_asyncpg_dsn(**kw)  # type: ignore[arg-type]
+    except Exception:
+        kw = {}
+
+    try:
+        out: Any = pick_asyncpg_dsn(**kw)  # type: ignore[arg-type]
     except Exception:
         out = pick_asyncpg_dsn()  # type: ignore[call-arg]
 
-    if isinstance(out, tuple) and len(out) >= 1:
+    if isinstance(out, tuple) and out:
         dsn = str(out[0] or "")
         kwargs = out[1] if (len(out) >= 2 and isinstance(out[1], dict)) else {}
         return dsn, dict(kwargs)
-    return "", {}
+
+    # Fallback: treat as DSN-like string
+    return str(out or ""), {}
 
 
 def _sanitize_connect_kwargs(connect_kwargs: dict[str, Any]) -> dict[str, Any]:
-    """
-    Keep only asyncpg-safe kwargs; drop libpq-only / unknown keys to avoid TypeError.
-    """
+    """Keep only asyncpg-safe kwargs; drop libpq-only / unknown keys to avoid TypeError."""
     if not connect_kwargs:
         return {}
 
@@ -434,7 +486,7 @@ def _sanitize_connect_kwargs(connect_kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Postgres pool management (asyncpg) + cooldown + soft reset
+# Postgres pool management (asyncpg) + cooldown + schema gate
 # -----------------------------------------------------------------------------
 _POOL: Any = None
 _POOL_LOCK = asyncio.Lock()
@@ -442,8 +494,18 @@ _POOL_FAIL_UNTIL = 0.0
 _POOL_LAST_ERR: str = ""
 _POOL_LAST_OK_AT = 0.0
 
-_SCHEMA_READY = False
+_SCHEMA_READY: bool = False
 _SCHEMA_LOCK = asyncio.Lock()
+
+
+def _pool_snapshot() -> Any | None:
+    # Snapshot indirection prevents mypy “unreachable” in double-checked patterns.
+    return _POOL
+
+
+def _schema_snapshot() -> bool:
+    # Snapshot indirection prevents mypy “unreachable” in double-checked patterns.
+    return bool(_SCHEMA_READY)
 
 
 def _pg_pool_min() -> int:
@@ -503,9 +565,7 @@ async def _reset_pool_soft(reason: str) -> None:
 async def _get_pg_pool(
     *, timeout_s: float | None = None, app_name: str | None = None
 ) -> Any | None:
-    """
-    Return pool or None in soft mode when unavailable.
-    """
+    """Return a pool or None in soft mode when unavailable."""
     global _POOL, _POOL_FAIL_UNTIL, _POOL_LAST_ERR, _POOL_LAST_OK_AT
 
     if not _ledger_enabled():
@@ -516,19 +576,21 @@ async def _get_pg_pool(
         if _strict_mode():
             raise RuntimeError(msg)
         if int(time.time()) % 60 == 0:
-            log.event("LEDGER_ASYNCPG_DISABLED", err=msg)
+            _log_event("LEDGER_ASYNCPG_DISABLED", err=msg)
         return None
 
     now = time.time()
-    if _POOL is None and now < _POOL_FAIL_UNTIL and not _strict_mode():
+    if _pool_snapshot() is None and now < _POOL_FAIL_UNTIL and not _strict_mode():
         return None
 
-    if _POOL is not None:
-        return _POOL
+    pool = _pool_snapshot()
+    if pool is not None:
+        return pool
 
     async with _POOL_LOCK:
-        if _POOL is not None:
-            return _POOL
+        pool2 = _pool_snapshot()
+        if pool2 is not None:
+            return pool2
 
         dsn, connect_kwargs = _pick_dsn_flex(timeout_s=timeout_s, app_name=app_name)
         if not dsn:
@@ -546,7 +608,7 @@ async def _get_pg_pool(
         idle = float(_pg_idle_sec())
 
         try:
-            log.event(
+            _log_event(
                 "LEDGER_PG_POOL_CREATE",
                 dsn=mask_dsn(dsn),
                 min=min_size,
@@ -554,6 +616,7 @@ async def _get_pg_pool(
                 cmd_timeout=float(kwargs.get("command_timeout", 0)),
                 idle=idle,
             )
+
             coro = asyncpg.create_pool(  # type: ignore[union-attr]
                 dsn=dsn,
                 min_size=min_size,
@@ -561,11 +624,13 @@ async def _get_pg_pool(
                 max_inactive_connection_lifetime=idle,
                 **kwargs,
             )
-            _POOL = await asyncio.wait_for(coro, timeout=_pg_create_timeout())
+            created = await asyncio.wait_for(coro, timeout=_pg_create_timeout())
+
+            _POOL = created
             _POOL_LAST_ERR = ""
             _POOL_FAIL_UNTIL = 0.0
             _POOL_LAST_OK_AT = time.time()
-            return _POOL
+            return created
         except Exception as err:
             _POOL = None
             _POOL_LAST_ERR = f"create_pool failed: {err}"
@@ -574,34 +639,43 @@ async def _get_pg_pool(
                 raise RuntimeError(
                     f"Failed to create ledger asyncpg pool dsn={mask_dsn(dsn)}"
                 ) from err
-            log.event("LEDGER_PG_POOL_CREATE_FAIL", dsn=mask_dsn(dsn), err=_short_exc(err))
+            _log_event("LEDGER_PG_POOL_CREATE_FAIL", dsn=mask_dsn(dsn), err=_short_exc(err))
             return None
 
 
-async def _ensure_schema_pg() -> None:
+async def _ensure_schema_pg() -> bool:
+    """Ensure schema exists. Returns True if ready, False if unavailable in soft mode."""
     global _SCHEMA_READY
-    if _SCHEMA_READY:
-        return
+
+    if _schema_snapshot():
+        return True
+
     async with _SCHEMA_LOCK:
-        if _SCHEMA_READY:
-            return
+        if _schema_snapshot():
+            return True
+
         pool = await _get_pg_pool(timeout_s=5.0, app_name="ledger.ensure_schema")
         if pool is None:
             if _strict_mode():
                 raise RuntimeError("Ledger schema ensure failed: pool unavailable")
-            return
+            return False
+
         async with pool.acquire() as con:
-            await con.execute(PG_SCHEMA)
+            for stmt in _split_sql(PG_SCHEMA):
+                await con.execute(stmt)
+
         _SCHEMA_READY = True
-        log.event("LEDGER_SCHEMA_READY", backend="pg")
+        _log_event("LEDGER_SCHEMA_READY", backend="pg")
+        return True
 
 
 async def close_pg_pool() -> None:
     global _POOL, _SCHEMA_READY
     async with _POOL_LOCK:
-        if _POOL is not None:
+        pool = _pool_snapshot()
+        if pool is not None:
             with contextlib.suppress(Exception):
-                await _POOL.close()
+                await pool.close()
         _POOL = None
     _SCHEMA_READY = False
 
@@ -638,7 +712,10 @@ def _sqlite_allowed() -> bool:
 def _sqlite_conn():  # pragma: no cover (dev-only)
     import sqlite3
 
-    os.makedirs(os.path.dirname(SQLITE_DB), exist_ok=True)
+    dirpath = os.path.dirname(SQLITE_DB)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+
     con = sqlite3.connect(SQLITE_DB)
     con.execute("PRAGMA journal_mode=WAL;")
     con.executescript(SQLITE_SCHEMA)
@@ -654,9 +731,7 @@ async def healthcheck(
     raise_on_fail: bool = False,
     app_name: str | None = "utils_pkg.ledger.healthcheck",
 ) -> dict[str, Any]:
-    """
-    Structured health result. Never raises unless raise_on_fail=True.
-    """
+    """Structured health result. Never raises unless raise_on_fail=True."""
     backend = _backend()
     enabled = _ledger_enabled()
     strict = _strict_mode()
@@ -685,8 +760,8 @@ async def healthcheck(
                 raise RuntimeError("Ledger sqlite backend selected but LEDGER_ALLOW_SQLITE=0")
             return result
         try:
-            with _sqlite_conn():
-                pass
+            with _sqlite_conn() as con:
+                con.execute("SELECT 1").fetchone()
             result["ok"] = True
             result["query"]["ok"] = True
             return result
@@ -696,7 +771,6 @@ async def healthcheck(
                 raise
             return result
 
-    # PG backend
     dsn, _ = _pick_dsn_flex(timeout_s=float(timeout_s), app_name=app_name)
     result["dsn_set"] = bool(dsn)
 
@@ -751,7 +825,7 @@ async def ping(*, timeout_s: float = 2.0) -> bool:
 @dataclass
 class RecordResult:
     ok: bool
-    backend: str
+    backend: LedgerBackend
     inserted: bool
     wallet: str
     side: str
@@ -778,8 +852,6 @@ async def _record_fill_pg(
     meta: dict[str, Any] | None,
     dedupe_key: str | None,
 ) -> RecordResult:
-    await _ensure_schema_pg()
-
     w = (wallet or "").strip()
     if not w:
         return RecordResult(
@@ -805,7 +877,7 @@ async def _record_fill_pg(
 
     t = int(ts if ts is not None else time.time())
     qtyui = _qty_ui(qraw, dec)
-    notion = qtyui * px
+    notional = qtyui * px
 
     dk = (dedupe_key or "").strip()
     if not dk:
@@ -813,16 +885,19 @@ async def _record_fill_pg(
             wallet=w, side=s, mint=m, qty_raw=qraw, decimals=dec, price_sol=px, ts=t, sig=sig
         )
 
-    poolv = pool or None
-    routev = route or None
     statusv = status or "filled"
-    metav = meta or {}
+    meta_json = _json_dumps(meta)
 
     dbpool = await _get_pg_pool(timeout_s=10.0, app_name="ledger.record_fill")
     if dbpool is None:
         if _strict_mode():
             raise RuntimeError("Ledger PG pool unavailable")
         return RecordResult(False, "pg", False, w, s, m, None, dk, Decimal("0"), "pool_unavailable")
+
+    if not await _ensure_schema_pg():
+        return RecordResult(
+            False, "pg", False, w, s, m, None, dk, Decimal("0"), "schema_unavailable"
+        )
 
     realized = Decimal("0")
 
@@ -844,15 +919,15 @@ async def _record_fill_pg(
                     m,
                     dec,
                     qraw,
-                    str(qtyui),
-                    str(px),
-                    str(notion),
+                    qtyui,
+                    px,
+                    notional,
                     sig,
                     dk,
-                    poolv,
-                    routev,
+                    pool or None,
+                    route or None,
                     statusv,
-                    metav,
+                    meta_json,
                 )
                 if not row:
                     return RecordResult(
@@ -875,9 +950,9 @@ async def _record_fill_pg(
                         t,
                         dec,
                         qraw,
-                        str(px),
-                        str(notion),
-                        metav,
+                        px,
+                        notional,
+                        meta_json,
                     )
                     return RecordResult(
                         True, "pg", True, w, s, m, fill_id, dk, Decimal("0"), "inserted_buy"
@@ -901,6 +976,7 @@ async def _record_fill_pg(
                 for lot in lots:
                     if sell_qty_left <= 0:
                         break
+
                     lot_id = int(lot["id"])
                     rem = int(lot["remaining_qty_raw"])
                     ldec = int(lot["decimals"] or 0)
@@ -932,16 +1008,16 @@ async def _record_fill_pg(
                         t,
                         use,
                         ldec,
-                        str(buy_px),
-                        str(sell_px),
-                        str(pnl),
+                        buy_px,
+                        sell_px,
+                        pnl,
                     )
 
                     realized += pnl
                     sell_qty_left -= use
 
                 if sell_qty_left > 0:
-                    log.event(
+                    _log_event(
                         "LEDGER_SELL_UNMATCHED_QTY",
                         wallet=w,
                         mint=m,
@@ -957,7 +1033,7 @@ async def _record_fill_pg(
             await _reset_pool_soft(reason=f"record transient: {err}")
         if _strict_mode():
             raise
-        log.event("LEDGER_RECORD_PG_ERR", err=_short_exc(err), wallet=w, side=s, mint=m)
+        _log_event("LEDGER_RECORD_PG_ERR", err=_short_exc(err), wallet=w, side=s, mint=m)
         return RecordResult(
             False, "pg", False, w, s, m, None, dk, Decimal("0"), f"pg_error:{_short_exc(err)}"
         )
@@ -1012,20 +1088,19 @@ async def _record_fill_sqlite(  # pragma: no cover (dev-only)
     dk = (dedupe_key or "").strip()
     if not dk:
         dk = _compute_dedupe_key(
-            wallet=w, side=s, mint=m, qty_raw=qraw, decimals=dec, price_sol=px, ts=t, sig=sig
+            wallet=w, side=s, mint=m, qty_raw=qraw, decimals=dec, price_sol=_d(px), ts=t, sig=sig
         )
 
     qtyui = float(_qty_ui(qraw, dec))
-    notion = float(qtyui * px)
-
-    import json
+    notional = float(Decimal(str(qtyui)) * Decimal(str(px)))
+    meta_json = _json_dumps(meta)
 
     with _sqlite_conn() as con:
         try:
             con.execute(
                 "INSERT INTO fills(ts, wallet, side, mint, qty_raw, decimals, price_sol, notional_sol, sig, dedupe_key, meta) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (t, w, s, m, qraw, dec, float(px), float(notion), sig, dk, json.dumps(meta or {})),
+                (t, w, s, m, qraw, dec, float(px), float(notional), sig, dk, meta_json),
             )
             con.commit()
             return RecordResult(True, "sqlite", True, w, s, m, None, dk, Decimal("0"), "inserted")
@@ -1108,7 +1183,6 @@ async def record_fill_async(
             "reason": res.reason,
         }
 
-    # PG default
     try:
         res = await _record_fill_pg(
             wallet=w,
@@ -1137,7 +1211,7 @@ async def record_fill_async(
     except Exception as e:
         if _strict_mode():
             raise
-        log.event(
+        _log_event(
             "LEDGER_RECORD_ERR",
             backend="pg",
             err=_short_exc(e),
@@ -1179,11 +1253,11 @@ def record_fill(
     - If we're already in an event loop: fire-and-forget task (best-effort).
     - Otherwise: run the async method to completion.
 
-    If you need deterministic persistence, call `await record_fill_async(...)`.
+    For deterministic persistence, call `await record_fill_async(...)`.
     """
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(
+        task = loop.create_task(
             record_fill_async(
                 side=side,
                 mint=mint,
@@ -1200,6 +1274,12 @@ def record_fill(
                 dedupe_key=dedupe_key,
             )
         )
+
+        def _done(t: asyncio.Task[dict[str, Any]]) -> None:
+            with contextlib.suppress(Exception):
+                _ = t.result()
+
+        task.add_done_callback(_done)
     except RuntimeError:
         asyncio.run(
             record_fill_async(
@@ -1219,7 +1299,7 @@ def record_fill(
             )
         )
     except Exception as e:
-        log.event("LEDGER_RECORD_SYNC_ERR", err=_short_exc(e))
+        _log_event("LEDGER_RECORD_SYNC_ERR", err=_short_exc(e))
 
 
 # -----------------------------------------------------------------------------
@@ -1232,10 +1312,9 @@ async def realized_pnl_range_async(
     wallet: str | None = None,
     mint: str | None = None,
 ) -> float:
-    """
-    Sum realized PnL (SOL) for sells whose timestamp is within [start_ts, end_ts].
-    """
+    """Sum realized PnL (SOL) for sells whose timestamp is within [start_ts, end_ts]."""
     backend = _backend()
+
     if backend == "sqlite":
         if not _sqlite_allowed():
             return 0.0
@@ -1252,13 +1331,15 @@ async def realized_pnl_range_async(
             return 0.0
 
     try:
-        await _ensure_schema_pg()
         w = (wallet or "").strip() or _default_wallet()
         if not w:
             return 0.0
 
         pool = await _get_pg_pool(timeout_s=5.0, app_name="ledger.pnl_range")
         if pool is None:
+            return 0.0
+
+        if not await _ensure_schema_pg():
             return 0.0
 
         async with pool.acquire() as con:
@@ -1285,11 +1366,12 @@ async def realized_pnl_range_async(
                     int(start_ts),
                     int(end_ts),
                 )
+
         return float(_d(row["pnl"] if row else 0))
     except Exception as e:
         if _strict_mode():
             raise
-        log.event("LEDGER_PNL_RANGE_ERR", err=_short_exc(e))
+        _log_event("LEDGER_PNL_RANGE_ERR", err=_short_exc(e))
         return 0.0
 
 
@@ -1302,6 +1384,7 @@ async def realized_pnl_today_async(
     """
     import datetime as dt
 
+    _ = tz  # reserved
     d = dt.datetime.utcnow().date()
     start = int(dt.datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=dt.UTC).timestamp())
     end = int(dt.datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=dt.UTC).timestamp())
@@ -1309,12 +1392,10 @@ async def realized_pnl_today_async(
 
 
 def realized_pnl_today(*, wallet: str | None = None, mint: str | None = None) -> float:
-    """
-    Sync wrapper for realized_pnl_today_async().
-    """
+    """Sync wrapper for realized_pnl_today_async()."""
     try:
         asyncio.get_running_loop()
-        log.event(
+        _log_event(
             "LEDGER_SYNC_PNL_CALLED_IN_LOOP", wallet=(wallet or "").strip() or _default_wallet()
         )
         return 0.0

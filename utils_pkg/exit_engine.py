@@ -17,6 +17,8 @@ positions, while delegating execution to the best available mechanism:
   ✅ Early follow-through protection (bad/no follow-through)
   ✅ Liquidity collapse exit (if liquidity data exists)
   ✅ Quote sanity (optional) before enqueue/direct fallback
+  ✅ Optional TP ladder (only if provided in position payload; no env keys added)
+  ✅ Optional risk_manager gating hook (best-effort; no hard dependency)
 
 It also:
   • Tracks open positions (in-memory + optional reconciliation via position_store)
@@ -64,6 +66,7 @@ import asyncio
 import contextlib
 import datetime as _dt
 import importlib
+import inspect
 import json
 import os
 import time
@@ -74,10 +77,12 @@ from typing import Any
 # =============================================================================
 # Identity / constants
 # =============================================================================
-EXIT_ENGINE_VERSION = "V3+++_LOCKIN_2026-01-10"
+EXIT_ENGINE_VERSION = "V3+++_LOCKIN_2026-02-06"
 _SOL_MINT = "So11111111111111111111111111111111111111112"
 _BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
-LAMPORTS_PER_SOL = 1_000_000_000  # kept for downstream compatibility
+
+# kept for downstream compatibility
+LAMPORTS_PER_SOL = 1_000_000_000
 
 INSTANCE_ID = (
     (os.getenv("INSTANCE_ID") or "").strip()
@@ -130,7 +135,6 @@ _install_log_shims()
 
 
 def _log(name: str, level: str = "info", **fields: Any) -> None:
-    # best-effort structured
     with contextlib.suppress(Exception):
         log.event(name, **fields)  # type: ignore[misc]
         return
@@ -145,7 +149,7 @@ def _log(name: str, level: str = "info", **fields: Any) -> None:
 
 
 # =============================================================================
-# Env helpers
+# Env helpers (DO NOT add new env keys lightly; contract tests enforce them)
 # =============================================================================
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
 _FALSE = {"0", "false", "f", "no", "n", "off"}
@@ -214,16 +218,15 @@ def _short_exc(e: BaseException, n: int = 260) -> str:
 
 
 async def _maybe_await(x: Any) -> Any:
-    if asyncio.iscoroutine(x):
+    if inspect.isawaitable(x):
         return await x
     return x
 
 
 def _json_default(o: Any) -> str:
-    try:
+    with contextlib.suppress(Exception):
         return str(o)
-    except Exception:
-        return "<unserializable>"
+    return "<unserializable>"
 
 
 def _json_dumps(payload: Any) -> str:
@@ -334,6 +337,8 @@ def _to_float(v: Any) -> float | None:
             return float(int(v))
         if isinstance(v, (int, float)):
             f = float(v)
+            if f != f or f in (float("inf"), float("-inf")):
+                return None
             return f
         if isinstance(v, str):
             s = v.strip()
@@ -341,6 +346,8 @@ def _to_float(v: Any) -> float | None:
                 return None
             s = s.replace(",", "")
             f2 = float(s)
+            if f2 != f2 or f2 in (float("inf"), float("-inf")):
+                return None
             return f2
     except Exception:
         return None
@@ -633,7 +640,7 @@ class ExitCfg:
 
 
 def _load_cfg() -> ExitCfg:
-    master = max(0, min(7, _env_int("MASTER_PHASE", _env_int("STRATEGY_PHASE", 7))))
+    master = max(0, min(8, _env_int("MASTER_PHASE", _env_int("STRATEGY_PHASE", 7))))
 
     dryrun = bool(
         _env_bool("DRYRUN", False)
@@ -820,6 +827,7 @@ async def _get_redis_async() -> Any:
     cu = _get_mod("utils_pkg.core_utils")
     if not cu:
         return None
+
     r = getattr(cu, "redis", None)
     if r is not None:
         return r
@@ -835,6 +843,7 @@ async def _get_redis_async() -> Any:
         with contextlib.suppress(Exception):
             out2 = gr()
             return await _maybe_await(out2)
+
     return None
 
 
@@ -911,6 +920,10 @@ class _Pos:
 
     follow_done: bool = False
     follow_pass: bool = False
+
+    # Optional profit-taking ladder index (only used if ladder is provided in payload/meta)
+    tp_next_idx: int = 0
+
     closed: bool = False
 
 
@@ -981,6 +994,7 @@ def _build_open_snapshot_nolock(now: float) -> dict[str, dict[str, Any]]:
             "opened_from": pos.opened_from,
             "follow_done": bool(pos.follow_done),
             "follow_pass": bool(pos.follow_pass),
+            "tp_next_idx": int(pos.tp_next_idx),
             "last_tick_ts": float(pos.last_tick_ts),
             "version": EXIT_ENGINE_VERSION,
             "instance": INSTANCE_ID,
@@ -1096,7 +1110,7 @@ def _scope_ok(snapshot: Mapping[str, Any]) -> bool:
 
 
 # =============================================================================
-# Metrics / deterministic decision object
+# Metrics / decision object
 # =============================================================================
 def _compute_metrics(
     entry: float | None, maxp: float | None, minp: float | None, last: float | None
@@ -1205,6 +1219,48 @@ async def _load_position_from_store_best_effort(mint: str) -> Mapping[str, Any] 
         except Exception:
             continue
     return None
+
+
+# =============================================================================
+# Optional risk_manager gate (best-effort; NO hard dependency)
+# =============================================================================
+async def _risk_gate_async(
+    decision: Mapping[str, Any], snapshot: Mapping[str, Any]
+) -> tuple[bool, str]:
+    hard = bool(decision.get("hard") or False)
+    rm = _get_mod("utils_pkg.risk_manager")
+    if not rm:
+        return True, "no_risk_manager"
+
+    candidates = (
+        "allow_exit",
+        "can_exit",
+        "exit_allowed",
+        "check_exit_allowed",
+        "is_exit_allowed",
+        "guard_exit",
+        "gate_exit",
+    )
+    for nm in candidates:
+        fn = getattr(rm, nm, None)
+        if not callable(fn):
+            continue
+        try:
+            out = fn(dict(decision), dict(snapshot))
+            out = await _maybe_await(out)
+            if isinstance(out, bool):
+                if (not out) and hard:
+                    return True, "risk_gate_block_soft_only"
+                return bool(out), "risk_gate_bool"
+            if isinstance(out, Mapping):
+                allow = out.get("allow")
+                if isinstance(allow, bool):
+                    if (not allow) and hard:
+                        return True, "risk_gate_block_soft_only"
+                    return bool(allow), str(out.get("reason") or "risk_gate_map")
+        except Exception:
+            continue
+    return True, "risk_gate_unknown"
 
 
 # =============================================================================
@@ -1340,8 +1396,8 @@ async def _direct_sell_best_effort(*, mint: str, amount_raw: int, slippage_bps: 
         return None
 
     with contextlib.suppress(Exception):
-        LI = _get_mod("utils_pkg.lightning_impl")
-        fn = getattr(LI, "sell_via_lightning", None) if LI else None
+        li = _get_mod("utils_pkg.lightning_impl")
+        fn = getattr(li, "sell_via_lightning", None) if li else None
         if callable(fn):
             with contextlib.suppress(TypeError):
                 sig = await _maybe_await(
@@ -1382,6 +1438,18 @@ async def _delegate_exit(
         return False
 
     now = float(_to_float(decision.get("ts")) or time.time())
+
+    # gate: risk_manager (best-effort). Hard exits are allowed even if it tries to block.
+    allow, gate_note = await _risk_gate_async(decision, snapshot)
+    if not allow and not bool(decision.get("hard") or False):
+        _log(
+            "EXIT_BLOCKED_BY_RISK_GATE",
+            level="warning",
+            mint=mint,
+            note=gate_note,
+            reason=str(decision.get("reason") or ""),
+        )
+        return False
 
     if not _exit_dedupe_ok(mint, now) or not _burst_cap_ok(now):
         return False
@@ -1483,6 +1551,7 @@ async def _delegate_exit(
                 )
                 return False
 
+    # AI sell brain hook (best effort)
     for hook_name in ("schedule_force_exit", "force_exit", "request_exit", "exit_now"):
         hook = _sell_hook(hook_name)
         if hook is None:
@@ -1565,6 +1634,10 @@ async def request_exit(ev: dict[str, Any]) -> bool:
     pool = _extract_pool(ev)
     now = time.time()
 
+    snapshot: dict[str, Any] = dict(ev)
+    if "sell_pct" not in snapshot and "sellPct" in snapshot:
+        snapshot["sell_pct"] = snapshot.get("sellPct")
+
     decision = _decision(
         action="EXIT",
         reason=str(ev.get("reason") or "external_request"),
@@ -1576,7 +1649,7 @@ async def request_exit(ev: dict[str, Any]) -> bool:
         extras={"source": "exit_engine.request_exit"},
     )
     await _log_exit_event_safe({**decision, "label": "exit_requested"})
-    ok = await _delegate_exit(decision=decision, snapshot=ev, amount_raw=amount_raw)
+    ok = await _delegate_exit(decision=decision, snapshot=snapshot, amount_raw=amount_raw)
     return bool(ok)
 
 
@@ -1697,6 +1770,52 @@ async def on_sell_filled(ev: dict[str, Any]) -> None:
 
 
 # =============================================================================
+# TP ladder (optional): only if provided in payload/meta; no env keys
+# =============================================================================
+def _parse_tp_ladder_from_any(obj: Mapping[str, Any] | None) -> list[tuple[float, float]]:
+    """
+    Accepts:
+      - tp_ladder: [(pnl_pct, sell_pct), ...]
+      - tp_ladder: [{"pnl_pct": 25, "sell_pct": 0.25}, ...]
+      - tp_levels / take_profit_levels similarly
+    Returns sorted unique ladder by pnl_pct ascending.
+    """
+    if not obj:
+        return []
+    for key in ("tp_ladder", "tp_levels", "take_profit_levels", "take_profit"):
+        raw = obj.get(key)
+        if raw is None:
+            continue
+        ladder: list[tuple[float, float]] = []
+        if isinstance(raw, (list, tuple)):
+            for it in raw:
+                if isinstance(it, (list, tuple)) and len(it) >= 2:
+                    a = _to_float(it[0])
+                    b = _to_float(it[1])
+                    if a is not None and b is not None:
+                        ladder.append((float(a), float(b)))
+                elif isinstance(it, Mapping):
+                    a2 = _to_float(
+                        it.get("pnl_pct") or it.get("tp_pct") or it.get("pnl") or it.get("pct")
+                    )
+                    b2 = _to_float(
+                        it.get("sell_pct") or it.get("sell") or it.get("portion") or it.get("size")
+                    )
+                    if a2 is not None and b2 is not None:
+                        ladder.append((float(a2), float(b2)))
+        if ladder:
+            norm: dict[float, float] = {}
+            for pnl, sp in ladder:
+                if pnl != pnl:
+                    continue
+                sp2 = _clamp(float(sp), 0.01, 1.0)
+                norm[float(pnl)] = sp2
+            out = sorted(norm.items(), key=lambda x: x[0])
+            return [(p, s) for (p, s) in out]
+    return []
+
+
+# =============================================================================
 # The DECIDER (contract tests call this)
 # =============================================================================
 def _map_position_fields(pos: Mapping[str, Any]) -> dict[str, Any]:
@@ -1724,6 +1843,7 @@ def _map_position_fields(pos: Mapping[str, Any]) -> dict[str, Any]:
         "entry_liq_usd": _extract_liq_usd(pos),
         "follow_done": bool(pos.get("follow_done") or False),
         "follow_pass": bool(pos.get("follow_pass") or False),
+        "tp_ladder": _parse_tp_ladder_from_any(pos),
     }
 
 
@@ -1790,7 +1910,6 @@ async def on_trade_tick(
     meta_in = _as_mapping(meta) or {}
 
     now = _deterministic_now(now_ts, tick_in, pos_in)
-
     with contextlib.suppress(Exception):
         await _housekeeping(now)
 
@@ -1822,6 +1941,7 @@ async def on_trade_tick(
                     "entry_liq_usd": p.entry_liq_usd,
                     "follow_done": bool(p.follow_done),
                     "follow_pass": bool(p.follow_pass),
+                    "tp_ladder": [],
                 }
 
     if pos_norm is None or not pos_norm.get("mint"):
@@ -1856,6 +1976,8 @@ async def on_trade_tick(
     trades_after: int
     max_price: float | None
     min_price: float | None
+    amount_raw_opt: int | None
+    tp_next_idx: int
 
     async with _OPEN_LOCK:
         p = _OPEN.get(mint)
@@ -1906,11 +2028,13 @@ async def on_trade_tick(
             min_price = p.min_price
             trades_after = int(p.trades_after_entry)
             amount_raw_opt = p.amount_raw
+            tp_next_idx = int(p.tp_next_idx)
         else:
             max_price = last_price
             min_price = last_price
             trades_after = int(trades or 0)
             amount_raw_opt = _coerce_int_opt(pos_norm.get("amount_raw"))
+            tp_next_idx = 0
 
     if max_price is None:
         mp = _to_float(meta_in.get("max_price") or meta_in.get("high") or meta_in.get("ath"))
@@ -1925,6 +2049,18 @@ async def on_trade_tick(
     age_min = age_sec / 60.0
 
     metrics = _compute_metrics(entry_price, max_price, min_price, last_price)
+
+    # TP ladder can come from position OR meta
+    tp_ladder = []
+    with contextlib.suppress(Exception):
+        if isinstance(pos_norm.get("tp_ladder"), list):
+            tp_ladder = [
+                (float(a), float(b))
+                for (a, b) in pos_norm["tp_ladder"]
+                if isinstance(a, (int, float)) and isinstance(b, (int, float))
+            ]
+    if not tp_ladder:
+        tp_ladder = _parse_tp_ladder_from_any(meta_in)
 
     snapshot: dict[str, Any] = {
         "mint": mint,
@@ -1944,7 +2080,7 @@ async def on_trade_tick(
         "trades_after_entry": int(trades_after),
         "sell_pct": float(CFG.fallback_sell_pct),
     }
-    amt_for_exit: int | None = amount_raw_opt  # <-- typed, fixes mypy arg-type errors
+    amt_for_exit: int | None = amount_raw_opt
 
     if not _scope_ok(snapshot):
         return _decision(
@@ -1976,6 +2112,8 @@ async def on_trade_tick(
     # -----------------------------
     # RULES (deterministic)
     # -----------------------------
+
+    # 0) Hard stop-loss
     if float(metrics["pnl_pct"]) <= -float(CFG.stop_loss_pct):
         dec = _decision(
             action="EXIT",
@@ -1992,6 +2130,7 @@ async def on_trade_tick(
         _ = await _delegate_exit(decision=dec, snapshot=snapshot, amount_raw=amt_for_exit)
         return dec
 
+    # 1) Hard liquidity floor
     if float(CFG.min_liq_usd) > 0.0 and snapshot.get("last_liq_usd") is not None:
         if float(_to_float(snapshot["last_liq_usd"]) or 0.0) < float(CFG.min_liq_usd):
             dec = _decision(
@@ -2009,6 +2148,7 @@ async def on_trade_tick(
             _ = await _delegate_exit(decision=dec, snapshot=snapshot, amount_raw=amt_for_exit)
             return dec
 
+    # 2) Liquidity collapse % from entry
     if (
         float(CFG.liq_collapse_pct) > 0.0
         and snapshot.get("entry_liq_usd")
@@ -2034,6 +2174,36 @@ async def on_trade_tick(
                 _ = await _delegate_exit(decision=dec, snapshot=snapshot, amount_raw=amt_for_exit)
                 return dec
 
+    # 3) Optional TP ladder (only if provided)
+    if tp_ladder and float(metrics["pnl_pct"]) > 0.0:
+        if 0 <= tp_next_idx < len(tp_ladder):
+            target_pnl, sell_pct = tp_ladder[tp_next_idx]
+            if float(metrics["pnl_pct"]) >= float(target_pnl):
+                snapshot["sell_pct"] = _clamp(float(sell_pct), 0.01, 1.0)
+                dec = _decision(
+                    action="EXIT",
+                    reason=f"tp_ladder_{tp_next_idx}",
+                    mint=mint,
+                    symbol=symbol,
+                    pool=pool,
+                    now_ts=now,
+                    hard=False,
+                    metrics=metrics,
+                    extras={
+                        "tp_target_pnl_pct": float(target_pnl),
+                        "sell_pct": float(snapshot["sell_pct"]),
+                    },
+                )
+                await _log_exit_event_safe({**dec, "label": "exit_signal"})
+                ok = await _delegate_exit(decision=dec, snapshot=snapshot, amount_raw=amt_for_exit)
+                if ok:
+                    async with _OPEN_LOCK:
+                        p5 = _OPEN.get(mint)
+                        if p5 and not p5.closed:
+                            p5.tp_next_idx = int(p5.tp_next_idx) + 1
+                return dec
+
+    # 4) Trailing stop (armed by up%)
     if float(CFG.trailing_arm_pct) > 0.0:
         if float(metrics["up_pct"]) >= float(CFG.trailing_arm_pct) and float(
             metrics["peak_dd_pct"]
@@ -2053,6 +2223,7 @@ async def on_trade_tick(
             _ = await _delegate_exit(decision=dec, snapshot=snapshot, amount_raw=amt_for_exit)
             return dec
 
+    # 5) Time stop
     if int(CFG.time_stop_min) > 0 and age_min >= float(CFG.time_stop_min):
         if float(metrics["pnl_pct"]) < float(CFG.time_stop_min_profit_pct):
             dec = _decision(
@@ -2070,6 +2241,7 @@ async def on_trade_tick(
             _ = await _delegate_exit(decision=dec, snapshot=snapshot, amount_raw=amt_for_exit)
             return dec
 
+    # 6) Stagnant exit
     if int(CFG.stagnant_max_min) > 0 and age_min >= float(CFG.stagnant_max_min):
         if float(metrics["range_pct"]) < float(CFG.stagnant_min_move_pct):
             dec = _decision(
@@ -2087,6 +2259,7 @@ async def on_trade_tick(
             _ = await _delegate_exit(decision=dec, snapshot=snapshot, amount_raw=amt_for_exit)
             return dec
 
+    # 7) Follow-through gate
     if CFG.follow_enabled:
         follow_done = bool(pos_norm.get("follow_done") or False)
         follow_pass_prev = bool(pos_norm.get("follow_pass") or False)
@@ -2171,6 +2344,7 @@ async def on_trade_tick(
                     )
                     return dec
 
+    # AI hook: informational only (no hard dependency)
     if not _is_safe_mode():
         fn_ai = _sell_hook("on_trade_tick")
         if fn_ai is not None:
