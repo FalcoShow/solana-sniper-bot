@@ -11,6 +11,7 @@ Goals
 - No event-loop misuse.
 - No hangs: sync fallback runs in a real subprocess with hard timeout.
 - JSON output is clean & stable, especially with --json-only.
+- Dotenv loading never uses find_dotenv() (avoids stdin/frame assertion edge cases).
 
 Modes
 -----
@@ -31,16 +32,20 @@ HEALTHCHECK_MODE=auto|http|local
 HEALTHCHECK_URL=...
 HEALTHCHECK_HTTP_PATH=/readyz
 PORT=8080
+
 HEALTHCHECK_RETRIES=2
 HEALTHCHECK_RETRY_DELAY_S=0.15
 HEALTHCHECK_HTTP_TIMEOUT_S=1.2
 HEALTHCHECK_TIMEOUT_S=8.0
+
 HEALTHCHECK_DEEP=0/1
 HEALTHCHECK_JSON=0/1
 HEALTHCHECK_JSON_ONLY=0/1
+
 HEALTHCHECK_ALLOW_LOCAL_FALLBACK=0/1   (auto mode)
 HEALTHCHECK_ALLOW_SYNC_FALLBACK=0/1    (local mode if only sync exists)
 HEALTHCHECK_NO_DOTENV=0/1
+
 SKIP_HEALTHCHECK=0/1 (and a few aliases)
 """
 
@@ -58,11 +63,18 @@ import traceback
 from pathlib import Path
 from typing import Any, Final, Mapping
 
+# ----------------------------
+# Exit codes (contract)
+# ----------------------------
 RC_READY: Final[int] = 0
 RC_NOT_READY: Final[int] = 1
 RC_MISCONFIG: Final[int] = 2
 RC_CTRL_C: Final[int] = 130
 
+
+# ----------------------------
+# Parsing helpers
+# ----------------------------
 _TRUE: Final[set[str]] = {"1", "true", "yes", "y", "on", "t"}
 _FALSE: Final[set[str]] = {"0", "false", "no", "n", "off", "f"}
 
@@ -73,6 +85,7 @@ _KV_SECRET_RE: Final[re.Pattern[str]] = re.compile(
 
 
 def _ts() -> str:
+    # Stable ISO8601 UTC with Z, matches prior outputs
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
@@ -125,6 +138,9 @@ def _mask_url(u: str) -> str:
     return out
 
 
+# ----------------------------
+# Repo bootstrap + dotenv
+# ----------------------------
 def _bootstrap_repo_root() -> str:
     """
     Ensure repo root is on sys.path so `python -m scripts.healthcheck` works
@@ -153,18 +169,22 @@ def _bootstrap_repo_root() -> str:
 
 
 def _maybe_load_dotenv() -> None:
+    """
+    Load dotenv ONLY from explicit paths to avoid python-dotenv find_dotenv()
+    frame assertion edge-cases (notably when code is executed via stdin).
+    """
     if _envb("HEALTHCHECK_NO_DOTENV", False):
         return
+
     with contextlib.suppress(Exception):
         from dotenv import load_dotenv  # type: ignore
 
-        repo = _envs("REPO_ROOT", "")
-        if repo:
+        repo = Path(_envs("REPO_ROOT", "")).resolve() if _envs("REPO_ROOT", "") else None
+        if repo and repo.exists():
             for nm in (".env.extra", ".env"):
-                p = Path(repo) / nm
+                p = repo / nm
                 if p.exists():
-                    load_dotenv(str(p), override=False)
-        load_dotenv(override=False)
+                    load_dotenv(dotenv_path=str(p), override=False)
 
 
 def _should_skip_entirely() -> tuple[bool, str]:
@@ -179,6 +199,9 @@ def _should_skip_entirely() -> tuple[bool, str]:
     return False, ""
 
 
+# ----------------------------
+# URL + kwargs helpers
+# ----------------------------
 def _default_health_url() -> str:
     u = _envs("HEALTHCHECK_URL", "").strip()
     if u:
@@ -207,7 +230,7 @@ def _filter_kwargs(fn: Any, kwargs: Mapping[str, Any]) -> dict[str, Any]:
 
 def _interpret_ready(payload: Any) -> tuple[bool, str]:
     """
-    Accept a few common readiness payload styles.
+    Accept common readiness payload styles.
     Tri-state aware: status=ok|degraded|fail.
     """
     if isinstance(payload, dict):
@@ -239,6 +262,9 @@ def _interpret_ready(payload: Any) -> tuple[bool, str]:
     return False, "unknown_payload_type"
 
 
+# ----------------------------
+# HTTP probe
+# ----------------------------
 async def _http_get(url: str, timeout_s: float) -> tuple[int, Any, str]:
     """
     Fast readiness probe. Prefers httpx if installed; falls back to urllib in a thread.
@@ -248,6 +274,7 @@ async def _http_get(url: str, timeout_s: float) -> tuple[int, Any, str]:
         raise RuntimeError("empty url")
     timeout_s = max(0.2, float(timeout_s))
 
+    # httpx fast path
     with contextlib.suppress(Exception):
         import httpx  # type: ignore
 
@@ -259,6 +286,7 @@ async def _http_get(url: str, timeout_s: float) -> tuple[int, Any, str]:
                     return int(r.status_code), r.json(), ctype
             return int(r.status_code), r.text, ctype
 
+    # urllib fallback (threaded)
     import urllib.error
     import urllib.request
 
@@ -271,7 +299,8 @@ async def _http_get(url: str, timeout_s: float) -> tuple[int, Any, str]:
                 body = resp.read().decode("utf-8", "ignore")
         except urllib.error.HTTPError as he:
             code = int(getattr(he, "code", 0) or 0)
-            ctype = (getattr(he, "headers", None) or {}).get("content-type", "")  # type: ignore[call-arg]
+            hdrs = getattr(he, "headers", None)
+            ctype = (hdrs.get("content-type") if hdrs else "") or ""
             ctype = str(ctype).lower()
             raw = he.read()
             body = (
@@ -286,6 +315,9 @@ async def _http_get(url: str, timeout_s: float) -> tuple[int, Any, str]:
     return await asyncio.to_thread(_do)
 
 
+# ----------------------------
+# JSON-only safety
+# ----------------------------
 @contextlib.contextmanager
 def _capture_stdio(enabled: bool):
     """
@@ -303,12 +335,14 @@ def _capture_stdio(enabled: bool):
         yield (buf_out, buf_err)
 
 
+# ----------------------------
+# Local snapshot (async preferred; sync subproc fallback)
+# ----------------------------
 def _sync_snapshot_subproc(
     *,
     deep: bool,
     hard_timeout_s: float,
     repo_root: str,
-    include_system: bool | None,
 ) -> dict[str, Any]:
     """
     Run health_snapshot_sync() in a REAL subprocess so we can hard-kill on timeout.
@@ -317,11 +351,10 @@ def _sync_snapshot_subproc(
     exe = sys.executable or "python"
     rr = str(repo_root or _envs("REPO_ROOT", ""))
 
-    inc_expr = "None" if include_system is None else ("True" if include_system else "False")
     code = (
         "import json; "
         "from utils_pkg.health import health_snapshot_sync; "
-        f"out = health_snapshot_sync(deep={int(bool(deep))}, include_system={inc_expr}); "
+        f"out = health_snapshot_sync(deep={int(bool(deep))}); "
         "print(json.dumps(out, ensure_ascii=False, default=str))"
     )
 
@@ -359,10 +392,7 @@ def _sync_snapshot_subproc(
             "err": f"sync_snapshot_subproc_failed: {type(e).__name__}: {e}",
         }
 
-    raw = (cp.stdout or "").strip()
-    if not raw:
-        raw = (cp.stderr or "").strip()
-
+    raw = (cp.stdout or "").strip() or (cp.stderr or "").strip()
     if not raw:
         return {
             "ts": _ts(),
@@ -412,8 +442,8 @@ async def _call_health_snapshot(*, deep: bool, timeout_s: float, json_only: bool
             "err": f"import_health_failed: {type(e).__name__}: {e}",
         }
 
-    hs = getattr(h, "health_snapshot", None)
     timeout_s = max(0.2, float(timeout_s))
+    hs = getattr(h, "health_snapshot", None)
 
     if callable(hs):
         kw = _filter_kwargs(hs, {"deep": deep})
@@ -450,7 +480,6 @@ async def _call_health_snapshot(*, deep: bool, timeout_s: float, json_only: bool
                 deep=deep,
                 hard_timeout_s=float(hard),
                 repo_root=str(repo_root),
-                include_system=None,
             )
 
     return {
@@ -463,10 +492,14 @@ async def _call_health_snapshot(*, deep: bool, timeout_s: float, json_only: bool
     }
 
 
+# ----------------------------
+# Main logic
+# ----------------------------
 async def _amain(args: argparse.Namespace) -> int:
     t0 = _now_ms()
 
     json_only = bool(args.json_only or _envb("HEALTHCHECK_JSON_ONLY", False))
+    # json-only implies emit json
     emit_json = bool(args.json or _envb("HEALTHCHECK_JSON", False) or json_only)
 
     skip, reason = _should_skip_entirely()
@@ -522,9 +555,7 @@ async def _amain(args: argparse.Namespace) -> int:
     async def _do_local() -> bool:
         snap = await _call_health_snapshot(deep=deep, timeout_s=snap_timeout_s, json_only=json_only)
         payload["snapshot"] = snap
-        # “No false greens”: only READY if ok is true.
         ok_local = bool(isinstance(snap, dict) and snap.get("ok") is True)
-        # Propagate tri-state if present
         st = str(snap.get("status", "")).lower() if isinstance(snap, dict) else ""
         if st in {"ok", "degraded", "fail"}:
             payload["status"] = st
@@ -601,7 +632,7 @@ async def _amain(args: argparse.Namespace) -> int:
 
     ok_local = await _do_local()
     payload["ok"] = bool(ok_local)
-    if not payload.get("status") or payload["status"] not in {"ok", "degraded", "fail"}:
+    if payload.get("status") not in {"ok", "degraded", "fail"}:
         payload["status"] = "ok" if ok_local else "fail"
     payload["ms"] = _now_ms() - t0
 

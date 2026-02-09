@@ -1,26 +1,23 @@
 # yaml-language-server: $schema=https://render.com/schema/render.yaml.json
-# render.yaml — God-Tier Blueprint (Phase 0–7 LOCK-IN)
+# render.yaml — God-Tier Blueprint (P0 Lock-In)
 #
 # Topology:
-#   - 1x Worker (pump-sniper): bash ./start.sh
-#   - 1x Postgres (sniper-db): private-only (ipAllowList: [])
-#   - 1x Key Value (sniper-redis): private-only (ipAllowList: [])
+#   - 1x Key Value (sniper-redis) — private-only
+#   - 1x Postgres  (sniper-db)    — private-only
+#   - 1x Worker    (pump-sniper)  — bash ./start.sh
 #
-# IMPORTANT:
-# - Keep secrets OUT of envVarGroups (no sync:false there).
-# - Put secrets under the worker's envVars with sync:false.
-# - Prefer fromService/fromDatabase wiring for REDIS_URL / DATABASE_URL, and let start.sh normalize.
+# Notes:
+# - Secrets MUST stay at service envVars with sync:false (never in envVarGroups).
+# - ai_db prefers SNIPER_DB_DSN, so we wire it explicitly from the database.
+# - Worker is correct for a trading bot (no requirement to bind $PORT).
 
 previews:
   generation: off
 
 envVarGroups:
-  # ---------------------------
-  # Non-secret runtime defaults
-  # ---------------------------
   - name: sniper-defaults
     envVars:
-      # Python runtime pin (Render supports PYTHON_VERSION as fully-qualified x.y.z)
+      # Python version pin (Render supports PYTHON_VERSION as fully-qualified x.y.z) :contentReference[oaicite:2]{index=2}
       - key: PYTHON_VERSION
         value: "3.13.4"
 
@@ -34,11 +31,11 @@ envVarGroups:
       - key: PYTHONFAULTHANDLER
         value: "1"
 
-      # start.sh control-plane defaults
+      # start.sh control-plane defaults (Render fail-closed)
       - key: RUN_MODE
         value: "bot"
       - key: START_STRICT
-        value: "1"              # fail-closed on Render
+        value: "1"
       - key: START_RUN_CHECK_ENV
         value: "1"
       - key: START_PRECHECKS
@@ -46,7 +43,7 @@ envVarGroups:
       - key: START_RUN_CI_SMOKE
         value: "0"
 
-      # dotenv loader controls (Render should not read repo .env files)
+      # dotenv policy (Render should not read repo .env files)
       - key: START_NO_DOTENV
         value: "1"
       - key: START_ALLOW_SOURCE_ENV
@@ -54,7 +51,7 @@ envVarGroups:
       - key: START_ENV_OVERRIDE
         value: "0"
 
-      # DB normalization / safety
+      # DSN normalization / safety
       - key: START_NORMALIZE_DSN
         value: "1"
       - key: START_ADD_SSLMODE
@@ -94,9 +91,10 @@ envVarGroups:
       - key: REDIS_TLS
         value: "0"
 
-  # ---------------------------
-  # Pump.fun knobs (non-secret)
-  # ---------------------------
+      # Safety: default OFF until you flip it on intentionally
+      - key: CANARY_TRADE_ENABLED
+        value: "0"
+
   - name: pumpfun-common
     envVars:
       - key: PUMPFUN_API_BASES
@@ -114,9 +112,6 @@ envVarGroups:
       - key: PUMPFUN_LOG_ERRORS_ONLY
         value: "1"
 
-  # ---------------------------
-  # Jupiter routing defaults (NO KEYS here)
-  # ---------------------------
   - name: jupiter-defaults
     envVars:
       - key: JUP_BASE_URL
@@ -131,9 +126,7 @@ envVarGroups:
         value: "0"
 
 services:
-  # ---------------------------------------------------------------------------
-  # Key Value (Redis) — private-only
-  # ---------------------------------------------------------------------------
+  # Key Value (Redis®-compatible) — private-only
   - type: keyvalue
     name: sniper-redis
     plan: free
@@ -141,9 +134,7 @@ services:
     ipAllowList: []
     maxmemoryPolicy: allkeys-lru
 
-  # ---------------------------------------------------------------------------
-  # Worker: main trading/orchestrator service
-  # ---------------------------------------------------------------------------
+  # Worker — trading/orchestrator
   - type: worker
     name: pump-sniper
     runtime: python
@@ -154,7 +145,7 @@ services:
       python -m pip install --upgrade pip
       python -m pip install -r requirements.txt
 
-      # Normalize CRLF -> LF for start.sh (Windows-safe, Render-safe)
+      # Normalize CRLF -> LF for start.sh (Windows-authored repos; Render-safe)
       python - <<'PY'
       from pathlib import Path
       p = Path("start.sh")
@@ -165,7 +156,7 @@ services:
       chmod +x start.sh || true
 
       # Fast shell syntax sanity (no env/secrets required)
-      bash ./start.sh bash-syntax
+      bash -n start.sh
 
       # Fast Python syntax sanity
       python -m compileall -q .
@@ -190,16 +181,12 @@ services:
       - fromGroup: pumpfun-common
       - fromGroup: jupiter-defaults
 
-      # ---- wiring (private network) ----
-
-      # Redis connection string (preferred)
+      # Redis wiring (private network)
       - key: REDIS_URL
         fromService:
           type: keyvalue
           name: sniper-redis
           property: connectionString
-
-      # Redis host/port (kept for compatibility; start.sh can synthesize too)
       - key: REDIS_HOST
         fromService:
           type: keyvalue
@@ -211,8 +198,16 @@ services:
           name: sniper-redis
           property: port
 
-      # Postgres DSNs — set multiple common keys for maximum compatibility
+      # Postgres wiring — set ALL common keys + SNIPER_DB_DSN (ai_db prefers this)
+      - key: SNIPER_DB_DSN
+        fromDatabase:
+          name: sniper-db
+          property: connectionString
       - key: PG_DSN_INTERNAL
+        fromDatabase:
+          name: sniper-db
+          property: connectionString
+      - key: PG_DSN
         fromDatabase:
           name: sniper-db
           property: connectionString
@@ -224,10 +219,6 @@ services:
         fromDatabase:
           name: sniper-db
           property: connectionString
-
-      # Optional safety: OFF by default (your code should honor this)
-      - key: CANARY_TRADE_ENABLED
-        value: "0"
 
       # ---- secrets (set in Render UI after first deploy) ----
       - key: KEYPAIR_PATH
@@ -258,9 +249,6 @@ services:
         sync: false
 
 databases:
-  # ---------------------------------------------------------------------------
-  # Postgres — private-only
-  # ---------------------------------------------------------------------------
   - name: sniper-db
     plan: basic-1gb
     region: oregon
