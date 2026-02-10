@@ -264,10 +264,13 @@ PY
 _paths=("$REPO_ROOT")
 [[ -d "$REPO_ROOT/src" ]] && _paths+=("$REPO_ROOT/src")
 
+# ---- ShellCheck SC2155 fix: declare/assign separately from export
 if [[ -n "${PYTHONPATH:-}" ]]; then
-  export PYTHONPATH="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")${PY_PATHSEP}${PYTHONPATH}"
+  PYTHONPATH="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")${PY_PATHSEP}${PYTHONPATH}"
+  export PYTHONPATH
 else
-  export PYTHONPATH="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")"
+  PYTHONPATH="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")"
+  export PYTHONPATH
 fi
 
 _log "Python: $("$PYTHON" -V 2>&1)"
@@ -672,7 +675,12 @@ if ! _is_true "${START_SKIP_WALLET}"; then
       case "${WALLET_PRIVATE_KEY}" in
         \[*|\{*)
           _write_wallet_file "${WALLET_PRIVATE_KEY}" || true
-          _verify_wallet_json && export WALLET_PRIVATE_KEY="$WALLET_PATH" || _warn "Wallet: inline JSON parse failed"
+          # ---- ShellCheck SC2015 fix: proper if/else (no A && B || C)
+          if _verify_wallet_json; then
+            export WALLET_PRIVATE_KEY="$WALLET_PATH"
+          else
+            _warn "Wallet: inline JSON parse failed"
+          fi
           ;;
       esac
     fi
@@ -680,7 +688,12 @@ if ! _is_true "${START_SKIP_WALLET}"; then
     if [[ -z "${WALLET_PRIVATE_KEY:-}" || ! -f "${WALLET_PRIVATE_KEY:-}" ]]; then
       if [[ -n "${WALLET_JSON:-}" ]]; then
         _write_wallet_file "${WALLET_JSON}" || true
-        _verify_wallet_json && export WALLET_PRIVATE_KEY="$WALLET_PATH" || _warn "Wallet: WALLET_JSON parse failed"
+        # ---- ShellCheck SC2015 fix
+        if _verify_wallet_json; then
+          export WALLET_PRIVATE_KEY="$WALLET_PATH"
+        else
+          _warn "Wallet: WALLET_JSON parse failed"
+        fi
       fi
     fi
 
@@ -690,7 +703,12 @@ if ! _is_true "${START_SKIP_WALLET}"; then
         if [[ ! -f "$WALLET_PATH" ]] || _is_true "${START_WALLET_OVERWRITE}"; then
           _decode_b64_to_file "$b64_val" || true
           chmod 600 "$WALLET_PATH" 2>/dev/null || true
-          _verify_wallet_json && export WALLET_PRIVATE_KEY="$WALLET_PATH" || _warn "Wallet: base64 decoded but JSON parse failed"
+          # ---- ShellCheck SC2015 fix
+          if _verify_wallet_json; then
+            export WALLET_PRIVATE_KEY="$WALLET_PATH"
+          else
+            _warn "Wallet: base64 decoded but JSON parse failed"
+          fi
         else
           export WALLET_PRIVATE_KEY="$WALLET_PATH"
         fi
