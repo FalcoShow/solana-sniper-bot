@@ -11,7 +11,6 @@ Goals
 - No event-loop misuse.
 - No hangs: sync fallback runs in a real subprocess with hard timeout.
 - JSON output is clean & stable, especially with --json-only.
-- Dotenv loading never uses find_dotenv() (avoids stdin/frame assertion edge cases).
 
 Modes
 -----
@@ -32,20 +31,16 @@ HEALTHCHECK_MODE=auto|http|local
 HEALTHCHECK_URL=...
 HEALTHCHECK_HTTP_PATH=/readyz
 PORT=8080
-
 HEALTHCHECK_RETRIES=2
 HEALTHCHECK_RETRY_DELAY_S=0.15
 HEALTHCHECK_HTTP_TIMEOUT_S=1.2
 HEALTHCHECK_TIMEOUT_S=8.0
-
 HEALTHCHECK_DEEP=0/1
 HEALTHCHECK_JSON=0/1
 HEALTHCHECK_JSON_ONLY=0/1
-
 HEALTHCHECK_ALLOW_LOCAL_FALLBACK=0/1   (auto mode)
 HEALTHCHECK_ALLOW_SYNC_FALLBACK=0/1    (local mode if only sync exists)
 HEALTHCHECK_NO_DOTENV=0/1
-
 SKIP_HEALTHCHECK=0/1 (and a few aliases)
 """
 
@@ -60,21 +55,16 @@ import subprocess
 import sys
 import time
 import traceback
+from collections.abc import Iterator
+from io import StringIO
 from pathlib import Path
-from typing import Any, Final, Mapping
+from typing import Any, Final, Mapping, cast
 
-# ----------------------------
-# Exit codes (contract)
-# ----------------------------
 RC_READY: Final[int] = 0
 RC_NOT_READY: Final[int] = 1
 RC_MISCONFIG: Final[int] = 2
 RC_CTRL_C: Final[int] = 130
 
-
-# ----------------------------
-# Parsing helpers
-# ----------------------------
 _TRUE: Final[set[str]] = {"1", "true", "yes", "y", "on", "t"}
 _FALSE: Final[set[str]] = {"0", "false", "no", "n", "off", "f"}
 
@@ -85,12 +75,15 @@ _KV_SECRET_RE: Final[re.Pattern[str]] = re.compile(
 
 
 def _ts() -> str:
-    # Stable ISO8601 UTC with Z, matches prior outputs
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def _now_ms() -> int:
     return int(time.monotonic() * 1000)
+
+
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, default=str)
 
 
 def _envs(k: str, d: str = "") -> str:
@@ -138,9 +131,6 @@ def _mask_url(u: str) -> str:
     return out
 
 
-# ----------------------------
-# Repo bootstrap + dotenv
-# ----------------------------
 def _bootstrap_repo_root() -> str:
     """
     Ensure repo root is on sys.path so `python -m scripts.healthcheck` works
@@ -169,22 +159,18 @@ def _bootstrap_repo_root() -> str:
 
 
 def _maybe_load_dotenv() -> None:
-    """
-    Load dotenv ONLY from explicit paths to avoid python-dotenv find_dotenv()
-    frame assertion edge-cases (notably when code is executed via stdin).
-    """
     if _envb("HEALTHCHECK_NO_DOTENV", False):
         return
-
     with contextlib.suppress(Exception):
         from dotenv import load_dotenv  # type: ignore
 
-        repo = Path(_envs("REPO_ROOT", "")).resolve() if _envs("REPO_ROOT", "") else None
-        if repo and repo.exists():
+        repo = _envs("REPO_ROOT", "")
+        if repo:
             for nm in (".env.extra", ".env"):
-                p = repo / nm
+                p = Path(repo) / nm
                 if p.exists():
-                    load_dotenv(dotenv_path=str(p), override=False)
+                    load_dotenv(str(p), override=False)
+        load_dotenv(override=False)
 
 
 def _should_skip_entirely() -> tuple[bool, str]:
@@ -199,9 +185,6 @@ def _should_skip_entirely() -> tuple[bool, str]:
     return False, ""
 
 
-# ----------------------------
-# URL + kwargs helpers
-# ----------------------------
 def _default_health_url() -> str:
     u = _envs("HEALTHCHECK_URL", "").strip()
     if u:
@@ -230,7 +213,7 @@ def _filter_kwargs(fn: Any, kwargs: Mapping[str, Any]) -> dict[str, Any]:
 
 def _interpret_ready(payload: Any) -> tuple[bool, str]:
     """
-    Accept common readiness payload styles.
+    Accept a few common readiness payload styles.
     Tri-state aware: status=ok|degraded|fail.
     """
     if isinstance(payload, dict):
@@ -262,9 +245,6 @@ def _interpret_ready(payload: Any) -> tuple[bool, str]:
     return False, "unknown_payload_type"
 
 
-# ----------------------------
-# HTTP probe
-# ----------------------------
 async def _http_get(url: str, timeout_s: float) -> tuple[int, Any, str]:
     """
     Fast readiness probe. Prefers httpx if installed; falls back to urllib in a thread.
@@ -274,7 +254,6 @@ async def _http_get(url: str, timeout_s: float) -> tuple[int, Any, str]:
         raise RuntimeError("empty url")
     timeout_s = max(0.2, float(timeout_s))
 
-    # httpx fast path
     with contextlib.suppress(Exception):
         import httpx  # type: ignore
 
@@ -286,7 +265,6 @@ async def _http_get(url: str, timeout_s: float) -> tuple[int, Any, str]:
                     return int(r.status_code), r.json(), ctype
             return int(r.status_code), r.text, ctype
 
-    # urllib fallback (threaded)
     import urllib.error
     import urllib.request
 
@@ -299,13 +277,16 @@ async def _http_get(url: str, timeout_s: float) -> tuple[int, Any, str]:
                 body = resp.read().decode("utf-8", "ignore")
         except urllib.error.HTTPError as he:
             code = int(getattr(he, "code", 0) or 0)
-            hdrs = getattr(he, "headers", None)
-            ctype = (hdrs.get("content-type") if hdrs else "") or ""
+            headers = getattr(he, "headers", None)
+            try:
+                ctype = (headers.get("content-type") if headers is not None else "") or ""
+            except Exception:
+                ctype = ""
             ctype = str(ctype).lower()
-            raw = he.read()
-            body = (
-                raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
-            )
+            raw = b""
+            with contextlib.suppress(Exception):
+                raw = he.read()
+            body = raw.decode("utf-8", "ignore") if raw else str(he)
 
         if "application/json" in ctype:
             with contextlib.suppress(Exception):
@@ -315,11 +296,8 @@ async def _http_get(url: str, timeout_s: float) -> tuple[int, Any, str]:
     return await asyncio.to_thread(_do)
 
 
-# ----------------------------
-# JSON-only safety
-# ----------------------------
 @contextlib.contextmanager
-def _capture_stdio(enabled: bool):
+def _capture_stdio(enabled: bool) -> Iterator[tuple[StringIO, StringIO] | None]:
     """
     When --json-only is used, prevent stray prints from breaking JSON output.
     """
@@ -327,22 +305,46 @@ def _capture_stdio(enabled: bool):
         yield None
         return
 
-    import io
-
-    buf_out = io.StringIO()
-    buf_err = io.StringIO()
+    buf_out = StringIO()
+    buf_err = StringIO()
     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
         yield (buf_out, buf_err)
 
 
-# ----------------------------
-# Local snapshot (async preferred; sync subproc fallback)
-# ----------------------------
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """
+    Best-effort extraction of a JSON object from noisy output.
+    We intentionally only accept dict payloads.
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+
+    # Fast path
+    with contextlib.suppress(Exception):
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return cast(dict[str, Any], obj)
+
+    # Noisy output path: find the last {...} block
+    start = s.rfind("{")
+    end = s.rfind("}")
+    if start >= 0 and end > start:
+        chunk = s[start : end + 1]
+        with contextlib.suppress(Exception):
+            obj2 = json.loads(chunk)
+            if isinstance(obj2, dict):
+                return cast(dict[str, Any], obj2)
+
+    return None
+
+
 def _sync_snapshot_subproc(
     *,
     deep: bool,
     hard_timeout_s: float,
     repo_root: str,
+    include_system: bool | None,
 ) -> dict[str, Any]:
     """
     Run health_snapshot_sync() in a REAL subprocess so we can hard-kill on timeout.
@@ -351,10 +353,11 @@ def _sync_snapshot_subproc(
     exe = sys.executable or "python"
     rr = str(repo_root or _envs("REPO_ROOT", ""))
 
+    inc_expr = "None" if include_system is None else ("True" if include_system else "False")
     code = (
         "import json; "
         "from utils_pkg.health import health_snapshot_sync; "
-        f"out = health_snapshot_sync(deep={int(bool(deep))}); "
+        f"out = health_snapshot_sync(deep={int(bool(deep))}, include_system={inc_expr}); "
         "print(json.dumps(out, ensure_ascii=False, default=str))"
     )
 
@@ -392,21 +395,14 @@ def _sync_snapshot_subproc(
             "err": f"sync_snapshot_subproc_failed: {type(e).__name__}: {e}",
         }
 
+    combined = ((cp.stdout or "") + "\n" + (cp.stderr or "")).strip()
+    obj = _extract_json_object(combined)
+    if obj is not None:
+        return obj
+
     raw = (cp.stdout or "").strip() or (cp.stderr or "").strip()
     if not raw:
-        return {
-            "ts": _ts(),
-            "status": "fail",
-            "ok": False,
-            "ms": 0,
-            "checks": [],
-            "err": f"sync_snapshot_empty_output: rc={cp.returncode}",
-        }
-
-    with contextlib.suppress(Exception):
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return obj
+        raw = combined
 
     return {
         "ts": _ts(),
@@ -415,7 +411,7 @@ def _sync_snapshot_subproc(
         "ms": 0,
         "checks": [],
         "err": "sync_snapshot_bad_payload",
-        "raw": raw[:600],
+        "raw": (raw or "")[:600],
         "rc": int(cp.returncode),
     }
 
@@ -442,8 +438,8 @@ async def _call_health_snapshot(*, deep: bool, timeout_s: float, json_only: bool
             "err": f"import_health_failed: {type(e).__name__}: {e}",
         }
 
-    timeout_s = max(0.2, float(timeout_s))
     hs = getattr(h, "health_snapshot", None)
+    timeout_s = max(0.2, float(timeout_s))
 
     if callable(hs):
         kw = _filter_kwargs(hs, {"deep": deep})
@@ -480,6 +476,7 @@ async def _call_health_snapshot(*, deep: bool, timeout_s: float, json_only: bool
                 deep=deep,
                 hard_timeout_s=float(hard),
                 repo_root=str(repo_root),
+                include_system=None,
             )
 
     return {
@@ -492,14 +489,10 @@ async def _call_health_snapshot(*, deep: bool, timeout_s: float, json_only: bool
     }
 
 
-# ----------------------------
-# Main logic
-# ----------------------------
 async def _amain(args: argparse.Namespace) -> int:
     t0 = _now_ms()
 
     json_only = bool(args.json_only or _envb("HEALTHCHECK_JSON_ONLY", False))
-    # json-only implies emit json
     emit_json = bool(args.json or _envb("HEALTHCHECK_JSON", False) or json_only)
 
     skip, reason = _should_skip_entirely()
@@ -513,7 +506,7 @@ async def _amain(args: argparse.Namespace) -> int:
             "ms": _now_ms() - t0,
         }
         if emit_json:
-            print(json.dumps(payload, ensure_ascii=False, default=str))
+            print(_json_dumps(payload))
         else:
             print(f"READY (skipped: {reason})")
         return RC_READY
@@ -528,7 +521,7 @@ async def _amain(args: argparse.Namespace) -> int:
             "ms": _now_ms() - t0,
         }
         if emit_json:
-            print(json.dumps(payload, ensure_ascii=False, default=str))
+            print(_json_dumps(payload))
         else:
             print(f"MISCONFIG: {payload['error']}")
         return RC_MISCONFIG
@@ -570,14 +563,16 @@ async def _amain(args: argparse.Namespace) -> int:
             try:
                 code, data, ctype = await _http_get(url, timeout_s=max(0.2, http_timeout_s))
                 ready, why = _interpret_ready(data)
+                code_i = int(code)
+                ok_code = 200 <= code_i < 300
                 last_http = {
                     "url": _mask_url(url),
                     "attempt": i + 1,
-                    "status": int(code),
+                    "status": code_i,
                     "content_type": str(ctype),
                     "ready": bool(ready),
                     "why": str(why),
-                    "ok": bool(int(code) == 200 and ready),
+                    "ok": bool(ok_code and ready),
                 }
                 if last_http["ok"]:
                     ok_http = True
@@ -604,7 +599,7 @@ async def _amain(args: argparse.Namespace) -> int:
             payload["status"] = "ok"
             payload["ms"] = _now_ms() - t0
             if emit_json:
-                print(json.dumps(payload, ensure_ascii=False, default=str))
+                print(_json_dumps(payload))
             else:
                 print("READY (http)")
             return RC_READY
@@ -614,7 +609,7 @@ async def _amain(args: argparse.Namespace) -> int:
             payload["status"] = "fail"
             payload["ms"] = _now_ms() - t0
             if emit_json:
-                print(json.dumps(payload, ensure_ascii=False, default=str))
+                print(_json_dumps(payload))
             else:
                 print("NOT READY (http)")
             return RC_NOT_READY
@@ -625,19 +620,19 @@ async def _amain(args: argparse.Namespace) -> int:
             payload["status"] = "fail"
             payload["ms"] = _now_ms() - t0
             if emit_json:
-                print(json.dumps(payload, ensure_ascii=False, default=str))
+                print(_json_dumps(payload))
             else:
                 print("NOT READY (auto; fallback disabled)")
             return RC_NOT_READY
 
     ok_local = await _do_local()
     payload["ok"] = bool(ok_local)
-    if payload.get("status") not in {"ok", "degraded", "fail"}:
+    if not payload.get("status") or payload["status"] not in {"ok", "degraded", "fail"}:
         payload["status"] = "ok" if ok_local else "fail"
     payload["ms"] = _now_ms() - t0
 
     if emit_json:
-        print(json.dumps(payload, ensure_ascii=False, default=str))
+        print(_json_dumps(payload))
     else:
         print("READY (local)" if ok_local else "NOT READY (local)")
 
@@ -685,12 +680,7 @@ def main() -> None:
             or _envb("HEALTHCHECK_JSON_ONLY", False)
         )
         if wants_json:
-            print(
-                json.dumps(
-                    {"ts": _ts(), "status": "fail", "ok": False, "error": err[:1200]},
-                    ensure_ascii=False,
-                )
-            )
+            print(_json_dumps({"ts": _ts(), "status": "fail", "ok": False, "error": err[:1200]}))
         else:
             print(err)
         rc = RC_MISCONFIG

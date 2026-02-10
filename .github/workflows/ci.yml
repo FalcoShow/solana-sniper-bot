@@ -5,13 +5,6 @@ on:
   pull_request:
     branches: ["**"]
   workflow_dispatch:
-    inputs:
-      run_online_probes:
-        description: "Run optional online connectivity probes (RPC/Jupiter/router). Manual-only to avoid flaky PR failures."
-        required: false
-        default: "false"
-        type: choice
-        options: ["false", "true"]
 
 permissions:
   contents: read
@@ -20,8 +13,13 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 env:
   CI: "1"
+  TZ: "UTC"
 
   # Default posture: offline & deterministic (no flaky network PRs)
   SAFE_MODE: "1"
@@ -31,7 +29,7 @@ env:
   NO_NETWORK_POLICY: "1"
   PROBES_ENABLED: "0"
 
-  # Preflight + router contracts (kept for consistency with scripts)
+  # Preflight defaults
   PREFLIGHT: "1"
   PREFLIGHT_JSON_ONLY: "1"
   PREFLIGHT_STEP_TIMEOUT_S: "60"
@@ -40,31 +38,61 @@ env:
   CHECK_ROUTER_JSON_ONLY: "1"
   CHECK_ROUTER_HARD_EXIT: "1"
 
-  # Common python runtime knobs
+  # Python runtime knobs
   PYTHONUNBUFFERED: "1"
   PYTHONFAULTHANDLER: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  TZ: "UTC"
 
-  # Make imports work for both repo-root and src/ layouts (Linux ":" separator).
+  # Linux ":" separator is correct on GitHub runners
   PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/src
 
-  # Pin CI toolchain versions (critical for deterministic formatting)
-  RUFF_VERSION: "0.9.2"
-
-defaults:
-  run:
-    shell: bash
+  PYTHON_VERSION: "3.13"
+  # Align CI tooling with your pinned requirements-dev.txt (you currently use ruff==0.15.0 there)
+  RUFF_VERSION: "0.15.0"
 
 jobs:
+  shell:
+    name: Shell gates (start.sh bash + shellcheck + LF)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: CRLF guard (start.sh)
+        run: |
+          set -euo pipefail
+          if LC_ALL=C grep -q $'\r' start.sh; then
+            echo "FATAL: start.sh has CRLF line endings (must be LF for Render)." >&2
+            exit 1
+          fi
+
+      - name: bash -n start.sh
+        run: |
+          set -euo pipefail
+          bash -n start.sh
+
+      - name: shellcheck start.sh
+        run: |
+          set -euo pipefail
+          shellcheck start.sh
+
   quality:
     name: Quality (ruff + format + compileall)
     runs-on: ubuntu-latest
+    needs: shell
     timeout-minutes: 15
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Git EOL hygiene (deterministic checkouts)
         run: |
@@ -72,17 +100,16 @@ jobs:
           git config --global core.autocrlf false
           git config --global core.eol lf
 
-      - name: Setup Python (3.13)
-        uses: actions/setup-python@v6
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
-            pyproject.toml
 
-      - name: Install deps (runtime + dev)
+      - name: Install deps (runtime + dev) + pin ruff
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
@@ -97,11 +124,12 @@ jobs:
             python -m pip install -e ".[dev]" || true
           fi
 
+          # Force the exact ruff version CI expects (deterministic)
           python -m pip install "ruff==${RUFF_VERSION}"
 
-          python -m pip check || true
           python -c "import sys; print('python', sys.version)"
           ruff --version
+          python -m pip check
 
       - name: Ruff (check)
         run: |
@@ -118,21 +146,15 @@ jobs:
           set -euo pipefail
           python -m compileall -q -f .
 
-  smoke:
-    name: Smoke (no-network spine + init)
+  typecheck:
+    name: Typecheck (mypy, config-gated)
     runs-on: ubuntu-latest
     needs: quality
     timeout-minutes: 15
 
-    env:
-      NO_NETWORK: "1"
-      DISABLE_NETWORK: "1"
-      NO_NETWORK_POLICY: "1"
-      PROBES_ENABLED: "0"
-
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Git EOL hygiene (deterministic checkouts)
         run: |
@@ -140,15 +162,71 @@ jobs:
           git config --global core.autocrlf false
           git config --global core.eol lf
 
-      - name: Setup Python (3.13)
-        uses: actions/setup-python@v6
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
-            pyproject.toml
+
+      - name: Install deps (runtime + dev)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip wheel setuptools
+
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          elif [ -f pyproject.toml ]; then
+            python -m pip install -e ".[dev]" || true
+          fi
+
+      - name: Run mypy only if config exists
+        run: |
+          set -euo pipefail
+
+          HAS_CFG="0"
+          if [ -f mypy.ini ] || [ -f setup.cfg ]; then
+            HAS_CFG="1"
+          fi
+          if [ -f pyproject.toml ] && grep -q "^\[tool\.mypy\]" pyproject.toml; then
+            HAS_CFG="1"
+          fi
+
+          if [ "$HAS_CFG" = "1" ]; then
+            python -m mypy --no-incremental .
+          else
+            echo "No mypy config found. Skipping mypy."
+          fi
+
+  smoke:
+    name: Smoke (no-network spine + init)
+    runs-on: ubuntu-latest
+    needs: quality
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Git EOL hygiene (deterministic checkouts)
+        run: |
+          set -euo pipefail
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install deps (runtime + dev)
         run: |
@@ -166,8 +244,6 @@ jobs:
           fi
 
           python -m pip install -U pytest pytest-asyncio
-          python -m pip check || true
-          python -c "import sys; print('python', sys.version)"
 
       - name: Prepare artifacts dir
         run: |
@@ -192,83 +268,15 @@ jobs:
           path: artifacts
           if-no-files-found: ignore
 
-  typecheck:
-    name: Typecheck (mypy, config-gated)
-    runs-on: ubuntu-latest
-    needs: quality
-    timeout-minutes: 15
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Git EOL hygiene (deterministic checkouts)
-        run: |
-          set -euo pipefail
-          git config --global core.autocrlf false
-          git config --global core.eol lf
-
-      - name: Setup Python (3.13)
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
-            pyproject.toml
-            mypy.ini
-            setup.cfg
-
-      - name: Install deps (runtime + dev + mypy)
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip wheel setuptools
-
-          if [ -f requirements.txt ]; then
-            python -m pip install -r requirements.txt
-          fi
-          if [ -f requirements-dev.txt ]; then
-            python -m pip install -r requirements-dev.txt
-          elif [ -f pyproject.toml ]; then
-            python -m pip install -e ".[dev]" || true
-          fi
-
-          python -m pip install -U mypy
-
-      - name: Run mypy only if config exists
-        run: |
-          set -euo pipefail
-
-          HAS_CFG="0"
-          if [ -f mypy.ini ] || [ -f setup.cfg ]; then
-            HAS_CFG="1"
-          fi
-          if [ -f pyproject.toml ] && grep -q "^\[tool\.mypy\]" pyproject.toml; then
-            HAS_CFG="1"
-          fi
-
-          if [ "$HAS_CFG" = "1" ]; then
-            python -m mypy --no-incremental .
-          else
-            echo "No mypy config found (pyproject [tool.mypy] / mypy.ini / setup.cfg). Skipping mypy."
-          fi
-
   preflight:
     name: Preflight (deploy profile, deterministic)
     runs-on: ubuntu-latest
     needs: smoke
     timeout-minutes: 20
 
-    env:
-      NO_NETWORK: "1"
-      DISABLE_NETWORK: "1"
-      NO_NETWORK_POLICY: "1"
-      PROBES_ENABLED: "0"
-
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Git EOL hygiene (deterministic checkouts)
         run: |
@@ -276,15 +284,14 @@ jobs:
           git config --global core.autocrlf false
           git config --global core.eol lf
 
-      - name: Setup Python (3.13)
-        uses: actions/setup-python@v6
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
-            pyproject.toml
 
       - name: Install deps (runtime + dev)
         run: |
@@ -326,15 +333,9 @@ jobs:
     needs: preflight
     timeout-minutes: 30
 
-    env:
-      NO_NETWORK: "1"
-      DISABLE_NETWORK: "1"
-      NO_NETWORK_POLICY: "1"
-      PROBES_ENABLED: "0"
-
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Git EOL hygiene (deterministic checkouts)
         run: |
@@ -342,15 +343,14 @@ jobs:
           git config --global core.autocrlf false
           git config --global core.eol lf
 
-      - name: Setup Python (3.13)
-        uses: actions/setup-python@v6
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
-            pyproject.toml
 
       - name: Install deps (runtime + dev)
         run: |
@@ -366,7 +366,7 @@ jobs:
             python -m pip install -e ".[dev]" || true
           fi
 
-          python -m pip install -U pytest pytest-asyncio pytest-xdist
+          python -m pip install -U pytest pytest-asyncio
 
       - name: Prepare artifacts dir
         run: |
@@ -384,90 +384,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-artifacts
-          path: artifacts
-          if-no-files-found: ignore
-
-  online_probes:
-    name: Online Probes (optional, manual)
-    runs-on: ubuntu-latest
-    needs: tests
-    timeout-minutes: 20
-
-    steps:
-      # This step ALWAYS runs so the job is never "skipped" in the UI.
-      - name: Gate (manual-only)
-        run: |
-          set -euo pipefail
-          echo "event=${{ github.event_name }}"
-          echo "run_online_probes=${{ github.event.inputs.run_online_probes || 'false' }}"
-          if [ "${{ github.event_name }}" != "workflow_dispatch" ] || [ "${{ github.event.inputs.run_online_probes }}" != "true" ]; then
-            echo "Online probes are manual-only. This job is a no-op for push/PR runs."
-            exit 0
-          fi
-          echo "Online probes enabled: proceeding."
-
-      - name: Checkout
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_online_probes == 'true' }}
-        uses: actions/checkout@v6
-
-      - name: Git EOL hygiene (deterministic checkouts)
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_online_probes == 'true' }}
-        run: |
-          set -euo pipefail
-          git config --global core.autocrlf false
-          git config --global core.eol lf
-
-      - name: Setup Python (3.13)
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_online_probes == 'true' }}
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
-            pyproject.toml
-
-      - name: Install deps (runtime + dev)
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_online_probes == 'true' }}
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip wheel setuptools
-
-          if [ -f requirements.txt ]; then
-            python -m pip install -r requirements.txt
-          fi
-          if [ -f requirements-dev.txt ]; then
-            python -m pip install -r requirements-dev.txt
-          elif [ -f pyproject.toml ]; then
-            python -m pip install -e ".[dev]" || true
-          fi
-
-      - name: Prepare artifacts dir
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_online_probes == 'true' }}
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-
-      - name: check_router (json-only, hard-exit) — informational
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_online_probes == 'true' }}
-        env:
-          NO_NETWORK: "0"
-          DISABLE_NETWORK: "0"
-          NO_NETWORK_POLICY: "0"
-          PROBES_ENABLED: "1"
-          DRYRUN: "1"
-          SAFE_MODE: "1"
-          CHECK_ROUTER_JSON_ONLY: "1"
-          CHECK_ROUTER_HARD_EXIT: "1"
-        run: |
-          set -euo pipefail
-          python -m scripts.check_router --json-only --total-timeout 25 | tee artifacts/check_router.json
-
-      - name: Upload artifacts (online probes)
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_online_probes == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: online-probes-artifacts
           path: artifacts
           if-no-files-found: ignore

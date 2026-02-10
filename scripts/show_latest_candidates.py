@@ -532,7 +532,7 @@ async def run_once(args: argparse.Namespace) -> Any:
             # Sort by score if requested (desc by default)
             if score_field:
                 rows_scores.sort(
-                    key=lambda rs: (rs[1] if rs[1] is not None else -1e18), reverse=not args.asc
+                    key=lambda rs: rs[1] if rs[1] is not None else -1e18, reverse=not args.asc
                 )
 
             if not args.json:

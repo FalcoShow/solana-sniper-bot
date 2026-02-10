@@ -1,0 +1,111 @@
+name: Online Probes (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_timeout_s:
+        description: "Total timeout (seconds) for check_router probe"
+        required: false
+        default: "25"
+      fail_on_probe_error:
+        description: "If true, fail the workflow when probes fail"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: online-probes-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CI: "1"
+  TZ: "UTC"
+
+  # Online posture
+  NO_NETWORK: "0"
+  DISABLE_NETWORK: "0"
+  NO_NETWORK_POLICY: "0"
+  PROBES_ENABLED: "1"
+
+  # Keep the bot safe even when online
+  SAFE_MODE: "1"
+  DRYRUN: "1"
+
+  PYTHONUNBUFFERED: "1"
+  PYTHONFAULTHANDLER: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+  # Linux runner uses ":" for PYTHONPATH
+  PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/src
+
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  probes:
+    name: check_router probe (manual)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Git EOL hygiene (deterministic checkouts)
+        run: |
+          set -euo pipefail
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install deps (runtime + dev)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip wheel setuptools
+
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          fi
+
+      - name: Prepare artifacts dir
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+
+      - name: check_router (json-only)
+        id: probe
+        run: |
+          set -euo pipefail
+          python -m scripts.check_router --json-only --total-timeout "${{ github.event.inputs.total_timeout_s }}" | tee artifacts/check_router.json
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: online-probes-artifacts
+          path: artifacts
+          if-no-files-found: ignore
+
+      - name: Optional fail gate
+        if: ${{ always() && github.event.inputs.fail_on_probe_error == 'true' && steps.probe.outcome != 'success' }}
+        run: |
+          echo "Probe failed and fail_on_probe_error=true" >&2
+          exit 1

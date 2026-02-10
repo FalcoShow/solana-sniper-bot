@@ -105,15 +105,24 @@ from collections import deque
 from dataclasses import dataclass
 from typing import IO, Any, Final
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging (UTC) — configured in main() (no import-time side effects)
+# ──────────────────────────────────────────────────────────────────────────────
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Logging (UTC)
-# ──────────────────────────────────────────────────────────────────────────────
+
 class _UTCFormatter(logging.Formatter):
     converter = staticmethod(time.gmtime)
 
 
-def _setup_logging() -> logging.Logger:
+LOG = logging.getLogger("watchdog")
+
+_TRUE: Final[set[str]] = {"1", "true", "yes", "y", "on", "t"}
+
+_SIGTERM: signal.Signals | None = getattr(signal, "SIGTERM", None)
+_SIGKILL: signal.Signals | None = getattr(signal, "SIGKILL", None)
+
+
+def _setup_logging() -> None:
     level_name = (os.getenv("WATCHDOG_LOGLEVEL", "INFO") or "INFO").strip().upper()
     level = getattr(logging, level_name, logging.INFO)
 
@@ -125,20 +134,10 @@ def _setup_logging() -> logging.Logger:
         )
     )
 
-    logger = logging.getLogger("watchdog")
-    logger.setLevel(level)
-    logger.handlers.clear()
-    logger.addHandler(handler)
-    logger.propagate = False
-    return logger
-
-
-LOG = _setup_logging()
-
-_SIGTERM: int | None = getattr(signal, "SIGTERM", None)
-_SIGKILL: int | None = getattr(signal, "SIGKILL", None)
-
-_TRUE: Final[set[str]] = {"1", "true", "yes", "y", "on", "t"}
+    LOG.setLevel(level)
+    LOG.handlers.clear()
+    LOG.addHandler(handler)
+    LOG.propagate = False
 
 
 def _utc_ts() -> str:
@@ -150,9 +149,7 @@ def _safe_str(x: object, max_len: int = 240) -> str:
         s = str(x)
     except Exception:
         return "<?>"
-    if len(s) <= max_len:
-        return s
-    return s[: max_len - 1] + "…"
+    return s if len(s) <= max_len else (s[: max_len - 1] + "…")
 
 
 def _truthy(val: str | None) -> bool:
@@ -183,9 +180,7 @@ def _get_float(name: str, default: float) -> float:
 
 def _resolve_path(repo_root: pathlib.Path, raw: str) -> pathlib.Path:
     p = pathlib.Path(raw)
-    if not p.is_absolute():
-        return (repo_root / p).resolve()
-    return p
+    return (repo_root / p).resolve() if not p.is_absolute() else p
 
 
 def _atomic_write_text(path: pathlib.Path, text: str) -> None:
@@ -196,23 +191,24 @@ def _atomic_write_text(path: pathlib.Path, text: str) -> None:
 
 
 def _looks_like_shell(s: str) -> bool:
-    # Shell metachars that should not be passed as argv tokens to Popen(shell=False)
-    # This catches your exact use case: "python -m scripts.preflight && bash ./start.sh"
     return any(x in s for x in ("&&", "||", "|", ";", ">", "<", "$(", "`"))
 
 
 def _redact_tokenish(s: str) -> str:
-    # Very small redaction to avoid accidental secret echo in logs.
-    # Do NOT attempt full parsing; just mask obvious KEY=VALUE patterns.
+    # Mask obvious KEY=VALUE patterns that look like secrets.
     pat = re.compile(r"(?i)\b([A-Z0-9_]*(TOKEN|SECRET|PASSWORD|KEY|DSN)[A-Z0-9_]*)=([^\s]+)")
     return pat.sub(lambda m: f"{m.group(1)}=***", s)
 
 
+def _redact_line(s: str) -> str:
+    # Keep logs useful but avoid storing obvious secrets in watchdog tail dumps.
+    s2 = _redact_tokenish(s)
+    # Mask URI credentials like postgres://user:pass@host/...
+    s2 = re.sub(r"(?i)\b(postgres(?:ql)?://)([^@\s]+)@", r"\1***@", s2)
+    return s2
+
+
 def _split_cmd_argv(spec: str) -> list[str]:
-    """
-    Split a command string into argv tokens (shell=False always).
-    On Windows, shlex.split(posix=False) behaves more predictably.
-    """
     spec = (spec or "").strip()
     if not spec:
         return []
@@ -243,7 +239,7 @@ class Rule:
 
 @dataclass(frozen=True)
 class StartCommand:
-    mode: str  # argv | shell
+    mode: str  # "argv" | "shell"
     argv: list[str]
 
 
@@ -354,8 +350,7 @@ def _parse_start_cmd(raw: str) -> StartCommand | None:
     if mode == "shell":
         return StartCommand(mode="shell", argv=_wrap_shell_cmd(raw))
     if mode == "argv":
-        argv = _split_cmd_argv(raw)
-        return StartCommand(mode="argv", argv=argv)
+        return StartCommand(mode="argv", argv=_split_cmd_argv(raw))
 
     # auto
     if _looks_like_shell(raw):
@@ -511,7 +506,7 @@ def _kill_pid(pid: int, sig: int) -> None:
 def _kill_process_group(pid: int, sig: int) -> bool:
     """
     On unix, if possible, kill the process group for pid.
-    Must stay MyPy-safe on Windows.
+    Must stay safe on Windows.
     """
     if os.name == "nt":
         return False
@@ -531,7 +526,6 @@ def stop_via_pidfile(pidfile: pathlib.Path, timeout_s: float = 3.0) -> None:
     if not pid:
         return
 
-    # Safety: never kill ourselves if pidfile is wrong.
     if pid == os.getpid():
         LOG.error("PIDFILE points to watchdog pid=%s; refusing to kill self", pid)
         return
@@ -544,11 +538,12 @@ def stop_via_pidfile(pidfile: pathlib.Path, timeout_s: float = 3.0) -> None:
     LOG.warning("Stopping existing process pid=%s (pidfile=%s)", pid, pidfile)
 
     if _SIGTERM is not None:
-        if not _kill_process_group(pid, _SIGTERM):
-            _kill_pid(pid, _SIGTERM)
+        sigterm = int(_SIGTERM)
+        if not _kill_process_group(pid, sigterm):
+            _kill_pid(pid, sigterm)
 
     t0 = time.monotonic()
-    while (time.monotonic() - t0) < timeout_s:
+    while (time.monotonic() - t0) < float(timeout_s):
         if not pid_is_alive(pid):
             break
         time.sleep(0.15)
@@ -564,11 +559,14 @@ def stop_via_pidfile(pidfile: pathlib.Path, timeout_s: float = 3.0) -> None:
                     check=False,
                 )
         else:
-            sigkill = _SIGKILL if _SIGKILL is not None else _SIGTERM
-            if sigkill is not None:
-                attempted = _kill_process_group(pid, sigkill)
-                if not attempted:
-                    _kill_pid(pid, sigkill)
+            sigkill = (
+                int(_SIGKILL)
+                if _SIGKILL is not None
+                else (int(_SIGTERM) if _SIGTERM is not None else 15)
+            )
+            attempted = _kill_process_group(pid, sigkill)
+            if not attempted:
+                _kill_pid(pid, sigkill)
 
     with contextlib.suppress(Exception):
         pidfile.unlink()
@@ -598,7 +596,7 @@ def start_background(cfg: Config) -> int:
         cmd = list(cfg.start_cmd.argv)
         cwd = str(cfg.repo_root)
         mode = cfg.start_cmd.mode
-        shown = _redact_tokenish(" ".join(cmd) if mode == "argv" else str(cmd[-1] if cmd else ""))
+        shown = _redact_tokenish(" ".join(cmd) if mode == "argv" else (cmd[-1] if cmd else ""))
         LOG.info("Start: using WATCHDOG_START_CMD mode=%s cmd=%s", mode, shown)
         if not cmd:
             raise ValueError("WATCHDOG_START_CMD resolved to empty argv")
@@ -609,17 +607,18 @@ def start_background(cfg: Config) -> int:
         cwd = str(cfg.start_sh.parent)
         LOG.info("Start: using WATCHDOG_START_SH=%s", cfg.start_sh)
 
-    popen_stdout: IO[str]
-    with open(cfg.outfile, "a", encoding="utf-8") as popen_stdout:
+    with open(cfg.outfile, "a", encoding="utf-8") as out:
         popen_kwargs: dict[str, Any] = {
-            "stdout": popen_stdout,
-            "stderr": popen_stdout,
+            "stdin": subprocess.DEVNULL,
+            "stdout": out,
+            "stderr": out,
             "cwd": cwd,
             "env": os.environ.copy(),
             "text": True,
             "close_fds": (os.name != "nt"),
         }
         if os.name != "nt":
+            # Make the child a new session leader -> killpg can stop it cleanly.
             popen_kwargs["start_new_session"] = True
         else:
             flags = _popen_creationflags()
@@ -693,7 +692,6 @@ class Tailer:
         self._f: IO[str] | None = None
         self._inode: tuple[int, int] | None = None  # (ino, dev) when available
         self._pos: int = 0
-        self._opened_once = False
 
     def _open(self, *, start_at_end: bool) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -720,9 +718,9 @@ class Tailer:
             st = self.path.stat()
             cur_inode = (int(getattr(st, "st_ino", 0) or 0), int(getattr(st, "st_dev", 0) or 0))
             if self._inode is not None and cur_inode != self._inode:
-                return True  # rotated/replaced
+                return True
             if int(st.st_size) < self._pos:
-                return True  # truncated
+                return True
             return False
         except FileNotFoundError:
             return True
@@ -733,15 +731,12 @@ class Tailer:
         if self._f is None:
             if not self.path.exists():
                 return None
-            # Initial open always seeks to end (avoid historical replay).
             self._open(start_at_end=True)
-            self._opened_once = True
 
         if self._needs_reopen():
             self._close()
             if not self.path.exists():
                 return None
-            # Reopen behavior: default end (no replay), optional start.
             self._open(start_at_end=not self.replay_on_reopen)
             return None
 
@@ -749,7 +744,6 @@ class Tailer:
         line = self._f.readline()
         if not line:
             return None
-
         self._pos = int(self._f.tell())
         return line.rstrip("\n")
 
@@ -815,7 +809,7 @@ def _dump_tail(run_dir: pathlib.Path, window: deque[Event], reason: str) -> None
         payload = {
             "ts": _utc_ts(),
             "reason": reason,
-            "lines": [e.line for e in list(window)[-200:]],
+            "lines": [_redact_line(e.line) for e in list(window)[-200:]],
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     except Exception:
@@ -873,9 +867,6 @@ def _restart_unlocked(cfg: Config, reason: str) -> int:
 
 
 def _run_rollback_script(cfg: Config, backup: pathlib.Path) -> None:
-    """
-    Run rollback script. On Render/Linux: bash rollback.sh <backup>
-    """
     if os.name == "nt":
         subprocess.run([str(cfg.rollback_sh), str(backup)], check=False)
         return
@@ -944,6 +935,7 @@ def do_rollback(cfg: Config, reason: str, window: deque[Event]) -> bool:
 # Main loop
 # ──────────────────────────────────────────────────────────────────────────────
 def main() -> int:
+    _setup_logging()
     cfg = load_config()
     cfg.run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -955,7 +947,7 @@ def main() -> int:
 
     with contextlib.suppress(Exception):
         if _SIGTERM is not None:
-            signal.signal(_SIGTERM, _handle_stop)  # type: ignore[arg-type]
+            signal.signal(_SIGTERM, _handle_stop)
     with contextlib.suppress(Exception):
         signal.signal(signal.SIGINT, _handle_stop)
 
@@ -1024,7 +1016,7 @@ def main() -> int:
                     "last_progress_age_s": float(now_mono - last_progress_at)
                     if last_progress_at
                     else -1.0,
-                    "actions_in_window": len(list(action_times)),
+                    "actions_in_window": len(action_times),
                     "cooldown_remaining_s": max(
                         0.0, float(cfg.cooldown_s) - (now_mono - last_action_at)
                     )
@@ -1043,7 +1035,6 @@ def main() -> int:
             time.sleep(cfg.poll_s)
             now2 = time.monotonic()
 
-            # PID dead => restart (rate-limited)
             pid = read_pid(cfg.pidfile)
             if pid and not pid_is_alive(pid):
                 if (now2 - last_action_at) < float(cfg.cooldown_s):
@@ -1059,14 +1050,12 @@ def main() -> int:
 
                 performed = do_restart(cfg, reason=last_action_reason, window=window)
                 if performed:
-                    # No-flap: reset progress timer + grace window after action
                     last_progress_at = now2
                     ignore_until = now2 + float(cfg.post_action_grace_s)
                     for hits in rule_hits:
                         hits.clear()
                 continue
 
-            # Stall detection (rate-limited)
             if last_progress_at is not None:
                 age = now2 - last_progress_at
                 if age >= float(cfg.stall_s):
@@ -1093,7 +1082,6 @@ def main() -> int:
 
             continue
 
-        # From here, `line` is a real line.
         if dedupe.seen(line):
             continue
 
@@ -1102,7 +1090,6 @@ def main() -> int:
         if cfg.progress_regex.search(line):
             last_progress_at = time.monotonic()
 
-        # Post-action grace: skip rule triggers briefly to avoid instant flap on startup chatter.
         if now_mono < ignore_until:
             continue
 
@@ -1126,7 +1113,6 @@ def main() -> int:
         if triggered_action is None:
             continue
 
-        # Cooldown + action window throttle
         if (now_mono - last_action_at) < float(cfg.cooldown_s):
             LOG.warning("Rule matched but in cooldown: %s", triggered_reason)
             continue
@@ -1144,14 +1130,13 @@ def main() -> int:
         if triggered_idx is not None:
             rule_hits[triggered_idx].clear()
 
-        performed = False
-        if triggered_action == "rollback":
-            performed = do_rollback(cfg, reason=last_action_reason, window=window)
-        else:
-            performed = do_restart(cfg, reason=last_action_reason, window=window)
+        performed = (
+            do_rollback(cfg, reason=last_action_reason, window=window)
+            if triggered_action == "rollback"
+            else do_restart(cfg, reason=last_action_reason, window=window)
+        )
 
         if performed:
-            # No-flap: reset progress timer + grace window after action
             last_progress_at = now_mono
             ignore_until = now_mono + float(cfg.post_action_grace_s)
             for hits in rule_hits:
@@ -1165,5 +1150,6 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
+        _setup_logging()
         LOG.warning("KeyboardInterrupt -> exit")
         raise SystemExit(0) from None
