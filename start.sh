@@ -3,12 +3,13 @@
 # start.sh — Canonical Bootstrap Spine (P0 LOCK-IN / God-Tier)
 #
 # Guarantees:
-#   - Deterministic boot (local == Render) via the same gates and launch path
-#   - Fail-closed on Render by default: gates MUST pass or EXIT 1
+#   - Deterministic boot (local == Render) via same gates + same launch path
+#   - Render fail-closed by default: gates MUST pass or EXIT 1
 #   - No secret leaks in logs (even on ERR traps)
 #   - Import-safe: no network on import, no eval-dotenv unless explicitly allowed
 #   - Canonical Python module launch + crash supervisor (restart/backoff)
 #   - Optional health gating using canonical scripts.healthcheck (JSON-robust)
+#   - Optional HTTP readiness sidecar (scripts.health_http) so /readyz exists
 #
 # Subcommands:
 #   ./start.sh help
@@ -22,6 +23,7 @@
 #   ./start.sh check-router [args...]
 #   ./start.sh check-jupiter [args...]
 #   ./start.sh healthcheck [args...]
+#   ./start.sh health-http [args...]         (run ONLY health_http server)
 #
 # Default run:
 #   ./start.sh
@@ -98,7 +100,6 @@ _on_err() {
   exit "${rc}"
 }
 trap '_on_err "$?" "$LINENO"' ERR
-trap 'rc=$?; _log "EXIT rc=$rc"' EXIT
 
 # -----------------------------------------------------------------------------
 # 0) Repo root + Render detect + CRLF guard
@@ -207,7 +208,7 @@ fi
 
 # Health gating (optional; uses canonical scripts.healthcheck)
 : "${START_HEALTH_GATING:=}"               # set to 1/0 to force
-: "${START_HEALTH_GATING_AUTO:=1}"         # if 1, auto-enable on Render when URL inferrable
+: "${START_HEALTH_GATING_AUTO:=1}"         # auto-enable on Render when URL inferrable
 : "${START_HEALTH_GATING_TIMEOUT_S:=75}"
 : "${START_HEALTH_GATING_INTERVAL_S:=2}"
 : "${START_HEALTH_GATING_MODE:=http}"      # http|local
@@ -215,9 +216,16 @@ fi
 
 # Canonical endpoint alignment (defaults to /readyz)
 : "${HEALTHCHECK_URL:=}"
-: "${HEALTHCHECK_HTTP_PATH:=/readyz}"
-: "${HEALTHCHECK_PATH:=}"                  # legacy alias
+: "${HEALTHCHECK_HTTP_PATH:=/readyz}"      # canonical
+: "${HEALTHCHECK_PATH:=}"                  # legacy alias (if set, wins)
 : "${READY_FILE:=}"
+
+# IMPORTANT: Ensure a /readyz listener exists in single-container boot:
+# Start scripts.health_http sidecar unless explicitly disabled.
+: "${START_HEALTH_HTTP_SIDECAR:=}"         # set 1/0 to force; default auto on Render when PORT present
+: "${START_DISABLE_HEALTH_HTTP:=0}"
+: "${START_HEALTH_HTTP_ARGS:=}"            # extra args appended to scripts.health_http (rare)
+: "${START_HEALTH_HTTP_GRACE_S:=8}"
 
 # export contract vars used by Python gatekeepers
 export RUN_MODE RUN_MODULE_OVERRIDE
@@ -264,13 +272,10 @@ PY
 _paths=("$REPO_ROOT")
 [[ -d "$REPO_ROOT/src" ]] && _paths+=("$REPO_ROOT/src")
 
-# ---- ShellCheck SC2155 fix: declare/assign separately from export
 if [[ -n "${PYTHONPATH:-}" ]]; then
-  PYTHONPATH="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")${PY_PATHSEP}${PYTHONPATH}"
-  export PYTHONPATH
+  export PYTHONPATH="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")${PY_PATHSEP}${PYTHONPATH}"
 else
-  PYTHONPATH="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")"
-  export PYTHONPATH
+  export PYTHONPATH="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")"
 fi
 
 _log "Python: $("$PYTHON" -V 2>&1)"
@@ -482,6 +487,7 @@ fi
 # -----------------------------------------------------------------------------
 cmd="${1:-}"
 
+# Allow "./start.sh bot|main|daytrader|backtest|paper_label" to set RUN_MODE
 case "$cmd" in
   bot|main|daytrader|backtest|paper_label|paperlabel|paper-label)
     export RUN_MODE="$cmd"
@@ -506,6 +512,7 @@ case "${cmd}" in
   ./start.sh check-router [args...]
   ./start.sh check-jupiter [args...]
   ./start.sh healthcheck [args...]
+  ./start.sh health-http [args...]
 TXT
     exit 0
     ;;
@@ -565,6 +572,11 @@ PY
   healthcheck)
     shift || true
     exec "$PYTHON" -m scripts.healthcheck "$@"
+    ;;
+  health-http|health_http)
+    shift || true
+    _py_has_module "scripts.health_http" || _die "scripts.health_http not found"
+    exec "$PYTHON" -m scripts.health_http "$@"
     ;;
 esac
 
@@ -675,12 +687,7 @@ if ! _is_true "${START_SKIP_WALLET}"; then
       case "${WALLET_PRIVATE_KEY}" in
         \[*|\{*)
           _write_wallet_file "${WALLET_PRIVATE_KEY}" || true
-          # ---- ShellCheck SC2015 fix: proper if/else (no A && B || C)
-          if _verify_wallet_json; then
-            export WALLET_PRIVATE_KEY="$WALLET_PATH"
-          else
-            _warn "Wallet: inline JSON parse failed"
-          fi
+          _verify_wallet_json && export WALLET_PRIVATE_KEY="$WALLET_PATH" || _warn "Wallet: inline JSON parse failed"
           ;;
       esac
     fi
@@ -688,12 +695,7 @@ if ! _is_true "${START_SKIP_WALLET}"; then
     if [[ -z "${WALLET_PRIVATE_KEY:-}" || ! -f "${WALLET_PRIVATE_KEY:-}" ]]; then
       if [[ -n "${WALLET_JSON:-}" ]]; then
         _write_wallet_file "${WALLET_JSON}" || true
-        # ---- ShellCheck SC2015 fix
-        if _verify_wallet_json; then
-          export WALLET_PRIVATE_KEY="$WALLET_PATH"
-        else
-          _warn "Wallet: WALLET_JSON parse failed"
-        fi
+        _verify_wallet_json && export WALLET_PRIVATE_KEY="$WALLET_PATH" || _warn "Wallet: WALLET_JSON parse failed"
       fi
     fi
 
@@ -703,12 +705,7 @@ if ! _is_true "${START_SKIP_WALLET}"; then
         if [[ ! -f "$WALLET_PATH" ]] || _is_true "${START_WALLET_OVERWRITE}"; then
           _decode_b64_to_file "$b64_val" || true
           chmod 600 "$WALLET_PATH" 2>/dev/null || true
-          # ---- ShellCheck SC2015 fix
-          if _verify_wallet_json; then
-            export WALLET_PRIVATE_KEY="$WALLET_PATH"
-          else
-            _warn "Wallet: base64 decoded but JSON parse failed"
-          fi
+          _verify_wallet_json && export WALLET_PRIVATE_KEY="$WALLET_PATH" || _warn "Wallet: base64 decoded but JSON parse failed"
         else
           export WALLET_PRIVATE_KEY="$WALLET_PATH"
         fi
@@ -729,7 +726,7 @@ fi
 # -----------------------------------------------------------------------------
 # 9) DB DSN mapping + normalization/export (no secret printing)
 # -----------------------------------------------------------------------------
-# Map SNIPER_DB_DSN into canonical vars (compat)
+# Map SNIPER_DB_DSN into SQLA defaults if present
 if [[ -n "${SNIPER_DB_DSN:-}" ]]; then
   [[ -z "${POSTGRES_DSN:-}" ]] && export POSTGRES_DSN="${SNIPER_DB_DSN}"
   [[ -z "${DATABASE_URL:-}" ]] && export DATABASE_URL="${SNIPER_DB_DSN}"
@@ -845,6 +842,7 @@ def emit(k: str, v: str):
     out.write(k.encode("utf-8") + b"\x00")
     out.write((v or "").encode("utf-8") + b"\x00")
 
+# Normalize + backfill canonical mapping
 if SNIPER_DB_DSN and SNIPER_DSN_N and (SNIPER_DSN_N != SNIPER_DB_DSN):
     emit("SNIPER_DB_DSN", SNIPER_DSN_N)
 
@@ -876,10 +874,10 @@ if _is_true "${START_STRICT}" && ! _is_true "${SKIP_DSN_REQUIRED}"; then
   fi
 fi
 
-[[ -n "${POSTGRES_DSN:-}"   ]] && _log "DB SQLA         : $(_mask_url "${POSTGRES_DSN}")"
-[[ -n "${DATABASE_URL:-}"   ]] && _log "DB DATABASE_URL : $(_mask_url "${DATABASE_URL}")"
-[[ -n "${PG_DSN:-}"         ]] && _log "DB asyncpg      : $(_mask_url "${PG_DSN}")"
-[[ -n "${SNIPER_DB_DSN:-}"  ]] && _log "DB SNIPER_DB_DSN: $(_mask_url "${SNIPER_DB_DSN}")"
+[[ -n "${POSTGRES_DSN:-}" ]]   && _log "DB SQLA         : $(_mask_url "${POSTGRES_DSN}")"
+[[ -n "${DATABASE_URL:-}" ]]   && _log "DB DATABASE_URL : $(_mask_url "${DATABASE_URL}")"
+[[ -n "${PG_DSN:-}" ]]         && _log "DB asyncpg      : $(_mask_url "${PG_DSN}")"
+[[ -n "${SNIPER_DB_DSN:-}" ]]  && _log "DB SNIPER_DB_DSN: $(_mask_url "${SNIPER_DB_DSN}")"
 
 # -----------------------------------------------------------------------------
 # 10) Gates: check_env + preflight + optional ci_smoke
@@ -944,26 +942,20 @@ else
   _warn "Gate: check_env disabled (not recommended)"
 fi
 
-_gate_preflight_or_die() {
+if _is_true "${START_PRECHECKS}"; then
   _log "Gate: preflight"
   if _run_preflight; then
     _log "Gate: preflight OK"
-    return 0
+  else
+    _warn "preflight failed; running check_env diagnostics (sanitized)"
+    if _py_has_module "scripts.check_env"; then
+      local -a dargs=(--json-only)
+      _is_true "${START_STRICT}" && dargs+=(--strict)
+      CHECK_ENV_INCLUDE_CONFIG_DETAIL=1 CHECK_ENV_JSON=1 CHECK_ENV_JSON_ONLY=1 \
+        "$PYTHON" -m scripts.check_env "${dargs[@]}" || true
+    fi
+    _die "preflight failed"
   fi
-
-  _warn "preflight failed; running check_env diagnostics (sanitized)"
-  if _py_has_module "scripts.check_env"; then
-    local -a dargs=(--json-only)
-    _is_true "${START_STRICT}" && dargs+=(--strict)
-    CHECK_ENV_INCLUDE_CONFIG_DETAIL=1 CHECK_ENV_JSON=1 CHECK_ENV_JSON_ONLY=1 \
-      "$PYTHON" -m scripts.check_env "${dargs[@]}" || true
-  fi
-
-  _die "preflight failed"
-}
-
-if _is_true "${START_PRECHECKS}"; then
-  _gate_preflight_or_die
 else
   _warn "Gate: preflight disabled (not recommended)"
 fi
@@ -1045,7 +1037,7 @@ PY
 fi
 
 # -----------------------------------------------------------------------------
-# 13) Health gating (optional; canonical scripts.healthcheck; log-safe parsing)
+# 13) Health URL inference + JSON-safe parse
 # -----------------------------------------------------------------------------
 _health_path() {
   if [[ -n "${HEALTHCHECK_PATH:-}" ]]; then
@@ -1078,6 +1070,7 @@ _health_infer_url() {
   fi
 
   printf '%s' ""
+  return 0
 }
 
 _extract_last_json_line() {
@@ -1124,23 +1117,12 @@ raise SystemExit(0 if (isinstance(obj, dict) and obj.get("ok") is True) else 2)
 PY
 }
 
-if [[ -z "${START_HEALTH_GATING:-}" ]]; then
-  if [[ "$IS_RENDER" == "1" ]] && _is_true "${START_HEALTH_GATING_AUTO:-1}"; then
-    _u="$(_health_infer_url)"
-    if [[ -n "$_u" ]]; then START_HEALTH_GATING="1"; else START_HEALTH_GATING="0"; fi
-  else
-    START_HEALTH_GATING="0"
-  fi
-fi
-
-HEALTH_URL="$(_health_infer_url)"
-
 _wait_health_or_fail() {
   local mode="${1:-http}"
   local url="${2:-}"
-  local timeout="${START_HEALTH_GATING_TIMEOUT_S:-75}"
-  local interval="${START_HEALTH_GATING_INTERVAL_S:-2}"
-  local deep="${START_HEALTH_GATING_DEEP:-0}"
+  local timeout_s="${3:-${START_HEALTH_GATING_TIMEOUT_S:-75}}"
+  local interval_s="${4:-${START_HEALTH_GATING_INTERVAL_S:-2}}"
+  local deep="${5:-${START_HEALTH_GATING_DEEP:-0}}"
 
   [[ -z "$mode" ]] && mode="http"
   if [[ "$mode" == "http" && -z "$url" ]]; then
@@ -1148,17 +1130,12 @@ _wait_health_or_fail() {
     return 1
   fi
 
-  _log "Health gating: mode=${mode} url=$(_mask_url "${url}") timeout=${timeout}s interval=${interval}s"
+  _log "Health gating: mode=${mode} url=$(_mask_url "${url}") timeout=${timeout_s}s interval=${interval_s}s"
 
   local start now elapsed
   start="$(date +%s 2>/dev/null || echo 0)"
 
   while true; do
-    if [[ -n "${child_pid:-}" ]] && ! kill -0 "${child_pid}" 2>/dev/null; then
-      _warn "Health gating: child exited before ready"
-      return 1
-    fi
-
     if _healthcheck_ok "$mode" "$url" "$deep"; then
       _log "Health gating: OK"
       if [[ -n "${READY_FILE:-}" ]]; then
@@ -1171,18 +1148,87 @@ _wait_health_or_fail() {
     now="$(date +%s 2>/dev/null || echo 0)"
     if [[ "$start" != "0" && "$now" != "0" ]]; then
       elapsed=$((now - start))
-      if [[ "$elapsed" -ge "$timeout" ]]; then
+      if [[ "$elapsed" -ge "$timeout_s" ]]; then
         _warn "Health gating: TIMEOUT"
         return 1
       fi
     fi
 
-    sleep "$interval"
+    sleep "$interval_s"
   done
 }
 
+# Decide whether health gating is on
+if [[ -z "${START_HEALTH_GATING:-}" ]]; then
+  if [[ "$IS_RENDER" == "1" ]] && _is_true "${START_HEALTH_GATING_AUTO:-1}"; then
+    _u="$(_health_infer_url)"
+    if [[ -n "$_u" ]]; then START_HEALTH_GATING="1"; else START_HEALTH_GATING="0"; fi
+  else
+    START_HEALTH_GATING="0"
+  fi
+fi
+
+HEALTH_URL="$(_health_infer_url)"
+
 # -----------------------------------------------------------------------------
-# 14) Supervisor launch (signal forwarding + safe shutdown + restart policy)
+# 14) Health HTTP sidecar (creates the /readyz listener in single-container boot)
+# -----------------------------------------------------------------------------
+health_http_pid=""
+_start_health_http_sidecar() {
+  [[ "$IS_RENDER" != "1" ]] && return 0
+  _is_true "${START_DISABLE_HEALTH_HTTP}" && return 0
+  _py_has_module "scripts.health_http" || { _warn "scripts.health_http not found; cannot start sidecar"; return 1; }
+
+  # Auto-enable by default on Render when PORT exists
+  if [[ -z "${START_HEALTH_HTTP_SIDECAR:-}" ]]; then
+    if [[ -n "${PORT:-}" ]]; then START_HEALTH_HTTP_SIDECAR="1"; else START_HEALTH_HTTP_SIDECAR="0"; fi
+  fi
+  _is_true "${START_HEALTH_HTTP_SIDECAR}" || return 0
+
+  # Only start it if RUN_MODULE isn't already health_http
+  if [[ "${RUN_MODULE}" == "scripts.health_http" || "${RUN_MODULE_OVERRIDE:-}" == "scripts.health_http" ]]; then
+    return 0
+  fi
+
+  _log "Starting health_http sidecar on PORT=${PORT:-} (module=scripts.health_http)"
+  # If READY_FILE is used, pass it through env so health_http can choose to use it (if implemented).
+  export READY_FILE="${READY_FILE:-}"
+  # Start in background; do NOT health-gate here yet (gates already ran); we just need the listener available.
+  # START_HEALTH_HTTP_ARGS allows optional args, but default should work (binds to $PORT)
+  if [[ -n "${START_HEALTH_HTTP_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    extra=( ${START_HEALTH_HTTP_ARGS} )
+    "$PYTHON" -m scripts.health_http "${extra[@]}" &
+  else
+    "$PYTHON" -m scripts.health_http &
+  fi
+  health_http_pid="$!"
+  _log "health_http sidecar pid=${health_http_pid}"
+  return 0
+}
+
+_stop_health_http_sidecar() {
+  [[ -z "${health_http_pid:-}" ]] && return 0
+  if kill -0 "${health_http_pid}" 2>/dev/null; then
+    _log "Stopping health_http sidecar pid=${health_http_pid}"
+    kill -TERM "${health_http_pid}" 2>/dev/null || true
+    local grace="${START_HEALTH_HTTP_GRACE_S:-8}" waited=0
+    while kill -0 "${health_http_pid}" 2>/dev/null; do
+      [[ "$waited" -ge "$grace" ]] && break
+      sleep 1
+      waited=$((waited + 1))
+    done
+    kill -KILL "${health_http_pid}" 2>/dev/null || true
+  fi
+  health_http_pid=""
+  return 0
+}
+
+# Ensure we always stop sidecar on exit
+trap '_stop_health_http_sidecar; rc=$?; _log "EXIT rc=$rc"; exit $rc' EXIT
+
+# -----------------------------------------------------------------------------
+# 15) Supervisor launch (signal forwarding + safe shutdown + restart policy)
 # -----------------------------------------------------------------------------
 _no_restart_csv="${MAIN_NO_RESTART_EXIT_CODES//;/,}"
 _no_restart_csv="${_no_restart_csv// /,}"
@@ -1234,6 +1280,7 @@ _forward_signal() {
   if [[ -n "${child_pid:-}" ]]; then
     _graceful_stop "$sig"
   fi
+  _stop_health_http_sidecar || true
 }
 
 trap '_forward_signal TERM' TERM
@@ -1265,9 +1312,11 @@ _start_child() {
   child_pgid="$(_get_pgid "$child_pid" || true)"
 }
 
-_log "Launch: module=${RUN_MODULE} args=${#run_argv[@]} restart=${MAIN_RESTART_ON_CRASH} health_gate=${START_HEALTH_GATING}"
+_log "Launch: module=${RUN_MODULE} args=${#run_argv[@]} restart=${MAIN_RESTART_ON_CRASH} health_gate=${START_HEALTH_GATING} sidecar=${START_HEALTH_HTTP_SIDECAR:-auto}"
 
 if ! _is_true "${MAIN_RESTART_ON_CRASH}"; then
+  # In no-supervisor mode, still start sidecar if configured (Render).
+  _start_health_http_sidecar || true
   exec "${PYTHON}" -m "${RUN_MODULE}" "${run_argv[@]}"
 fi
 
@@ -1278,8 +1327,16 @@ crashes_in_window=0
 
 while true; do
   rc=0
+
+  # Sidecar first (ensures a port listener exists on Render)
+  _start_health_http_sidecar || {
+    _is_true "${START_STRICT}" && _die "health_http sidecar failed to start"
+    _warn "health_http sidecar failed to start (non-strict); continuing"
+  }
+
   _start_child
 
+  # Optional gating (most useful on Render web)
   if _is_true "${START_HEALTH_GATING}"; then
     if [[ "${START_HEALTH_GATING_MODE}" == "http" ]]; then
       if [[ -z "${HEALTH_URL:-}" ]]; then
@@ -1287,7 +1344,7 @@ while true; do
         _graceful_stop "TERM" || true
         exit 1
       fi
-      if ! _wait_health_or_fail "http" "${HEALTH_URL}"; then
+      if ! _wait_health_or_fail "http" "${HEALTH_URL}" "${START_HEALTH_GATING_TIMEOUT_S}" "${START_HEALTH_GATING_INTERVAL_S}" "${START_HEALTH_GATING_DEEP}"; then
         _warn "Health gating failed; stopping child and failing deploy"
         _graceful_stop "TERM" || true
         exit 1
