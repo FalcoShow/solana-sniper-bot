@@ -88,7 +88,12 @@ _join_by() {
   local out="" first=1 x
   for x in "$@"; do
     [[ -z "$x" ]] && continue
-    if [[ "$first" == "1" ]]; then out="$x"; first=0; else out="${out}${sep}${x}"; fi
+    if [[ "$first" == "1" ]]; then
+      out="$x"
+      first=0
+    else
+      out="${out}${sep}${x}"
+    fi
   done
   printf '%s' "$out"
 }
@@ -227,10 +232,14 @@ fi
 : "${START_HEALTH_HTTP_ARGS:=}"            # extra args appended to scripts.health_http (rare)
 : "${START_HEALTH_HTTP_GRACE_S:=8}"
 
-# export contract vars used by Python gatekeepers
+# Export contract vars used by Python gatekeepers
 export RUN_MODE RUN_MODULE_OVERRIDE
 export SKIP_DSN_REQUIRED
 export REDIS_DB REDIS_TLS
+
+# IMPORTANT: export these so Python scripts see the same policy (fixes "preflight skipped" surprise)
+export START_STRICT START_PRECHECKS START_RUN_CHECK_ENV
+export START_PREFLIGHT_FORCE START_PREFLIGHT_JSON_ONLY START_PREFLIGHT_PROFILE
 
 _log "────────────────────────────────────────────"
 _log "   Bootstrap Spine (Canonical) — Render=${IS_RENDER}"
@@ -272,11 +281,13 @@ PY
 _paths=("$REPO_ROOT")
 [[ -d "$REPO_ROOT/src" ]] && _paths+=("$REPO_ROOT/src")
 
+# ShellCheck SC2155: do assignment separately, then export
+_py_path="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")"
 if [[ -n "${PYTHONPATH:-}" ]]; then
-  export PYTHONPATH="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")${PY_PATHSEP}${PYTHONPATH}"
-else
-  export PYTHONPATH="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")"
+  _py_path="${_py_path}${PY_PATHSEP}${PYTHONPATH}"
 fi
+export PYTHONPATH="$_py_path"
+unset _py_path
 
 _log "Python: $("$PYTHON" -V 2>&1)"
 
@@ -523,7 +534,18 @@ TXT
     ;;
   preflight)
     shift || true
-    exec "$PYTHON" -m scripts.preflight "$@"
+    # Make subcommand behavior match the main gate defaults (fixes "skipped" surprise)
+    pf_args=()
+    if _is_true "${START_PREFLIGHT_FORCE:-1}" && _supports_arg "scripts.preflight" "--force"; then
+      pf_args+=(--force)
+    fi
+    if _is_true "${START_PREFLIGHT_JSON_ONLY:-1}" && _supports_arg "scripts.preflight" "--json-only"; then
+      pf_args+=(--json-only)
+    fi
+    if [[ -n "${START_PREFLIGHT_PROFILE:-}" ]] && _supports_arg "scripts.preflight" "--profile"; then
+      pf_args+=(--profile "${START_PREFLIGHT_PROFILE}")
+    fi
+    exec "$PYTHON" -m scripts.preflight "${pf_args[@]}" "$@"
     ;;
   check-env|check_env)
     shift || true
@@ -687,7 +709,11 @@ if ! _is_true "${START_SKIP_WALLET}"; then
       case "${WALLET_PRIVATE_KEY}" in
         \[*|\{*)
           _write_wallet_file "${WALLET_PRIVATE_KEY}" || true
-          _verify_wallet_json && export WALLET_PRIVATE_KEY="$WALLET_PATH" || _warn "Wallet: inline JSON parse failed"
+          if _verify_wallet_json; then
+            export WALLET_PRIVATE_KEY="$WALLET_PATH"
+          else
+            _warn "Wallet: inline JSON parse failed"
+          fi
           ;;
       esac
     fi
@@ -695,7 +721,11 @@ if ! _is_true "${START_SKIP_WALLET}"; then
     if [[ -z "${WALLET_PRIVATE_KEY:-}" || ! -f "${WALLET_PRIVATE_KEY:-}" ]]; then
       if [[ -n "${WALLET_JSON:-}" ]]; then
         _write_wallet_file "${WALLET_JSON}" || true
-        _verify_wallet_json && export WALLET_PRIVATE_KEY="$WALLET_PATH" || _warn "Wallet: WALLET_JSON parse failed"
+        if _verify_wallet_json; then
+          export WALLET_PRIVATE_KEY="$WALLET_PATH"
+        else
+          _warn "Wallet: WALLET_JSON parse failed"
+        fi
       fi
     fi
 
@@ -705,7 +735,11 @@ if ! _is_true "${START_SKIP_WALLET}"; then
         if [[ ! -f "$WALLET_PATH" ]] || _is_true "${START_WALLET_OVERWRITE}"; then
           _decode_b64_to_file "$b64_val" || true
           chmod 600 "$WALLET_PATH" 2>/dev/null || true
-          _verify_wallet_json && export WALLET_PRIVATE_KEY="$WALLET_PATH" || _warn "Wallet: base64 decoded but JSON parse failed"
+          if _verify_wallet_json; then
+            export WALLET_PRIVATE_KEY="$WALLET_PATH"
+          else
+            _warn "Wallet: base64 decoded but JSON parse failed"
+          fi
         else
           export WALLET_PRIVATE_KEY="$WALLET_PATH"
         fi
@@ -842,7 +876,6 @@ def emit(k: str, v: str):
     out.write(k.encode("utf-8") + b"\x00")
     out.write((v or "").encode("utf-8") + b"\x00")
 
-# Normalize + backfill canonical mapping
 if SNIPER_DB_DSN and SNIPER_DSN_N and (SNIPER_DSN_N != SNIPER_DB_DSN):
     emit("SNIPER_DB_DSN", SNIPER_DSN_N)
 
@@ -889,8 +922,10 @@ _run_check_env() {
     return 0
   fi
 
-  local -a args=(--json-only)
-  _is_true "${START_STRICT}" && args+=(--strict)
+  args=(--json-only)
+  if _is_true "${START_STRICT}"; then
+    args+=(--strict)
+  fi
   CHECK_ENV_JSON=1 CHECK_ENV_JSON_ONLY=1 "$PYTHON" -m scripts.check_env "${args[@]}"
 }
 
@@ -901,7 +936,7 @@ _run_preflight() {
     return 0
   fi
 
-  local -a args=()
+  args=()
 
   if _is_true "${START_STRICT}"; then
     _supports_arg "scripts.preflight" "--strict" && args+=(--strict)
@@ -949,8 +984,10 @@ if _is_true "${START_PRECHECKS}"; then
   else
     _warn "preflight failed; running check_env diagnostics (sanitized)"
     if _py_has_module "scripts.check_env"; then
-      local -a dargs=(--json-only)
-      _is_true "${START_STRICT}" && dargs+=(--strict)
+      dargs=(--json-only)
+      if _is_true "${START_STRICT}"; then
+        dargs+=(--strict)
+      fi
       CHECK_ENV_INCLUDE_CONFIG_DETAIL=1 CHECK_ENV_JSON=1 CHECK_ENV_JSON_ONLY=1 \
         "$PYTHON" -m scripts.check_env "${dargs[@]}" || true
     fi
@@ -1191,13 +1228,10 @@ _start_health_http_sidecar() {
   fi
 
   _log "Starting health_http sidecar on PORT=${PORT:-} (module=scripts.health_http)"
-  # If READY_FILE is used, pass it through env so health_http can choose to use it (if implemented).
   export READY_FILE="${READY_FILE:-}"
-  # Start in background; do NOT health-gate here yet (gates already ran); we just need the listener available.
-  # START_HEALTH_HTTP_ARGS allows optional args, but default should work (binds to $PORT)
+
   if [[ -n "${START_HEALTH_HTTP_ARGS:-}" ]]; then
-    # shellcheck disable=SC2206
-    extra=( ${START_HEALTH_HTTP_ARGS} )
+    read -r -a extra <<<"${START_HEALTH_HTTP_ARGS}"
     "$PYTHON" -m scripts.health_http "${extra[@]}" &
   else
     "$PYTHON" -m scripts.health_http &
@@ -1224,8 +1258,8 @@ _stop_health_http_sidecar() {
   return 0
 }
 
-# Ensure we always stop sidecar on exit
-trap '_stop_health_http_sidecar; rc=$?; _log "EXIT rc=$rc"; exit $rc' EXIT
+# Ensure we always stop sidecar on exit (capture rc FIRST)
+trap 'rc=$?; _stop_health_http_sidecar; _log "EXIT rc=$rc"; exit "$rc"' EXIT
 
 # -----------------------------------------------------------------------------
 # 15) Supervisor launch (signal forwarding + safe shutdown + restart policy)
@@ -1315,7 +1349,6 @@ _start_child() {
 _log "Launch: module=${RUN_MODULE} args=${#run_argv[@]} restart=${MAIN_RESTART_ON_CRASH} health_gate=${START_HEALTH_GATING} sidecar=${START_HEALTH_HTTP_SIDECAR:-auto}"
 
 if ! _is_true "${MAIN_RESTART_ON_CRASH}"; then
-  # In no-supervisor mode, still start sidecar if configured (Render).
   _start_health_http_sidecar || true
   exec "${PYTHON}" -m "${RUN_MODULE}" "${run_argv[@]}"
 fi
@@ -1328,15 +1361,15 @@ crashes_in_window=0
 while true; do
   rc=0
 
-  # Sidecar first (ensures a port listener exists on Render)
   _start_health_http_sidecar || {
-    _is_true "${START_STRICT}" && _die "health_http sidecar failed to start"
+    if _is_true "${START_STRICT}"; then
+      _die "health_http sidecar failed to start"
+    fi
     _warn "health_http sidecar failed to start (non-strict); continuing"
   }
 
   _start_child
 
-  # Optional gating (most useful on Render web)
   if _is_true "${START_HEALTH_GATING}"; then
     if [[ "${START_HEALTH_GATING_MODE}" == "http" ]]; then
       if [[ -z "${HEALTH_URL:-}" ]]; then
