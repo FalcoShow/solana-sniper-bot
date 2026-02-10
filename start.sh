@@ -3,8 +3,8 @@
 # start.sh — Canonical Bootstrap Spine (P0 LOCK-IN / God-Tier)
 #
 # Guarantees:
-#   - Deterministic boot (local == Render) via the same gates and same launch path
-#   - Render fail-closed by default: gates MUST pass or EXIT 1
+#   - Deterministic boot (local == Render) via the same gates and launch path
+#   - Fail-closed on Render by default: gates MUST pass or EXIT 1
 #   - No secret leaks in logs (even on ERR traps)
 #   - Import-safe: no network on import, no eval-dotenv unless explicitly allowed
 #   - Canonical Python module launch + crash supervisor (restart/backoff)
@@ -210,13 +210,13 @@ fi
 : "${START_HEALTH_GATING_AUTO:=1}"         # if 1, auto-enable on Render when URL inferrable
 : "${START_HEALTH_GATING_TIMEOUT_S:=75}"
 : "${START_HEALTH_GATING_INTERVAL_S:=2}"
-: "${START_HEALTH_GATING_MODE:=http}"      # http|local (local for non-web workers if you want)
+: "${START_HEALTH_GATING_MODE:=http}"      # http|local
 : "${START_HEALTH_GATING_DEEP:=0}"
 
 # Canonical endpoint alignment (defaults to /readyz)
 : "${HEALTHCHECK_URL:=}"
-: "${HEALTHCHECK_HTTP_PATH:=/readyz}"      # canonical
-: "${HEALTHCHECK_PATH:=}"                  # legacy alias (if set, wins)
+: "${HEALTHCHECK_HTTP_PATH:=/readyz}"
+: "${HEALTHCHECK_PATH:=}"                  # legacy alias
 : "${READY_FILE:=}"
 
 # export contract vars used by Python gatekeepers
@@ -479,7 +479,6 @@ fi
 # -----------------------------------------------------------------------------
 cmd="${1:-}"
 
-# Allow "./start.sh bot|main|daytrader|backtest|paper_label" to set RUN_MODE
 case "$cmd" in
   bot|main|daytrader|backtest|paper_label|paperlabel|paper-label)
     export RUN_MODE="$cmd"
@@ -712,7 +711,7 @@ fi
 # -----------------------------------------------------------------------------
 # 9) DB DSN mapping + normalization/export (no secret printing)
 # -----------------------------------------------------------------------------
-# IMPORTANT: your ai_db is using SNIPER_DB_DSN; map it into the canonical DSN vars
+# Map SNIPER_DB_DSN into canonical vars (compat)
 if [[ -n "${SNIPER_DB_DSN:-}" ]]; then
   [[ -z "${POSTGRES_DSN:-}" ]] && export POSTGRES_DSN="${SNIPER_DB_DSN}"
   [[ -z "${DATABASE_URL:-}" ]] && export DATABASE_URL="${SNIPER_DB_DSN}"
@@ -828,7 +827,6 @@ def emit(k: str, v: str):
     out.write(k.encode("utf-8") + b"\x00")
     out.write((v or "").encode("utf-8") + b"\x00")
 
-# Canonical mapping back
 if SNIPER_DB_DSN and SNIPER_DSN_N and (SNIPER_DSN_N != SNIPER_DB_DSN):
     emit("SNIPER_DB_DSN", SNIPER_DSN_N)
 
@@ -860,10 +858,10 @@ if _is_true "${START_STRICT}" && ! _is_true "${SKIP_DSN_REQUIRED}"; then
   fi
 fi
 
-[[ -n "${POSTGRES_DSN:-}" ]] && _log "DB SQLA        : $(_mask_url "${POSTGRES_DSN}")"
-[[ -n "${DATABASE_URL:-}" ]] && _log "DB DATABASE_URL: $(_mask_url "${DATABASE_URL}")"
-[[ -n "${PG_DSN:-}" ]]       && _log "DB asyncpg     : $(_mask_url "${PG_DSN}")"
-[[ -n "${SNIPER_DB_DSN:-}" ]] && _log "DB SNIPER_DB_DSN: $(_mask_url "${SNIPER_DB_DSN}")"
+[[ -n "${POSTGRES_DSN:-}"   ]] && _log "DB SQLA         : $(_mask_url "${POSTGRES_DSN}")"
+[[ -n "${DATABASE_URL:-}"   ]] && _log "DB DATABASE_URL : $(_mask_url "${DATABASE_URL}")"
+[[ -n "${PG_DSN:-}"         ]] && _log "DB asyncpg      : $(_mask_url "${PG_DSN}")"
+[[ -n "${SNIPER_DB_DSN:-}"  ]] && _log "DB SNIPER_DB_DSN: $(_mask_url "${SNIPER_DB_DSN}")"
 
 # -----------------------------------------------------------------------------
 # 10) Gates: check_env + preflight + optional ci_smoke
@@ -1032,7 +1030,6 @@ fi
 # 13) Health gating (optional; canonical scripts.healthcheck; log-safe parsing)
 # -----------------------------------------------------------------------------
 _health_path() {
-  # Legacy HEALTHCHECK_PATH wins if set; else HEALTHCHECK_HTTP_PATH
   if [[ -n "${HEALTHCHECK_PATH:-}" ]]; then
     printf '%s' "${HEALTHCHECK_PATH}"
     return 0
@@ -1052,25 +1049,20 @@ _health_infer_url() {
   [[ -z "$path" ]] && path="/readyz"
   [[ "${path:0:1}" != "/" ]] && path="/${path}"
 
-  # Prefer localhost:PORT for deterministic in-container checks
   if [[ -n "${PORT:-}" ]]; then
     printf '%s' "http://127.0.0.1:${PORT}${path}"
     return 0
   fi
 
-  # Fallback to external URL if present
   if [[ -n "${RENDER_EXTERNAL_URL:-}" ]]; then
     printf '%s' "${RENDER_EXTERNAL_URL%/}${path}"
     return 0
   fi
 
   printf '%s' ""
-  return 0
 }
 
 _extract_last_json_line() {
-  # Reads stdin, returns the last line that looks like JSON object.
-  # This makes us immune to stray log lines before JSON.
   awk '
     /^[[:space:]]*\{.*\}[[:space:]]*$/ { last=$0 }
     END { if (length(last)>0) print last }
@@ -1078,16 +1070,12 @@ _extract_last_json_line() {
 }
 
 _healthcheck_ok() {
-  # Returns 0 if healthcheck JSON says ok:true, else 1
   local mode="${1:-http}"
   local url="${2:-}"
   local deep="${3:-0}"
 
   _py_has_module "scripts.healthcheck" || return 1
 
-  # Enforce deterministic semantics for gating:
-  # - mode=http => do NOT fallback to local snapshot; we want actual readiness endpoint
-  # - json-only, short timeout; retries handled by the script via env/defaults
   local out json
   if [[ "$mode" == "http" ]]; then
     out="$(
@@ -1118,15 +1106,10 @@ raise SystemExit(0 if (isinstance(obj, dict) and obj.get("ok") is True) else 2)
 PY
 }
 
-# Decide whether health gating is on
 if [[ -z "${START_HEALTH_GATING:-}" ]]; then
   if [[ "$IS_RENDER" == "1" ]] && _is_true "${START_HEALTH_GATING_AUTO:-1}"; then
     _u="$(_health_infer_url)"
-    if [[ -n "$_u" ]]; then
-      START_HEALTH_GATING="1"
-    else
-      START_HEALTH_GATING="0"
-    fi
+    if [[ -n "$_u" ]]; then START_HEALTH_GATING="1"; else START_HEALTH_GATING="0"; fi
   else
     START_HEALTH_GATING="0"
   fi
@@ -1153,7 +1136,6 @@ _wait_health_or_fail() {
   start="$(date +%s 2>/dev/null || echo 0)"
 
   while true; do
-    # If process died during boot, fail immediately
     if [[ -n "${child_pid:-}" ]] && ! kill -0 "${child_pid}" 2>/dev/null; then
       _warn "Health gating: child exited before ready"
       return 1
@@ -1280,7 +1262,6 @@ while true; do
   rc=0
   _start_child
 
-  # Health gating only if enabled
   if _is_true "${START_HEALTH_GATING}"; then
     if [[ "${START_HEALTH_GATING_MODE}" == "http" ]]; then
       if [[ -z "${HEALTH_URL:-}" ]]; then
@@ -1294,7 +1275,6 @@ while true; do
         exit 1
       fi
     else
-      # local mode (no HTTP required)
       if ! _wait_health_or_fail "local" "" "${START_HEALTH_GATING_TIMEOUT_S}" "${START_HEALTH_GATING_INTERVAL_S}" "${START_HEALTH_GATING_DEEP}"; then
         _warn "Health gating (local) failed; stopping child and failing deploy"
         _graceful_stop "TERM" || true
