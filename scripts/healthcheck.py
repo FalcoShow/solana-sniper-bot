@@ -55,8 +55,10 @@ import subprocess
 import sys
 import time
 import traceback
+from collections.abc import Iterator
+from io import StringIO
 from pathlib import Path
-from typing import Any, Final, Mapping
+from typing import Any, Final, Mapping, cast
 
 RC_READY: Final[int] = 0
 RC_NOT_READY: Final[int] = 1
@@ -78,6 +80,10 @@ def _ts() -> str:
 
 def _now_ms() -> int:
     return int(time.monotonic() * 1000)
+
+
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, default=str)
 
 
 def _envs(k: str, d: str = "") -> str:
@@ -271,12 +277,16 @@ async def _http_get(url: str, timeout_s: float) -> tuple[int, Any, str]:
                 body = resp.read().decode("utf-8", "ignore")
         except urllib.error.HTTPError as he:
             code = int(getattr(he, "code", 0) or 0)
-            ctype = (getattr(he, "headers", None) or {}).get("content-type", "")  # type: ignore[call-arg]
+            headers = getattr(he, "headers", None)
+            try:
+                ctype = (headers.get("content-type") if headers is not None else "") or ""
+            except Exception:
+                ctype = ""
             ctype = str(ctype).lower()
-            raw = he.read()
-            body = (
-                raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
-            )
+            raw = b""
+            with contextlib.suppress(Exception):
+                raw = he.read()
+            body = raw.decode("utf-8", "ignore") if raw else str(he)
 
         if "application/json" in ctype:
             with contextlib.suppress(Exception):
@@ -287,7 +297,7 @@ async def _http_get(url: str, timeout_s: float) -> tuple[int, Any, str]:
 
 
 @contextlib.contextmanager
-def _capture_stdio(enabled: bool):
+def _capture_stdio(enabled: bool) -> Iterator[tuple[StringIO, StringIO] | None]:
     """
     When --json-only is used, prevent stray prints from breaking JSON output.
     """
@@ -295,12 +305,38 @@ def _capture_stdio(enabled: bool):
         yield None
         return
 
-    import io
-
-    buf_out = io.StringIO()
-    buf_err = io.StringIO()
+    buf_out = StringIO()
+    buf_err = StringIO()
     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
         yield (buf_out, buf_err)
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """
+    Best-effort extraction of a JSON object from noisy output.
+    We intentionally only accept dict payloads.
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+
+    # Fast path
+    with contextlib.suppress(Exception):
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return cast(dict[str, Any], obj)
+
+    # Noisy output path: find the last {...} block
+    start = s.rfind("{")
+    end = s.rfind("}")
+    if start >= 0 and end > start:
+        chunk = s[start : end + 1]
+        with contextlib.suppress(Exception):
+            obj2 = json.loads(chunk)
+            if isinstance(obj2, dict):
+                return cast(dict[str, Any], obj2)
+
+    return None
 
 
 def _sync_snapshot_subproc(
@@ -359,24 +395,14 @@ def _sync_snapshot_subproc(
             "err": f"sync_snapshot_subproc_failed: {type(e).__name__}: {e}",
         }
 
-    raw = (cp.stdout or "").strip()
-    if not raw:
-        raw = (cp.stderr or "").strip()
+    combined = ((cp.stdout or "") + "\n" + (cp.stderr or "")).strip()
+    obj = _extract_json_object(combined)
+    if obj is not None:
+        return obj
 
+    raw = (cp.stdout or "").strip() or (cp.stderr or "").strip()
     if not raw:
-        return {
-            "ts": _ts(),
-            "status": "fail",
-            "ok": False,
-            "ms": 0,
-            "checks": [],
-            "err": f"sync_snapshot_empty_output: rc={cp.returncode}",
-        }
-
-    with contextlib.suppress(Exception):
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return obj
+        raw = combined
 
     return {
         "ts": _ts(),
@@ -385,7 +411,7 @@ def _sync_snapshot_subproc(
         "ms": 0,
         "checks": [],
         "err": "sync_snapshot_bad_payload",
-        "raw": raw[:600],
+        "raw": (raw or "")[:600],
         "rc": int(cp.returncode),
     }
 
@@ -480,7 +506,7 @@ async def _amain(args: argparse.Namespace) -> int:
             "ms": _now_ms() - t0,
         }
         if emit_json:
-            print(json.dumps(payload, ensure_ascii=False, default=str))
+            print(_json_dumps(payload))
         else:
             print(f"READY (skipped: {reason})")
         return RC_READY
@@ -495,7 +521,7 @@ async def _amain(args: argparse.Namespace) -> int:
             "ms": _now_ms() - t0,
         }
         if emit_json:
-            print(json.dumps(payload, ensure_ascii=False, default=str))
+            print(_json_dumps(payload))
         else:
             print(f"MISCONFIG: {payload['error']}")
         return RC_MISCONFIG
@@ -522,9 +548,7 @@ async def _amain(args: argparse.Namespace) -> int:
     async def _do_local() -> bool:
         snap = await _call_health_snapshot(deep=deep, timeout_s=snap_timeout_s, json_only=json_only)
         payload["snapshot"] = snap
-        # “No false greens”: only READY if ok is true.
         ok_local = bool(isinstance(snap, dict) and snap.get("ok") is True)
-        # Propagate tri-state if present
         st = str(snap.get("status", "")).lower() if isinstance(snap, dict) else ""
         if st in {"ok", "degraded", "fail"}:
             payload["status"] = st
@@ -539,14 +563,16 @@ async def _amain(args: argparse.Namespace) -> int:
             try:
                 code, data, ctype = await _http_get(url, timeout_s=max(0.2, http_timeout_s))
                 ready, why = _interpret_ready(data)
+                code_i = int(code)
+                ok_code = 200 <= code_i < 300
                 last_http = {
                     "url": _mask_url(url),
                     "attempt": i + 1,
-                    "status": int(code),
+                    "status": code_i,
                     "content_type": str(ctype),
                     "ready": bool(ready),
                     "why": str(why),
-                    "ok": bool(int(code) == 200 and ready),
+                    "ok": bool(ok_code and ready),
                 }
                 if last_http["ok"]:
                     ok_http = True
@@ -573,7 +599,7 @@ async def _amain(args: argparse.Namespace) -> int:
             payload["status"] = "ok"
             payload["ms"] = _now_ms() - t0
             if emit_json:
-                print(json.dumps(payload, ensure_ascii=False, default=str))
+                print(_json_dumps(payload))
             else:
                 print("READY (http)")
             return RC_READY
@@ -583,7 +609,7 @@ async def _amain(args: argparse.Namespace) -> int:
             payload["status"] = "fail"
             payload["ms"] = _now_ms() - t0
             if emit_json:
-                print(json.dumps(payload, ensure_ascii=False, default=str))
+                print(_json_dumps(payload))
             else:
                 print("NOT READY (http)")
             return RC_NOT_READY
@@ -594,7 +620,7 @@ async def _amain(args: argparse.Namespace) -> int:
             payload["status"] = "fail"
             payload["ms"] = _now_ms() - t0
             if emit_json:
-                print(json.dumps(payload, ensure_ascii=False, default=str))
+                print(_json_dumps(payload))
             else:
                 print("NOT READY (auto; fallback disabled)")
             return RC_NOT_READY
@@ -606,7 +632,7 @@ async def _amain(args: argparse.Namespace) -> int:
     payload["ms"] = _now_ms() - t0
 
     if emit_json:
-        print(json.dumps(payload, ensure_ascii=False, default=str))
+        print(_json_dumps(payload))
     else:
         print("READY (local)" if ok_local else "NOT READY (local)")
 
@@ -654,12 +680,7 @@ def main() -> None:
             or _envb("HEALTHCHECK_JSON_ONLY", False)
         )
         if wants_json:
-            print(
-                json.dumps(
-                    {"ts": _ts(), "status": "fail", "ok": False, "error": err[:1200]},
-                    ensure_ascii=False,
-                )
-            )
+            print(_json_dumps({"ts": _ts(), "status": "fail", "ok": False, "error": err[:1200]}))
         else:
             print(err)
         rc = RC_MISCONFIG

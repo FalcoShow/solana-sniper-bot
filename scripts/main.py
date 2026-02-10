@@ -2572,6 +2572,52 @@ async def _shutdown_best_effort(stop_evt: asyncio.Event, *, reason: str, run_id:
                 return
 
 
+async def _close_asyncpg_pools_best_effort(*, run_id: str, timeout_s: float = 2.0) -> None:
+    """
+    Best-effort close of any asyncpg pools used by the app.
+    Stdlib-only at import time; uses lazy imports; time-bounded.
+    """
+    targets: list[tuple[str, tuple[str, ...]]] = [
+        # your AI DB pool
+        ("utils_pkg.ai_db", ("close_asyncpg_pool", "close_pool", "shutdown", "close")),
+        # some repos also keep a separate positions/PG pool
+        ("utils_pkg.positions_pg", ("close_asyncpg_pool", "close_pool", "shutdown", "close")),
+        # generic shutdown module (already handled elsewhere, but harmless here)
+        (
+            "utils_pkg.shutdown",
+            ("shutdown", "shutdown_all", "close_all", "graceful_shutdown", "cleanup"),
+        ),
+    ]
+
+    async def _call(fn: Any) -> None:
+        try:
+            out = fn()
+            if inspect.isawaitable(out):
+                await out
+        except TypeError:
+            # some close fns accept kwargs
+            out = fn(run_id=run_id)
+            if inspect.isawaitable(out):
+                await out
+
+    for mod_name, fn_names in targets:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:
+            continue
+
+        for fn_name in fn_names:
+            fn = getattr(mod, fn_name, None)
+            if not callable(fn):
+                continue
+            try:
+                await asyncio.wait_for(_call(fn), timeout=timeout_s)
+            except Exception:
+                # never let shutdown fail because of pool close
+                pass
+            break
+
+
 def _scanner_modules_from_env() -> list[str] | None:
     raw = _envs("SCANNER_MODULES", "").strip()
     if not raw:
@@ -2706,6 +2752,10 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
         if _envb("PANIC_STOP", False):
             log.event("PANIC_STOP_SET", run_id=RUN_ID)
             stop_evt.set()
+
+            await _close_asyncpg_pools_best_effort(
+                run_id=RUN_ID, timeout_s=float(_envf("MAIN_CLOSE_POOLS_TIMEOUT_S", 2.0))
+            )
 
         await _run_preflight_if_enabled(RUN_ID)
         with contextlib.suppress(Exception):

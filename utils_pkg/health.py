@@ -6,17 +6,17 @@ utils_pkg/health.py
 God-Tier Health Snapshot (P0) — deterministic, bounded, never-hangs
 ==================================================================
 
-Source of truth health model
-----------------------------
+Canonical health model
+----------------------
 This module defines the ONE canonical health model used everywhere:
 - health_snapshot(): async → dict payload (JSON-serializable)
 - health_snapshot_sync(): sync wrapper for scripts/tests
 
-Tri-state model (no false greens)
+Tri-state status with two booleans
 ---------------------------------
-- status="ok"        → ok=True  (READY)
-- status="degraded"  → ok=False (NOT READY; optional issues / partial dependency failures)
-- status="fail"      → ok=False (NOT READY; required check(s) failed)
+- status="ok"        → ok=True,  ready=True
+- status="degraded"  → ok=True,  ready=False   (optional dependency issues)
+- status="fail"      → ok=False, ready=False   (required check(s) failed / total timeout)
 
 Rules:
 - Any REQUIRED check failing => status="fail"
@@ -26,10 +26,11 @@ Rules:
 Hard requirements
 -----------------
 - Never hangs: bounded by HEALTH_TOTAL_TIMEOUT_S (and per-check timeouts).
-- Never raises: returns ok=False with error details.
+- Never raises: returns ok/ready with error details.
 - Import-safe: NO network connects on import.
 - Pytest-safe: no logging reconfiguration / handler mutation on import.
 - Short cache TTL to avoid flapping / storms.
+- Partial results preserved even near timeout (deadline budgeting).
 
 Env keys used (must exist in canonical contract + .env.example)
 --------------------------------------------------------------
@@ -43,6 +44,12 @@ HEALTH_INCLUDE_SYSTEM
 
 Also reads (debug/system only):
 APP_ENV
+
+Optional DB posture (IMPORTANT)
+------------------------------
+- If AI DB is enabled but unavailable:
+  - If HEALTH_REQUIRE_DB_IF_ENABLED is true => REQUIRED => status="fail"
+  - Otherwise OPTIONAL => status="degraded" (ok=True, ready=False)
 """
 
 import asyncio
@@ -56,7 +63,7 @@ import weakref
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal, cast
 
 log = logging.getLogger("health")
 
@@ -163,7 +170,8 @@ def _load_config() -> HealthConfig:
     stmt_ms_raw = _env_int("HEALTH_DB_STATEMENT_TIMEOUT_MS", 1200)
     stmt_ms = int(max(50, min(stmt_ms_raw, 30_000)))
 
-    require_db = _env_bool("HEALTH_REQUIRE_DB_IF_ENABLED", True)
+    # Optional DB posture by default; require only when explicitly enabled by env.
+    require_db = _env_bool("HEALTH_REQUIRE_DB_IF_ENABLED", False)
     include_system = _env_bool("HEALTH_INCLUDE_SYSTEM", True)
 
     return HealthConfig(
@@ -249,10 +257,12 @@ async def _run_check(
     try:
         res = await asyncio.wait_for(fn(), timeout=float(timeout_s))
         if isinstance(res, dict):
-            res = dict(res)
-            res.pop("name", None)
-            res.pop("required", None)
-            check.update(_json_safe(res))
+            res2: dict[str, Any] = {}
+            for k, v in res.items():
+                if k in ("name", "required"):
+                    continue
+                res2[str(k)] = _json_safe(v)
+            check.update(res2)
         check["ok"] = bool(check.get("ok", False))
     except asyncio.TimeoutError:
         check["ok"] = False
@@ -305,7 +315,7 @@ async def _check_ai_db(cfg: HealthConfig) -> dict[str, Any]:
     """
     Deterministic DB check:
     - If AI_DB disabled → ok=True (detail=disabled)
-    - If enabled → one asyncpg connect (strict timeout) + SELECT 1
+    - If enabled → bounded connect + SELECT 1 (or ai_db-provided probe if present)
     Never raises.
     """
     try:
@@ -319,6 +329,32 @@ async def _check_ai_db(cfg: HealthConfig) -> dict[str, Any]:
     if not enabled:
         return {"ok": True, "detail": "ai_db_disabled"}
 
+    # If ai_db exposes a minimal probe, prefer it (no duplicated logic).
+    # Signature expected: await ai_db.health_probe(timeout_s=..., statement_timeout_ms=...)
+    probe = getattr(ai_db, "health_probe", None)
+    if callable(probe):
+        try:
+            probe_fn = cast(Callable[..., Awaitable[Any]], probe)
+            res_any = await asyncio.wait_for(
+                probe_fn(
+                    timeout_s=float(cfg.db_timeout_s),
+                    statement_timeout_ms=int(cfg.db_statement_timeout_ms),
+                ),
+                timeout=float(cfg.db_timeout_s),
+            )
+            if isinstance(res_any, dict):
+                return {str(k): _json_safe(v) for k, v in res_any.items()}
+            return {
+                "ok": False,
+                "detail": "health_probe_bad_return",
+                "type": type(res_any).__name__,
+            }
+        except asyncio.TimeoutError:
+            return {"ok": False, "detail": "db_timeout"}
+        except Exception as e:
+            return {"ok": False, "detail": "db_error", "err": f"{type(e).__name__}: {e}"}
+
+    # Fallback: direct asyncpg connect + SELECT 1
     try:
         import asyncpg  # type: ignore
     except Exception as e:
@@ -350,8 +386,7 @@ async def _check_ai_db(cfg: HealthConfig) -> dict[str, Any]:
                 _env_str("DATABASE_URL", "")
                 or _env_str("POSTGRES_DSN", "")
                 or _env_str("PG_DSN", "")
-            )
-            dsn = dsn.strip()
+            ).strip()
     except Exception as e:
         return {"ok": False, "detail": "dsn_unresolved", "err": f"{type(e).__name__}: {e}"}
 
@@ -381,7 +416,10 @@ async def _check_ai_db(cfg: HealthConfig) -> dict[str, Any]:
             ssl=ssl_ctx,
             server_settings=server_settings,
         )
-        val = await asyncio.wait_for(conn.fetchval("SELECT 1"), timeout=float(cfg.db_timeout_s))
+        val = await asyncio.wait_for(
+            conn.fetchval("SELECT 1"),
+            timeout=float(cfg.db_timeout_s),
+        )
         ok = bool(val == 1)
         return {
             "ok": ok,
@@ -426,52 +464,101 @@ async def health_snapshot(
         if cached is not None:
             return cached
 
-    async def _build() -> dict[str, Any]:
-        started = time.monotonic()
-        lock = _get_loop_lock()
+    started = time.monotonic()
+    deadline = started + float(cfg.total_timeout_s)
 
+    def _time_left() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    lock = _get_loop_lock()
+    warnings: list[str] = []
+    fix_hints: list[str] = []
+
+    try:
         async with lock:
             if not deep:
                 cached2 = _cache_get_if_fresh(cfg)
                 if cached2 is not None:
                     return cached2
 
-            per_check = float(min(cfg.check_timeout_s, cfg.total_timeout_s))
             checks: list[dict[str, Any]] = []
 
+            # --- runtime (required)
+            tl = _time_left()
+            if tl <= 0.0:
+                return {
+                    "ts": _utcnow_iso(),
+                    "status": "fail",
+                    "ok": False,
+                    "ready": False,
+                    "ms": _ms_since(started),
+                    "checks": checks,
+                    "warnings": warnings,
+                    "fix_hints": fix_hints,
+                    "err": "health_snapshot_total_timeout_before_checks",
+                }
+
+            runtime_timeout = min(float(cfg.check_timeout_s), tl)
             checks.append(
-                await _run_check("runtime", _check_runtime, timeout_s=per_check, required=True)
+                await _run_check(
+                    "runtime", _check_runtime, timeout_s=runtime_timeout, required=True
+                )
             )
 
             # Decide whether DB is REQUIRED for overall readiness.
             db_required = False
+            db_enabled = False
             try:
                 from utils_pkg import ai_db  # type: ignore
 
-                enabled = bool(getattr(ai_db, "AI_DB_ENABLED", False)) or _ai_db_enabled_fallback()
-                if enabled and cfg.require_db_if_enabled:
-                    db_required = True
-            except Exception:
-                db_required = bool(deep and cfg.require_db_if_enabled)
-
-            checks.append(
-                await _run_check(
-                    "ai_db",
-                    lambda: _check_ai_db(cfg),
-                    timeout_s=float(min(cfg.db_timeout_s, cfg.total_timeout_s)),
-                    required=db_required,
+                db_enabled = (
+                    bool(getattr(ai_db, "AI_DB_ENABLED", False)) or _ai_db_enabled_fallback()
                 )
-            )
+            except Exception:
+                db_enabled = _ai_db_enabled_fallback()
+
+            if db_enabled and cfg.require_db_if_enabled:
+                db_required = True
+
+            # --- ai_db (optional by default unless require_db_if_enabled=true)
+            tl = _time_left()
+            if tl > 0.0:
+                db_timeout = min(float(cfg.db_timeout_s), tl)
+                checks.append(
+                    await _run_check(
+                        "ai_db",
+                        lambda: _check_ai_db(cfg),
+                        timeout_s=db_timeout,
+                        required=db_required,
+                    )
+                )
+            else:
+                # Preserve partial results; mark DB check skipped due to deadline.
+                checks.append(
+                    {
+                        "name": "ai_db",
+                        "required": bool(db_required),
+                        "ok": False,
+                        "ms": 0,
+                        "err": "skipped_due_to_deadline",
+                    }
+                )
 
             status: HealthStatus = _compute_status(checks)
-            ok = bool(status == "ok")
+
+            # ok=True means "service can run" (fail only if required checks fail)
+            ok = bool(status != "fail")
+            ready = bool(status == "ok")
 
             payload: dict[str, Any] = {
                 "ts": _utcnow_iso(),
                 "status": status,
                 "ok": ok,
+                "ready": ready,
                 "ms": _ms_since(started),
                 "checks": checks,
+                "warnings": warnings,
+                "fix_hints": fix_hints,
             }
 
             if include_system:
@@ -487,17 +574,6 @@ async def health_snapshot(
 
             return payload
 
-    try:
-        return await asyncio.wait_for(_build(), timeout=float(cfg.total_timeout_s))
-    except asyncio.TimeoutError:
-        return {
-            "ts": _utcnow_iso(),
-            "status": "fail",
-            "ok": False,
-            "ms": int(float(cfg.total_timeout_s) * 1000),
-            "checks": [],
-            "err": "health_snapshot_total_timeout",
-        }
     except Exception as e:
         with suppress(Exception):
             log.debug("health_snapshot failed", exc_info=True)
@@ -505,8 +581,11 @@ async def health_snapshot(
             "ts": _utcnow_iso(),
             "status": "fail",
             "ok": False,
-            "ms": 0,
+            "ready": False,
+            "ms": _ms_since(started),
             "checks": [],
+            "warnings": warnings,
+            "fix_hints": fix_hints,
             "err": f"{type(e).__name__}: {e}",
         }
 
@@ -527,8 +606,11 @@ def health_snapshot_sync(
             "ts": _utcnow_iso(),
             "status": "fail",
             "ok": False,
+            "ready": False,
             "ms": 0,
             "checks": [],
+            "warnings": [],
+            "fix_hints": [],
             "err": "health_snapshot_sync_called_inside_event_loop_use_await",
         }
     except RuntimeError:
@@ -541,8 +623,11 @@ def health_snapshot_sync(
             "ts": _utcnow_iso(),
             "status": "fail",
             "ok": False,
+            "ready": False,
             "ms": 0,
             "checks": [],
+            "warnings": [],
+            "fix_hints": [],
             "err": f"{type(e).__name__}: {e}",
         }
 

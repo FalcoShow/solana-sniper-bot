@@ -98,8 +98,8 @@ import shlex
 import ssl
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
@@ -897,8 +897,10 @@ _NORMALIZED: DSNInfo | None = None
 
 
 def reset_dsn_cache() -> None:
-    global _NORMALIZED
+    global _NORMALIZED, _ASYNCPG_POOL_DSN
     _NORMALIZED = None
+    # Force pool re-resolve/recreate on next acquire (pool is closed/rebuilt lazily).
+    _ASYNCPG_POOL_DSN = None
 
 
 def _effective_min_feature_version(explicit: int | None) -> int | None:
@@ -1375,16 +1377,104 @@ async def asyncpg_connect(
     raise last_err
 
 
-_ASYNCPG_POOL: Any = None
+# -----------------------------------------------------------------------------
+# Asyncpg pool lifecycle + reconnect hardening
+# -----------------------------------------------------------------------------
+_ASYNCPG_POOL: Any | None = None
+_ASYNCPG_POOL_DSN: str | None = None
+_ASYNCPG_POOL_PID: int | None = None
+_ASYNCPG_POOL_LOCK: asyncio.Lock = asyncio.Lock()
 
 
-async def get_asyncpg_pool() -> Any:
-    """Optional shared asyncpg pool (disabled by default)."""
-    global _ASYNCPG_POOL
-    if _ASYNCPG_POOL is not None:
-        return _ASYNCPG_POOL
+def _pool_is_closed(pool: Any) -> bool:
+    # asyncpg Pool has a private `_closed` flag; some versions expose `is_closed()`.
+    try:
+        v = getattr(pool, "_closed", None)
+        if isinstance(v, bool):
+            return v
+    except Exception:
+        pass
+    try:
+        fn = getattr(pool, "is_closed", None)
+        if callable(fn):
+            return bool(fn())
+    except Exception:
+        pass
+    return False
 
-    if not _ASYNCPG_OK:
+
+def _is_asyncpg_conn_lost(err: BaseException) -> bool:
+    """
+    True if this error indicates a dead/stale connection from asyncpg/pool.
+    Safe when asyncpg is not installed.
+    """
+    # Common non-asyncpg signals
+    if isinstance(err, (ConnectionResetError, BrokenPipeError, TimeoutError)):
+        return True
+
+    if not _ASYNCPG_OK or asyncpg is None:  # type: ignore[truthy-bool]
+        return False
+
+    try:
+        exc_mod = getattr(asyncpg, "exceptions", None)  # type: ignore[union-attr]
+        if exc_mod is None:
+            return False
+
+        cls = getattr(exc_mod, "ConnectionDoesNotExistError", None)
+        if cls is not None and isinstance(err, cls):
+            return True
+
+        cls2 = getattr(exc_mod, "InterfaceError", None)
+        if cls2 is not None and isinstance(err, cls2):
+            # Often raised when a connection is already closed.
+            msg = str(err).lower()
+            if "closed" in msg or "connection" in msg:
+                return True
+
+    except Exception:
+        # If introspection fails, fall back to message heuristics.
+        pass
+
+    msg = str(err).lower()
+    return ("connection does not exist" in msg) or ("connection is closed" in msg)
+
+
+async def _close_pool_nolock(*, reason: str = "") -> None:
+    global _ASYNCPG_POOL, _ASYNCPG_POOL_DSN, _ASYNCPG_POOL_PID
+    if _ASYNCPG_POOL is None:
+        _ASYNCPG_POOL_DSN = None
+        _ASYNCPG_POOL_PID = None
+        return
+
+    pool = _ASYNCPG_POOL
+    _ASYNCPG_POOL = None
+    _ASYNCPG_POOL_DSN = None
+    _ASYNCPG_POOL_PID = None
+
+    try:
+        if not _pool_is_closed(pool):
+            with suppress(Exception):
+                await pool.close()
+    except Exception as e:
+        if reason and log.every("ai_db_pool_close_fail", 1000):
+            log.warning("ai_db: pool close failed (%s): %s", reason, e)
+
+
+async def reset_asyncpg_pool(*, reason: str = "manual_reset") -> None:
+    """
+    Force-close the shared pool (if any). Next use will recreate it.
+    """
+    async with _ASYNCPG_POOL_LOCK:
+        await _close_pool_nolock(reason=reason)
+
+
+async def _create_pool_nolock() -> Any:
+    """
+    Create a pool. Caller must hold _ASYNCPG_POOL_LOCK.
+    """
+    global _ASYNCPG_POOL, _ASYNCPG_POOL_DSN, _ASYNCPG_POOL_PID
+
+    if not _ASYNCPG_OK or asyncpg is None:  # type: ignore[truthy-bool]
         raise RuntimeError("asyncpg not installed. pip install asyncpg")
     if not AI_DB_ENABLED:
         raise RuntimeError("AI DB disabled (AI_DB_ENABLED=0)")
@@ -1395,7 +1485,7 @@ async def get_asyncpg_pool() -> Any:
     ssl_ctx = ssl_context_for_dsn(info.normalized_asyncpg)
     server_settings = _asyncpg_server_settings(None)
 
-    _ASYNCPG_POOL = await asyncpg.create_pool(  # type: ignore[union-attr]
+    pool = await asyncpg.create_pool(  # type: ignore[union-attr]
         dsn=info.normalized_asyncpg,
         min_size=int(AI_DB_ASYNCPG_POOL_MIN_SIZE),
         max_size=int(AI_DB_ASYNCPG_POOL_MAX_SIZE),
@@ -1404,15 +1494,147 @@ async def get_asyncpg_pool() -> Any:
         ssl=ssl_ctx,
         server_settings=server_settings,
     )
-    return _ASYNCPG_POOL
+
+    # Warm-check once to fail fast if DSN/SSL is wrong.
+    try:
+        async with pool.acquire(timeout=float(AI_DB_CONNECT_TIMEOUT_S)) as conn:
+            with suppress(Exception):
+                await conn.execute("SELECT 1")
+    except Exception:
+        with suppress(Exception):
+            await pool.close()
+        raise
+
+    _ASYNCPG_POOL = pool
+    _ASYNCPG_POOL_DSN = info.normalized_asyncpg
+    _ASYNCPG_POOL_PID = os.getpid()
+    return pool
+
+
+async def get_asyncpg_pool() -> Any:
+    """
+    Optional shared asyncpg pool (disabled by default).
+
+    Hardening:
+      - PID drift (fork) => rebuild
+      - DSN change / reset_dsn_cache() => rebuild
+      - closed pool => rebuild
+    """
+    global _ASYNCPG_POOL, _ASYNCPG_POOL_DSN, _ASYNCPG_POOL_PID
+
+    if not AI_DB_USE_ASYNCPG_POOL:
+        raise RuntimeError("AI_DB_USE_ASYNCPG_POOL=0 (pool disabled)")
+    if not AI_DB_ENABLED:
+        raise RuntimeError("AI DB disabled (AI_DB_ENABLED=0)")
+
+    async with _ASYNCPG_POOL_LOCK:
+        # If we already have a pool, verify it is still valid for this process + DSN.
+        if _ASYNCPG_POOL is not None:
+            pid_ok = _ASYNCPG_POOL_PID == os.getpid()
+            dsn_ok = True
+            try:
+                current = resolve_dsn_info().normalized_asyncpg
+                dsn_ok = (_ASYNCPG_POOL_DSN == current) if _ASYNCPG_POOL_DSN else True
+            except Exception:
+                # If DSN can't resolve, keep existing pool (optional posture).
+                dsn_ok = True
+
+            if pid_ok and dsn_ok and (not _pool_is_closed(_ASYNCPG_POOL)):
+                return _ASYNCPG_POOL
+
+            await _close_pool_nolock(reason="pool_invalid")
+
+        return await _create_pool_nolock()
 
 
 async def close_asyncpg_pool() -> None:
-    global _ASYNCPG_POOL
-    if _ASYNCPG_POOL is not None:
-        with suppress(Exception):
-            await _ASYNCPG_POOL.close()
-        _ASYNCPG_POOL = None
+    """
+    Close the shared asyncpg pool (if any).
+    Safe to call repeatedly.
+    """
+    async with _ASYNCPG_POOL_LOCK:
+        await _close_pool_nolock(reason="close_asyncpg_pool")
+
+
+@asynccontextmanager
+async def acquire_asyncpg_connection(
+    *,
+    timeout: float | None = None,
+    prefer_pool: bool = True,
+) -> AsyncIterator[Any]:
+    """
+    Acquire a connection using the pool when enabled (and prefer_pool=True),
+    otherwise create a one-off connection.
+
+    Hardening:
+      - if we see ConnectionDoesNotExistError (or equivalent), we reset/recreate pool and retry once.
+    """
+    to = float(timeout if timeout is not None else AI_DB_CONNECT_TIMEOUT_S)
+
+    if prefer_pool and AI_DB_USE_ASYNCPG_POOL:
+        # Acquire from pool with 1 retry on dead connection.
+        for attempt in range(2):
+            pool = await get_asyncpg_pool()
+            try:
+                async with pool.acquire(timeout=to) as conn:
+                    yield conn
+                return
+            except Exception as e:
+                if attempt == 0 and _is_asyncpg_conn_lost(e):
+                    await reset_asyncpg_pool(reason="conn_lost_acquire")
+                    continue
+                raise
+    else:
+        conn = await asyncpg_connect(timeout=to)
+        try:
+            yield conn
+        finally:
+            with suppress(Exception):
+                await conn.close()
+
+
+async def asyncpg_exec(
+    sql: str,
+    *args: Any,
+    timeout: float | None = None,
+    prefer_pool: bool = True,
+) -> Any:
+    """
+    Execute a statement via asyncpg with automatic retry on connection-lost.
+    """
+    to = float(timeout if timeout is not None else AI_DB_CONNECT_TIMEOUT_S)
+
+    for attempt in range(2):
+        try:
+            async with acquire_asyncpg_connection(timeout=to, prefer_pool=prefer_pool) as conn:
+                return await conn.execute(sql, *args, timeout=to)
+        except Exception as e:
+            if attempt == 0 and _is_asyncpg_conn_lost(e) and prefer_pool and AI_DB_USE_ASYNCPG_POOL:
+                await reset_asyncpg_pool(reason="conn_lost_exec")
+                continue
+            raise
+
+
+async def asyncpg_fetch(
+    sql: str,
+    *args: Any,
+    timeout: float | None = None,
+    prefer_pool: bool = True,
+) -> Any:
+    """
+    Fetch rows via asyncpg with automatic retry on connection-lost.
+    """
+    to = float(timeout if timeout is not None else AI_DB_CONNECT_TIMEOUT_S)
+
+    for attempt in range(2):
+        try:
+            async with acquire_asyncpg_connection(timeout=to, prefer_pool=prefer_pool) as conn:
+                return await conn.fetch(sql, *args, timeout=to)
+        except Exception as e:
+            if attempt == 0 and _is_asyncpg_conn_lost(e) and prefer_pool and AI_DB_USE_ASYNCPG_POOL:
+                await reset_asyncpg_pool(reason="conn_lost_fetch")
+                continue
+            raise
 
 
 # =============================================================================
@@ -3783,6 +4005,10 @@ __all__ = [
     "fetch_training_rows",
     "fetch_unlabeled_candidates",
     "get_asyncpg_pool",
+    "acquire_asyncpg_connection",
+    "asyncpg_exec",
+    "asyncpg_fetch",
+    "reset_asyncpg_pool",
     "get_env_scoped_dashboard",
     "get_normalized_dsn_for_debug",
     # writes/reads
