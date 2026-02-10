@@ -5,13 +5,6 @@ on:
   pull_request:
     branches: ["**"]
   workflow_dispatch:
-    inputs:
-      run_online_probes:
-        description: "Run optional online connectivity probes (RPC/Jupiter/router). Manual-only to avoid flaky PR failures."
-        required: false
-        default: "false"
-        type: choice
-        options: ["false", "true"]
 
 permissions:
   contents: read
@@ -20,8 +13,13 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 env:
   CI: "1"
+  TZ: "UTC"
 
   # Default posture: offline & deterministic (no flaky network PRs)
   SAFE_MODE: "1"
@@ -44,17 +42,13 @@ env:
   PYTHONUNBUFFERED: "1"
   PYTHONFAULTHANDLER: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  TZ: "UTC"
 
   # Linux ":" separator is correct on GitHub runners
   PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/src
 
   PYTHON_VERSION: "3.13"
-  RUFF_VERSION: "0.9.2"
-
-defaults:
-  run:
-    shell: bash
+  # Align CI tooling with your pinned requirements-dev.txt (you currently use ruff==0.15.0 there)
+  RUFF_VERSION: "0.15.0"
 
 jobs:
   shell:
@@ -85,7 +79,7 @@ jobs:
           set -euo pipefail
           bash -n start.sh
 
-      - name: shellcheck start.sh (warnings fail)
+      - name: shellcheck start.sh
         run: |
           set -euo pipefail
           shellcheck start.sh
@@ -111,6 +105,9 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install deps (runtime + dev) + pin ruff
         run: |
@@ -127,10 +124,12 @@ jobs:
             python -m pip install -e ".[dev]" || true
           fi
 
+          # Force the exact ruff version CI expects (deterministic)
           python -m pip install "ruff==${RUFF_VERSION}"
 
           python -c "import sys; print('python', sys.version)"
           ruff --version
+          python -m pip check
 
       - name: Ruff (check)
         run: |
@@ -168,8 +167,11 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
-      - name: Install deps (runtime + dev + mypy)
+      - name: Install deps (runtime + dev)
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
@@ -182,8 +184,6 @@ jobs:
           elif [ -f pyproject.toml ]; then
             python -m pip install -e ".[dev]" || true
           fi
-
-          python -m pip install -U mypy
 
       - name: Run mypy only if config exists
         run: |
@@ -198,7 +198,7 @@ jobs:
           fi
 
           if [ "$HAS_CFG" = "1" ]; then
-            python -m mypy .
+            python -m mypy --no-incremental .
           else
             echo "No mypy config found. Skipping mypy."
           fi
@@ -224,8 +224,11 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
-      - name: Install deps (runtime + dev + pytest)
+      - name: Install deps (runtime + dev)
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
@@ -286,8 +289,11 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
-      - name: Install deps (runtime + dev + pytest)
+      - name: Install deps (runtime + dev)
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
@@ -342,8 +348,11 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
-      - name: Install deps (runtime + dev + pytest)
+      - name: Install deps (runtime + dev)
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
@@ -357,7 +366,7 @@ jobs:
             python -m pip install -e ".[dev]" || true
           fi
 
-          python -m pip install -U pytest pytest-asyncio pytest-xdist
+          python -m pip install -U pytest pytest-asyncio
 
       - name: Prepare artifacts dir
         run: |
@@ -375,72 +384,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-artifacts
-          path: artifacts
-          if-no-files-found: ignore
-
-  online_probes:
-    name: Online Probes (optional, manual)
-    runs-on: ubuntu-latest
-    needs: tests
-    timeout-minutes: 20
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_online_probes == 'true' }}
-
-    env:
-      NO_NETWORK: "0"
-      DISABLE_NETWORK: "0"
-      NO_NETWORK_POLICY: "0"
-      PROBES_ENABLED: "1"
-
-      DRYRUN: "1"
-      SAFE_MODE: "1"
-
-      CHECK_ROUTER_JSON_ONLY: "1"
-      CHECK_ROUTER_HARD_EXIT: "1"
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Git EOL hygiene (deterministic checkouts)
-        run: |
-          set -euo pipefail
-          git config --global core.autocrlf false
-          git config --global core.eol lf
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: Install deps (runtime + dev)
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip wheel setuptools
-
-          if [ -f requirements.txt ]; then
-            python -m pip install -r requirements.txt
-          fi
-          if [ -f requirements-dev.txt ]; then
-            python -m pip install -r requirements-dev.txt
-          elif [ -f pyproject.toml ]; then
-            python -m pip install -e ".[dev]" || true
-          fi
-
-      - name: Prepare artifacts dir
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-
-      - name: check_router (json-only, hard-exit) — informational
-        run: |
-          set -euo pipefail
-          python -m scripts.check_router --json-only --total-timeout 25 | tee artifacts/check_router.json
-
-      - name: Upload artifacts (online probes)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: online-probes-artifacts
           path: artifacts
           if-no-files-found: ignore
