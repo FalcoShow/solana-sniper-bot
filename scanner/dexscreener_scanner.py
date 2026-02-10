@@ -348,10 +348,10 @@ class DexConfig:
 
     # Queries
     queries: tuple[str, ...] = field(
-        default_factory=lambda: tuple(
-            q.strip() for q in _s("DEX_SEARCH_QUERIES", "solana").split(",") if q.strip()
+        default_factory=lambda: (
+            tuple(q.strip() for q in _s("DEX_SEARCH_QUERIES", "solana").split(",") if q.strip())
+            or ("solana",)
         )
-        or ("solana",)
     )
     query_concurrency: int = field(default_factory=lambda: max(1, _i("DEX_QUERY_CONCURRENCY", 3)))
 
