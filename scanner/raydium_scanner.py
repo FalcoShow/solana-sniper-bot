@@ -42,6 +42,9 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlencode
+
+__version__ = "3.1.0"
 
 # =============================================================================
 # Optional HTTP deps (scanner should degrade gracefully unless FAST_FAIL)
@@ -97,19 +100,15 @@ def _coerce_source(x: Any) -> SourceT:
 
     s = str(x or "raydium").strip() or "raydium"
 
-    # Enum name lookup: Source.RAYDIUM etc.
     with contextlib.suppress(Exception):
         return src[s.upper()]  # type: ignore[index,return-value]
 
-    # Value ctor: Source("raydium") etc.
     with contextlib.suppress(Exception):
         return src(s)  # type: ignore[call-arg,return-value]
 
-    # Attribute fallback
     with contextlib.suppress(Exception):
         return src.RAYDIUM  # type: ignore[return-value]
 
-    # last resort: first enum member
     with contextlib.suppress(Exception):
         return list(src)[0]  # type: ignore[return-value]
 
@@ -213,11 +212,10 @@ LOG = _LogProxy(_resolve_logger_base("scanner.raydium_scanner"))
 
 
 def _short(x: Any, n: int = 240) -> str:
-    try:
+    with contextlib.suppress(Exception):
         s = str(x)
         return s if len(s) <= n else (s[:n] + "…")
-    except Exception:
-        return "<unprintable>"
+    return "<unprintable>"
 
 
 # =============================================================================
@@ -246,10 +244,9 @@ def _i(name: str, default: int) -> int:
     s = raw.strip()
     if s == "":
         return int(default)
-    try:
+    with contextlib.suppress(Exception):
         return int(float(s))
-    except Exception:
-        return int(default)
+    return int(default)
 
 
 def _f(name: str, default: float) -> float:
@@ -259,10 +256,9 @@ def _f(name: str, default: float) -> float:
     s = raw.strip()
     if s == "":
         return float(default)
-    try:
+    with contextlib.suppress(Exception):
         return float(s)
-    except Exception:
-        return float(default)
+    return float(default)
 
 
 def _s(name: str, default: str = "") -> str:
@@ -287,9 +283,7 @@ def _disabled() -> bool:
 
 
 def _coerce_int(value: Any, default: int) -> int:
-    if value is None:
-        return int(default)
-    if isinstance(value, bool):
+    if value is None or isinstance(value, bool):
         return int(default)
     if isinstance(value, int):
         return int(value)
@@ -309,17 +303,7 @@ def _coerce_int(value: Any, default: int) -> int:
     return int(default)
 
 
-# config.py is optional; env always wins
-try:
-    import config as C  # type: ignore
-except Exception:  # pragma: no cover
-
-    class _C:
-        pass
-
-    C = _C()  # type: ignore
-
-
+# config.py is optional; env always wins (import lazily to reduce import-time side effects)
 def _cfg(name: str, default: Any) -> Any:
     if os.getenv(name) not in (None, ""):
         if isinstance(default, bool):
@@ -329,7 +313,12 @@ def _cfg(name: str, default: Any) -> Any:
         if isinstance(default, float):
             return _f(name, float(default))
         return _s(name, str(default))
-    return getattr(C, name, default)
+
+    with contextlib.suppress(Exception):
+        import config as C  # type: ignore
+
+        return getattr(C, name, default)
+    return default
 
 
 # Optional mint normalizer (must be Any->str to avoid conditional signature mismatch)
@@ -801,7 +790,8 @@ def _b58encode(data: bytes) -> str:
             pad += 1
         else:
             break
-    return ("1" * pad) + "".join(reversed(out or ["1"]))
+    core = "".join(reversed(out)) if out else "1"
+    return ("1" * pad) + core
 
 
 def _stable_pubkey(tag: str) -> str:
@@ -968,6 +958,14 @@ class _RpsGate:
 _RPS = _RpsGate()
 
 
+def _debug_url(url: str, params: dict[str, Any] | None) -> str:
+    if not params:
+        return url
+    with contextlib.suppress(Exception):
+        return f"{url}?{urlencode({k: str(v) for k, v in params.items()})}"
+    return url
+
+
 async def _fetch_json(
     session: Any,
     st: Settings,
@@ -1002,12 +1000,11 @@ async def _fetch_json(
                 first = text[:140]
 
                 if status == 200:
-                    try:
+                    with contextlib.suppress(Exception):
                         return await r.json(content_type=None), status, first
-                    except Exception:
-                        with contextlib.suppress(Exception):
-                            return json.loads(text), status, first
-                        return None, status, first
+                    with contextlib.suppress(Exception):
+                        return json.loads(text), status, first
+                    return None, status, first
 
                 if 400 <= status < 500 and status != 429:
                     return None, status, first
@@ -1033,7 +1030,7 @@ async def _fetch_json(
                 level=logging.INFO,
                 msg="RAY_HTTP_ERR",
                 err=type(e).__name__,
-                url=url,
+                url=_debug_url(url, params),
                 attempt=attempt,
                 retries=st.retries,
             )
@@ -1113,18 +1110,16 @@ async def _fetch_pairs(
 # Normalization helpers
 # =============================================================================
 def _nzf(v: Any, d: float = 0.0) -> float:
-    try:
+    with contextlib.suppress(Exception):
         x = float(v)
         return d if x != x else x
-    except Exception:
-        return d
+    return d
 
 
 def _nzi(v: Any, d: int = 0) -> int:
-    try:
+    with contextlib.suppress(Exception):
         return int(v)
-    except Exception:
-        return d
+    return d
 
 
 def _age_min(created_ms_or_s: Any) -> float | None:
@@ -1320,7 +1315,6 @@ def _build_candidate_factory() -> Callable[[dict[str, Any]], CandidateT]:
     if CandidateClass is None:  # pragma: no cover
         raise RuntimeError("scanner.registry.Candidate missing — cannot emit candidates")
 
-    # Prefer classmethods if present
     for fn_name in ("from_meta", "from_dict", "from_mapping"):
         fn = getattr(CandidateClass, fn_name, None)
         if callable(fn):
@@ -1330,7 +1324,6 @@ def _build_candidate_factory() -> Callable[[dict[str, Any]], CandidateT]:
 
             return _wrap
 
-    # Signature-aware ctor mapping
     try:
         sig = inspect.signature(CandidateClass)
         params = set(sig.parameters.keys())
@@ -1364,12 +1357,10 @@ def _build_candidate_factory() -> Callable[[dict[str, Any]], CandidateT]:
         _set_if("data", meta)
         _set_if("extra", meta)
 
-        # If we can match any parameters, try that first.
         if kwargs:
             with contextlib.suppress(TypeError):
                 return CandidateClass(**kwargs)  # type: ignore[misc]
 
-        # Fallback: Any-safe progressive ctor attempts (keeps mypy happy and runtime resilient)
         mint = str(meta.get("mint") or "").strip()
         symbol = str(meta.get("symbol") or "").strip() or (mint[:6] if mint else "UNKNOWN")
         src = _coerce_source(meta.get("source") or "raydium")
@@ -1389,7 +1380,6 @@ def _build_candidate_factory() -> Callable[[dict[str, Any]], CandidateT]:
             except TypeError:
                 continue
 
-        # Final fallback (should basically never happen)
         return cls_any(meta)
 
     return _ctor

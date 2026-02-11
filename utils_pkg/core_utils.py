@@ -43,13 +43,22 @@ import random
 import ssl
 import struct
 import time
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Set as AbstractSet,
+)
 from contextlib import asynccontextmanager
-from typing import Any, Final, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Final, TypeVar, cast
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import certifi
-import httpx
+
+if TYPE_CHECKING:  # pragma: no cover
+    import httpx  # type: ignore
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Contract / test / safe-mode gates (NO hangs, NO forced real network)
@@ -108,13 +117,13 @@ def _contract_no_network() -> bool:
     if os.getenv("CONTRACT_TEST", "").strip() == "1":
         return True
 
-    if os.getenv("PYTEST_MODE", "").strip().lower() in _TRUE:
+    if _env_bool("PYTEST_MODE", False):
         return True
-    if os.getenv("NO_NETWORK", "").strip().lower() in _TRUE:
+    if _env_bool("NO_NETWORK", False):
         return True
-    if os.getenv("DISABLE_NETWORK", "").strip().lower() in _TRUE:
+    if _env_bool("DISABLE_NETWORK", False):
         return True
-    if os.getenv("SAFE_MODE", "").strip().lower() in _TRUE:
+    if _env_bool("SAFE_MODE", False):
         return True
 
     # Default: tests run offline unless explicitly allowed
@@ -122,14 +131,28 @@ def _contract_no_network() -> bool:
 
 
 def _contract_no_redis() -> bool:
+    """
+    Redis is considered "network-ish" in contract modes.
+    """
     if _contract_no_network():
         return True
-    if os.getenv("DISABLE_REDIS", "").strip().lower() in _TRUE:
+    if _env_bool("DISABLE_REDIS", False):
         return True
-    return bool(os.getenv("REDIS_ENABLED", "").strip().lower() in _FALSE)
+    # Back-compat: REDIS_ENABLED=false disables.
+    if os.getenv("REDIS_ENABLED", "").strip().lower() in _FALSE:
+        return True
+    return False
+
+
+def _running_loop() -> asyncio.AbstractEventLoop | None:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
 
 
 async def _sleep(seconds: float) -> None:
+    # Never sleep in contract/no-network; prevents hanging CI/pytest.
     if seconds <= 0:
         return
     if _contract_no_network():
@@ -138,7 +161,7 @@ async def _sleep(seconds: float) -> None:
 
 
 def _jitter(min_ms: int = 20, max_ms: int = 120) -> float:
-    # Only used when network is allowed; tests/contract won't call this.
+    # Only used when network is allowed; contract/pytest shouldn't hit this.
     return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
 
@@ -196,7 +219,8 @@ def _log_every(key: str, n: int = 30, msg: str | None = None, **kw: Any) -> None
             return
     except Exception:
         pass
-    # fallback: very small local throttle
+
+    # fallback: tiny in-memory throttle
     try:
         now = time.monotonic()
         store = getattr(_log_every, "_store", {})  # type: ignore[attr-defined]
@@ -207,45 +231,6 @@ def _log_every(key: str, n: int = 30, msg: str | None = None, **kw: Any) -> None
             _log_event(msg or key, **kw)
     except Exception:
         return
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional heavy deps (never hard-fail import)
-# ──────────────────────────────────────────────────────────────────────────────
-try:  # pragma: no cover
-    from solana.rpc.async_api import AsyncClient  # type: ignore
-    from solana.rpc.commitment import Confirmed  # type: ignore
-    from solana.rpc.types import TokenAccountOpts  # type: ignore
-except Exception:  # pragma: no cover
-    AsyncClient = None  # type: ignore
-    Confirmed = None  # type: ignore
-    TokenAccountOpts = None  # type: ignore
-
-try:  # pragma: no cover
-    from solders.keypair import Keypair  # type: ignore
-    from solders.pubkey import Pubkey as PublicKey  # type: ignore
-except Exception:  # pragma: no cover
-    Keypair = None  # type: ignore
-    PublicKey = None  # type: ignore
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional project imports
-# ──────────────────────────────────────────────────────────────────────────────
-try:  # pragma: no cover
-    from utils_pkg import solana_wallet as SW  # type: ignore
-except Exception:  # pragma: no cover
-    SW = None  # type: ignore
-
-try:  # pragma: no cover
-    from utils_pkg.mint_guard import guard_jupiter_quote_args as _guard_quote_args  # type: ignore
-except Exception:  # pragma: no cover
-    _guard_quote_args = None  # type: ignore
-
-try:  # pragma: no cover
-    from utils_pkg.mints import SOL_MINT as WSOL_MINT  # type: ignore
-except Exception:  # pragma: no cover
-    WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -271,8 +256,12 @@ except Exception:  # pragma: no cover
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants / endpoints
 # ──────────────────────────────────────────────────────────────────────────────
+
 LAMPORTS_PER_SOL: Final[int] = 1_000_000_000
 LAMPORTS_PER_SOL_F: Final[float] = float(LAMPORTS_PER_SOL)
+
+# Canonical WSOL mint fallback (safe constant; avoid import-time heaviness)
+WSOL_MINT: Final[str] = "So11111111111111111111111111111111111111112"
 
 COINGECKO_SOL_API: Final[str] = (
     "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
@@ -290,6 +279,7 @@ JUPITER_SWAP_API: str = _env_str("JUPITER_SWAP_API", "") or "https://quote-api.j
 # ──────────────────────────────────────────────────────────────────────────────
 # Runtime globals (NO I/O here)
 # ──────────────────────────────────────────────────────────────────────────────
+
 # Session aliases (compat)
 _aiohttp_session: Any | None = None
 aiohttp_session: Any | None = None
@@ -301,11 +291,13 @@ session: Any | None = None
 
 _aiohttp_lock = asyncio.Lock()
 
-_httpx_client: httpx.AsyncClient | None = None
+_httpx_client: "httpx.AsyncClient | None" = None
 _httpx_lock = asyncio.Lock()
 
 solana_client: Any | None = None
 wallet: Any | None = None
+
+# Redis client (async). DO NOT CONNECT at import-time.
 redis: Any | None = None
 
 _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
@@ -322,55 +314,394 @@ _SQLITE_READY = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Mint normalization (canonical shim; no heavy import-time deps)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_NORM_MINT_FN: Callable[[str], str] | None = None
+_NORM_MINT_TRIED = False
+
+
+def _resolve_normalize_mint() -> Callable[[str], str] | None:
+    global _NORM_MINT_FN, _NORM_MINT_TRIED
+    if _NORM_MINT_TRIED:
+        return _NORM_MINT_FN
+    _NORM_MINT_TRIED = True
+
+    with contextlib.suppress(Exception):
+        mod = importlib.import_module("utils_pkg.mints")
+        fn = getattr(mod, "normalize_mint", None)
+        if callable(fn):
+            _NORM_MINT_FN = cast(Callable[[str], str], fn)
+            return _NORM_MINT_FN
+
+    _NORM_MINT_FN = None
+    return None
+
+
+def normalize_mint(m: Any) -> str:
+    """
+    Canonical mint normalization hook.
+    - Uses utils_pkg.mints.normalize_mint if available
+    - Otherwise returns stripped string
+    - Never raises
+    """
+    s = str(m or "").strip()
+    if not s:
+        return ""
+    fn = _resolve_normalize_mint()
+    if fn is None:
+        return s
+    with contextlib.suppress(Exception):
+        out = fn(s)
+        out_s = str(out or "").strip()
+        return out_s or s
+    return s
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Background task tracking (MYPY-SAFE)
+# ──────────────────────────────────────────────────────────────────────────────
+
+T = TypeVar("T")
+
+
+def _as_coroutine(aw: Awaitable[T]) -> Coroutine[Any, Any, T]:
+    if inspect.iscoroutine(aw):
+        return cast(Coroutine[Any, Any, T], aw)
+
+    async def _wrap() -> T:
+        return await aw
+
+    return _wrap()
+
+
+def _track_task(task: asyncio.Task[Any]) -> None:
+    _BACKGROUND_TASKS.add(task)
+
+    def _done(t: asyncio.Task[Any]) -> None:
+        _BACKGROUND_TASKS.discard(t)
+
+    task.add_done_callback(_done)
+
+
+def create_task(coro: Awaitable[T], *, name: str | None = None) -> asyncio.Task[T]:
+    c = _as_coroutine(coro)
+    try:
+        loop = asyncio.get_running_loop()
+        task: asyncio.Task[T]
+        task = loop.create_task(c, name=name) if name else loop.create_task(c)
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+        task = loop.create_task(c)
+    _track_task(cast(asyncio.Task[Any], task))
+    return task
+
+
+def _spawn(coro: Awaitable[Any], *, name: str) -> None:
+    # Fire-and-forget helper. Never raises. Never creates a loop.
+    if _running_loop() is None:
+        return
+    with contextlib.suppress(Exception):
+        create_task(coro, name=name)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # NullRedis for contract/no-network tests (and safe default fallback)
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+class _NullRedisLock:
+    """
+    Minimal async Lock shim compatible with common redis-py lock usage patterns.
+
+    - acquire/release/extend always succeed
+    - supports `async with`
+    - deterministic, never raises
+    """
+
+    def __init__(self, name: str, timeout: float | None = None) -> None:
+        self.name = name
+        self.timeout = timeout
+        self._held = False
+
+    async def acquire(self, *_: Any, **__: Any) -> bool:
+        self._held = True
+        return True
+
+    async def release(self) -> bool:
+        self._held = False
+        return True
+
+    async def extend(self, *_: Any, **__: Any) -> bool:
+        return True
+
+    async def locked(self) -> bool:
+        return bool(self._held)
+
+    async def __aenter__(self) -> "_NullRedisLock":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        _ = (exc_type, exc, tb)
+        await self.release()
+        return None
+
+
+class _NullPubSub:
+    """
+    Async pubsub shim:
+      - subscribe/unsubscribe no-op
+      - get_message returns None
+      - listen() is an async iterator that yields nothing
+    """
+
+    async def subscribe(self, *_: Any, **__: Any) -> None:
+        return None
+
+    async def unsubscribe(self, *_: Any, **__: Any) -> None:
+        return None
+
+    async def psubscribe(self, *_: Any, **__: Any) -> None:
+        return None
+
+    async def punsubscribe(self, *_: Any, **__: Any) -> None:
+        return None
+
+    async def get_message(self, *_: Any, **__: Any) -> Any:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        return None
+
+    async def listen(self) -> "AsyncIterator[Any]":
+        # Keep async-generator type without “unreachable yield” errors in mypy.
+        if TYPE_CHECKING:  # pragma: no cover
+            yield None
+        return
+
+    def __aiter__(self) -> "AsyncIterator[Any]":
+        return self.listen()
+
+
 class _NullRedis:
+    """
+    Broad async no-op Redis client used for:
+      - contract/no-network tests
+      - safe-mode fallback when redis is disabled/unavailable
+
+    Design goals:
+      - never raises for common redis operations
+      - async-first
+      - deterministic falsy truthiness (prevents `if redis:` from acting enabled)
+      - still “works” when called (ping True, reads None/empty, writes ok)
+    """
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return "<_NullRedis offline>"
+
+    async def __aenter__(self) -> "_NullRedis":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        _ = (exc_type, exc, tb)
+        return None
+
+    # ── KV ──────────────────────────────────────────────────────────────
     async def get(self, key: str) -> Any:
+        _ = key
         return None
 
     async def mget(self, *keys: str) -> list[Any]:
+        _ = keys
         return [None for _ in keys]
 
     async def set(self, key: str, value: Any, **kwargs: Any) -> bool:
+        _ = (key, value, kwargs)
         return True
 
+    async def setex(self, key: str, ttl: int, value: Any) -> bool:
+        _ = (key, ttl, value)
+        return True
+
+    async def setnx(self, key: str, value: Any) -> bool:
+        _ = (key, value)
+        return True
+
+    async def incr(self, key: str, amount: int = 1) -> int:
+        _ = (key, amount)
+        return 0
+
+    async def decr(self, key: str, amount: int = 1) -> int:
+        _ = (key, amount)
+        return 0
+
+    async def delete(self, *keys: str) -> int:
+        _ = keys
+        return 0
+
+    async def exists(self, *keys: str) -> int:
+        _ = keys
+        return 0
+
+    async def expire(self, key: str, ttl: int) -> bool:
+        _ = (key, ttl)
+        return True
+
+    async def ttl(self, key: str) -> int:
+        _ = key
+        return -1
+
+    # ── Hashes ──────────────────────────────────────────────────────────
     async def hget(self, key: str, field: str) -> Any:
+        _ = (key, field)
         return None
 
     async def hset(self, key: str, field: str, value: Any) -> int:
+        _ = (key, field, value)
         return 1
 
+    async def hdel(self, key: str, *fields: str) -> int:
+        _ = (key, fields)
+        return 0
+
     async def hgetall(self, key: str) -> dict[str, Any]:
+        _ = key
         return {}
 
+    async def hincrbyfloat(self, key: str, field: str, amount: float) -> float:
+        _ = (key, field, amount)
+        return 0.0
+
+    # ── Sorted sets ─────────────────────────────────────────────────────
     async def zadd(self, key: str, mapping: dict[str, float], **kwargs: Any) -> int:
+        _ = (key, mapping, kwargs)
         return 0
 
     async def zcard(self, key: str) -> int:
+        _ = key
         return 0
 
     async def zrange(self, key: str, start: int, stop: int, **kwargs: Any) -> list[Any]:
+        _ = (key, start, stop, kwargs)
         return []
 
+    async def zrevrange(self, key: str, start: int, stop: int, **kwargs: Any) -> list[Any]:
+        _ = (key, start, stop, kwargs)
+        return []
+
+    async def zrem(self, key: str, *members: str) -> int:
+        _ = (key, members)
+        return 0
+
+    # ── Sets ────────────────────────────────────────────────────────────
     async def sadd(self, key: str, *vals: Any) -> int:
+        _ = (key, vals)
         return 0
 
     async def sismember(self, key: str, val: Any) -> bool:
+        _ = (key, val)
         return False
 
+    async def smembers(self, key: str) -> AbstractSet[Any]:
+        _ = key
+        return set()
+
+    # ── Lists ───────────────────────────────────────────────────────────
+    async def lpush(self, key: str, *vals: Any) -> int:
+        _ = (key, vals)
+        return 0
+
+    async def rpush(self, key: str, *vals: Any) -> int:
+        _ = (key, vals)
+        return 0
+
+    async def lrange(self, key: str, start: int, stop: int) -> list[Any]:
+        _ = (key, start, stop)
+        return []
+
+    async def blpop(self, keys: Any, timeout: int = 0) -> Any:
+        _ = (keys, timeout)
+        return None
+
+    # ── Pub/Sub ─────────────────────────────────────────────────────────
+    async def publish(self, channel: str, message: Any) -> int:
+        _ = (channel, message)
+        return 0
+
+    def pubsub(self, *_: Any, **__: Any) -> _NullPubSub:
+        return _NullPubSub()
+
+    # ── Locks / scripts / scanning ──────────────────────────────────────
+    def lock(self, name: str, timeout: float | None = None, **_: Any) -> _NullRedisLock:
+        return _NullRedisLock(name, timeout=timeout)
+
+    async def eval(self, *_: Any, **__: Any) -> Any:
+        return None
+
+    async def script_load(self, *_: Any, **__: Any) -> str:
+        return ""
+
+    def register_script(self, *_: Any, **__: Any) -> Callable[..., Awaitable[Any]]:
+        async def _runner(*a: Any, **k: Any) -> Any:
+            _ = (a, k)
+            return None
+
+        return _runner
+
+    async def scan_iter(self, *_: Any, **__: Any) -> "AsyncIterator[str]":
+        if TYPE_CHECKING:  # pragma: no cover
+            yield ""
+        return
+
+    # ── Pipeline / multi ────────────────────────────────────────────────
+    def pipeline(self, *_: Any, **__: Any) -> "_NullRedis":
+        return self
+
+    async def execute(self) -> list[Any]:
+        return []
+
+    async def watch(self, *keys: str) -> None:
+        _ = keys
+        return None
+
+    async def unwatch(self) -> None:
+        return None
+
+    # ── Health / lifecycle ──────────────────────────────────────────────
     async def ping(self) -> bool:
         return True
 
     async def close(self) -> None:
         return None
 
+    async def aclose(self) -> None:
+        return None
+
 
 _NULL_REDIS = _NullRedis()
+
+
+def is_null_redis(r: Any | None) -> bool:
+    if r is None:
+        return True
+    if isinstance(r, _NullRedis):
+        return True
+    n = getattr(getattr(r, "__class__", None), "__name__", "")
+    return n in {"_NullRedis", "NullRedis"}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FakeSession-first HTTP helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 def get_http_session() -> Any | None:
     g = globals()
     candidates = [
@@ -392,18 +723,36 @@ def get_http_session() -> Any | None:
         if v is not None:
             return v
 
+    # Fallback heuristic: any object with get/post methods.
     for k, v in list(g.items()):
         if v is None:
             continue
         if "session" in k.lower() or "client" in k.lower():
             if callable(getattr(v, "get", None)) or callable(getattr(v, "post", None)):
                 return v
-
     return None
 
 
+def set_http_session(s: Any | None) -> None:
+    global \
+        _aiohttp_session, \
+        aiohttp_session, \
+        _http_session, \
+        http_session, \
+        _HTTP_SESSION, \
+        HTTP_SESSION, \
+        session
+    _aiohttp_session = s
+    aiohttp_session = s
+    _http_session = s
+    http_session = s
+    _HTTP_SESSION = s
+    HTTP_SESSION = s
+    session = s
+
+
 @asynccontextmanager
-async def _as_ctx(obj: Any):
+async def _as_ctx(obj: Any) -> AsyncIterator[Any]:
     if hasattr(obj, "__aenter__") and hasattr(obj, "__aexit__"):
         async with obj as resp:
             yield resp
@@ -621,11 +970,15 @@ async def _get_json(
 # ──────────────────────────────────────────────────────────────────────────────
 # httpx fallback (PROD-only; never in contract/pytest unless explicitly allowed)
 # ──────────────────────────────────────────────────────────────────────────────
-async def _ensure_httpx_client() -> httpx.AsyncClient:
+
+
+async def _ensure_httpx_client() -> "httpx.AsyncClient":
     global _httpx_client
     async with _httpx_lock:
         if _httpx_client is not None:
             return _httpx_client
+        import httpx  # lazy
+
         verify_ctx = ssl.create_default_context(cafile=certifi.where())
         _httpx_client = httpx.AsyncClient(
             timeout=httpx.Timeout(_env_float("HTTP_TIMEOUT_SEC", 18.0)),
@@ -653,6 +1006,7 @@ async def _http_get_json(
     timeout_s: float | None = None,
     retries: int | None = None,
 ) -> dict[str, Any] | None:
+    # Hard gate: never do real httpx in contract; never in pytest unless explicitly allowed.
     if _contract_no_network():
         return None
     if _in_pytest() and not _env_bool("ALLOW_TEST_HTTPX", False):
@@ -665,30 +1019,49 @@ async def _http_get_json(
     for i in range(attempt_n + 1):
         try:
             c = await _ensure_httpx_client()
+
             hdrs = {"accept": "application/json", "user-agent": _env_str("HTTP_UA", "pnlsniper")}
             if headers:
                 hdrs.update(headers)
+
             if timeout_s is not None:
                 r = await c.get(url, params=params, headers=hdrs, timeout=float(timeout_s))
             else:
                 r = await c.get(url, params=params, headers=hdrs)
+
             r.raise_for_status()
             data = r.json()
             return data if isinstance(data, dict) else None
+
         except Exception:
-            if i < attempt_n:
-                await _sleep(base_sleep * (2**i) + _jitter(10, 80))
-            continue
+            if i >= attempt_n:
+                break
+            await _sleep(base_sleep * (2**i) + _jitter(10, 80))
+
     return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Redis (lazy; NEVER connects in contract/pytest unless explicitly allowed)
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 def _effective_redis_url() -> str:
     return (
         _env_str("REDIS_URL") or _env_str("REDIS_TLS_URL") or (CFG_REDIS_URL or "").strip() or ""
     ).strip()
+
+
+def _redis_required() -> bool:
+    """
+    If true, failing to initialize redis in non-contract mode should be treated as an error.
+    (kept behind env gates so tests remain stable)
+    """
+    if _env_bool("REDIS_REQUIRED", False):
+        return True
+    if _env_bool("STRICT_REDIS", False):
+        return True
+    return False
 
 
 async def _init_redis_if_needed() -> None:
@@ -707,23 +1080,47 @@ async def _init_redis_if_needed() -> None:
     url = _effective_redis_url()
     if not url:
         redis = _NULL_REDIS
+        if _redis_required():
+            raise RuntimeError("REDIS_REQUIRED=true but no REDIS_URL provided")
         return
 
     try:
         import redis.asyncio as redis_async  # type: ignore
-    except Exception:
+    except Exception as e:
         redis = _NULL_REDIS
+        if _redis_required():
+            raise RuntimeError(f"REDIS_REQUIRED=true but redis import failed: {_short(e)}") from e
         return
 
     try:
+        # from_url is lazy (no connect until command).
         redis = redis_async.from_url(url, decode_responses=True)
-    except Exception:
+    except Exception as e:
         redis = _NULL_REDIS
+        if _redis_required():
+            raise RuntimeError(f"REDIS_REQUIRED=true but redis init failed: {_short(e)}") from e
 
 
-def get_redis() -> Any:
+def get_redis(*, autoinit: bool | None = None) -> Any:
+    """
+    Canonical Redis accessor.
+
+    Contract:
+      - returns _NULL_REDIS
+
+    Prod:
+      - returns initialized client if present
+      - otherwise returns _NULL_REDIS
+      - optional warmup only if a running loop exists (never creates loops)
+    """
     if _contract_no_redis():
         return _NULL_REDIS
+
+    if redis is None:
+        do_init = _env_bool("REDIS_AUTOINIT", True) if autoinit is None else bool(autoinit)
+        if do_init and _running_loop() is not None:
+            _spawn(_init_redis_if_needed(), name="init_redis")
+
     return redis if redis is not None else _NULL_REDIS
 
 
@@ -734,9 +1131,20 @@ async def get_redis_async() -> Any:
     return redis if redis is not None else _NULL_REDIS
 
 
+async def redis_health(*, r: Any | None = None) -> dict[str, Any]:
+    rr = r if r is not None else get_redis(autoinit=True)
+    if rr is None or is_null_redis(rr):
+        return {"ok": False, "mode": "null", "reason": "disabled_or_unavailable"}
+    with contextlib.suppress(Exception):
+        pong = await rr.ping()
+        return {"ok": bool(pong), "mode": "real"}
+    return {"ok": False, "mode": "real", "reason": "ping_failed"}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # SQLite (entry price + sniped tokens) — disabled in pytest unless allowed
 # ──────────────────────────────────────────────────────────────────────────────
+
 _ENTRY_PRICE_PREFIX: Final[str] = "entry_price:"
 _SNIPED_KEY_PREFIX: Final[str] = "sniped:"
 _SNIPED_SET_KEY: Final[str] = "sniped_tokens"
@@ -746,15 +1154,20 @@ async def _maybe_await(x: Any) -> Any:
     return await x if asyncio.iscoroutine(x) else x
 
 
-def _get_rr(redis_arg: Any | None = None, r_arg: Any | None = None) -> Any | None:
-    return redis_arg or r_arg or globals().get("redis")
+def _pick_redis(redis_arg: Any | None = None, r_arg: Any | None = None) -> Any | None:
+    # NOTE: do not use truthiness here (NullRedis is intentionally falsy).
+    if redis_arg is not None:
+        return redis_arg
+    if r_arg is not None:
+        return r_arg
+    return globals().get("redis")
 
 
 def _norm_mint(mint: Any | None, token_mint: Any | None, token: Any | None = None) -> str:
     m = mint if mint is not None else token_mint
     if (m is None or str(m).strip() == "") and token is not None:
         m = token
-    s = str(m or "").strip()
+    s = normalize_mint(m)
     if not s:
         raise ValueError("mint/token_mint is required")
     return s
@@ -768,6 +1181,7 @@ def _norm_price(price: Any | None, entry_price: Any | None) -> float:
 
 
 def _sqlite_path() -> str:
+    # Disk I/O only when called (not import-time).
     p = str(SQLITE_DB_PATH or "./state.sqlite3")
     os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
     return p
@@ -787,19 +1201,32 @@ def _sqlite_exec_sync(sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any,
 
 
 async def init_sqlite() -> None:
-    global _SQLITE_READY
+    """
+    Initialize the SQLite table once.
 
-    if not _SQLITE_ENABLED or _SQLITE_READY:
+    Mypy note:
+      We intentionally do NOT pre-check `_SQLITE_READY` before the async lock.
+      Mypy flow-narrows globals and can incorrectly mark the in-lock recheck
+      as unreachable across an await boundary.
+    """
+    global _SQLITE_READY
+    if not _SQLITE_ENABLED:
         return
 
     async with _SQLITE_LOCK:
-        if not _SQLITE_READY:
+        if _SQLITE_READY:
+            return
+
+        try:
             await asyncio.to_thread(
                 _sqlite_exec_sync,
-                "CREATE TABLE IF NOT EXISTS sniped_tokens (token TEXT PRIMARY KEY, price REAL, timestamp INTEGER, unit TEXT)",
+                "CREATE TABLE IF NOT EXISTS sniped_tokens ("
+                "token TEXT PRIMARY KEY, price REAL, timestamp INTEGER, unit TEXT)",
                 (),
             )
             _SQLITE_READY = True
+        except Exception:
+            _SQLITE_READY = False
 
 
 async def remember_entry_price(
@@ -817,6 +1244,7 @@ async def remember_entry_price(
 
     if ts is None:
         ts = int(time.time())
+
     u = (unit or "usd").strip().lower()
     if u not in ("usd", "sol", "sniped"):
         u = "usd"
@@ -825,11 +1253,12 @@ async def remember_entry_price(
     if not _SQLITE_READY:
         return
 
-    await asyncio.to_thread(
-        _sqlite_exec_sync,
-        "INSERT OR REPLACE INTO sniped_tokens (token, price, timestamp, unit) VALUES (?, ?, ?, ?)",
-        (str(token), float(p), int(ts), u),
-    )
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(
+            _sqlite_exec_sync,
+            "INSERT OR REPLACE INTO sniped_tokens (token, price, timestamp, unit) VALUES (?, ?, ?, ?)",
+            (str(token), float(p), int(ts), u),
+        )
 
 
 async def save_entry_price(
@@ -850,9 +1279,10 @@ async def save_entry_price(
 ) -> None:
     _ = args
 
+    # Back-compat positional fallthrough
     if mint is None and token_mint is None:
         if c is not None:
-            redis = redis or a
+            redis = redis if redis is not None else a
             mint = cast(str, b)
             if price is None:
                 price = cast(float, c)
@@ -861,26 +1291,33 @@ async def save_entry_price(
             if price is None:
                 price = cast(float, b)
 
-    m = _norm_mint(mint, token_mint)
-    p = _norm_price(price, entry_price)
+    try:
+        m = _norm_mint(mint, token_mint)
+        p = _norm_price(price, entry_price)
+    except Exception:
+        return
 
     payload = {"price": float(p), "ts": int(ts or time.time()), "unit": str(unit)}
-    rr = _get_rr(redis, r)
+    key = f"{_ENTRY_PRICE_PREFIX}{m}"
+    val = json.dumps(payload, separators=(",", ":"))
 
+    rr = _pick_redis(redis, r)
+
+    stored = False
     if rr is not None:
-        key = f"{_ENTRY_PRICE_PREFIX}{m}"
-        val = json.dumps(payload, separators=(",", ":"))
+        fn_set = getattr(rr, "set", None)
+        if callable(fn_set):
+            with contextlib.suppress(Exception):
+                await _maybe_await(fn_set(key, val))
+                stored = True
 
-        if callable(getattr(rr, "set", None)):
-            await _maybe_await(rr.set(key, val))
-            return
-        try:
-            rr[key] = val
-            return
-        except Exception:
-            pass
+        if not stored:
+            with contextlib.suppress(Exception):
+                rr[key] = val
+                stored = True
 
-    await remember_entry_price(m, float(p), ts=ts, unit=unit)
+    if not stored:
+        await remember_entry_price(m, float(p), ts=ts, unit=unit)
 
 
 async def get_entry_price(
@@ -899,13 +1336,17 @@ async def get_entry_price(
 
     if mint is None and token_mint is None:
         if b is not None:
-            redis = redis or a
+            redis = redis if redis is not None else a
             mint = cast(str, b)
         else:
             mint = cast(str, a)
 
-    m = _norm_mint(mint, token_mint)
-    rr = _get_rr(redis, r)
+    try:
+        m = _norm_mint(mint, token_mint)
+    except Exception:
+        return default
+
+    rr = _pick_redis(redis, r)
 
     if rr is not None and callable(getattr(rr, "get", None)):
         raw = await _maybe_await(rr.get(f"{_ENTRY_PRICE_PREFIX}{m}"))
@@ -948,9 +1389,10 @@ async def clear_entry_price(token: str) -> None:
     await init_sqlite()
     if not _SQLITE_READY:
         return
-    await asyncio.to_thread(
-        _sqlite_exec_sync, "DELETE FROM sniped_tokens WHERE token = ?", (str(token),)
-    )
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(
+            _sqlite_exec_sync, "DELETE FROM sniped_tokens WHERE token = ?", (str(token),)
+        )
 
 
 async def cache_sniped_token(
@@ -964,23 +1406,40 @@ async def cache_sniped_token(
     ts: int | None = None,
     **_kw: Any,
 ) -> None:
-    _ = ttl_sec
-    m = _norm_mint(mint, token_mint, token=token)
-    rr = _get_rr(redis, r)
+    try:
+        m = _norm_mint(mint, token_mint, token=token)
+    except Exception:
+        return
 
+    rr = _pick_redis(redis, r)
+
+    cached = False
     if rr is not None:
-        if callable(getattr(rr, "sadd", None)):
-            await _maybe_await(rr.sadd(_SNIPED_SET_KEY, m))
-        if callable(getattr(rr, "set", None)):
-            await _maybe_await(rr.set(f"{_SNIPED_KEY_PREFIX}{m}", "1"))
-            return
-        try:
-            rr[f"{_SNIPED_KEY_PREFIX}{m}"] = "1"
-            return
-        except Exception:
-            pass
+        fn_sadd = getattr(rr, "sadd", None)
+        if callable(fn_sadd):
+            with contextlib.suppress(Exception):
+                await _maybe_await(fn_sadd(_SNIPED_SET_KEY, m))
 
-    await remember_entry_price(m, 0.0, ts=int(ts or time.time()), unit="sniped")
+        fn_setex = getattr(rr, "setex", None)
+        if callable(fn_setex):
+            with contextlib.suppress(Exception):
+                await _maybe_await(fn_setex(f"{_SNIPED_KEY_PREFIX}{m}", int(ttl_sec), "1"))
+                cached = True
+
+        if not cached:
+            fn_set = getattr(rr, "set", None)
+            if callable(fn_set):
+                with contextlib.suppress(Exception):
+                    await _maybe_await(fn_set(f"{_SNIPED_KEY_PREFIX}{m}", "1"))
+                    cached = True
+
+        if not cached:
+            with contextlib.suppress(Exception):
+                rr[f"{_SNIPED_KEY_PREFIX}{m}"] = "1"
+                cached = True
+
+    if not cached:
+        await remember_entry_price(m, 0.0, ts=int(ts or time.time()), unit="sniped")
 
 
 async def was_token_sniped(
@@ -993,8 +1452,12 @@ async def was_token_sniped(
     r: Any | None = None,
     **_kw: Any,
 ) -> bool:
-    m = _norm_mint(mint, token_mint, token=(token2 if token2 is not None else token))
-    rr = _get_rr(redis, r)
+    try:
+        m = _norm_mint(mint, token_mint, token=(token2 if token2 is not None else token))
+    except Exception:
+        return False
+
+    rr = _pick_redis(redis, r)
 
     if rr is not None:
         if callable(getattr(rr, "sismember", None)):
@@ -1003,10 +1466,9 @@ async def was_token_sniped(
         if callable(getattr(rr, "get", None)):
             out = await _maybe_await(rr.get(f"{_SNIPED_KEY_PREFIX}{m}"))
             return out is not None
-        try:
+        with contextlib.suppress(Exception):
             return (f"{_SNIPED_KEY_PREFIX}{m}") in rr
-        except Exception:
-            return False
+        return False
 
     if not _SQLITE_ENABLED:
         return False
@@ -1026,6 +1488,8 @@ async def was_token_sniped(
 # ──────────────────────────────────────────────────────────────────────────────
 # Telegram
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 def _tg_token() -> str:
     return (
         TELEGRAM_BOT_TOKEN or _env_str("TELEGRAM_BOT_TOKEN", "") or _env_str("TELEGRAM_TOKEN", "")
@@ -1094,6 +1558,8 @@ async def send_telegram(
 # ──────────────────────────────────────────────────────────────────────────────
 # SOL price (Coingecko) + converters
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 async def get_sol_usd(*, session: Any | None = None) -> float:
     global _SOL_CACHE_TS, _SOL_CACHE_PX
     now = time.time()
@@ -1137,6 +1603,8 @@ async def convert_usd_to_sol(usd_amount: float) -> float:
 # ──────────────────────────────────────────────────────────────────────────────
 # Token price (Birdeye)
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 def _birdeye_headers() -> dict[str, str]:
     h = {"accept": "application/json", "user-agent": _env_str("HTTP_UA", "pnlsniper")}
     key = (
@@ -1188,6 +1656,8 @@ async def get_token_price(token_address: str, *, session: Any | None = None) -> 
 # ──────────────────────────────────────────────────────────────────────────────
 # Dexscreener snapshot (kept)
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 async def get_pair_snapshot_dexscreener(token_address: str) -> dict[str, Any]:
     url = DEXSCREENER_TOKEN_URL.format(mint=token_address)
     data = await _http_get_json(url, timeout_s=12.0)
@@ -1209,6 +1679,13 @@ async def get_pair_snapshot_dexscreener(token_address: str) -> dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Jupiter quote + swap (TEST-LOCKED)
 # ──────────────────────────────────────────────────────────────────────────────
+
+try:  # pragma: no cover
+    from utils_pkg.mint_guard import guard_jupiter_quote_args as _guard_quote_args  # type: ignore
+except Exception:  # pragma: no cover
+    _guard_quote_args = None  # type: ignore
+
+
 def _slp01_to_bps(v: float) -> int:
     try:
         x = float(v)
@@ -1303,8 +1780,8 @@ async def get_jupiter_quote(
     if amt_i <= 0:
         return None
 
-    a = str(input_mint)
-    b = str(output_mint)
+    a = normalize_mint(input_mint) or str(input_mint)
+    b = normalize_mint(output_mint) or str(output_mint)
 
     if _guard_quote_args is not None:
         with contextlib.suppress(Exception):
@@ -1389,7 +1866,6 @@ async def swap_token_jupiter(
     if q is None or not _valid_quote(q):
         return (False, "")
 
-    # Delegate if your project has a real swap executor.
     for mod_name, fn_names in (
         ("utils_pkg.router", ("swap_token_jupiter", "swap", "swap_jupiter", "swap_token")),
         ("utils_pkg.jupiter", ("swap_token_jupiter", "swap", "swap_jupiter")),
@@ -1424,6 +1900,8 @@ async def swap_token_jupiter(
 # ──────────────────────────────────────────────────────────────────────────────
 # Exit helper
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 def dca_profit_exit(
     entry_price: float | None = None,
     current_price: float | None = None,
@@ -1462,6 +1940,8 @@ def dca_profit_exit(
 # ──────────────────────────────────────────────────────────────────────────────
 # AI fraud score stub (kept; safe)
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 async def ai_fraud_score(
     snapshot: dict[str, Any] | None = None, *, session: Any | None = None, **_kw: Any
 ) -> float:
@@ -1473,6 +1953,29 @@ async def ai_fraud_score(
 # ──────────────────────────────────────────────────────────────────────────────
 # RPC + Solana client + wallet (lazy; safe)
 # ──────────────────────────────────────────────────────────────────────────────
+
+try:  # pragma: no cover
+    from solana.rpc.async_api import AsyncClient  # type: ignore
+    from solana.rpc.commitment import Confirmed  # type: ignore
+    from solana.rpc.types import TokenAccountOpts  # type: ignore
+except Exception:  # pragma: no cover
+    AsyncClient = None  # type: ignore
+    Confirmed = None  # type: ignore
+    TokenAccountOpts = None  # type: ignore
+
+try:  # pragma: no cover
+    from solders.keypair import Keypair  # type: ignore
+    from solders.pubkey import Pubkey as PublicKey  # type: ignore
+except Exception:  # pragma: no cover
+    Keypair = None  # type: ignore
+    PublicKey = None  # type: ignore
+
+try:  # pragma: no cover
+    from utils_pkg import solana_wallet as SW  # type: ignore
+except Exception:  # pragma: no cover
+    SW = None  # type: ignore
+
+
 def _base_rpc_url() -> str:
     v = _env_str("SOL_RPC_URL", "") or _env_str("RPC_URL", "") or str(RPC_URL or "")
     v = (v or "").strip()
@@ -1527,6 +2030,8 @@ async def _load_wallet_if_needed(*, require: bool) -> Any | None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Resource lifecycle
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 async def init_resources(require_wallet: bool | None = None) -> None:
     global _INITED
     async with _INIT_LOCK:
@@ -1560,12 +2065,29 @@ async def close_resources() -> None:
             await solana_client.close()
     solana_client = None
 
-    with contextlib.suppress(Exception):
-        if redis is not None and hasattr(redis, "close"):
-            out = redis.close()
-            if asyncio.iscoroutine(out):
-                await out
+    r = redis
     redis = None
+    if r is not None and not is_null_redis(r):
+        with contextlib.suppress(Exception):
+            fn = getattr(r, "aclose", None)
+            if callable(fn):
+                out = fn()
+                if asyncio.iscoroutine(out):
+                    await out
+        with contextlib.suppress(Exception):
+            fn = getattr(r, "close", None)
+            if callable(fn):
+                out = fn()
+                if asyncio.iscoroutine(out):
+                    await out
+        with contextlib.suppress(Exception):
+            pool = getattr(r, "connection_pool", None)
+            disc = getattr(pool, "disconnect", None) if pool is not None else None
+            if callable(disc):
+                out = disc(inuse_connections=True)  # type: ignore[call-arg]
+                if asyncio.iscoroutine(out):
+                    await out
+
     wallet = None
 
     with contextlib.suppress(Exception):
@@ -1577,10 +2099,10 @@ async def close_resources() -> None:
 
 
 @asynccontextmanager
-async def managed_resources(require_wallet: bool | None = None):
+async def managed_resources(require_wallet: bool | None = None) -> AsyncIterator[None]:
     await init_resources(require_wallet=require_wallet)
     try:
-        yield
+        yield None
     finally:
         await close_resources()
 
@@ -1603,103 +2125,134 @@ async def get_wallet_keypair(required: bool = True) -> Any:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Background task tracking (MYPY-SAFE)
-# ──────────────────────────────────────────────────────────────────────────────
-T = TypeVar("T")
-
-
-def _as_coroutine(aw: Awaitable[T]) -> Coroutine[Any, Any, T]:
-    if inspect.iscoroutine(aw):
-        return cast(Coroutine[Any, Any, T], aw)
-
-    async def _wrap() -> T:
-        return await aw
-
-    return _wrap()
-
-
-def _track_task(task: asyncio.Task[Any]) -> None:
-    _BACKGROUND_TASKS.add(task)
-
-    def _done(t: asyncio.Task[Any]) -> None:
-        _BACKGROUND_TASKS.discard(t)
-
-    task.add_done_callback(_done)
-
-
-def create_task(coro: Awaitable[T], *, name: str | None = None) -> asyncio.Task[T]:
-    c = _as_coroutine(coro)
-
-    try:
-        loop = asyncio.get_running_loop()
-        task: asyncio.Task[T]
-        if name:
-            task = loop.create_task(c, name=name)
-        else:
-            task = loop.create_task(c)
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        task = loop.create_task(c)
-
-    _track_task(cast(asyncio.Task[Any], task))
-    return task
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Wallet token helpers (kept; lazy)
 # ──────────────────────────────────────────────────────────────────────────────
+
 TOKEN_PROGRAM_ID_STR: Final[str] = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM_ID_STR: Final[str] = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+
+_SPL_MIN_ACCOUNT_BYTES: Final[int] = 72  # mint(32)+owner(32)+amount(8)
 
 
 def _parse_token_account_data(data: bytes) -> dict[str, Any]:
     if PublicKey is None:
         raise ValueError("PublicKey unavailable")
-    if len(data) != 165:
-        raise ValueError("Invalid SPL token account length")
-    mint = str(PublicKey.from_bytes(bytes(data[0:32])))
-    owner = str(PublicKey.from_bytes(bytes(data[32:64])))
-    amount = struct.unpack("<Q", data[64:72])[0]
-    return {"mint": mint, "owner": owner, "amount": amount}
+    if not isinstance(data, (bytes, bytearray)):
+        raise ValueError("Invalid token account data type")
+    b = bytes(data)
+    if len(b) < _SPL_MIN_ACCOUNT_BYTES:
+        raise ValueError(f"Invalid SPL token account length: {len(b)}")
+    mint = str(PublicKey.from_bytes(b[0:32]))
+    owner = str(PublicKey.from_bytes(b[32:64]))
+    amount = struct.unpack("<Q", b[64:72])[0]
+    return {"mint": mint, "owner": owner, "amount": int(amount)}
 
 
 def _extract_b64_account_data(acc: Any) -> str | None:
-    try:
-        d = acc.account.data
-        if isinstance(d, (list, tuple)) and d and isinstance(d[0], str):
-            return d[0]
-        if isinstance(d, dict):
-            dv = d.get("data")
-            if isinstance(dv, (list, tuple)) and dv and isinstance(dv[0], str):
-                return dv[0]
-        if isinstance(d, str):
-            return d
-    except Exception:
+    def _first_b64(x: Any) -> str | None:
+        if isinstance(x, (list, tuple)) and x:
+            if isinstance(x[0], str) and x[0]:
+                return x[0]
+            for it in x:
+                if isinstance(it, str) and it:
+                    return it
+            return None
+        if isinstance(x, str) and x:
+            return x
         return None
+
+    with contextlib.suppress(Exception):
+        d = getattr(getattr(acc, "account", None), "data", None)
+        got = _first_b64(d)
+        if got:
+            return got
+
+        if isinstance(acc, dict):
+            if "account" in acc and isinstance(acc["account"], dict):
+                got = _first_b64(acc["account"].get("data"))
+                if got:
+                    return got
+            got = _first_b64(acc.get("data"))
+            if got:
+                return got
+            if "account" in acc and isinstance(acc["account"], dict):
+                ad = acc["account"].get("data")
+                if isinstance(ad, dict):
+                    got = _first_b64(ad.get("data"))
+                    if got:
+                        return got
     return None
+
+
+def _iter_token_accounts(resp: Any) -> list[Any]:
+    v = getattr(resp, "value", None)
+    if isinstance(v, list):
+        return v
+
+    if isinstance(resp, dict):
+        vv = resp.get("value")
+        if isinstance(vv, list):
+            return vv
+        r = resp.get("result")
+        if isinstance(r, dict):
+            rv = r.get("value")
+            if isinstance(rv, list):
+                return rv
+    return []
+
+
+def _extract_balance_value(resp: Any) -> int:
+    v = getattr(resp, "value", None)
+    if isinstance(v, int):
+        return v
+
+    if isinstance(resp, dict):
+        vv = resp.get("value")
+        if isinstance(vv, int):
+            return vv
+        r = resp.get("result")
+        if isinstance(r, dict):
+            rv = r.get("value")
+            if isinstance(rv, int):
+                return rv
+
+    with contextlib.suppress(Exception):
+        return int(v)  # type: ignore[arg-type]
+    return 0
 
 
 async def get_wallet_tokens(wallet_pubkey: str) -> list[dict[str, Any]]:
     await init_resources(require_wallet=False)
+
     c = solana_client
     if c is None or PublicKey is None or TokenAccountOpts is None:
         return []
-    owner = PublicKey.from_string(wallet_pubkey)
+
+    try:
+        owner = PublicKey.from_string(str(wallet_pubkey))
+    except Exception:
+        return []
+
     out: list[dict[str, Any]] = []
 
     async def _fetch_for_program(pid_str: str) -> None:
-        try:
+        with contextlib.suppress(Exception):
             pid = PublicKey.from_string(pid_str)
             resp = await c.get_token_accounts_by_owner(owner, TokenAccountOpts(program_id=pid))
-            for acc in getattr(resp, "value", []) or []:
+            for acc in _iter_token_accounts(resp):
                 raw_b64 = _extract_b64_account_data(acc)
                 if not raw_b64:
                     continue
-                raw = base64.b64decode(raw_b64)
-                parsed = _parse_token_account_data(raw)
-                out.append({"mint": parsed["mint"], "amount_raw": parsed["amount"]})
-        except Exception:
-            return
+                raw_b64_s = raw_b64.strip()
+                if not raw_b64_s:
+                    continue
+                with contextlib.suppress(Exception):
+                    raw = base64.b64decode(raw_b64_s, validate=False)
+                    parsed = _parse_token_account_data(raw)
+                    amt = int(parsed.get("amount") or 0)
+                    if amt <= 0:
+                        continue
+                    out.append({"mint": str(parsed["mint"]), "amount_raw": amt})
 
     await _fetch_for_program(TOKEN_PROGRAM_ID_STR)
     await _fetch_for_program(TOKEN_2022_PROGRAM_ID_STR)
@@ -1708,21 +2261,30 @@ async def get_wallet_tokens(wallet_pubkey: str) -> list[dict[str, Any]]:
 
 async def get_sol_balance(pubkey: str | Any) -> float:
     await init_resources(require_wallet=False)
+
     c = solana_client
     if c is None or PublicKey is None:
         return 0.0
+
     try:
         pk = PublicKey.from_string(pubkey) if isinstance(pubkey, str) else pubkey
-        resp = await c.get_balance(pk)
-        lamports = getattr(resp, "value", None)
-        return float(lamports or 0) / LAMPORTS_PER_SOL_F
     except Exception:
         return 0.0
+
+    with contextlib.suppress(Exception):
+        resp = await c.get_balance(pk)
+        lamports = _extract_balance_value(resp)
+        if lamports > 0:
+            return float(lamports) / LAMPORTS_PER_SOL_F
+
+    return 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Savings transfer (reinvestor compatibility: MUST exist)
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 async def transfer_to_savings(
     amount_sol: float | None = None,
     *,
@@ -1769,7 +2331,7 @@ async def transfer_to_savings(
 def transfer_to_savings_sync(*args: Any, **kwargs: Any) -> tuple[bool, str]:
     try:
         asyncio.get_running_loop()
-        create_task(transfer_to_savings(*args, **kwargs), name="transfer_to_savings")
+        _spawn(transfer_to_savings(*args, **kwargs), name="transfer_to_savings")
         return (True, "")
     except RuntimeError:
         try:
@@ -1781,21 +2343,13 @@ def transfer_to_savings_sync(*args: Any, **kwargs: Any) -> tuple[bool, str]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Notion logging shim (mypy-safe, import-safe, best-effort)
 # ──────────────────────────────────────────────────────────────────────────────
+
 _NotionLogFn = Callable[..., Any]
 _NOTION_LOG_IMPL: _NotionLogFn | None = None
 _NOTION_LOG_TRIED = False
 
 
 def _resolve_log_to_notion() -> _NotionLogFn | None:
-    """
-    Resolve a project-provided Notion logger without requiring static exports.
-
-    Tries, in order:
-      - utils_pkg.notion_alert.log_to_notion
-      - utils_pkg.notion_client.log_to_notion
-
-    Returns None if unavailable. Never raises.
-    """
     global _NOTION_LOG_IMPL, _NOTION_LOG_TRIED
     if _NOTION_LOG_TRIED:
         return _NOTION_LOG_IMPL
@@ -1815,13 +2369,6 @@ def _resolve_log_to_notion() -> _NotionLogFn | None:
 
 
 def log_to_notion(*args: Any, **kwargs: Any) -> Any:
-    """
-    Best-effort Notion logging hook.
-
-    - Never hard-fails in prod
-    - Never forces network at import time
-    - Mypy-safe even if notion modules don't export log_to_notion
-    """
     fn = _resolve_log_to_notion()
     if fn is None:
         return None
@@ -1829,8 +2376,30 @@ def log_to_notion(*args: Any, **kwargs: Any) -> Any:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Health snapshot (safe/degraded signals; never raises)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def health_snapshot() -> dict[str, Any]:
+    """
+    Import-safe health snapshot for status endpoints / logs.
+    Never raises. Never forces network.
+    """
+    rr = get_redis(autoinit=False)
+    return {
+        "ts": time.time(),
+        "contract_no_network": _contract_no_network(),
+        "contract_no_redis": _contract_no_redis(),
+        "redis": "null" if (rr is None or is_null_redis(rr)) else "real",
+        "sqlite_enabled": bool(_SQLITE_ENABLED),
+        "http_session_injected": bool(get_http_session() is not None),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Hard compatibility aliases (IMPORTANT: must be real names for "from ... import")
 # ──────────────────────────────────────────────────────────────────────────────
+
 get_sol_price = get_sol_usd
 get_sol_price_usd = get_sol_usd
 sol_to_usd = convert_sol_to_usd
@@ -1850,6 +2419,7 @@ __all__ = [
     "dca_profit_exit",
     "get_entry_price",
     "get_http_session",
+    "set_http_session",
     "get_jupiter_quote",
     "get_pair_snapshot_dexscreener",
     "get_redis",
@@ -1864,10 +2434,13 @@ __all__ = [
     "get_wallet_keypair",
     "get_wallet_pubkey",
     "get_wallet_tokens",
+    "health_snapshot",
     "init_resources",
     "init_sqlite",
+    "is_null_redis",
     "log_to_notion",
     "managed_resources",
+    "normalize_mint",
     "remember_entry_price",
     "save_entry_price",
     "send_telegram",

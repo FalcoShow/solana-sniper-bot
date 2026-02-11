@@ -9,8 +9,8 @@ God-Tier Auto Exit Worker package — V3+++ LOCK-IN
 
 This package provides a stable, import-safe public surface for the auto-exit worker.
 
-WHY THIS FILE EXISTS
---------------------
+IMPORTANT NAME COLLISION NOTE
+-----------------------------
 This repo contains a directory: utils_pkg/auto_exit_worker/ (a Python package).
 Therefore:
 
@@ -38,6 +38,10 @@ CONTRACTS / FEATURES PRESERVED
    - AutoExitWorkerConfig
    - auto_exit_worker
 
+3) NullRedis-ish detection MUST match core_utils contract:
+   - Prefer utils_pkg.core_utils.is_null_redis()
+   - Fallback: None OR class-name in {"_NullRedis", "NullRedis"}
+
 NO SIDE EFFECTS
 ---------------
 Importing this module must be safe anywhere:
@@ -48,18 +52,14 @@ Importing this module must be safe anywhere:
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import time
 from dataclasses import dataclass
 from importlib import import_module
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Protocol, cast
 
-__version__ = "3.1.0"
-
-
-# =============================================================================
-# Logging (safe, no hard deps)
-# =============================================================================
+__version__ = "3.1.1"
 
 log = logging.getLogger("auto_exit_worker")
 
@@ -78,8 +78,7 @@ class _HealthFn(Protocol):
       - sync fn(...) -> dict
     """
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:  # noqa: D401
-        ...
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 ShutdownCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -96,23 +95,57 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 # =============================================================================
+# Canonical NullRedis detection (aligned with core_utils)
+# =============================================================================
+
+_IS_NULL_REDIS_IMPL: Callable[[Any | None], bool] | None = None
+
+
+def _resolve_is_null_redis() -> Callable[[Any | None], bool]:
+    """
+    Resolve canonical NullRedis detection.
+
+    Prefer:
+      - utils_pkg.core_utils.is_null_redis
+
+    Fallback:
+      - None => True
+      - class-name in {"_NullRedis", "NullRedis"} => True
+
+    Cached after first resolution; import-safe and avoids cycles.
+    """
+    global _IS_NULL_REDIS_IMPL
+    if _IS_NULL_REDIS_IMPL is not None:
+        return _IS_NULL_REDIS_IMPL
+
+    with contextlib.suppress(Exception):
+        from utils_pkg.core_utils import is_null_redis as impl  # type: ignore
+
+        _IS_NULL_REDIS_IMPL = cast(Callable[[Any | None], bool], impl)
+        return _IS_NULL_REDIS_IMPL
+
+    def _fallback(r: Any | None) -> bool:
+        if r is None:
+            return True
+        name = getattr(getattr(r, "__class__", None), "__name__", "")
+        return name in {"_NullRedis", "NullRedis"}
+
+    _IS_NULL_REDIS_IMPL = _fallback
+    return _IS_NULL_REDIS_IMPL
+
+
+def _is_null_redis(r: Any | None) -> bool:
+    return _resolve_is_null_redis()(r)
+
+
+# =============================================================================
 # Small helpers (pure, deterministic)
 # =============================================================================
 
 
-def _is_null_redis(r: Any) -> bool:
-    """
-    Detect NullRedis-ish clients without importing anything heavy.
-    """
-    return r is None or r.__class__.__name__ in {"_NullRedis", "NullRedis"}
-
-
 async def _maybe_await(v: Any) -> Any:
-    if asyncio.iscoroutine(v) or isinstance(v, Awaitable):
+    if inspect.isawaitable(v):
         return await v
-    # also handle objects that are awaitable but not coroutine instances
-    if hasattr(v, "__await__"):
-        return await v  # type: ignore[misc]
     return v
 
 
@@ -121,21 +154,39 @@ def _filter_kwargs_by_signature(fn: Any, kwargs: dict[str, Any]) -> dict[str, An
     Best-effort signature-tolerant kwarg filtering.
 
     Why:
-      - health_snapshot() signatures can evolve across phases
-      - tests may pass a stub with a different signature
+      - health_snapshot() signatures can evolve
+      - tests may pass stubs with different kwargs
       - we never want "unexpected keyword argument" to crash the worker
     """
-    try:
-        import inspect
-
+    with contextlib.suppress(Exception):
         sig = inspect.signature(fn)
         params = sig.parameters.values()
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
             return kwargs
         allowed = {p.name for p in params}
         return {k: v for k, v in kwargs.items() if k in allowed}
-    except Exception:
-        return kwargs
+    return kwargs
+
+
+def _sanitize_health_snapshot(snap: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Keep logs safe: do not dump full snapshot (may include env/config/secrets).
+    """
+
+    def _s(x: Any, lim: int = 260) -> str:
+        with contextlib.suppress(Exception):
+            t = str(x)
+            return t if len(t) <= lim else (t[:lim] + "…")
+        return "<?>"
+
+    return {
+        "ok": bool(snap.get("ok") is True),
+        "detail": _s(snap.get("detail") or ""),
+        "err": _s(snap.get("err") or ""),
+        "step": _s(snap.get("step") or ""),
+        "exit_code": snap.get("exit_code"),
+        "sec": snap.get("sec"),
+    }
 
 
 async def _call_health_fn(
@@ -149,10 +200,11 @@ async def _call_health_fn(
 
     Strategy:
       1) try common kw set
-      2) if TypeError (unexpected kw), filter by signature and retry
+      2) if TypeError, filter by signature and retry
       3) if still TypeError, try smaller kw sets
     """
     timeout_s = float(timeout_s)
+
     kw_full: dict[str, Any] = {
         "deep": bool(deep),
         "timeout_s": timeout_s,
@@ -175,14 +227,37 @@ async def _call_health_fn(
     except TypeError:
         pass
 
-    # last-resort fallbacks (for very strict stubs)
     for kw in ({"deep": bool(deep)}, {"timeout_s": timeout_s}, {"timeout": timeout_s}, {}):
-        try:
+        with contextlib.suppress(TypeError):
             return await _run_with(kw)
-        except TypeError:
-            continue
 
     return {"ok": False, "err": "health_snapshot_signature_incompatible"}
+
+
+async def _sleep_or_stop(stop_event: asyncio.Event, seconds: float) -> bool:
+    """
+    Sleep bounded by stop_event. Returns True if stop_event was set.
+    """
+    seconds = max(0.01, float(seconds))
+    if stop_event.is_set():
+        return True
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=seconds)
+        return True
+    except asyncio.TimeoutError:
+        return stop_event.is_set()
+
+
+async def _call_engine(engine: Any, method: str, redis: Any) -> None:
+    """
+    Call engine.method(redis) safely (sync/async).
+    """
+    fn = getattr(engine, method, None)
+    if not callable(fn):
+        log.warning("EXIT_ENGINE_MISSING_%s", method.upper())
+        return
+    out = fn(redis)
+    await _maybe_await(out)
 
 
 # =============================================================================
@@ -246,105 +321,104 @@ async def auto_exit_worker(
         - exit_engine.claim(redis)
       (either may be sync or async; both are optional but logged if missing)
     - Exits cleanly when stop_event is set
-
-    Notes:
-    - No external I/O is initiated here beyond what exit_engine does.
-    - Import-safe: health_fn default is lazy-imported.
     """
     stop_event = stop_event or asyncio.Event()
-    cfg0 = config or AutoExitWorkerConfig()
+    cfg = config or AutoExitWorkerConfig()
 
-    cfg = AutoExitWorkerConfig(
-        poll_s=float(poll_s),
-        health_every_s=float(cfg0.health_every_s),
-        health_timeout_s=float(cfg0.health_timeout_s),
-        health_deep=bool(cfg0.health_deep),
-        grace_s=float(cfg0.grace_s),
-        max_consecutive_unhealthy=int(cfg0.max_consecutive_unhealthy),
-        noop_sleep_s=float(cfg0.noop_sleep_s),
-        log_unhealthy_every_s=float(cfg0.log_unhealthy_every_s),
-        hard_kill=bool(cfg0.hard_kill),
+    # Preserve legacy poll_s positional behavior (always respected)
+    try:
+        poll_s_f = float(poll_s)
+    except Exception:
+        poll_s_f = float(cfg.poll_s)
+    if poll_s_f <= 0:
+        poll_s_f = 0.01
+
+    # Local effective config (no mutation)
+    eff = AutoExitWorkerConfig(
+        poll_s=poll_s_f,
+        health_every_s=float(cfg.health_every_s),
+        health_timeout_s=float(cfg.health_timeout_s),
+        health_deep=bool(cfg.health_deep),
+        grace_s=float(cfg.grace_s),
+        max_consecutive_unhealthy=int(cfg.max_consecutive_unhealthy),
+        noop_sleep_s=float(cfg.noop_sleep_s),
+        log_unhealthy_every_s=float(cfg.log_unhealthy_every_s),
+        hard_kill=bool(cfg.hard_kill),
     )
 
-    if cfg.poll_s <= 0.0:
-        raise ValueError("poll_s must be > 0")
-    if cfg.max_consecutive_unhealthy < 1:
+    if eff.max_consecutive_unhealthy < 1:
         raise ValueError("AutoExitWorkerConfig.max_consecutive_unhealthy must be >= 1")
 
     # Default health function (lazy import to keep import-time side effects at zero)
     if health_fn is None:
         from utils_pkg.health import health_snapshot as _health_snapshot  # type: ignore
 
-        health_fn = _health_snapshot
+        health_fn = cast(_HealthFn, _health_snapshot)
 
     start_m = time.monotonic()
     last_health_m = 0.0
+    last_unhealthy_log_m = 0.0
     consecutive_unhealthy = 0
     shutdown_fired = False
-    last_unhealthy_log_m = 0.0
 
-    async def _sleep_or_stop(seconds: float) -> bool:
-        """
-        Sleep bounded by stop_event. Returns True if stop_event was set.
-        """
-        seconds = max(0.01, float(seconds))
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=seconds)
-            return True
-        except asyncio.TimeoutError:
-            return stop_event.is_set()
-
-    async def _health_check_if_due() -> tuple[bool, dict[str, Any] | None]:
-        nonlocal last_health_m, consecutive_unhealthy, shutdown_fired, last_unhealthy_log_m
+    async def _health_check_if_due() -> None:
+        nonlocal last_health_m, last_unhealthy_log_m, consecutive_unhealthy, shutdown_fired
 
         now_m = time.monotonic()
-        if (now_m - last_health_m) < max(0.05, cfg.health_every_s):
-            return True, None
-
+        if (now_m - last_health_m) < max(0.05, eff.health_every_s):
+            return
         last_health_m = now_m
-        snap: dict[str, Any]
+
+        snap: Any
         try:
             snap = await asyncio.wait_for(
                 _call_health_fn(
                     health_fn,  # type: ignore[arg-type]
-                    deep=cfg.health_deep,
-                    timeout_s=cfg.health_timeout_s,
+                    deep=eff.health_deep,
+                    timeout_s=eff.health_timeout_s,
                 ),
-                timeout=max(0.2, float(cfg.health_timeout_s)),
+                timeout=max(0.2, float(eff.health_timeout_s)),
             )
         except Exception as e:
             snap = {"ok": False, "err": f"health_snapshot_exception: {type(e).__name__}: {e}"}
 
+        if not isinstance(snap, Mapping):
+            snap = {"ok": False, "err": f"health_snapshot_bad_type: {type(snap).__name__}"}
+
         ok = bool(snap.get("ok") is True)
-        in_grace = (time.monotonic() - start_m) < max(0.0, cfg.grace_s)
+        in_grace = (time.monotonic() - start_m) < max(0.0, eff.grace_s)
 
         if ok or in_grace:
             consecutive_unhealthy = 0
-            return True, snap
+            return
 
         consecutive_unhealthy += 1
 
-        # rate-limited warning spam control
-        if (now_m - last_unhealthy_log_m) >= max(0.25, cfg.log_unhealthy_every_s):
+        if (now_m - last_unhealthy_log_m) >= max(0.25, eff.log_unhealthy_every_s):
             last_unhealthy_log_m = now_m
+            safe = _sanitize_health_snapshot(snap)
             log.warning(
                 "AUTO_EXIT_HEALTH_UNHEALTHY",
                 extra={
                     "consecutive_unhealthy": consecutive_unhealthy,
-                    "max_consecutive_unhealthy": cfg.max_consecutive_unhealthy,
-                    "grace_s": cfg.grace_s,
-                    "err": snap.get("err"),
+                    "max_consecutive_unhealthy": eff.max_consecutive_unhealthy,
+                    "grace_s": eff.grace_s,
+                    "snap_err": safe.get("err"),
                 },
             )
 
-        if (not shutdown_fired) and consecutive_unhealthy >= cfg.max_consecutive_unhealthy:
+        if (not shutdown_fired) and consecutive_unhealthy >= eff.max_consecutive_unhealthy:
             shutdown_fired = True
+            safe = _sanitize_health_snapshot(snap)
             log.error(
                 "AUTO_EXIT_WORKER_SHUTDOWN_TRIGGERED",
                 extra={
                     "consecutive_unhealthy": consecutive_unhealthy,
-                    "max_consecutive_unhealthy": cfg.max_consecutive_unhealthy,
-                    "grace_s": cfg.grace_s,
+                    "max_consecutive_unhealthy": eff.max_consecutive_unhealthy,
+                    "grace_s": eff.grace_s,
+                    "snap_ok": safe.get("ok"),
+                    "snap_detail": safe.get("detail"),
+                    "snap_err": safe.get("err"),
                 },
             )
 
@@ -353,50 +427,45 @@ async def auto_exit_worker(
 
             if on_shutdown is not None:
                 with contextlib.suppress(Exception):
-                    await _maybe_await(on_shutdown(snap))
+                    await _maybe_await(on_shutdown(dict(snap)))
 
-            if cfg.hard_kill:
+            if eff.hard_kill:
                 raise SystemExit(1)
-
-        return False, snap
 
     # Null redis => no-op mode (but still honors stop_event + health logic)
     if _is_null_redis(redis):
         log.warning("AUTO_EXIT_WORKER_DISABLED: redis_unavailable (null redis)")
         while not stop_event.is_set():
-            with contextlib.suppress(Exception):
-                await _health_check_if_due()
-            if await _sleep_or_stop(cfg.noop_sleep_s):
+            with contextlib.suppress(asyncio.CancelledError):
+                with contextlib.suppress(Exception):
+                    await _health_check_if_due()
+            if await _sleep_or_stop(stop_event, eff.noop_sleep_s):
                 break
         return
 
     # Main loop
     while not stop_event.is_set():
-        # health check (never blocks beyond health_timeout_s)
-        with contextlib.suppress(Exception):
-            await _health_check_if_due()
+        with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(Exception):
+                await _health_check_if_due()
 
         # reclaim
         try:
-            reclaim = getattr(exit_engine, "reclaim", None)
-            if callable(reclaim):
-                await _maybe_await(reclaim(redis))
-            else:
-                log.warning("EXIT_ENGINE_MISSING_RECLAIM")
+            await _call_engine(exit_engine, "reclaim", redis)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             log.info("EXIT_RECLAIM_ERR %r", {"err": f"{type(e).__name__}: {e}"})
 
         # claim
         try:
-            claim = getattr(exit_engine, "claim", None)
-            if callable(claim):
-                await _maybe_await(claim(redis))
-            else:
-                log.warning("EXIT_ENGINE_MISSING_CLAIM")
+            await _call_engine(exit_engine, "claim", redis)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             log.info("EXIT_CLAIM_ERR %r", {"err": f"{type(e).__name__}: {e}"})
 
-        if await _sleep_or_stop(cfg.poll_s):
+        if await _sleep_or_stop(stop_event, eff.poll_s):
             break
 
 

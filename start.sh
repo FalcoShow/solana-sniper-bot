@@ -11,6 +11,12 @@
 #   - Optional health gating using canonical scripts.healthcheck (JSON-robust)
 #   - Optional HTTP readiness sidecar (scripts.health_http) so /readyz exists
 #
+# CRITICAL SINGLE-PORT RULE (Render):
+#   - Only ONE process may bind $PORT.
+#   - If health_http sidecar is enabled (recommended), it owns $PORT and we
+#     export DISABLE_MAIN_HTTP=1 so scripts.main will NOT bind $PORT.
+#   - If sidecar is disabled, scripts.main may bind $PORT normally.
+#
 # Subcommands:
 #   ./start.sh help
 #   ./start.sh bash-syntax
@@ -232,6 +238,12 @@ fi
 : "${START_HEALTH_HTTP_ARGS:=}"            # extra args appended to scripts.health_http (rare)
 : "${START_HEALTH_HTTP_GRACE_S:=8}"
 
+# SINGLE-PORT OWNERSHIP: exported to Python (scripts.main will honor this)
+: "${DISABLE_MAIN_HTTP:=0}"                # 1 disables scripts.main binding to $PORT (when sidecar owns it)
+: "${MAIN_HTTP_PORT:=}"                    # optional alt port (rare)
+: "${HEALTH_HTTP_PORT:=}"                  # explicit port for health_http (defaults to $PORT)
+export DISABLE_MAIN_HTTP MAIN_HTTP_PORT HEALTH_HTTP_PORT
+
 # Export contract vars used by Python gatekeepers
 export RUN_MODE RUN_MODULE_OVERRIDE
 export SKIP_DSN_REQUIRED
@@ -281,7 +293,6 @@ PY
 _paths=("$REPO_ROOT")
 [[ -d "$REPO_ROOT/src" ]] && _paths+=("$REPO_ROOT/src")
 
-# ShellCheck SC2155: do assignment separately, then export
 _py_path="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")"
 if [[ -n "${PYTHONPATH:-}" ]]; then
   _py_path="${_py_path}${PY_PATHSEP}${PYTHONPATH}"
@@ -534,7 +545,6 @@ TXT
     ;;
   preflight)
     shift || true
-    # Make subcommand behavior match the main gate defaults (fixes "skipped" surprise)
     pf_args=()
     if _is_true "${START_PREFLIGHT_FORCE:-1}" && _supports_arg "scripts.preflight" "--force"; then
       pf_args+=(--force)
@@ -598,6 +608,8 @@ PY
   health-http|health_http)
     shift || true
     _py_has_module "scripts.health_http" || _die "scripts.health_http not found"
+    # health-http owns PORT; be explicit for downstream modules
+    export DISABLE_MAIN_HTTP=1
     exec "$PYTHON" -m scripts.health_http "$@"
     ;;
 esac
@@ -760,7 +772,6 @@ fi
 # -----------------------------------------------------------------------------
 # 9) DB DSN mapping + normalization/export (no secret printing)
 # -----------------------------------------------------------------------------
-# Map SNIPER_DB_DSN into SQLA defaults if present
 if [[ -n "${SNIPER_DB_DSN:-}" ]]; then
   [[ -z "${POSTGRES_DSN:-}" ]] && export POSTGRES_DSN="${SNIPER_DB_DSN}"
   [[ -z "${DATABASE_URL:-}" ]] && export DATABASE_URL="${SNIPER_DB_DSN}"
@@ -1211,23 +1222,30 @@ HEALTH_URL="$(_health_infer_url)"
 # 14) Health HTTP sidecar (creates the /readyz listener in single-container boot)
 # -----------------------------------------------------------------------------
 health_http_pid=""
+
 _start_health_http_sidecar() {
+  # Default policy: only on Render, only when PORT exists, unless forced
   [[ "$IS_RENDER" != "1" ]] && return 0
   _is_true "${START_DISABLE_HEALTH_HTTP}" && return 0
   _py_has_module "scripts.health_http" || { _warn "scripts.health_http not found; cannot start sidecar"; return 1; }
 
-  # Auto-enable by default on Render when PORT exists
   if [[ -z "${START_HEALTH_HTTP_SIDECAR:-}" ]]; then
     if [[ -n "${PORT:-}" ]]; then START_HEALTH_HTTP_SIDECAR="1"; else START_HEALTH_HTTP_SIDECAR="0"; fi
   fi
   _is_true "${START_HEALTH_HTTP_SIDECAR}" || return 0
 
-  # Only start it if RUN_MODULE isn't already health_http
+  # Do not start if the main module itself is health_http
   if [[ "${RUN_MODULE}" == "scripts.health_http" || "${RUN_MODULE_OVERRIDE:-}" == "scripts.health_http" ]]; then
     return 0
   fi
 
-  _log "Starting health_http sidecar on PORT=${PORT:-} (module=scripts.health_http)"
+  # SINGLE-PORT: sidecar will own PORT => main must NOT bind PORT
+  if [[ -n "${PORT:-}" ]]; then
+    export HEALTH_HTTP_PORT="${HEALTH_HTTP_PORT:-${PORT}}"
+    export DISABLE_MAIN_HTTP=1
+  fi
+
+  _log "Starting health_http sidecar on PORT=${HEALTH_HTTP_PORT:-${PORT:-}} (module=scripts.health_http)"
   export READY_FILE="${READY_FILE:-}"
 
   if [[ -n "${START_HEALTH_HTTP_ARGS:-}" ]]; then
@@ -1346,7 +1364,7 @@ _start_child() {
   child_pgid="$(_get_pgid "$child_pid" || true)"
 }
 
-_log "Launch: module=${RUN_MODULE} args=${#run_argv[@]} restart=${MAIN_RESTART_ON_CRASH} health_gate=${START_HEALTH_GATING} sidecar=${START_HEALTH_HTTP_SIDECAR:-auto}"
+_log "Launch: module=${RUN_MODULE} args=${#run_argv[@]} restart=${MAIN_RESTART_ON_CRASH} health_gate=${START_HEALTH_GATING} sidecar=${START_HEALTH_HTTP_SIDECAR:-auto} disable_main_http=${DISABLE_MAIN_HTTP}"
 
 if ! _is_true "${MAIN_RESTART_ON_CRASH}"; then
   _start_health_http_sidecar || true
