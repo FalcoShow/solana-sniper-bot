@@ -293,12 +293,18 @@ PY
 _paths=("$REPO_ROOT")
 [[ -d "$REPO_ROOT/src" ]] && _paths+=("$REPO_ROOT/src")
 
+# Build PYTHONPATH safely even under 'set -u'
+_old_pythonpath="${PYTHONPATH:-}"
+
+_py_path=""
 _py_path="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")"
-if [[ -n "${PYTHONPATH:-}" ]]; then
-  _py_path="${_py_path}${PY_PATHSEP}${PYTHONPATH}"
+
+if [[ -n "${_old_pythonpath}" ]]; then
+  _py_path="${_py_path}${PY_PATHSEP}${_old_pythonpath}"
 fi
-export PYTHONPATH="$_py_path"
-unset _py_path
+
+export PYTHONPATH="${_py_path}"
+unset _py_path _old_pythonpath
 
 _log "Python: $("$PYTHON" -V 2>&1)"
 
@@ -545,6 +551,8 @@ TXT
     ;;
   preflight)
     shift || true
+
+# Make subcommand behavior match the main gate defaults (fixes "skipped" surprise)
     pf_args=()
     if _is_true "${START_PREFLIGHT_FORCE:-1}" && _supports_arg "scripts.preflight" "--force"; then
       pf_args+=(--force)
