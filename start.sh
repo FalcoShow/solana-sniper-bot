@@ -47,6 +47,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
+set +x 2>/dev/null || true
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
@@ -263,11 +264,26 @@ _log "Mode: RUN_MODE=${RUN_MODE} strict=${START_STRICT} prechecks=${START_PRECHE
 # -----------------------------------------------------------------------------
 PYTHON="${PYTHON:-}"
 
+OS_UNAME="$(uname -s 2>/dev/null || echo "")"
+IS_LINUX=0
+if [[ "$OS_UNAME" == "Linux" ]]; then
+  IS_LINUX=1
+fi
+
 if [[ -z "$PYTHON" ]]; then
+  # Prefer a Linux venv if present
   if [[ -x ".venv/bin/python" ]]; then
     PYTHON=".venv/bin/python"
+
+  # On Linux/WSL: NEVER use Windows python.exe (interop causes port/env weirdness)
+  elif [[ "$IS_LINUX" == "1" ]]; then
+    command -v python3 >/dev/null 2>&1 || _die "python3 not found (install python3 or create .venv in WSL)"
+    PYTHON="python3"
+
+  # On Windows shells: allow Windows venv python
   elif [[ -x ".venv/Scripts/python.exe" ]]; then
     PYTHON=".venv/Scripts/python.exe"
+
   elif command -v python3 >/dev/null 2>&1; then
     PYTHON="python3"
   elif command -v python >/dev/null 2>&1; then
@@ -276,6 +292,9 @@ if [[ -z "$PYTHON" ]]; then
     _die "Python executable not found"
   fi
 fi
+
+_log "Python exe: ${PYTHON}"
+_log "Python: $("$PYTHON" -V 2>&1)"
 
 export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
@@ -293,20 +312,13 @@ PY
 _paths=("$REPO_ROOT")
 [[ -d "$REPO_ROOT/src" ]] && _paths+=("$REPO_ROOT/src")
 
-# Build PYTHONPATH safely even under 'set -u'
 _old_pythonpath="${PYTHONPATH:-}"
-
-_py_path=""
 _py_path="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")"
-
 if [[ -n "${_old_pythonpath}" ]]; then
   _py_path="${_py_path}${PY_PATHSEP}${_old_pythonpath}"
 fi
-
 export PYTHONPATH="${_py_path}"
 unset _py_path _old_pythonpath
-
-_log "Python: $("$PYTHON" -V 2>&1)"
 
 _py_has_module() {
   local mod="${1:-}"
@@ -358,6 +370,10 @@ fi
 # -----------------------------------------------------------------------------
 # 4) Dotenv loading (safe; no eval/source unless allowed)
 # -----------------------------------------------------------------------------
+# Lock Render/PORT provided by the environment (Render contract / CLI prefix)
+PORT_LOCKED="${PORT:-}"
+RENDER_LOCKED="${RENDER:-}"
+
 _HAS_PY_DOTENV=0
 if "$PYTHON" - >/dev/null 2>&1 <<'PY'
 try:
@@ -510,6 +526,17 @@ else
   _warn "Dotenv loading disabled (START_NO_DOTENV=1)"
 fi
 
+# Restore locked values so .env can never override Render/CLI injected contract vars
+if [[ -n "${PORT_LOCKED}" ]]; then
+  export PORT="${PORT_LOCKED}"
+fi
+if [[ -n "${RENDER_LOCKED}" ]]; then
+  export RENDER="${RENDER_LOCKED}"
+fi
+unset PORT_LOCKED RENDER_LOCKED
+
+_log "Ports(after dotenv): PORT=${PORT:-} HEALTH_HTTP_PORT=${HEALTH_HTTP_PORT:-} HEALTH_PORT=${HEALTH_PORT:-} START_ENV_OVERRIDE=${START_ENV_OVERRIDE:-0}"
+
 # -----------------------------------------------------------------------------
 # 5) Subcommands (run after env load)
 # -----------------------------------------------------------------------------
@@ -552,7 +579,7 @@ TXT
   preflight)
     shift || true
 
-# Make subcommand behavior match the main gate defaults (fixes "skipped" surprise)
+    # Make subcommand behavior match the main gate defaults (fixes "skipped" surprise)
     pf_args=()
     if _is_true "${START_PREFLIGHT_FORCE:-1}" && _supports_arg "scripts.preflight" "--force"; then
       pf_args+=(--force)
@@ -616,8 +643,16 @@ PY
   health-http|health_http)
     shift || true
     _py_has_module "scripts.health_http" || _die "scripts.health_http not found"
-    # health-http owns PORT; be explicit for downstream modules
+
+    # health-http owns PORT; be explicit and deterministic
     export DISABLE_MAIN_HTTP=1
+
+    if [[ -n "${PORT:-}" ]]; then
+      export HEALTH_HTTP_PORT="${HEALTH_HTTP_PORT:-${PORT}}"
+      export HEALTH_PORT="${HEALTH_PORT:-${PORT}}"
+    fi
+
+    _log "health-http env: PORT=${PORT:-} HEALTH_PORT=${HEALTH_PORT:-} HEALTH_HTTP_PORT=${HEALTH_HTTP_PORT:-}"
     exec "$PYTHON" -m scripts.health_http "$@"
     ;;
 esac
@@ -1115,8 +1150,15 @@ _health_infer_url() {
   [[ -z "$path" ]] && path="/readyz"
   [[ "${path:0:1}" != "/" ]] && path="/${path}"
 
-  if [[ -n "${PORT:-}" ]]; then
-    printf '%s' "http://127.0.0.1:${PORT}${path}"
+  local p="${PORT:-}"
+  [[ -z "$p" && -n "${HEALTH_HTTP_PORT:-}" ]] && p="${HEALTH_HTTP_PORT}"
+  [[ -z "$p" && -n "${HEALTH_PORT:-}" ]] && p="${HEALTH_PORT}"
+
+  # Local "Render-like" default (Render always sets PORT, but WSL tests might not)
+  [[ -z "$p" && "$IS_RENDER" == "1" ]] && p="8080"
+
+  if [[ -n "$p" ]]; then
+    printf '%s' "http://127.0.0.1:${p}${path}"
     return 0
   fi
 
@@ -1130,10 +1172,15 @@ _health_infer_url() {
 }
 
 _extract_last_json_line() {
-  awk '
-    /^[[:space:]]*\{.*\}[[:space:]]*$/ { last=$0 }
-    END { if (length(last)>0) print last }
-  '
+  if command -v awk >/dev/null 2>&1; then
+    awk '
+      /^[[:space:]]*\{.*\}[[:space:]]*$/ { last=$0 }
+      END { if (length(last)>0) print last }
+    '
+    return 0
+  fi
+  # Fallback: just print nothing (caller handles)
+  return 0
 }
 
 _healthcheck_ok() {
@@ -1247,23 +1294,47 @@ _start_health_http_sidecar() {
     return 0
   fi
 
-  # SINGLE-PORT: sidecar will own PORT => main must NOT bind PORT
-  if [[ -n "${PORT:-}" ]]; then
-    export HEALTH_HTTP_PORT="${HEALTH_HTTP_PORT:-${PORT}}"
-    export DISABLE_MAIN_HTTP=1
+  # SINGLE-PORT: sidecar owns the port; main must NOT bind it.
+  # Render always sets PORT, but local Render-mimic may not.
+  if [[ -z "${PORT:-}" && -n "${HEALTH_HTTP_PORT:-}" ]]; then
+    export PORT="${HEALTH_HTTP_PORT}"
+  elif [[ -z "${PORT:-}" && "$IS_RENDER" == "1" ]]; then
+    export PORT="8080"
   fi
+
+  export HEALTH_HTTP_PORT="${HEALTH_HTTP_PORT:-${PORT:-}}"
+  export DISABLE_MAIN_HTTP=1
 
   _log "Starting health_http sidecar on PORT=${HEALTH_HTTP_PORT:-${PORT:-}} (module=scripts.health_http)"
   export READY_FILE="${READY_FILE:-}"
 
   if [[ -n "${START_HEALTH_HTTP_ARGS:-}" ]]; then
-    read -r -a extra <<<"${START_HEALTH_HTTP_ARGS}"
+    extra=()
+    while IFS= read -r a; do
+      [[ -n "$a" ]] && extra+=("$a")
+    done < <(
+      START_HEALTH_HTTP_ARGS_RAW="${START_HEALTH_HTTP_ARGS}" "$PYTHON" - <<'PY'
+import os, shlex, sys
+raw = os.environ.get("START_HEALTH_HTTP_ARGS_RAW","") or ""
+try:
+    parts = shlex.split(raw)
+except Exception:
+    parts = raw.split()
+for p in parts:
+    sys.stdout.write(str(p).replace("\r"," ").replace("\n"," ") + "\n")
+PY
+    )
     "$PYTHON" -m scripts.health_http "${extra[@]}" &
   else
     "$PYTHON" -m scripts.health_http &
   fi
   health_http_pid="$!"
   _log "health_http sidecar pid=${health_http_pid}"
+  sleep 0.2
+  if ! kill -0 "${health_http_pid}" 2>/dev/null; then
+    _warn "health_http sidecar exited immediately"
+    return 1
+  fi
   return 0
 }
 

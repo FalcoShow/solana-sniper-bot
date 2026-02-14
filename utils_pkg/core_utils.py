@@ -477,13 +477,14 @@ class _NullPubSub:
     async def aclose(self) -> None:
         return None
 
-    async def listen(self) -> "AsyncIterator[Any]":
-        # Keep async-generator type without “unreachable yield” errors in mypy.
-        if TYPE_CHECKING:  # pragma: no cover
+    async def listen(self) -> AsyncIterator[Any]:
+        # Must be an async generator so `async for` works. Use a non-constant guard
+        # to avoid mypy "unreachable" while still yielding nothing by default.
+        if _env_bool("COREUTILS_DUMMY_ASYNC_YIELD", False):  # pragma: no cover
             yield None
         return
 
-    def __aiter__(self) -> "AsyncIterator[Any]":
+    def __aiter__(self) -> AsyncIterator[Any]:
         return self.listen()
 
 
@@ -600,6 +601,29 @@ class _NullRedis:
         _ = (key, members)
         return 0
 
+    async def zscore(self, key: str, member: str) -> float | None:
+        _ = (key, member)
+        return None
+
+    async def zrangebyscore(
+        self,
+        key: str,
+        min: float | str,
+        max: float | str,
+        start: int | None = None,
+        num: int | None = None,
+        withscores: bool = False,
+        score_cast_func: Any = None,
+        **kwargs: Any,
+    ) -> list[Any]:
+        # Critical for exit reclaim loops in offline/safe modes.
+        _ = (key, min, max, start, num, withscores, score_cast_func, kwargs)
+        return []
+
+    async def zremrangebyscore(self, key: str, min: float | str, max: float | str) -> int:
+        _ = (key, min, max)
+        return 0
+
     # ── Sets ────────────────────────────────────────────────────────────
     async def sadd(self, key: str, *vals: Any) -> int:
         _ = (key, vals)
@@ -655,8 +679,9 @@ class _NullRedis:
 
         return _runner
 
-    async def scan_iter(self, *_: Any, **__: Any) -> "AsyncIterator[str]":
-        if TYPE_CHECKING:  # pragma: no cover
+    async def scan_iter(self, *_: Any, **__: Any) -> AsyncIterator[str]:
+        # Keep async-generator shape for compatibility; avoid mypy unreachable warning.
+        if _env_bool("COREUTILS_DUMMY_ASYNC_YIELD", False):  # pragma: no cover
             yield ""
         return
 

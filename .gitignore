@@ -251,3 +251,6 @@ render.env
 # local envs (never commit)
 .venv/
 .venv-wsl/
+
+# local venvs
+.venv_wsl/
