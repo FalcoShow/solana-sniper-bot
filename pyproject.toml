@@ -1,6 +1,6 @@
 [build-system]
 # Keep build tooling bounded to avoid surprise CI/Render breaks.
-requires = ["setuptools>=69,<80", "wheel>=0.41,<1"]
+requires = ["setuptools>=69,<83", "wheel>=0.41,<1"]
 build-backend = "setuptools.build_meta"
 
 [project]
