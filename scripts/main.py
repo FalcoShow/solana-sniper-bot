@@ -209,6 +209,11 @@ def _is_render() -> bool:
     )
 
 
+def _in_tests() -> bool:
+    # pytest sets this env var for each test
+    return bool(os.getenv("PYTEST_CURRENT_TEST"))
+
+
 def _fast_fail() -> bool:
     return _envb("MAIN_FAST_FAIL", False)
 
@@ -225,11 +230,8 @@ def _jitter_disabled() -> bool:
 # Canonical run-mode (optional; defaults unchanged unless RUN_MODE set)
 # =============================================================================
 def _run_mode() -> str:
-    # Accept a few aliases but only RUN_MODE is canonical.
     raw = (_envs("RUN_MODE", "") or _envs("TRADE_MODE", "") or _envs("MODE", "")).strip().lower()
-    if raw in {"safe", "paper", "live"}:
-        return raw
-    return ""
+    return raw if raw in {"safe", "paper", "live"} else ""
 
 
 def _apply_run_mode_defaults() -> str:
@@ -255,11 +257,9 @@ def _apply_run_mode_defaults() -> str:
     if mode == "paper":
         os.environ.setdefault("DRYRUN", "1")
         os.environ.setdefault("DRY_RUN", "1")
-        # do not force-disable buys; executor should honor dryrun.
         return "paper"
 
     if mode == "live":
-        # ensure dryrun is not implicitly on
         if os.getenv("DRYRUN") is None and os.getenv("DRY_RUN") is None:
             os.environ.setdefault("DRYRUN", "0")
         return "live"
@@ -302,10 +302,6 @@ def _redact_fields(fields: dict[str, Any]) -> dict[str, Any]:
 def install_stdlib_event(force: bool | None = None) -> None:
     """
     Install safe Logger.event / Logger.every / Logger.once shims.
-
-    Important: we DO NOT trust other shims that might already exist in the process,
-    because buggy implementations are the #1 cause of:
-        "Logging error: TypeError: not enough arguments for format string"
 
     We only skip installing if we detect our own shim already present.
     """
@@ -991,7 +987,6 @@ def _resolve_modules() -> Modules:
         ],
         critical=False,
     )
-
     auto_exit_worker_loop = (
         getattr(auto_exit_worker_mod, "worker_loop", None) if auto_exit_worker_mod else None
     )
@@ -1036,6 +1031,37 @@ def _resolve_modules() -> Modules:
         smart_mod=smart_mod,
         data_logger_mod=data_logger_mod,
     )
+
+
+def _copy_modules(dst: Modules, src: Modules) -> None:
+    # mutate in-place (critical for early-http snapshot to see live modules once loaded)
+    for attr in (
+        "normalize_mint",
+        "maybe_buy",
+        "buys_allowed",
+        "scoring_mod",
+        "scoring_fn",
+        "scoring_enabled",
+        "ai_risk_mod",
+        "ai_overlay_fn",
+        "ai_risk_score_fn",
+        "ai_risk_gate_fn",
+        "ai_risk_enabled",
+        "infra_guard_mod",
+        "circuit_breakers_mod",
+        "ai_pass_gate",
+        "ai_candidate_cls",
+        "routeguard_mod",
+        "risk_mod",
+        "exit_mod",
+        "auto_exit_worker_mod",
+        "auto_exit_worker_loop",
+        "reinvest_mod",
+        "smart_mod",
+        "data_logger_mod",
+    ):
+        with contextlib.suppress(Exception):
+            setattr(dst, attr, getattr(src, attr))
 
 
 # =============================================================================
@@ -1424,7 +1450,9 @@ async def _scoring_gate(M: Modules, ui: JSONDict) -> tuple[bool, str]:
         kw = _filter_kwargs(fn, {"pool": raw_pool, "raw_pool": raw_pool, "context": context})
 
         def call() -> Any:
-            return fn(**kw) if kw else fn(raw_pool, context=context)  # type: ignore[misc]
+            if kw:
+                return fn(**kw)  # type: ignore[misc]
+            return fn(raw_pool, context=context)  # type: ignore[misc]
 
         if inspect.iscoroutinefunction(fn):
             out = await asyncio.wait_for(call(), timeout=_SCORING_TIMEOUT_S)
@@ -2174,7 +2202,6 @@ async def _entry_worker(
                     err=_short_exc(e),
                     tb=traceback.format_exc(limit=2),
                 )
-
         finally:
             with contextlib.suppress(Exception):
                 if mint:
@@ -2207,8 +2234,6 @@ def _install_signal_handlers(stop_evt: asyncio.Event, run_id: str) -> None:
 
 # =============================================================================
 # Optional stdlib HTTP server (+ P2 hook for utils_pkg.health)
-# P0 HARDEN: Bind to MAIN_HTTP_PORT OR Render's PORT env automatically.
-# Adds /readyz and /livez endpoints (Render-style).
 # =============================================================================
 def _resolve_health_snapshot_fn() -> Callable[[], Any] | None:
     with contextlib.suppress(Exception):
@@ -2223,11 +2248,15 @@ def _http_port() -> int:
     """
     Deterministic + Render-safe:
 
+    - Disabled automatically during pytest unless MAIN_HTTP_ALLOW_IN_TESTS=1.
     - MAIN_HTTP_PORT wins ONLY if > 0.
     - Otherwise fall back to Render's PORT if present.
     - Otherwise optional HTTP_PORT.
     - Else 0 (disabled).
     """
+    if _in_tests() and not _envb("MAIN_HTTP_ALLOW_IN_TESTS", False):
+        return 0
+
     if os.getenv("MAIN_HTTP_PORT") is not None:
         p = int(_envi("MAIN_HTTP_PORT", 0))
         if p > 0:
@@ -2380,8 +2409,7 @@ async def _http_server(
             await _write_resp(writer, 200, body, ctype)
             return
 
-        ctype = "text/plain"
-        await _write_resp(writer, 200, "ok\n", ctype)
+        await _write_resp(writer, 200, "ok\n", "text/plain")
 
     try:
         server = await asyncio.start_server(_handle, host=host, port=port)
@@ -2402,6 +2430,15 @@ async def _http_server(
         with contextlib.suppress(Exception):
             await server.wait_closed()
         log.event("HTTP_SERVER_STOPPED", run_id=st.run_id)
+
+
+def _early_http_enabled(port: int) -> bool:
+    if port <= 0:
+        return False
+    if _envb("MAIN_HTTP_DISABLED", False):
+        return False
+    # Default early-http ON in Render, OFF elsewhere, unless explicitly set.
+    return _envb("MAIN_HTTP_EARLY_START", _is_render())
 
 
 # =============================================================================
@@ -2503,7 +2540,7 @@ async def _uptime_monitor(stop_evt: asyncio.Event, st: RuntimeState, max_uptime_
 # =============================================================================
 async def _run_preflight_if_enabled(run_id: str) -> None:
     def _should_run() -> bool:
-        if _envb("SAFE_MODE", False) or os.getenv("PYTEST_CURRENT_TEST"):
+        if _envb("SAFE_MODE", False) or _in_tests():
             return False
         return _envb("MAIN_RUN_PREFLIGHT_DEFAULT", _is_render())
 
@@ -2578,11 +2615,8 @@ async def _close_asyncpg_pools_best_effort(*, run_id: str, timeout_s: float = 2.
     Stdlib-only at import time; uses lazy imports; time-bounded.
     """
     targets: list[tuple[str, tuple[str, ...]]] = [
-        # your AI DB pool
         ("utils_pkg.ai_db", ("close_asyncpg_pool", "close_pool", "shutdown", "close")),
-        # some repos also keep a separate positions/PG pool
         ("utils_pkg.positions_pg", ("close_asyncpg_pool", "close_pool", "shutdown", "close")),
-        # generic shutdown module (already handled elsewhere, but harmless here)
         (
             "utils_pkg.shutdown",
             ("shutdown", "shutdown_all", "close_all", "graceful_shutdown", "cleanup"),
@@ -2592,13 +2626,10 @@ async def _close_asyncpg_pools_best_effort(*, run_id: str, timeout_s: float = 2.
     async def _call(fn: Any) -> None:
         try:
             out = fn()
-            if inspect.isawaitable(out):
-                await out
         except TypeError:
-            # some close fns accept kwargs
             out = fn(run_id=run_id)
-            if inspect.isawaitable(out):
-                await out
+        if inspect.isawaitable(out):
+            await out
 
     for mod_name, fn_names in targets:
         try:
@@ -2613,7 +2644,6 @@ async def _close_asyncpg_pools_best_effort(*, run_id: str, timeout_s: float = 2.
             try:
                 await asyncio.wait_for(_call(fn), timeout=timeout_s)
             except Exception:
-                # never let shutdown fail because of pool close
                 pass
             break
 
@@ -2699,7 +2729,7 @@ def _task_view_from_supervisor(sup: Any) -> JSONDict:
 
 
 # =============================================================================
-# Main
+# Main (orchestrator)
 # =============================================================================
 async def main(stop_evt: asyncio.Event | None = None) -> None:
     global RUN_ID
@@ -2707,7 +2737,6 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
     _refresh_config()
     refresh_runtime_constants()
 
-    # Apply canonical run mode only if explicitly set
     applied_mode = _apply_run_mode_defaults()
 
     if not RUN_ID or _envb("MAIN_FORCE_NEW_RUN_ID", True):
@@ -2733,29 +2762,35 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
     tick_q: asyncio.Queue[JSONDict] = asyncio.Queue(maxsize=tqmax)
     st = RuntimeState(run_id=RUN_ID)
 
+    # Placeholder Modules object (mutated in-place once full imports complete).
+    M = Modules(normalize_mint=_resolve_normalize_mint())
+
     # Task view function can be updated after supervisor exists.
     task_view_holder: dict[str, Callable[[], JSONDict]] = {"fn": (lambda: {})}
 
-    # Start early HTTP server if enabled (Render healthchecks). Uses same queues/state.
     http_task: asyncio.Task[None] | None = None
-    early_http = bool(_http_port() > 0 and _envb("MAIN_HTTP_EARLY_START", True))
+    port = int(_http_port())
+    early_http = _early_http_enabled(port)
     if early_http:
-        M = Modules(normalize_mint=_resolve_normalize_mint())
         http_task = asyncio.create_task(
             _http_server(M, st, cand_q, tick_q, stop_evt, lambda: task_view_holder["fn"]()),
             name="main::http_server",
         )
-    else:
-        M = _resolve_modules()
 
     try:
+        # ===== Critical correctness fix =====
+        # PANIC_STOP must be clean and NOT contain unreachable statements (mypy/ruff).
         if _envb("PANIC_STOP", False):
             log.event("PANIC_STOP_SET", run_id=RUN_ID)
             stop_evt.set()
-
-            await _close_asyncpg_pools_best_effort(
-                run_id=RUN_ID, timeout_s=float(_envf("MAIN_CLOSE_POOLS_TIMEOUT_S", 2.0))
-            )
+            # always attempt graceful shutdown steps, but never explode
+            with contextlib.suppress(Exception):
+                await _shutdown_best_effort(stop_evt, reason="panic_stop", run_id=RUN_ID)
+            with contextlib.suppress(Exception):
+                await _close_asyncpg_pools_best_effort(
+                    run_id=RUN_ID, timeout_s=float(_envf("MAIN_CLOSE_POOLS_TIMEOUT_S", 2.0))
+                )
+            return
 
         await _run_preflight_if_enabled(RUN_ID)
         with contextlib.suppress(Exception):
@@ -2763,38 +2798,9 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
         with contextlib.suppress(Exception):
             await _ai_db_bootstrap_best_effort(RUN_ID)
 
+        # Hydrate modules (in-place) AFTER preflight/bootstrap.
         resolved = _resolve_modules()
-        # If we started early HTTP with a placeholder Modules(), populate it in-place.
-        if isinstance(M, Modules):
-            for attr in (
-                "normalize_mint",
-                "maybe_buy",
-                "buys_allowed",
-                "scoring_mod",
-                "scoring_fn",
-                "scoring_enabled",
-                "ai_risk_mod",
-                "ai_overlay_fn",
-                "ai_risk_score_fn",
-                "ai_risk_gate_fn",
-                "ai_risk_enabled",
-                "infra_guard_mod",
-                "circuit_breakers_mod",
-                "ai_pass_gate",
-                "ai_candidate_cls",
-                "routeguard_mod",
-                "risk_mod",
-                "exit_mod",
-                "auto_exit_worker_mod",
-                "auto_exit_worker_loop",
-                "reinvest_mod",
-                "smart_mod",
-                "data_logger_mod",
-            ):
-                with contextlib.suppress(Exception):
-                    setattr(M, attr, getattr(resolved, attr))
-        else:
-            M = resolved
+        _copy_modules(M, resolved)
 
         phase_ = _phase()
         disable_sells = _sells_disabled()
@@ -2840,7 +2846,7 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
             jitter_disabled=int(_jitter_disabled()),
             max_uptime_sec=int(max_uptime_sec),
             auto_exit_enabled=int(_auto_exit_enabled()),
-            http_port=int(_http_port()),
+            http_port=int(port),
             early_http=int(early_http),
         )
 
@@ -2909,10 +2915,9 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
         def task_view_fn() -> JSONDict:
             return _task_view_from_supervisor(sup)
 
-        # Promote task view into the early HTTP closure (so /state shows tasks once supervisor exists).
         task_view_holder["fn"] = task_view_fn
 
-        # HTTP server: if we early-started it, do NOT bind a 2nd copy.
+        # HTTP server: if early-started it, do NOT bind a 2nd copy.
         if not early_http:
             add_task(
                 "http_server",
@@ -3144,6 +3149,9 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
             log.event("MAIN_SHUTDOWN_BEGIN", run_id=RUN_ID)
             stop_evt.set()
             await _shutdown_best_effort(stop_evt, reason="main_shutdown", run_id=RUN_ID)
+            await _close_asyncpg_pools_best_effort(
+                run_id=RUN_ID, timeout_s=float(_envf("MAIN_CLOSE_POOLS_TIMEOUT_S", 2.0))
+            )
             log.event("MAIN_SHUTDOWN_DONE", run_id=RUN_ID)
 
     finally:
