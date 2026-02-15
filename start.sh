@@ -39,7 +39,7 @@
 # -----------------------------------------------------------------------------
 # SH-SAFE prologue: if invoked by sh/dash, re-exec with bash.
 # -----------------------------------------------------------------------------
-if [ -z "${BASH_VERSION:-}" ]; then
+if [[ -z "${BASH_VERSION:-}" ]]; then
   if command -v bash >/dev/null 2>&1; then
     exec bash "$0" "$@"
   fi
@@ -120,7 +120,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 export REPO_ROOT="${REPO_ROOT:-$SCRIPT_DIR}"
 
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+# Keep any activated venv FIRST on PATH (do not shadow it with /usr/bin).
+BASE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+if [[ -n "${PATH:-}" ]]; then
+  export PATH="${PATH}:${BASE_PATH}"
+else
+  export PATH="${BASE_PATH}"
+fi
+unset BASE_PATH
 
 IS_RENDER=0
 if [[ -n "${RENDER_SERVICE_ID:-}" || -n "${RENDER_INSTANCE_ID:-}" || -n "${RENDER_EXTERNAL_URL:-}" ]]; then
@@ -260,7 +267,7 @@ _log "────────────────────────�
 _log "Mode: RUN_MODE=${RUN_MODE} strict=${START_STRICT} prechecks=${START_PRECHECKS} check_env=${START_RUN_CHECK_ENV}"
 
 # -----------------------------------------------------------------------------
-# 2) Python selection + deterministic runtime + PYTHONPATH (OS-aware separator)
+# 2) Python selection + deterministic runtime
 # -----------------------------------------------------------------------------
 PYTHON="${PYTHON:-}"
 
@@ -270,71 +277,125 @@ if [[ "$OS_UNAME" == "Linux" ]]; then
   IS_LINUX=1
 fi
 
-if [[ -z "$PYTHON" ]]; then
-  # Prefer a Linux venv if present
-  if [[ -x ".venv/bin/python" ]]; then
-    PYTHON=".venv/bin/python"
-
-  # On Linux/WSL: NEVER use Windows python.exe (interop causes port/env weirdness)
-  elif [[ "$IS_LINUX" == "1" ]]; then
-    command -v python3 >/dev/null 2>&1 || _die "python3 not found (install python3 or create .venv in WSL)"
-    PYTHON="python3"
-
-  # On Windows shells: allow Windows venv python
-  elif [[ -x ".venv/Scripts/python.exe" ]]; then
-    PYTHON=".venv/Scripts/python.exe"
-
-  elif command -v python3 >/dev/null 2>&1; then
-    PYTHON="python3"
-  elif command -v python >/dev/null 2>&1; then
-    PYTHON="python"
-  else
-    _die "Python executable not found"
+_pick_python() {
+  # 1) Explicit override wins
+  if [[ -n "${PYTHON:-}" ]]; then
+    printf '%s' "${PYTHON}"
+    return 0
   fi
-fi
+
+  # 2) If a venv is ACTIVATED, always use it.
+  if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
+    printf '%s' "${VIRTUAL_ENV}/bin/python"
+    return 0
+  fi
+
+  # 3) Repo-local venvs (WSL + common layouts)
+  for p in \
+    ".venv_wsl/bin/python" \
+    ".venv/bin/python" \
+    "venv/bin/python" \
+    ".venv_wsl/bin/python3" \
+    ".venv/bin/python3" \
+    "venv/bin/python3"
+  do
+    if [[ -x "$p" ]]; then
+      printf '%s' "$p"
+      return 0
+    fi
+  done
+
+  # 4) Windows venv (only if we're not on Linux/WSL)
+  if [[ "$IS_LINUX" != "1" && -x ".venv/Scripts/python.exe" ]]; then
+    printf '%s' ".venv/Scripts/python.exe"
+    return 0
+  fi
+
+  # 5) Fallbacks
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "python3"
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1; then
+    printf '%s' "python"
+    return 0
+  fi
+
+  return 1
+}
+
+PYTHON="$(_pick_python)" || _die "Python executable not found"
 
 _log "Python exe: ${PYTHON}"
 _log "Python: $("$PYTHON" -V 2>&1)"
 
-export PYTHONUNBUFFERED=1
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONUTF8="${PYTHONUTF8:-1}"
-export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
-export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
-export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
+# Double-check which interpreter we *actually* got (catches WSL->Windows interop)
+_PY_SYS_EXE="$("$PYTHON" -c 'import sys; print(sys.executable)' 2>/dev/null || true)"
+[[ -n "${_PY_SYS_EXE:-}" ]] && _log "Python sys.executable: ${_PY_SYS_EXE}"
 
-PY_PATHSEP="$("$PYTHON" - <<'PY'
-import os
-print(os.pathsep)
-PY
-)" || PY_PATHSEP=":"
-
-_paths=("$REPO_ROOT")
-[[ -d "$REPO_ROOT/src" ]] && _paths+=("$REPO_ROOT/src")
-
-_old_pythonpath="${PYTHONPATH:-}"
-_py_path="$(_join_by "${PY_PATHSEP}" "${_paths[@]}")"
-if [[ -n "${_old_pythonpath}" ]]; then
-  _py_path="${_py_path}${PY_PATHSEP}${_old_pythonpath}"
+if [[ "$IS_LINUX" == "1" && "${_PY_SYS_EXE:-}" == *.exe ]]; then
+  _die "Windows python detected under WSL/Linux (${_PY_SYS_EXE}). Use a Linux venv interpreter."
 fi
-export PYTHONPATH="${_py_path}"
-unset _py_path _old_pythonpath
+unset _PY_SYS_EXE
+
+# -----------------------------------------------------------------------------
+# 2b) Python helpers (FIX: these MUST exist; your failure was `_py_has_module: command not found`)
+# -----------------------------------------------------------------------------
+# Cache results to avoid repeated python process spins
+declare -A __PY_HAS_MODULE_CACHE 2>/dev/null || true
+declare -A __PY_HELP_CACHE 2>/dev/null || true
 
 _py_has_module() {
   local mod="${1:-}"
   [[ -z "$mod" ]] && return 1
-  "$PYTHON" - "$mod" >/dev/null 2>&1 <<'PY'
+
+  if [[ -n "${__PY_HAS_MODULE_CACHE[$mod]+x}" ]]; then
+    [[ "${__PY_HAS_MODULE_CACHE[$mod]}" == "1" ]]
+    return $?
+  fi
+
+  if "$PYTHON" - "$mod" >/dev/null 2>&1 <<'PY'
 import importlib.util, sys
 m = sys.argv[1]
 sys.exit(0 if importlib.util.find_spec(m) is not None else 1)
 PY
+  then
+    __PY_HAS_MODULE_CACHE["$mod"]="1"
+    return 0
+  fi
+
+  __PY_HAS_MODULE_CACHE["$mod"]="0"
+  return 1
+}
+
+_py_module_help() {
+  local mod="${1:-}"
+  [[ -z "$mod" ]] && return 1
+
+  if [[ -n "${__PY_HELP_CACHE[$mod]+x}" ]]; then
+    printf '%s' "${__PY_HELP_CACHE[$mod]}"
+    return 0
+  fi
+
+  # Never fail the whole script on help probing.
+  local help_txt
+  help_txt="$("$PYTHON" -m "$mod" --help 2>&1 || true)"
+  __PY_HELP_CACHE["$mod"]="$help_txt"
+  printf '%s' "$help_txt"
+  return 0
 }
 
 _supports_arg() {
-  local mod="${1:-}" arg="${2:-}"
-  [[ -z "$mod" || -z "$arg" ]] && return 1
-  command -v grep >/dev/null 2>&1 || return 1
-  "$PYTHON" -m "$mod" --help 2>&1 | grep -Fq -- "$arg"
+  # Usage: _supports_arg "scripts.preflight" "--json-only"
+  local mod="${1:-}" flag="${2:-}"
+  [[ -z "$mod" || -z "$flag" ]] && return 1
+  _py_has_module "$mod" || return 1
+
+  # Search help text for the exact flag token
+  # (Do not use -w because flags include dashes.)
+  local h
+  h="$(_py_module_help "$mod")"
+  printf '%s' "$h" | grep -Fq -- "$flag"
 }
 
 # -----------------------------------------------------------------------------
@@ -1154,7 +1215,7 @@ _health_infer_url() {
   [[ -z "$p" && -n "${HEALTH_HTTP_PORT:-}" ]] && p="${HEALTH_HTTP_PORT}"
   [[ -z "$p" && -n "${HEALTH_PORT:-}" ]] && p="${HEALTH_PORT}"
 
-  # Local "Render-like" default (Render always sets PORT, but WSL tests might not)
+  # Local "Render-like" default
   [[ -z "$p" && "$IS_RENDER" == "1" ]] && p="8080"
 
   if [[ -n "$p" ]]; then
@@ -1172,15 +1233,14 @@ _health_infer_url() {
 }
 
 _extract_last_json_line() {
-  if command -v awk >/dev/null 2>&1; then
-    awk '
-      /^[[:space:]]*\{.*\}[[:space:]]*$/ { last=$0 }
-      END { if (length(last)>0) print last }
-    '
-    return 0
-  fi
-  # Fallback: just print nothing (caller handles)
-  return 0
+  # Pure-bash fallback: keep last line that looks like a JSON object.
+  local line last=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      \{*\}) last="$line" ;;
+    esac
+  done
+  [[ -n "$last" ]] && printf '%s\n' "$last"
 }
 
 _healthcheck_ok() {
@@ -1298,14 +1358,18 @@ _start_health_http_sidecar() {
   # Render always sets PORT, but local Render-mimic may not.
   if [[ -z "${PORT:-}" && -n "${HEALTH_HTTP_PORT:-}" ]]; then
     export PORT="${HEALTH_HTTP_PORT}"
-  elif [[ -z "${PORT:-}" && "$IS_RENDER" == "1" ]]; then
+  elif [[ -z "${PORT:-}" ]]; then
     export PORT="8080"
   fi
 
-  export HEALTH_HTTP_PORT="${HEALTH_HTTP_PORT:-${PORT:-}}"
+  # Enforce single-port ownership: sidecar binds PORT, and we align HEALTH_HTTP_PORT to it.
+  if [[ -n "${HEALTH_HTTP_PORT:-}" && "${HEALTH_HTTP_PORT}" != "${PORT}" ]]; then
+    _warn "HEALTH_HTTP_PORT (${HEALTH_HTTP_PORT}) != PORT (${PORT}); enforcing single-port: sidecar binds PORT"
+  fi
+  export HEALTH_HTTP_PORT="${PORT}"
   export DISABLE_MAIN_HTTP=1
 
-  _log "Starting health_http sidecar on PORT=${HEALTH_HTTP_PORT:-${PORT:-}} (module=scripts.health_http)"
+  _log "Starting health_http sidecar on PORT=${PORT:-} (module=scripts.health_http)"
   export READY_FILE="${READY_FILE:-}"
 
   if [[ -n "${START_HEALTH_HTTP_ARGS:-}" ]]; then

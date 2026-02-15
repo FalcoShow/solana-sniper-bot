@@ -1,9 +1,8 @@
-# scripts/health_http.py
 from __future__ import annotations
 
 """
-scripts/health_http.py — God-Tier Health HTTP (P0 LOCK-IN, stdlib-only)
-======================================================================
+scripts/health_http.py — God-Tier Health HTTP (P0 LOCK-IN, stdlib-only runtime)
+==============================================================================
 
 Purpose
 -------
@@ -32,8 +31,15 @@ Key behaviors (IMPORTANT)
 - Import-safe:
     - no third-party imports required; server only runs under __main__.
 
-Env
----
+Extras (safe, optional)
+-----------------------
+- Per-request verbose override for debugging:
+    - /readyz?verbose=1  (does NOT change default unless asked)
+- Per-request refresh to bypass cache:
+    - /readyz?refresh=1
+
+Env (same contract as your previous version)
+--------------------------------------------
 Server:
   PORT is authoritative on Render (single-port contract).
   Optional overrides: HEALTH_HTTP_PORT, then HEALTH_PORT (legacy/local).
@@ -73,11 +79,6 @@ Postgres (any one):
 
 Solana RPC:
   SOLANA_RPC_URL / RPC_URL / SOLANA_RPC_HTTP / SOL_RPC_URL / RPC_URLS / SOL_RPC_URLS
-
-Notes
------
-- This file is the server.
-- scripts/healthcheck.py is the client (deploy runner) that calls /readyz with retries.
 """
 
 import argparse
@@ -93,7 +94,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Awaitable, Callable, cast
+from typing import Any, Awaitable, Callable, Mapping, cast
 from urllib.parse import parse_qs, urlparse
 
 # ------------------------------------------------------------------------------
@@ -104,12 +105,11 @@ try:
 except Exception:  # pragma: no cover
 
     def get_logger(name: str | None = None):  # type: ignore
-        logging.basicConfig(level=logging.INFO)
         return logging.getLogger(name or "health_http")
 
 
-log = get_logger("health_http")
-
+# Keep logger type flexible (some repos use custom EventLogger types).
+log: Any = get_logger("health_http")
 
 # ------------------------------------------------------------------------------
 # Optional deps (best-effort). Zero are REQUIRED.
@@ -117,13 +117,12 @@ log = get_logger("health_http")
 try:
     import httpx  # type: ignore
 except Exception:  # pragma: no cover
-    httpx = None
+    httpx = None  # type: ignore
 
 try:
     import redis.asyncio as aioredis  # type: ignore
 except Exception:  # pragma: no cover
-    aioredis = None
-
+    aioredis = None  # type: ignore
 
 # ------------------------------------------------------------------------------
 # Config helpers
@@ -132,6 +131,15 @@ _TRUE = {"1", "true", "yes", "y", "on", "t"}
 _FALSE = {"0", "false", "no", "n", "off", "f"}
 
 _URL_CRED_RE = re.compile(r"(://)([^/@\s]+)@")
+
+
+# Wall time (for timestamps) and monotonic time (for TTL/latency).
+def _wall_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _mono_ms() -> int:
+    return int(time.monotonic() * 1000)
 
 
 def _envs(name: str, default: str = "") -> str:
@@ -144,10 +152,10 @@ def _envs(name: str, default: str = "") -> str:
 
 
 def _envb(name: str, default: bool = False) -> bool:
-    v = _envs(name, "")
-    if v == "":
+    raw = _envs(name, "")
+    if raw == "":
         return bool(default)
-    s = v.lower().strip()
+    s = raw.lower().strip()
     if s in _TRUE:
         return True
     if s in _FALSE:
@@ -169,10 +177,6 @@ def _envf(name: str, default: float) -> float:
         return float(default)
 
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
 def _render_detected() -> bool:
     return bool(
         _envs("RENDER_SERVICE_ID", "")
@@ -183,7 +187,7 @@ def _render_detected() -> bool:
 
 def _no_network() -> bool:
     # Canonical toggles used elsewhere in your system
-    return _envb("NO_NETWORK", False) or _envb("NO_NET", False)
+    return _envb("NO_NETWORK", False) or _envb("NO_NET", False) or _envb("DRYRUN", False)
 
 
 def _resolve_health_port() -> int:
@@ -334,7 +338,8 @@ def load_health_config() -> HealthConfig:
 # ------------------------------------------------------------------------------
 # Runtime meta + env flags
 # ------------------------------------------------------------------------------
-_START_TS_MS = _now_ms()
+_START_WALL_MS = _wall_ms()
+_START_MONO_MS = _mono_ms()
 
 
 def _env_flags() -> dict[str, Any]:
@@ -378,13 +383,14 @@ def _env_flags() -> dict[str, Any]:
 
 
 def _build_meta() -> dict[str, Any]:
+    uptime_sec = int((_mono_ms() - _START_MONO_MS) / 1000)
     return {
         "service": _envs("SERVICE_NAME", "sniper"),
         "version": _envs("APP_VERSION", _envs("GIT_SHA", "")) or "",
         "host": platform.node(),
         "pid": os.getpid(),
         "render": _render_detected(),
-        "uptime_sec": int((_now_ms() - _START_TS_MS) / 1000),
+        "uptime_sec": max(0, uptime_sec),
         "ts_utc": datetime.now(UTC).isoformat(),
     }
 
@@ -409,15 +415,24 @@ async def _call_maybe_async(
     )
 
 
+def _mk_res(ok: bool, status: str, detail: str, t0_mono_ms: int) -> CheckResult:
+    return CheckResult(
+        ok=bool(ok),
+        status=str(status),
+        detail=str(detail),
+        latency_ms=max(0, _mono_ms() - t0_mono_ms),
+        ts_ms=_wall_ms(),
+    )
+
+
 async def _check_redis(cfg: HealthConfig) -> CheckResult:
-    t0 = _now_ms()
+    t0 = _mono_ms()
+
     if not cfg.check_redis:
-        return CheckResult(True, "skip", "disabled", _now_ms() - t0, _now_ms())
+        return _mk_res(True, "skip", "disabled", t0)
 
     if _no_network() and not cfg.require_redis:
-        return CheckResult(
-            True, "skip", "policy_skip:no_network_or_dryrun", _now_ms() - t0, _now_ms()
-        )
+        return _mk_res(True, "skip", "policy_skip:no_network_or_dryrun", t0)
 
     # Prefer canonical helper if present
     try:
@@ -426,63 +441,44 @@ async def _check_redis(cfg: HealthConfig) -> CheckResult:
         r = await asyncio.wait_for(core_get_redis_async(), timeout=max(1.0, cfg.dep_timeout_s))
         pong = await asyncio.wait_for(r.ping(), timeout=max(1.0, cfg.dep_timeout_s))
         ok = bool(pong)
-        return CheckResult(
-            ok,
-            "ok" if ok else "fail",
-            "ping ok" if ok else "ping failed",
-            _now_ms() - t0,
-            _now_ms(),
-        )
+        return _mk_res(ok, "ok" if ok else "fail", "ping ok" if ok else "ping failed", t0)
     except Exception:
         pass
 
     if aioredis is None:
         ok = not cfg.require_redis
-        return CheckResult(
-            ok, "skip" if ok else "fail", "redis client not installed", _now_ms() - t0, _now_ms()
-        )
+        return _mk_res(ok, "skip" if ok else "fail", "redis client not installed", t0)
 
     url = _resolve_redis_url()
     if not url:
         ok = not cfg.require_redis
-        return CheckResult(
-            ok, "skip" if ok else "fail", "REDIS_URL missing", _now_ms() - t0, _now_ms()
-        )
+        return _mk_res(ok, "skip" if ok else "fail", "REDIS_URL missing", t0)
 
     try:
-        r2 = aioredis.from_url(url, decode_responses=True)
-        pong = await asyncio.wait_for(r2.ping(), timeout=max(1.0, cfg.dep_timeout_s))
+        r2 = aioredis.from_url(url, decode_responses=True)  # type: ignore[union-attr]
+        pong2 = await asyncio.wait_for(r2.ping(), timeout=max(1.0, cfg.dep_timeout_s))
         with contextlib.suppress(Exception):
             await r2.close()
-        ok = bool(pong)
-        return CheckResult(
-            ok,
-            "ok" if ok else "fail",
-            "ping ok" if ok else "ping failed",
-            _now_ms() - t0,
-            _now_ms(),
-        )
+        ok = bool(pong2)
+        return _mk_res(ok, "ok" if ok else "fail", "ping ok" if ok else "ping failed", t0)
     except Exception as e:
         if _no_network() and not cfg.require_redis:
-            return CheckResult(
-                True, "skip", "policy_skip:no_network_or_dryrun", _now_ms() - t0, _now_ms()
-            )
-        return CheckResult(False, "fail", f"{type(e).__name__}: {e}", _now_ms() - t0, _now_ms())
+            return _mk_res(True, "skip", "policy_skip:no_network_or_dryrun", t0)
+        return _mk_res(False, "fail", f"{type(e).__name__}: {e}", t0)
 
 
 async def _check_pg(cfg: HealthConfig) -> CheckResult:
-    t0 = _now_ms()
+    t0 = _mono_ms()
+
     if not cfg.check_pg:
-        return CheckResult(True, "skip", "disabled", _now_ms() - t0, _now_ms())
+        return _mk_res(True, "skip", "disabled", t0)
 
     if _no_network() and not cfg.require_pg:
-        return CheckResult(
-            True, "skip", "policy_skip:no_network_or_dryrun", _now_ms() - t0, _now_ms()
-        )
+        return _mk_res(True, "skip", "policy_skip:no_network_or_dryrun", t0)
 
     if not _resolve_pg_dsn():
         ok = not cfg.require_pg
-        return CheckResult(ok, "skip" if ok else "fail", "no pg dsn set", _now_ms() - t0, _now_ms())
+        return _mk_res(ok, "skip" if ok else "fail", "no pg dsn set", t0)
 
     # Prefer canonical ai_db ping (keeps DSN normalization + SSL logic consistent)
     try:
@@ -490,13 +486,13 @@ async def _check_pg(cfg: HealthConfig) -> CheckResult:
 
         from utils_pkg import ai_db  # type: ignore
 
-        candidates = ["ping_async", "ping", "healthcheck", "check"]
-        fn = None
+        candidates = ("ping_async", "ping", "healthcheck", "check")
+        fn: Callable[..., Any] | None = None
         fn_name = ""
         for nm in candidates:
             cand = getattr(ai_db, nm, None)
             if callable(cand):
-                fn = cand
+                fn = cast(Callable[..., Any], cand)
                 fn_name = nm
                 break
         if fn is None:
@@ -511,33 +507,32 @@ async def _check_pg(cfg: HealthConfig) -> CheckResult:
         except Exception:
             kw = {}
 
-        v = await _call_maybe_async(fn, cfg.dep_timeout_s, **kw)  # type: ignore[arg-type]
+        v = await _call_maybe_async(fn, cfg.dep_timeout_s, **kw)
         if isinstance(v, bool) and not v:
             raise RuntimeError(f"ai_db.{fn_name} returned False")
 
-        return CheckResult(True, "ok", f"ai_db.{fn_name}", _now_ms() - t0, _now_ms())
+        return _mk_res(True, "ok", f"ai_db.{fn_name}", t0)
     except Exception as e:
         if _no_network() and not cfg.require_pg:
-            return CheckResult(
-                True, "skip", "policy_skip:no_network_or_dryrun", _now_ms() - t0, _now_ms()
-            )
-        return CheckResult(False, "fail", f"{type(e).__name__}: {e}", _now_ms() - t0, _now_ms())
+            return _mk_res(True, "skip", "policy_skip:no_network_or_dryrun", t0)
+        return _mk_res(False, "fail", f"{type(e).__name__}: {e}", t0)
 
 
-def _rpc_post_json_sync(url: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+def _rpc_post_json_sync(url: str, payload: Mapping[str, Any], timeout_s: float) -> dict[str, Any]:
+    # httpx fast path if installed
     if httpx is not None:
-        r = httpx.post(url, json=payload, timeout=timeout_s)
-        if int(r.status_code) != 200:
-            raise RuntimeError(f"http {r.status_code}")
+        r = httpx.post(url, json=dict(payload), timeout=timeout_s)  # type: ignore[union-attr]
+        if int(getattr(r, "status_code", 0)) != 200:
+            raise RuntimeError(f"http {getattr(r, 'status_code', 0)}")
         out = r.json()
         if not isinstance(out, dict):
             raise RuntimeError("rpc_non_object_json")
         return cast(dict[str, Any], out)
 
-    # urllib fallback
+    # urllib fallback (stdlib-only)
     import urllib.request
 
-    data = json.dumps(payload).encode("utf-8")
+    data = json.dumps(dict(payload)).encode("utf-8")
     req = urllib.request.Request(
         url, data=data, headers={"content-type": "application/json"}, method="POST"
     )
@@ -550,21 +545,18 @@ def _rpc_post_json_sync(url: str, payload: dict[str, Any], timeout_s: float) -> 
 
 
 async def _check_rpc(cfg: HealthConfig) -> CheckResult:
-    t0 = _now_ms()
+    t0 = _mono_ms()
+
     if not cfg.check_rpc:
-        return CheckResult(True, "skip", "disabled", _now_ms() - t0, _now_ms())
+        return _mk_res(True, "skip", "disabled", t0)
 
     if _no_network() and not cfg.require_rpc:
-        return CheckResult(
-            True, "skip", "policy_skip:no_network_or_dryrun", _now_ms() - t0, _now_ms()
-        )
+        return _mk_res(True, "skip", "policy_skip:no_network_or_dryrun", t0)
 
     url = _resolve_rpc_url()
     if not url:
         ok = not cfg.require_rpc
-        return CheckResult(
-            ok, "skip" if ok else "fail", "no rpc url set", _now_ms() - t0, _now_ms()
-        )
+        return _mk_res(ok, "skip" if ok else "fail", "no rpc url set", t0)
 
     try:
         payload = {
@@ -579,25 +571,20 @@ async def _check_rpc(cfg: HealthConfig) -> CheckResult:
         )
         bh = cast(dict[str, Any], data.get("result", {})).get("value", {}).get("blockhash")
         ok = bool(bh)
-        return CheckResult(
-            ok,
-            "ok" if ok else "fail",
-            "blockhash ok" if ok else "missing blockhash",
-            _now_ms() - t0,
-            _now_ms(),
+        return _mk_res(
+            ok, "ok" if ok else "fail", "blockhash ok" if ok else "missing blockhash", t0
         )
     except Exception as e:
         if _no_network() and not cfg.require_rpc:
-            return CheckResult(
-                True, "skip", "policy_skip:no_network_or_dryrun", _now_ms() - t0, _now_ms()
-            )
-        return CheckResult(False, "fail", f"{type(e).__name__}: {e}", _now_ms() - t0, _now_ms())
+            return _mk_res(True, "skip", "policy_skip:no_network_or_dryrun", t0)
+        return _mk_res(False, "fail", f"{type(e).__name__}: {e}", t0)
 
 
 async def _check_router(cfg: HealthConfig) -> CheckResult:
-    t0 = _now_ms()
+    t0 = _mono_ms()
+
     if not cfg.check_router:
-        return CheckResult(True, "skip", "disabled", _now_ms() - t0, _now_ms())
+        return _mk_res(True, "skip", "disabled", t0)
 
     # Router check is import-only by design; no network required here.
     try:
@@ -605,22 +592,20 @@ async def _check_router(cfg: HealthConfig) -> CheckResult:
 
         for nm in ("get_quote", "quote", "get_buy_quote"):
             if callable(getattr(jrouter, nm, None)):
-                return CheckResult(True, "ok", f"import ok ({nm})", _now_ms() - t0, _now_ms())
+                return _mk_res(True, "ok", f"import ok ({nm})", t0)
 
         fn = getattr(jrouter, "healthcheck", None)
         if callable(fn):
-            v = await _call_maybe_async(fn, cfg.dep_timeout_s)
+            v = await _call_maybe_async(cast(Callable[..., Any], fn), cfg.dep_timeout_s)
             ok = bool(v)
-            return CheckResult(
-                ok, "ok" if ok else "fail", "router.healthcheck", _now_ms() - t0, _now_ms()
-            )
+            return _mk_res(ok, "ok" if ok else "fail", "router.healthcheck", t0)
 
-        return CheckResult(False, "fail", "router missing quote fn", _now_ms() - t0, _now_ms())
+        return _mk_res(False, "fail", "router missing quote fn", t0)
     except Exception as e:
-        return CheckResult(False, "fail", f"{type(e).__name__}: {e}", _now_ms() - t0, _now_ms())
+        return _mk_res(False, "fail", f"{type(e).__name__}: {e}", t0)
 
 
-def _ready_from_checks(cfg: HealthConfig, checks: dict[str, CheckResult]) -> tuple[bool, str]:
+def _ready_from_checks(cfg: HealthConfig, checks: Mapping[str, CheckResult]) -> tuple[bool, str]:
     failed_required: list[str] = []
     if cfg.require_redis and not checks.get("redis", CheckResult(True, "skip")).ok:
         failed_required.append("redis")
@@ -668,10 +653,10 @@ async def _collect_checks(cfg: HealthConfig) -> dict[str, CheckResult]:
                 return name, res
             except TimeoutError:
                 return name, CheckResult(
-                    False, "fail", f"timeout>{cfg.dep_timeout_s}s", 0, _now_ms()
+                    False, "fail", f"timeout>{cfg.dep_timeout_s}s", 0, _wall_ms()
                 )
             except Exception as e:
-                return name, CheckResult(False, "fail", f"{type(e).__name__}: {e}", 0, _now_ms())
+                return name, CheckResult(False, "fail", f"{type(e).__name__}: {e}", 0, _wall_ms())
 
     jobs: list[asyncio.Task[tuple[str, CheckResult]]] = [
         asyncio.create_task(_run("redis", _check_redis(cfg))),
@@ -684,10 +669,15 @@ async def _collect_checks(cfg: HealthConfig) -> dict[str, CheckResult]:
 
 
 def _run_async(coro: Awaitable[Any]) -> Any:
+    """
+    Run coroutine in a safe, isolated way.
+    - In normal usage (no running loop in this thread), asyncio.run is perfect.
+    - If a loop is already running in *this* thread (rare for ThreadingHTTPServer),
+      fall back to a fresh loop to avoid crashing readiness.
+    """
     try:
         return asyncio.run(coro)
     except RuntimeError:
-        # Safety fallback (rare): create isolated loop
         loop = asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(loop)
@@ -699,13 +689,18 @@ def _run_async(coro: Awaitable[Any]) -> Any:
 
 
 class _HealthCache:
+    """
+    Single-flight cached readiness results.
+    Uses monotonic time for TTL correctness even if wall clock shifts.
+    """
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
 
         self._computing = False
 
-        self._cache_ts_ms = 0
+        self._cache_mono_ms = 0
         self._cache_cfg_sig = ""
         self._cache_checks: dict[str, CheckResult] = {}
         self._cache_ready = False
@@ -715,14 +710,14 @@ class _HealthCache:
         cfg = load_health_config()
         sig = _cfg_signature(cfg)
         ttl_ms = int(cfg.cache_ttl_sec * 1000)
-        now = _now_ms()
+        now_m = _mono_ms()
 
         with self._cond:
             cache_valid = (
                 (not force_refresh)
                 and (self._cache_cfg_sig == sig)
                 and bool(self._cache_checks)
-                and (now - self._cache_ts_ms) < ttl_ms
+                and (now_m - self._cache_mono_ms) < ttl_ms
             )
             if cache_valid:
                 return cfg, self._cache_checks, self._cache_ready, self._cache_why
@@ -731,11 +726,12 @@ class _HealthCache:
             while self._computing:
                 self._cond.wait(timeout=1.0)
 
+                now_m2 = _mono_ms()
                 cache_valid2 = (
                     (not force_refresh)
                     and (self._cache_cfg_sig == sig)
                     and bool(self._cache_checks)
-                    and (now - self._cache_ts_ms) < ttl_ms
+                    and (now_m2 - self._cache_mono_ms) < ttl_ms
                 )
                 if cache_valid2:
                     return cfg, self._cache_checks, self._cache_ready, self._cache_why
@@ -751,7 +747,7 @@ class _HealthCache:
             self._cache_checks = checks
             self._cache_ready = bool(ready)
             self._cache_why = str(why)
-            self._cache_ts_ms = _now_ms()
+            self._cache_mono_ms = _mono_ms()
             self._computing = False
             self._cond.notify_all()
 
@@ -760,19 +756,18 @@ class _HealthCache:
 
 CACHE = _HealthCache()
 
-
 # ------------------------------------------------------------------------------
 # HTTP server
 # ------------------------------------------------------------------------------
 PREFIX = (_envs("HEALTH_PATH_PREFIX", "")).rstrip("/")
-DISABLE_DOCS = _envb("HEALTH_DISABLE_DOCS", True)  # kept for compatibility (stdlib has no docs)
+DISABLE_DOCS = _envb("HEALTH_DISABLE_DOCS", True)  # kept for compatibility
 
 
 def _path(p: str) -> str:
     return f"{PREFIX}{p}" if PREFIX else p
 
 
-def _bool_q(qs: dict[str, list[str]], key: str, default: bool = False) -> bool:
+def _bool_q(qs: Mapping[str, list[str]], key: str, default: bool = False) -> bool:
     if key not in qs:
         return default
     raw = (qs.get(key) or [""])[0].strip().lower()
@@ -785,7 +780,7 @@ def _bool_q(qs: dict[str, list[str]], key: str, default: bool = False) -> bool:
     return default
 
 
-def _json_body(obj: dict[str, Any]) -> bytes:
+def _json_body(obj: Mapping[str, Any]) -> bytes:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
@@ -796,7 +791,8 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:
         # Quiet by default; enable with HEALTH_HTTP_LOG=1
         if _envb("HEALTH_HTTP_LOG", False):
-            log.info(fmt, *args)
+            with contextlib.suppress(Exception):
+                log.info(fmt, *args)
 
     def _send(
         self, status: int, body: bytes, content_type: str = "application/json; charset=utf-8"
@@ -807,7 +803,8 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         if self.command != "HEAD":
-            self.wfile.write(body)
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                self.wfile.write(body)
 
     def _redirect(self, location: str) -> None:
         self.send_response(307)
@@ -845,6 +842,10 @@ class HealthHandler(BaseHTTPRequestHandler):
             refresh = _bool_q(qs, "refresh", False)
             cfg, checks, ready, why = CACHE.get(force_refresh=bool(refresh))
 
+            req_verbose = (
+                bool(cfg.verbose) or _bool_q(qs, "verbose", False) or _bool_q(qs, "v", False)
+            )
+
             payload2: dict[str, Any] = {
                 "ok": bool(ready),
                 "ready": bool(ready),
@@ -853,7 +854,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 "checks": {},
             }
 
-            if cfg.verbose:
+            if req_verbose:
                 payload2["env"] = _env_flags()
                 payload2["resolved"] = {
                     "rpc": _mask_url(_resolve_rpc_url() or ""),
@@ -888,25 +889,29 @@ def main() -> None:
     host = str(args.host)
     port = int(args.port)
 
+    # If nothing configured logging yet, set a sane baseline.
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO)
+
     log_level = (_envs("HEALTH_LOG_LEVEL", "info") or "info").lower()
-    # best-effort set level if using std logging fallback
     with contextlib.suppress(Exception):
         if hasattr(log, "setLevel"):
             level = getattr(logging, log_level.upper(), logging.INFO)
             log.setLevel(level)
 
-    log.info(
-        "health_http bind host=%s port=%s prefix=%s ttl=%ss verbose=%s no_network=%s",
-        host,
-        port,
-        PREFIX or "/",
-        load_health_config().cache_ttl_sec,
-        int(load_health_config().verbose),
-        int(_no_network()),
-    )
+    cfg = load_health_config()
+    with contextlib.suppress(Exception):
+        log.info(
+            "health_http bind host=%s port=%s prefix=%s ttl=%ss verbose=%s no_network=%s",
+            host,
+            port,
+            PREFIX or "/",
+            cfg.cache_ttl_sec,
+            int(cfg.verbose),
+            int(_no_network()),
+        )
 
     ThreadingHTTPServer.allow_reuse_address = True
-
     httpd = ThreadingHTTPServer((host, port), HealthHandler)
     try:
         httpd.serve_forever(poll_interval=0.5)

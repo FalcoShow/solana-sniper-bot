@@ -16,6 +16,7 @@ Hard requirements
 ✅ Candidate dict output compatible with downstream entry pipeline
 ✅ Backwards-compatible API: scan_pumpfun / scan_once / scan_loop / shutdown
 ✅ Cancellation-safe: never swallow asyncio.CancelledError
+✅ NEVER-EXIT: operational exceptions are contained (return [] / keep looping)
 
 Canonical candidate shape (minimum)
 -----------------------------------
@@ -698,12 +699,22 @@ class TokenState:
         self.last_ts = max(self.last_ts, t.ts)
 
 
+@dataclass(frozen=True)
+class _Fundamentals:
+    mcap_usd: float | None
+    liq_usd: float | None
+    price_usd: float | None
+
+
 class PumpPortalClient:
     """
     Dedicated background WS loop. Safe to call ensure_started() many times.
     snapshot() returns copies to avoid iterating over mutable state mid-update.
 
-    LOCK-IN: close() cancels task and guarantees ws+session closure.
+    LOCK-IN:
+      - state updates are atomic under _state_lock (no races with snapshot)
+      - close() cancels task and guarantees ws+session closure
+      - loop contains operational exceptions (never exits unless stopped/cancelled)
     """
 
     def __init__(self) -> None:
@@ -733,6 +744,7 @@ class PumpPortalClient:
             self._stop.clear()
             self._ready.clear()
             self._task = asyncio.create_task(self._run_loop(), name="pumpportal_ws")
+
         with contextlib.suppress(Exception):
             await asyncio.wait_for(self._ready.wait(), timeout=float(CFG.connect_timeout_s))
 
@@ -786,6 +798,7 @@ class PumpPortalClient:
     async def snapshot(self, *, max_items: int) -> list[TokenState]:
         """
         Return copies of newest token states to avoid races with the WS loop.
+        (WS loop updates are atomic under the same lock.)
         """
         async with self._state_lock:
             mints = list(self._order)[-max_items:]
@@ -828,14 +841,92 @@ class PumpPortalClient:
                             return mm.group(0)
         return ""
 
-    async def _touch(
+    @staticmethod
+    def _is_trade(msg: dict[str, Any]) -> bool:
+        tx = msg.get("txType") or msg.get("side") or msg.get("type")
+        if isinstance(tx, str) and tx.lower() in {"buy", "sell"}:
+            return True
+        return any(k in msg for k in ("solAmount", "sol_amount", "tokenAmount", "token_amount"))
+
+    @staticmethod
+    def _parse_trade(msg: dict[str, Any]) -> Trade:
+        side = str(msg.get("txType") or msg.get("side") or msg.get("type") or "?").lower()
+        if side not in {"buy", "sell"}:
+            side = "?"
+        ts = _nz(
+            msg.get("timestamp") or msg.get("ts") or msg.get("time") or time.time(), time.time()
+        )
+        if ts > 10_000_000_000:
+            ts = ts / 1000.0
+
+        sol = _nz(msg.get("solAmount") or msg.get("sol_amount") or msg.get("sol"), 0.0)
+        token = _nz(msg.get("tokenAmount") or msg.get("token_amount") or msg.get("token"), 0.0)
+        price_sol = (sol / token) if (sol > 0 and token > 0) else 0.0
+        return Trade(
+            ts=float(ts), side=side, sol=float(sol), token=float(token), price_sol=float(price_sol)
+        )
+
+    @staticmethod
+    def _fundamentals_from_msg(msg: dict[str, Any], sol_usd: float) -> _Fundamentals:
+        mcap_usd_val: float | None = None
+        liq_usd_val: float | None = None
+        price_usd_val: float | None = None
+
+        mcap_usd = (
+            msg.get("marketCapUsd")
+            or msg.get("marketCapUSD")
+            or msg.get("mcapUsd")
+            or msg.get("mcap_usd")
+        )
+        if mcap_usd is None:
+            mcap_sol = msg.get("marketCapSol") or msg.get("marketCapSOL") or msg.get("mcapSol")
+            if mcap_sol is not None and sol_usd > 0:
+                mcap_usd = _nz(mcap_sol, 0.0) * sol_usd
+        if mcap_usd is not None:
+            mcap_usd_val = max(0.0, _nz(mcap_usd, 0.0))
+
+        liq_usd = (
+            msg.get("liquidityUsd")
+            or msg.get("liquidityUSD")
+            or msg.get("liqUsd")
+            or msg.get("liq_usd")
+        )
+        if liq_usd is None:
+            liq_sol = (
+                msg.get("vSolInBondingCurve")
+                or msg.get("solInBondingCurve")
+                or msg.get("liquiditySol")
+            )
+            if liq_sol is not None and sol_usd > 0:
+                liq_usd = _nz(liq_sol, 0.0) * sol_usd
+        if liq_usd is not None:
+            liq_usd_val = max(0.0, _nz(liq_usd, 0.0))
+
+        price_usd = msg.get("priceUsd") or msg.get("priceUSD") or msg.get("usdPrice")
+        if price_usd is None:
+            price_sol = msg.get("priceSol") or msg.get("priceSOL")
+            if price_sol is not None and sol_usd > 0:
+                price_usd = _nz(price_sol, 0.0) * sol_usd
+        if price_usd is not None:
+            price_usd_val = max(0.0, _nz(price_usd, 0.0))
+
+        return _Fundamentals(mcap_usd=mcap_usd_val, liq_usd=liq_usd_val, price_usd=price_usd_val)
+
+    async def _upsert_state(
         self,
-        mint: str,
         *,
-        symbol: str = "",
-        name: str = "",
-        created_ts: float = 0.0,
-    ) -> TokenState:
+        mint: str,
+        symbol: str,
+        name: str,
+        created_ts: float,
+        fundamentals: _Fundamentals,
+        trade: Trade | None,
+    ) -> None:
+        """
+        Atomic state update under _state_lock.
+        This is the key hardening change: snapshot() cannot race fundamentals updates anymore.
+        """
+        now = time.time()
         async with self._state_lock:
             st = self._tokens.get(mint)
             if st is None:
@@ -858,8 +949,18 @@ class PumpPortalClient:
                 st.name = name
             if created_ts and st.created_ts <= 0:
                 st.created_ts = created_ts
-            st.last_ts = max(st.last_ts, time.time())
-            return st
+
+            st.last_ts = max(st.last_ts, now)
+
+            if fundamentals.mcap_usd is not None:
+                st.mcap_usd = float(fundamentals.mcap_usd)
+            if fundamentals.liq_usd is not None:
+                st.liq_usd = float(fundamentals.liq_usd)
+            if fundamentals.price_usd is not None:
+                st.price_usd = float(fundamentals.price_usd)
+
+            if trade is not None:
+                st.push_trade(trade, max_trades=int(CFG.max_trades_per_token))
 
     async def _ws_send(self, payload: dict[str, Any]) -> None:
         ws = self._ws
@@ -890,68 +991,6 @@ class PumpPortalClient:
 
         async with self._state_lock:
             self._subscribed_trades.update(keys)
-
-    def _is_trade(self, msg: dict[str, Any]) -> bool:
-        tx = msg.get("txType") or msg.get("side") or msg.get("type")
-        if isinstance(tx, str) and tx.lower() in {"buy", "sell"}:
-            return True
-        return any(k in msg for k in ("solAmount", "sol_amount", "tokenAmount", "token_amount"))
-
-    def _parse_trade(self, msg: dict[str, Any]) -> Trade:
-        side = str(msg.get("txType") or msg.get("side") or msg.get("type") or "?").lower()
-        if side not in {"buy", "sell"}:
-            side = "?"
-        ts = _nz(
-            msg.get("timestamp") or msg.get("ts") or msg.get("time") or time.time(), time.time()
-        )
-        if ts > 10_000_000_000:
-            ts = ts / 1000.0
-
-        sol = _nz(msg.get("solAmount") or msg.get("sol_amount") or msg.get("sol"), 0.0)
-        token = _nz(msg.get("tokenAmount") or msg.get("token_amount") or msg.get("token"), 0.0)
-        price_sol = (sol / token) if (sol > 0 and token > 0) else 0.0
-        return Trade(
-            ts=float(ts), side=side, sol=float(sol), token=float(token), price_sol=float(price_sol)
-        )
-
-    def _apply_fundamentals(self, st: TokenState, msg: dict[str, Any], sol_usd: float) -> None:
-        mcap_usd = (
-            msg.get("marketCapUsd")
-            or msg.get("marketCapUSD")
-            or msg.get("mcapUsd")
-            or msg.get("mcap_usd")
-        )
-        if mcap_usd is None:
-            mcap_sol = msg.get("marketCapSol") or msg.get("marketCapSOL") or msg.get("mcapSol")
-            if mcap_sol is not None and sol_usd > 0:
-                mcap_usd = _nz(mcap_sol, 0.0) * sol_usd
-        if mcap_usd is not None:
-            st.mcap_usd = max(0.0, _nz(mcap_usd, 0.0))
-
-        liq_usd = (
-            msg.get("liquidityUsd")
-            or msg.get("liquidityUSD")
-            or msg.get("liqUsd")
-            or msg.get("liq_usd")
-        )
-        if liq_usd is None:
-            liq_sol = (
-                msg.get("vSolInBondingCurve")
-                or msg.get("solInBondingCurve")
-                or msg.get("liquiditySol")
-            )
-            if liq_sol is not None and sol_usd > 0:
-                liq_usd = _nz(liq_sol, 0.0) * sol_usd
-        if liq_usd is not None:
-            st.liq_usd = max(0.0, _nz(liq_usd, 0.0))
-
-        price_usd = msg.get("priceUsd") or msg.get("priceUSD") or msg.get("usdPrice")
-        if price_usd is None:
-            price_sol = msg.get("priceSol") or msg.get("priceSOL")
-            if price_sol is not None and sol_usd > 0:
-                price_usd = _nz(price_sol, 0.0) * sol_usd
-        if price_usd is not None:
-            st.price_usd = max(0.0, _nz(price_usd, 0.0))
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._sess is not None and not self._sess.closed:
@@ -1040,15 +1079,19 @@ class PumpPortalClient:
                         if created_ts > 10_000_000_000:
                             created_ts = created_ts / 1000.0
 
-                    st = await self._touch(
-                        mint, symbol=symbol, name=name, created_ts=float(created_ts)
-                    )
-                    self._apply_fundamentals(st, data, sol_usd_cache)
-
+                    fundamentals = self._fundamentals_from_msg(data, sol_usd_cache)
+                    trade: Trade | None = None
                     if self._is_trade(data):
-                        t = self._parse_trade(data)
-                        async with self._state_lock:
-                            st.push_trade(t, max_trades=int(CFG.max_trades_per_token))
+                        trade = self._parse_trade(data)
+
+                    await self._upsert_state(
+                        mint=mint,
+                        symbol=symbol,
+                        name=name,
+                        created_ts=float(created_ts),
+                        fundamentals=fundamentals,
+                        trade=trade,
+                    )
 
             except asyncio.CancelledError:
                 raise
