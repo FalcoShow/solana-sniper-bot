@@ -2244,6 +2244,33 @@ def _resolve_health_snapshot_fn() -> Callable[[], Any] | None:
     return None
 
 
+def _health_sidecar_owns_port() -> bool:
+    """
+    Render bootstrap may start a dedicated health_http sidecar that binds PORT.
+    If HEALTH_PORT/HEALTH_HTTP_PORT matches PORT, assume the sidecar owns the bind.
+
+    Override with MAIN_HTTP_ALLOW_BIND_PORT=1 if you *really* want main to bind PORT.
+    """
+    if not _is_render():
+        return False
+
+    if _envb("MAIN_HTTP_ALLOW_BIND_PORT", False):
+        return False
+
+    port = int(_envi("PORT", 0))
+    hp = 0
+
+    if os.getenv("HEALTH_HTTP_PORT") is not None:
+        hp = max(hp, int(_envi("HEALTH_HTTP_PORT", 0)))
+    if os.getenv("HEALTH_PORT") is not None:
+        hp = max(hp, int(_envi("HEALTH_PORT", 0)))
+
+    if port <= 0 or hp <= 0:
+        return False
+
+    return hp == port
+
+
 def _http_port() -> int:
     """
     Deterministic + Render-safe:
@@ -2255,6 +2282,16 @@ def _http_port() -> int:
     - Else 0 (disabled).
     """
     if _in_tests() and not _envb("MAIN_HTTP_ALLOW_IN_TESTS", False):
+        return 0
+
+    # If Render health sidecar owns PORT, do NOT bind it from main unless explicitly configured.
+    if _health_sidecar_owns_port():
+        if os.getenv("MAIN_HTTP_PORT") is not None:
+            p = int(_envi("MAIN_HTTP_PORT", 0))
+            return p if p > 0 else 0
+        if os.getenv("HTTP_PORT") is not None:
+            p = int(_envi("HTTP_PORT", 0))
+            return p if p > 0 else 0
         return 0
 
     if os.getenv("MAIN_HTTP_PORT") is not None:
@@ -2436,6 +2473,8 @@ def _early_http_enabled(port: int) -> bool:
     if port <= 0:
         return False
     if _envb("MAIN_HTTP_DISABLED", False):
+        return False
+    if _health_sidecar_owns_port():
         return False
     # Default early-http ON in Render, OFF elsewhere, unless explicitly set.
     return _envb("MAIN_HTTP_EARLY_START", _is_render())
@@ -2892,6 +2931,30 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
 
         restart_cfg_unlimited = RestartConfig(max_restarts=None)
 
+        def _wrap_supervised_task(
+            task_name: str, coro_factory: Callable[[], Awaitable[None]]
+        ) -> Callable[[], Awaitable[None]]:
+            """
+            Ensures a supervised task never "silently completes" while the system is still running.
+            If a task returns while stop_evt is not set -> treat as failure so supervisor restarts it.
+            """
+
+            async def _runner() -> None:
+                try:
+                    await coro_factory()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    raise
+
+                # Normal completion is only allowed during shutdown.
+                if stop_evt.is_set():
+                    return
+
+                raise RuntimeError(f"task_returned_unexpectedly:{task_name}")
+
+            return _runner
+
         def add_task(
             name: str,
             coro_factory: Callable[[], Awaitable[None]],
@@ -2901,9 +2964,10 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
             tags: JSONDict | None = None,
             shutdown_timeout_s: float = 15.0,
         ) -> None:
+            wrapped = _wrap_supervised_task(name, coro_factory)
             spec = TS_TaskSpec(
                 name=name,
-                coro_factory=coro_factory,
+                coro_factory=wrapped,
                 restart_policy=restart_policy,
                 restart=restart_cfg_unlimited,
                 essential=essential,
@@ -2918,7 +2982,8 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
         task_view_holder["fn"] = task_view_fn
 
         # HTTP server: if early-started it, do NOT bind a 2nd copy.
-        if not early_http:
+        # Also: do not create a supervised task if HTTP is effectively disabled (port=0).
+        if (not early_http) and int(_http_port()) > 0 and (not _envb("MAIN_HTTP_DISABLED", False)):
             add_task(
                 "http_server",
                 lambda: _http_server(M, st, cand_q, tick_q, stop_evt, task_view_fn),
@@ -2933,7 +2998,11 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
             mods = _scanner_modules_from_env() or _default_scanner_modules()
             log.event("SCANNERS_SELECTED", run_id=RUN_ID, modules=",".join(mods) if mods else "")
             for mod_name in mods or []:
-                crit = _envb(f"SCANNER_CRITICAL__{mod_name.replace('.', '_').upper()}", True)
+                # Default: scanners are NOT essential (they must never take the worker down).
+                crit_default = _envb("SCANNER_TASKS_ESSENTIAL_DEFAULT", False)
+                crit = _envb(
+                    f"SCANNER_CRITICAL__{mod_name.replace('.', '_').upper()}", crit_default
+                )
                 add_task(
                     f"scanner::{mod_name}",
                     lambda m=mod_name: _scanner_run_module(M, m, cand_q, tick_q, stop_evt, st),
@@ -3145,6 +3214,10 @@ async def main(stop_evt: asyncio.Event | None = None) -> None:
 
         try:
             await sup.run()
+            # If the supervisor returns while we are not stopping, treat as a crash.
+            if not stop_evt.is_set():
+                log.event("SUPERVISOR_RETURNED_WITHOUT_STOP", run_id=RUN_ID)
+                raise RuntimeError("supervisor_returned_without_stop")
         finally:
             log.event("MAIN_SHUTDOWN_BEGIN", run_id=RUN_ID)
             stop_evt.set()
@@ -3364,6 +3437,9 @@ def get_contracts_surface(*, safe: bool = True) -> Any:
 async def run_forever() -> None:
     is_render_ = _is_render()
     restart_default = (not is_render_) and (_phase() >= 7)
+    # On Render, default to self-heal on crash unless explicitly disabled.
+    if is_render_ and os.getenv("MAIN_INNER_RESTART_ON_CRASH") is None:
+        restart_default = True
     restart = _envb("MAIN_INNER_RESTART_ON_CRASH", restart_default)
 
     if not restart:
